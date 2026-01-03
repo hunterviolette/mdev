@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+// src/app/state.rs
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::model::{AnalysisResult, CommitEntry};
@@ -35,6 +36,21 @@ pub struct TerminalState {
     pub last_status: Option<i32>,
 }
 
+// Context exporter
+pub struct ContextExporterState {
+    pub save_path: Option<PathBuf>,
+    pub max_bytes_per_file: usize,
+    pub skip_binary: bool,
+    pub mode: ContextExportMode,
+    pub status: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextExportMode {
+    EntireRepo,
+    TreeSelect,
+}
+
 pub struct AppState {
     pub inputs: InputsState,
     pub results: ResultsState,
@@ -47,6 +63,9 @@ pub struct AppState {
 
     // Terminal instances (ephemeral)
     pub terminals: HashMap<ComponentId, TerminalState>,
+
+    // Context exporters (ephemeral)
+    pub context_exporters: HashMap<ComponentId, ContextExporterState>,
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
@@ -85,6 +104,9 @@ pub struct UiState {
 
 pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
+
+    // NEW: set of files selected for context export (TreeSelect mode)
+    pub context_selected_files: HashSet<String>,
 }
 
 pub struct FileViewerState {
@@ -158,12 +180,17 @@ impl Default for AppState {
                 show_top_level_stats: true,
                 filter_text: "".to_string(),
             },
-            tree: TreeState { expand_cmd: None },
+            tree: TreeState {
+                expand_cmd: None,
+                context_selected_files: HashSet::new(),
+            },
 
             file_viewers,
             active_file_viewer: Some(2),
 
             terminals: HashMap::new(),
+
+            context_exporters: HashMap::new(),
 
             theme: ThemeState {
                 code_theme: CodeTheme::dark(),

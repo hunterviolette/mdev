@@ -3,7 +3,7 @@ use eframe::egui;
 use super::super::actions::{Action, ComponentKind};
 use super::super::state::AppState;
 
-use super::{file_viewer, summary_panel, terminal, tree_panel};
+use super::{context_exporter, file_viewer, summary_panel, terminal, tree_panel};
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -73,6 +73,20 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                 let shown = window.show(ui.ctx(), |ui| {
                     let content_size = ui.available_size();
 
+                    // Allow some panels to run WITHOUT analysis results.
+                    match c.kind {
+                        ComponentKind::Terminal => {
+                            actions.extend(terminal::terminal_panel(ctx, ui, state, c.id));
+                            return content_size;
+                        }
+                        ComponentKind::ContextExporter => {
+                            actions.extend(context_exporter::context_exporter(ui, state, c.id));
+                            return content_size;
+                        }
+                        _ => {}
+                    }
+
+                    // For Tree/FileViewer/Summary we want analysis results
                     let Some(res) = res_opt.as_ref() else {
                         ui.label("Select a repo (it will auto-run), or click Run.");
                         return content_size;
@@ -93,8 +107,8 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                                 summary_panel::summary_panel(ui, res);
                             });
                         }
-                        ComponentKind::Terminal => {
-                            actions.extend(terminal::terminal_panel(ctx, ui, state, c.id));
+                        ComponentKind::Terminal | ComponentKind::ContextExporter => {
+                            // handled above
                         }
                     }
 

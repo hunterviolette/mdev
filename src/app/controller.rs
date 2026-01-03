@@ -1,11 +1,12 @@
+// src/app/controller.rs
 use std::collections::HashMap;
-
-use crate::{analyze, format, git};
-use crate::model::CommitEntry;
 
 use anyhow::Result;
 use regex::Regex;
 use rfd::FileDialog;
+
+use crate::{analyze, format, git};
+use crate::model::CommitEntry;
 
 use super::actions::{Action, ComponentId, ComponentKind, ExpandCmd};
 use super::layout::{
@@ -95,6 +96,130 @@ impl AppState {
             }
             // --------------------------
 
+            // ---- CONTEXT EXPORTER actions ----
+            Action::ContextPickSavePath { exporter_id } => {
+                let default_name = "repo_context.txt";
+                if let Some(path) = FileDialog::new()
+                    .set_title("Save context file")
+                    .set_file_name(default_name)
+                    .save_file()
+                {
+                    if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                        ex.save_path = Some(path);
+                        ex.status = None;
+                    }
+                }
+            }
+
+            Action::ContextSetMaxBytes { exporter_id, max } => {
+                if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                    ex.max_bytes_per_file = max.max(1_000);
+                }
+            }
+
+            Action::ContextToggleSkipBinary { exporter_id } => {
+                if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                    ex.skip_binary = !ex.skip_binary;
+                }
+            }
+
+            Action::ContextGenerate { exporter_id } => {
+                // repo must exist
+                let Some(repo) = self.inputs.repo.clone() else {
+                    if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                        ex.status = Some("No repo selected.".into());
+                    }
+                    return;
+                };
+
+                // snapshot exporter state (owned) so we can mut borrow later safely
+                let (mode, out_path, max_bytes_per_file, skip_binary) =
+                    match self.context_exporters.get(&exporter_id) {
+                        Some(ex) => (
+                            ex.mode,
+                            ex.save_path.clone(),
+                            ex.max_bytes_per_file,
+                            ex.skip_binary,
+                        ),
+                        None => return,
+                    };
+
+                // need save path
+                let Some(out_path) = out_path else {
+                    if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                        ex.status = Some("Pick a save path first.".into());
+                    }
+                    return;
+                };
+
+                // compile excludes
+                let compiled = match self.compile_excludes() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                            ex.status = Some(format!("Bad exclude regex: {:#}", e));
+                        }
+                        return;
+                    }
+                };
+
+                // include list only in TreeSelect mode
+                let include_files: Option<Vec<String>> = match mode {
+                    super::state::ContextExportMode::EntireRepo => None,
+                    super::state::ContextExportMode::TreeSelect => {
+                        if self.results.result.is_none() {
+                            if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                                ex.status = Some(
+                                    "Run analysis first (tree selection requires analysis).".into(),
+                                );
+                            }
+                            return;
+                        }
+
+                        let mut v: Vec<String> =
+                            self.tree.context_selected_files.iter().cloned().collect();
+
+                        // IMPORTANT: empty selection must NOT fall back to entire repo.
+                        if v.is_empty() {
+                            if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                                ex.status = Some("No files selected in tree.".into());
+                            }
+                            return;
+                        }
+
+                        // deterministic order
+                        v.sort();
+                        Some(v)
+                    }
+                };
+
+                if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                    ex.status = Some("Generating…".into());
+                }
+
+                let opts = git::ContextExportOptions {
+                    git_ref: &self.inputs.git_ref,
+                    exclude: &compiled,
+                    max_bytes_per_file,
+                    skip_binary,
+                    include_files: include_files.as_deref(),
+                };
+
+                match git::export_repo_context(&repo, &out_path, opts) {
+                    Ok(()) => {
+                        if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                            ex.status = Some(format!("Wrote: {}", out_path.display()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                            ex.status = Some(format!("Export failed: {:#}", e));
+                        }
+                    }
+                }
+            }
+            // ------------------------------
+
             Action::AddComponent { kind } => self.add_component(kind),
 
             Action::FocusFileViewer(id) => self.active_file_viewer = Some(id),
@@ -130,8 +255,9 @@ impl AppState {
                     });
                 self.active_file_viewer = Some(2);
 
-                // terminals are ephemeral; rebuild them from layout (default layout likely has none)
+                // terminals/context exporters are ephemeral; rebuild from layout
                 self.rebuild_terminals_from_layout();
+                self.rebuild_context_exporters_from_layout();
             }
 
             Action::SaveWorkspace {
@@ -205,6 +331,38 @@ impl AppState {
             ComponentKind::FileViewer => self.new_file_viewer(),
             ComponentKind::Terminal => self.new_terminal(),
 
+            ComponentKind::ContextExporter => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Context Exporter {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [120.0, 120.0],
+                        size: [560.0, 260.0],
+                    },
+                );
+
+                self.context_exporters.insert(
+                    id,
+                    super::state::ContextExporterState {
+                        save_path: None,
+                        max_bytes_per_file: 200_000,
+                        skip_binary: true,
+                        mode: super::state::ContextExportMode::EntireRepo,
+                        status: None,
+                    },
+                );
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
             ComponentKind::Tree | ComponentKind::Summary => {
                 self.layout.merge_with_defaults();
 
@@ -212,7 +370,9 @@ impl AppState {
                 let title = match kind {
                     ComponentKind::Tree => format!("Tree {}", id),
                     ComponentKind::Summary => format!("Summary {}", id),
-                    ComponentKind::FileViewer | ComponentKind::Terminal => unreachable!(),
+                    ComponentKind::FileViewer
+                    | ComponentKind::Terminal
+                    | ComponentKind::ContextExporter => unreachable!(),
                 };
 
                 self.layout.components.push(super::layout::ComponentInstance { id, kind, title });
@@ -288,6 +448,10 @@ impl AppState {
             w.open = false;
         }
 
+        // Clean up ephemeral component state (safe no-op if not present)
+        self.context_exporters.remove(&id);
+        self.terminals.remove(&id);
+
         // If it was active FV, pick another FV if available
         if self.active_file_viewer == Some(id) {
             self.active_file_viewer = self
@@ -307,8 +471,6 @@ impl AppState {
         use super::actions::TerminalShell;
         use super::state::TerminalState;
 
-        // Terminals are ephemeral. Workspace load restores the *layout* and terminal component IDs,
-        // but the runtime terminal state must be recreated fresh each time.
         self.terminals.clear();
 
         let term_ids: Vec<ComponentId> = self
@@ -328,6 +490,31 @@ impl AppState {
                     input: String::new(),
                     output: String::new(),
                     last_status: None,
+                },
+            );
+        }
+    }
+
+    fn rebuild_context_exporters_from_layout(&mut self) {
+        self.context_exporters.clear();
+
+        let ids: Vec<ComponentId> = self
+            .layout
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::ContextExporter)
+            .map(|c| c.id)
+            .collect();
+
+        for id in ids {
+            self.context_exporters.insert(
+                id,
+                super::state::ContextExporterState {
+                    save_path: None,
+                    max_bytes_per_file: 200_000,
+                    skip_binary: true,
+                    mode: super::state::ContextExportMode::EntireRepo,
+                    status: None,
                 },
             );
         }
@@ -364,7 +551,11 @@ impl AppState {
                     out.push(if ok { ch } else { '_' });
                 }
                 let out = out.trim().trim_end_matches('.').to_string();
-                if out.is_empty() { "workspace".to_string() } else { out }
+                if out.is_empty() {
+                    "workspace".to_string()
+                } else {
+                    out
+                }
             }
         };
 
@@ -544,7 +735,6 @@ impl AppState {
         }
     }
 
-    /// This is called from app.rs every frame.
     /// Applies pending workspace once viewport resize has taken effect (or after a short timeout).
     pub fn try_apply_pending_workspace(
         &mut self,
@@ -576,7 +766,6 @@ impl AppState {
             return false;
         }
 
-        // Ready (or timed out): apply now.
         let pending = self.pending_workspace_apply.take().unwrap();
 
         match pending.preset {
@@ -586,8 +775,8 @@ impl AppState {
                 layout.merge_with_defaults();
                 self.layout = layout;
 
-                //  terminals are ephemeral; recreate from the restored layout
                 self.rebuild_terminals_from_layout();
+                self.rebuild_context_exporters_from_layout();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -608,8 +797,8 @@ impl AppState {
                 layout.merge_with_defaults();
                 self.layout = layout;
 
-                //  terminals are ephemeral; recreate from layout (repo already restored)
                 self.rebuild_terminals_from_layout();
+                self.rebuild_context_exporters_from_layout();
 
                 // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();
@@ -632,7 +821,7 @@ impl AppState {
                     );
                 }
 
-                // Restore active FV (fallback to first FV component)
+                // Restore active FV
                 self.active_file_viewer = state_snap.active_file_viewer.or_else(|| {
                     self.layout
                         .components
@@ -726,15 +915,18 @@ impl AppState {
 
         match analyze::analyze_repo(&repo, &self.inputs.git_ref, &compiled, self.inputs.max_exts) {
             Ok(res) => {
+                self.set_context_selection_all(&res);
                 self.results.result = Some(res);
                 self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
             }
-            Err(e) => self.results.error = Some(format!("{:#}", e)),
+            Err(e) => {
+                self.results.error = Some(format!("{:#}", e));
+            }
         }
     }
 
     // ---------------------------
-    // File viewer (per instance)
+    // File viewer
     // ---------------------------
 
     fn parse_history(bytes: &[u8]) -> Vec<CommitEntry> {
@@ -773,7 +965,6 @@ impl AppState {
             return;
         };
 
-        // Determine from/to refs (fallback to current git_ref)
         let (from_sel, to_sel) = {
             let v = self.file_viewers.get(&viewer_id).unwrap();
             (v.diff_base.clone(), v.diff_target.clone())
@@ -782,7 +973,6 @@ impl AppState {
         let from_ref = from_sel.unwrap_or_else(|| self.inputs.git_ref.clone());
         let to_ref = to_sel.unwrap_or_else(|| self.inputs.git_ref.clone());
 
-        // Clear old output/error
         if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
             v.diff_err = None;
             v.diff_text.clear();
@@ -867,7 +1057,7 @@ impl AppState {
             return;
         };
 
-        // Always refresh history for this viewer/path (fixes non-original viewers)
+        // Always refresh history
         let mut history_err: Option<String> = None;
         match git::file_history(repo, &path, 80) {
             Ok(bytes) => {
@@ -921,57 +1111,9 @@ impl AppState {
         }
     }
 
-    fn app_data_dir() -> anyhow::Result<std::path::PathBuf> {
-        use anyhow::anyhow;
-        use directories::ProjectDirs;
-
-        // Change these identifiers if you want a different folder name.
-        // On Windows: %APPDATA%\DescribeRepo
-        // On macOS: ~/Library/Application Support/DescribeRepo
-        // On Linux: ~/.local/share/describerepo (depending on dirs rules)
-        let proj = ProjectDirs::from("", "", "DescribeRepo")
-            .ok_or_else(|| anyhow!("Failed to resolve platform data directory"))?;
-
-        Ok(proj.data_dir().to_path_buf())
-    }
-
-    fn workspaces_dir() -> anyhow::Result<std::path::PathBuf> {
-        let mut dir = Self::app_data_dir()?;
-        dir.push("workspaces");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
-    fn sanitize_workspace_name(name: &str) -> String {
-        // Keep it simple and safe across platforms:
-        // - trim
-        // - replace path separators and weird chars with '_'
-        // - fallback to "workspace" if empty
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return "workspace".to_string();
-        }
-
-        let mut out = String::with_capacity(trimmed.len());
-        for ch in trimmed.chars() {
-            let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ' ';
-            if ok {
-                out.push(ch);
-            } else {
-                out.push('_');
-            }
-        }
-
-        // Avoid trailing dots/spaces which Windows hates in filenames
-        let out = out.trim().trim_end_matches('.').to_string();
-        if out.is_empty() { "workspace".to_string() } else { out }
-    }
-
-    fn workspace_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
-        let dir = Self::workspaces_dir()?;
-        let safe = Self::sanitize_workspace_name(name);
-        Ok(dir.join(format!("{safe}.json")))
-    }
+    // ---------------------------
+    // Workspace list (used by command palette)
+    // ---------------------------
 
     pub fn list_workspaces(&self) -> Vec<String> {
         let dir = match Self::workspaces_dir() {
@@ -999,160 +1141,27 @@ impl AppState {
         names
     }
 
-    fn save_workspace_to_appdata(
-        &mut self,
-        canvas_size: [f32; 2],
-        viewport_outer_pos: Option<[f32; 2]>,
-        viewport_inner_size: Option<[f32; 2]>,
-        suggested_name: Option<&str>,
-    ) {
-        // Name logic:
-        // - if user provided a name -> use it
-        // - else reuse last palette name if available
-        // - else default "workspace"
-        let name = suggested_name
-            .map(|s| s.to_string())
-            .or_else(|| self.palette_last_name.clone())
-            .unwrap_or_else(|| "workspace".to_string());
+    fn app_data_dir() -> anyhow::Result<std::path::PathBuf> {
+        use anyhow::anyhow;
+        use directories::ProjectDirs;
 
-        let path = match Self::workspace_path(&name) {
-            Ok(p) => p,
-            Err(e) => {
-                self.results.error = Some(format!("Failed to resolve workspace directory: {:#}", e));
-                return;
-            }
-        };
+        let proj = ProjectDirs::from("", "", "DescribeRepo")
+            .ok_or_else(|| anyhow!("Failed to resolve platform data directory"))?;
 
-        self.layout.merge_with_defaults();
-
-        // snapshot viewer selections only (we reload content from git)
-        let mut fv_snap: HashMap<ComponentId, FileViewerSnapshot> = HashMap::new();
-        for (id, v) in self.file_viewers.iter() {
-            fv_snap.insert(
-                *id,
-                FileViewerSnapshot {
-                    selected_file: v.selected_file.clone(),
-                    selected_commit: v.selected_commit.clone(),
-                },
-            );
-        }
-
-        let layout_preset = Preset {
-            name: "layout".to_string(),
-            kind: PresetKind::LayoutOnly(LayoutSnapshot {
-                canvas_size,
-                layout: self.layout.clone(),
-            }),
-        };
-
-        let state_preset = Preset {
-            name: "state".to_string(),
-            kind: PresetKind::FullState(StateSnapshot {
-                canvas_size,
-                viewport_outer_pos,
-                viewport_inner_size,
-
-                repo: self.inputs.repo.clone(),
-                git_ref: self.inputs.git_ref.clone(),
-                exclude_regex: self.inputs.exclude_regex.clone(),
-                max_exts: self.inputs.max_exts,
-
-                filter_text: self.ui.filter_text.clone(),
-                show_top_level_stats: self.ui.show_top_level_stats,
-
-                layout: self.layout.clone(),
-
-                file_viewers: fv_snap,
-                active_file_viewer: self.active_file_viewer,
-            }),
-        };
-
-        let ws = WorkspaceFile {
-            version: 2,
-            default_preset: Some("state".to_string()),
-            presets: vec![layout_preset, state_preset],
-        };
-
-        match serde_json::to_string_pretty(&ws) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
-                    self.results.error = Some(format!("Failed to save workspace: {}", e));
-                } else {
-                    self.results.error = None;
-                }
-            }
-            Err(e) => self.results.error = Some(format!("Failed to serialize workspace: {}", e)),
-        }
+        Ok(proj.data_dir().to_path_buf())
     }
 
-    fn load_workspace_from_appdata(&mut self, suggested_name: Option<&str>) {
-        // If user provided a name use it; else try palette_last_name; else refuse gracefully.
-        let name = suggested_name
-            .map(|s| s.to_string())
-            .or_else(|| self.palette_last_name.clone());
-
-        let Some(name) = name else {
-            self.results.error = Some(
-                "No workspace name provided. Try: workspace/load/<name> (or list available names)."
-                    .into(),
-            );
-            return;
-        };
-
-        let path = match Self::workspace_path(&name) {
-            Ok(p) => p,
-            Err(e) => {
-                self.results.error = Some(format!("Failed to resolve workspace directory: {:#}", e));
-                return;
-            }
-        };
-
-        let s = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.results.error = Some(format!("Failed to read workspace '{}': {}", name, e));
-                return;
-            }
-        };
-
-        let ws = match serde_json::from_str::<WorkspaceFile>(&s) {
-            Ok(ws) => ws,
-            Err(e) => {
-                self.results.error = Some(format!("Failed to parse workspace '{}': {}", name, e));
-                return;
-            }
-        };
-
-        let preset = ws
-            .default_preset
-            .as_ref()
-            .and_then(|n| ws.presets.iter().find(|p| &p.name == n))
-            .or_else(|| ws.presets.first());
-
-        let Some(preset) = preset else {
-            self.results.error = Some("Workspace has no presets.".into());
-            return;
-        };
-
-        let mut target_inner_size: Option<[f32; 2]> = None;
-
-        if let PresetKind::FullState(st) = &preset.kind {
-            self.pending_viewport_restore = Some(ViewportRestore {
-                outer_pos: st.viewport_outer_pos,
-                inner_size: st.viewport_inner_size,
-            });
-            target_inner_size = st.viewport_inner_size;
-        }
-
-        // IMPORTANT: don't apply immediately; wait for viewport/canvas to settle
-        self.pending_workspace_apply = Some(PendingWorkspaceApply {
-            preset: preset.kind.clone(),
-            target_inner_size,
-            wait_frames: 10,
-        });
-
-        self.results.error = None;
+    fn workspaces_dir() -> anyhow::Result<std::path::PathBuf> {
+        let mut dir = Self::app_data_dir()?;
+        dir.push("workspaces");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
+
+
+    // ---------------------------
+    // Terminal
+    // ---------------------------
 
     fn new_terminal(&mut self) {
         use super::layout::{ComponentInstance, WindowLayout};
@@ -1262,6 +1271,25 @@ impl AppState {
                 t.output.push_str(&format!("Failed to run command: {}\n", e));
             }
         }
+    }
+
+    // ---------------------------
+    // Context selection helpers
+    // ---------------------------
+
+    fn collect_all_files(node: &crate::model::DirNode, out: &mut Vec<String>) {
+        for f in &node.files {
+            out.push(f.full_path.clone());
+        }
+        for c in &node.children {
+            Self::collect_all_files(c, out);
+        }
+    }
+
+    fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
+        let mut files = Vec::new();
+        Self::collect_all_files(&res.root, &mut files);
+        self.tree.context_selected_files = files.into_iter().collect();
     }
 
     // helpers used by UI

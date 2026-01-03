@@ -1,3 +1,4 @@
+// src/app/ui/tree_panel.rs
 use eframe::egui;
 
 use crate::format;
@@ -15,25 +16,84 @@ fn file_viewer_choices(state: &AppState) -> Vec<(ComponentId, String)> {
         .map(|c| (c.id, c.title.clone()))
         .collect();
 
-    // Stable order
     list.sort_by(|a, b| a.1.cmp(&b.1));
     list
 }
 
-/// Render one file row. If there's only one FileViewer instance, click opens immediately.
-/// If there are multiple, click opens a small popup menu anchored to this row.
+fn collect_files_under_dir(node: &DirNode, out: &mut Vec<String>) {
+    for f in &node.files {
+        out.push(f.full_path.clone());
+    }
+    for c in &node.children {
+        collect_files_under_dir(c, out);
+    }
+}
+
+fn collect_all_files(res: &AnalysisResult) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in &res.root.files {
+        out.push(f.full_path.clone());
+    }
+    for d in &res.root.children {
+        collect_files_under_dir(d, &mut out);
+    }
+    out
+}
+
+fn dir_selection_state(state: &AppState, node: &DirNode) -> (bool, bool) {
+    let mut files = Vec::new();
+    collect_files_under_dir(node, &mut files);
+
+    if files.is_empty() {
+        return (true, true);
+    }
+
+    let mut any = false;
+    let mut all = true;
+    for f in files {
+        let sel = state.tree.context_selected_files.contains(&f);
+        any |= sel;
+        all &= sel;
+    }
+    (all, any)
+}
+
+fn set_dir_selected(state: &mut AppState, node: &DirNode, selected: bool) {
+    let mut files = Vec::new();
+    collect_files_under_dir(node, &mut files);
+
+    if selected {
+        for f in files {
+            state.tree.context_selected_files.insert(f);
+        }
+    } else {
+        for f in files {
+            state.tree.context_selected_files.remove(&f);
+        }
+    }
+}
+
+/// Render one file row:
+/// - checkbox gates context export selection
+/// - filename still opens file viewer (existing behavior)
 fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, f: &FileRow) {
     let viewers = file_viewer_choices(state);
-
-    // IMPORTANT: use a stable ID that does NOT depend on ui id-stack.
     let popup_id = egui::Id::new(("open_in_popup", f.full_path.as_str()));
 
-    // Row UI: LOC + clickable blue "link" label (no wrapping so we get horizontal scrolling)
+    let mut checked = state.tree.context_selected_files.contains(&f.full_path);
+
     let link_resp = ui
         .horizontal(|ui| {
+            if ui.checkbox(&mut checked, "").clicked() {
+                if checked {
+                    state.tree.context_selected_files.insert(f.full_path.clone());
+                } else {
+                    state.tree.context_selected_files.remove(&f.full_path);
+                }
+            }
+
             ui.monospace(format!("{:>6}", f.loc_display));
 
-            // egui::Link has no `.wrap(...)`. Use a Label styled like a hyperlink + click sense.
             let link_text = egui::RichText::new(&f.name).color(ui.visuals().hyperlink_color);
 
             ui.add(
@@ -46,10 +106,6 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
         })
         .inner;
 
-    // On click:
-    // - 0 viewers: show error
-    // - 1 viewer: open directly
-    // - >1 viewers: open popup anchored at the clicked row
     if link_resp.clicked() {
         if viewers.is_empty() {
             state.results.error = Some(
@@ -64,16 +120,12 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
         }
     }
 
-    // Show the popup menu if open (anchored near this row).
     egui::popup::popup_below_widget(ui, popup_id, &link_resp, |ui| {
         ui.set_min_width(260.0);
 
         ui.label("Open in:");
         ui.separator();
 
-        // Default selection preference:
-        // - active viewer (if exists)
-        // - otherwise first viewer
         let default_id = state
             .active_file_viewer
             .filter(|id| viewers.iter().any(|(vid, _)| vid == id))
@@ -84,14 +136,9 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
 
             if ui.selectable_label(selected, title).clicked() {
                 state.active_file_viewer = Some(*viewer_id);
-
-                // Optional: bring that viewer to front (only if your canvas supports it).
                 actions.push(Action::FocusFileViewer(*viewer_id));
-
-                // Actually open the file
                 actions.push(Action::OpenFile(f.full_path.clone()));
-
-                ui.close_menu(); // closes popup immediately
+                ui.close_menu();
             }
         }
     });
@@ -107,7 +154,6 @@ fn show_dir(
     expand_cmd: Option<ExpandCmd>,
     actions: &mut Vec<Action>,
 ) {
-    // IMPORTANT: stable ID independent of ui id-stack (prevents expansion reset on layout changes).
     let id = egui::Id::new(("dir", node.full_path.as_str()));
 
     let badge = if show_stats_badge {
@@ -117,9 +163,9 @@ fn show_dir(
     };
     let label = format!("{}/{}", node.name, badge);
 
-    let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let mut st =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
 
-    // Apply expand/collapse ONCE (tree_panel clears it after rendering)
     if let Some(cmd) = expand_cmd {
         match cmd {
             ExpandCmd::ExpandAll => st.set_open(true),
@@ -128,6 +174,18 @@ fn show_dir(
     }
 
     st.show_header(ui, |ui| {
+        // NOTE: egui checkboxes don’t support true tri-state without extra work.
+        // We follow your ask: "dir selects all files in it" using a single checkbox.
+        // Behavior:
+        // - checked => all files under dir are selected
+        // - unchecked => none selected (even if previously partial)
+        let (all, _any) = dir_selection_state(state, node);
+        let mut desired = all;
+
+        if ui.checkbox(&mut desired, "").clicked() {
+            set_dir_selected(state, node, desired);
+        }
+
         ui.add(egui::Label::new(label).wrap(false));
     })
     .body(|ui| {
@@ -158,7 +216,6 @@ pub fn tree_panel(
     // One-shot expand/collapse command
     let expand_cmd = state.tree.expand_cmd;
 
-    // Tree-local controls (moved from top panel)
     ui.horizontal(|ui| {
         ui.checkbox(&mut state.ui.show_top_level_stats, "Badges");
 
@@ -170,12 +227,20 @@ pub fn tree_panel(
         if ui.button("Collapse all").clicked() {
             actions.push(Action::CollapseAll);
         }
+
+        ui.separator();
+
+        if ui.button("All context").clicked() {
+            state.tree.context_selected_files = collect_all_files(res).into_iter().collect();
+        }
+        if ui.button("No context").clicked() {
+            state.tree.context_selected_files.clear();
+        }
     });
 
     ui.add_space(6.0);
 
     ui.push_id("tree_panel", |ui| {
-        // No “shape restrictions”: always allow both scrollbars
         egui::ScrollArea::both()
             .id_source("tree_scroll_both")
             .auto_shrink([false, false])
@@ -189,9 +254,7 @@ pub fn tree_panel(
                 };
                 let root_label = format!("./{}", badge);
 
-                // IMPORTANT: stable ID independent of ui id-stack.
                 let root_id = egui::Id::new(("dir", "root"));
-
                 let mut root_state =
                     egui::collapsing_header::CollapsingState::load_with_default_open(
                         ui.ctx(),
@@ -208,6 +271,22 @@ pub fn tree_panel(
 
                 root_state
                     .show_header(ui, |ui| {
+                        // Root checkbox controls all files
+                        let all_files = collect_all_files(res);
+                        let mut all = !all_files.is_empty()
+                            && all_files
+                                .iter()
+                                .all(|p| state.tree.context_selected_files.contains(p));
+
+                        if ui.checkbox(&mut all, "").clicked() {
+                            if all {
+                                state.tree.context_selected_files =
+                                    all_files.into_iter().collect();
+                            } else {
+                                state.tree.context_selected_files.clear();
+                            }
+                        }
+
                         ui.add(egui::Label::new(root_label).wrap(false));
                     })
                     .body(|ui| {

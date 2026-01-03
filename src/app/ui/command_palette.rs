@@ -16,6 +16,7 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "file_viewer" | "fileviewer" | "viewer" => Some(ComponentKind::FileViewer),
         "summary" => Some(ComponentKind::Summary),
         "terminal" | "term" => Some(ComponentKind::Terminal),
+        "context_exporter" => Some(ComponentKind::ContextExporter),
         _ => None,
     }
 }
@@ -96,6 +97,7 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/tree".into(),
                     "component/summary".into(),
                     "component/terminal".into(),
+                    "component/context_exporter".into(),
                 ]
             } else {
                 vec![]
@@ -178,7 +180,9 @@ pub fn command_palette(
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
-                    .hint_text("workspace/load/foo | workspace/save/my_layout | component/terminal"),
+                    .hint_text(
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter",
+                    ),
             );
             resp.request_focus();
 
@@ -194,6 +198,7 @@ pub fn command_palette(
                     "workspace/load".into(),
                     "component/file_viewer".into(),
                     "component/terminal".into(),
+                    "component/context_exporter".into(), 
                 ];
             }
 

@@ -11,7 +11,8 @@ pub enum ComponentKind {
     Tree,
     FileViewer,
     Summary,
-    Terminal, // NEW
+    Terminal,
+    ContextExporter, // NEW
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -43,7 +44,7 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
-    // Diff actions (if you already have these, keep them)
+    // Diff actions
     ToggleDiff {
         viewer_id: ComponentId,
     },
@@ -59,7 +60,7 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
-    // Terminal actions (NEW)
+    // Terminal actions
     RunTerminalCommand {
         terminal_id: ComponentId,
         cmd: String,
@@ -70,6 +71,21 @@ pub enum Action {
     SetTerminalShell {
         terminal_id: ComponentId,
         shell: TerminalShell,
+    },
+
+    // Context exporter actions (NEW)
+    ContextPickSavePath {
+        exporter_id: ComponentId,
+    },
+    ContextGenerate {
+        exporter_id: ComponentId,
+    },
+    ContextSetMaxBytes {
+        exporter_id: ComponentId,
+        max: usize,
+    },
+    ContextToggleSkipBinary {
+        exporter_id: ComponentId,
     },
 
     // Command palette + dynamic layout
