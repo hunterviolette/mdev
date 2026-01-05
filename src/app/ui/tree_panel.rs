@@ -82,6 +82,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
 
     let mut checked = state.tree.context_selected_files.contains(&f.full_path);
 
+    // NOTE: use a *focusable* widget for the filename so keyboard focus can leave the editor.
     let link_resp = ui
         .horizontal(|ui| {
             if ui.checkbox(&mut checked, "").clicked() {
@@ -96,17 +97,20 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
 
             let link_text = egui::RichText::new(&f.name).color(ui.visuals().hyperlink_color);
 
-            ui.add(
-                egui::Label::new(link_text)
-                    .wrap(false)
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(&f.full_path)
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            //  Link is focusable (unlike Label + Sense::click)
+            let resp = ui
+                .add(egui::Link::new(link_text))
+                .on_hover_text(&f.full_path)
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            resp
         })
         .inner;
 
     if link_resp.clicked() {
+        //  Explicitly move keyboard focus away from the code editor
+        link_resp.request_focus();
+
         if viewers.is_empty() {
             state.results.error = Some(
                 "No File Viewer windows. Create one with command palette: component/file_viewer"
@@ -280,8 +284,7 @@ pub fn tree_panel(
 
                         if ui.checkbox(&mut all, "").clicked() {
                             if all {
-                                state.tree.context_selected_files =
-                                    all_files.into_iter().collect();
+                                state.tree.context_selected_files = all_files.into_iter().collect();
                             } else {
                                 state.tree.context_selected_files.clear();
                             }
@@ -312,9 +315,6 @@ pub fn tree_panel(
                     });
             });
     });
-
-    // Consume one-shot expand/collapse so it doesn't keep forcing open/close every frame.
-    state.tree.expand_cmd = None;
 
     actions
 }

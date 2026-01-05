@@ -28,19 +28,10 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.layout_epoch = state.layout_epoch.wrapping_add(1);
 
             // Ensure default FV exists
-            state.file_viewers.entry(2).or_insert_with(|| crate::app::state::FileViewerState {
-                selected_file: None,
-                selected_commit: None,
-                file_commits: vec![],
-                file_content: "".into(),
-                file_content_err: None,
-
-                show_diff: false,
-                diff_base: None,
-                diff_target: None,
-                diff_text: "".into(),
-                diff_err: None,
-            });
+            state
+                .file_viewers
+                .entry(2)
+                .or_insert_with(crate::app::state::FileViewerState::new);
             state.active_file_viewer = Some(2);
 
             // Ephemeral components rebuilt from layout
@@ -148,22 +139,8 @@ impl AppState {
             },
         );
 
-        self.file_viewers.insert(
-            id,
-            crate::app::state::FileViewerState {
-                selected_file: None,
-                selected_commit: None,
-                file_commits: vec![],
-                file_content: "".into(),
-                file_content_err: None,
-
-                show_diff: false,
-                diff_base: None,
-                diff_target: None,
-                diff_text: "".into(),
-                diff_err: None,
-            },
-        );
+        self.file_viewers
+            .insert(id, crate::app::state::FileViewerState::new());
 
         self.active_file_viewer = Some(id);
         self.layout_epoch = self.layout_epoch.wrapping_add(1);

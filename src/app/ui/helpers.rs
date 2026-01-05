@@ -7,10 +7,10 @@ pub fn language_hint_for_path(path: &str) -> &str {
 
     match ext.as_str() {
         "rs" => "rs",
-        "ts" => "ts",
-        "tsx" => "tsx",
+        "ts" => "js",
+        "tsx" => "js",
         "js" => "js",
-        "jsx" => "jsx",
+        "jsx" => "js",
         "json" => "json",
         "yml" => "yml",
         "yaml" => "yaml",

@@ -1,10 +1,11 @@
+// src/app/controllers/workspace_controller.rs
 use std::collections::HashMap;
 
 use crate::app::actions::{Action, ComponentId, ComponentKind, ExpandCmd};
 use crate::app::layout::{
     FileViewerSnapshot, LayoutSnapshot, Preset, PresetKind, StateSnapshot, WorkspaceFile,
 };
-use crate::app::state::{AppState, PendingWorkspaceApply, ViewportRestore};
+use crate::app::state::{AppState, PendingWorkspaceApply, ViewportRestore, WORKTREE_REF};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -303,7 +304,15 @@ impl AppState {
             PresetKind::FullState(state_snap) => {
                 // Restore inputs/UI
                 self.inputs.repo = state_snap.repo;
-                self.inputs.git_ref = state_snap.git_ref;
+                self.inputs.local_repo = self.inputs.repo.clone();
+
+                // Never allow WORKTREE to become the default ref on load.
+                self.inputs.git_ref = if state_snap.git_ref == WORKTREE_REF {
+                    "HEAD".to_string()
+                } else {
+                    state_snap.git_ref
+                };
+
                 self.inputs.exclude_regex = state_snap.exclude_regex;
                 self.inputs.max_exts = state_snap.max_exts;
 
@@ -323,22 +332,10 @@ impl AppState {
                 // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();
                 for (id, snap) in state_snap.file_viewers.iter() {
-                    self.file_viewers.insert(
-                        *id,
-                        crate::app::state::FileViewerState {
-                            selected_file: snap.selected_file.clone(),
-                            selected_commit: snap.selected_commit.clone(),
-                            file_commits: vec![],
-                            file_content: "".into(),
-                            file_content_err: None,
-
-                            show_diff: false,
-                            diff_base: None,
-                            diff_target: None,
-                            diff_text: "".into(),
-                            diff_err: None,
-                        },
-                    );
+                    let mut fv = crate::app::state::FileViewerState::new();
+                    fv.selected_file = snap.selected_file.clone();
+                    fv.selected_commit = snap.selected_commit.clone();
+                    self.file_viewers.insert(*id, fv);
                 }
 
                 // Restore active FV (fallback to first FV component)
@@ -351,6 +348,9 @@ impl AppState {
                 });
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
+
+                // Ensure git refs dropdown is correct (HEAD first, WORKTREE second)
+                self.refresh_git_refs();
 
                 // Reset analysis results then re-run
                 self.results.result = None;

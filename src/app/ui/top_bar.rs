@@ -1,10 +1,11 @@
+// src/app/ui/top_bar.rs
 use eframe::egui;
 use egui_extras::syntax_highlighting::CodeTheme;
 
 use crate::format;
 
 use super::super::actions::Action;
-use super::super::state::AppState;
+use super::super::state::{AppState, WORKTREE_REF};
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -27,14 +28,12 @@ fn viewport_inner_size(ctx: &egui::Context) -> Option<[f32; 2]> {
 }
 
 fn apply_theme(ctx: &egui::Context, state: &mut AppState) {
-    // Apply egui visuals (UI chrome)
     if state.theme.prefs.dark {
         ctx.set_visuals(egui::Visuals::dark());
     } else {
         ctx.set_visuals(egui::Visuals::light());
     }
 
-    // Apply code highlighting theme
     let json = format!(
         r#"{{"dark_mode":{},"syntect_theme":"{}"}}"#,
         state.theme.prefs.dark,
@@ -53,15 +52,51 @@ pub fn top_bar(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) -> 
     let mut actions = vec![];
 
     ui.horizontal(|ui| {
-        if ui.button("Select Repo…").clicked() {
+        // ----- Local repo picker only -----
+        if ui.button("Pick Local Repo…").clicked() {
             actions.push(Action::PickRepo);
         }
 
+        ui.separator();
+
+        // ----- Ref dropdown -----
         ui.label("Ref:");
-        ui.text_edit_singleline(&mut state.inputs.git_ref);
+
+        let has_opts = !state.inputs.git_ref_options.is_empty();
+        if has_opts {
+            // Display "Working tree" when WORKTREE_REF is selected
+            let selected_label = if state.inputs.git_ref == WORKTREE_REF {
+                "Working tree".to_string()
+            } else {
+                state.inputs.git_ref.clone()
+            };
+
+            egui::ComboBox::from_id_source("git_ref_combo")
+                .selected_text(selected_label)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for r in state.inputs.git_ref_options.iter() {
+                        let label = if r == WORKTREE_REF { "Working tree" } else { r.as_str() };
+
+                        if ui
+                            .selectable_label(&state.inputs.git_ref == r, label)
+                            .clicked()
+                        {
+                            actions.push(Action::SetGitRef(r.clone()));
+                        }
+                    }
+                });
+        } else {
+            ui.text_edit_singleline(&mut state.inputs.git_ref);
+        }
+
+        if ui.button("↻").clicked() {
+            actions.push(Action::RefreshGitRefs);
+        }
 
         ui.separator();
 
+        // ----- Filter -----
         ui.label("Filter:");
         ui.text_edit_singleline(&mut state.ui.filter_text);
 
@@ -73,7 +108,7 @@ pub fn top_bar(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) -> 
 
         ui.separator();
 
-        // Theme toggle (do not overwrite theme each frame)
+        // Theme toggle
         let was_dark = state.theme.prefs.dark;
 
         if ui.selectable_label(state.theme.prefs.dark, "Dark").clicked() {
@@ -107,23 +142,34 @@ pub fn top_bar(ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) -> 
         }
 
         ui.label("Max exts:");
+        //  FIX: Rust inclusive range is ..=
         ui.add(egui::DragValue::new(&mut state.inputs.max_exts).clamp_range(1..=20));
     });
 
+    // Status lines
     if let Some(repo) = &state.inputs.repo {
-        ui.label(format!("Repo: {}", repo.display()));
+        ui.label(format!("Repo: {:?}", repo));
     } else {
         ui.label("Repo: (none selected)");
     }
 
-    if let Some(err) = &state.results.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, err);
-    }
+    // Workspace save/load helpers (unchanged behavior)
+    ui.horizontal(|ui| {
+        let canvas = last_canvas_size(ctx);
+        let outer = viewport_outer_pos(ctx);
+        let inner = viewport_inner_size(ctx);
 
-    // If you still use these helpers elsewhere:
-    let _ = last_canvas_size(ctx);
-    let _ = viewport_outer_pos(ctx);
-    let _ = viewport_inner_size(ctx);
+        if ui.button("Save workspace").clicked() {
+            actions.push(Action::SaveWorkspace {
+                canvas_size: canvas,
+                viewport_outer_pos: outer,
+                viewport_inner_size: inner,
+            });
+        }
+        if ui.button("Load workspace").clicked() {
+            actions.push(Action::LoadWorkspace);
+        }
+    });
 
     actions
 }

@@ -1,3 +1,7 @@
+// src/app/actions.rs
+
+use crate::app::state::FileViewAt;
+
 #[derive(Clone, Copy, Debug)]
 pub enum ExpandCmd {
     ExpandAll,
@@ -12,7 +16,7 @@ pub enum ComponentKind {
     FileViewer,
     Summary,
     Terminal,
-    ContextExporter, // NEW
+    ContextExporter,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -27,15 +31,24 @@ pub enum TerminalShell {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    // ---------------------------
+    // Repo + analysis
+    // ---------------------------
     PickRepo,
+
+    RefreshGitRefs,
+    SetGitRef(String),
+
     RunAnalysis,
+
     ExpandAll,
     CollapseAll,
 
-    // Tree -> open file in ACTIVE file viewer
     OpenFile(String),
 
-    // File viewer instance actions
+    // ---------------------------
+    // File viewer actions
+    // ---------------------------
     SelectCommit {
         viewer_id: ComponentId,
         sel: Option<String>,
@@ -44,7 +57,22 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
-    // Diff actions
+    /// Set a viewer's "View at" mode (the enum lives in state.rs).
+    /// - FollowTopBar: uses the global top bar ref
+    /// - WorkingTree: uses disk
+    /// - Commit: (generally set automatically when selecting a commit)
+    SetViewerViewAt {
+        viewer_id: ComponentId,
+        view_at: FileViewAt,
+    },
+
+    ToggleEditWorkingTree {
+        viewer_id: ComponentId,
+    },
+    SaveWorkingTreeFile {
+        viewer_id: ComponentId,
+    },
+
     ToggleDiff {
         viewer_id: ComponentId,
     },
@@ -60,7 +88,9 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
+    // ---------------------------
     // Terminal actions
+    // ---------------------------
     RunTerminalCommand {
         terminal_id: ComponentId,
         cmd: String,
@@ -73,7 +103,9 @@ pub enum Action {
         shell: TerminalShell,
     },
 
-    // Context exporter actions (NEW)
+    // ---------------------------
+    // Context exporter actions
+    // ---------------------------
     ContextPickSavePath {
         exporter_id: ComponentId,
     },
@@ -88,7 +120,9 @@ pub enum Action {
         exporter_id: ComponentId,
     },
 
-    // Command palette + dynamic layout
+    // ---------------------------
+    // Layout / components
+    // ---------------------------
     AddComponent {
         kind: ComponentKind,
     },

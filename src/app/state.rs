@@ -1,12 +1,15 @@
-// src/app/state.rs
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::model::{AnalysisResult, CommitEntry};
 use egui_extras::syntax_highlighting::CodeTheme;
+
+use crate::model::{AnalysisResult, CommitEntry};
 
 use super::actions::{ComponentId, ExpandCmd, TerminalShell};
 use super::layout::{LayoutConfig, PresetKind};
+
+/// Special ref name used to indicate "show the working tree (uncommitted) version".
+pub const WORKTREE_REF: &str = "WORKTREE";
 
 #[derive(Clone, Debug)]
 pub struct ViewportRestore {
@@ -51,13 +54,27 @@ pub enum ContextExportMode {
     TreeSelect,
 }
 
+/// Per-file-viewer "where am I viewing this file from?"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileViewAt {
+    /// Use the global top-bar selection (inputs.git_ref).
+    FollowTopBar,
+    /// Always show the local working tree version.
+    WorkingTree,
+    /// Show a specific commit (hash stored in `selected_commit`).
+    Commit,
+}
+
+// Pull the editor state type from UI module
+pub use crate::app::ui::code_editor::CodeEditorState;
+
 pub struct AppState {
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
     pub tree: TreeState,
 
-    // MULTI viewer instances
+    // Multi viewer instances
     pub file_viewers: HashMap<ComponentId, FileViewerState>,
     pub active_file_viewer: Option<ComponentId>,
 
@@ -86,8 +103,19 @@ pub struct AppState {
 }
 
 pub struct InputsState {
+    /// ACTIVE repo used by analysis/file viewer/export/terminal
     pub repo: Option<PathBuf>,
+
+    /// Last-picked local repo path (for display / future convenience)
+    pub local_repo: Option<PathBuf>,
+
+    /// Currently selected ref (used by analysis + git-show reads)
+    /// NOTE: may be WORKTREE_REF
     pub git_ref: String,
+
+    /// Cached dropdown options for git_ref (remote + local + HEAD + WORKTREE)
+    pub git_ref_options: Vec<String>,
+
     pub exclude_regex: Vec<String>,
     pub max_exts: usize,
 }
@@ -104,17 +132,29 @@ pub struct UiState {
 
 pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
-
-    // NEW: set of files selected for context export (TreeSelect mode)
     pub context_selected_files: HashSet<String>,
 }
 
 pub struct FileViewerState {
     pub selected_file: Option<String>,
+
+    // commit selection (only meaningful when view_at == Commit)
     pub selected_commit: Option<String>,
+
+    // viewer view mode
+    pub view_at: FileViewAt,
+
     pub file_commits: Vec<CommitEntry>,
     pub file_content: String,
     pub file_content_err: Option<String>,
+
+    // Editing working tree
+    pub edit_working_tree: bool,
+    pub edit_buffer: String,
+    pub edit_status: Option<String>,
+
+    // NEW: real editor state (cursor/selection/cache)
+    pub editor: CodeEditorState,
 
     // Diff fields
     pub show_diff: bool,
@@ -122,6 +162,32 @@ pub struct FileViewerState {
     pub diff_target: Option<String>,
     pub diff_text: String,
     pub diff_err: Option<String>,
+}
+
+impl FileViewerState {
+    pub fn new() -> Self {
+        Self {
+            selected_file: None,
+            selected_commit: None,
+            view_at: FileViewAt::FollowTopBar,
+
+            file_commits: vec![],
+            file_content: String::new(),
+            file_content_err: None,
+
+            edit_working_tree: false,
+            edit_buffer: String::new(),
+            edit_status: None,
+
+            editor: CodeEditorState::default(),
+
+            show_diff: false,
+            diff_base: None,
+            diff_target: None,
+            diff_text: String::new(),
+            diff_err: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -146,29 +212,19 @@ impl Default for AppState {
     fn default() -> Self {
         let layout = LayoutConfig::default();
 
-        // default file viewer instance is ID=2 (matches LayoutConfig::default)
         let mut file_viewers = HashMap::new();
-        file_viewers.insert(
-            2,
-            FileViewerState {
-                selected_file: None,
-                selected_commit: None,
-                file_commits: vec![],
-                file_content: "".to_string(),
-                file_content_err: None,
-
-                show_diff: false,
-                diff_base: None,
-                diff_target: None,
-                diff_text: "".to_string(),
-                diff_err: None,
-            },
-        );
+        file_viewers.insert(2, FileViewerState::new());
 
         Self {
             inputs: InputsState {
                 repo: None,
+                local_repo: None,
+
+                // HEAD is default
                 git_ref: "HEAD".to_string(),
+                // ensure HEAD first, WORKTREE second
+                git_ref_options: vec!["HEAD".to_string(), WORKTREE_REF.to_string()],
+
                 exclude_regex: vec![r"\.lock$".into(), r"(^|/)package-lock\.json$".into()],
                 max_exts: 6,
             },
@@ -189,7 +245,6 @@ impl Default for AppState {
             active_file_viewer: Some(2),
 
             terminals: HashMap::new(),
-
             context_exporters: HashMap::new(),
 
             theme: ThemeState {
@@ -218,6 +273,59 @@ impl Default for AppState {
 
             pending_open_file_path: None,
             pending_open_file_viewer: None,
+        }
+    }
+}
+
+impl AppState {
+    /// Set the global ref and immediately refresh any file viewers that follow the top bar.
+    pub fn set_git_ref(&mut self, git_ref: String) {
+        self.inputs.git_ref = git_ref;
+        self.refresh_follow_top_bar_viewers();
+    }
+
+    /// Replace ref dropdown options, enforcing:
+    /// - HEAD is ALWAYS first
+    /// - WORKTREE is ALWAYS second
+    pub fn set_git_ref_options(&mut self, mut refs: Vec<String>) {
+        // normalize
+        refs.retain(|r| !r.trim().is_empty());
+        refs.retain(|r| r != WORKTREE_REF);
+        refs.retain(|r| r != "HEAD");
+
+        // de-dupe while preserving rough order
+        let mut seen = std::collections::HashSet::new();
+        refs.retain(|r| seen.insert(r.clone()));
+
+        // HEAD first, WORKTREE second, then the rest
+        let mut out = Vec::with_capacity(refs.len() + 2);
+        out.push("HEAD".to_string());
+        out.push(WORKTREE_REF.to_string());
+        out.extend(refs);
+
+        self.inputs.git_ref_options = out;
+
+        // If current selection vanished, fall back safely to HEAD.
+        let cur = self.inputs.git_ref.clone();
+        if !self.inputs.git_ref_options.iter().any(|r| r == &cur) {
+            self.set_git_ref("HEAD".to_string());
+        }
+    }
+
+    /// Reload all viewers in FollowTopBar mode that have a selected file.
+    pub fn refresh_follow_top_bar_viewers(&mut self) {
+        let ids: Vec<ComponentId> = self.file_viewers.keys().cloned().collect();
+        for id in ids {
+            let should = self
+                .file_viewers
+                .get(&id)
+                .map(|v| v.view_at == FileViewAt::FollowTopBar && v.selected_file.is_some())
+                .unwrap_or(false);
+
+            if should {
+                // NOTE: This method is implemented in file_viewer_controller.rs (single source of truth).
+                self.load_file_at_current_selection(id);
+            }
         }
     }
 }
