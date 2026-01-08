@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use egui_extras::syntax_highlighting::CodeTheme;
 
 use crate::model::{AnalysisResult, CommitEntry};
+use crate::platform::Platform;
 
 use super::actions::{ComponentId, ExpandCmd, TerminalShell};
 use super::layout::{LayoutConfig, PresetKind};
@@ -69,6 +71,9 @@ pub enum FileViewAt {
 pub use crate::app::ui::code_editor::CodeEditorState;
 
 pub struct AppState {
+    /// Platform boundary (dialogs, app-data, processes).
+    pub platform: Arc<dyn Platform>,
+
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
@@ -208,14 +213,16 @@ pub struct DeferredActions {
     pub refresh_viewer: Option<ComponentId>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
+impl AppState {
+    pub fn new(platform: Arc<dyn Platform>) -> Self {
         let layout = LayoutConfig::default();
 
         let mut file_viewers = HashMap::new();
         file_viewers.insert(2, FileViewerState::new());
 
         Self {
+            platform,
+
             inputs: InputsState {
                 repo: None,
                 local_repo: None,
@@ -275,13 +282,19 @@ impl Default for AppState {
             pending_open_file_viewer: None,
         }
     }
-}
 
-impl AppState {
     /// Set the global ref and immediately refresh any file viewers that follow the top bar.
     pub fn set_git_ref(&mut self, git_ref: String) {
         self.inputs.git_ref = git_ref;
+
+        // Existing behavior: refresh file viewers that follow top bar.
         self.refresh_follow_top_bar_viewers();
+
+        // NEW: keep analysis-derived views (Tree/Stats/Context selection) in sync
+        // with the selected ref. Needed so WORKTREE shows working tree files.
+        if self.inputs.repo.is_some() {
+            self.run_analysis();
+        }
     }
 
     /// Replace ref dropdown options, enforcing:
@@ -323,7 +336,7 @@ impl AppState {
                 .unwrap_or(false);
 
             if should {
-                // NOTE: This method is implemented in file_viewer_controller.rs (single source of truth).
+                // Implemented in file_viewer_controller.rs
                 self.load_file_at_current_selection(id);
             }
         }

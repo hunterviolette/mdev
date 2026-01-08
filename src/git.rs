@@ -1,9 +1,9 @@
-// src/git.rs  (only the Context export section needs replacing)
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
 use crate::app::state::WORKTREE_REF;
 
 pub fn ensure_git_installed() -> Result<()> {
@@ -48,7 +48,6 @@ pub fn run_git_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, V
 }
 
 /// Returns raw bytes of file content at `spec` where spec is like "<ref>:<path>".
-/// This fails if file doesn't exist at that ref.
 pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
     run_git(repo, &["show", spec])
 }
@@ -73,12 +72,8 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
 
 /// Diff a single file between two refs/commits (e.g. "HEAD", "main", or a full hash).
 /// Uses: `git diff <from>..<to> -- <path>`
-/// Returns stdout bytes (unified diff). If there are no changes, stdout may be empty.
 pub fn diff_file_between(repo: &Path, from_ref: &str, to_ref: &str, path: &str) -> Result<Vec<u8>> {
     let range = format!("{from_ref}..{to_ref}");
-
-    // Use the lower-level runner so we can pass the constructed range as &str temporarily.
-    // We build owned Strings to keep lifetimes simple.
     let args_owned: Vec<String> = vec![
         "diff".to_string(),
         "--no-color".to_string(),
@@ -86,13 +81,12 @@ pub fn diff_file_between(repo: &Path, from_ref: &str, to_ref: &str, path: &str) 
         "--".to_string(),
         path.to_string(),
     ];
-
     let args_refs: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
     run_git(repo, &args_refs)
 }
 
 // -----------------------------------------------------------------------------
-// NEW: Git ref dropdown helpers
+// Git ref dropdown helpers
 // -----------------------------------------------------------------------------
 
 fn split_lines(bytes: &[u8]) -> Vec<String> {
@@ -103,30 +97,18 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Returns refs suitable for a dropdown:
-/// - "HEAD"
-/// - local branches (e.g. "main")
-/// - remote branches (e.g. "origin/main", "upstream/dev")
-///
-/// NOTE: filters out "*/HEAD" symbolic refs like "origin/HEAD".
 pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     ensure_git_repo(repo)?;
 
-    // Local branches (short)
     let locals = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
         .context("listing local branches failed")?;
     let mut local_refs = split_lines(&locals);
 
-    // Remote branches (short, like origin/main)
-    let remotes = run_git(
-        repo,
-        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
-    )
-    .context("listing remote branches failed")?;
+    let remotes = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
+        .context("listing remote branches failed")?;
     let mut remote_refs = split_lines(&remotes);
     remote_refs.retain(|r| !r.ends_with("/HEAD"));
 
-    // Merge + de-dupe
     let mut all = Vec::new();
     all.push("HEAD".to_string());
     all.append(&mut local_refs);
@@ -135,7 +117,6 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     all.sort();
     all.dedup();
 
-    // Keep HEAD at top if present
     if let Some(pos) = all.iter().position(|s| s == "HEAD") {
         all.remove(pos);
     }
@@ -145,18 +126,19 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
 }
 
 // -----------------------------------------------------------------------------
-// NEW: Working tree read/write (for file viewer + agents)
+// Working tree read/write
 // -----------------------------------------------------------------------------
 
 fn safe_join_repo_path(repo: &Path, rel_path: &str) -> Result<PathBuf> {
-    // Normalize forward slashes -> platform path
     let rel = rel_path.trim_start_matches("./").replace('\\', "/");
     let p = repo.join(Path::new(&rel));
 
-    // Minimal safety: prevent obvious traversal
-    // (this is intentionally simple; you can harden further if you want)
-    if rel.contains("..") {
-        bail!("refusing to access path with '..': {}", rel_path);
+    // FIX: block only ParentDir ("..") segments, not any dot character.
+    for comp in Path::new(&rel).components() {
+        use std::path::Component;
+        if let Component::ParentDir = comp {
+            bail!("refusing to access path with '..': {}", rel_path);
+        }
     }
 
     Ok(p)
@@ -177,7 +159,7 @@ pub fn write_worktree_file(repo: &Path, rel_path: &str, contents: &[u8]) -> Resu
 }
 
 // -----------------------------------------------------------------------------
-// AI Context export (tree + contents) - kept in git.rs per request
+// AI Context export (tree + contents)
 // -----------------------------------------------------------------------------
 
 pub struct ContextExportOptions<'a> {
@@ -185,35 +167,28 @@ pub struct ContextExportOptions<'a> {
     pub exclude: &'a [regex::Regex],
     pub max_bytes_per_file: usize,
     pub skip_binary: bool,
-    pub include_files: Option<&'a [String]>, // NEW
+    pub include_files: Option<&'a [String]>, // TreeSelect mode
 }
 
-/// Exports a single text file containing:
-/// 1) list of tracked files (tree)
-/// 2) the contents of each tracked file at `git_ref`
-///
-/// WORKTREE behavior:
-/// - If opts.git_ref == WORKTREE_REF, reads file bytes from disk (working tree)
-///   instead of `git show`.
-///
-/// Notes:
-/// - Uses `git ls-files -z` to list tracked files.
-/// - Applies exclude regex to paths.
-/// - Skips binary files by default.
-/// - Truncates large files for safety.
-pub fn export_repo_context(
-    repo: &Path,
-    out_path: &Path,
-    opts: ContextExportOptions<'_>,
-) -> Result<()> {
-    // 1) Build file list:
-    //    - If include_files is Some => ONLY those files (TreeSelect mode)
-    //    - Else => all tracked files (EntireRepo mode)
+pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOptions<'_>) -> Result<()> {
+    let use_worktree = opts.git_ref == WORKTREE_REF;
+
+    // 1) Build file list
     let mut files: Vec<String> = if let Some(list) = opts.include_files {
         if list.is_empty() {
             bail!("TreeSelect mode: include_files is empty");
         }
         let mut v: Vec<String> = list.iter().map(|s| normalize_repo_rel(s)).collect();
+        v.sort();
+        v.dedup();
+        v
+    } else if use_worktree {
+        // WORKTREE EntireRepo: tracked + untracked
+        let tracked = run_git(repo, &["ls-files", "-z"]).context("git ls-files failed")?;
+        let untracked = run_git(repo, &["ls-files", "-z", "--others", "--exclude-standard"])
+            .context("git ls-files --others failed")?;
+        let mut v = split_nul(&tracked);
+        v.extend(split_nul(&untracked));
         v.sort();
         v.dedup();
         v
@@ -224,14 +199,15 @@ pub fn export_repo_context(
         v
     };
 
-    // 2) Apply exclude regex patterns (always)
+    // 2) Apply exclude regex patterns
     files.retain(|p| !opts.exclude.iter().any(|rx| rx.is_match(p)));
 
-    // 3) Optional safety: if TreeSelect list contains untracked paths, filter them out.
-    if opts.include_files.is_some() {
+    // 3) TreeSelect safety:
+    // - For non-worktree refs, keep old behavior: only allow tracked files.
+    // - For WORKTREE, allow exporting untracked selections.
+    if opts.include_files.is_some() && !use_worktree {
         let tracked_raw = run_git(repo, &["ls-files", "-z"]).context("git ls-files failed")?;
-        let tracked: std::collections::HashSet<String> =
-            split_nul(&tracked_raw).into_iter().collect();
+        let tracked: std::collections::HashSet<String> = split_nul(&tracked_raw).into_iter().collect();
         files.retain(|p| tracked.contains(p));
         if files.is_empty() {
             bail!("TreeSelect mode: none of the selected files are tracked (after filtering).");
@@ -247,7 +223,7 @@ pub fn export_repo_context(
     writeln!(w, "# files: {}", files.len())?;
     writeln!(w)?;
 
-    writeln!(w, "## FILE TREE (tracked)")?;
+    writeln!(w, "## FILE TREE ({})", if use_worktree { "worktree" } else { "tracked" })?;
     for p in &files {
         writeln!(w, "{p}")?;
     }
@@ -255,19 +231,13 @@ pub fn export_repo_context(
 
     writeln!(w, "## FILE CONTENTS")?;
 
-    let use_worktree = opts.git_ref == WORKTREE_REF;
-
     for p in &files {
         writeln!(w)?;
         writeln!(w, "===== FILE: {p} =====")?;
 
-        // ---- read bytes from the right source ----
         let read_res: Result<Vec<u8>> = if use_worktree {
-            // Working tree: read from disk
-            read_worktree_file(repo, p)
-                .with_context(|| format!("failed to read working tree file '{}'", p))
+            read_worktree_file(repo, p).with_context(|| format!("failed to read working tree file '{}'", p))
         } else {
-            // Git ref: read from git object store
             let spec = format!("{}:{}", opts.git_ref, p);
             show_file_at(repo, &spec).with_context(|| format!("failed to git-show '{}'", spec))
         };
@@ -312,7 +282,7 @@ pub fn export_repo_context(
     Ok(())
 }
 
-// --- helpers (keep your existing ones; included here for completeness) ---
+// --- helpers ---
 
 fn normalize_repo_rel(s: &str) -> String {
     let mut out = s.replace('\\', "/");
@@ -340,5 +310,8 @@ fn split_nul(buf: &[u8]) -> Vec<String> {
             start = i + 1;
         }
     }
-    out
+    if start < buf.len() {
+        out.push(String::from_utf8_lossy(&buf[start..]).to_string());
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
 }

@@ -1,7 +1,5 @@
-// src/app/controllers/analysis_controller.rs
 use anyhow::Result;
 use regex::Regex;
-use rfd::FileDialog;
 
 use crate::{analyze, git};
 use crate::app::actions::{Action, ExpandCmd};
@@ -18,17 +16,10 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::SetGitRef(r) => {
-            //  immediate refresh of FollowTopBar viewers (clean, no deferred)
             state.set_git_ref(r.clone());
             true
         }
         Action::RunAnalysis => {
-            // Always ensure we don't run analysis with WORKTREE as an unintended default.
-            // (WORKTREE can still be chosen explicitly from the dropdown.)
-            if state.inputs.git_ref == WORKTREE_REF {
-                state.set_git_ref("HEAD".to_string());
-            }
-
             state.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
             state.run_analysis();
             true
@@ -49,31 +40,27 @@ impl AppState {
     }
 
     pub(crate) fn pick_local_repo_and_run(&mut self) {
-        if let Some(p) = FileDialog::new()
-            .set_title("Select a LOCAL git repo folder (commit to/from)")
-            .pick_folder()
-        {
-            self.inputs.local_repo = Some(p.clone());
-            self.inputs.repo = Some(p);
+        let Some(p) = self.platform.pick_folder("Select a LOCAL git repo folder") else {
+            return;
+        };
 
-            // Force default ref to HEAD on new repo selection.
-            self.set_git_ref("HEAD".to_string());
+        self.inputs.local_repo = Some(p.clone());
+        self.inputs.repo = Some(p);
 
-            self.results.result = None;
-            self.results.error = None;
+        self.set_git_ref("HEAD".to_string());
 
-            self.refresh_git_refs();
+        self.results.result = None;
+        self.results.error = None;
 
-            self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
-            self.run_analysis();
-        }
+        self.refresh_git_refs();
+
+        self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
+        self.run_analysis();
     }
 
     pub(crate) fn refresh_git_refs(&mut self) {
         let Some(repo) = self.inputs.repo.clone() else {
-            // Keep dropdown sane even when no repo selected.
             self.set_git_ref_options(vec!["HEAD".to_string(), WORKTREE_REF.to_string()]);
-            // Ensure current selection is safe.
             if self.inputs.git_ref != "HEAD" {
                 self.set_git_ref("HEAD".to_string());
             }
@@ -81,14 +68,9 @@ impl AppState {
         };
 
         match git::list_git_refs_for_dropdown(&repo) {
-            Ok(list) => {
-                //  IMPORTANT: AppState::set_git_ref_options enforces ordering:
-                // HEAD first, WORKTREE second.
-                self.set_git_ref_options(list);
-            }
+            Ok(list) => self.set_git_ref_options(list),
             Err(e) => {
                 self.results.error = Some(format!("{:#}", e));
-                // Still keep HEAD + WORKTREE in the dropdown on error (HEAD first).
                 self.set_git_ref_options(vec!["HEAD".to_string(), WORKTREE_REF.to_string()]);
                 if self.inputs.git_ref != "HEAD" {
                     self.set_git_ref("HEAD".to_string());
@@ -124,7 +106,7 @@ impl AppState {
 
         match analyze::analyze_repo(&repo, &self.inputs.git_ref, &compiled, self.inputs.max_exts) {
             Ok(res) => {
-                // keep old behavior for ContextExporter TreeSelect defaults
+                // Keep old behavior: default context-export selection selects all files.
                 self.set_context_selection_all(&res);
 
                 self.results.result = Some(res);
