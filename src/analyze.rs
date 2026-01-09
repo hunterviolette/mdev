@@ -1,3 +1,4 @@
+use crate::app::state::WORKTREE_REF;
 use crate::git;
 use crate::model::{AnalysisResult, DirNode, DirStats, FileInfo, FileRow, StatAgg};
 use anyhow::Result;
@@ -61,25 +62,61 @@ pub fn analyze_repo(
     exclude: &[Regex],
     _max_exts_shown: usize,
 ) -> Result<AnalysisResult> {
-    let ls = git::run_git(repo, &["ls-tree", "-r", "--name-only", git_ref])?;
-    let mut files: Vec<String> = decode_lines(&ls)
+    // WORKTREE: include tracked + untracked (so file tree matches disk and context export can include new files)
+    let mut files: Vec<String> = if git_ref == WORKTREE_REF {
+        git::list_worktree_files(repo)?
+    } else {
+        let ls = git::run_git(repo, &["ls-tree", "-r", "--name-only", git_ref])?;
+        decode_lines(&ls)
+    };
+
+    files = files
         .into_iter()
-        .filter(|f| !f.trim().is_empty())
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
         .filter(|f| !exclude.iter().any(|rx| rx.is_match(f)))
         .collect();
+
     files.sort();
+    files.dedup();
 
     let mut infos: Vec<FileInfo> = Vec::with_capacity(files.len());
     let mut skipped_bin = 0u64;
 
     for f in &files {
         let ext = ext_of(f);
-        let spec = format!("{}:{}", git_ref, f);
 
-        // NOTE: run_git_allow_fail returns (code, stdout, stderr)
-        let (code, blob, _stderr) = git::run_git_allow_fail(repo, &["show", &spec])?;
+        let blob: Vec<u8> = if git_ref == WORKTREE_REF {
+            match git::read_worktree_file(repo, f) {
+                Ok(b) => b,
+                Err(_) => {
+                    skipped_bin += 1;
+                    infos.push(FileInfo {
+                        path: f.clone(),
+                        ext,
+                        is_text: false,
+                        loc: None,
+                    });
+                    continue;
+                }
+            }
+        } else {
+            let spec = format!("{}:{}", git_ref, f);
+            let (code, b, _stderr) = git::run_git_allow_fail(repo, &["show", &spec])?;
+            if code != 0 {
+                skipped_bin += 1;
+                infos.push(FileInfo {
+                    path: f.clone(),
+                    ext,
+                    is_text: false,
+                    loc: None,
+                });
+                continue;
+            }
+            b
+        };
 
-        if code != 0 || blob.is_empty() || is_binary(&blob) {
+        if blob.is_empty() || is_binary(&blob) {
             skipped_bin += 1;
             infos.push(FileInfo {
                 path: f.clone(),
@@ -212,41 +249,33 @@ fn build_subtree(top_name: String, items: &[&FileInfo], top_dir_stats: DirStats)
     }
     sort_node(&mut nb);
 
-    fn to_dirnode(name: String, full_path: String, nb: NodeBuild) -> DirNode {
-        let mut children: Vec<DirNode> = nb
-            .dirs
-            .into_iter()
-            .map(|(dname, child)| {
-                let child_full = if full_path.is_empty() {
-                    dname.clone()
-                } else {
-                    format!("{}/{}", full_path, dname)
-                };
-                to_dirnode(dname, child_full, child)
-            })
-            .collect();
-        children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    fn build_children(parent_full: &str, map: &HashMap<String, NodeBuild>) -> Vec<DirNode> {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
-        DirNode {
-            name,
-            full_path,
-            children,
-            files: nb.files,
-            stats: DirStats::default(), // nested stats hidden
+        let mut out = vec![];
+        for k in keys {
+            let child = map.get(&k).unwrap();
+            let full = if parent_full.is_empty() {
+                k.clone()
+            } else {
+                format!("{}/{}", parent_full, k)
+            };
+
+            let dn = DirNode {
+                name: k.clone(),
+                full_path: full.clone(),
+                children: build_children(&full, &child.dirs),
+                files: child.files.clone(),
+                stats: DirStats::default(), // only root + top-level stats are meaningful currently
+            };
+
+            out.push(dn);
         }
+        out
     }
 
     node.files = nb.files;
-    node.children = nb
-        .dirs
-        .into_iter()
-        .map(|(dname, child)| {
-            let full = format!("{}/{}", node.full_path, dname);
-            to_dirnode(dname, full, child)
-        })
-        .collect();
-    node.children
-        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
+    node.children = build_children(&node.full_path, &nb.dirs);
     node
 }

@@ -1,5 +1,7 @@
-use crate::app::actions::{Action, ComponentId};
-use crate::app::state::AppState;
+use crate::app::actions::{Action, ComponentId, ComponentKind, TerminalShell};
+use crate::app::layout::{ComponentInstance, WindowLayout};
+use crate::app::state::{AppState, TerminalState};
+use crate::capabilities::{CapabilityRequest, CapabilityResponse};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -28,19 +30,15 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
+    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_terminals_from_layout(&mut self) {
-        use crate::app::actions::TerminalShell;
-        use crate::app::state::TerminalState;
-
-        // Terminals are ephemeral. Workspace load restores the *layout* and terminal component IDs,
-        // but the runtime terminal state must be recreated fresh each time.
         self.terminals.clear();
 
         let term_ids: Vec<ComponentId> = self
             .layout
             .components
             .iter()
-            .filter(|c| c.kind == crate::app::actions::ComponentKind::Terminal)
+            .filter(|c| c.kind == ComponentKind::Terminal)
             .map(|c| c.id)
             .collect();
 
@@ -58,11 +56,8 @@ impl AppState {
         }
     }
 
+    /// Used by layout controller when adding a Terminal component.
     pub fn new_terminal(&mut self) {
-        use crate::app::layout::{ComponentInstance, WindowLayout};
-        use crate::app::state::TerminalState;
-        use crate::app::actions::ComponentKind;
-
         self.layout.merge_with_defaults();
 
         let id = self.layout.next_free_id();
@@ -95,7 +90,7 @@ impl AppState {
         self.terminals.insert(
             id,
             TerminalState {
-                shell: crate::app::actions::TerminalShell::Auto,
+                shell: TerminalShell::Auto,
                 cwd: self.inputs.repo.clone(),
                 input: String::new(),
                 output: String::new(),
@@ -107,54 +102,35 @@ impl AppState {
     }
 
     fn run_terminal_command(&mut self, terminal_id: ComponentId, cmd: &str) {
-        use std::process::Command;
-
         let Some(t) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
 
         let cwd = t.cwd.clone().or_else(|| self.inputs.repo.clone());
-
-        let (program, args): (&str, Vec<String>) = match t.shell {
-            crate::app::actions::TerminalShell::Auto => {
-                if cfg!(windows) {
-                    ("powershell", vec!["-NoProfile".into(), "-Command".into(), cmd.into()])
-                } else {
-                    ("bash", vec!["-lc".into(), cmd.into()])
-                }
-            }
-            crate::app::actions::TerminalShell::PowerShell => (
-                "powershell",
-                vec!["-NoProfile".into(), "-Command".into(), cmd.into()],
-            ),
-            crate::app::actions::TerminalShell::Cmd => ("cmd", vec!["/C".into(), cmd.into()]),
-            crate::app::actions::TerminalShell::Bash => ("bash", vec!["-lc".into(), cmd.into()]),
-            crate::app::actions::TerminalShell::Zsh => ("zsh", vec!["-lc".into(), cmd.into()]),
-            crate::app::actions::TerminalShell::Sh => ("sh", vec!["-lc".into(), cmd.into()]),
-        };
+        let shell = t.shell.clone();
 
         t.output.push_str(&format!("\n$ {}\n", cmd));
 
-        let mut c = Command::new(program);
-        c.args(args);
-
-        if let Some(dir) = cwd {
-            c.current_dir(dir);
-        }
-
-        match c.output() {
-            Ok(out) => {
-                let code = out.status.code().unwrap_or(-1);
+        match self.broker.exec(CapabilityRequest::RunShellCommand {
+            shell,
+            cmd: cmd.to_string(),
+            cwd,
+        }) {
+            Ok(CapabilityResponse::ShellOutput {
+                code,
+                stdout,
+                stderr,
+            }) => {
                 t.last_status = Some(code);
 
-                if !out.stdout.is_empty() {
-                    t.output.push_str(&String::from_utf8_lossy(&out.stdout));
+                if !stdout.is_empty() {
+                    t.output.push_str(&stdout);
                     if !t.output.ends_with('\n') {
                         t.output.push('\n');
                     }
                 }
-                if !out.stderr.is_empty() {
-                    t.output.push_str(&String::from_utf8_lossy(&out.stderr));
+                if !stderr.is_empty() {
+                    t.output.push_str(&stderr);
                     if !t.output.ends_with('\n') {
                         t.output.push('\n');
                     }
@@ -162,9 +138,15 @@ impl AppState {
 
                 t.output.push_str(&format!("[exit: {}]\n", code));
             }
+            Ok(_) => {
+                t.last_status = Some(-1);
+                t.output
+                    .push_str("Unexpected response from RunShellCommand.\n");
+            }
             Err(e) => {
                 t.last_status = Some(-1);
-                t.output.push_str(&format!("Failed to run command: {}\n", e));
+                t.output
+                    .push_str(&format!("Failed to run command: {:#}\n", e));
             }
         }
     }

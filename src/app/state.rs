@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use egui_extras::syntax_highlighting::CodeTheme;
 
+use crate::capabilities::CapabilityBroker;
 use crate::model::{AnalysisResult, CommitEntry};
+use crate::platform::Platform;
 
 use super::actions::{ComponentId, ExpandCmd, TerminalShell};
 use super::layout::{LayoutConfig, PresetKind};
@@ -69,6 +72,12 @@ pub enum FileViewAt {
 pub use crate::app::ui::code_editor::CodeEditorState;
 
 pub struct AppState {
+    /// Platform boundary (dialogs, app-data, processes).
+    pub platform: Arc<dyn Platform>,
+
+    /// Single “capability engine” used by both UI and future AI/agent callers.
+    pub broker: CapabilityBroker,
+
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
@@ -157,7 +166,13 @@ pub struct FileViewerState {
     pub editor: CodeEditorState,
 
     // Diff fields
+    /// Whether diff mode is active (viewer shows diff output instead of file contents).
     pub show_diff: bool,
+
+    /// Whether the diff picker overlay (From/To + Generate) is currently open.
+    /// This is separate from `show_diff` so the picker can be dismissed while keeping the diff visible.
+    pub diff_picker_open: bool,
+
     pub diff_base: Option<String>,
     pub diff_target: Option<String>,
     pub diff_text: String,
@@ -182,6 +197,7 @@ impl FileViewerState {
             editor: CodeEditorState::default(),
 
             show_diff: false,
+            diff_picker_open: false,
             diff_base: None,
             diff_target: None,
             diff_text: String::new(),
@@ -208,14 +224,19 @@ pub struct DeferredActions {
     pub refresh_viewer: Option<ComponentId>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
+impl AppState {
+    pub fn new(platform: Arc<dyn Platform>) -> Self {
         let layout = LayoutConfig::default();
+
+        let broker = CapabilityBroker::new(platform.clone());
 
         let mut file_viewers = HashMap::new();
         file_viewers.insert(2, FileViewerState::new());
 
         Self {
+            platform,
+            broker,
+
             inputs: InputsState {
                 repo: None,
                 local_repo: None,
@@ -275,9 +296,7 @@ impl Default for AppState {
             pending_open_file_viewer: None,
         }
     }
-}
 
-impl AppState {
     /// Set the global ref and immediately refresh any file viewers that follow the top bar.
     pub fn set_git_ref(&mut self, git_ref: String) {
         self.inputs.git_ref = git_ref;
@@ -286,10 +305,12 @@ impl AppState {
 
     /// Replace ref dropdown options, enforcing:
     /// - HEAD is ALWAYS first
-    /// - WORKTREE is ALWAYS second
+    /// - WORKTREE is ALWAYS present (shown as "Working tree" in UI)
     pub fn set_git_ref_options(&mut self, mut refs: Vec<String>) {
         // normalize
         refs.retain(|r| !r.trim().is_empty());
+
+        // remove these if present; we'll re-add in the right place
         refs.retain(|r| r != WORKTREE_REF);
         refs.retain(|r| r != "HEAD");
 
@@ -312,20 +333,25 @@ impl AppState {
         }
     }
 
-    /// Reload all viewers in FollowTopBar mode that have a selected file.
-    pub fn refresh_follow_top_bar_viewers(&mut self) {
-        let ids: Vec<ComponentId> = self.file_viewers.keys().cloned().collect();
-        for id in ids {
-            let should = self
-                .file_viewers
-                .get(&id)
-                .map(|v| v.view_at == FileViewAt::FollowTopBar && v.selected_file.is_some())
-                .unwrap_or(false);
 
-            if should {
-                // NOTE: This method is implemented in file_viewer_controller.rs (single source of truth).
-                self.load_file_at_current_selection(id);
-            }
+    /// Refresh any file viewers that are following the top bar ref.
+    pub fn refresh_follow_top_bar_viewers(&mut self) {
+        // Avoid borrow issues by collecting ids first.
+        let ids: Vec<ComponentId> = self
+            .file_viewers
+            .iter()
+            .filter_map(|(id, v)| {
+                if v.view_at == FileViewAt::FollowTopBar && v.selected_file.is_some() {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for id in ids {
+            self.load_file_at_current_selection(id);
         }
     }
+
 }

@@ -73,6 +73,13 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
+    OpenDiffPicker {
+        viewer_id: ComponentId,
+    },
+    CloseDiffPicker {
+        viewer_id: ComponentId,
+    },
+
     ToggleDiff {
         viewer_id: ComponentId,
     },
