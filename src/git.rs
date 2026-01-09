@@ -95,17 +95,15 @@ pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
 }
 
 /// Returns history lines for a file at repo-relative `path`.
-/// Output format: "<hash>\x1f<date>\x1f<subject>\n"
 pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
-    let max_s = max.to_string();
     run_git(
         repo,
         &[
             "log",
-            "--date=short",
-            "--pretty=format:%H%x1f%ad%x1f%s",
+            "--no-color",
+            "--pretty=format:%H|%ct|%s",
             "-n",
-            &max_s,
+            &max.to_string(),
             "--",
             path,
         ],
@@ -312,8 +310,7 @@ pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOpti
         list_worktree_files(repo)?
     } else {
         // list files at ref
-        let spec = format!("{}", opts.git_ref);
-        let bytes = run_git(repo, &["ls-tree", "-r", "--name-only", &spec])?;
+        let bytes = run_git(repo, &["ls-tree", "-r", "--name-only", opts.git_ref])?;
         split_lines(&bytes)
     };
 
@@ -356,4 +353,68 @@ pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOpti
     }
     std::fs::write(out_path, out).with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Minimal extensions for patch-apply + file ops (DO NOT remove anything above)
+// -----------------------------------------------------------------------------
+
+pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git -C {:?} {}", repo, args.join(" ")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| "failed writing stdin to git")?;
+    }
+
+    let out = child.wait_with_output().with_context(|| "failed to wait for git")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(out.stdout)
+}
+
+pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
+    // feed patch on stdin
+    let _ = run_git_with_input(repo, &["apply", "--whitespace=nowarn", "-"], patch_text.as_bytes())?;
+    Ok(())
+}
+
+pub fn delete_worktree_path(repo: &Path, rel_path: &str) -> Result<()> {
+    let p = safe_join_repo_path(repo, rel_path)?;
+    if !p.exists() {
+        return Ok(());
+    }
+    let md = std::fs::metadata(&p).with_context(|| format!("failed to stat {}", p.display()))?;
+    if md.is_dir() {
+        std::fs::remove_dir_all(&p)
+            .with_context(|| format!("failed to remove dir {}", p.display()))?;
+    } else {
+        std::fs::remove_file(&p).with_context(|| format!("failed to remove file {}", p.display()))?;
+    }
+    Ok(())
+}
+
+pub fn move_worktree_path(repo: &Path, from: &str, to: &str) -> Result<()> {
+    let src = safe_join_repo_path(repo, from)?;
+    let dst = safe_join_repo_path(repo, to)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
+    }
+    std::fs::rename(&src, &dst)
+        .with_context(|| format!("failed to rename {} -> {}", src.display(), dst.display()))
 }

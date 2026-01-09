@@ -64,6 +64,24 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
+            CapabilityRequest::DeleteWorktreePath { repo, path } => {
+                git::delete_worktree_path(&repo, &path)
+                    .with_context(|| format!("delete_worktree_path failed for {path}"))?;
+                Ok(CapabilityResponse::Unit)
+            }
+
+            CapabilityRequest::MoveWorktreePath { repo, from, to } => {
+                git::move_worktree_path(&repo, &from, &to)
+                    .with_context(|| format!("move_worktree_path failed for {from} -> {to}"))?;
+                Ok(CapabilityResponse::Unit)
+            }
+
+            CapabilityRequest::ApplyGitPatch { repo, patch } => {
+                git::apply_git_patch(&repo, &patch)
+                    .with_context(|| "apply_git_patch failed")?;
+                Ok(CapabilityResponse::Unit)
+            }
+
             CapabilityRequest::FileHistory { repo, path, max } => {
                 let bytes = git::file_history(&repo, &path, max)
                     .with_context(|| format!("file_history failed for {path}"))?;
