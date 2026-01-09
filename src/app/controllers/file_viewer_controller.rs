@@ -1,312 +1,157 @@
-// src/app/controllers/file_viewer_controller.rs
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::{AppState, FileViewAt, WORKTREE_REF};
-use crate::git;
-use crate::model::CommitEntry;
+use crate::capabilities::{CapabilityRequest, CapabilityResponse, FileSource};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
-        Action::SelectCommit { viewer_id, sel } => {
-            state.deferred.select_commit = Some((*viewer_id, sel.clone()));
-            true
-        }
-        Action::RefreshFile { viewer_id } => {
-            state.deferred.refresh_viewer = Some(*viewer_id);
+        // ------------------------------------------------------------
+        // Open file (generic open; usually opens in active viewer)
+        // ------------------------------------------------------------
+        Action::OpenFile(path) => {
+            let viewer_id = state
+                .active_file_viewer
+                .or_else(|| state.file_viewers.keys().cloned().next());
+
+            if let Some(viewer_id) = viewer_id {
+                open_path_in_viewer(state, viewer_id, path.clone());
+            } else {
+                state.deferred.open_file = Some(path.clone());
+                state.deferred.open_file_target_viewer = None;
+            }
             true
         }
 
+        // ------------------------------------------------------------
+        // View mode changes
+        // ------------------------------------------------------------
         Action::SetViewerViewAt { viewer_id, view_at } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 v.view_at = *view_at;
-                v.selected_commit = None;
-                v.file_content_err = None;
-                v.edit_status = None;
-
-                reset_editor_view_state(v);
+                if *view_at != FileViewAt::Commit {
+                    v.selected_commit = None;
+                }
             }
             state.load_file_at_current_selection(*viewer_id);
             true
         }
 
-        Action::ToggleEditWorkingTree { viewer_id } => {
-            state.toggle_edit_working_tree(*viewer_id);
-            true
-        }
-
-        Action::SaveWorkingTreeFile { viewer_id } => {
-            state.save_working_tree_file(*viewer_id);
-            true
-        }
-
-        // ---- DIFF actions ----
-        Action::ToggleDiff { viewer_id } => {
+        Action::SelectCommit { viewer_id, sel } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
-                v.show_diff = !v.show_diff;
-                v.diff_err = None;
-                if !v.show_diff {
-                    v.diff_text.clear();
+                v.selected_commit = sel.clone();
+                v.view_at = FileViewAt::Commit;
+            }
+            state.load_file_at_current_selection(*viewer_id);
+            true
+        }
+
+        Action::RefreshFile { viewer_id } => {
+            state.load_file_at_current_selection(*viewer_id);
+            true
+        }
+
+        // ------------------------------------------------------------
+        // Editing
+        // ------------------------------------------------------------
+        Action::ToggleEditWorkingTree { viewer_id } => {
+            if let Some(v) = state.file_viewers.get_mut(viewer_id) {
+                v.edit_working_tree = !v.edit_working_tree;
+                v.edit_status = None;
+                if v.edit_working_tree {
+                    v.edit_buffer = v.file_content.clone();
                 }
             }
             true
         }
+
+        Action::SaveWorkingTreeFile { viewer_id } => {
+            state.save_working_tree_edits(*viewer_id);
+            true
+        }
+
+        // ------------------------------------------------------------
+        // Diff (do NOT auto-run on toggle)
+        // ------------------------------------------------------------
+        Action::ToggleDiff { viewer_id } => {
+            if let Some(v) = state.file_viewers.get_mut(viewer_id) {
+                let turning_on = !v.show_diff;
+                v.show_diff = turning_on;
+
+                // Clear stale results when opening/closing
+                v.diff_err = None;
+                v.diff_text.clear();
+
+                if turning_on {
+                    // Open picker immediately; Generate closes it, diff stays visible.
+                    v.diff_picker_open = true;
+
+                    if v.diff_base.is_none() {
+                        v.diff_base = Some("HEAD".to_string());
+                    }
+                    if v.diff_target.is_none() {
+                        v.diff_target = Some(state.inputs.git_ref.clone());
+                    }
+                } else {
+                    // Turning off diff also closes the picker.
+                    v.diff_picker_open = false;
+                }
+            }
+            true
+        }
+
         Action::SetDiffBase { viewer_id, sel } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 v.diff_base = sel.clone();
+                v.diff_err = None;
+                v.diff_text.clear();
             }
             true
         }
+
         Action::SetDiffTarget { viewer_id, sel } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 v.diff_target = sel.clone();
+                v.diff_err = None;
+                v.diff_text.clear();
             }
             true
         }
+
+        // Generate diff button
         Action::RefreshDiff { viewer_id } => {
-            state.load_diff_for_viewer(*viewer_id);
+            state.refresh_diff(*viewer_id);
+            if let Some(v) = state.file_viewers.get_mut(viewer_id) {
+                v.diff_picker_open = false; // ✅ THIS IS THE KEY UX FIX
+            }
             true
         }
-        // ----------------------
 
         _ => false,
     }
 }
 
-pub fn finalize_frame(state: &mut AppState) {
-    state.apply_deferred_actions();
-}
+fn open_path_in_viewer(state: &mut AppState, viewer_id: ComponentId, path: String) {
+    if let Some(v) = state.file_viewers.get_mut(&viewer_id) {
+        v.selected_file = Some(path);
+        v.file_content_err = None;
+        v.edit_status = None;
 
-/// Reset editor UI state after reloading/replacing buffer.
-fn reset_editor_view_state(v: &mut crate::app::state::FileViewerState) {
-    v.editor.cursor_cc = 0;
-    v.editor.selection_anchor_cc = None;
-    v.editor.has_focus = false;
-    v.editor.buffer_version = v.editor.buffer_version.wrapping_add(1);
-    v.editor.line_cache.clear();
+        // Optional: when switching files, keep diff mode off by default
+        // (prevents surprising "stale diff" feeling between files)
+        v.show_diff = false;
+        v.diff_picker_open = false;
+        v.diff_text.clear();
+        v.diff_err = None;
+    }
+    state.active_file_viewer = Some(viewer_id);
+    state.load_file_at_current_selection(viewer_id);
 }
 
 impl AppState {
-    fn toggle_edit_working_tree(&mut self, viewer_id: ComponentId) {
-        let Some(v) = self.file_viewers.get_mut(&viewer_id) else {
-            return;
-        };
-
-        v.edit_status = None;
-        v.edit_working_tree = !v.edit_working_tree;
-
-        reset_editor_view_state(v);
-
-        if v.edit_working_tree {
-            v.view_at = FileViewAt::WorkingTree;
-            v.selected_commit = None;
-
-            let Some(repo) = self.inputs.repo.clone() else {
-                v.edit_status = Some("No active repo selected.".into());
-                return;
-            };
-            let Some(path) = v.selected_file.clone() else {
-                v.edit_status = Some("No file selected.".into());
-                return;
-            };
-
-            match git::read_worktree_file(&repo, &path) {
-                Ok(bytes) => {
-                    v.edit_buffer = String::from_utf8_lossy(&bytes).to_string();
-                    v.edit_status = Some("Loaded from working tree.".into());
-                    reset_editor_view_state(v);
-                }
-                Err(e) => {
-                    v.edit_buffer.clear();
-                    v.edit_status = Some(format!("Failed to read working tree: {:#}", e));
-                }
-            }
-        }
-
-        self.load_file_at_current_selection(viewer_id);
-    }
-
-    fn save_working_tree_file(&mut self, viewer_id: ComponentId) {
-        let Some(repo) = self.inputs.repo.clone() else {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.edit_status = Some("No active repo selected.".into());
-            }
-            return;
-        };
-
-        let (path, text) = {
-            let Some(v) = self.file_viewers.get(&viewer_id) else {
-                return;
-            };
-            let Some(path) = v.selected_file.clone() else {
-                return;
-            };
-            (path, v.edit_buffer.clone())
-        };
-
-        match git::write_worktree_file(&repo, &path, text.as_bytes()) {
-            Ok(()) => {
-                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.edit_status = Some("Saved to working tree.".into());
-                    v.view_at = FileViewAt::WorkingTree;
-                    v.selected_commit = None;
-                    reset_editor_view_state(v);
-                }
-                self.load_file_at_current_selection(viewer_id);
-            }
-            Err(e) => {
-                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.edit_status = Some(format!("Save failed: {:#}", e));
-                }
-            }
-        }
-    }
-
-    fn apply_deferred_actions(&mut self) {
-        if let Some(path) = self.deferred.open_file.take() {
-            let target = self
-                .deferred
-                .open_file_target_viewer
-                .take()
-                .or(self.active_file_viewer);
-
-            if let Some(viewer_id) = target {
-                self.load_file_view(viewer_id, &path);
-            }
-        }
-
-        if let Some((viewer_id, sel)) = self.deferred.select_commit.take() {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.selected_commit = sel.clone();
-                if sel.is_some() {
-                    v.view_at = FileViewAt::Commit;
-                } else if v.view_at == FileViewAt::Commit {
-                    v.view_at = FileViewAt::FollowTopBar;
-                }
-
-                reset_editor_view_state(v);
-            }
-
-            if self
-                .file_viewers
-                .get(&viewer_id)
-                .and_then(|v| v.selected_file.clone())
-                .is_some()
-            {
-                self.load_file_at_current_selection(viewer_id);
-            }
-        }
-
-        if let Some(viewer_id) = self.deferred.refresh_viewer.take() {
-            self.load_file_at_current_selection(viewer_id);
-        }
-    }
-
-    fn parse_history(bytes: &[u8]) -> Vec<CommitEntry> {
-        let s = String::from_utf8_lossy(bytes);
-        s.lines()
-            .filter_map(|line| {
-                let mut parts = line.split('\x1f');
-                let hash = parts.next()?.to_string();
-                let date = parts.next()?.to_string();
-                let summary = parts.next().unwrap_or("").to_string();
-                Some(CommitEntry { hash, date, summary })
-            })
-            .collect()
-    }
-
-    fn is_binary(blob: &[u8]) -> bool {
-        blob.iter().any(|&b| b == 0)
-    }
-
-    fn load_diff_for_viewer(&mut self, viewer_id: ComponentId) {
-        let Some(repo) = self.inputs.repo.clone() else {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.diff_err = Some("No repo selected".into());
-            }
-            return;
-        };
-
-        let Some(path) = self
-            .file_viewers
-            .get(&viewer_id)
-            .and_then(|v| v.selected_file.clone())
-        else {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.diff_err = Some("No file selected".into());
-            }
-            return;
-        };
-
-        let (from_sel, to_sel) = {
-            let v = self.file_viewers.get(&viewer_id).unwrap();
-            (v.diff_base.clone(), v.diff_target.clone())
-        };
-
-        let from_ref = from_sel.unwrap_or_else(|| self.inputs.git_ref.clone());
-        let to_ref = to_sel.unwrap_or_else(|| self.inputs.git_ref.clone());
-
-        if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-            v.diff_err = None;
-            v.diff_text.clear();
-        }
-
-        match git::diff_file_between(&repo, &from_ref, &to_ref, &path) {
-            Ok(bytes) => {
-                let s = String::from_utf8_lossy(&bytes).to_string();
-                let out = if s.trim().is_empty() {
-                    "(no changes)".to_string()
-                } else {
-                    s
-                };
-                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.diff_text = out;
-                }
-            }
-            Err(e) => {
-                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.diff_err = Some(format!("Failed to diff: {:#}", e));
-                }
-            }
-        }
-    }
-
-    pub fn load_file_view(&mut self, viewer_id: ComponentId, file_path: &str) {
-        let Some(repo) = self.inputs.repo.clone() else {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.file_content_err = Some("No repo selected".into());
-            }
-            return;
-        };
-
-        let v = self
-            .file_viewers
-            .entry(viewer_id)
-            .or_insert_with(crate::app::state::FileViewerState::new);
-
-        v.selected_file = Some(file_path.to_string());
-        v.selected_commit = None;
-
-        if v.view_at == FileViewAt::Commit && v.selected_commit.is_none() {
-            v.view_at = FileViewAt::FollowTopBar;
-        }
-
-        v.file_content.clear();
-        v.file_content_err = None;
-        v.file_commits.clear();
-
-        reset_editor_view_state(v);
-
-        match git::file_history(&repo, file_path, 80) {
-            Ok(bytes) => v.file_commits = Self::parse_history(&bytes),
-            Err(e) => v.file_content_err = Some(format!("Failed to load history: {:#}", e)),
-        }
-
-        self.load_file_at_current_selection(viewer_id);
-    }
-
     pub fn load_file_at_current_selection(&mut self, viewer_id: ComponentId) {
         let Some(repo) = self.inputs.repo.clone() else {
             if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.file_content_err = Some("No repo selected".into());
+                v.file_content_err = Some("No repo selected.".into());
+                v.file_content.clear();
             }
             return;
         };
@@ -316,119 +161,219 @@ impl AppState {
             .get(&viewer_id)
             .and_then(|v| v.selected_file.clone())
         else {
+            return;
+        };
+
+        let source: FileSource = match self.file_viewers.get(&viewer_id).map(|v| v.view_at) {
+            Some(FileViewAt::WorkingTree) => FileSource::Worktree,
+            Some(FileViewAt::Commit) => {
+                let commit = self
+                    .file_viewers
+                    .get(&viewer_id)
+                    .and_then(|v| v.selected_commit.clone())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                FileSource::GitRef(commit)
+            }
+            _ => crate::capabilities::CapabilityBroker::file_source_from_ref(&self.inputs.git_ref),
+        };
+
+        match self.broker.exec(CapabilityRequest::ReadFile {
+            repo: repo.clone(),
+            path: path.clone(),
+            source,
+        }) {
+            Ok(CapabilityResponse::Bytes(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.file_content = text;
+                    v.file_content_err = None;
+                    if v.edit_working_tree {
+                        v.edit_buffer = v.file_content.clone();
+                    }
+                }
+            }
+            Ok(_) => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.file_content_err = Some("Unexpected response reading file.".into());
+                    v.file_content.clear();
+                }
+            }
+            Err(e) => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.file_content_err = Some(format!("{:#}", e));
+                    v.file_content.clear();
+                }
+            }
+        }
+
+        // History for picker (your repo returns Bytes you parse)
+        match self.broker.exec(CapabilityRequest::FileHistory {
+            repo,
+            path: path.clone(),
+            max: 80,
+        }) {
+            Ok(CapabilityResponse::Bytes(bytes)) => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.file_commits = Self::parse_history(&bytes);
+                }
+            }
+            _ => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.file_commits.clear();
+                }
+            }
+        }
+    }
+
+    pub fn save_working_tree_edits(&mut self, viewer_id: ComponentId) {
+        let Some(repo) = self.inputs.repo.clone() else {
             if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.file_content_err = Some("No file selected".into());
+                v.edit_status = Some("No repo selected.".into());
             }
             return;
         };
 
-        // refresh history (doesn't require mutable self until after git call)
-        let history_res = git::file_history(&repo, &path, 80);
-
-        if let Ok(bytes) = &history_res {
-            if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                v.file_commits = Self::parse_history(bytes);
-            }
-        }
-
-        let history_err: Option<String> = match history_res {
-            Ok(_) => None,
-            Err(e) => Some(format!("Failed to load history: {:#}", e)),
+        let Some(path) = self
+            .file_viewers
+            .get(&viewer_id)
+            .and_then(|v| v.selected_file.clone())
+        else {
+            return;
         };
 
-        let (mode, selected_commit, top_ref) = {
-            let v = self.file_viewers.get(&viewer_id).unwrap();
-            (v.view_at, v.selected_commit.clone(), self.inputs.git_ref.clone())
+        let text = match self.file_viewers.get(&viewer_id) {
+            Some(v) => v.edit_buffer.clone(),
+            None => return,
         };
 
-        let content_result: Result<Vec<u8>, String> = match mode {
-            FileViewAt::WorkingTree => git::read_worktree_file(&repo, &path)
-                .map_err(|e| format!("Failed to read working tree: {:#}", e)),
-
-            FileViewAt::Commit => match selected_commit {
-                Some(hash) => {
-                    let spec = format!("{}:{}", hash, path);
-                    git::show_file_at(&repo, &spec)
-                        .map_err(|e| format!("Failed to load {}: {:#}", spec, e))
-                }
-                None => Err("NO_COMMIT_SELECTED".to_string()),
-            },
-
-            FileViewAt::FollowTopBar => {
-                if top_ref == WORKTREE_REF {
-                    git::read_worktree_file(&repo, &path)
-                        .map_err(|e| format!("Failed to read working tree: {:#}", e))
-                } else {
-                    let spec = format!("{}:{}", top_ref, path);
-                    git::show_file_at(&repo, &spec)
-                        .map_err(|e| format!("Failed to load {}: {:#}", spec, e))
-                }
-            }
-        };
-
-        match content_result {
-            Ok(bytes) => {
-                let resolved_worktree = match mode {
-                    FileViewAt::WorkingTree => true,
-                    FileViewAt::FollowTopBar => top_ref == WORKTREE_REF,
-                    FileViewAt::Commit => false,
-                };
-
+        match self.broker.exec(CapabilityRequest::WriteWorktreeFile {
+            repo,
+            path: path.clone(),
+            contents: text.as_bytes().to_vec(),
+        }) {
+            Ok(CapabilityResponse::Unit) => {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.edit_status = Some("Saved to working tree.".into());
+                    v.file_content = v.edit_buffer.clone();
                     v.file_content_err = None;
-
-                    if Self::is_binary(&bytes) {
-                        v.file_content = "(binary file)".into();
-                        v.edit_working_tree = false;
-                    } else {
-                        let text = String::from_utf8_lossy(&bytes).to_string();
-                        v.file_content = text.clone();
-
-                        // NOTE: you wanted worktree NOT to be default in general,
-                        // but when *actually* in WORKTREE view, editor should be on.
-                        if resolved_worktree {
-                            v.edit_working_tree = true;
-                            v.edit_buffer = text;
-                            v.view_at = FileViewAt::WorkingTree;
-                            v.selected_commit = None;
-                            reset_editor_view_state(v);
-                        } else {
-                            // If not worktree, do not auto-force edit mode.
-                            // Keep user toggle.
-                        }
-                    }
+                }
+                if self.inputs.git_ref == WORKTREE_REF {
+                    self.run_analysis();
                 }
             }
-            Err(msg) if msg == "NO_COMMIT_SELECTED" => {
+            Ok(_) => {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.view_at = FileViewAt::FollowTopBar;
-                    v.selected_commit = None;
+                    v.edit_status = Some("Unexpected response saving file.".into());
                 }
-                self.load_file_at_current_selection(viewer_id);
-                return;
             }
-            Err(msg) => {
+            Err(e) => {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-                    v.file_content.clear();
-                    v.file_content_err = Some(msg);
+                    v.edit_status = Some(format!("{:#}", e));
                 }
             }
         }
+    }
 
-        let final_err = match (
-            history_err,
-            self.file_viewers
-                .get(&viewer_id)
-                .and_then(|v| v.file_content_err.clone()),
-        ) {
-            (None, None) => None,
-            (Some(h), None) => Some(h),
-            (None, Some(c)) => Some(c),
-            (Some(h), Some(c)) => Some(format!("{h}\n{c}")),
+    fn refresh_diff(&mut self, viewer_id: ComponentId) {
+        let Some(repo) = self.inputs.repo.clone() else {
+            return;
         };
 
-        if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
-            v.file_content_err = final_err;
+        let Some(path) = self
+            .file_viewers
+            .get(&viewer_id)
+            .and_then(|v| v.selected_file.clone())
+        else {
+            return;
+        };
+
+        let (show_diff, base, target) = match self.file_viewers.get(&viewer_id) {
+            Some(v) => (v.show_diff, v.diff_base.clone(), v.diff_target.clone()),
+            None => return,
+        };
+
+        if !show_diff {
+            return;
         }
+
+        // Allow None => "use top-bar ref"
+        let from_ref = base.unwrap_or_else(|| self.inputs.git_ref.clone());
+        let to_ref = target.unwrap_or_else(|| self.inputs.git_ref.clone());
+
+        match self.broker.exec(CapabilityRequest::DiffFileBetween {
+            repo,
+            from_ref,
+            to_ref,
+            path,
+        }) {
+            Ok(CapabilityResponse::Bytes(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.diff_text = text;
+                    v.diff_err = None;
+                }
+            }
+            Ok(_) => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.diff_err = Some("Unexpected response generating diff.".into());
+                    v.diff_text.clear();
+                }
+            }
+            Err(e) => {
+                if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
+                    v.diff_err = Some(format!("{:#}", e));
+                    v.diff_text.clear();
+                }
+            }
+        }
+    }
+
+    fn parse_history(bytes: &[u8]) -> Vec<crate::model::CommitEntry> {
+        let s = String::from_utf8_lossy(bytes);
+        let mut out = vec![];
+        for line in s.lines() {
+            let mut parts = line.split('\x1f');
+            let hash = parts.next().unwrap_or("").to_string();
+            let date = parts.next().unwrap_or("").to_string();
+            let summary = parts.next().unwrap_or("").to_string();
+            if !hash.is_empty() {
+                out.push(crate::model::CommitEntry { hash, date, summary });
+            }
+        }
+        out
+    }
+}
+
+/// Applies deferred “open file”, “select commit”, “refresh viewer” actions at end-of-frame.
+pub fn finalize_frame(state: &mut AppState) {
+    // 1) open file if deferred
+    if let Some(path) = state.deferred.open_file.take() {
+        let target = state
+            .deferred
+            .open_file_target_viewer
+            .take()
+            .or(state.active_file_viewer)
+            .or_else(|| state.file_viewers.keys().cloned().next());
+
+        if let Some(viewer_id) = target {
+            open_path_in_viewer(state, viewer_id, path);
+        } else {
+            // no viewer yet; keep it deferred
+            state.deferred.open_file = Some(path);
+        }
+    }
+
+    // 2) select commit if deferred
+    if let Some((viewer_id, commit)) = state.deferred.select_commit.take() {
+        if let Some(v) = state.file_viewers.get_mut(&viewer_id) {
+            v.selected_commit = commit;
+            v.view_at = FileViewAt::Commit;
+        }
+        state.load_file_at_current_selection(viewer_id);
+    }
+
+    // 3) refresh viewer if deferred
+    if let Some(viewer_id) = state.deferred.refresh_viewer.take() {
+        state.load_file_at_current_selection(viewer_id);
     }
 }

@@ -1,15 +1,12 @@
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::AppState;
-use crate::git;
+use crate::capabilities::{CapabilityRequest, CapabilityResponse, ContextExportReq};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
         Action::ContextPickSavePath { exporter_id } => {
             let default_name = "repo_context.txt";
-            if let Some(path) = state
-                .platform
-                .save_file("Save context file", default_name)
-            {
+            if let Some(path) = state.platform.save_file("Save context file", default_name) {
                 if let Some(ex) = state.context_exporters.get_mut(exporter_id) {
                     ex.save_path = Some(path);
                     ex.status = None;
@@ -63,16 +60,6 @@ impl AppState {
             return;
         };
 
-        let compiled = match self.compile_excludes() {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
-                    ex.status = Some(format!("{:#}", e));
-                }
-                return;
-            }
-        };
-
         let include_files: Option<Vec<String>> = match mode {
             crate::app::state::ContextExportMode::EntireRepo => None,
             crate::app::state::ContextExportMode::TreeSelect => {
@@ -82,18 +69,25 @@ impl AppState {
             }
         };
 
-        let opts = git::ContextExportOptions {
-            git_ref: &self.inputs.git_ref,
-            exclude: &compiled,
+        let req = ContextExportReq {
+            repo,
+            out_path,
+            git_ref: self.inputs.git_ref.clone(),
+            exclude_regex: self.inputs.exclude_regex.clone(),
             max_bytes_per_file,
             skip_binary,
-            include_files: include_files.as_deref(),
+            include_files,
         };
 
-        match git::export_repo_context(&repo, &out_path, opts) {
-            Ok(()) => {
+        match self.broker.exec(CapabilityRequest::ExportContext(req)) {
+            Ok(CapabilityResponse::Unit) => {
                 if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
-                    ex.status = Some(format!("Wrote {}", out_path.display()));
+                    ex.status = Some("Wrote context file successfully.".into());
+                }
+            }
+            Ok(_) => {
+                if let Some(ex) = self.context_exporters.get_mut(&exporter_id) {
+                    ex.status = Some("Unexpected response exporting context.".into());
                 }
             }
             Err(e) => {

@@ -4,6 +4,7 @@ mod git;
 mod model;
 mod app;
 mod platform;
+mod capabilities;
 
 use std::sync::Arc;
 

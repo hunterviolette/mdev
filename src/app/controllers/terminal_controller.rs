@@ -1,6 +1,7 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind, TerminalShell};
 use crate::app::layout::{ComponentInstance, WindowLayout};
 use crate::app::state::{AppState, TerminalState};
+use crate::capabilities::{CapabilityRequest, CapabilityResponse};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -10,6 +11,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             }
             true
         }
+
         Action::ClearTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
                 t.output.clear();
@@ -17,15 +19,18 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             }
             true
         }
+
         Action::RunTerminalCommand { terminal_id, cmd } => {
             state.run_terminal_command(*terminal_id, cmd);
             true
         }
+
         _ => false,
     }
 }
 
 impl AppState {
+    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_terminals_from_layout(&mut self) {
         self.terminals.clear();
 
@@ -51,6 +56,7 @@ impl AppState {
         }
     }
 
+    /// Used by layout controller when adding a Terminal component.
     pub fn new_terminal(&mut self) {
         self.layout.merge_with_defaults();
 
@@ -105,24 +111,37 @@ impl AppState {
 
         t.output.push_str(&format!("\n$ {}\n", cmd));
 
-        match self.platform.run_shell_command(shell, cmd, cwd) {
-            Ok(out) => {
-                t.last_status = Some(out.code);
+        match self.broker.exec(CapabilityRequest::RunShellCommand {
+            shell,
+            cmd: cmd.to_string(),
+            cwd,
+        }) {
+            Ok(CapabilityResponse::ShellOutput {
+                code,
+                stdout,
+                stderr,
+            }) => {
+                t.last_status = Some(code);
 
-                if !out.stdout.is_empty() {
-                    t.output.push_str(&out.stdout);
+                if !stdout.is_empty() {
+                    t.output.push_str(&stdout);
                     if !t.output.ends_with('\n') {
                         t.output.push('\n');
                     }
                 }
-                if !out.stderr.is_empty() {
-                    t.output.push_str(&out.stderr);
+                if !stderr.is_empty() {
+                    t.output.push_str(&stderr);
                     if !t.output.ends_with('\n') {
                         t.output.push('\n');
                     }
                 }
 
-                t.output.push_str(&format!("[exit: {}]\n", out.code));
+                t.output.push_str(&format!("[exit: {}]\n", code));
+            }
+            Ok(_) => {
+                t.last_status = Some(-1);
+                t.output
+                    .push_str("Unexpected response from RunShellCommand.\n");
             }
             Err(e) => {
                 t.last_status = Some(-1);

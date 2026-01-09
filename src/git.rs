@@ -1,6 +1,6 @@
+// src/git.rs
 use anyhow::{bail, Context, Result};
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,13 +47,55 @@ pub fn run_git_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, V
     Ok((code, out.stdout, out.stderr))
 }
 
+fn split_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Dropdown refs: HEAD first, then local branches, then remotes (excluding */HEAD).
+pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
+    ensure_git_repo(repo)?;
+
+    let locals = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .context("listing local branches failed")?;
+    let mut local_refs = split_lines(&locals);
+
+    let remotes = run_git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )
+    .context("listing remote branches failed")?;
+    let mut remote_refs = split_lines(&remotes);
+    remote_refs.retain(|r| !r.ends_with("/HEAD"));
+
+    let mut all = Vec::new();
+    all.push("HEAD".to_string());
+    all.append(&mut local_refs);
+    all.append(&mut remote_refs);
+
+    // stable cleanup
+    all.sort();
+    all.dedup();
+
+    // enforce HEAD first
+    if let Some(pos) = all.iter().position(|s| s == "HEAD") {
+        all.remove(pos);
+    }
+    all.insert(0, "HEAD".to_string());
+
+    Ok(all)
+}
+
 /// Returns raw bytes of file content at `spec` where spec is like "<ref>:<path>".
 pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
     run_git(repo, &["show", spec])
 }
 
 /// Returns history lines for a file at repo-relative `path`.
-/// Output format is: "<hash>\x1f<date>\x1f<subject>\n"
+/// Output format: "<hash>\x1f<date>\x1f<subject>\n"
 pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     let max_s = max.to_string();
     run_git(
@@ -70,9 +112,116 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     )
 }
 
-/// Diff a single file between two refs/commits (e.g. "HEAD", "main", or a full hash).
-/// Uses: `git diff <from>..<to> -- <path>`
+/// List all repo-relative file paths from the working tree:
+/// tracked + untracked (respecting .gitignore)
+pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
+    ensure_git_repo(repo)?;
+    let bytes = run_git(
+        repo,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    )?;
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in 0..bytes.len() {
+        if bytes[i] == 0u8 {
+            if i > start {
+                let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
+                if !s.trim().is_empty() {
+                    out.push(s);
+                }
+            }
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        let s = String::from_utf8_lossy(&bytes[start..]).to_string();
+        if !s.trim().is_empty() {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+fn exists_in_ref(repo: &Path, git_ref: &str, path: &str) -> Result<bool> {
+    let spec = format!("{git_ref}:{path}");
+    let (code, _out, _err) = run_git_allow_fail(repo, &["cat-file", "-e", &spec])?;
+    Ok(code == 0)
+}
+
+fn exists_in_worktree(repo: &Path, rel_path: &str) -> bool {
+    let rel = rel_path.trim_start_matches("./").replace('\\', "/");
+    repo.join(Path::new(&rel)).is_file()
+}
+
+/// WORKTREE-aware single-file diff.
 pub fn diff_file_between(repo: &Path, from_ref: &str, to_ref: &str, path: &str) -> Result<Vec<u8>> {
+    // Commit -> WORKTREE
+    if to_ref == WORKTREE_REF {
+        if from_ref != WORKTREE_REF && exists_in_ref(repo, from_ref, path).unwrap_or(false) {
+            let args_owned: Vec<String> = vec![
+                "diff".to_string(),
+                "--no-color".to_string(),
+                from_ref.to_string(),
+                "--".to_string(),
+                path.to_string(),
+            ];
+            let args_refs: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+            return run_git(repo, &args_refs);
+        }
+
+        // untracked/added file in worktree
+        if exists_in_worktree(repo, path) {
+            let abs = repo.join(Path::new(&path.replace('\\', "/")));
+            let try_null = {
+                let args_owned: Vec<String> = vec![
+                    "diff".to_string(),
+                    "--no-color".to_string(),
+                    "--no-index".to_string(),
+                    "--".to_string(),
+                    "/dev/null".to_string(),
+                    abs.to_string_lossy().to_string(),
+                ];
+                let args_refs: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+                run_git(repo, &args_refs)
+            };
+            if let Ok(bytes) = try_null {
+                return Ok(bytes);
+            }
+
+            let args_owned2: Vec<String> = vec![
+                "diff".to_string(),
+                "--no-color".to_string(),
+                "--no-index".to_string(),
+                "--".to_string(),
+                "NUL".to_string(),
+                abs.to_string_lossy().to_string(),
+            ];
+            let args_refs2: Vec<&str> = args_owned2.iter().map(|s| s.as_str()).collect();
+            return run_git(repo, &args_refs2);
+        }
+
+        return Ok(Vec::new());
+    }
+
+    // WORKTREE -> Commit
+    if from_ref == WORKTREE_REF {
+        if exists_in_ref(repo, to_ref, path).unwrap_or(false) {
+            let args_owned: Vec<String> = vec![
+                "diff".to_string(),
+                "--no-color".to_string(),
+                "--reverse".to_string(),
+                to_ref.to_string(),
+                "--".to_string(),
+                path.to_string(),
+            ];
+            let args_refs: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
+            return run_git(repo, &args_refs);
+        }
+        return Ok(Vec::new());
+    }
+
+    // Normal ref..ref diff
     let range = format!("{from_ref}..{to_ref}");
     let args_owned: Vec<String> = vec![
         "diff".to_string(),
@@ -86,62 +235,15 @@ pub fn diff_file_between(repo: &Path, from_ref: &str, to_ref: &str, path: &str) 
 }
 
 // -----------------------------------------------------------------------------
-// Git ref dropdown helpers
-// -----------------------------------------------------------------------------
-
-fn split_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
-    ensure_git_repo(repo)?;
-
-    let locals = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
-        .context("listing local branches failed")?;
-    let mut local_refs = split_lines(&locals);
-
-    let remotes = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
-        .context("listing remote branches failed")?;
-    let mut remote_refs = split_lines(&remotes);
-    remote_refs.retain(|r| !r.ends_with("/HEAD"));
-
-    let mut all = Vec::new();
-    all.push("HEAD".to_string());
-    all.append(&mut local_refs);
-    all.append(&mut remote_refs);
-
-    all.sort();
-    all.dedup();
-
-    if let Some(pos) = all.iter().position(|s| s == "HEAD") {
-        all.remove(pos);
-    }
-    all.insert(0, "HEAD".to_string());
-
-    Ok(all)
-}
-
-// -----------------------------------------------------------------------------
 // Working tree read/write
 // -----------------------------------------------------------------------------
 
 fn safe_join_repo_path(repo: &Path, rel_path: &str) -> Result<PathBuf> {
     let rel = rel_path.trim_start_matches("./").replace('\\', "/");
-    let p = repo.join(Path::new(&rel));
-
-    // FIX: block only ParentDir ("..") segments, not any dot character.
-    for comp in Path::new(&rel).components() {
-        use std::path::Component;
-        if let Component::ParentDir = comp {
-            bail!("refusing to access path with '..': {}", rel_path);
-        }
+    if rel.contains("..") {
+        bail!("refusing to access path with '..': {}", rel_path);
     }
-
-    Ok(p)
+    Ok(repo.join(Path::new(&rel)))
 }
 
 pub fn read_worktree_file(repo: &Path, rel_path: &str) -> Result<Vec<u8>> {
@@ -149,169 +251,109 @@ pub fn read_worktree_file(repo: &Path, rel_path: &str) -> Result<Vec<u8>> {
     std::fs::read(&p).with_context(|| format!("failed to read {}", p.display()))
 }
 
-pub fn write_worktree_file(repo: &Path, rel_path: &str, contents: &[u8]) -> Result<()> {
+pub fn write_worktree_file(repo: &Path, rel_path: &str, bytes: &[u8]) -> Result<()> {
     let p = safe_join_repo_path(repo, rel_path)?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
     }
-    std::fs::write(&p, contents).with_context(|| format!("failed to write {}", p.display()))
+    std::fs::write(&p, bytes).with_context(|| format!("failed to write {}", p.display()))
 }
 
 // -----------------------------------------------------------------------------
-// AI Context export (tree + contents)
+// Context exporter
 // -----------------------------------------------------------------------------
 
 pub struct ContextExportOptions<'a> {
-    pub git_ref: &'a str,
-    pub exclude: &'a [regex::Regex],
+    pub git_ref: &'a str,                 // may be WORKTREE
+    pub exclude: &'a [Regex],
     pub max_bytes_per_file: usize,
     pub skip_binary: bool,
-    pub include_files: Option<&'a [String]>, // TreeSelect mode
+    pub include_files: Option<&'a [String]>, // None => full repo selection
+}
+
+fn is_excluded(ex: &[Regex], path: &str) -> bool {
+    ex.iter().any(|r| r.is_match(path))
+}
+
+fn is_probably_binary(bytes: &[u8]) -> bool {
+    // Simple heuristic: any NUL byte
+    bytes.iter().any(|&b| b == 0)
+}
+
+fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
+    out.push_str("\n");
+    out.push_str("==== ");
+    out.push_str(header);
+    out.push_str(" ====\n");
+
+    if bytes.len() > limit {
+        out.push_str(&format!(
+            "[TRUNCATED] {} bytes (limit {})\n",
+            bytes.len(),
+            limit
+        ));
+        out.push_str(&String::from_utf8_lossy(&bytes[..limit]));
+        out.push_str("\n");
+    } else {
+        out.push_str(&String::from_utf8_lossy(bytes));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
 }
 
 pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOptions<'_>) -> Result<()> {
-    let use_worktree = opts.git_ref == WORKTREE_REF;
+    ensure_git_repo(repo)?;
 
-    // 1) Build file list
-    let mut files: Vec<String> = if let Some(list) = opts.include_files {
-        if list.is_empty() {
-            bail!("TreeSelect mode: include_files is empty");
-        }
-        let mut v: Vec<String> = list.iter().map(|s| normalize_repo_rel(s)).collect();
-        v.sort();
-        v.dedup();
-        v
-    } else if use_worktree {
-        // WORKTREE EntireRepo: tracked + untracked
-        let tracked = run_git(repo, &["ls-files", "-z"]).context("git ls-files failed")?;
-        let untracked = run_git(repo, &["ls-files", "-z", "--others", "--exclude-standard"])
-            .context("git ls-files --others failed")?;
-        let mut v = split_nul(&tracked);
-        v.extend(split_nul(&untracked));
-        v.sort();
-        v.dedup();
-        v
+    let files: Vec<String> = if let Some(sel) = opts.include_files {
+        sel.to_vec()
+    } else if opts.git_ref == WORKTREE_REF {
+        list_worktree_files(repo)?
     } else {
-        let raw = run_git(repo, &["ls-files", "-z"]).context("git ls-files failed")?;
-        let mut v = split_nul(&raw);
-        v.sort();
-        v
+        // list files at ref
+        let spec = format!("{}", opts.git_ref);
+        let bytes = run_git(repo, &["ls-tree", "-r", "--name-only", &spec])?;
+        split_lines(&bytes)
     };
 
-    // 2) Apply exclude regex patterns
-    files.retain(|p| !opts.exclude.iter().any(|rx| rx.is_match(p)));
+    let mut out = String::new();
+    out.push_str("## Repo Context Export\n");
+    out.push_str(&format!("repo: {}\n", repo.display()));
+    out.push_str(&format!("ref: {}\n", opts.git_ref));
+    out.push_str(&format!("files: {}\n", files.len()));
+    out.push_str("\n");
 
-    // 3) TreeSelect safety:
-    // - For non-worktree refs, keep old behavior: only allow tracked files.
-    // - For WORKTREE, allow exporting untracked selections.
-    if opts.include_files.is_some() && !use_worktree {
-        let tracked_raw = run_git(repo, &["ls-files", "-z"]).context("git ls-files failed")?;
-        let tracked: std::collections::HashSet<String> = split_nul(&tracked_raw).into_iter().collect();
-        files.retain(|p| tracked.contains(p));
-        if files.is_empty() {
-            bail!("TreeSelect mode: none of the selected files are tracked (after filtering).");
+    for f in files {
+        let f_norm = f.replace('\\', "/");
+        if is_excluded(opts.exclude, &f_norm) {
+            continue;
         }
-    }
 
-    let f = File::create(out_path).with_context(|| format!("failed to create {:?}", out_path))?;
-    let mut w = BufWriter::new(f);
-
-    writeln!(w, "# REPO CONTEXT")?;
-    writeln!(w, "# repo: {:?}", repo)?;
-    writeln!(w, "# ref: {}", opts.git_ref)?;
-    writeln!(w, "# files: {}", files.len())?;
-    writeln!(w)?;
-
-    writeln!(w, "## FILE TREE ({})", if use_worktree { "worktree" } else { "tracked" })?;
-    for p in &files {
-        writeln!(w, "{p}")?;
-    }
-    writeln!(w)?;
-
-    writeln!(w, "## FILE CONTENTS")?;
-
-    for p in &files {
-        writeln!(w)?;
-        writeln!(w, "===== FILE: {p} =====")?;
-
-        let read_res: Result<Vec<u8>> = if use_worktree {
-            read_worktree_file(repo, p).with_context(|| format!("failed to read working tree file '{}'", p))
+        let bytes = if opts.git_ref == WORKTREE_REF {
+            match read_worktree_file(repo, &f_norm) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
         } else {
-            let spec = format!("{}:{}", opts.git_ref, p);
-            show_file_at(repo, &spec).with_context(|| format!("failed to git-show '{}'", spec))
+            let spec = format!("{}:{}", opts.git_ref, f_norm);
+            match show_file_at(repo, &spec) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
         };
 
-        match read_res {
-            Ok(blob) => {
-                if opts.skip_binary && is_binary(&blob) {
-                    writeln!(w, "[[SKIPPED binary file]]")?;
-                    continue;
-                }
-
-                if opts.max_bytes_per_file > 0 && blob.len() > opts.max_bytes_per_file {
-                    writeln!(
-                        w,
-                        "[[TRUNCATED {} bytes -> {} bytes]]",
-                        blob.len(),
-                        opts.max_bytes_per_file
-                    )?;
-                    w.write_all(&blob[..opts.max_bytes_per_file])?;
-                    if !blob[..opts.max_bytes_per_file].ends_with(b"\n") {
-                        writeln!(w)?;
-                    }
-                } else {
-                    w.write_all(&blob)?;
-                    if !blob.ends_with(b"\n") {
-                        writeln!(w)?;
-                    }
-                }
-            }
-            Err(e) => {
-                if use_worktree {
-                    writeln!(w, "[[ERROR reading working tree file {p}: {:#}]]", e)?;
-                } else {
-                    let spec = format!("{}:{}", opts.git_ref, p);
-                    writeln!(w, "[[ERROR reading {spec}: {:#}]]", e)?;
-                }
-            }
+        if opts.skip_binary && is_probably_binary(&bytes) {
+            continue;
         }
+
+        write_section(&mut out, &f_norm, &bytes, opts.max_bytes_per_file);
     }
 
-    w.flush()?;
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
+    }
+    std::fs::write(out_path, out).with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(())
-}
-
-// --- helpers ---
-
-fn normalize_repo_rel(s: &str) -> String {
-    let mut out = s.replace('\\', "/");
-    while let Some(rest) = out.strip_prefix("./") {
-        out = rest.to_string();
-    }
-    while let Some(rest) = out.strip_prefix('/') {
-        out = rest.to_string();
-    }
-    out
-}
-
-fn is_binary(blob: &[u8]) -> bool {
-    blob.iter().any(|&b| b == 0)
-}
-
-fn split_nul(buf: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in buf.iter().enumerate() {
-        if b == 0 {
-            if i > start {
-                out.push(String::from_utf8_lossy(&buf[start..i]).to_string());
-            }
-            start = i + 1;
-        }
-    }
-    if start < buf.len() {
-        out.push(String::from_utf8_lossy(&buf[start..]).to_string());
-    }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
 }

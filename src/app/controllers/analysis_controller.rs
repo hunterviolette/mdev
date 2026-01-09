@@ -1,7 +1,4 @@
-use anyhow::Result;
-use regex::Regex;
-
-use crate::{analyze, git};
+use crate::capabilities::{CapabilityRequest, CapabilityResponse};
 use crate::app::actions::{Action, ExpandCmd};
 use crate::app::state::{AppState, WORKTREE_REF};
 
@@ -17,6 +14,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
         Action::SetGitRef(r) => {
             state.set_git_ref(r.clone());
+            state.run_analysis();
             true
         }
         Action::RunAnalysis => {
@@ -29,14 +27,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    pub(crate) fn compile_excludes(&self) -> Result<Vec<Regex>> {
-        let mut compiled = Vec::new();
-        for rx in &self.inputs.exclude_regex {
-            compiled.push(
-                Regex::new(rx).map_err(|e| anyhow::anyhow!("Bad exclude regex '{}': {}", rx, e))?,
-            );
-        }
-        Ok(compiled)
+    pub(crate) fn compile_excludes_raw(&self) -> Vec<String> {
+        self.inputs.exclude_regex.clone()
     }
 
     pub(crate) fn pick_local_repo_and_run(&mut self) {
@@ -67,8 +59,14 @@ impl AppState {
             return;
         };
 
-        match git::list_git_refs_for_dropdown(&repo) {
-            Ok(list) => self.set_git_ref_options(list),
+        match self
+            .broker
+            .exec(CapabilityRequest::ListGitRefs { repo })
+        {
+            Ok(CapabilityResponse::GitRefs(list)) => self.set_git_ref_options(list),
+            Ok(_) => {
+                self.results.error = Some("Unexpected response listing git refs.".into());
+            }
             Err(e) => {
                 self.results.error = Some(format!("{:#}", e));
                 self.set_git_ref_options(vec!["HEAD".to_string(), WORKTREE_REF.to_string()]);
@@ -91,27 +89,30 @@ impl AppState {
             }
         };
 
-        if let Err(e) = git::ensure_git_repo(&repo) {
+        if let Err(e) = self
+            .broker
+            .exec(CapabilityRequest::EnsureGitRepo { repo: repo.clone() })
+        {
             self.results.error = Some(format!("{:#}", e));
             return;
         }
 
-        let compiled = match self.compile_excludes() {
-            Ok(c) => c,
-            Err(e) => {
-                self.results.error = Some(format!("{:#}", e));
-                return;
-            }
-        };
+        let exclude = self.compile_excludes_raw();
 
-        match analyze::analyze_repo(&repo, &self.inputs.git_ref, &compiled, self.inputs.max_exts) {
-            Ok(res) => {
+        match self.broker.exec(CapabilityRequest::AnalyzeRepo {
+            repo,
+            git_ref: self.inputs.git_ref.clone(),
+            exclude_regex: exclude,
+            max_exts: self.inputs.max_exts,
+        }) {
+            Ok(CapabilityResponse::Analysis(res)) => {
                 // Keep old behavior: default context-export selection selects all files.
                 self.set_context_selection_all(&res);
 
                 self.results.result = Some(res);
                 self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
             }
+            Ok(_) => self.results.error = Some("Unexpected response from analysis.".into()),
             Err(e) => self.results.error = Some(format!("{:#}", e)),
         }
     }
