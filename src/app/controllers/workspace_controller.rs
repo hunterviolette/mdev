@@ -104,7 +104,6 @@ impl AppState {
         names
     }
 
-
     fn workspace_path(&self, name: &str) -> anyhow::Result<PathBuf> {
         let dir = self.workspaces_dir()?;
         let safe = Self::sanitize_workspace_name(name);
@@ -441,9 +440,31 @@ impl AppState {
     }
 
     pub(crate) fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
+        // Maintain a per-ref selection:
+        // - If we have a saved selection for this ref, restore it (filtered to existing files).
+        // - Otherwise, preserve current selection (filtered).
+        // - If nothing is selected after filtering, default to "all files selected".
         let mut files = Vec::new();
         Self::collect_all_files(&res.root, &mut files);
-        self.tree.context_selected_files = files.into_iter().collect();
+        let all: std::collections::HashSet<String> = files.into_iter().collect();
+
+        let key = self.inputs.git_ref.clone();
+
+        let mut selected = self
+            .tree
+            .context_selected_by_ref
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.tree.context_selected_files.clone());
+
+        selected.retain(|p| all.contains(p));
+
+        if selected.is_empty() {
+            selected = all.clone();
+        }
+
+        self.tree.context_selected_files = selected.clone();
+        self.tree.context_selected_by_ref.insert(key, selected);
     }
 
     fn collect_all_files(node: &crate::model::DirNode, out: &mut Vec<String>) {

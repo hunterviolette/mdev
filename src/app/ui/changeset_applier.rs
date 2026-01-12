@@ -6,16 +6,16 @@ use crate::app::state::AppState;
 
 /// Schema (and example) copied to clipboard for the AI/user.
 pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
-  "version": 1,
-  "description": "Optional human-readable note",
-  "operations": [
-    { "op": "git_apply", "patch": "diff --git a/src/lib.rs b/src/lib.rs\n..." },
-    { "op": "write", "path": "src/new_file.rs", "contents": "fn main() {}\n" },
-    { "op": "move", "from": "old/path.rs", "to": "new/path.rs" },
-    { "op": "delete", "path": "src/old_file.rs" }
+  \"version\": 1,
+  \"description\": \"Optional human-readable note\",
+  \"operations\": [
+    { \"op\": \"git_apply\", \"patch\": \"diff --git a/src/lib.rs b/src/lib.rs\\n...\" },
+    { \"op\": \"write\", \"path\": \"src/new_file.rs\", \"contents\": \"fn main() {}\\n\" },
+    { \"op\": \"move\", \"from\": \"old/path.rs\", \"to\": \"new/path.rs\" },
+    { \"op\": \"delete\", \"path\": \"src/old_file.rs\" }
   ],
-  "post_commands": [
-    { "shell": "Auto", "cmd": "cargo build", "cwd": "." }
+  \"post_commands\": [
+    { \"shell\": \"Auto\", \"cmd\": \"cargo build\", \"cwd\": \".\" }
   ]
 }"#;
 
@@ -42,6 +42,20 @@ pub fn changeset_applier_panel(
         if ui.button("Copy schema + example").clicked() {
             ctx.output_mut(|o| o.copied_text = CHANGESET_SCHEMA_EXAMPLE.to_string());
             st.status = Some("Copied schema/example to clipboard.".into());
+        }
+
+        let has_output = st
+            .status
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if ui
+            .add_enabled(has_output, egui::Button::new("Copy output"))
+            .clicked()
+        {
+            if let Some(s) = &st.status {
+                ctx.output_mut(|o| o.copied_text = s.clone());
+            }
         }
 
         if ui.button("Clear").clicked() {

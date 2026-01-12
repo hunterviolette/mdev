@@ -97,7 +97,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
 
             let link_text = egui::RichText::new(&f.name).color(ui.visuals().hyperlink_color);
 
-            //  Link is focusable (unlike Label + Sense::click)
+            // Link is focusable (unlike Label + Sense::click)
             let resp = ui
                 .add(egui::Link::new(link_text))
                 .on_hover_text(&f.full_path)
@@ -108,7 +108,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
         .inner;
 
     if link_resp.clicked() {
-        //  Explicitly move keyboard focus away from the code editor
+        // Explicitly move keyboard focus away from the code editor
         link_resp.request_focus();
 
         if viewers.is_empty() {
@@ -218,7 +218,8 @@ pub fn tree_panel(
     let max_exts = state.inputs.max_exts;
 
     // One-shot expand/collapse command
-    let expand_cmd = state.tree.expand_cmd;
+    // IMPORTANT: consume it so it doesn't override manual caret toggles every frame.
+    let expand_cmd = state.tree.expand_cmd.take();
 
     ui.horizontal(|ui| {
         ui.checkbox(&mut state.ui.show_top_level_stats, "Badges");
@@ -315,6 +316,13 @@ pub fn tree_panel(
                     });
             });
     });
+
+    // Persist current selection for this ref each frame so reruns of analysis (same ref)
+    // do not blow away user selections.
+    let key = state.inputs.git_ref.clone();
+    state.tree
+        .context_selected_by_ref
+        .insert(key, state.tree.context_selected_files.clone());
 
     actions
 }

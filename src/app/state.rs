@@ -132,6 +132,9 @@ pub struct UiState {
 pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
     pub context_selected_files: HashSet<String>,
+
+    /// Preserve tree-select checkbox state per git ref label (HEAD/main/origin/.../WORKTREE).
+    pub context_selected_by_ref: HashMap<String, HashSet<String>>,
 }
 
 pub struct FileViewerState {
@@ -237,6 +240,7 @@ impl AppState {
             tree: TreeState {
                 expand_cmd: None,
                 context_selected_files: HashSet::new(),
+                context_selected_by_ref: HashMap::new(),
             },
 
             file_viewers,
@@ -276,7 +280,20 @@ impl AppState {
     }
 
     pub fn set_git_ref(&mut self, git_ref: String) {
-        self.inputs.git_ref = git_ref;
+        // Save selection for previous ref.
+        let prev = self.inputs.git_ref.clone();
+        self.tree
+            .context_selected_by_ref
+            .insert(prev, self.tree.context_selected_files.clone());
+
+        // Switch ref.
+        self.inputs.git_ref = git_ref.clone();
+
+        // Restore selection for new ref if available.
+        if let Some(saved) = self.tree.context_selected_by_ref.get(&git_ref).cloned() {
+            self.tree.context_selected_files = saved;
+        }
+
         self.refresh_follow_top_bar_viewers();
     }
 
@@ -301,6 +318,14 @@ impl AppState {
         }
     }
 
+    /// NEW: when the chosen folder isn't a git repo, the app becomes "WORKTREE only".
+    pub fn set_git_ref_options_worktree_only(&mut self) {
+        self.inputs.git_ref_options = vec![WORKTREE_REF.to_string()];
+        if self.inputs.git_ref != WORKTREE_REF {
+            self.set_git_ref(WORKTREE_REF.to_string());
+        }
+    }
+
     pub fn refresh_follow_top_bar_viewers(&mut self) {
         let ids: Vec<ComponentId> = self
             .file_viewers
@@ -318,5 +343,4 @@ impl AppState {
             self.load_file_at_current_selection(id);
         }
     }
-
 }
