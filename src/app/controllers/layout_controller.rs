@@ -1,6 +1,6 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind};
 use crate::app::layout::{ComponentInstance, LayoutConfig, WindowLayout};
-use crate::app::state::{AppState, ContextExportMode, ContextExporterState};
+use crate::app::state::{AppState, ChangeSetApplierState, ContextExportMode, ContextExporterState};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -37,6 +37,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             // Ephemeral components rebuilt from layout
             state.rebuild_terminals_from_layout();
             state.rebuild_context_exporters_from_layout();
+            state.rebuild_changeset_appliers_from_layout(); // NEW
             true
         }
         _ => false,
@@ -81,6 +82,35 @@ impl AppState {
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
+            ComponentKind::ChangeSetApplier => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("ChangeSet Applier {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [140.0, 140.0],
+                        size: [640.0, 520.0],
+                    },
+                );
+
+                self.changeset_appliers.insert(
+                    id,
+                    ChangeSetApplierState {
+                        payload: String::new(),
+                        status: None,
+                    },
+                );
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
             ComponentKind::Tree | ComponentKind::Summary => {
                 self.layout.merge_with_defaults();
 
@@ -90,10 +120,13 @@ impl AppState {
                     ComponentKind::Summary => format!("Summary {}", id),
                     ComponentKind::FileViewer
                     | ComponentKind::Terminal
-                    | ComponentKind::ContextExporter => unreachable!(),
+                    | ComponentKind::ContextExporter
+                    | ComponentKind::ChangeSetApplier => unreachable!(),
                 };
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.layout
+                    .components
+                    .push(ComponentInstance { id, kind, title });
 
                 self.layout.windows.insert(
                     id,
@@ -154,6 +187,7 @@ impl AppState {
         // Clean up ephemeral component state (safe no-op if not present)
         self.context_exporters.remove(&id);
         self.terminals.remove(&id);
+        self.changeset_appliers.remove(&id); // NEW
 
         if self.active_file_viewer == Some(id) {
             self.active_file_viewer = self

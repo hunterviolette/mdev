@@ -46,6 +46,22 @@ pub enum CapabilityRequest {
         contents: Vec<u8>,
     },
 
+    DeleteWorktreePath {
+        repo: PathBuf,
+        path: String, // repo-relative
+    },
+
+    MoveWorktreePath {
+        repo: PathBuf,
+        from: String,
+        to: String,
+    },
+
+    ApplyGitPatch {
+        repo: PathBuf,
+        patch: String,
+    },
+
     FileHistory {
         repo: PathBuf,
         path: String,

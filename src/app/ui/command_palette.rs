@@ -17,6 +17,7 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "summary" => Some(ComponentKind::Summary),
         "terminal" | "term" => Some(ComponentKind::Terminal),
         "context_exporter" => Some(ComponentKind::ContextExporter),
+        "changeset_applier" | "changeset" | "patch" => Some(ComponentKind::ChangeSetApplier),
         _ => None,
     }
 }
@@ -42,7 +43,10 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     }
 
                     if segments.len() == 2 {
-                        return names.into_iter().map(|n| format!("workspace/save/{n}")).collect();
+                        return names
+                            .into_iter()
+                            .map(|n| format!("workspace/save/{n}"))
+                            .collect();
                     }
 
                     let typed = segments.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -67,7 +71,10 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     }
 
                     if segments.len() == 2 {
-                        return names.into_iter().map(|n| format!("workspace/load/{n}")).collect();
+                        return names
+                            .into_iter()
+                            .map(|n| format!("workspace/load/{n}"))
+                            .collect();
                     }
 
                     let typed = segments.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -98,6 +105,7 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/summary".into(),
                     "component/terminal".into(),
                     "component/context_exporter".into(),
+                    "component/changeset_applier".into(),
                 ]
             } else {
                 vec![]
@@ -153,6 +161,8 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
     }
 }
 
+/// Command palette UI.
+/// Returns actions to dispatch this frame.
 pub fn command_palette(
     ctx: &egui::Context,
     state: &mut AppState,
@@ -181,7 +191,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier",
                     ),
             );
             resp.request_focus();
@@ -198,7 +208,8 @@ pub fn command_palette(
                     "workspace/load".into(),
                     "component/file_viewer".into(),
                     "component/terminal".into(),
-                    "component/context_exporter".into(), 
+                    "component/context_exporter".into(),
+                    "component/changeset_applier".into(),
                 ];
             }
 

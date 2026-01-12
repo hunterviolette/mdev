@@ -6,7 +6,10 @@ use crate::app::actions::{Action, ComponentId, ComponentKind, ExpandCmd};
 use crate::app::layout::{
     FileViewerSnapshot, LayoutSnapshot, Preset, PresetKind, StateSnapshot, WorkspaceFile,
 };
-use crate::app::state::{AppState, ContextExporterState, ContextExportMode, PendingWorkspaceApply, ViewportRestore, WORKTREE_REF};
+use crate::app::state::{
+    AppState, ContextExportMode, ContextExporterState, PendingWorkspaceApply, ViewportRestore,
+    WORKTREE_REF,
+};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -76,23 +79,17 @@ impl AppState {
         }
     }
 
-    fn workspace_path(&self, name: &str) -> anyhow::Result<PathBuf> {
-        let dir = self.workspaces_dir()?;
-        let safe = Self::sanitize_workspace_name(name);
-        Ok(dir.join(format!("{safe}.json")))
-    }
-
     pub fn list_workspaces(&self) -> Vec<String> {
         let dir = match self.workspaces_dir() {
             Ok(d) => d,
             Err(_) => return vec![],
         };
 
-        let mut names = vec![];
         let Ok(rd) = std::fs::read_dir(dir) else {
             return vec![];
         };
 
+        let mut names = Vec::new();
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -107,146 +104,168 @@ impl AppState {
         names
     }
 
-    // ---------------------------
-    // Save / Load
-    // ---------------------------
+    fn workspace_path(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let dir = self.workspaces_dir()?;
+        let safe = Self::sanitize_workspace_name(name);
+        Ok(dir.join(format!("{safe}.json")))
+    }
 
-    fn save_workspace_to_appdata(
+    fn load_default_workspace_file(&self) -> WorkspaceFile {
+        WorkspaceFile {
+            version: 1,
+            default_preset: Some("Default".to_string()),
+            presets: vec![
+                Preset {
+                    name: "Default".to_string(),
+                    kind: PresetKind::FullState(StateSnapshot {
+                        canvas_size: [1200.0, 800.0],
+                        viewport_outer_pos: None,
+                        viewport_inner_size: None,
+                        repo: None,
+                        git_ref: "HEAD".to_string(),
+                        exclude_regex: vec![r"\.lock$".into(), r"(^|/)package-lock\.json$".into()],
+                        max_exts: 6,
+                        filter_text: "".to_string(),
+                        show_top_level_stats: true,
+                        layout: crate::app::layout::LayoutConfig::default(),
+                        file_viewers: HashMap::new(),
+                        active_file_viewer: Some(2),
+                    }),
+                },
+                Preset {
+                    name: "Layout Only".to_string(),
+                    kind: PresetKind::LayoutOnly(LayoutSnapshot {
+                        canvas_size: [1200.0, 800.0],
+                        layout: crate::app::layout::LayoutConfig::default(),
+                    }),
+                },
+            ],
+        }
+    }
+
+    pub fn save_workspace_to_appdata(
         &mut self,
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
         viewport_inner_size: Option<[f32; 2]>,
-        suggested_name: Option<&str>,
+        name_opt: Option<&str>,
     ) {
-        let name = suggested_name
-            .map(|s| s.to_string())
-            .or_else(|| self.palette_last_name.clone())
-            .unwrap_or_else(|| "workspace".to_string());
+        let name = name_opt.unwrap_or("workspace");
 
-        let path = match self.workspace_path(&name) {
+        let path = match self.workspace_path(name) {
             Ok(p) => p,
             Err(e) => {
-                self.results.error =
-                    Some(format!("Failed to resolve workspace directory: {:#}", e));
+                self.results.error = Some(format!("{:#}", e));
                 return;
             }
         };
 
-        self.layout.merge_with_defaults();
-
-        // snapshot viewer selections only (we reload content from git)
-        let mut fv_snap: HashMap<ComponentId, FileViewerSnapshot> = HashMap::new();
-        for (id, v) in self.file_viewers.iter() {
-            fv_snap.insert(
+        let mut file_viewers = HashMap::new();
+        for (id, fv) in self.file_viewers.iter() {
+            file_viewers.insert(
                 *id,
                 FileViewerSnapshot {
-                    selected_file: v.selected_file.clone(),
-                    selected_commit: v.selected_commit.clone(),
+                    selected_file: fv.selected_file.clone(),
+                    selected_commit: fv.selected_commit.clone(),
                 },
             );
         }
 
-        let layout_preset = Preset {
-            name: "layout".to_string(),
-            kind: PresetKind::LayoutOnly(LayoutSnapshot {
-                canvas_size,
-                layout: self.layout.clone(),
-            }),
+        let state_snap = StateSnapshot {
+            canvas_size,
+            viewport_outer_pos,
+            viewport_inner_size,
+
+            repo: self.inputs.repo.clone(),
+            git_ref: self.inputs.git_ref.clone(),
+            exclude_regex: self.inputs.exclude_regex.clone(),
+            max_exts: self.inputs.max_exts,
+
+            filter_text: self.ui.filter_text.clone(),
+            show_top_level_stats: self.ui.show_top_level_stats,
+
+            layout: self.layout.clone(),
+
+            file_viewers,
+            active_file_viewer: self.active_file_viewer,
         };
 
-        let state_preset = Preset {
-            name: "state".to_string(),
-            kind: PresetKind::FullState(StateSnapshot {
-                canvas_size,
-                viewport_outer_pos,
-                viewport_inner_size,
-
-                repo: self.inputs.repo.clone(),
-                git_ref: self.inputs.git_ref.clone(),
-                exclude_regex: self.inputs.exclude_regex.clone(),
-                max_exts: self.inputs.max_exts,
-
-                filter_text: self.ui.filter_text.clone(),
-                show_top_level_stats: self.ui.show_top_level_stats,
-
-                layout: self.layout.clone(),
-
-                file_viewers: fv_snap,
-                active_file_viewer: self.active_file_viewer,
-            }),
+        let ws_file = WorkspaceFile {
+            version: 1,
+            default_preset: Some(name.to_string()),
+            presets: vec![Preset {
+                name: name.to_string(),
+                kind: PresetKind::FullState(state_snap),
+            }],
         };
 
-        let ws = WorkspaceFile {
-            version: 2,
-            default_preset: Some("state".to_string()),
-            presets: vec![layout_preset, state_preset],
-        };
-
-        match serde_json::to_string_pretty(&ws) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
-                    self.results.error = Some(format!("Failed to save workspace: {}", e));
-                } else {
-                    self.results.error = None;
-                }
-            }
+        let text = match serde_json::to_string_pretty(&ws_file) {
+            Ok(t) => t,
             Err(e) => {
-                self.results.error = Some(format!("Failed to serialize workspace: {}", e));
+                self.results.error = Some(format!("{:#}", e));
+                return;
             }
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Err(e) = std::fs::write(&path, text) {
+            self.results.error = Some(format!("{:#}", e));
+            return;
         }
     }
 
-    fn load_workspace_from_appdata(&mut self, suggested_name: Option<&str>) {
-        let name = suggested_name
-            .map(|s| s.to_string())
-            .or_else(|| self.palette_last_name.clone());
-
-        let Some(name) = name else {
-            self.results.error = Some(
-                "No workspace name provided. Try: workspace/load/<name> (or list available names)."
-                    .into(),
-            );
-            return;
-        };
-
-        let path = match self.workspace_path(&name) {
+    pub fn load_workspace_from_appdata(&mut self, name_opt: Option<&str>) {
+        let name = name_opt.unwrap_or("workspace");
+        let path = match self.workspace_path(name) {
             Ok(p) => p,
             Err(e) => {
-                self.results.error =
-                    Some(format!("Failed to resolve workspace directory: {:#}", e));
+                self.results.error = Some(format!("{:#}", e));
                 return;
             }
         };
 
-        let s = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                // If missing, create a default and load it.
+                let def = self.load_default_workspace_file();
+                let text = serde_json::to_string_pretty(&def).unwrap_or_default();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, text);
+                self.apply_workspace_preset(&def, Some(name));
+                return;
+            }
+        };
+
+        let parsed: WorkspaceFile = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
             Err(e) => {
-                self.results.error = Some(format!("Failed to read workspace '{}': {}", name, e));
+                self.results.error = Some(format!("Invalid workspace JSON: {e}"));
                 return;
             }
         };
 
-        let ws = match serde_json::from_str::<WorkspaceFile>(&s) {
-            Ok(ws) => ws,
-            Err(e) => {
-                self.results.error = Some(format!("Failed to parse workspace '{}': {}", name, e));
-                return;
-            }
-        };
+        self.apply_workspace_preset(&parsed, Some(name));
+    }
 
-        let preset = ws
+    fn apply_workspace_preset(&mut self, ws: &WorkspaceFile, name: Option<&str>) {
+        let preset_name = ws
             .default_preset
-            .as_ref()
-            .and_then(|n| ws.presets.iter().find(|p| &p.name == n))
-            .or_else(|| ws.presets.first());
+            .clone()
+            .or_else(|| name.map(|s| s.to_string()))
+            .unwrap_or_else(|| "Default".to_string());
 
-        let Some(preset) = preset else {
-            self.results.error = Some("Workspace has no presets.".into());
+        let Some(preset) = ws.presets.iter().find(|p| p.name == preset_name) else {
+            self.results.error = Some(format!("Preset not found: {preset_name}"));
             return;
         };
 
-        let mut target_inner_size: Option<[f32; 2]> = None;
-
+        let mut target_inner_size = None;
         if let PresetKind::FullState(st) = &preset.kind {
             self.pending_viewport_restore = Some(ViewportRestore {
                 outer_pos: st.viewport_outer_pos,
@@ -313,6 +332,7 @@ impl AppState {
 
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
+                self.rebuild_changeset_appliers_from_layout();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -341,6 +361,7 @@ impl AppState {
                 // Ephemeral
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
+                self.rebuild_changeset_appliers_from_layout();
 
                 // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();
@@ -419,9 +440,31 @@ impl AppState {
     }
 
     pub(crate) fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
+        // Maintain a per-ref selection:
+        // - If we have a saved selection for this ref, restore it (filtered to existing files).
+        // - Otherwise, preserve current selection (filtered).
+        // - If nothing is selected after filtering, default to "all files selected".
         let mut files = Vec::new();
         Self::collect_all_files(&res.root, &mut files);
-        self.tree.context_selected_files = files.into_iter().collect();
+        let all: std::collections::HashSet<String> = files.into_iter().collect();
+
+        let key = self.inputs.git_ref.clone();
+
+        let mut selected = self
+            .tree
+            .context_selected_by_ref
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.tree.context_selected_files.clone());
+
+        selected.retain(|p| all.contains(p));
+
+        if selected.is_empty() {
+            selected = all.clone();
+        }
+
+        self.tree.context_selected_files = selected.clone();
+        self.tree.context_selected_by_ref.insert(key, selected);
     }
 
     fn collect_all_files(node: &crate::model::DirNode, out: &mut Vec<String>) {

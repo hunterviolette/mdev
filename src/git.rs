@@ -95,52 +95,138 @@ pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
 }
 
 /// Returns history lines for a file at repo-relative `path`.
-/// Output format: "<hash>\x1f<date>\x1f<subject>\n"
+/// If not a git repo, returns empty (so UI still works in plain working trees).
 pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
-    let max_s = max.to_string();
+    if ensure_git_installed().is_err() || ensure_git_repo(repo).is_err() {
+        return Ok(Vec::new());
+    }
+
     run_git(
         repo,
         &[
             "log",
-            "--date=short",
-            "--pretty=format:%H%x1f%ad%x1f%s",
+            "--no-color",
+            "--pretty=format:%H|%ct|%s",
             "-n",
-            &max_s,
+            &max.to_string(),
             "--",
             path,
         ],
     )
 }
 
-/// List all repo-relative file paths from the working tree:
-/// tracked + untracked (respecting .gitignore)
-pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
-    ensure_git_repo(repo)?;
-    let bytes = run_git(
-        repo,
-        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-    )?;
+/// --- FS fallback helpers (for plain working trees) ---
+
+fn normalize_rel_path(p: &Path) -> Option<String> {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_start_matches("./").to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
+    fn skip_dir(name: &str) -> bool {
+        matches!(
+            name,
+            ".git"
+                | "node_modules"
+                | "target"
+                | ".next"
+                | ".turbo"
+                | ".idea"
+                | ".vscode"
+                | ".DS_Store"
+        )
+    }
 
     let mut out = Vec::new();
-    let mut start = 0usize;
-    for i in 0..bytes.len() {
-        if bytes[i] == 0u8 {
-            if i > start {
-                let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
-                if !s.trim().is_empty() {
-                    out.push(s);
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        for ent in rd {
+            let ent = match ent {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let ft = match ent.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            // avoid symlink cycles / oddities
+            if ft.is_symlink() {
+                continue;
+            }
+
+            let path = ent.path();
+
+            if ft.is_dir() {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if skip_dir(&name) {
+                    continue;
+                }
+                stack.push(path);
+            } else if ft.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    if let Some(s) = normalize_rel_path(rel) {
+                        out.push(s);
+                    }
                 }
             }
-            start = i + 1;
         }
     }
-    if start < bytes.len() {
-        let s = String::from_utf8_lossy(&bytes[start..]).to_string();
-        if !s.trim().is_empty() {
-            out.push(s);
-        }
-    }
+
+    out.sort();
+    out.dedup();
     Ok(out)
+}
+
+/// List all repo-relative file paths from the working tree:
+/// - If git repo: tracked + untracked (respecting .gitignore)
+/// - Otherwise: filesystem walk fallback
+pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
+    if ensure_git_installed().is_ok() && ensure_git_repo(repo).is_ok() {
+        let bytes = run_git(
+            repo,
+            &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        )?;
+
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        for i in 0..bytes.len() {
+            if bytes[i] == 0u8 {
+                if i > start {
+                    let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
+                    if !s.trim().is_empty() {
+                        out.push(s);
+                    }
+                }
+                start = i + 1;
+            }
+        }
+        if start < bytes.len() {
+            let s = String::from_utf8_lossy(&bytes[start..]).to_string();
+            if !s.trim().is_empty() {
+                out.push(s);
+            }
+        }
+
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
+
+    // plain folder fallback
+    list_files_recursive_fs(repo)
 }
 
 fn exists_in_ref(repo: &Path, git_ref: &str, path: &str) -> Result<bool> {
@@ -155,7 +241,16 @@ fn exists_in_worktree(repo: &Path, rel_path: &str) -> bool {
 }
 
 /// WORKTREE-aware single-file diff.
-pub fn diff_file_between(repo: &Path, from_ref: &str, to_ref: &str, path: &str) -> Result<Vec<u8>> {
+/// NOTE: Diffs require git (and a git repo). This will error in plain working trees (intended).
+pub fn diff_file_between(
+    repo: &Path,
+    from_ref: &str,
+    to_ref: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
+    ensure_git_installed()?;
+    ensure_git_repo(repo)?;
+
     // Commit -> WORKTREE
     if to_ref == WORKTREE_REF {
         if from_ref != WORKTREE_REF && exists_in_ref(repo, from_ref, path).unwrap_or(false) {
@@ -261,6 +356,37 @@ pub fn write_worktree_file(repo: &Path, rel_path: &str, bytes: &[u8]) -> Result<
 }
 
 // -----------------------------------------------------------------------------
+// Minimal FS operations (used by ChangeSet applier)
+// -----------------------------------------------------------------------------
+
+pub fn delete_worktree_path(repo: &Path, rel_path: &str) -> Result<()> {
+    let p = safe_join_repo_path(repo, rel_path)?;
+    if !p.exists() {
+        return Ok(());
+    }
+    let md = std::fs::metadata(&p).with_context(|| format!("failed to stat {}", p.display()))?;
+    if md.is_dir() {
+        std::fs::remove_dir_all(&p)
+            .with_context(|| format!("failed to remove dir {}", p.display()))?;
+    } else {
+        std::fs::remove_file(&p).with_context(|| format!("failed to remove file {}", p.display()))?;
+    }
+    Ok(())
+}
+
+pub fn move_worktree_path(repo: &Path, from: &str, to: &str) -> Result<()> {
+    let src = safe_join_repo_path(repo, from)?;
+    let dst = safe_join_repo_path(repo, to)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
+    }
+    std::fs::rename(&src, &dst)
+        .with_context(|| format!("failed to rename {} -> {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Context exporter
 // -----------------------------------------------------------------------------
 
@@ -303,17 +429,23 @@ fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
     }
 }
 
-pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOptions<'_>) -> Result<()> {
-    ensure_git_repo(repo)?;
+pub fn export_repo_context(
+    repo: &Path,
+    out_path: &Path,
+    opts: ContextExportOptions<'_>,
+) -> Result<()> {
+    // Only require git when exporting a git ref.
+    if opts.git_ref != WORKTREE_REF {
+        ensure_git_installed()?;
+        ensure_git_repo(repo)?;
+    }
 
     let files: Vec<String> = if let Some(sel) = opts.include_files {
         sel.to_vec()
     } else if opts.git_ref == WORKTREE_REF {
         list_worktree_files(repo)?
     } else {
-        // list files at ref
-        let spec = format!("{}", opts.git_ref);
-        let bytes = run_git(repo, &["ls-tree", "-r", "--name-only", &spec])?;
+        let bytes = run_git(repo, &["ls-tree", "-r", "--name-only", opts.git_ref])?;
         split_lines(&bytes)
     };
 
@@ -354,6 +486,100 @@ pub fn export_repo_context(repo: &Path, out_path: &Path, opts: ContextExportOpti
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
     }
-    std::fs::write(out_path, out).with_context(|| format!("failed to write {}", out_path.display()))?;
+    std::fs::write(out_path, out)
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Minimal extensions for patch-apply + file ops (DO NOT remove anything above)
+// -----------------------------------------------------------------------------
+
+pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git -C {:?} {}", repo, args.join(" ")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_bytes)
+            .with_context(|| "failed writing stdin to git")?;
+    }
+
+    let out = child.wait_with_output().with_context(|| "failed to wait for git")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(out.stdout)
+}
+
+pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
+    // Normalize to LF and ensure trailing newline. Do NOT rewrite hunks.
+    let mut patch = patch_text.replace("\r\n", "\n");
+    if !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+
+    // Basic stats...
+    let len = patch.len();
+    let nl_count = patch.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let has_diff_git = patch.contains("diff --git ");
+    let has_unified_hunk = patch.contains("\n@@ -") || patch.starts_with("@@ -");
+    let has_cr = patch.as_bytes().iter().any(|&b| b == b'\r');
+
+    let debug_path = repo.join(".describe_repo_last_patch.patch");
+    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
+        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
+    }
+
+    match run_git_with_input(repo, &["apply", "--whitespace=nowarn", "-"], patch.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let mut preview = patch.chars().take(200).collect::<String>();
+            preview = preview.replace('\n', "\\n");
+            preview = preview.replace('\r', "\\r");
+
+            let check = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["apply", "--check", "--whitespace=nowarn"])
+                .arg(&debug_path)
+                .output();
+
+            let mut check_msg = String::new();
+            if let Ok(o) = check {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                check_msg.push_str(&format!(
+                    "git apply --check exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
+                    o.status.code(),
+                    stdout,
+                    stderr
+                ));
+            }
+
+            bail!(
+                "git apply failed.\n\
+                 patch_len={len} nl_count={nl_count} has_diff_git={has_diff_git} has_unified_hunk={has_unified_hunk} has_cr={has_cr}\n\
+                 debug_patch_file={}\n\
+                 preview='{}'\n\
+                 underlying_error={:#}\n\
+                 {}",
+                debug_path.display(),
+                preview,
+                e,
+                check_msg
+            );
+        }
+    }
 }

@@ -17,6 +17,7 @@ pub enum ComponentKind {
     Summary,
     Terminal,
     ContextExporter,
+    ChangeSetApplier,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -125,6 +126,16 @@ pub enum Action {
     },
     ContextToggleSkipBinary {
         exporter_id: ComponentId,
+    },
+
+    // ---------------------------
+    // Change-set applier (AI patch payloads)
+    // ---------------------------
+    ApplyChangeSet {
+        applier_id: ComponentId,
+    },
+    ClearChangeSet {
+        applier_id: ComponentId,
     },
 
     // ---------------------------

@@ -4,8 +4,8 @@ use super::actions::Action;
 use super::state::AppState;
 
 use super::controllers::{
-    analysis_controller, context_exporter_controller, file_viewer_controller, layout_controller,
-    palette_controller, terminal_controller, tree_controller, workspace_controller,
+    analysis_controller, changeset_controller, context_exporter_controller, file_viewer_controller,
+    layout_controller, palette_controller, terminal_controller, tree_controller, workspace_controller,
 };
 
 impl AppState {
@@ -15,6 +15,9 @@ impl AppState {
             return;
         }
         if analysis_controller::handle(self, &action) {
+            return;
+        }
+        if changeset_controller::handle(self, &action) {
             return;
         }
         if tree_controller::handle(self, &action) {
@@ -35,8 +38,6 @@ impl AppState {
         if workspace_controller::handle(self, &action) {
             return;
         }
-
-        // Action::None or any unhandled actions: do nothing (same as before)
     }
 
     pub fn finalize_frame(&mut self) {
