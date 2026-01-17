@@ -19,17 +19,19 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             viewport_inner_size,
         } => {
             let name = state.palette_last_name.take();
+            state.current_workspace_name = name.clone().unwrap_or_else(|| "workspace".to_string());
             state.save_workspace_to_appdata(
                 *canvas_size,
                 *viewport_outer_pos,
                 *viewport_inner_size,
-                name.as_deref(), // ✅ 4th arg restored
+                name.as_deref(), 
             );
             true
         }
 
         Action::LoadWorkspace => {
             let name = state.palette_last_name.take();
+            state.current_workspace_name = name.clone().unwrap_or_else(|| "workspace".to_string());
             state.load_workspace_from_appdata(name.as_deref());
             true
         }

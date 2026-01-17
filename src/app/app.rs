@@ -32,6 +32,23 @@ impl eframe::App for AppState {
         let pressed = ctx.input(|i| {
             i.key_pressed(egui::Key::E) && i.modifiers.ctrl && i.modifiers.shift
         });
+
+        // Native window title
+        let repo_name = self
+            .inputs
+            .repo
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("(no repo)");
+        let repo_header = self.inputs.git_ref.as_str();
+        let workspace_name = self.current_workspace_name.as_str();
+        let title = format!("Repo Analyzer - {} - {} - {}", repo_name, repo_header, workspace_name);
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
+
         if pressed {
             self.palette.open = !self.palette.open;
             if self.palette.open {
