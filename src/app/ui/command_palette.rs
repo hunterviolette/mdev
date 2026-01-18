@@ -161,6 +161,124 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
     }
 }
 
+// ---------------------------
+// Fuzzy search helpers
+// ---------------------------
+
+fn normalize_q(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
+    let q = normalize_q(query);
+    if q.is_empty() {
+        return Some(0);
+    }
+
+    let c = candidate.to_ascii_lowercase();
+
+    // Token-based "all tokens must appear" scoring.
+    let tokens: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        return Some(0);
+    }
+
+    let mut score: i32 = 0;
+    for t in tokens {
+        if let Some(pos) = c.find(t) {
+            // Earlier match is better.
+            score += 100 - (pos as i32).min(100);
+        } else {
+            return None;
+        }
+    }
+
+    // Prefer shorter candidates slightly.
+    score -= (c.len() as i32).min(80);
+    Some(score)
+}
+
+fn fuzzy_filter_sort(query: &str, candidates: &[String], limit: usize) -> Vec<String> {
+    let mut scored: Vec<(i32, String)> = candidates
+        .iter()
+        .filter_map(|c| fuzzy_score(query, c).map(|s| (s, c.clone())))
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().take(limit).map(|(_, s)| s).collect()
+}
+
+fn all_commands(state: &AppState) -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "workspace/save".into(),
+        "workspace/load".into(),
+        "component/file_viewer".into(),
+        "component/tree".into(),
+        "component/summary".into(),
+        "component/terminal".into(),
+        "component/context_exporter".into(),
+        "component/changeset_applier".into(),
+    ];
+
+    let mut names = state.list_workspaces();
+    names.sort();
+    for n in names {
+        out.push(format!("workspace/save/{n}"));
+        out.push(format!("workspace/load/{n}"));
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn detect_command_lane(query: &str) -> Option<&'static str> {
+    // If the user starts a lane prefix, constrain suggestions to that lane.
+    // This prevents accidents like typing workspace/load/... and seeing workspace/save/... results.
+    let q = query.trim().to_ascii_lowercase();
+    if q.starts_with("workspace/load") {
+        return Some("workspace/load");
+    }
+    if q.starts_with("workspace/save") {
+        return Some("workspace/save");
+    }
+    if q.starts_with("component/") {
+        return Some("component/");
+    }
+    if q.starts_with("workspace/") {
+        return Some("workspace/");
+    }
+    None
+}
+
+fn constrain_to_lane(mut sugg: Vec<String>, lane: Option<&str>) -> Vec<String> {
+    let Some(lane) = lane else {
+        return sugg;
+    };
+
+    if lane == "workspace/load" {
+        sugg.retain(|s| s == "workspace/load" || s.starts_with("workspace/load/"));
+        return sugg;
+    }
+
+    if lane == "workspace/save" {
+        sugg.retain(|s| s == "workspace/save" || s.starts_with("workspace/save/"));
+        return sugg;
+    }
+
+    if lane == "component/" {
+        sugg.retain(|s| s.starts_with("component/"));
+        return sugg;
+    }
+
+    if lane == "workspace/" {
+        sugg.retain(|s| s.starts_with("workspace/"));
+        return sugg;
+    }
+
+    sugg
+}
+
 /// Command palette UI.
 /// Returns actions to dispatch this frame.
 pub fn command_palette(
@@ -196,34 +314,79 @@ pub fn command_palette(
             );
             resp.request_focus();
 
-            let segments = split_segments(&state.palette.query);
+            // Fuzzy search over ALL commands. Arrow keys navigate; Enter executes selection.
+
+            // If the query changes via typing, reset selection.
+            if resp.changed() {
+                state.palette.selected = 0;
+            }
+
+            let all = all_commands(state);
+            let lane = detect_command_lane(&state.palette.query);
+
+            let mut sugg = if state.palette.query.trim().is_empty() {
+                // When empty, show a stable "top" list (not the entire command universe).
+                all.into_iter().take(30).collect::<Vec<_>>()
+            } else {
+                // Pull more, then constrain + truncate.
+                fuzzy_filter_sort(&state.palette.query, &all, 60)
+            };
+
+            sugg = constrain_to_lane(sugg, lane);
+            if sugg.len() > 30 {
+                sugg.truncate(30);
+            }
+
+            // Keyboard navigation
+            let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            let up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+            let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+            if sugg.is_empty() {
+                state.palette.selected = 0;
+            } else if state.palette.selected >= sugg.len() {
+                state.palette.selected = 0;
+            }
+
+            if down && !sugg.is_empty() {
+                state.palette.selected = (state.palette.selected + 1).min(sugg.len() - 1);
+            }
+            if up && !sugg.is_empty() {
+                state.palette.selected = state.palette.selected.saturating_sub(1);
+            }
 
             ui.separator();
             ui.label("Suggestions:");
-            let mut sugg = suggestions_for(state, &segments);
-
-            if !state.palette.query.trim().is_empty() && sugg.is_empty() {
-                sugg = vec![
-                    "workspace/save".into(),
-                    "workspace/load".into(),
-                    "component/file_viewer".into(),
-                    "component/terminal".into(),
-                    "component/context_exporter".into(),
-                    "component/changeset_applier".into(),
-                ];
-            }
 
             egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                for s in &sugg {
-                    if ui.link(s).clicked() {
-                        state.palette.query = s.trim_end_matches('/').to_string();
+                for (i, s) in sugg.iter().enumerate() {
+                    let selected = i == state.palette.selected;
+
+                    let row = ui.selectable_label(selected, s);
+
+                    // When navigating with arrow keys, keep the selected row in view.
+                    if selected {
+                        ui.scroll_to_rect(row.rect, Some(egui::Align::Center));
+                    }
+
+                    if row.clicked() {
+                        state.palette.selected = i;
+                        state.palette.query = s.to_string();
                     }
                 }
             });
 
-            ui.separator();
+            // On Enter, promote selected suggestion into the query before parsing.
+            if enter {
+                if let Some(chosen) = sugg.get(state.palette.selected).cloned() {
+                    state.palette.query = chosen;
+                }
+            }
 
+            let segments = split_segments(&state.palette.query);
             let (cmd, name_arg) = parse_command(&segments);
+
+            ui.separator();
 
             if cmd.is_some() {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, "✓ Valid command (press Enter)");
@@ -231,7 +394,7 @@ pub fn command_palette(
                 ui.colored_label(egui::Color32::LIGHT_RED, "… Incomplete/invalid command");
             }
 
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if enter {
                 if let Some(mut act) = cmd {
                     if let Action::SaveWorkspace { .. } = act {
                         act = Action::SaveWorkspace {

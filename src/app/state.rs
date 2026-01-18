@@ -106,6 +106,9 @@ pub struct AppState {
     pub palette: CommandPaletteState,
     pub palette_last_name: Option<String>,
 
+    pub current_workspace_name: String,
+    pub last_window_title: Option<String>,
+
     pub pending_open_file_path: Option<String>,
     pub pending_open_file_viewer: Option<ComponentId>,
 }
@@ -273,6 +276,9 @@ impl AppState {
 
             palette: CommandPaletteState::default(),
             palette_last_name: None,
+
+            current_workspace_name: "workspace".to_string(),
+            last_window_title: None,
 
             pending_open_file_path: None,
             pending_open_file_viewer: None,
