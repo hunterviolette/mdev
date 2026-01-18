@@ -8,27 +8,64 @@ use crate::app::state::AppState;
 /// - Prefer `edit` for small, anchored changes (more reliable than `git_apply`).
 /// - `post_commands` is kept but defaults to empty; run `cargo run` manually during development.
 pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
-  \"version\": 1,
-  \"description\": \"Optional human-readable note\",
-  \"operations\": [
+  "version": 1,
+  "description": "Minimal schema example. Key rules: replace_block => use `replacement` (NOT `text`). insert_before/insert_after => use `text`. delete_block => no `text`/`replacement`. Every edit change MUST include `match`.",
+  "operations": [
     {
-      \"op\": \"edit\",
-      \"path\": \"src/app/ui/changeset_applier.rs\",
-      \"changes\": [
+      "op": "edit",
+      "path": "src/app/ui/changeset_applier.rs",
+      "changes": [
         {
-          \"action\": \"insert_after\",
-          \"match\": { \"type\": \"literal\", \"mode\": \"normalized_newlines\", \"must_match\": \"exactly_one\", \"text\": \"egui::ScrollArea::vertical()\", \"occurrence\": 1 },
-          \"text\": \"\\n                .id_source(\\\"example_scroll_id\\\")\"
+          "action": "insert_after",
+          "match": {
+            "type": "literal",
+            "mode": "normalized_newlines",
+            "must_match": "exactly_one",
+            "occurrence": 1,
+            "text": "egui::ScrollArea::vertical()"
+          },
+          "text": "\n                .id_source(\"example_scroll_id\")"
+        },
+        {
+          "action": "insert_before",
+          "match": {
+            "type": "literal",
+            "mode": "normalized_newlines",
+            "must_match": "exactly_one",
+            "occurrence": 1,
+            "text": "ui.label(\"Payload\");"
+          },
+          "text": "    // inserted comment (example)\n"
+        },
+        {
+          "action": "replace_block",
+          "match": {
+            "type": "literal",
+            "mode": "normalized_newlines",
+            "must_match": "exactly_one",
+            "occurrence": 1,
+            "text": "ui.label(\"Payload\");"
+          },
+          "replacement": "ui.label(\"Payload (example)\");"
+        },
+        {
+          "action": "delete_block",
+          "match": {
+            "type": "literal",
+            "mode": "normalized_newlines",
+            "must_match": "at_least_one",
+            "text": "TODO:"
+          }
         }
       ]
     },
 
-    { \"op\": \"write\", \"path\": \"src/new_file.rs\", \"contents\": \"fn main() {}\\n\" },
-    { \"op\": \"move\", \"from\": \"old/path.rs\", \"to\": \"new/path.rs\" },
-    { \"op\": \"delete\", \"path\": \"src/old_file.rs\" }
+    { "op": "write", "path": "tmp/changeset_example.txt", "contents": "hello from write\n" },
+    { "op": "move", "from": "tmp/changeset_example.txt", "to": "tmp/changeset_example_moved.txt" },
+    { "op": "delete", "path": "tmp/changeset_example_moved.txt" }
   ],
-  \"post_commands\": [
-    { \"shell\": \"Auto\", \"cmd\": \"cargo build\", \"cwd\": \".\" }
+  "post_commands": [
+    { "shell": "Auto", "cmd": "cargo build", "cwd": "." }
   ]
 }"#;
 
