@@ -108,6 +108,8 @@ pub enum CapabilityRequest {
     GitStageAll { repo: PathBuf },
     GitUnstageAll { repo: PathBuf },
 
+    GitRestorePaths { repo: PathBuf, paths: Vec<String> },
+
     GitCurrentBranch { repo: PathBuf },
     GitListLocalBranches { repo: PathBuf },
     GitListRemotes { repo: PathBuf },

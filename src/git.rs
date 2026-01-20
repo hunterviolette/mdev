@@ -205,6 +205,27 @@ pub fn git_unstage_paths(repo: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn git_restore_paths(repo: &Path, paths: &[String]) -> Result<()> {
+    ensure_git_repo(repo)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    for p in paths {
+        if p.contains("..") {
+            bail!("refusing to restore path with '..': {}", p);
+        }
+    }
+
+    let mut args: Vec<&str> = vec!["restore", "--worktree", "--"];
+    let owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    args.extend(refs);
+
+    let _ = run_git(repo, &args)?;
+    Ok(())
+}
+
 pub fn git_stage_all(repo: &Path) -> Result<()> {
     ensure_git_repo(repo)?;
     let _ = run_git(repo, &["add", "-A"])?;

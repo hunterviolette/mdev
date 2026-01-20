@@ -171,6 +171,12 @@ pub enum Action {
         sc_id: ComponentId,
         path: String,
     },
+
+    DiscardPath {
+        sc_id: ComponentId,
+        path: String,
+        untracked: bool,
+    },
     SetSourceControlBranch {
         sc_id: ComponentId,
         branch: String,

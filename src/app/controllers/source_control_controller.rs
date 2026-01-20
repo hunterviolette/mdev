@@ -79,6 +79,14 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             unstage_path(state, *sc_id, path);
             true
         }
+        Action::DiscardPath {
+            sc_id,
+            path,
+            untracked,
+        } => {
+            discard_path(state, *sc_id, path, *untracked);
+            true
+        }
 
         _ => false,
     }
@@ -230,6 +238,33 @@ fn unstage_path(state: &mut AppState, sc_id: ComponentId, path: &str) {
             refresh(state, sc_id);
         }
         Err(e) => set_err(state, sc_id, format!("Unstage failed: {:#}", e)),
+    }
+}
+
+fn discard_path(state: &mut AppState, sc_id: ComponentId, path: &str, untracked: bool) {
+    let Some(repo) = ensure_repo(state, sc_id) else { return; };
+
+    if untracked {
+        match state.broker.exec(CapabilityRequest::DeleteWorktreePath {
+            repo,
+            path: path.to_string(),
+        }) {
+            Ok(_) => {
+                set_ok(state, sc_id, format!("Deleted untracked: {}", path));
+                refresh(state, sc_id);
+            }
+            Err(e) => set_err(state, sc_id, format!("Delete failed: {:#}", e)),
+        }
+        return;
+    }
+
+    let paths = vec![path.to_string()];
+    match state.broker.exec(CapabilityRequest::GitRestorePaths { repo, paths }) {
+        Ok(_) => {
+            set_ok(state, sc_id, format!("Discarded changes: {}", path));
+            refresh(state, sc_id);
+        }
+        Err(e) => set_err(state, sc_id, format!("Discard failed: {:#}", e)),
     }
 }
 

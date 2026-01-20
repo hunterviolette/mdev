@@ -129,6 +129,10 @@ impl CapabilityBroker {
                 git::git_unstage_paths(&repo, &paths)?;
                 Ok(CapabilityResponse::Unit)
             }
+            CapabilityRequest::GitRestorePaths { repo, paths } => {
+                git::git_restore_paths(&repo, &paths)?;
+                Ok(CapabilityResponse::Unit)
+            }
             CapabilityRequest::GitStageAll { repo } => {
                 git::git_stage_all(&repo)?;
                 Ok(CapabilityResponse::Unit)
