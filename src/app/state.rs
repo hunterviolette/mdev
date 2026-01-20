@@ -58,6 +58,35 @@ pub struct ChangeSetApplierState {
     pub status: Option<String>,
 }
 
+// Source control
+#[derive(Clone, Debug)]
+pub struct SourceControlFile {
+    pub path: String,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub staged: bool,
+    pub untracked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceControlState {
+    pub branch: String,
+    pub branch_options: Vec<String>,
+    pub remote: String,
+    pub remote_options: Vec<String>,
+
+    pub commit_message: String,
+
+    pub files: Vec<SourceControlFile>,
+    pub selected: HashSet<String>,
+
+    pub last_output: Option<String>,
+    pub last_error: Option<String>,
+
+    // internal: trigger initial refresh
+    pub needs_refresh: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextExportMode {
     EntireRepo,
@@ -93,6 +122,8 @@ pub struct AppState {
     pub context_exporters: HashMap<ComponentId, ContextExporterState>,
 
     pub changeset_appliers: HashMap<ComponentId, ChangeSetApplierState>,
+
+    pub source_controls: HashMap<ComponentId, SourceControlState>,
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
@@ -252,6 +283,7 @@ impl AppState {
             terminals: HashMap::new(),
             context_exporters: HashMap::new(),
             changeset_appliers: HashMap::new(),
+            source_controls: HashMap::new(),
 
             theme: ThemeState {
                 code_theme: CodeTheme::dark(),

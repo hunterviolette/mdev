@@ -335,6 +335,7 @@ impl AppState {
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
+                self.rebuild_source_controls_from_layout();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -364,6 +365,7 @@ impl AppState {
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
+                self.rebuild_source_controls_from_layout();
 
                 // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();

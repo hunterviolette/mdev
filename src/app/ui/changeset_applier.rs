@@ -9,7 +9,7 @@ use crate::app::state::AppState;
 /// - `post_commands` is kept but defaults to empty; run `cargo run` manually during development.
 pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
   "version": 1,
-  "description": "Minimal schema example. Key rules: replace_block => use `replacement` (NOT `text`). insert_before/insert_after => use `text`. delete_block => no `text`/`replacement`. Every edit change MUST include `match`.",
+  "description": Schema example. Do not waste tokens/operations inserting or adjusting comments unless required.
   "operations": [
     {
       "op": "edit",
@@ -63,11 +63,12 @@ pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
     { "op": "write", "path": "tmp/changeset_example.txt", "contents": "hello from write\n" },
     { "op": "move", "from": "tmp/changeset_example.txt", "to": "tmp/changeset_example_moved.txt" },
     { "op": "delete", "path": "tmp/changeset_example_moved.txt" }
-  ],
-  "post_commands": [
-    { "shell": "Auto", "cmd": "cargo build", "cwd": "." }
   ]
 }"#;
+
+//   "post_commands": [
+//     { "shell": "Auto", "cmd": "cargo build", "cwd": "." }
+//   ]
 
 pub fn changeset_applier_panel(
     ctx: &egui::Context,
@@ -121,10 +122,11 @@ pub fn changeset_applier_panel(
 
     ui.add_space(8.0);
 
-    // Keep this component from "blowing out" its layout.
-    // Use two scrollable panes with capped heights.
     let available_h = ui.available_height().max(200.0);
-    let pane_h = (available_h * 0.45).clamp(140.0, 320.0);
+    let pane_h = ((available_h - 8.0) * 0.5).max(120.0);
+
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+    let desired_rows = ((pane_h / row_h).floor() as usize).max(6);
 
     // Payload pane
     ui.label("Payload");
@@ -133,12 +135,14 @@ pub fn changeset_applier_panel(
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_source("changeset_applier_payload_scroll")
+                .auto_shrink([false, false])
                 .max_height(pane_h)
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut st.payload)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
+                            .desired_rows(desired_rows)
                             .hint_text("Paste JSON payload here..."),
                     );
                 });
@@ -154,12 +158,14 @@ pub fn changeset_applier_panel(
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_source("changeset_applier_output_scroll")
+                .auto_shrink([false, false])
                 .max_height(pane_h)
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut output)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
+                            .desired_rows(desired_rows)
                             .interactive(false),
                     );
                 });

@@ -2,6 +2,7 @@
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::process::Command;
 
 use crate::app::state::WORKTREE_REF;
@@ -88,6 +89,299 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
 
     Ok(all)
 }
+
+// -----------------------------------------------------------------------------
+// Source control (git) capabilities
+// -----------------------------------------------------------------------------
+
+fn run_git_text_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, String, String)> {
+    let (code, stdout, stderr) = run_git_allow_fail(repo, args)?;
+    Ok((
+        code,
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
+    ))
+}
+
+pub fn git_list_local_branches(repo: &Path) -> Result<Vec<String>> {
+    ensure_git_repo(repo)?;
+    let out = run_git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        .context("listing local branches failed")?;
+    let mut v = split_lines(&out);
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
+pub fn git_list_remotes(repo: &Path) -> Result<Vec<String>> {
+    ensure_git_repo(repo)?;
+    let out = run_git(repo, &["remote"]).context("listing remotes failed")?;
+    let mut v = split_lines(&out);
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
+pub fn git_current_branch(repo: &Path) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let out = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).context("current branch failed")?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+pub fn git_fetch(repo: &Path, remote: Option<&str>) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let r = remote.unwrap_or("origin");
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &["fetch", r])?;
+    Ok(format!("git fetch {}\n[exit: {}]\n{}{}", r, code, stdout, stderr))
+}
+
+pub fn git_pull(repo: &Path, remote: Option<&str>, branch: Option<&str>) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let r = remote.unwrap_or("origin");
+    let args: Vec<&str> = match branch {
+        Some(b) if !b.trim().is_empty() => vec!["pull", r, b],
+        _ => vec!["pull", r],
+    };
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &args)?;
+    Ok(format!("git {}\n[exit: {}]\n{}{}", args.join(" "), code, stdout, stderr))
+}
+
+pub fn git_push(repo: &Path, remote: Option<&str>, branch: Option<&str>) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let r = remote.unwrap_or("origin");
+    let args: Vec<&str> = match branch {
+        Some(b) if !b.trim().is_empty() => vec!["push", r, b],
+        _ => vec!["push", r],
+    };
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &args)?;
+    Ok(format!("git {}\n[exit: {}]\n{}{}", args.join(" "), code, stdout, stderr))
+}
+
+pub fn git_checkout_branch(repo: &Path, branch: &str, create_if_missing: bool) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let b = branch.trim();
+    if b.is_empty() {
+        bail!("branch is empty");
+    }
+
+    let args: Vec<&str> = if create_if_missing {
+        vec!["checkout", "-b", b]
+    } else {
+        vec!["checkout", b]
+    };
+
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &args)?;
+    Ok(format!("git {}\n[exit: {}]\n{}{}", args.join(" "), code, stdout, stderr))
+}
+
+pub fn git_stage_paths(repo: &Path, paths: &[String]) -> Result<()> {
+    ensure_git_repo(repo)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    for p in paths {
+        if p.contains("..") {
+            bail!("refusing to stage path with '..': {}", p);
+        }
+    }
+
+    let mut args: Vec<&str> = vec!["add", "--"];
+    let owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    args.extend(refs);
+
+    let _ = run_git(repo, &args)?;
+    Ok(())
+}
+
+pub fn git_unstage_paths(repo: &Path, paths: &[String]) -> Result<()> {
+    ensure_git_repo(repo)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    for p in paths {
+        if p.contains("..") {
+            bail!("refusing to unstage path with '..': {}", p);
+        }
+    }
+
+    let mut args: Vec<&str> = vec!["restore", "--staged", "--"];
+    let owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    args.extend(refs);
+
+    let _ = run_git(repo, &args)?;
+    Ok(())
+}
+
+pub fn git_restore_paths(repo: &Path, paths: &[String]) -> Result<()> {
+    ensure_git_repo(repo)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    for p in paths {
+        if p.contains("..") {
+            bail!("refusing to restore path with '..': {}", p);
+        }
+    }
+
+    let mut args: Vec<&str> = vec!["restore", "--worktree", "--"];
+    let owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    args.extend(refs);
+
+    let _ = run_git(repo, &args)?;
+    Ok(())
+}
+
+pub fn git_stage_all(repo: &Path) -> Result<()> {
+    ensure_git_repo(repo)?;
+    let _ = run_git(repo, &["add", "-A"])?;
+    Ok(())
+}
+
+pub fn git_unstage_all(repo: &Path) -> Result<()> {
+    ensure_git_repo(repo)?;
+    // `git restore` does not support `-A`. To unstage everything, provide a pathspec.
+    // Running from repo root, "." covers the whole worktree.
+    let _ = run_git(repo, &["restore", "--staged", "--", "."])?;
+    Ok(())
+}
+
+pub fn git_commit(repo: &Path, message: &str, branch: Option<&str>) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let msg = message.trim();
+    if msg.is_empty() {
+        bail!("commit message is empty");
+    }
+
+    let mut log = String::new();
+
+    if let Some(b) = branch {
+        let b = b.trim();
+        if !b.is_empty() {
+            let out = git_checkout_branch(repo, b, false)?;
+            log.push_str(&out);
+            if !log.ends_with('\n') {
+                log.push('\n');
+            }
+        }
+    }
+
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &["commit", "-m", msg])?;
+    log.push_str(&format!("git commit -m <msg>\n[exit: {}]\n{}{}", code, stdout, stderr));
+    Ok(log)
+}
+
+pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
+    use crate::capabilities::{GitStatusEntry, GitStatusResult};
+
+    ensure_git_repo(repo)?;
+
+    let out = run_git(repo, &["status", "--porcelain=v2", "-b", "-z"]).context("git status failed")?;
+    let s = String::from_utf8_lossy(&out);
+    let parts: Vec<&str> = s.split('\0').collect();
+
+    let mut branch: Option<String> = None;
+    let mut upstream: Option<String> = None;
+    let mut ahead: u32 = 0;
+    let mut behind: u32 = 0;
+
+    let mut files: Vec<GitStatusEntry> = Vec::new();
+
+    for p in parts {
+        if p.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = p.strip_prefix("# ") {
+            if let Some(v) = rest.strip_prefix("branch.head ") {
+                let v = v.trim();
+                if v != "(detached)" {
+                    branch = Some(v.to_string());
+                } else {
+                    branch = Some("HEAD".to_string());
+                }
+                continue;
+            }
+            if let Some(v) = rest.strip_prefix("branch.upstream ") {
+                upstream = Some(v.trim().to_string());
+                continue;
+            }
+            if let Some(v) = rest.strip_prefix("branch.ab ") {
+                let toks: Vec<&str> = v.split_whitespace().collect();
+                for t in toks {
+                    if let Some(a) = t.strip_prefix('+') {
+                        ahead = a.parse::<u32>().unwrap_or(0);
+                    } else if let Some(b) = t.strip_prefix('-') {
+                        behind = b.parse::<u32>().unwrap_or(0);
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+
+        if let Some(rest) = p.strip_prefix("? ") {
+            let path = rest.trim().to_string();
+            files.push(GitStatusEntry {
+                path,
+                index_status: "?".to_string(),
+                worktree_status: "?".to_string(),
+                staged: false,
+                untracked: true,
+            });
+            continue;
+        }
+
+        if p.starts_with("1 ") || p.starts_with("2 ") {
+            let mut it = p.split_whitespace();
+            let _rec_type = it.next();
+            let xy = it.next().unwrap_or("..");
+            let x = xy.chars().nth(0).unwrap_or('.');
+            let y = xy.chars().nth(1).unwrap_or('.');
+
+            let path = p.rsplit_once(' ').map(|(_, b)| b).unwrap_or("").trim();
+
+            let index_status = x.to_string();
+            let worktree_status = y.to_string();
+            let staged = x != '.' && x != ' ';
+            let untracked = false;
+
+            if !path.is_empty() {
+                files.push(GitStatusEntry {
+                    path: path.to_string(),
+                    index_status,
+                    worktree_status,
+                    staged,
+                    untracked,
+                });
+            }
+            continue;
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut dedup: Vec<GitStatusEntry> = Vec::new();
+    for f in files.into_iter().rev() {
+        if seen.insert(f.path.clone()) {
+            dedup.push(f);
+        }
+    }
+    dedup.reverse();
+
+    Ok(GitStatusResult {
+        branch,
+        upstream,
+        ahead,
+        behind,
+        files: dedup,
+    })
+}
+
 
 /// Returns raw bytes of file content at `spec` where spec is like "<ref>:<path>".
 pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {

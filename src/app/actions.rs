@@ -18,6 +18,7 @@ pub enum ComponentKind {
     Terminal,
     ContextExporter,
     ChangeSetApplier,
+    SourceControl,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -136,6 +137,77 @@ pub enum Action {
     },
     ClearChangeSet {
         applier_id: ComponentId,
+    },
+
+    // ---------------------------
+    // Source control (git)
+    // ---------------------------
+    RefreshSourceControl {
+        sc_id: ComponentId,
+    },
+    ToggleSourceControlSelect {
+        sc_id: ComponentId,
+        path: String,
+    },
+    StageSelected {
+        sc_id: ComponentId,
+    },
+    UnstageSelected {
+        sc_id: ComponentId,
+    },
+    StageAll {
+        sc_id: ComponentId,
+    },
+    UnstageAll {
+        sc_id: ComponentId,
+    },
+
+    StagePath {
+        sc_id: ComponentId,
+        path: String,
+    },
+
+    UnstagePath {
+        sc_id: ComponentId,
+        path: String,
+    },
+
+    DiscardPath {
+        sc_id: ComponentId,
+        path: String,
+        untracked: bool,
+    },
+    SetSourceControlBranch {
+        sc_id: ComponentId,
+        branch: String,
+    },
+    SetSourceControlRemote {
+        sc_id: ComponentId,
+        remote: String,
+    },
+    RefreshSourceControlBranchRemoteLists {
+        sc_id: ComponentId,
+    },
+    CheckoutBranch {
+        sc_id: ComponentId,
+        create_if_missing: bool,
+    },
+    FetchRemote {
+        sc_id: ComponentId,
+    },
+    PullRemote {
+        sc_id: ComponentId,
+    },
+    SetCommitMessage {
+        sc_id: ComponentId,
+        msg: String,
+    },
+    CommitStaged {
+        sc_id: ComponentId,
+    },
+
+    CommitAndPush {
+        sc_id: ComponentId,
     },
 
     // ---------------------------

@@ -38,6 +38,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.rebuild_terminals_from_layout();
             state.rebuild_context_exporters_from_layout();
             state.rebuild_changeset_appliers_from_layout(); // NEW
+            state.rebuild_source_controls_from_layout();
+            state.rebuild_source_controls_from_layout(); // NEW
             true
         }
         _ => false,
@@ -76,6 +78,43 @@ impl AppState {
                         skip_binary: true,
                         mode: ContextExportMode::EntireRepo,
                         status: None,
+                    },
+                );
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
+            ComponentKind::SourceControl => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Source Control {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [160.0, 160.0],
+                        size: [760.0, 620.0],
+                    },
+                );
+
+                self.source_controls.insert(
+                    id,
+                    crate::app::state::SourceControlState {
+                        branch: "".to_string(),
+                        branch_options: vec![],
+                        remote: "origin".to_string(),
+                        remote_options: vec!["origin".to_string()],
+                        commit_message: String::new(),
+                        files: vec![],
+                        selected: std::collections::HashSet::new(),
+                        last_output: None,
+                        last_error: None,
+                        needs_refresh: true,
                     },
                 );
 
@@ -121,6 +160,7 @@ impl AppState {
                     ComponentKind::FileViewer
                     | ComponentKind::Terminal
                     | ComponentKind::ContextExporter
+                    | ComponentKind::SourceControl
                     | ComponentKind::ChangeSetApplier => unreachable!(),
                 };
 
@@ -188,6 +228,8 @@ impl AppState {
         self.context_exporters.remove(&id);
         self.terminals.remove(&id);
         self.changeset_appliers.remove(&id); // NEW
+        self.source_controls.remove(&id);
+        self.source_controls.remove(&id); // NEW
 
         if self.active_file_viewer == Some(id) {
             self.active_file_viewer = self

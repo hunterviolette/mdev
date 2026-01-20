@@ -113,6 +113,88 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
+            // -----------------------------------------------------------------
+            // Source control (git)
+            // -----------------------------------------------------------------
+            CapabilityRequest::GitStatus { repo } => {
+                let st = git::git_status(&repo)?;
+                Ok(CapabilityResponse::GitStatus(st))
+            }
+
+            CapabilityRequest::GitStagePaths { repo, paths } => {
+                git::git_stage_paths(&repo, &paths)?;
+                Ok(CapabilityResponse::Unit)
+            }
+            CapabilityRequest::GitUnstagePaths { repo, paths } => {
+                git::git_unstage_paths(&repo, &paths)?;
+                Ok(CapabilityResponse::Unit)
+            }
+            CapabilityRequest::GitRestorePaths { repo, paths } => {
+                git::git_restore_paths(&repo, &paths)?;
+                Ok(CapabilityResponse::Unit)
+            }
+            CapabilityRequest::GitStageAll { repo } => {
+                git::git_stage_all(&repo)?;
+                Ok(CapabilityResponse::Unit)
+            }
+            CapabilityRequest::GitUnstageAll { repo } => {
+                git::git_unstage_all(&repo)?;
+                Ok(CapabilityResponse::Unit)
+            }
+
+            CapabilityRequest::GitCurrentBranch { repo } => {
+                let b = git::git_current_branch(&repo)?;
+                Ok(CapabilityResponse::GitBranch(b))
+            }
+            CapabilityRequest::GitListLocalBranches { repo } => {
+                let bs = git::git_list_local_branches(&repo)?;
+                Ok(CapabilityResponse::GitBranches(bs))
+            }
+            CapabilityRequest::GitListRemotes { repo } => {
+                let rs = git::git_list_remotes(&repo)?;
+                Ok(CapabilityResponse::GitRemotes(rs))
+            }
+
+            CapabilityRequest::GitCheckoutBranch {
+                repo,
+                branch,
+                create_if_missing,
+            } => {
+                let out = git::git_checkout_branch(&repo, &branch, create_if_missing)?;
+                Ok(CapabilityResponse::Text(out))
+            }
+
+            CapabilityRequest::GitFetch { repo, remote } => {
+                let out = git::git_fetch(&repo, remote.as_deref())?;
+                Ok(CapabilityResponse::Text(out))
+            }
+            CapabilityRequest::GitPull {
+                repo,
+                remote,
+                branch,
+            } => {
+                let out = git::git_pull(&repo, remote.as_deref(), branch.as_deref())?;
+                Ok(CapabilityResponse::Text(out))
+            }
+
+            CapabilityRequest::GitCommit {
+                repo,
+                message,
+                branch,
+            } => {
+                let out = git::git_commit(&repo, &message, branch.as_deref())?;
+                Ok(CapabilityResponse::Text(out))
+            }
+
+            CapabilityRequest::GitPush {
+                repo,
+                remote,
+                branch,
+            } => {
+                let out = git::git_push(&repo, remote.as_deref(), branch.as_deref())?;
+                Ok(CapabilityResponse::Text(out))
+            }
+
             CapabilityRequest::RunShellCommand { shell, cmd, cwd } => {
                 let out = self
                     .platform
