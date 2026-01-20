@@ -10,3 +10,4 @@ pub mod context_exporter;
 pub mod code_editor;
 pub mod changeset_applier;
 pub mod source_control;
+pub mod diff_viewer;

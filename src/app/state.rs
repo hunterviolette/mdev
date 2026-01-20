@@ -87,6 +87,67 @@ pub struct SourceControlState {
     pub needs_refresh: bool,
 }
 
+// -----------------------------------------------------------------
+// Diff viewer
+// -----------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffRowKind {
+    Equal,
+    Add,
+    Delete,
+    Change,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffRow {
+    pub left_no: Option<usize>,
+    pub right_no: Option<usize>,
+    pub left: Option<String>,
+    pub right: Option<String>,
+    pub kind: DiffRowKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffViewerState {
+    pub path: Option<String>,
+
+    /// Left side (old)
+    pub from_ref: String,
+    /// Right side (new)
+    pub to_ref: String,
+
+    /// Full, raw side-by-side rows (entire file)
+    pub rows: Vec<DiffRow>,
+
+    /// UI: if true, show only hunks (changes + surrounding context)
+    pub only_changes: bool,
+
+    /// UI: number of surrounding context lines when `only_changes` is enabled
+    pub context_lines: usize,
+
+    pub last_error: Option<String>,
+
+    pub needs_refresh: bool,
+}
+
+// Note: additional UI preferences for the diff viewer
+
+impl DiffViewerState {
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            from_ref: "HEAD".to_string(),
+            to_ref: WORKTREE_REF.to_string(),
+            rows: vec![],
+            only_changes: true,
+            context_lines: 3,
+            last_error: None,
+            needs_refresh: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextExportMode {
     EntireRepo,
@@ -117,6 +178,9 @@ pub struct AppState {
 
     pub file_viewers: HashMap<ComponentId, FileViewerState>,
     pub active_file_viewer: Option<ComponentId>,
+
+    pub diff_viewers: HashMap<ComponentId, DiffViewerState>,
+    pub active_diff_viewer: Option<ComponentId>,
 
     pub terminals: HashMap<ComponentId, TerminalState>,
     pub context_exporters: HashMap<ComponentId, ContextExporterState>,
@@ -279,6 +343,9 @@ impl AppState {
 
             file_viewers,
             active_file_viewer: Some(2),
+
+            diff_viewers: HashMap::new(),
+            active_diff_viewer: None,
 
             terminals: HashMap::new(),
             context_exporters: HashMap::new(),

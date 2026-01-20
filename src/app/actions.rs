@@ -19,6 +19,7 @@ pub enum ComponentKind {
     ContextExporter,
     ChangeSetApplier,
     SourceControl,
+    DiffViewer,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -47,6 +48,25 @@ pub enum Action {
     CollapseAll,
 
     OpenFile(String),
+
+    // ---------------------------
+    // Diff viewer actions
+    // ---------------------------
+    /// Open a repo-relative path in a Diff Viewer. If no Diff Viewer exists,
+    /// one is created; otherwise this attaches to the last active Diff Viewer.
+    OpenDiffViewerForPath { path: String },
+
+    /// Open/attach a Diff Viewer for a path with explicit left/right refs.
+    OpenDiffViewerForPathWithRefs {
+        path: String,
+        from_ref: String,
+        to_ref: String,
+    },
+
+    RefreshDiffViewer {
+        viewer_id: ComponentId,
+    },
+
 
     // ---------------------------
     // File viewer actions

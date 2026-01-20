@@ -37,9 +37,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             // Ephemeral components rebuilt from layout
             state.rebuild_terminals_from_layout();
             state.rebuild_context_exporters_from_layout();
-            state.rebuild_changeset_appliers_from_layout(); // NEW
+            state.rebuild_changeset_appliers_from_layout();
             state.rebuild_source_controls_from_layout();
-            state.rebuild_source_controls_from_layout(); // NEW
+            state.rebuild_diff_viewers_from_layout();
             true
         }
         _ => false,
@@ -51,6 +51,30 @@ impl AppState {
         match kind {
             ComponentKind::FileViewer => self.new_file_viewer(),
             ComponentKind::Terminal => self.new_terminal(),
+            ComponentKind::DiffViewer => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Diff Viewer {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [180.0, 180.0],
+                        size: [980.0, 720.0],
+                    },
+                );
+
+                self.diff_viewers.insert(id, crate::app::state::DiffViewerState::new());
+                self.active_diff_viewer = Some(id);
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
 
             ComponentKind::ContextExporter => {
                 self.layout.merge_with_defaults();
@@ -161,7 +185,8 @@ impl AppState {
                     | ComponentKind::Terminal
                     | ComponentKind::ContextExporter
                     | ComponentKind::SourceControl
-                    | ComponentKind::ChangeSetApplier => unreachable!(),
+                    | ComponentKind::ChangeSetApplier
+                    | ComponentKind::DiffViewer => unreachable!(),
                 };
 
                 self.layout

@@ -7,6 +7,8 @@ use crate::model::AnalysisResult;
 pub enum FileSource {
     /// Read from `git show <ref>:<path>`
     GitRef(String),
+    /// Read from the git index (staged) via `git show :<path>`
+    Index,
     /// Read from disk (working tree)
     Worktree,
 }

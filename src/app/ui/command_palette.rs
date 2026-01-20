@@ -19,6 +19,7 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "context_exporter" => Some(ComponentKind::ContextExporter),
         "changeset_applier" => Some(ComponentKind::ChangeSetApplier),
         "source_control" => Some(ComponentKind::SourceControl),
+        "diff_viewer" => Some(ComponentKind::DiffViewer),
         _ => None,
     }
 }
@@ -107,7 +108,8 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/terminal".into(),
                     "component/context_exporter".into(),
                     "component/changeset_applier".into(),
-                    "component/source_control".into()
+                    "component/source_control".into(),
+                    "component/diff_viewer".into()
                 ]
             } else {
                 vec![]

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::AppState;
+use crate::app::state::WORKTREE_REF;
 
 fn overlay_bounds(ui: &egui::Ui) -> egui::Rect {
     // Constrain overlays to the clipped region of this component so they stay
@@ -87,7 +88,7 @@ pub fn source_control_panel(
 ) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::new();
 
-    let Some(repo) = state.inputs.repo.as_ref() else {
+    let Some(_repo) = state.inputs.repo.as_ref() else {
         ui.label("No repo selected. Pick a folder first.");
         return actions;
     };
@@ -450,7 +451,19 @@ pub fn source_control_panel(
                     // Show combined code for context (e.g. AM/MM), but this list is the staged pipeline.
                     let code = format!("{}{}", f.index_status, f.worktree_status);
                     ui.monospace(code);
-                    ui.monospace(&f.path);
+
+                    // Clickable filename -> open/attach Diff Viewer
+                    // STAGED list (like VS Code): INDEX (staged) vs WORKTREE
+                    if ui
+                        .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
+                        .clicked()
+                    {
+                        actions.push(Action::OpenDiffViewerForPathWithRefs {
+                            path: f.path.clone(),
+                            from_ref: "HEAD".to_string(),
+                            to_ref: "INDEX".to_string(),
+                        });
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Unstage").clicked() {
@@ -497,7 +510,19 @@ pub fn source_control_panel(
 
                     let code = format!("{}{}", f.index_status, f.worktree_status);
                     ui.monospace(code);
-                    ui.monospace(&f.path);
+
+                    // Clickable filename -> open/attach Diff Viewer
+                    // UNSTAGED list (like VS Code): HEAD vs WORKTREE
+                    if ui
+                        .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
+                        .clicked()
+                    {
+                        actions.push(Action::OpenDiffViewerForPathWithRefs {
+                            path: f.path.clone(),
+                            from_ref: "INDEX".to_string(),
+                            to_ref: WORKTREE_REF.to_string(),
+                        });
+                    }
 
                     if f.untracked {
                         ui.label("(untracked)");

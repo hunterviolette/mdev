@@ -4,9 +4,9 @@ use super::actions::Action;
 use super::state::AppState;
 
 use super::controllers::{
-    analysis_controller, changeset_controller, context_exporter_controller, file_viewer_controller,
-    layout_controller, palette_controller, source_control_controller, terminal_controller, tree_controller,
-    workspace_controller,
+    analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
+    file_viewer_controller, layout_controller, palette_controller, source_control_controller,
+    terminal_controller, tree_controller, workspace_controller,
 };
 
 impl AppState {
@@ -34,6 +34,9 @@ impl AppState {
             return;
         }
         if source_control_controller::handle(self, &action) {
+            return;
+        }
+        if diff_viewer_controller::handle(self, &action) {
             return;
         }
         if layout_controller::handle(self, &action) {
