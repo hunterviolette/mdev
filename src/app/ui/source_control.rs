@@ -355,9 +355,8 @@ pub fn source_control_panel(
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Note: push is not currently wired in Action enum.
                             if ui.add_enabled(can_commit, egui::Button::new("Commit + Push")).clicked() {
-                                actions.push(Action::CommitStaged { sc_id });
+                                actions.push(Action::CommitAndPush { sc_id });
                                 actions.push(Action::RefreshSourceControl { sc_id });
                                 commit_open = false;
                             }

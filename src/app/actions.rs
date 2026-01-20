@@ -206,6 +206,10 @@ pub enum Action {
         sc_id: ComponentId,
     },
 
+    CommitAndPush {
+        sc_id: ComponentId,
+    },
+
     // ---------------------------
     // Layout / components
     // ---------------------------

@@ -71,6 +71,12 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             commit(state, *sc_id);
             true
         }
+        Action::CommitAndPush { sc_id } => {
+            // Compose existing operations instead of duplicating logic.
+            commit(state, *sc_id);
+            push_remote(state, *sc_id);
+            true
+        }
         Action::StagePath { sc_id, path } => {
             stage_path(state, *sc_id, path);
             true
@@ -430,6 +436,99 @@ fn commit(state: &mut AppState, sc_id: ComponentId) {
         }
         Ok(_) => set_err(state, sc_id, "Unexpected response from GitCommit.".to_string()),
         Err(e) => set_err(state, sc_id, format!("Commit failed: {:#}", e)),
+    }
+}
+
+fn commit_and_push(state: &mut AppState, sc_id: ComponentId) {
+    let Some(repo) = ensure_repo(state, sc_id) else { return; };
+
+    let (msg, branch, remote) = state
+        .source_controls
+        .get(&sc_id)
+        .map(|sc| {
+            (
+                sc.commit_message.trim().to_string(),
+                sc.branch.trim().to_string(),
+                sc.remote.trim().to_string(),
+            )
+        })
+        .unwrap_or_default();
+
+    if msg.is_empty() {
+        set_err(state, sc_id, "Commit message is empty.".to_string());
+        return;
+    }
+
+    let branch_opt = if branch.is_empty() { None } else { Some(branch) };
+    let remote_opt = if remote.is_empty() { None } else { Some(remote) };
+
+    // 1) Commit
+    let commit_out = match state.broker.exec(CapabilityRequest::GitCommit {
+        repo: repo.clone(),
+        message: msg,
+        branch: branch_opt.clone(),
+    }) {
+        Ok(CapabilityResponse::Text(out)) => out,
+        Ok(_) => {
+            set_err(state, sc_id, "Unexpected response from GitCommit.".to_string());
+            return;
+        }
+        Err(e) => {
+            set_err(state, sc_id, format!("Commit failed: {:#}", e));
+            return;
+        }
+    };
+
+    // 2) Push
+    let push_out = match state.broker.exec(CapabilityRequest::GitPush {
+        repo: repo.clone(),
+        remote: remote_opt,
+        branch: branch_opt,
+    }) {
+        Ok(CapabilityResponse::Text(out)) => out,
+        Ok(_) => {
+            set_err(state, sc_id, "Unexpected response from GitPush.".to_string());
+            return;
+        }
+        Err(e) => {
+            set_err(state, sc_id, format!("Push failed: {:#}", e));
+            return;
+        }
+    };
+
+    if let Some(sc) = state.source_controls.get_mut(&sc_id) {
+        sc.commit_message.clear();
+    }
+
+    set_ok(state, sc_id, format!("{}\n\n{}", commit_out, push_out));
+}
+
+fn push_remote(state: &mut AppState, sc_id: ComponentId) {
+    let Some(repo) = ensure_repo(state, sc_id) else { return; };
+
+    let (remote, branch) = state
+        .source_controls
+        .get(&sc_id)
+        .map(|sc| (sc.remote.trim().to_string(), sc.branch.trim().to_string()))
+        .unwrap_or_default();
+
+    let remote = if remote.is_empty() { None } else { Some(remote) };
+    let branch = if branch.is_empty() { None } else { Some(branch) };
+
+    match state.broker.exec(CapabilityRequest::GitPush { repo, remote, branch }) {
+        Ok(CapabilityResponse::Text(out)) => {
+            // Append push output if we already have commit output.
+            if let Some(sc) = state.source_controls.get_mut(&sc_id) {
+                if let Some(existing) = sc.last_output.take() {
+                    sc.last_output = Some(format!("{}\n\n{}", existing, out));
+                } else {
+                    sc.last_output = Some(out);
+                }
+                sc.last_error = None;
+            }
+        }
+        Ok(_) => set_err(state, sc_id, "Unexpected response from GitPush.".to_string()),
+        Err(e) => set_err(state, sc_id, format!("Push failed: {:#}", e)),
     }
 }
 

@@ -146,6 +146,17 @@ pub fn git_pull(repo: &Path, remote: Option<&str>, branch: Option<&str>) -> Resu
     Ok(format!("git {}\n[exit: {}]\n{}{}", args.join(" "), code, stdout, stderr))
 }
 
+pub fn git_push(repo: &Path, remote: Option<&str>, branch: Option<&str>) -> Result<String> {
+    ensure_git_repo(repo)?;
+    let r = remote.unwrap_or("origin");
+    let args: Vec<&str> = match branch {
+        Some(b) if !b.trim().is_empty() => vec!["push", r, b],
+        _ => vec!["push", r],
+    };
+    let (code, stdout, stderr) = run_git_text_allow_fail(repo, &args)?;
+    Ok(format!("git {}\n[exit: {}]\n{}{}", args.join(" "), code, stdout, stderr))
+}
+
 pub fn git_checkout_branch(repo: &Path, branch: &str, create_if_missing: bool) -> Result<String> {
     ensure_git_repo(repo)?;
     let b = branch.trim();

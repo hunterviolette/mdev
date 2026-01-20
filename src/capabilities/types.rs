@@ -133,6 +133,12 @@ pub enum CapabilityRequest {
         branch: Option<String>,
     },
 
+    GitPush {
+        repo: PathBuf,
+        remote: Option<String>,
+        branch: Option<String>,
+    },
+
     RunShellCommand {
         shell: TerminalShell,
         cmd: String,

@@ -186,6 +186,15 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Text(out))
             }
 
+            CapabilityRequest::GitPush {
+                repo,
+                remote,
+                branch,
+            } => {
+                let out = git::git_push(&repo, remote.as_deref(), branch.as_deref())?;
+                Ok(CapabilityResponse::Text(out))
+            }
+
             CapabilityRequest::RunShellCommand { shell, cmd, cwd } => {
                 let out = self
                     .platform
