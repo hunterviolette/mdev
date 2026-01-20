@@ -17,7 +17,8 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "summary" => Some(ComponentKind::Summary),
         "terminal" | "term" => Some(ComponentKind::Terminal),
         "context_exporter" => Some(ComponentKind::ContextExporter),
-        "changeset_applier" | "changeset" | "patch" => Some(ComponentKind::ChangeSetApplier),
+        "changeset_applier" => Some(ComponentKind::ChangeSetApplier),
+        "source_control" => Some(ComponentKind::SourceControl),
         _ => None,
     }
 }
@@ -106,6 +107,7 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/terminal".into(),
                     "component/context_exporter".into(),
                     "component/changeset_applier".into(),
+                    "component/source_control".into()
                 ]
             } else {
                 vec![]
@@ -218,6 +220,7 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "component/terminal".into(),
         "component/context_exporter".into(),
         "component/changeset_applier".into(),
+        "component/source_control".into(),
     ];
 
     let mut names = state.list_workspaces();

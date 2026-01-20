@@ -7,3 +7,4 @@ pub mod terminal_controller;
 pub mod tree_controller;
 pub mod workspace_controller;
 pub mod changeset_controller;
+pub mod source_control_controller;
