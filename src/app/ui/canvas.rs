@@ -31,6 +31,13 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
             let clip_rect = canvas_rect.translate(-canvas_rect.min.to_vec2());
             ui.set_clip_rect(clip_rect);
 
+            // Optional faint canvas background tint (per-workspace).
+            // Drawn behind all component windows.
+            if let Some([r, g, b, a]) = state.ui.canvas_bg_tint {
+                let col = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                ui.painter().rect_filled(clip_rect, 0.0, col);
+            }
+
             let max_canvas_w = clip_rect.width().max(1.0);
             let max_canvas_h = clip_rect.height().max(1.0);
 

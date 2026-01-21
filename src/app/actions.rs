@@ -50,6 +50,18 @@ pub enum Action {
     OpenFile(String),
 
     // ---------------------------
+    // UI prefs
+    // ---------------------------
+    /// Open the "canvas tint" popup (launched via command palette).
+    OpenCanvasTintPopup,
+    /// Close the "canvas tint" popup.
+    CloseCanvasTintPopup,
+    /// Set the canvas background tint (stored in UiState and persisted in workspaces).
+    /// - None disables the tint.
+    /// - Some([r,g,b,a]) uses sRGBA bytes.
+    SetCanvasBgTint { rgba: Option<[u8; 4]> },
+
+    // ---------------------------
     // Diff viewer actions
     // ---------------------------
     /// Open a repo-relative path in a Diff Viewer. If no Diff Viewer exists,

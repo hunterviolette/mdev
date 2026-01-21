@@ -107,6 +107,13 @@ impl eframe::App for AppState {
             self.apply_action(a);
         }
 
+        // Canvas tint popup (modal; freezes underlying canvas while open)
+        // Must be called every frame so it can draw.
+        let tint_actions = ui::canvas_tint::canvas_tint(ctx, self);
+        for a in tint_actions {
+            self.apply_action(a);
+        }
+
         self.finalize_frame();
     }
 }

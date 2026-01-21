@@ -129,6 +129,7 @@ impl AppState {
                         max_exts: 6,
                         filter_text: "".to_string(),
                         show_top_level_stats: true,
+                        canvas_bg_tint: None,
                         layout: crate::app::layout::LayoutConfig::default(),
                         file_viewers: HashMap::new(),
                         active_file_viewer: Some(2),
@@ -185,6 +186,8 @@ impl AppState {
 
             filter_text: self.ui.filter_text.clone(),
             show_top_level_stats: self.ui.show_top_level_stats,
+            canvas_bg_tint: self.ui.canvas_bg_tint,
+
 
             layout: self.layout.clone(),
 
@@ -355,6 +358,8 @@ impl AppState {
 
                 self.ui.filter_text = state_snap.filter_text;
                 self.ui.show_top_level_stats = state_snap.show_top_level_stats;
+                self.ui.canvas_bg_tint = state_snap.canvas_bg_tint;
+                self.ui.canvas_tint_popup_open = false;
 
                 let mut layout = state_snap.layout;
                 layout.rescale_from(state_snap.canvas_size, current_canvas_size);

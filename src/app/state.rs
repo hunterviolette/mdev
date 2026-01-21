@@ -225,6 +225,19 @@ pub struct ResultsState {
 pub struct UiState {
     pub show_top_level_stats: bool,
     pub filter_text: String,
+
+    /// Optional faint sRGBA tint drawn behind the canvas content.
+    /// Stored as bytes to make persistence stable across versions.
+    pub canvas_bg_tint: Option<[u8; 4]>,
+
+    /// UI-only: whether the tint popup is currently open.
+    pub canvas_tint_popup_open: bool,
+
+    /// UI-only: live tint value while the popup is open.
+    ///
+    /// This prevents "jumping"/drift in the color picker by keeping a stable
+    /// in-progress value independent of persistence/application timing.
+    pub canvas_tint_draft: Option<[u8; 4]>,
 }
 
 pub struct TreeState {
@@ -333,6 +346,9 @@ impl AppState {
             ui: UiState {
                 show_top_level_stats: true,
                 filter_text: "".to_string(),
+                canvas_bg_tint: None,
+                canvas_tint_popup_open: false,
+                canvas_tint_draft: None,
             },
 
             tree: TreeState {

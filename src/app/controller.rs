@@ -6,13 +6,16 @@ use super::state::AppState;
 use super::controllers::{
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
     file_viewer_controller, layout_controller, palette_controller, source_control_controller,
-    terminal_controller, tree_controller, workspace_controller,
+    terminal_controller, tree_controller, canvas_tint, workspace_controller,
 };
 
 impl AppState {
     pub fn apply_action(&mut self, action: Action) {
         // Keep ordering stable (global -> domain -> layout/workspace)
         if palette_controller::handle(self, &action) {
+            return;
+        }
+        if canvas_tint::handle(self, &action) {
             return;
         }
         if analysis_controller::handle(self, &action) {
