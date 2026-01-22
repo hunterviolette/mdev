@@ -4,6 +4,8 @@ pub mod controller;
 pub mod state;
 pub mod theme;
 pub mod ui;
+pub mod openai;
+
 
 pub mod layout;
 

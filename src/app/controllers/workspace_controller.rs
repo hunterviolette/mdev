@@ -339,6 +339,9 @@ impl AppState {
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
                 self.rebuild_source_controls_from_layout();
+                // Ensure ephemeral viewer backing-state maps are present after workspace apply.
+                self.rebuild_diff_viewers_from_layout();
+                self.rebuild_execute_loops_from_layout();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -346,12 +349,8 @@ impl AppState {
             PresetKind::FullState(state_snap) => {
                 self.inputs.repo = state_snap.repo;
 
-                // Prevent loading WORKTREE as the ref; keep old behavior.
-                self.inputs.git_ref = if state_snap.git_ref == WORKTREE_REF {
-                    "HEAD".to_string()
-                } else {
-                    state_snap.git_ref
-                };
+                // Persist the saved ref exactly (including WORKTREE).
+                self.inputs.git_ref = state_snap.git_ref;
 
                 self.inputs.exclude_regex = state_snap.exclude_regex;
                 self.inputs.max_exts = state_snap.max_exts;

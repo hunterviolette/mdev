@@ -3,7 +3,7 @@ use eframe::egui;
 use super::super::actions::{Action, ComponentKind};
 use super::super::state::AppState;
 
-use super::{changeset_applier, context_exporter, diff_viewer, file_viewer, source_control, summary_panel, terminal, tree_panel};
+use super::{changeset_applier, context_exporter, diff_viewer, changeset_loop, file_viewer, source_control, summary_panel, terminal, tree_panel};
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -90,10 +90,15 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                             actions.extend(context_exporter::context_exporter(ui, state, c.id));
                             return content_size;
                         }
-                        ComponentKind::ChangeSetApplier => {
+                        ComponentKind::ChangeSetApplier =>
+                                 {
                             actions.extend(changeset_applier::changeset_applier_panel(
                                 ctx, ui, state, c.id,
                             ));
+                            return content_size;
+                        }
+                        ComponentKind::ExecuteLoop => {
+                            actions.extend(changeset_loop::changeset_loop_panel(ctx, ui, state, c.id));
                             return content_size;
                         }
                         ComponentKind::SourceControl => {
@@ -134,6 +139,7 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         ComponentKind::Terminal
                         | ComponentKind::ContextExporter
                         | ComponentKind::ChangeSetApplier
+                        | ComponentKind::ExecuteLoop
                         | ComponentKind::SourceControl
                         | ComponentKind::DiffViewer => {
                             // handled above

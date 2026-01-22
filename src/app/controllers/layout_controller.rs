@@ -1,6 +1,7 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind};
 use crate::app::layout::{ComponentInstance, LayoutConfig, WindowLayout};
 use crate::app::state::{AppState, ChangeSetApplierState, ContextExportMode, ContextExporterState};
+use crate::app::state::ExecuteLoopState;
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -40,6 +41,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.rebuild_changeset_appliers_from_layout();
             state.rebuild_source_controls_from_layout();
             state.rebuild_diff_viewers_from_layout();
+            state.rebuild_execute_loops_from_layout();
             true
         }
         _ => false,
@@ -174,6 +176,29 @@ impl AppState {
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
+            ComponentKind::ExecuteLoop => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Execute Loop {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [150.0, 150.0],
+                        size: [860.0, 680.0],
+                    },
+                );
+
+                self.execute_loops.insert(id, ExecuteLoopState::new());
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
             ComponentKind::Tree | ComponentKind::Summary => {
                 self.layout.merge_with_defaults();
 
@@ -186,6 +211,7 @@ impl AppState {
                     | ComponentKind::ContextExporter
                     | ComponentKind::SourceControl
                     | ComponentKind::ChangeSetApplier
+                    | ComponentKind::ExecuteLoop
                     | ComponentKind::DiffViewer => unreachable!(),
                 };
 
@@ -252,9 +278,13 @@ impl AppState {
         // Clean up ephemeral component state (safe no-op if not present)
         self.context_exporters.remove(&id);
         self.terminals.remove(&id);
-        self.changeset_appliers.remove(&id); // NEW
+        self.changeset_appliers.remove(&id);
+        self.execute_loops.remove(&id);
         self.source_controls.remove(&id);
-        self.source_controls.remove(&id); // NEW
+        self.diff_viewers.remove(&id);
+
+        self.execute_loops.remove(&id);
+
 
         if self.active_file_viewer == Some(id) {
             self.active_file_viewer = self

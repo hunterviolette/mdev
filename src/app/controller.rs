@@ -4,6 +4,7 @@ use super::actions::Action;
 use super::state::AppState;
 
 use super::controllers::{
+    changeset_loop_controller,
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
     file_viewer_controller, layout_controller, palette_controller, source_control_controller,
     terminal_controller, tree_controller, canvas_tint, workspace_controller,
@@ -24,6 +25,10 @@ impl AppState {
         if changeset_controller::handle(self, &action) {
             return;
         }
+        if changeset_loop_controller::handle(self, &action) {
+            return;
+        }
+
         if tree_controller::handle(self, &action) {
             return;
         }

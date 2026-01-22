@@ -10,3 +10,4 @@ pub mod workspace_controller;
 pub mod changeset_controller;
 pub mod source_control_controller;
 pub mod diff_viewer_controller;
+pub mod changeset_loop_controller;

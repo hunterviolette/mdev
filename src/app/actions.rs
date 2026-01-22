@@ -18,6 +18,7 @@ pub enum ComponentKind {
     Terminal,
     ContextExporter,
     ChangeSetApplier,
+    ExecuteLoop,
     SourceControl,
     DiffViewer,
 }
@@ -34,6 +35,24 @@ pub enum TerminalShell {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    // Execute loop
+    ExecuteLoopRunOnce { loop_id: ComponentId },
+
+    /// Execute Loop chat: send the current draft.
+    ExecuteLoopSend { loop_id: ComponentId },
+    /// Execute Loop chat: switch between Conversation and ChangeSet modes.
+    ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
+    /// Execute Loop chat: inject freshly generated context as a system message.
+    ExecuteLoopInjectContext { loop_id: ComponentId },
+    /// Execute Loop chat: clear conversation transcript (keeps system instruction).
+    ExecuteLoopClearChat { loop_id: ComponentId },
+    /// Execute Loop chat: user reviewed a ChangeSet response; return to Conversation mode.
+    ExecuteLoopMarkReviewed { loop_id: ComponentId },
+    /// Execute Loop: run postprocess command (e.g. cargo check) after apply.
+    ExecuteLoopRunPostprocess { loop_id: ComponentId },
+
+    ExecuteLoopClear { loop_id: ComponentId },
+
     // ---------------------------
     // Repo + analysis
     // ---------------------------
