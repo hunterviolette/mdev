@@ -11,9 +11,11 @@ use crate::platform::Platform;
 
 use super::openai::OpenAIClient;
 
+use serde::{Deserialize, Serialize};
+
 use super::actions::{ComponentId, ExpandCmd, TerminalShell};
 use super::actions::ComponentKind;
-use super::layout::{LayoutConfig, PresetKind};
+use super::layout::{ExecuteLoopSnapshot, LayoutConfig, PresetKind};
 
 /// Special ref name used to indicate "show the working tree (uncommitted) version".
 pub const WORKTREE_REF: &str = "WORKTREE";
@@ -61,7 +63,7 @@ pub struct ChangeSetApplierState {
     pub status: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecuteLoopMode {
     /// Normal assistant conversation (freeform).
     Conversation,
@@ -69,10 +71,16 @@ pub enum ExecuteLoopMode {
     ChangeSet,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteLoopMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecuteLoopTurnResult {
+    pub text: String,
+    pub conversation_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -82,9 +90,25 @@ pub struct ExecuteLoopIteration {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TaskState {
+    pub bound_execute_loop: Option<ComponentId>,
+    pub paused: bool,
+}
+
 pub struct ExecuteLoopState {
     /// Selected model id (shown in UI). Options are fetched from the OpenAI models API.
     pub model: String,
+    /// Task-level pause (disables auto-flow when true).
+    pub paused: bool,
+
+    /// Persisted stats (best-effort; increment where you already detect outcomes).
+    pub changesets_total: u32,
+    pub changesets_ok: u32,
+    pub changesets_err: u32,
+    pub postprocess_ok: u32,
+    pub postprocess_err: u32,
+
     /// Cached options for dropdown. Empty => not yet fetched / failed.
     pub model_options: Vec<String>,
 
@@ -103,6 +127,16 @@ pub struct ExecuteLoopState {
     /// If true, the next send injects fresh context (generated in-memory).
     pub include_context_next: bool,
 
+    /// OpenAI Conversations API id (conv_...). When set, we send only delta turns.
+    pub conversation_id: Option<String>,
+
+    /// True while we are fetching conversation history from the server.
+    pub history_sync_pending: bool,
+    /// Receives fetched conversation messages from the background thread.
+    pub history_sync_rx: Option<std::sync::mpsc::Receiver<Result<Vec<ExecuteLoopMessage>, String>>>,
+    /// The last conversation id we successfully synced (prevents refetch every frame).
+    pub history_synced_conversation_id: Option<String>,
+
     /// If true, auto-fill the first ChangeSet Applier when in ChangeSet mode.
     pub auto_fill_first_changeset_applier: bool,
 
@@ -116,7 +150,7 @@ pub struct ExecuteLoopState {
     /// True while an OpenAI request is in-flight (done on a background thread).
     pub pending: bool,
     /// Receives the next assistant response (or error) from the background thread.
-    pub pending_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub pending_rx: Option<std::sync::mpsc::Receiver<Result<ExecuteLoopTurnResult, String>>>,
 
     /// Postprocess command to run after applying a ChangeSet (e.g. `cargo check`).
     pub postprocess_cmd: String,
@@ -153,9 +187,19 @@ impl ExecuteLoopState {
             }],
             draft: String::new(),
             include_context_next: true,
+            conversation_id: None,
+            history_sync_pending: false,
+            history_sync_rx: None,
+            history_synced_conversation_id: None,
             auto_fill_first_changeset_applier: true,
             awaiting_review: false,
             changeset_auto: true,
+            paused: false,
+            changesets_total: 0,
+            changesets_ok: 0,
+            changesets_err: 0,
+            postprocess_ok: 0,
+            postprocess_err: 0,
             pending: false,
             pending_rx: None,
             postprocess_cmd: "cargo check".to_string(),
@@ -260,7 +304,7 @@ impl DiffViewerState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextExportMode {
     EntireRepo,
     TreeSelect,
@@ -301,6 +345,15 @@ pub struct AppState {
 
     pub changeset_appliers: HashMap<ComponentId, ChangeSetApplierState>,
     pub execute_loops: HashMap<ComponentId, ExecuteLoopState>,
+
+    /// Repo-global persisted ExecuteLoop snapshots (loaded at repo select).
+    /// ExecuteLoopState is ephemeral and is hydrated on-demand from this store.
+    pub execute_loop_store: HashMap<ComponentId, ExecuteLoopSnapshot>,
+
+    pub tasks: HashMap<ComponentId, TaskState>,
+
+    /// Dirty flag for global per-repo task/chat store autosave.
+    pub task_store_dirty: bool,
 
     pub source_controls: HashMap<ComponentId, SourceControlState>,
 
@@ -484,6 +537,9 @@ impl AppState {
             context_exporters: HashMap::new(),
             changeset_appliers: HashMap::new(),
             execute_loops: HashMap::new(),
+            execute_loop_store: HashMap::new(),
+            tasks: HashMap::new(),
+            task_store_dirty: false,
             source_controls: HashMap::new(),
 
             theme: ThemeState {
@@ -536,6 +592,72 @@ impl AppState {
         self.refresh_follow_top_bar_viewers();
     }
 
+    // -----------------------------------------------------------------
+    // Restored helpers (other code expects these to exist)
+    // -----------------------------------------------------------------
+
+    pub(crate) fn rebuild_context_exporters_from_layout(&mut self) {
+        self.context_exporters.clear();
+
+        let ids: Vec<ComponentId> = self
+            .layout
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::ContextExporter)
+            .map(|c| c.id)
+            .collect();
+
+        for id in ids {
+            self.context_exporters.insert(
+                id,
+                ContextExporterState {
+                    save_path: None,
+                    max_bytes_per_file: 200_000,
+                    skip_binary: true,
+                    mode: ContextExportMode::EntireRepo,
+                    status: None,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
+        // Maintain a per-ref selection:
+        // - If we have a saved selection for this ref, restore it (filtered to existing files).
+        // - Otherwise, preserve current selection (filtered).
+        // - If nothing is selected after filtering, default to "all files selected".
+        let mut files = Vec::new();
+        Self::collect_all_files(&res.root, &mut files);
+        let all: std::collections::HashSet<String> = files.into_iter().collect();
+
+        let key = self.inputs.git_ref.clone();
+
+        let mut selected = self
+            .tree
+            .context_selected_by_ref
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.tree.context_selected_files.clone());
+
+        selected.retain(|p| all.contains(p));
+
+        if selected.is_empty() {
+            selected = all.clone();
+        }
+
+        self.tree.context_selected_files = selected.clone();
+        self.tree.context_selected_by_ref.insert(key, selected);
+    }
+
+    fn collect_all_files(node: &crate::model::DirNode, out: &mut Vec<String>) {
+        for f in &node.files {
+            out.push(f.full_path.clone());
+        }
+        for c in &node.children {
+            Self::collect_all_files(c, out);
+        }
+    }
+
     pub fn set_git_ref_options(&mut self, mut refs: Vec<String>) {
         refs.retain(|r| !r.trim().is_empty());
         refs.retain(|r| r != WORKTREE_REF);
@@ -582,6 +704,24 @@ impl AppState {
 
         for id in ids {
             self.execute_loops.insert(id, ExecuteLoopState::new());
+        }
+    }
+
+    pub fn rebuild_tasks_from_layout(&mut self) {
+        let existing = std::mem::take(&mut self.tasks);
+        self.tasks = HashMap::new();
+
+        let ids: Vec<ComponentId> = self
+            .layout
+            .components
+            .iter()
+            .filter(|c| c.kind == ComponentKind::Task)
+            .map(|c| c.id)
+            .collect();
+
+        for id in ids {
+            let st = existing.get(&id).cloned().unwrap_or_default();
+            self.tasks.insert(id, st);
         }
     }
 

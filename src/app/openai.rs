@@ -36,6 +36,196 @@ impl OpenAIClient {
         Ok(rb.bearer_auth(key))
     }
 
+    pub fn create_conversation(&self, items: Vec<(String, String)>) -> Result<String> {
+        // POST /v1/conversations
+        // Body: { items: [ { role, content }, ... ] }
+        // Response: { id: "conv_..." , ... }
+
+        let url = format!("{}/v1/conversations", self.base_url.trim_end_matches('/'));
+
+        let payload_items: Vec<serde_json::Value> = items
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+
+        let body = serde_json::json!({
+            "items": payload_items
+        });
+
+        let rb = self.http.post(url).json(&body);
+        let rb = self.auth(rb)?;
+        let resp = rb.send().context("OpenAI /v1/conversations request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_txt = resp.text().unwrap_or_default();
+            return Err(anyhow!("OpenAI /v1/conversations returned {}: {}", status, body_txt));
+        }
+
+        let v: serde_json::Value = resp
+            .json()
+            .context("Failed to parse /v1/conversations JSON")?;
+
+        let id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("/v1/conversations response missing 'id'"))?;
+
+        Ok(id.to_string())
+    }
+
+    /// Fetch conversation items and convert them into a simple (role, text) transcript.
+    /// Uses: GET /v1/conversations/{conversation_id}/items
+    pub fn list_conversation_messages(&self, conversation_id: &str) -> Result<Vec<(String, String)>> {
+        let url = format!(
+            "{}/v1/conversations/{}/items",
+            self.base_url.trim_end_matches('/'),
+            conversation_id
+        );
+
+        let rb = self.http.get(url);
+        let rb = self.auth(rb)?;
+        let resp = rb.send().context("OpenAI /v1/conversations/{id}/items request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_txt = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "OpenAI /v1/conversations/{}/items returned {}: {}",
+                conversation_id,
+                status,
+                body_txt
+            ));
+        }
+
+        let v: serde_json::Value = resp
+            .json()
+            .context("Failed to parse /v1/conversations/{id}/items JSON")?;
+
+        let mut out: Vec<(String, String)> = Vec::new();
+
+        // Response shape is an item list: { data: [ ...items... ], ... }
+        if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
+            for item in data {
+                // We only care about message-like items with role + content.
+                let role = item
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if role.is_empty() {
+                    continue;
+                }
+
+                let mut text = String::new();
+
+                // Typical shape: content: [ { type: "input_text"|"output_text", text: "..." }, ... ]
+                if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                    for part in content_arr {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                text.push_str("\n");
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                }
+
+                // Fallback: some message items may contain a direct text field.
+                if text.is_empty() {
+                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                        text = t.to_string();
+                    }
+                }
+
+                if !text.is_empty() {
+                    out.push((role, text));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Generate text using /v1/responses attached to a persistent conversation.
+    ///
+    /// - If `conversation_id` is None, creates a new conversation using `seed_items_if_new`.
+    /// - Sends only the `turn_items` as the input delta for this turn.
+    /// - Returns (assistant_text, conversation_id).
+    pub fn chat_in_conversation(
+        &self,
+        model: &str,
+        conversation_id: Option<String>,
+        seed_items_if_new: Vec<(String, String)>,
+        turn_items: Vec<(String, String)>,
+    ) -> Result<(String, String)> {
+        let conv_id = match conversation_id {
+            Some(id) => id,
+            None => self.create_conversation(seed_items_if_new)?,
+        };
+
+        let url = format!("{}/v1/responses", self.base_url.trim_end_matches('/'));
+
+        let input: Vec<serde_json::Value> = turn_items
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+
+        let body = serde_json::json!({
+            "model": model,
+            "conversation": conv_id,
+            "input": input
+        });
+
+        let rb = self.http.post(url).json(&body);
+        let rb = self.auth(rb)?;
+        let resp = rb.send().context("OpenAI /v1/responses request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_txt = resp.text().unwrap_or_default();
+            return Err(anyhow!("OpenAI /v1/responses returned {}: {}", status, body_txt));
+        }
+
+        let v: serde_json::Value = resp.json().context("Failed to parse /v1/responses JSON")?;
+
+        let mut out = String::new();
+        if let Some(output_items) = v.get("output").and_then(|o| o.as_array()) {
+            for item in output_items {
+                let role_ok = item
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r == "assistant")
+                    .unwrap_or(true);
+
+                if !role_ok {
+                    continue;
+                }
+
+                if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                    for part in content_arr {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            if !out.is_empty() {
+                                out.push_str("\n");
+                            }
+                            out.push_str(t);
+                        }
+                    }
+                }
+
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    if !out.is_empty() {
+                        out.push_str("\n");
+                    }
+                    out.push_str(t);
+                }
+            }
+        }
+
+        Ok((out, conv_id))
+    }
+
     pub fn list_models(&self) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct ModelsResp {

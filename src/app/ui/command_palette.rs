@@ -20,6 +20,7 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "changeset_applier" => Some(ComponentKind::ChangeSetApplier),
         "execute_loop" => Some(ComponentKind::ExecuteLoop),
         "source_control" => Some(ComponentKind::SourceControl),
+        "task" => Some(ComponentKind::Task),
         "diff_viewer" => Some(ComponentKind::DiffViewer),
         _ => None,
     }
@@ -111,6 +112,7 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/changeset_applier".into(),
                     "component/execute_loop".into(),
                     "component/source_control".into(),
+                    "component/task".into(),
                     "component/diff_viewer".into(),
                 ]
             } else {
@@ -248,6 +250,8 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "component/changeset_applier".into(),
         "component/execute_loop".into(),
         "component/source_control".into(),
+        "component/task".into(),
+        "component/diff_viewer".into(),
 
         // UI preferences
         "ui/canvas_tint".into(),
@@ -350,7 +354,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | ui/canvas_tint",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | component/task | ui/canvas_tint",
                     ),
             );
             resp.request_focus();

@@ -4,12 +4,10 @@ use std::path::PathBuf;
 
 use crate::app::actions::{Action, ComponentId, ComponentKind, ExpandCmd};
 use crate::app::layout::{
-    FileViewerSnapshot, LayoutSnapshot, Preset, PresetKind, StateSnapshot, WorkspaceFile,
+    ContextExporterSnapshot, ExecuteLoopSnapshot, FileViewerSnapshot, LayoutSnapshot, Preset,
+    PresetKind, StateSnapshot, TaskSnapshot, WorkspaceFile,
 };
-use crate::app::state::{
-    AppState, ContextExportMode, ContextExporterState, PendingWorkspaceApply, ViewportRestore,
-    WORKTREE_REF,
-};
+use crate::app::state::{AppState, PendingWorkspaceApply, ViewportRestore};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -24,7 +22,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 *canvas_size,
                 *viewport_outer_pos,
                 *viewport_inner_size,
-                name.as_deref(), 
+                name.as_deref(),
             );
             true
         }
@@ -133,6 +131,9 @@ impl AppState {
                         layout: crate::app::layout::LayoutConfig::default(),
                         file_viewers: HashMap::new(),
                         active_file_viewer: Some(2),
+                        context_exporters: HashMap::new(),
+                        execute_loops: HashMap::new(),
+                        tasks: HashMap::new(),
                     }),
                 },
                 Preset {
@@ -174,6 +175,20 @@ impl AppState {
             );
         }
 
+        let mut context_exporters = HashMap::new();
+        for (id, ex) in self.context_exporters.iter() {
+            context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
+        }
+
+        // Chats/tasks are persisted globally per-repo.
+        // Workspace remains layout/session config only.
+        if self.task_store_dirty {
+            self.save_repo_task_store();
+        }
+
+        let execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot> = HashMap::new();
+        let tasks: HashMap<ComponentId, TaskSnapshot> = HashMap::new();
+
         let state_snap = StateSnapshot {
             canvas_size,
             viewport_outer_pos,
@@ -188,11 +203,14 @@ impl AppState {
             show_top_level_stats: self.ui.show_top_level_stats,
             canvas_bg_tint: self.ui.canvas_bg_tint,
 
-
             layout: self.layout.clone(),
 
             file_viewers,
             active_file_viewer: self.active_file_viewer,
+
+            context_exporters,
+            execute_loops,
+            tasks,
         };
 
         let ws_file = WorkspaceFile {
@@ -342,6 +360,10 @@ impl AppState {
                 // Ensure ephemeral viewer backing-state maps are present after workspace apply.
                 self.rebuild_diff_viewers_from_layout();
                 self.rebuild_execute_loops_from_layout();
+                self.rebuild_tasks_from_layout();
+
+                // Chats/tasks are global per-repo; re-hydrate after layout changes.
+                let _ = self.load_repo_task_store();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -370,6 +392,22 @@ impl AppState {
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
                 self.rebuild_source_controls_from_layout();
+                self.rebuild_diff_viewers_from_layout();
+                self.rebuild_execute_loops_from_layout();
+                self.rebuild_tasks_from_layout();
+
+                // Restore per-context-exporter persisted state (currently only mode).
+                for (id, snap) in state_snap.context_exporters.iter() {
+                    if let Some(ex) = self.context_exporters.get_mut(id) {
+                        ex.mode = snap.mode;
+                    }
+                }
+
+                // IMPORTANT:
+                // ExecuteLoop chat threads + Tasks are persisted globally per-repo, not in workspace.
+                // Do NOT restore (or clear) them from the workspace snapshot.
+                // Instead, hydrate from the per-repo task store after the components exist.
+                let _ = self.load_repo_task_store();
 
                 // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();
@@ -415,72 +453,6 @@ impl AppState {
                     self.results.error = Some("Loaded state has no repo selected.".into());
                 }
             }
-        }
-    }
-
-    // ---------------------------
-    // Restored helpers (other code expects these to exist)
-    // ---------------------------
-
-    pub(crate) fn rebuild_context_exporters_from_layout(&mut self) {
-        self.context_exporters.clear();
-
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
-            .filter(|c| c.kind == ComponentKind::ContextExporter)
-            .map(|c| c.id)
-            .collect();
-
-        for id in ids {
-            self.context_exporters.insert(
-                id,
-                ContextExporterState {
-                    save_path: None,
-                    max_bytes_per_file: 200_000,
-                    skip_binary: true,
-                    mode: ContextExportMode::EntireRepo,
-                    status: None,
-                },
-            );
-        }
-    }
-
-    pub(crate) fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
-        // Maintain a per-ref selection:
-        // - If we have a saved selection for this ref, restore it (filtered to existing files).
-        // - Otherwise, preserve current selection (filtered).
-        // - If nothing is selected after filtering, default to "all files selected".
-        let mut files = Vec::new();
-        Self::collect_all_files(&res.root, &mut files);
-        let all: std::collections::HashSet<String> = files.into_iter().collect();
-
-        let key = self.inputs.git_ref.clone();
-
-        let mut selected = self
-            .tree
-            .context_selected_by_ref
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| self.tree.context_selected_files.clone());
-
-        selected.retain(|p| all.contains(p));
-
-        if selected.is_empty() {
-            selected = all.clone();
-        }
-
-        self.tree.context_selected_files = selected.clone();
-        self.tree.context_selected_by_ref.insert(key, selected);
-    }
-
-    fn collect_all_files(node: &crate::model::DirNode, out: &mut Vec<String>) {
-        for f in &node.files {
-            out.push(f.full_path.clone());
-        }
-        for c in &node.children {
-            Self::collect_all_files(c, out);
         }
     }
 }

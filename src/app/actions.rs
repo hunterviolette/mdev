@@ -20,6 +20,7 @@ pub enum ComponentKind {
     ChangeSetApplier,
     ExecuteLoop,
     SourceControl,
+    Task,
     DiffViewer,
 }
 
@@ -52,6 +53,22 @@ pub enum Action {
     ExecuteLoopRunPostprocess { loop_id: ComponentId },
 
     ExecuteLoopClear { loop_id: ComponentId },
+
+    // ---------------------------
+    // Task
+    // ---------------------------
+    /// Toggle pause for a Task (and any bound Execute Loop auto-processing).
+    TaskSetPaused { task_id: ComponentId, paused: bool },
+
+    /// Bind a Task to a specific Execute Loop instance (chat thread).
+    TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
+
+    /// Open (focus) the bound Execute Loop window for this task.
+    TaskOpenExecuteLoop { task_id: ComponentId },
+
+    /// Create a NEW Execute Loop (chat thread), bind it to this Task, and open it.
+    TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+
 
     // ---------------------------
     // Repo + analysis

@@ -4,10 +4,9 @@ pub mod controller;
 pub mod state;
 pub mod theme;
 pub mod ui;
-pub mod openai;
-
-
 pub mod layout;
+pub mod openai;
+pub mod task_store;
 
 mod app;
 

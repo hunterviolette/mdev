@@ -81,6 +81,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 st.pending = false;
                 st.pending_rx = None;
 
+                // Reset OpenAI-side conversation state.
+                st.conversation_id = None;
+
                 st.postprocess_pending = false;
                 st.postprocess_rx = None;
 
@@ -128,7 +131,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         return;
     }
 
-    let (model, mode, draft, existing_msgs, include_context_next) = {
+    let (model, mode, draft, existing_msgs, include_context_next, conversation_id) = {
         let Some(st) = state.execute_loops.get(&loop_id) else {
             return;
         };
@@ -138,6 +141,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
             st.draft.clone(),
             st.messages.clone(),
             st.include_context_next,
+            st.conversation_id.clone(),
         )
     };
 
@@ -176,13 +180,19 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         None
     };
 
-    let mut outbound: Vec<(String, String)> = Vec::new();
-    for m in existing_msgs.iter() {
-        outbound.push((m.role.clone(), m.content.clone()));
-    }
+    // Conversations API approach:
+    // - If conversation_id is None, seed a new conversation with existing_msgs.
+    // - Send only the delta items for this turn (context/schema/user).
+
+    let seed_items_if_new: Vec<(String, String)> = existing_msgs
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    let mut turn_items: Vec<(String, String)> = Vec::new();
 
     if let Some(ctx_text) = &ctx_text_opt {
-        outbound.push((
+        turn_items.push((
             "system".to_string(),
             format!("REPO CONTEXT (generated):\n{}", ctx_text),
         ));
@@ -192,7 +202,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         // Pull the schema example from the ChangeSet Applier UI (single source of truth).
         let schema = crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE;
 
-        outbound.push((
+        turn_items.push((
             "system".to_string(),
             format!(
                 "Return ONLY ONE valid JSON object matching this ChangeSet schema. No prose, no markdown, no code fences. Do not output multiple JSON objects.\n\nSCHEMA EXAMPLE (copy this structure exactly):\n{}\n\nCRITICAL RULES:\n- Output exactly ONE JSON object.\n- Use ONLY match.type=\"literal\".\n- match.text MUST appear verbatim in the provided context; do not guess.\n- Prefer insert_after/insert_before with a short unique anchor over replace_block.",
@@ -201,45 +211,61 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         ));
     }
 
-    outbound.push(("user".to_string(), draft.trim().to_string()));
+    turn_items.push(("user".to_string(), draft.trim().to_string()));
 
     // Spawn background thread.
     let openai = state.openai.clone();
-    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+    let (tx, rx) = mpsc::channel::<Result<crate::app::state::ExecuteLoopTurnResult, String>>();
 
     std::thread::spawn(move || {
         let res = openai
-            .chat_completion_messages(&model, outbound, 0.2)
+            .chat_in_conversation(&model, conversation_id, seed_items_if_new, turn_items)
+            .map(|(text, conv_id)| crate::app::state::ExecuteLoopTurnResult {
+                text,
+                conversation_id: conv_id,
+            })
             .map_err(|e| format!("{:#}", e));
         let _ = tx.send(res);
     });
 
     // Update state (commit user message immediately + set pending).
-    let Some(st) = state.execute_loops.get_mut(&loop_id) else {
-        return;
-    };
+    let mut _did_mutate = false;
 
-    if let Some(mut ms) = fetched_models {
-        ms.sort();
-        ms.dedup();
-        st.model_options = ms;
-        if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model) {
-            st.model = st.model_options[0].clone();
+
+    {
+        let Some(st) = state.execute_loops.get_mut(&loop_id) else {
+            return;
+        };
+
+        if let Some(mut ms) = fetched_models {
+            ms.sort();
+            ms.dedup();
+            st.model_options = ms;
+            if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model) {
+                st.model = st.model_options[0].clone();
+            }
         }
+
+        st.messages.push(ExecuteLoopMessage {
+            role: "user".to_string(),
+            content: st.draft.trim().to_string(),
+        });
+        st.draft.clear();
+
+        st.include_context_next = false;
+
+        st.pending = true;
+        st.pending_rx = Some(rx);
+
+        st.last_status = Some("Waiting for response…".to_string());
+        _did_mutate = true;
     }
 
-    st.messages.push(ExecuteLoopMessage {
-        role: "user".to_string(),
-        content: st.draft.trim().to_string(),
-    });
-    st.draft.clear();
-
-    st.include_context_next = false;
-
-    st.pending = true;
-    st.pending_rx = Some(rx);
-
-    st.last_status = Some("Waiting for response…".to_string());
+    if _did_mutate {
+        // Write-through persistence for chats
+        state.task_store_dirty = true;
+        state.save_repo_task_store();
+    }
 }
 
 fn start_postprocess(state: &mut AppState, loop_id: ComponentId) {
