@@ -57,6 +57,12 @@ pub struct StateSnapshot {
     pub filter_text: String,
     pub show_top_level_stats: bool,
 
+    /// UI prefs: optional canvas background tint.
+    ///
+    /// `#[serde(default)]` keeps older workspace files loadable.
+    #[serde(default)]
+    pub canvas_bg_tint: Option<[u8; 4]>,
+
     /// Layout
     pub layout: LayoutConfig,
 
