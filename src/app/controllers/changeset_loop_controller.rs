@@ -47,6 +47,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
 
         Action::ExecuteLoopInjectContext { loop_id } => {
+
             let ctx_text = match state.generate_current_context_text() {
                 Ok(t) => t,
                 Err(e) => {
@@ -58,30 +59,44 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             };
 
             if let Some(st) = state.execute_loops.get_mut(loop_id) {
-                st.messages.push(ExecuteLoopMessage {
-                    role: "system".to_string(),
-                    content: format!("REPO CONTEXT (generated):\n{}", ctx_text),
-                });
-                st.last_status = Some("Context injected.".to_string());
+                if st.draft.trim().is_empty() {
+                    st.draft = format!("CONTEXT UPDATE:\n{}\n", ctx_text);
+                } else {
+                    st.draft = format!("CONTEXT UPDATE:\n{}\n\n{}", ctx_text, st.draft);
+                }
+                st.last_status = Some("Context prepared in draft (user message).".to_string());
             }
             true
         }
 
         Action::ExecuteLoopClearChat { loop_id } => {
-            if let Some(st) = state.execute_loops.get_mut(loop_id) {
-                let sys = st.instruction.clone();
-                st.messages.clear();
-                st.messages.push(ExecuteLoopMessage {
-                    role: "system".to_string(),
-                    content: sys,
-                });
+            use std::time::{SystemTime, UNIX_EPOCH};
 
+            let now_ms: u64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            // Build the canonical cleared transcript (system-only) from the loop's instruction.
+            let sys_content = state
+                .execute_loops
+                .get(loop_id)
+                .map(|st| st.instruction.clone())
+                .unwrap_or_default();
+
+            let cleared_messages = vec![ExecuteLoopMessage {
+                role: "system".to_string(),
+                content: sys_content,
+            }];
+
+            // 1) Clear the loop view state.
+            if let Some(st) = state.execute_loops.get_mut(loop_id) {
+                st.messages = cleared_messages.clone();
                 st.draft.clear();
                 st.awaiting_review = false;
                 st.pending = false;
                 st.pending_rx = None;
 
-                // Reset OpenAI-side conversation state.
                 st.conversation_id = None;
 
                 st.postprocess_pending = false;
@@ -93,14 +108,35 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
                 st.last_status = Some("Chat cleared.".to_string());
             }
+
+            let bound_task_id = state
+                .tasks
+                .iter()
+                .find_map(|(tid, t)| (t.bound_execute_loop == Some(*loop_id)).then_some(*tid));
+
+            if let Some(tid) = bound_task_id {
+                let active_cid = state.tasks.get(&tid).and_then(|t| t.active_conversation);
+                if let Some(cid) = active_cid {
+                    if let Some(t) = state.tasks.get_mut(&tid) {
+                        if let Some(snap) = t.conversations.get_mut(&cid) {
+                            snap.messages = cleared_messages;
+                            snap.conversation_id = None;
+                            snap.updated_at_ms = now_ms;
+                        }
+                    }
+
+                    state.task_store_dirty = true;
+                    state.save_repo_task_store();
+                }
+            }
+
             true
         }
 
         Action::ExecuteLoopMarkReviewed { loop_id } => {
             if let Some(st) = state.execute_loops.get_mut(loop_id) {
                 st.awaiting_review = false;
-                st.mode = ExecuteLoopMode::Conversation;
-                st.last_status = Some("Reviewed. Back to Conversation.".to_string());
+                st.last_status = Some("Reviewed. Ready.".to_string());
             }
             true
         }
@@ -131,13 +167,14 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         return;
     }
 
-    let (model, mode, draft, existing_msgs, include_context_next, conversation_id) = {
+    let (model, mode, instruction, draft, _existing_msgs, include_context_next, conversation_id) = {
         let Some(st) = state.execute_loops.get(&loop_id) else {
             return;
         };
         (
             st.model.clone(),
             st.mode,
+            st.instruction.clone(),
             st.draft.clone(),
             st.messages.clone(),
             st.include_context_next,
@@ -166,7 +203,10 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         }
     };
 
-    let ctx_text_opt = if include_context_next {
+    // Seed repo context only when starting a new conversation. After that, do not inject system items.
+    let is_new_conversation = conversation_id.is_none();
+
+    let ctx_text_opt = if is_new_conversation && include_context_next {
         match state.generate_current_context_text() {
             Ok(t) => Some(t),
             Err(e) => {
@@ -180,46 +220,51 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         None
     };
 
-    // Conversations API approach:
-    // - If conversation_id is None, seed a new conversation with existing_msgs.
-    // - Send only the delta items for this turn (context/schema/user).
+    let seed_items_if_new: Vec<(String, String)> = if is_new_conversation {
+        let schema = crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE;
+        let mut sys = String::new();
+        if !instruction.trim().is_empty() {
+            sys.push_str(&instruction);
+        }
 
-    let seed_items_if_new: Vec<(String, String)> = existing_msgs
-        .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
-        .collect();
+        if let Some(ctx_text) = &ctx_text_opt {
+            sys.push_str("\n\nREPO CONTEXT (generated):\n");
+            sys.push_str(ctx_text);
+        }
+
+        sys.push_str("\n\nCHANGESET MODE CONTRACT:\n");
+        sys.push_str("- When the user sends MODE: changeset, return ONLY ONE valid JSON object matching the ChangeSet schema.\n");
+        sys.push_str("\nSCHEMA EXAMPLE (copy this structure exactly):\n");
+        sys.push_str(schema);
+
+        vec![
+          (
+            "system".to_string(),
+            sys
+          )
+        ]
+    } else {
+        Vec::new()
+    };
+
+    let mode_header = match mode {
+        ExecuteLoopMode::Conversation => "MODE: conversation",
+        ExecuteLoopMode::ChangeSet => "MODE: changeset",
+    };
+
+    let user_payload = format!("{}\n\n{}", mode_header, draft.trim());
 
     let mut turn_items: Vec<(String, String)> = Vec::new();
+    turn_items.push(("user".to_string(), user_payload));
 
-    if let Some(ctx_text) = &ctx_text_opt {
-        turn_items.push((
-            "system".to_string(),
-            format!("REPO CONTEXT (generated):\n{}", ctx_text),
-        ));
-    }
+    let seed_items_for_api = seed_items_if_new.clone();
 
-    if mode == ExecuteLoopMode::ChangeSet {
-        // Pull the schema example from the ChangeSet Applier UI (single source of truth).
-        let schema = crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE;
-
-        turn_items.push((
-            "system".to_string(),
-            format!(
-                "Return ONLY ONE valid JSON object matching this ChangeSet schema. No prose, no markdown, no code fences. Do not output multiple JSON objects.\n\nSCHEMA EXAMPLE (copy this structure exactly):\n{}\n\nCRITICAL RULES:\n- Output exactly ONE JSON object.\n- Use ONLY match.type=\"literal\".\n- match.text MUST appear verbatim in the provided context; do not guess.\n- Prefer insert_after/insert_before with a short unique anchor over replace_block.",
-                schema
-            ),
-        ));
-    }
-
-    turn_items.push(("user".to_string(), draft.trim().to_string()));
-
-    // Spawn background thread.
     let openai = state.openai.clone();
     let (tx, rx) = mpsc::channel::<Result<crate::app::state::ExecuteLoopTurnResult, String>>();
 
     std::thread::spawn(move || {
         let res = openai
-            .chat_in_conversation(&model, conversation_id, seed_items_if_new, turn_items)
+            .chat_in_conversation(&model, conversation_id, seed_items_for_api, turn_items)
             .map(|(text, conv_id)| crate::app::state::ExecuteLoopTurnResult {
                 text,
                 conversation_id: conv_id,
@@ -228,7 +273,35 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         let _ = tx.send(res);
     });
 
-    // Update state (commit user message immediately + set pending).
+    if is_new_conversation {
+        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+            if let Some((_, sys_content)) = seed_items_if_new.first() {
+                if st.messages.is_empty() {
+                    st.messages.push(ExecuteLoopMessage {
+                        role: "system".to_string(),
+                        content: sys_content.clone(),
+                    });
+                } else {
+                    // If there's already a system message at the top, replace it.
+                    if st.messages[0].role == "system" {
+                        st.messages[0].content = sys_content.clone();
+                    } else {
+                        // Otherwise insert the system prompt at the beginning so ordering is:
+                        // system -> user -> assistant
+                        st.messages.insert(
+                            0,
+                            ExecuteLoopMessage {
+                                role: "system".to_string(),
+                                content: sys_content.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            st.include_context_next = false;
+        }
+    }
+
     let mut _did_mutate = false;
 
 

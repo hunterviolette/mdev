@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ComponentKind};
+use super::actions::{ComponentId, ComponentKind, ConversationId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -63,6 +63,12 @@ pub struct ExecuteLoopSnapshot {
     #[serde(default)]
     pub paused: bool,
 
+    #[serde(default)]
+    pub created_at_ms: u64,
+
+    #[serde(default)]
+    pub updated_at_ms: u64,
+
     // Persisted ExecuteLoop UI toggles/inputs (backward compatible)
     #[serde(default)]
     pub changeset_auto: bool,
@@ -73,12 +79,16 @@ pub struct ExecuteLoopSnapshot {
     // Best-effort stats (can be filled later; keep defaults for backward compat)
     #[serde(default)]
     pub changesets_total: u32,
+
     #[serde(default)]
     pub changesets_ok: u32,
+
     #[serde(default)]
     pub changesets_err: u32,
+
     #[serde(default)]
     pub postprocess_ok: u32,
+
     #[serde(default)]
     pub postprocess_err: u32,
 }
@@ -89,6 +99,24 @@ pub struct TaskSnapshot {
     pub bound_execute_loop: Option<ComponentId>,
     #[serde(default)]
     pub paused: bool,
+
+    #[serde(default)]
+    pub execute_loop_ids: Vec<ComponentId>,
+
+    #[serde(default)]
+    pub created_at_ms: u64,
+
+    #[serde(default)]
+    pub updated_at_ms: u64,
+
+    #[serde(default)]
+    pub conversations: HashMap<ConversationId, ExecuteLoopSnapshot>,
+
+    #[serde(default)]
+    pub active_conversation: Option<ConversationId>,
+    
+    #[serde(default)]
+    pub next_conversation_id: ConversationId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

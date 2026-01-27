@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui_extras::syntax_highlighting::CodeTheme;
+use std::collections::BTreeSet;
 
 use crate::capabilities::CapabilityBroker;
 use crate::model::{AnalysisResult, CommitEntry};
@@ -13,7 +14,7 @@ use super::openai::OpenAIClient;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ExpandCmd, TerminalShell};
+use super::actions::{ComponentId, ConversationId, ExpandCmd, TerminalShell};
 use super::actions::ComponentKind;
 use super::layout::{ExecuteLoopSnapshot, LayoutConfig, PresetKind};
 
@@ -90,10 +91,37 @@ pub struct ExecuteLoopIteration {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TaskState {
     pub bound_execute_loop: Option<ComponentId>,
     pub paused: bool,
+    pub execute_loop_ids: Vec<ComponentId>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub conversations: HashMap<ConversationId, ExecuteLoopSnapshot>,
+    pub active_conversation: Option<ConversationId>,
+    pub next_conversation_id: ConversationId,
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            bound_execute_loop: None,
+            paused: false,
+            execute_loop_ids: Vec::new(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            conversations: HashMap::new(),
+            active_conversation: None,
+            next_conversation_id: 1,
+        }
+    }
 }
 
 pub struct ExecuteLoopState {
@@ -175,16 +203,14 @@ pub struct ExecuteLoopState {
 
 impl ExecuteLoopState {
     pub fn new() -> Self {
-        let instruction = "Please provide a ChangeSet JSON for the requested functionality.".to_string();
+
+        let instruction = "".to_string();
         Self {
             model: "gpt-4o-mini".to_string(),
             model_options: vec![],
             mode: ExecuteLoopMode::Conversation,
-            instruction: instruction.clone(),
-            messages: vec![ExecuteLoopMessage {
-                role: "system".to_string(),
-                content: instruction,
-            }],
+            instruction,
+            messages: vec![],
             draft: String::new(),
             include_context_next: true,
             conversation_id: None,
@@ -394,19 +420,20 @@ pub struct UiState {
     pub show_top_level_stats: bool,
     pub filter_text: String,
 
-    /// Optional faint sRGBA tint drawn behind the canvas content.
-    /// Stored as bytes to make persistence stable across versions.
     pub canvas_bg_tint: Option<[u8; 4]>,
-
-    /// UI-only: whether the tint popup is currently open.
     pub canvas_tint_popup_open: bool,
-
-    /// UI-only: live tint value while the popup is open.
-    ///
-    /// This prevents "jumping"/drift in the color picker by keeping a stable
-    /// in-progress value independent of persistence/application timing.
     pub canvas_tint_draft: Option<[u8; 4]>,
+
+    pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
 }
+
+impl UiState {
+    pub fn task_panel_selected_loops_mut(&mut self) -> &mut HashMap<ComponentId, BTreeSet<ConversationId>> {
+        // Lazily allocate via Option to keep struct init stable.
+        self.task_panel_selected_loops.get_or_insert_with(HashMap::new)
+    }
+}
+
 
 pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
@@ -519,6 +546,7 @@ impl AppState {
                 canvas_bg_tint: None,
                 canvas_tint_popup_open: false,
                 canvas_tint_draft: None,
+                task_panel_selected_loops: None,
             },
 
             tree: TreeState {
@@ -614,7 +642,7 @@ impl AppState {
                     save_path: None,
                     max_bytes_per_file: 200_000,
                     skip_binary: true,
-                    mode: ContextExportMode::EntireRepo,
+                    mode: ContextExportMode::TreeSelect,
                     status: None,
                 },
             );
@@ -622,10 +650,6 @@ impl AppState {
     }
 
     pub(crate) fn set_context_selection_all(&mut self, res: &crate::model::AnalysisResult) {
-        // Maintain a per-ref selection:
-        // - If we have a saved selection for this ref, restore it (filtered to existing files).
-        // - Otherwise, preserve current selection (filtered).
-        // - If nothing is selected after filtering, default to "all files selected".
         let mut files = Vec::new();
         Self::collect_all_files(&res.root, &mut files);
         let all: std::collections::HashSet<String> = files.into_iter().collect();

@@ -45,16 +45,16 @@ pub fn changeset_loop_panel(
     let before_mode = st.mode;
     let before_include_ctx = st.include_context_next;
     let before_auto_fill = st.auto_fill_first_changeset_applier;
+
+
+    // In ChangeSet mode, ExecuteLoop always auto-fills + auto-applies into the first ChangeSetApplier.
+    if st.mode == ExecuteLoopMode::ChangeSet && !st.auto_fill_first_changeset_applier {
+        st.auto_fill_first_changeset_applier = true;
+        did_mutate = true;
+    }
     let before_changeset_auto = st.changeset_auto;
     let before_postprocess_cmd = st.postprocess_cmd.clone();
 
-    // ------------------------------------------------------------
-    // Fetch & hydrate server-side conversation history when resuming
-    // ------------------------------------------------------------
-    // If we have a conversation_id but haven't synced its items into st.messages yet,
-    // fetch /v1/conversations/{id}/items on a background thread and replace st.messages.
-    // This makes "Open Execute Loop" show the historical transcript and ensures local state
-    // matches the persistent conversation.
     if !st.history_sync_pending {
         if let Some(cid) = st.conversation_id.clone() {
             let already_synced = st
@@ -94,13 +94,41 @@ pub fn changeset_loop_panel(
     if st.history_sync_pending {
         if let Some(rx) = &st.history_sync_rx {
             match rx.try_recv() {
-                Ok(Ok(msgs)) => {
-                    // Replace local transcript with server transcript.
+                Ok(Ok(mut msgs)) => {
+
+                    if let Some(sys_idx) = msgs.iter().position(|m| m.role == "system") {
+                        let sys = msgs.remove(sys_idx);
+                        msgs.insert(0, sys);
+                    }
+
+                    if msgs.len() >= 3 {
+                        let tail = &msgs[1..];
+                        let mut first_non = None;
+                        let mut second_non = None;
+                        for m in tail {
+                            if m.role == "system" {
+                                continue;
+                            }
+                            if first_non.is_none() {
+                                first_non = Some(m.role.as_str());
+                            } else {
+                                second_non = Some(m.role.as_str());
+                                break;
+                            }
+                        }
+
+                        if first_non == Some("assistant") && second_non == Some("user") {
+                            let head = msgs.remove(0);
+                            msgs.reverse();
+                            msgs.insert(0, head);
+                        }
+                    }
+
                     st.messages = msgs;
                     st.history_synced_conversation_id = st.conversation_id.clone();
                     st.history_sync_pending = false;
                     st.history_sync_rx = None;
-                                    }
+                }
                 Ok(Err(err)) => {
                     // Non-fatal: keep local messages; show status.
                     st.last_status = Some(format!("History sync failed: {}", err));
@@ -133,6 +161,13 @@ pub fn changeset_loop_panel(
                     // Persist OpenAI conversation id so subsequent turns can send only deltas.
                     st.conversation_id = Some(out.conversation_id.clone());
 
+                    if let Some(sys_idx) = st.messages.iter().position(|m| m.role == "system") {
+                        if sys_idx != 0 {
+                            let sys = st.messages.remove(sys_idx);
+                            st.messages.insert(0, sys);
+                        }
+                    }
+
                     st.messages.push(ExecuteLoopMessage {
                         role: "assistant".to_string(),
                         content: out.text.clone(),
@@ -143,43 +178,29 @@ pub fn changeset_loop_panel(
                     st.pending_rx = None;
 
                     if st.mode == ExecuteLoopMode::ChangeSet {
-                        // Auto-fill and auto-apply
-                        if st.auto_fill_first_changeset_applier {
-                            if let Some((applier_id, ap)) = state.changeset_appliers.iter_mut().next() {
-                                ap.payload = out.text.clone();
-                                ap.status = Some(format!("Auto-filled from Execute Loop {}", loop_id));
+                        // Always auto-fill + auto-apply in ChangeSet mode.
+                        if let Some((applier_id, ap)) = state.changeset_appliers.iter_mut().next() {
+                            ap.payload = out.text.clone();
+                            ap.status = Some(format!("Auto-filled from Execute Loop {}", loop_id));
 
-                                // Log the attempt into the chat so it’s visible.
-                                st.messages.push(ExecuteLoopMessage {
-                                    role: "system".to_string(),
-                                    content: format!(
-                                        "CHANGESET AUTO-APPLY: sending payload to ChangeSetApplier {} (then applying)",
-                                        applier_id
-                                    ),
-                                });
-                                did_mutate = true;
+                            // Track this applier so we can log its result status changes.
+                            st.last_auto_applier_id = Some(*applier_id);
+                            st.last_auto_applier_status = ap.status.clone();
+                            // Mark that we are waiting on the apply result to decide next step.
+                            st.awaiting_apply_result = true;
 
-                                // Track this applier so we can log its result status changes.
-                                st.last_auto_applier_id = Some(*applier_id);
-                                st.last_auto_applier_status = ap.status.clone();
-                                // Mark that we are waiting on the apply result to decide next step.
-                                st.awaiting_apply_result = true;
+                            // Stats: count an auto-apply attempt.
+                            st.changesets_total = st.changesets_total.saturating_add(1);
 
-                                // Stats: count an auto-apply attempt.
-                                st.changesets_total = st.changesets_total.saturating_add(1);
-
-                                actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
-                                st.last_status = Some("ChangeSet received: auto-applying…".to_string());
-                            } else {
-                                st.last_status = Some(
-                                    "ChangeSet received, but no ChangeSet Applier exists.".to_string(),
-                                );
-                            }
+                            actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
+                            st.last_status = Some("ChangeSet received: auto-applying…".to_string());
                         } else {
-                            st.last_status = Some("ChangeSet received (auto-fill disabled).".to_string());
+                            st.last_status = Some(
+                                "ChangeSet received, but no ChangeSet Applier exists.".to_string(),
+                            );
                         }
 
-                        // Pause only if manual stepping.
+                        // Pause only if Step mode.
                         st.awaiting_review = !st.changeset_auto;
                     } else {
                         st.last_status = Some("Response received.".to_string());
@@ -453,8 +474,8 @@ pub fn changeset_loop_panel(
 
         if st.awaiting_review {
             ui.separator();
-            ui.strong("Awaiting review");
-            if ui.button("Mark reviewed").clicked() {
+            ui.strong("Awaiting step");
+            if ui.button("Step").clicked() {
                 actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
             }
         }
@@ -532,12 +553,26 @@ pub fn changeset_loop_panel(
 
         if st.mode == ExecuteLoopMode::ChangeSet {
             ui.separator();
-            ui.checkbox(&mut st.changeset_auto, "Auto");
-            ui.small(if st.changeset_auto { "(won't pause)" } else { "(pause each step)" });
+            ui.label("Loop");
+
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.changeset_auto, "Auto").clicked() {
+                    st.changeset_auto = true;
+                    // If user flips to Auto while paused, unpause so it can continue.
+                    st.awaiting_review = false;
+                }
+                if ui.selectable_label(!st.changeset_auto, "Step").clicked() {
+                    st.changeset_auto = false;
+                }
+            });
+
+            ui.small(if st.changeset_auto {
+                "(runs continuously)"
+            } else {
+                "(pauses after each step)"
+            });
         }
 
-        ui.separator();
-        ui.checkbox(&mut st.auto_fill_first_changeset_applier, "Auto-fill + auto-apply ChangeSet");
     });
 
     ui.add_space(8.0);
@@ -569,7 +604,7 @@ pub fn changeset_loop_panel(
         });
         ui.add(
             egui::Label::new(
-                "Run this after the ChangeSet is applied. If it fails, the output will be sent back to the model for a follow-up ChangeSet (auto mode), or paused for review (manual).",
+                "Run this after the ChangeSet is applied. If it fails, the output will be sent back to the model for a follow-up ChangeSet (Auto), or paused for Step.",
             )
             .wrap(true),
         );
@@ -582,6 +617,17 @@ pub fn changeset_loop_panel(
 
     // Conversation transcript
     ui.label("Conversation");
+
+    let mut force_open_all: Option<bool> = None;
+    ui.horizontal(|ui| {
+        if ui.small_button("Expand all").clicked() {
+            force_open_all = Some(true);
+        }
+        if ui.small_button("Collapse all").clicked() {
+            force_open_all = Some(false);
+        }
+    });
+
     egui::ScrollArea::both()
         .id_source(("execute_loop_chat_scroll", loop_id))
         .auto_shrink([false, false])
@@ -593,23 +639,44 @@ pub fn changeset_loop_panel(
             }
 
             for (i, m) in st.messages.iter().enumerate() {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(6.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("#{}", i + 1));
-                            ui.separator();
-                            ui.monospace(&m.role);
+                let header = format!("#{}  {}", i + 1, m.role);
+
+                let id = ui.make_persistent_id(("execute_loop_msg", loop_id, i));
+                let default_open = m.role != "system";
+                let mut cs = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ctx,
+                    id,
+                    default_open,
+                );
+
+                if let Some(force) = force_open_all {
+                    cs.set_open(force);
+                }
+
+                cs.show_header(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(&header);
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if m.role == "assistant" {
+                                if ui.small_button("Copy").clicked() {
+                                    ctx.output_mut(|o| o.copied_text = m.content.clone());
+                                }
+                            }
                         });
-                        ui.add_space(4.0);
-                        // Use a selectable label so users can highlight/copy transcript text.
-                        // (Non-interactive TextEdit prevents selection.)
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(m.content.clone()).monospace())
-                                .selectable(true)
-                                .wrap(false),
-                        );
                     });
+                })
+                .body(|ui| {
+                    ui.add_space(4.0);
+                    // Use a selectable label so users can highlight/copy transcript text.
+                    // (Non-interactive TextEdit prevents selection.)
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(m.content.clone()).monospace())
+                            .selectable(true)
+                            .wrap(false),
+                    );
+                });
+
                 ui.add_space(6.0);
             }
         });
@@ -631,6 +698,30 @@ pub fn changeset_loop_panel(
             actions.push(Action::ExecuteLoopSend { loop_id });
         }
 
+        if st.mode == ExecuteLoopMode::ChangeSet {
+            ui.separator();
+
+            // Auto vs Step indicator (explicitly labeled as requested).
+            ui.small(if st.changeset_auto { "Auto" } else { "Step" });
+
+            // Only allow stepping when paused and not busy.
+            let can_step = st.awaiting_review && !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
+            if ui
+                .add_enabled(!st.changeset_auto && can_step, egui::Button::new("Step"))
+                .on_hover_text("Advance one step (only enabled when paused)")
+                .clicked()
+            {
+                // Unpause.
+                actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
+
+                if !st.draft.trim().is_empty() {
+                    actions.push(Action::ExecuteLoopSend { loop_id });
+                } else if !st.postprocess_cmd.trim().is_empty() {
+                    actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+                }
+            }
+        }
+
         if st.pending {
             ui.separator();
             ui.small("Waiting for response…");
@@ -639,12 +730,7 @@ pub fn changeset_loop_panel(
             ui.small("Running postprocess…");
         } else if st.awaiting_review {
             ui.separator();
-            ui.small("Paused for review — click 'Mark reviewed' to continue.");
-        }
-
-        if st.mode == ExecuteLoopMode::ChangeSet {
-            ui.separator();
-            ui.small(if st.changeset_auto { "Auto" } else { "Manual" });
+            ui.small("Paused — click Step to continue.");
         }
     });
 

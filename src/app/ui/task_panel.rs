@@ -1,8 +1,9 @@
 // src/app/ui/task_panel.rs
 use eframe::egui;
 
-use crate::app::actions::{Action, ComponentId};
+use crate::app::actions::{Action, ComponentId, ConversationId};
 use crate::app::state::AppState;
+use std::collections::BTreeSet;
 
 fn status_string(loop_st: &crate::app::state::ExecuteLoopState) -> String {
     if loop_st.paused {
@@ -40,11 +41,28 @@ fn status_string_from_snapshot(snap: &crate::app::layout::ExecuteLoopSnapshot) -
     }
 }
 
-fn pct(n: u32, d: u32) -> String {
-    if d == 0 {
-        "-".to_string()
+fn fmt_dt(ms: u64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    if ms == 0 {
+        return "-".to_string();
+    }
+
+    let nanos = (ms as i128) * 1_000_000;
+    match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+        Ok(dt) => dt.format(&Rfc3339).unwrap_or_else(|_| ms.to_string()),
+        Err(_) => ms.to_string(),
+    }
+}
+
+fn oai_id_tail_last_10(oai_id: &str) -> String {
+    // Char-safe tail (OpenAI ids are ASCII-ish, but keep this correct for Unicode anyway).
+    let tail: String = oai_id.chars().rev().take(10).collect::<String>().chars().rev().collect();
+    if oai_id.chars().count() > 10 {
+        format!("…{}", tail)
     } else {
-        format!("{:.0}%", (n as f32) * 100.0 / (d as f32))
+        tail
     }
 }
 
@@ -56,121 +74,191 @@ pub fn task_panel(
 ) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::new();
 
+    // Local (non-persisted) multi-select state per task.
+    // Stored in AppState.ui to avoid `static mut` (and to keep selection stable across frames).
+    let selected_conversations: &mut BTreeSet<ConversationId> = {
+        let map = state.ui.task_panel_selected_loops_mut();
+        map.entry(task_id).or_insert_with(BTreeSet::new)
+    };
+
     // Avoid holding a mutable borrow of `state.tasks` across UI closures.
-    let (task_paused, task_bound_execute_loop) = {
+    let (_task_paused, _task_bound_execute_loop, task_active_conversation) = {
         let task = state.tasks.entry(task_id).or_default();
-        (task.paused, task.bound_execute_loop)
+        (task.paused, task.bound_execute_loop, task.active_conversation)
     };
 
     ui.horizontal(|ui| {
         ui.heading(format!("Task {}", task_id));
         ui.add_space(8.0);
 
-        let pause_label = if task_paused { "Resume" } else { "Pause" };
-        if ui.button(pause_label).clicked() {
-            actions.push(Action::TaskSetPaused {
-                task_id,
-                paused: !task_paused,
-            });
+        if ui
+            .button("Delete selected")
+            .on_hover_text("Delete all selected conversations")
+            .clicked()
+        {
+            let ids: Vec<ConversationId> = selected_conversations.iter().copied().collect();
+            if !ids.is_empty() {
+                actions.push(Action::TaskConversationsDelete {
+                    task_id,
+                    conversation_ids: ids,
+                });
+                selected_conversations.clear();
+            }
         }
 
-        if ui.button("New chat").on_hover_text("Create a new chat thread (Execute Loop) and bind it to this Task").clicked() {
-            actions.push(Action::TaskCreateAndBindExecuteLoop { task_id });
+        if ui.button("Pause selected").clicked() {
+            let ids: Vec<ConversationId> = selected_conversations.iter().copied().collect();
+            if !ids.is_empty() {
+                actions.push(Action::TaskConversationsSetPaused {
+                    task_id,
+                    conversation_ids: ids,
+                    paused: true,
+                });
+            }
+        }
+
+        if ui.button("Resume selected").clicked() {
+            let ids: Vec<ConversationId> = selected_conversations.iter().copied().collect();
+            if !ids.is_empty() {
+                actions.push(Action::TaskConversationsSetPaused {
+                    task_id,
+                    conversation_ids: ids,
+                    paused: false,
+                });
+            }
+        }
+
+        ui.add_space(8.0);
+
+        if ui
+            .button("New chat")
+            .on_hover_text("Create a new conversation and open it")
+            .clicked()
+        {
+            actions.push(Action::TaskCreateConversationAndOpen { task_id });
         }
     });
 
     ui.add_space(8.0);
-
-
     ui.add_space(8.0);
 
     ui.group(|ui| {
-        ui.label("Chats (Execute Loops) — status / stats");
+        ui.label("Chats (Conversations) — status / stats");
 
-        // Map loop -> bound tasks (for display)
-        let mut loop_to_tasks: std::collections::HashMap<ComponentId, Vec<ComponentId>> =
-            Default::default();
-        for (tid, t) in state.tasks.iter() {
-            if let Some(lid) = t.bound_execute_loop {
-                loop_to_tasks.entry(lid).or_default().push(*tid);
-            }
-        }
-        for v in loop_to_tasks.values_mut() {
-            v.sort();
-        }
-
-        let mut ids: Vec<ComponentId> = state.execute_loop_store.keys().copied().collect();
+        // List Task-owned durable conversations.
+        let mut ids: Vec<ConversationId> = state
+            .tasks
+            .get(&task_id)
+            .map(|t| t.conversations.keys().copied().collect())
+            .unwrap_or_default();
         ids.sort();
 
-        egui::Grid::new(("execute_loop_stats_grid", task_id))
+        egui::Grid::new(("conversation_stats_grid", task_id))
             .striped(true)
             .show(ui, |ui| {
-                ui.strong("Loop");
-                ui.strong("Bound tasks");
+                ui.strong("Sel");
+                ui.strong("Conversation");
+                ui.strong("Status");
                 ui.strong("Mode");
-                ui.strong("Paused");
                 ui.strong("Msgs");
                 ui.strong("Apply ok/total");
-                ui.strong("Apply %");
                 ui.strong("Post ok/total");
-                ui.strong("Post %");
-                ui.strong("Status");
+                ui.strong("Updated");
                 ui.end_row();
 
-                for loop_id in ids {
-                    let snap = match state.execute_loop_store.get(&loop_id) {
+                for conversation_id in ids {
+                    let snap = match state
+                        .tasks
+                        .get(&task_id)
+                        .and_then(|t| t.conversations.get(&conversation_id))
+                    {
                         Some(s) => s,
                         None => continue,
                     };
 
-                    let bound_tasks = loop_to_tasks
-                        .get(&loop_id)
-                        .map(|v| {
-                            v.iter()
-                                .map(|x| x.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_else(|| "-".to_string());
-
                     let mode = format!("{:?}", snap.mode);
-                    let paused = if snap.paused { "yes" } else { "no" };
                     let msgs = snap.messages.len();
 
                     let apply_total = snap.changesets_total;
                     let apply_ok = snap.changesets_ok;
-                    let apply_pct = pct(apply_ok, apply_total);
 
                     let post_total = snap.postprocess_ok + snap.postprocess_err;
                     let post_ok = snap.postprocess_ok;
-                    let post_pct = pct(post_ok, post_total);
 
-                    // Prefer richer live status if loop is loaded/open, else snapshot-only.
-                    let status = if let Some(loop_st) = state.execute_loops.get(&loop_id) {
-                        status_string(loop_st)
-                    } else {
-                        status_string_from_snapshot(snap)
-                    };
+                    // Snapshot status (task-scoped durable view).
+                    let status = status_string_from_snapshot(snap);
 
-                    let selected = task_bound_execute_loop == Some(loop_id);
-                    if ui
-                        .selectable_label(selected, format!("Execute Loop {}", loop_id))
-                        .clicked()
-                    {
-                        // Single click: bind + open.
-                        actions.push(Action::TaskBindExecuteLoop { task_id, loop_id });
-                        actions.push(Action::TaskOpenExecuteLoop { task_id });
+                    // Selection checkbox
+                    let mut is_sel = selected_conversations.contains(&conversation_id);
+                    if ui.checkbox(&mut is_sel, "").changed() {
+                        if is_sel {
+                            selected_conversations.insert(conversation_id);
+                        } else {
+                            selected_conversations.remove(&conversation_id);
+                        }
                     }
 
-                    ui.monospace(bound_tasks);
+                    ui.horizontal(|ui| {
+                        let selected = task_active_conversation == Some(conversation_id);
+
+                        // Display: last 10 chars of the OpenAI conversation id (conv_...), if present.
+                        // Hover: show full OpenAI id and internal ConversationId.
+                        let (display, hover) = match snap.conversation_id.as_deref() {
+                            Some(full) if !full.trim().is_empty() => {
+                                let tail = oai_id_tail_last_10(full);
+                                (tail, format!("OpenAI: {}\nInternal: Conversation {}", full, conversation_id))
+                            }
+                            _ => (
+                                format!("Conversation {}", conversation_id),
+                                format!("OpenAI: (none yet)\nInternal: Conversation {}", conversation_id),
+                            ),
+                        };
+
+                        let resp = ui.selectable_label(selected, display);
+
+                        // Hover: show full OpenAI conversation id + usage hint.
+                        let resp = if let Some(full) = snap.conversation_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                            let hover = format!("{}\n\nLeft-click: open\nRight-click: copy id", full);
+                            resp.on_hover_text(hover)
+                        } else {
+                            resp.on_hover_text("(no OpenAI conversation id yet)\n\nLeft-click: open\nRight-click: copy id")
+                        };
+
+                        // Right-click: copy full OpenAI conversation id to clipboard.
+                        if resp.clicked_by(eframe::egui::PointerButton::Secondary) {
+                            if let Some(full) = snap.conversation_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                                ui.output_mut(|o| o.copied_text = full.to_string());
+                            }
+                        }
+
+                        // Left-click: open (existing behavior).
+                        if resp.clicked() {
+                            actions.push(Action::TaskOpenConversation {
+                                task_id,
+                                conversation_id,
+                            });
+                        }
+                    });
+
+                    ui.monospace(status);
                     ui.monospace(mode);
-                    ui.monospace(paused);
                     ui.monospace(msgs.to_string());
                     ui.monospace(format!("{}/{}", apply_ok, apply_total));
-                    ui.monospace(apply_pct);
                     ui.monospace(format!("{}/{}", post_ok, post_total));
-                    ui.monospace(post_pct);
-                    ui.monospace(status);
+
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(fmt_dt(snap.updated_at_ms)).monospace())
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(format!(
+                        "Created: {}",
+                        fmt_dt(if snap.created_at_ms == 0 {
+                            snap.updated_at_ms
+                        } else {
+                            snap.created_at_ms
+                        })
+                    ));
+
                     ui.end_row();
                 }
             });

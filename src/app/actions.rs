@@ -10,6 +10,9 @@ pub enum ExpandCmd {
 
 pub type ComponentId = u64;
 
+/// Durable identifier for a conversation owned by a Task (not tied to UI component ids).
+pub type ConversationId = u64;
+
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum ComponentKind {
     Tree,
@@ -36,38 +39,29 @@ pub enum TerminalShell {
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    // Execute loop
     ExecuteLoopRunOnce { loop_id: ComponentId },
-
-    /// Execute Loop chat: send the current draft.
     ExecuteLoopSend { loop_id: ComponentId },
-    /// Execute Loop chat: switch between Conversation and ChangeSet modes.
     ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
-    /// Execute Loop chat: inject freshly generated context as a system message.
     ExecuteLoopInjectContext { loop_id: ComponentId },
-    /// Execute Loop chat: clear conversation transcript (keeps system instruction).
     ExecuteLoopClearChat { loop_id: ComponentId },
-    /// Execute Loop chat: user reviewed a ChangeSet response; return to Conversation mode.
     ExecuteLoopMarkReviewed { loop_id: ComponentId },
-    /// Execute Loop: run postprocess command (e.g. cargo check) after apply.
     ExecuteLoopRunPostprocess { loop_id: ComponentId },
-
     ExecuteLoopClear { loop_id: ComponentId },
 
     // ---------------------------
     // Task
     // ---------------------------
-    /// Toggle pause for a Task (and any bound Execute Loop auto-processing).
     TaskSetPaused { task_id: ComponentId, paused: bool },
-
-    /// Bind a Task to a specific Execute Loop instance (chat thread).
     TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
-
-    /// Open (focus) the bound Execute Loop window for this task.
     TaskOpenExecuteLoop { task_id: ComponentId },
-
-    /// Create a NEW Execute Loop (chat thread), bind it to this Task, and open it.
     TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+    TaskCreateConversationAndOpen { task_id: ComponentId },
+    TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
+    TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
+    TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
+    ExecuteLoopDelete { loop_id: ComponentId },
+    ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
+    ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
 
 
     // ---------------------------
