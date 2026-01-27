@@ -10,6 +10,9 @@ pub enum ExpandCmd {
 
 pub type ComponentId = u64;
 
+/// Durable identifier for a conversation owned by a Task (not tied to UI component ids).
+pub type ConversationId = u64;
+
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum ComponentKind {
     Tree,
@@ -18,7 +21,9 @@ pub enum ComponentKind {
     Terminal,
     ContextExporter,
     ChangeSetApplier,
+    ExecuteLoop,
     SourceControl,
+    Task,
     DiffViewer,
 }
 
@@ -34,6 +39,31 @@ pub enum TerminalShell {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    ExecuteLoopRunOnce { loop_id: ComponentId },
+    ExecuteLoopSend { loop_id: ComponentId },
+    ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
+    ExecuteLoopInjectContext { loop_id: ComponentId },
+    ExecuteLoopClearChat { loop_id: ComponentId },
+    ExecuteLoopMarkReviewed { loop_id: ComponentId },
+    ExecuteLoopRunPostprocess { loop_id: ComponentId },
+    ExecuteLoopClear { loop_id: ComponentId },
+
+    // ---------------------------
+    // Task
+    // ---------------------------
+    TaskSetPaused { task_id: ComponentId, paused: bool },
+    TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
+    TaskOpenExecuteLoop { task_id: ComponentId },
+    TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+    TaskCreateConversationAndOpen { task_id: ComponentId },
+    TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
+    TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
+    TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
+    ExecuteLoopDelete { loop_id: ComponentId },
+    ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
+    ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
+
+
     // ---------------------------
     // Repo + analysis
     // ---------------------------

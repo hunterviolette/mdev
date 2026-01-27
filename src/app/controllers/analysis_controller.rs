@@ -56,6 +56,10 @@ impl AppState {
 
         self.refresh_git_refs();
 
+        // Chats/tasks are persisted globally per-repo.
+        // Hydrate them as soon as the repo is selected.
+        let _ = self.load_repo_task_store();
+
         self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
         self.run_analysis();
     }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ComponentKind};
+use super::actions::{ComponentId, ComponentKind, ConversationId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -39,7 +39,101 @@ pub struct FileViewerSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextExporterSnapshot {
+    pub mode: crate::app::state::ContextExportMode,
+}
+
+// ---------------------------
+// New: persisted ExecuteLoop + Task snapshots
+// ---------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecuteLoopSnapshot {
+    pub model: String,
+    pub instruction: String,
+    pub mode: crate::app::state::ExecuteLoopMode,
+    pub include_context_next: bool,
+    pub auto_fill_first_changeset_applier: bool,
+    pub messages: Vec<crate::app::state::ExecuteLoopMessage>,
+
+    /// OpenAI Conversations API id (conv_...). Stored so loops can resume without resending history.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+
+    #[serde(default)]
+    pub paused: bool,
+
+    #[serde(default)]
+    pub created_at_ms: u64,
+
+    #[serde(default)]
+    pub updated_at_ms: u64,
+
+    // Persisted ExecuteLoop UI toggles/inputs (backward compatible)
+    #[serde(default)]
+    pub changeset_auto: bool,
+
+    #[serde(default)]
+    pub postprocess_cmd: String,
+
+    // Best-effort stats (can be filled later; keep defaults for backward compat)
+    #[serde(default)]
+    pub changesets_total: u32,
+
+    #[serde(default)]
+    pub changesets_ok: u32,
+
+    #[serde(default)]
+    pub changesets_err: u32,
+
+    #[serde(default)]
+    pub postprocess_ok: u32,
+
+    #[serde(default)]
+    pub postprocess_err: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    #[serde(default)]
+    pub bound_execute_loop: Option<ComponentId>,
+    #[serde(default)]
+    pub paused: bool,
+
+    #[serde(default)]
+    pub execute_loop_ids: Vec<ComponentId>,
+
+    #[serde(default)]
+    pub created_at_ms: u64,
+
+    #[serde(default)]
+    pub updated_at_ms: u64,
+
+    #[serde(default)]
+    pub conversations: HashMap<ConversationId, ExecuteLoopSnapshot>,
+
+    #[serde(default)]
+    pub active_conversation: Option<ConversationId>,
+    
+    #[serde(default)]
+    pub next_conversation_id: ConversationId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateSnapshot {
+    /// Context exporters (per instance)
+    /// Stored so exporter mode (EntireRepo vs TreeSelect) persists across workspace save/load.
+    #[serde(default)]
+    pub context_exporters: HashMap<ComponentId, ContextExporterSnapshot>,
+
+    /// Execute loops (per instance)
+    #[serde(default)]
+    pub execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot>,
+
+    /// Tasks (per instance)
+    #[serde(default)]
+    pub tasks: HashMap<ComponentId, TaskSnapshot>,
+
     /// IMPORTANT: layout coordinates are canvas-local
     pub canvas_size: [f32; 2],
 
