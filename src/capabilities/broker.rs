@@ -45,6 +45,11 @@ impl CapabilityBroker {
                 let bytes = match source {
                     FileSource::Worktree => git::read_worktree_file(&repo, &path)
                         .with_context(|| format!("read_worktree_file failed for {path}"))?,
+                    FileSource::Index => {
+                        let spec = format!(":{path}");
+                        git::show_file_at(&repo, &spec)
+                            .with_context(|| format!("git show failed for {spec}"))?
+                    }
                     FileSource::GitRef(r) => {
                         let spec = format!("{r}:{path}");
                         git::show_file_at(&repo, &spec)

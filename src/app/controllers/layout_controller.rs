@@ -1,6 +1,7 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind};
 use crate::app::layout::{ComponentInstance, LayoutConfig, WindowLayout};
 use crate::app::state::{AppState, ChangeSetApplierState, ContextExportMode, ContextExporterState};
+use crate::app::state::ExecuteLoopState;
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -37,9 +38,10 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             // Ephemeral components rebuilt from layout
             state.rebuild_terminals_from_layout();
             state.rebuild_context_exporters_from_layout();
-            state.rebuild_changeset_appliers_from_layout(); // NEW
+            state.rebuild_changeset_appliers_from_layout();
             state.rebuild_source_controls_from_layout();
-            state.rebuild_source_controls_from_layout(); // NEW
+            state.rebuild_diff_viewers_from_layout();
+            state.rebuild_execute_loops_from_layout();
             true
         }
         _ => false,
@@ -51,6 +53,54 @@ impl AppState {
         match kind {
             ComponentKind::FileViewer => self.new_file_viewer(),
             ComponentKind::Terminal => self.new_terminal(),
+            ComponentKind::Task => {
+                // Minimal: create a window/component like others (actual Task behavior handled elsewhere)
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Task {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [200.0, 200.0],
+                        size: [520.0, 260.0],
+                    },
+                );
+
+                // Backing state is optional; if tasks map exists, ensure entry.
+                self.tasks.entry(id).or_default();
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
+            ComponentKind::DiffViewer => {
+                self.layout.merge_with_defaults();
+
+                let id = self.layout.next_free_id();
+                let title = format!("Diff Viewer {}", id);
+
+                self.layout.components.push(ComponentInstance { id, kind, title });
+
+                self.layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos: [180.0, 180.0],
+                        size: [980.0, 720.0],
+                    },
+                );
+
+                self.diff_viewers.insert(id, crate::app::state::DiffViewerState::new());
+                self.active_diff_viewer = Some(id);
+
+                self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            }
+
 
             ComponentKind::ContextExporter => {
                 self.layout.merge_with_defaults();
@@ -150,6 +200,11 @@ impl AppState {
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
+            ComponentKind::ExecuteLoop => {
+                // Create a new chat thread (Execute Loop).
+                self.new_execute_loop_component();
+            }
+
             ComponentKind::Tree | ComponentKind::Summary => {
                 self.layout.merge_with_defaults();
 
@@ -161,7 +216,10 @@ impl AppState {
                     | ComponentKind::Terminal
                     | ComponentKind::ContextExporter
                     | ComponentKind::SourceControl
-                    | ComponentKind::ChangeSetApplier => unreachable!(),
+                    | ComponentKind::ChangeSetApplier
+                    | ComponentKind::ExecuteLoop
+                    | ComponentKind::Task
+                    | ComponentKind::DiffViewer => unreachable!(),
                 };
 
                 self.layout
@@ -181,6 +239,35 @@ impl AppState {
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
         }
+    }
+
+    /// Create a new Execute Loop component (chat thread) and return its id.
+    pub fn new_execute_loop_component(&mut self) -> ComponentId {
+        self.layout.merge_with_defaults();
+
+        let id = self.layout.next_free_id();
+        let title = format!("Execute Loop {}", id);
+
+        self.layout.components.push(ComponentInstance {
+            id,
+            kind: ComponentKind::ExecuteLoop,
+            title,
+        });
+
+        self.layout.windows.insert(
+            id,
+            WindowLayout {
+                open: true,
+                locked: false,
+                pos: [150.0, 150.0],
+                size: [860.0, 680.0],
+            },
+        );
+
+        self.execute_loops.insert(id, ExecuteLoopState::new());
+
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
+        id
     }
 
     fn new_file_viewer(&mut self) {
@@ -227,9 +314,16 @@ impl AppState {
         // Clean up ephemeral component state (safe no-op if not present)
         self.context_exporters.remove(&id);
         self.terminals.remove(&id);
-        self.changeset_appliers.remove(&id); // NEW
+        self.changeset_appliers.remove(&id);
+        // Persist latest ExecuteLoop state (if any) before dropping the ephemeral view/controller.
+        self.persist_execute_loop_snapshot(id);
+        if self.task_store_dirty {
+            self.save_repo_task_store();
+        }
+
+        self.execute_loops.remove(&id);
         self.source_controls.remove(&id);
-        self.source_controls.remove(&id); // NEW
+        self.diff_viewers.remove(&id);
 
         if self.active_file_viewer == Some(id) {
             self.active_file_viewer = self

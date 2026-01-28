@@ -3,7 +3,7 @@ use eframe::egui;
 use super::super::actions::{Action, ComponentKind};
 use super::super::state::AppState;
 
-use super::{changeset_applier, context_exporter, file_viewer, source_control, summary_panel, terminal, tree_panel};
+use super::{changeset_applier, context_exporter, diff_viewer, changeset_loop, file_viewer, source_control, summary_panel, task_panel, terminal, tree_panel};
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -30,6 +30,13 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
         .show(ctx, |ui| {
             let clip_rect = canvas_rect.translate(-canvas_rect.min.to_vec2());
             ui.set_clip_rect(clip_rect);
+
+            // Optional faint canvas background tint (per-workspace).
+            // Drawn behind all component windows.
+            if let Some([r, g, b, a]) = state.ui.canvas_bg_tint {
+                let col = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                ui.painter().rect_filled(clip_rect, 0.0, col);
+            }
 
             let max_canvas_w = clip_rect.width().max(1.0);
             let max_canvas_h = clip_rect.height().max(1.0);
@@ -83,14 +90,30 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                             actions.extend(context_exporter::context_exporter(ui, state, c.id));
                             return content_size;
                         }
-                        ComponentKind::ChangeSetApplier => {
+                        ComponentKind::ChangeSetApplier =>
+                                 {
                             actions.extend(changeset_applier::changeset_applier_panel(
                                 ctx, ui, state, c.id,
                             ));
                             return content_size;
                         }
+                        ComponentKind::ExecuteLoop => {
+                            actions.extend(changeset_loop::changeset_loop_panel(ctx, ui, state, c.id));
+                            return content_size;
+                        }
+                        ComponentKind::Task => {
+                            actions.extend(task_panel::task_panel(ctx, ui, state, c.id));
+                            return content_size;
+                        }
                         ComponentKind::SourceControl => {
                             actions.extend(source_control::source_control_panel(ctx, ui, state, c.id));
+                            return content_size;
+                        }
+                        ComponentKind::DiffViewer => {
+                            if ui.rect_contains_pointer(ui.max_rect()) {
+                                state.active_diff_viewer = Some(c.id);
+                            }
+                            actions.extend(diff_viewer::diff_viewer_panel(ctx, ui, state, c.id));
                             return content_size;
                         }
                         _ => {}
@@ -120,7 +143,10 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         ComponentKind::Terminal
                         | ComponentKind::ContextExporter
                         | ComponentKind::ChangeSetApplier
-                        | ComponentKind::SourceControl => {
+                        | ComponentKind::ExecuteLoop
+                        | ComponentKind::Task
+                        | ComponentKind::SourceControl
+                        | ComponentKind::DiffViewer => {
                             // handled above
                         }
                     }

@@ -2,6 +2,8 @@ use crate::app::actions::{Action, ComponentId};
 use crate::app::state::AppState;
 use crate::capabilities::{CapabilityRequest, CapabilityResponse, ContextExportReq};
 
+use anyhow::{Context, Result};
+
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
         Action::ContextPickSavePath { exporter_id } => {
@@ -95,6 +97,68 @@ impl AppState {
                     ex.status = Some(format!("{:#}", e));
                 }
             }
+        }
+    }
+
+    /// Generate the *current* context text using the same ExportContext capability as the
+    /// Context Exporter component, but writing to a temp file and reading it back.
+    ///
+    /// - If the Tree has context-selected files, we export only those.
+    /// - Otherwise we export the full repo for the currently selected git_ref.
+    ///
+    /// This is intended for ExecuteLoop autonomy (no user-provided path needed).
+    pub(crate) fn generate_current_context_text(&mut self) -> Result<String> {
+        let repo = self
+            .inputs
+            .repo
+            .clone()
+            .context("No repo selected.")?;
+
+        // If the user selected files in Tree, honor that selection.
+        let include_files: Option<Vec<String>> = if self.tree.context_selected_files.is_empty() {
+            None
+        } else {
+            let mut v: Vec<String> = self.tree.context_selected_files.iter().cloned().collect();
+            v.sort();
+            Some(v)
+        };
+
+        // Temp output file
+        let out_path = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let mut p = std::env::temp_dir();
+            p.push(format!("repo_context_{ts}.txt"));
+            p
+        };
+
+        // Default to the same-ish defaults as the Context Exporter component state.
+        // (If you later want ExecuteLoop to expose these, thread them from its state.)
+        let req = ContextExportReq {
+            repo,
+            out_path: out_path.clone(),
+            git_ref: self.inputs.git_ref.clone(),
+            exclude_regex: self.inputs.exclude_regex.clone(),
+            max_bytes_per_file: 200_000,
+            skip_binary: true,
+            include_files,
+        };
+
+        match self.broker.exec(CapabilityRequest::ExportContext(req)) {
+            Ok(CapabilityResponse::Unit) => {
+                let text = std::fs::read_to_string(&out_path)
+                    .with_context(|| format!("Failed to read temp context file {}", out_path.display()))?;
+
+                // Best-effort cleanup.
+                let _ = std::fs::remove_file(&out_path);
+
+                Ok(text)
+            }
+            Ok(_) => anyhow::bail!("Unexpected response exporting context."),
+            Err(e) => Err(e).context("ExportContext failed"),
         }
     }
 }

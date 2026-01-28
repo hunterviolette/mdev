@@ -18,14 +18,17 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "terminal" | "term" => Some(ComponentKind::Terminal),
         "context_exporter" => Some(ComponentKind::ContextExporter),
         "changeset_applier" => Some(ComponentKind::ChangeSetApplier),
+        "execute_loop" => Some(ComponentKind::ExecuteLoop),
         "source_control" => Some(ComponentKind::SourceControl),
+        "task" => Some(ComponentKind::Task),
+        "diff_viewer" => Some(ComponentKind::DiffViewer),
         _ => None,
     }
 }
 
 fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
     if segments.is_empty() {
-        return vec!["workspace".into(), "component".into()];
+        return vec!["workspace".into(), "component".into(), "ui".into()];
     }
 
     match segments[0].as_str() {
@@ -107,14 +110,27 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
                     "component/terminal".into(),
                     "component/context_exporter".into(),
                     "component/changeset_applier".into(),
-                    "component/source_control".into()
+                    "component/execute_loop".into(),
+                    "component/source_control".into(),
+                    "component/task".into(),
+                    "component/diff_viewer".into(),
                 ]
             } else {
                 vec![]
             }
         }
 
-        _ => vec!["workspace".into(), "component".into()],
+        "ui" => {
+            // UI commands
+            if segments.len() == 1 {
+                vec!["ui/canvas_tint".into()]
+            } else {
+                // Only suggest existing commands (no legacy /clear)
+                vec!["ui/canvas_tint".into()]
+            }
+        }
+
+        _ => vec!["workspace".into(), "component".into(), "ui".into()],
     }
 }
 
@@ -154,6 +170,18 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
                 "load" => {
                     let name = segments.get(2).cloned();
                     (Some(Action::LoadWorkspace), name)
+                }
+                _ => (None, None),
+            }
+        }
+
+        "ui" => {
+            if segments.len() < 2 {
+                return (None, None);
+            }
+            match segments[1].as_str() {
+                "canvas_tint" => {
+                    (Some(Action::OpenCanvasTintPopup), None)
                 }
                 _ => (None, None),
             }
@@ -220,7 +248,13 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "component/terminal".into(),
         "component/context_exporter".into(),
         "component/changeset_applier".into(),
+        "component/execute_loop".into(),
         "component/source_control".into(),
+        "component/task".into(),
+        "component/diff_viewer".into(),
+
+        // UI preferences
+        "ui/canvas_tint".into(),
     ];
 
     let mut names = state.list_workspaces();
@@ -248,6 +282,9 @@ fn detect_command_lane(query: &str) -> Option<&'static str> {
     if q.starts_with("component/") {
         return Some("component/");
     }
+    if q.starts_with("ui/") {
+        return Some("ui/");
+    }
     if q.starts_with("workspace/") {
         return Some("workspace/");
     }
@@ -271,6 +308,11 @@ fn constrain_to_lane(mut sugg: Vec<String>, lane: Option<&str>) -> Vec<String> {
 
     if lane == "component/" {
         sugg.retain(|s| s.starts_with("component/"));
+        return sugg;
+    }
+
+    if lane == "ui/" {
+        sugg.retain(|s| s.starts_with("ui/"));
         return sugg;
     }
 
@@ -312,7 +354,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | component/task | ui/canvas_tint",
                     ),
             );
             resp.request_focus();

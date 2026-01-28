@@ -9,6 +9,8 @@ mod capabilities;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
+    let _ = dotenvy::dotenv();
+
     let native_options = eframe::NativeOptions::default();
 
     eframe::run_native(

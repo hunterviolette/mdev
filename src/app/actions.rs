@@ -10,6 +10,9 @@ pub enum ExpandCmd {
 
 pub type ComponentId = u64;
 
+/// Durable identifier for a conversation owned by a Task (not tied to UI component ids).
+pub type ConversationId = u64;
+
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum ComponentKind {
     Tree,
@@ -18,7 +21,10 @@ pub enum ComponentKind {
     Terminal,
     ContextExporter,
     ChangeSetApplier,
+    ExecuteLoop,
     SourceControl,
+    Task,
+    DiffViewer,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -33,6 +39,31 @@ pub enum TerminalShell {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    ExecuteLoopRunOnce { loop_id: ComponentId },
+    ExecuteLoopSend { loop_id: ComponentId },
+    ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
+    ExecuteLoopInjectContext { loop_id: ComponentId },
+    ExecuteLoopClearChat { loop_id: ComponentId },
+    ExecuteLoopMarkReviewed { loop_id: ComponentId },
+    ExecuteLoopRunPostprocess { loop_id: ComponentId },
+    ExecuteLoopClear { loop_id: ComponentId },
+
+    // ---------------------------
+    // Task
+    // ---------------------------
+    TaskSetPaused { task_id: ComponentId, paused: bool },
+    TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
+    TaskOpenExecuteLoop { task_id: ComponentId },
+    TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+    TaskCreateConversationAndOpen { task_id: ComponentId },
+    TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
+    TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
+    TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
+    ExecuteLoopDelete { loop_id: ComponentId },
+    ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
+    ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
+
+
     // ---------------------------
     // Repo + analysis
     // ---------------------------
@@ -47,6 +78,37 @@ pub enum Action {
     CollapseAll,
 
     OpenFile(String),
+
+    // ---------------------------
+    // UI prefs
+    // ---------------------------
+    /// Open the "canvas tint" popup (launched via command palette).
+    OpenCanvasTintPopup,
+    /// Close the "canvas tint" popup.
+    CloseCanvasTintPopup,
+    /// Set the canvas background tint (stored in UiState and persisted in workspaces).
+    /// - None disables the tint.
+    /// - Some([r,g,b,a]) uses sRGBA bytes.
+    SetCanvasBgTint { rgba: Option<[u8; 4]> },
+
+    // ---------------------------
+    // Diff viewer actions
+    // ---------------------------
+    /// Open a repo-relative path in a Diff Viewer. If no Diff Viewer exists,
+    /// one is created; otherwise this attaches to the last active Diff Viewer.
+    OpenDiffViewerForPath { path: String },
+
+    /// Open/attach a Diff Viewer for a path with explicit left/right refs.
+    OpenDiffViewerForPathWithRefs {
+        path: String,
+        from_ref: String,
+        to_ref: String,
+    },
+
+    RefreshDiffViewer {
+        viewer_id: ComponentId,
+    },
+
 
     // ---------------------------
     // File viewer actions
