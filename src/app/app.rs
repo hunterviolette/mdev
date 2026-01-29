@@ -26,7 +26,9 @@ fn current_viewport_inner_size(ctx: &egui::Context) -> Option<[f32; 2]> {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        theme::seed_solarized_dark_once(ctx);
+        
+
+        theme::apply_from_state(ctx, self);
 
         // Ctrl+Shift+E toggles palette
         let pressed = ctx.input(|i| {
@@ -64,6 +66,12 @@ impl eframe::App for AppState {
                 self.apply_action(a);
             }
         });
+
+        // Personalization modal (theme + canvas tint)
+        let actions = ui::personalization::personalization(ctx, self);
+        for a in actions {
+            self.apply_action(a);
+        }
 
         // Persist the "canvas rect" AFTER top panel has taken its space
         let canvas_rect = ctx.available_rect();
@@ -109,7 +117,7 @@ impl eframe::App for AppState {
 
         // Canvas tint popup (modal; freezes underlying canvas while open)
         // Must be called every frame so it can draw.
-        let tint_actions = ui::canvas_tint::canvas_tint(ctx, self);
+        let tint_actions = ui::personalization::personalization(ctx, self);
         for a in tint_actions {
             self.apply_action(a);
         }

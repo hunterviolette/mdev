@@ -1,9 +1,32 @@
 use eframe::egui;
+use egui_extras::syntax_highlighting::CodeTheme;
+
 
 use crate::app::actions::Action;
 use crate::app::state::AppState;
 
 const DEFAULT_CANVAS_BG_TINT: [u8; 4] = [0, 128, 255, 18];
+
+fn apply_theme(ctx: &egui::Context, state: &mut AppState) {
+    if state.theme.prefs.dark {
+        ctx.set_visuals(egui::Visuals::dark());
+    } else {
+        ctx.set_visuals(egui::Visuals::light());
+    }
+
+    let json = format!(
+        r#"{{"dark_mode":{},"syntect_theme":"{}"}}"#,
+        state.theme.prefs.dark,
+        state.theme.prefs.syntect_theme
+    );
+
+    if let Ok(theme) = serde_json::from_str::<CodeTheme>(&json) {
+        theme.clone().store_in_memory(ctx);
+        state.theme.code_theme = theme;
+    } else {
+        state.theme.code_theme = CodeTheme::from_memory(ctx);
+    }
+}
 
 
 fn centered_rect(screen: egui::Rect, w: f32, h: f32) -> egui::Rect {
@@ -11,11 +34,7 @@ fn centered_rect(screen: egui::Rect, w: f32, h: f32) -> egui::Rect {
     egui::Rect::from_center_size(screen.center(), size)
 }
 
-/// Modal popup for setting a faint per-workspace canvas background tint.
-///
-/// Key property: we block input to the app *except* for the popup itself.
-/// We do this by capturing clicks in four rectangles around the popup rect.
-pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
+pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
     let mut actions = Vec::new();
 
     if !state.ui.canvas_tint_popup_open {
@@ -23,8 +42,6 @@ pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
     }
 
     let screen = ctx.screen_rect();
-    // Taller popup to host an embedded picker (no floating picker popup),
-    // which eliminates focus/input conflicts with the modal blocker.
     let popup_rect = centered_rect(screen, 480.0, 420.0);
 
     // Close on Esc.
@@ -33,14 +50,9 @@ pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
         return actions;
     }
 
-    // -------------------------------
-    // Modal blocker (input outside popup)
-    // -------------------------------
-    // We draw a dimming layer across the whole screen, but only *capture input*
-    // in the regions OUTSIDE the popup. This leaves the popup interactive.
     let mut clicked_outside = false;
 
-    egui::Area::new(egui::Id::new("canvas_tint_popup_modal_blocker"))
+    egui::Area::new(egui::Id::new("personalization_popup_modal_blocker"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
@@ -98,7 +110,7 @@ pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     ui.set_min_size(popup_rect.size());
 
                     ui.horizontal(|ui| {
-                        ui.heading("Canvas background tint");
+                        ui.heading("Personalization");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✕").clicked() {
                                 actions.push(Action::CloseCanvasTintPopup);
@@ -107,12 +119,36 @@ pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     });
 
                     ui.add_space(6.0);
-                    ui.label("Sets a faint sRGBA overlay behind the canvas to visually identify the current workspace.");
+                    ui.label("Theme + visual workspace hints.");
                     ui.separator();
 
-                    // Use a stable draft value while the popup is open.
-                    // This keeps the picker selector stable while dragging and avoids
-                    // jumps due to state being reconstructed each frame.
+                    // -------------------------------
+                    // Theme (moved from top bar)
+                    // -------------------------------
+                    ui.label("Theme:");
+                    let was_dark = state.theme.prefs.dark;
+
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(state.theme.prefs.dark, "Dark").clicked() {
+                            state.theme.prefs.dark = true;
+                            if !was_dark {
+                                state.theme.prefs.syntect_theme = "SolarizedDark".to_string();
+                            }
+                            apply_theme(ctx, state);
+                        }
+
+                        if ui.selectable_label(!state.theme.prefs.dark, "Light").clicked() {
+                            state.theme.prefs.dark = false;
+                            if was_dark {
+                                state.theme.prefs.syntect_theme = "SolarizedLight".to_string();
+                            }
+                            apply_theme(ctx, state);
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label("Canvas background tint:");
+
                     let rgba_bytes = state
                         .ui
                         .canvas_tint_draft
@@ -127,8 +163,6 @@ pub fn canvas_tint(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
 
                     ui.label("Tint:");
 
-                    // Embedded picker UI (not a floating popup). This prevents the modal
-                    // blocker from stealing input from the picker.
                     let before = col;
                     egui::widgets::color_picker::color_picker_color32(
                         ui,

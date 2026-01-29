@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use eframe::egui;
 use egui_extras::syntax_highlighting::highlight;
 
-use crate::app::theme;
 use crate::app::ui::helpers::language_hint_for_path;
 
 /// Persistent editor state (cursor, selection, caches).
@@ -660,7 +659,7 @@ pub fn code_editor(
     text: &mut String,
     st: &mut CodeEditorState,
 ) -> bool {
-    theme::seed_solarized_dark_once(ctx);
+
     st.begin_frame();
 
     let mut changed = false;

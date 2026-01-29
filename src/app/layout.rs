@@ -152,10 +152,16 @@ pub struct StateSnapshot {
     pub show_top_level_stats: bool,
 
     /// UI prefs: optional canvas background tint.
-    ///
-    /// `#[serde(default)]` keeps older workspace files loadable.
     #[serde(default)]
     pub canvas_bg_tint: Option<[u8; 4]>,
+
+    /// Theme prefs (persisted with workspace)
+    #[serde(default)]
+    pub theme_dark: bool,
+
+    /// Syntect theme name for code highlighting (egui_extras).
+    #[serde(default)]
+    pub theme_syntect: String,
 
     /// Layout
     pub layout: LayoutConfig,

@@ -122,12 +122,7 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
 
         "ui" => {
             // UI commands
-            if segments.len() == 1 {
-                vec!["ui/canvas_tint".into()]
-            } else {
-                // Only suggest existing commands (no legacy /clear)
-                vec!["ui/canvas_tint".into()]
-            }
+            vec!["ui/personalization".into()]
         }
 
         _ => vec!["workspace".into(), "component".into(), "ui".into()],
@@ -180,9 +175,7 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
                 return (None, None);
             }
             match segments[1].as_str() {
-                "canvas_tint" => {
-                    (Some(Action::OpenCanvasTintPopup), None)
-                }
+                "personalization" => (Some(Action::OpenCanvasTintPopup), None),
                 _ => (None, None),
             }
         }
@@ -254,7 +247,7 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "component/diff_viewer".into(),
 
         // UI preferences
-        "ui/canvas_tint".into(),
+        "ui/personalization".into(),
     ];
 
     let mut names = state.list_workspaces();
@@ -354,7 +347,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | component/task | ui/canvas_tint",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | component/task | ui/personalization",
                     ),
             );
             resp.request_focus();

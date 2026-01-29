@@ -7,7 +7,7 @@ use super::controllers::{
     changeset_loop_controller,
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
     file_viewer_controller, layout_controller, palette_controller, source_control_controller,
-    terminal_controller, tree_controller, canvas_tint, workspace_controller,
+    terminal_controller, tree_controller, personalization, workspace_controller,
     task_controller,
 };
 
@@ -367,7 +367,7 @@ impl AppState {
         if palette_controller::handle(self, &action) {
             return;
         }
-        if canvas_tint::handle(self, &action) {
+        if personalization::handle(self, &action) {
             return;
         }
         if analysis_controller::handle(self, &action) {
