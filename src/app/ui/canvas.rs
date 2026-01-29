@@ -12,7 +12,6 @@ fn canvas_rect_id() -> egui::Id {
 pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
     let mut actions = vec![];
 
-    state.layout.merge_with_defaults();
 
     let res_opt = state.results.result.clone();
 
@@ -42,9 +41,9 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
             let max_canvas_h = clip_rect.height().max(1.0);
 
             // Render all components in layout order
-            let components = state.layout.components.clone();
+            let components = state.active_layout().components.clone();
             for c in components {
-                let Some(w0) = state.layout.get_window(c.id).cloned() else { continue };
+                let Some(w0) = state.active_layout().get_window(c.id).cloned() else { continue };
                 if !w0.open {
                     continue;
                 }
@@ -56,10 +55,11 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     w0.size[1].clamp(120.0, max_canvas_h),
                 );
 
-                let window_id = egui::Id::new(("canvas_window", c.id, state.layout_epoch));
+                let canvas_epoch = state.active_canvas_state().layout_epoch;
+                let window_id = egui::Id::new(("canvas_window", state.active_canvas, canvas_epoch, c.id));
 
                 let title = if c.kind == ComponentKind::FileViewer {
-                    if state.active_file_viewer == Some(c.id) {
+                    if state.active_file_viewer_id() == Some(c.id) {
                         format!("{}  (active)", c.title)
                     } else {
                         c.title.clone()
@@ -111,7 +111,7 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         }
                         ComponentKind::DiffViewer => {
                             if ui.rect_contains_pointer(ui.max_rect()) {
-                                state.active_diff_viewer = Some(c.id);
+                                state.set_active_diff_viewer_id(Some(c.id));
                             }
                             actions.extend(diff_viewer::diff_viewer_panel(ctx, ui, state, c.id));
                             return content_size;
@@ -131,7 +131,7 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         }
                         ComponentKind::FileViewer => {
                             if ui.rect_contains_pointer(ui.max_rect()) {
-                                state.active_file_viewer = Some(c.id);
+                                state.set_active_file_viewer_id(Some(c.id));
                             }
                             actions.extend(file_viewer::file_viewer(ctx, ui, state, c.id));
                         }
@@ -154,7 +154,7 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     content_size
                 });
 
-                if let Some(w) = state.layout.get_window_mut(c.id) {
+                if let Some(w) = state.active_layout_mut().get_window_mut(c.id) {
                     w.open = open;
 
                     if let Some(inner) = shown {

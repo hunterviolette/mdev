@@ -9,7 +9,7 @@ use super::super::state::AppState;
 
 fn file_viewer_choices(state: &AppState) -> Vec<(ComponentId, String)> {
     let mut list: Vec<(ComponentId, String)> = state
-        .layout
+        .active_layout()
         .components
         .iter()
         .filter(|c| c.kind == ComponentKind::FileViewer)
@@ -117,7 +117,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
                     .to_string(),
             );
         } else if viewers.len() == 1 {
-            state.active_file_viewer = Some(viewers[0].0);
+            state.set_active_file_viewer_id(Some(viewers[0].0));
             actions.push(Action::OpenFile(f.full_path.clone()));
         } else {
             ui.memory_mut(|m| m.open_popup(popup_id));
@@ -131,7 +131,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
         ui.separator();
 
         let default_id = state
-            .active_file_viewer
+            .active_file_viewer_id()
             .filter(|id| viewers.iter().any(|(vid, _)| vid == id))
             .unwrap_or(viewers[0].0);
 
@@ -139,7 +139,7 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
             let selected = *viewer_id == default_id;
 
             if ui.selectable_label(selected, title).clicked() {
-                state.active_file_viewer = Some(*viewer_id);
+                state.set_active_file_viewer_id(Some(*viewer_id));
                 actions.push(Action::FocusFileViewer(*viewer_id));
                 actions.push(Action::OpenFile(f.full_path.clone()));
                 ui.close_menu();

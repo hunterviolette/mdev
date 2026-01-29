@@ -349,6 +349,15 @@ pub enum FileViewAt {
 
 pub use crate::app::ui::code_editor::CodeEditorState;
 
+#[derive(Clone, Debug)]
+pub struct CanvasState {
+    pub name: String,
+    pub layout: LayoutConfig,
+    pub active_file_viewer: Option<ComponentId>,
+    pub active_diff_viewer: Option<ComponentId>,
+    pub layout_epoch: u32,
+}
+
 pub struct AppState {
     pub platform: Arc<dyn Platform>,
     pub broker: CapabilityBroker,
@@ -360,11 +369,13 @@ pub struct AppState {
     pub ui: UiState,
     pub tree: TreeState,
 
+    pub canvases: Vec<CanvasState>,
+    pub active_canvas: usize,
+    pub next_component_id: ComponentId,
+
     pub file_viewers: HashMap<ComponentId, FileViewerState>,
-    pub active_file_viewer: Option<ComponentId>,
 
     pub diff_viewers: HashMap<ComponentId, DiffViewerState>,
-    pub active_diff_viewer: Option<ComponentId>,
 
     pub terminals: HashMap<ComponentId, TerminalState>,
     pub context_exporters: HashMap<ComponentId, ContextExporterState>,
@@ -385,7 +396,6 @@ pub struct AppState {
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
-    pub layout: LayoutConfig,
 
     pub layout_epoch: u64,
 
@@ -513,6 +523,141 @@ pub struct DeferredActions {
 }
 
 impl AppState {
+    pub fn active_canvas_state(&self) -> &CanvasState {
+        let idx = self.active_canvas.min(self.canvases.len().saturating_sub(1));
+        &self.canvases[idx]
+    }
+
+    pub fn active_canvas_state_mut(&mut self) -> &mut CanvasState {
+        if self.canvases.is_empty() {
+            let layout = LayoutConfig::default();
+            self.canvases.push(CanvasState {
+                name: "Canvas 1".to_string(),
+                layout: layout.clone(),
+                active_file_viewer: Some(2),
+                active_diff_viewer: None,
+                layout_epoch: 0,
+            });
+            self.active_canvas = 0;
+            self.next_component_id = layout.next_free_id();
+            self.file_viewers.entry(2).or_insert_with(FileViewerState::new);
+        }
+        let idx = self.active_canvas.min(self.canvases.len().saturating_sub(1));
+        &mut self.canvases[idx]
+    }
+
+    pub fn active_layout(&self) -> &LayoutConfig {
+        &self.active_canvas_state().layout
+    }
+
+    pub fn active_layout_mut(&mut self) -> &mut LayoutConfig {
+        &mut self.active_canvas_state_mut().layout
+    }
+
+    pub fn active_file_viewer_id(&self) -> Option<ComponentId> {
+        self.active_canvas_state().active_file_viewer
+    }
+
+    pub fn set_active_file_viewer_id(&mut self, id: Option<ComponentId>) {
+        self.active_canvas_state_mut().active_file_viewer = id;
+    }
+
+    pub fn active_diff_viewer_id(&self) -> Option<ComponentId> {
+        self.active_canvas_state().active_diff_viewer
+    }
+
+    pub fn set_active_diff_viewer_id(&mut self, id: Option<ComponentId>) {
+        self.active_canvas_state_mut().active_diff_viewer = id;
+    }
+
+    pub fn alloc_component_id(&mut self) -> ComponentId {
+        let id = self.next_component_id;
+        self.next_component_id = self.next_component_id.wrapping_add(1);
+        id
+    }
+
+    pub fn all_layouts(&self) -> impl Iterator<Item = &LayoutConfig> {
+        self.canvases.iter().map(|c| &c.layout)
+    }
+
+    pub fn canvas_select(&mut self, index: usize) {
+        if self.canvases.is_empty() {
+            return;
+        }
+        self.active_canvas = index.min(self.canvases.len() - 1);
+    }
+
+    pub fn canvas_add(&mut self) {
+        if self.canvases.len() >= 10 {
+            return;
+        }
+
+        let idx = self.canvases.len();
+
+        let layout = LayoutConfig {
+            components: vec![],
+            windows: HashMap::new(),
+        };
+
+        self.canvases.push(CanvasState {
+            name: format!("Canvas {}", idx + 1),
+            layout,
+            active_file_viewer: None,
+            active_diff_viewer: None,
+            layout_epoch: 0,
+        });
+
+        self.active_canvas = idx;
+
+        self.rebuild_context_exporters_from_layout();
+        self.rebuild_execute_loops_from_layout();
+        self.rebuild_tasks_from_layout();
+    }
+
+    pub fn canvas_rename(&mut self, index: usize, name: String) {
+        if let Some(c) = self.canvases.get_mut(index) {
+            let n = name.trim();
+            if !n.is_empty() {
+                c.name = n.to_string();
+            }
+        }
+    }
+
+    pub fn canvas_delete(&mut self, index: usize) {
+        if self.canvases.len() <= 1 {
+            return;
+        }
+        if index >= self.canvases.len() {
+            return;
+        }
+
+        let ids: std::collections::HashSet<ComponentId> = self.canvases[index]
+            .layout
+            .components
+            .iter()
+            .map(|c| c.id)
+            .collect();
+
+        for id in ids.iter().copied() {
+            self.context_exporters.remove(&id);
+            self.execute_loops.remove(&id);
+            self.file_viewers.remove(&id);
+            self.diff_viewers.remove(&id);
+        }
+
+        self.canvases.remove(index);
+
+        if self.active_canvas >= self.canvases.len() {
+            self.active_canvas = self.canvases.len() - 1;
+        }
+
+        self.rebuild_context_exporters_from_layout();
+        self.rebuild_execute_loops_from_layout();
+        self.rebuild_tasks_from_layout();
+
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
+    }
+
     pub fn new(platform: Arc<dyn Platform>) -> Self {
         let layout = LayoutConfig::default();
         let broker = CapabilityBroker::new(platform.clone());
@@ -555,11 +700,19 @@ impl AppState {
                 context_selected_by_ref: HashMap::new(),
             },
 
+            canvases: vec![CanvasState {
+                name: "Canvas 1".to_string(),
+                layout: layout.clone(),
+                active_file_viewer: Some(2),
+                active_diff_viewer: None,
+                layout_epoch: 0,
+            }],
+            active_canvas: 0,
+            next_component_id: layout.next_free_id(),
+
             file_viewers,
-            active_file_viewer: Some(2),
 
             diff_viewers: HashMap::new(),
-            active_diff_viewer: None,
 
             terminals: HashMap::new(),
             context_exporters: HashMap::new(),
@@ -585,7 +738,6 @@ impl AppState {
                 refresh_viewer: None,
             },
 
-            layout,
             layout_epoch: 0,
 
             pending_viewport_restore: None,
@@ -625,27 +777,23 @@ impl AppState {
     // -----------------------------------------------------------------
 
     pub(crate) fn rebuild_context_exporters_from_layout(&mut self) {
-        self.context_exporters.clear();
-
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let ids: std::collections::HashSet<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::ContextExporter)
             .map(|c| c.id)
             .collect();
 
+        self.context_exporters.retain(|id, _| ids.contains(id));
+
         for id in ids {
-            self.context_exporters.insert(
-                id,
-                ContextExporterState {
-                    save_path: None,
-                    max_bytes_per_file: 200_000,
-                    skip_binary: true,
-                    mode: ContextExportMode::TreeSelect,
-                    status: None,
-                },
-            );
+            self.context_exporters.entry(id).or_insert_with(|| ContextExporterState {
+                save_path: None,
+                max_bytes_per_file: 200_000,
+                skip_binary: true,
+                mode: ContextExportMode::TreeSelect,
+                status: None,
+            });
         }
     }
 
@@ -716,18 +864,17 @@ impl AppState {
     /// Execute Loops are ephemeral UI components; their backing state map must be
     /// re-synced after workspace/layout load to avoid "missing/broken" state.
     pub fn rebuild_execute_loops_from_layout(&mut self) {
-        self.execute_loops.clear();
-
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let ids: std::collections::HashSet<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::ExecuteLoop)
             .map(|c| c.id)
             .collect();
 
+        self.execute_loops.retain(|id, _| ids.contains(id));
+
         for id in ids {
-            self.execute_loops.insert(id, ExecuteLoopState::new());
+            self.execute_loops.entry(id).or_insert_with(ExecuteLoopState::new);
         }
     }
 
@@ -736,9 +883,8 @@ impl AppState {
         self.tasks = HashMap::new();
 
         let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::Task)
             .map(|c| c.id)
             .collect();

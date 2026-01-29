@@ -34,13 +34,15 @@ impl AppState {
     pub fn rebuild_terminals_from_layout(&mut self) {
         self.terminals.clear();
 
-        let term_ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let mut term_ids: Vec<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::Terminal)
             .map(|c| c.id)
             .collect();
+
+        term_ids.sort_unstable();
+        term_ids.dedup();
 
         for id in term_ids {
             self.terminals.insert(
@@ -58,12 +60,12 @@ impl AppState {
 
     /// Used by layout controller when adding a Terminal component.
     pub fn new_terminal(&mut self) {
-        self.layout.merge_with_defaults();
+        self.active_layout_mut().merge_with_defaults();
 
-        let id = self.layout.next_free_id();
+        let id = self.alloc_component_id();
 
         let term_count = self
-            .layout
+            .active_layout()
             .components
             .iter()
             .filter(|c| c.kind == ComponentKind::Terminal)
@@ -71,13 +73,13 @@ impl AppState {
 
         let title = format!("Terminal {}", term_count + 1);
 
-        self.layout.components.push(ComponentInstance {
+        self.active_layout_mut().components.push(ComponentInstance {
             id,
             kind: ComponentKind::Terminal,
             title,
         });
 
-        self.layout.windows.insert(
+        self.active_layout_mut().windows.insert(
             id,
             WindowLayout {
                 open: true,

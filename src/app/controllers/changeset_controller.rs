@@ -109,20 +109,22 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    /// Keep `changeset_appliers` in sync with the current layout.
+    /// Keep `changeset_appliers` in sync with all canvases.
     /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_changeset_appliers_from_layout(&mut self) {
         use crate::app::state::ChangeSetApplierState;
 
         self.changeset_appliers.clear();
 
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let mut ids: Vec<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::ChangeSetApplier)
             .map(|c| c.id)
             .collect();
+
+        ids.sort_unstable();
+        ids.dedup();
 
         for id in ids {
             self.changeset_appliers.insert(

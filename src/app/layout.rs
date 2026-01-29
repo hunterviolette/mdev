@@ -120,6 +120,15 @@ pub struct TaskSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanvasSnapshot {
+    pub name: String,
+    pub layout: LayoutConfig,
+    pub active_file_viewer: Option<ComponentId>,
+    #[serde(default)]
+    pub active_diff_viewer: Option<ComponentId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateSnapshot {
     /// Context exporters (per instance)
     /// Stored so exporter mode (EntireRepo vs TreeSelect) persists across workspace save/load.
@@ -163,11 +172,24 @@ pub struct StateSnapshot {
     #[serde(default)]
     pub theme_syntect: String,
 
-    /// Layout
+    #[serde(default)]
+    pub canvases: Vec<CanvasSnapshot>,
+
+    #[serde(default)]
+    pub active_canvas: usize,
+
+    #[serde(default)]
+    pub next_component_id: ComponentId,
+
+    /// Legacy single-canvas layout (kept for backward compatibility)
+    #[serde(default)]
     pub layout: LayoutConfig,
 
     /// File viewers (per instance)
+    #[serde(default)]
     pub file_viewers: HashMap<ComponentId, FileViewerSnapshot>,
+
+    #[serde(default)]
     pub active_file_viewer: Option<ComponentId>,
 }
 
@@ -266,6 +288,32 @@ impl Default for LayoutConfig {
 }
 
 impl LayoutConfig {
+    pub fn ensure_window_layouts(&mut self) {
+        for c in self.components.iter() {
+            if self.windows.contains_key(&c.id) {
+                continue;
+            }
+
+            let (pos, size) = match c.kind {
+                ComponentKind::Tree => ([24.0, 24.0], [340.0, 760.0]),
+                ComponentKind::Summary => ([380.0, 24.0], [520.0, 360.0]),
+                ComponentKind::FileViewer => ([380.0, 400.0], [900.0, 720.0]),
+                ComponentKind::DiffViewer => ([380.0, 400.0], [900.0, 720.0]),
+                _ => ([60.0, 60.0], [760.0, 700.0]),
+            };
+
+            self.windows.insert(
+                c.id,
+                WindowLayout {
+                    open: true,
+                    locked: false,
+                    pos,
+                    size,
+                },
+            );
+        }
+    }
+
     pub fn get_window(&self, id: ComponentId) -> Option<&WindowLayout> {
         self.windows.get(&id)
     }

@@ -24,7 +24,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
 impl AppState {
     pub fn open_or_attach_diff_viewer_with_refs(&mut self, path: String, from_ref: String, to_ref: String) {
-        let target_id = if let Some(active) = self.active_diff_viewer {
+        let target_id = if let Some(active) = self.active_diff_viewer_id() {
             active
         } else {
             self.new_diff_viewer_component()
@@ -37,7 +37,7 @@ impl AppState {
             v.needs_refresh = true;
         }
 
-        self.active_diff_viewer = Some(target_id);
+        self.set_active_diff_viewer_id(Some(target_id));
         self.refresh_diff_viewer(target_id);
     }
 
@@ -46,17 +46,15 @@ impl AppState {
     /// - Else reuse the most recently open Diff Viewer
     /// - Else create a new Diff Viewer component
     pub fn open_or_attach_diff_viewer(&mut self, path: String) {
-        // 1) Prefer currently active diff viewer if open
         let mut target = self
-            .active_diff_viewer
-            .and_then(|id| self.layout.get_window(id).map(|w| (id, w.open)))
+            .active_diff_viewer_id()
+            .and_then(|id| self.active_layout().get_window(id).map(|w| (id, w.open)))
             .and_then(|(id, open)| if open { Some(id) } else { None });
 
-        // 2) Else find the last open DiffViewer in layout order
         if target.is_none() {
-            for c in self.layout.components.iter().rev() {
+            for c in self.active_layout().components.iter().rev() {
                 if c.kind == ComponentKind::DiffViewer {
-                    if let Some(w) = self.layout.get_window(c.id) {
+                    if let Some(w) = self.active_layout().get_window(c.id) {
                         if w.open {
                             target = Some(c.id);
                             break;
@@ -66,7 +64,6 @@ impl AppState {
             }
         }
 
-        // 3) Else create a new DiffViewer component
         let target_id = match target {
             Some(id) => id,
             None => self.new_diff_viewer_component(),
@@ -82,17 +79,17 @@ impl AppState {
             v.needs_refresh = true;
         }
 
-        self.active_diff_viewer = Some(target_id);
+        self.set_active_diff_viewer_id(Some(target_id));
         self.refresh_diff_viewer(target_id);
     }
 
     fn new_diff_viewer_component(&mut self) -> ComponentId {
-        self.layout.merge_with_defaults();
+        self.active_layout_mut().merge_with_defaults();
 
-        let id = self.layout.next_free_id();
+        let id = self.alloc_component_id();
         let title = format!("Diff Viewer {}", id);
 
-        self.layout
+        self.active_layout_mut()
             .components
             .push(crate::app::layout::ComponentInstance {
                 id,
@@ -100,7 +97,7 @@ impl AppState {
                 title,
             });
 
-        self.layout.windows.insert(
+        self.active_layout_mut().windows.insert(
             id,
             crate::app::layout::WindowLayout {
                 open: true,
@@ -111,7 +108,7 @@ impl AppState {
         );
 
         self.diff_viewers.insert(id, DiffViewerState::new());
-        self.active_diff_viewer = Some(id);
+        self.set_active_diff_viewer_id(Some(id));
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
 
         id
@@ -191,21 +188,30 @@ impl AppState {
     pub fn rebuild_diff_viewers_from_layout(&mut self) {
         self.diff_viewers.clear();
 
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let mut ids: Vec<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::DiffViewer)
             .map(|c| c.id)
             .collect();
+
+        ids.sort_unstable();
+        ids.dedup();
 
         for id in ids {
             self.diff_viewers.insert(id, DiffViewerState::new());
         }
 
-        if let Some(active) = self.active_diff_viewer {
-            if !self.diff_viewers.contains_key(&active) {
-                self.active_diff_viewer = None;
+        for canvas in self.canvases.iter_mut() {
+            if let Some(active) = canvas.active_diff_viewer {
+                let exists = canvas
+                    .layout
+                    .components
+                    .iter()
+                    .any(|c| c.kind == ComponentKind::DiffViewer && c.id == active);
+                if !exists {
+                    canvas.active_diff_viewer = None;
+                }
             }
         }
     }

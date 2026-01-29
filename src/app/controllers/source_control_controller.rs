@@ -537,13 +537,15 @@ impl AppState {
     pub fn rebuild_source_controls_from_layout(&mut self) {
         self.source_controls.clear();
 
-        let ids: Vec<ComponentId> = self
-            .layout
-            .components
-            .iter()
+        let mut ids: Vec<ComponentId> = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::SourceControl)
             .map(|c| c.id)
             .collect();
+
+        ids.sort_unstable();
+        ids.dedup();
 
         for id in ids {
             self.source_controls.insert(

@@ -9,7 +9,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         // ------------------------------------------------------------
         Action::OpenFile(path) => {
             let viewer_id = state
-                .active_file_viewer
+                .active_file_viewer_id()
                 .or_else(|| state.file_viewers.keys().cloned().next());
 
             if let Some(viewer_id) = viewer_id {
@@ -142,7 +142,7 @@ fn open_path_in_viewer(state: &mut AppState, viewer_id: ComponentId, path: Strin
         v.diff_text.clear();
         v.diff_err = None;
     }
-    state.active_file_viewer = Some(viewer_id);
+    state.set_active_file_viewer_id(Some(viewer_id));
     state.load_file_at_current_selection(viewer_id);
 }
 
@@ -352,7 +352,7 @@ pub fn finalize_frame(state: &mut AppState) {
             .deferred
             .open_file_target_viewer
             .take()
-            .or(state.active_file_viewer)
+            .or(state.active_file_viewer_id())
             .or_else(|| state.file_viewers.keys().cloned().next());
 
         if let Some(viewer_id) = target {

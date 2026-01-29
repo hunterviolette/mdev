@@ -118,6 +118,9 @@ impl AppState {
                 Preset {
                     name: "Default".to_string(),
                     kind: PresetKind::FullState(StateSnapshot {
+                        canvases: vec![],
+                        active_canvas: 0,
+                        next_component_id: 0,
                         canvas_size: [1200.0, 800.0],
                         viewport_outer_pos: None,
                         viewport_inner_size: None,
@@ -177,6 +180,17 @@ impl AppState {
             );
         }
 
+        let _canvases: Vec<crate::app::layout::CanvasSnapshot> = self
+            .canvases
+            .iter()
+            .map(|c| crate::app::layout::CanvasSnapshot {
+                name: c.name.clone(),
+                layout: c.layout.clone(),
+                active_file_viewer: c.active_file_viewer,
+                active_diff_viewer: c.active_diff_viewer,
+            })
+            .collect();
+
         let mut context_exporters = HashMap::new();
         for (id, ex) in self.context_exporters.iter() {
             context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
@@ -208,10 +222,23 @@ impl AppState {
             theme_dark: self.theme.prefs.dark,
             theme_syntect: self.theme.prefs.syntect_theme.clone(),
 
-            layout: self.layout.clone(),
+            canvases: self
+                .canvases
+                .iter()
+                .map(|c| crate::app::layout::CanvasSnapshot {
+                    name: c.name.clone(),
+                    layout: c.layout.clone(),
+                    active_file_viewer: c.active_file_viewer,
+                    active_diff_viewer: c.active_diff_viewer,
+                })
+                .collect(),
+            active_canvas: self.active_canvas,
+            next_component_id: self.next_component_id,
+
+            layout: self.active_layout().clone(),
 
             file_viewers,
-            active_file_viewer: self.active_file_viewer,
+            active_file_viewer: self.active_file_viewer_id(),
 
             context_exporters,
             execute_loops,
@@ -355,19 +382,21 @@ impl AppState {
             PresetKind::LayoutOnly(layout_snap) => {
                 let mut layout = layout_snap.layout;
                 layout.rescale_from(layout_snap.canvas_size, current_canvas_size);
-                layout.merge_with_defaults();
-                self.layout = layout;
+                layout.ensure_window_layouts();
+                {
+                    let canvas = self.active_canvas_state_mut();
+                    canvas.layout = layout;
+                    canvas.layout_epoch = canvas.layout_epoch.wrapping_add(1);
+                }
 
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
                 self.rebuild_source_controls_from_layout();
-                // Ensure ephemeral viewer backing-state maps are present after workspace apply.
                 self.rebuild_diff_viewers_from_layout();
                 self.rebuild_execute_loops_from_layout();
                 self.rebuild_tasks_from_layout();
 
-                // Chats/tasks are global per-repo; re-hydrate after layout changes.
                 let _ = self.load_repo_task_store();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
@@ -375,8 +404,6 @@ impl AppState {
 
             PresetKind::FullState(state_snap) => {
                 self.inputs.repo = state_snap.repo;
-
-                // Persist the saved ref exactly (including WORKTREE).
                 self.inputs.git_ref = state_snap.git_ref;
 
                 self.inputs.exclude_regex = state_snap.exclude_regex;
@@ -387,8 +414,6 @@ impl AppState {
                 self.ui.canvas_bg_tint = state_snap.canvas_bg_tint;
                 self.ui.canvas_tint_popup_open = false;
 
-                // Restore theme prefs from workspace.
-                // Older workspace files may have empty syntect theme; fall back based on dark/light.
                 self.theme.prefs.dark = state_snap.theme_dark;
                 if state_snap.theme_syntect.trim().is_empty() {
                     self.theme.prefs.syntect_theme = if self.theme.prefs.dark {
@@ -400,12 +425,44 @@ impl AppState {
                     self.theme.prefs.syntect_theme = state_snap.theme_syntect;
                 }
 
-                let mut layout = state_snap.layout;
-                layout.rescale_from(state_snap.canvas_size, current_canvas_size);
-                layout.merge_with_defaults();
-                self.layout = layout;
+                self.next_component_id = if state_snap.next_component_id == 0 {
+                    self.next_component_id
+                } else {
+                    state_snap.next_component_id
+                };
 
-                // Ephemeral
+                if !state_snap.canvases.is_empty() {
+                    self.canvases = state_snap
+                        .canvases
+                        .into_iter()
+                        .map(|c| {
+                            let mut layout = c.layout;
+                            layout.rescale_from(state_snap.canvas_size, current_canvas_size);
+                            layout.ensure_window_layouts();
+                            crate::app::state::CanvasState {
+                                name: c.name,
+                                layout,
+                                active_file_viewer: c.active_file_viewer,
+                                active_diff_viewer: c.active_diff_viewer,
+                                layout_epoch: 1,
+                            }
+                        })
+                        .collect();
+                    self.active_canvas = state_snap.active_canvas.min(self.canvases.len().saturating_sub(1));
+                } else {
+                    let mut layout = state_snap.layout;
+                    layout.rescale_from(state_snap.canvas_size, current_canvas_size);
+                    layout.ensure_window_layouts();
+                    self.canvases = vec![crate::app::state::CanvasState {
+                        name: "Canvas 1".to_string(),
+                        layout,
+                        active_file_viewer: state_snap.active_file_viewer,
+                        active_diff_viewer: None,
+                        layout_epoch: 1,
+                    }];
+                    self.active_canvas = 0;
+                }
+
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
                 self.rebuild_changeset_appliers_from_layout();
@@ -414,20 +471,14 @@ impl AppState {
                 self.rebuild_execute_loops_from_layout();
                 self.rebuild_tasks_from_layout();
 
-                // Restore per-context-exporter persisted state (currently only mode).
                 for (id, snap) in state_snap.context_exporters.iter() {
                     if let Some(ex) = self.context_exporters.get_mut(id) {
                         ex.mode = snap.mode;
                     }
                 }
 
-                // IMPORTANT:
-                // ExecuteLoop chat threads + Tasks are persisted globally per-repo, not in workspace.
-                // Do NOT restore (or clear) them from the workspace snapshot.
-                // Instead, hydrate from the per-repo task store after the components exist.
                 let _ = self.load_repo_task_store();
 
-                // Restore file viewer instances (selection state only)
                 self.file_viewers.clear();
                 for (id, snap) in state_snap.file_viewers.iter() {
                     let mut fv = crate::app::state::FileViewerState::new();
@@ -436,18 +487,19 @@ impl AppState {
                     self.file_viewers.insert(*id, fv);
                 }
 
-                // Restore active FV (fallback to first FV component)
-                self.active_file_viewer = state_snap.active_file_viewer.or_else(|| {
-                    self.layout
-                        .components
-                        .iter()
-                        .find(|c| c.kind == ComponentKind::FileViewer)
-                        .map(|c| c.id)
-                });
+                for canvas in self.canvases.iter_mut() {
+                    canvas.active_file_viewer = canvas.active_file_viewer.or_else(|| {
+                        canvas
+                            .layout
+                            .components
+                            .iter()
+                            .find(|c| c.kind == ComponentKind::FileViewer)
+                            .map(|c| c.id)
+                    });
+                }
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
 
-                // Recompute refs + rerun analysis + refresh viewers
                 self.refresh_git_refs();
                 self.results.result = None;
                 self.results.error = None;

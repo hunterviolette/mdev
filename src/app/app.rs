@@ -31,6 +31,25 @@ impl eframe::App for AppState {
         theme::apply_from_state(ctx, self);
 
         // Ctrl+Shift+E toggles palette
+
+        let canvas_shortcut = ctx.input(|i| {
+            if !i.modifiers.ctrl {
+                return None;
+            }
+
+            if i.key_pressed(egui::Key::Num1) { return Some(0); }
+            if i.key_pressed(egui::Key::Num2) { return Some(1); }
+            if i.key_pressed(egui::Key::Num3) { return Some(2); }
+            if i.key_pressed(egui::Key::Num4) { return Some(3); }
+            if i.key_pressed(egui::Key::Num5) { return Some(4); }
+            if i.key_pressed(egui::Key::Num6) { return Some(5); }
+            if i.key_pressed(egui::Key::Num7) { return Some(6); }
+            if i.key_pressed(egui::Key::Num8) { return Some(7); }
+            if i.key_pressed(egui::Key::Num9) { return Some(8); }
+            if i.key_pressed(egui::Key::Num0) { return Some(9); }
+            None
+        });
+
         let pressed = ctx.input(|i| {
             i.key_pressed(egui::Key::E) && i.modifiers.ctrl && i.modifiers.shift
         });
@@ -58,6 +77,11 @@ impl eframe::App for AppState {
                 self.palette.selected = 0;
             }
         }
+
+        if let Some(idx) = canvas_shortcut {
+            self.apply_action(super::actions::Action::CanvasSelect { index: idx });
+        }
+
 
         // Top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui_top| {

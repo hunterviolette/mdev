@@ -119,14 +119,11 @@ impl AppState {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Hydrate tasks (existing component ids only; layout is workspace-owned)
         for (task_id, ts) in parsed.tasks.iter() {
-            if !self
-                .layout
-                .components
-                .iter()
-                .any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id)
-            {
+            let exists = self
+                .all_layouts()
+                .any(|l| l.components.iter().any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id));
+            if !exists {
                 continue;
             }
 
@@ -328,39 +325,41 @@ impl AppState {
         }
     }
 
-    /// Ensure the ExecuteLoop component/window exists in the layout and is open.
     pub fn ensure_execute_loop_component_open(&mut self, loop_id: crate::app::actions::ComponentId) {
         use crate::app::actions::ComponentKind;
         use crate::app::layout::{ComponentInstance, WindowLayout};
 
-        let exists = self
-            .layout
-            .components
-            .iter()
-            .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
-
-        if !exists {
-            self.layout.merge_with_defaults();
-            self.layout.components.push(ComponentInstance {
-                id: loop_id,
-                kind: ComponentKind::ExecuteLoop,
-                title: format!("Execute Loop {}", loop_id),
-            });
-            self.layout.windows.insert(
-                loop_id,
-                WindowLayout {
-                    open: true,
-                    locked: false,
-                    pos: [150.0, 150.0],
-                    size: [860.0, 680.0],
-                },
-            );
-            self.layout_epoch = self.layout_epoch.wrapping_add(1);
+        for (idx, canvas) in self.canvases.iter_mut().enumerate() {
+            let exists = canvas
+                .layout
+                .components
+                .iter()
+                .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
+            if exists {
+                if let Some(w) = canvas.layout.get_window_mut(loop_id) {
+                    w.open = true;
+                }
+                self.active_canvas = idx;
+                return;
+            }
         }
 
-        if let Some(w) = self.layout.get_window_mut(loop_id) {
-            w.open = true;
-        }
+        self.active_layout_mut().merge_with_defaults();
+        self.active_layout_mut().components.push(ComponentInstance {
+            id: loop_id,
+            kind: ComponentKind::ExecuteLoop,
+            title: format!("Execute Loop {}", loop_id),
+        });
+        self.active_layout_mut().windows.insert(
+            loop_id,
+            WindowLayout {
+                open: true,
+                locked: false,
+                pos: [150.0, 150.0],
+                size: [860.0, 680.0],
+            },
+        );
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
     pub fn apply_action(&mut self, action: Action) {
         // Keep ordering stable (global -> domain -> layout/workspace)

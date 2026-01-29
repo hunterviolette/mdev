@@ -40,14 +40,13 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 .unwrap_or_default()
                 .as_millis() as u64;
 
-            // Close + remove the loop window/component from layout.
-            if let Some(w) = state.layout.get_window_mut(*loop_id) {
-                w.open = false;
+            for canvas in state.canvases.iter_mut() {
+                if let Some(w) = canvas.layout.get_window_mut(*loop_id) {
+                    w.open = false;
+                }
+                canvas.layout.windows.remove(loop_id);
+                canvas.layout.components.retain(|c| !(c.kind == ComponentKind::ExecuteLoop && c.id == *loop_id));
             }
-            state.layout.windows.remove(loop_id);
-            state.layout.components.retain(|c| {
-                !(c.kind == ComponentKind::ExecuteLoop && c.id == *loop_id)
-            });
             state.layout_epoch = state.layout_epoch.wrapping_add(1);
 
             // Remove live loop state (if loaded) and persisted snapshot.
@@ -155,7 +154,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             // Step 3: open + hydrate from the conversation snapshot.
             state.ensure_execute_loop_component_open(loop_id);
             state.apply_execute_loop_snapshot(loop_id, &snap_clone);
-            if let Some(w) = state.layout.get_window_mut(loop_id) {
+            if let Some(w) = state.active_layout_mut().get_window_mut(loop_id) {
                 w.open = true;
             }
 
@@ -192,7 +191,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             } else {
                 state.ensure_execute_loop_state_loaded(loop_id);
             }
-            if let Some(w) = state.layout.get_window_mut(loop_id) {
+            if let Some(w) = state.active_layout_mut().get_window_mut(loop_id) {
                 w.open = true;
             }
 
@@ -277,7 +276,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 state.save_repo_task_store();
             }
 
-            if let Some(w) = state.layout.get_window_mut(new_id) {
+            if let Some(w) = state.active_layout_mut().get_window_mut(new_id) {
                 w.open = true;
             }
 
@@ -329,7 +328,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 state.apply_execute_loop_snapshot(loop_id, &snap);
             }
 
-            if let Some(w) = state.layout.get_window_mut(loop_id) {
+            if let Some(w) = state.active_layout_mut().get_window_mut(loop_id) {
                 w.open = true;
             }
 

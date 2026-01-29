@@ -284,6 +284,14 @@ pub enum Action {
 
     ResetLayout,
 
+    // ---------------------------
+    // Canvases
+    // ---------------------------
+    CanvasSelect { index: usize },
+    CanvasAdd,
+    CanvasRename { index: usize, name: String },
+    CanvasDelete { index: usize },
+
     SaveWorkspace {
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
