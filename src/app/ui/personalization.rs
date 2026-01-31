@@ -23,8 +23,16 @@ fn apply_theme(ctx: &egui::Context, state: &mut AppState) {
     if let Ok(theme) = serde_json::from_str::<CodeTheme>(&json) {
         theme.clone().store_in_memory(ctx);
         state.theme.code_theme = theme;
+
+        // Keep theme apply cache in sync so the next frame doesn't redo work.
+        state.theme.last_applied_dark = Some(state.theme.prefs.dark);
+        state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     } else {
         state.theme.code_theme = CodeTheme::from_memory(ctx);
+
+        // Keep theme apply cache in sync so the next frame doesn't redo work.
+        state.theme.last_applied_dark = Some(state.theme.prefs.dark);
+        state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     }
 }
 

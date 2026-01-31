@@ -435,6 +435,12 @@ pub struct UiState {
     pub canvas_tint_draft: Option<[u8; 4]>,
 
     pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
+
+    // ---------------------------
+    // Canvas tabs rename UI (top bar)
+    // ---------------------------
+    pub canvas_rename_index: Option<usize>,
+    pub canvas_rename_draft: String,
 }
 
 impl UiState {
@@ -513,6 +519,10 @@ pub struct ThemePrefs {
 pub struct ThemeState {
     pub code_theme: CodeTheme,
     pub prefs: ThemePrefs,
+
+    // Cache: avoid rebuilding/storing CodeTheme every frame.
+    pub last_applied_dark: Option<bool>,
+    pub last_applied_syntect_theme: Option<String>,
 }
 
 pub struct DeferredActions {
@@ -691,6 +701,8 @@ impl AppState {
                 canvas_bg_tint: None,
                 canvas_tint_popup_open: false,
                 canvas_tint_draft: None,
+                canvas_rename_index: None,
+                canvas_rename_draft: String::new(),
                 task_panel_selected_loops: None,
             },
 
@@ -729,6 +741,8 @@ impl AppState {
                     dark: true,
                     syntect_theme: "SolarizedDark".to_string(),
                 },
+                last_applied_dark: None,
+                last_applied_syntect_theme: None,
             },
 
             deferred: DeferredActions {

@@ -1,7 +1,9 @@
 use eframe::egui;
 
-use super::super::actions::{Action, ComponentKind};
+use super::super::actions::{Action, ComponentId, ComponentKind};
 use super::super::state::AppState;
+use crate::model::AnalysisResult;
+
 
 use super::{changeset_applier, context_exporter, diff_viewer, changeset_loop, file_viewer, source_control, summary_panel, task_panel, terminal, tree_panel};
 
@@ -13,7 +15,9 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
     let mut actions = vec![];
 
 
-    let res_opt = state.results.result.clone();
+    // Do not hold a borrow of state.results across the large UI closure.
+    // This keeps the borrow checker happy while still avoiding a deep clone.
+    let has_results = state.results.result.is_some();
 
     let canvas_rect = ctx
         .data_mut(|d| d.get_persisted::<egui::Rect>(canvas_rect_id()))
@@ -40,10 +44,17 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
             let max_canvas_w = clip_rect.width().max(1.0);
             let max_canvas_h = clip_rect.height().max(1.0);
 
-            // Render all components in layout order
-            let components = state.active_layout().components.clone();
-            for c in components {
-                let Some(w0) = state.active_layout().get_window(c.id).cloned() else { continue };
+            // Render all components in layout order.
+            // Avoid cloning ComponentInstance list each frame; collect only what we need.
+            let components: Vec<(ComponentId, ComponentKind, String)> = state
+                .active_layout()
+                .components
+                .iter()
+                .map(|c| (c.id, c.kind, c.title.clone()))
+                .collect();
+
+            for (id, kind, title_base) in components {
+                let Some(w0) = state.active_layout().get_window(id).cloned() else { continue };
                 if !w0.open {
                     continue;
                 }
@@ -56,16 +67,16 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                 );
 
                 let canvas_epoch = state.active_canvas_state().layout_epoch;
-                let window_id = egui::Id::new(("canvas_window", state.active_canvas, canvas_epoch, c.id));
+                let window_id = egui::Id::new(("canvas_window", state.active_canvas, canvas_epoch, id));
 
-                let title = if c.kind == ComponentKind::FileViewer {
-                    if state.active_file_viewer_id() == Some(c.id) {
-                        format!("{}  (active)", c.title)
+                let title = if kind == ComponentKind::FileViewer {
+                    if state.active_file_viewer_id() == Some(id) {
+                        format!("{}  (active)", title_base)
                     } else {
-                        c.title.clone()
+                        title_base.clone()
                     }
                 } else {
-                    c.title.clone()
+                    title_base.clone()
                 };
 
                 let window = egui::Window::new(title)
@@ -81,61 +92,70 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     let content_size = ui.available_size();
 
                     // Allow some panels to run WITHOUT analysis results.
-                    match c.kind {
+                    match kind {
                         ComponentKind::Terminal => {
-                            actions.extend(terminal::terminal_panel(ctx, ui, state, c.id));
+                            actions.extend(terminal::terminal_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         ComponentKind::ContextExporter => {
-                            actions.extend(context_exporter::context_exporter(ui, state, c.id));
+                            actions.extend(context_exporter::context_exporter(ui, state, id));
                             return content_size;
                         }
-                        ComponentKind::ChangeSetApplier =>
-                                 {
-                            actions.extend(changeset_applier::changeset_applier_panel(
-                                ctx, ui, state, c.id,
-                            ));
+                        ComponentKind::ChangeSetApplier => {
+                            actions.extend(changeset_applier::changeset_applier_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         ComponentKind::ExecuteLoop => {
-                            actions.extend(changeset_loop::changeset_loop_panel(ctx, ui, state, c.id));
+                            actions.extend(changeset_loop::changeset_loop_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         ComponentKind::Task => {
-                            actions.extend(task_panel::task_panel(ctx, ui, state, c.id));
+                            actions.extend(task_panel::task_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         ComponentKind::SourceControl => {
-                            actions.extend(source_control::source_control_panel(ctx, ui, state, c.id));
+                            actions.extend(source_control::source_control_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         ComponentKind::DiffViewer => {
                             if ui.rect_contains_pointer(ui.max_rect()) {
-                                state.set_active_diff_viewer_id(Some(c.id));
+                                state.set_active_diff_viewer_id(Some(id));
                             }
-                            actions.extend(diff_viewer::diff_viewer_panel(ctx, ui, state, c.id));
+                            actions.extend(diff_viewer::diff_viewer_panel(ctx, ui, state, id));
                             return content_size;
                         }
                         _ => {}
                     }
 
                     // For Tree/FileViewer/Summary we want analysis results
-                    let Some(res) = res_opt.as_ref() else {
-                        ui.label("Select a repo (it will auto-run), or click Run.");
+                    if !has_results {
+                        ui.label("No analysis results yet");
                         return content_size;
+                    }
+
+                    // IMPORTANT: do not hold an immutable borrow of `state.results` while calling panel fns
+                    // that take `&mut AppState`. Use a raw pointer to avoid borrow conflicts without cloning.
+                    let res_ptr: *const AnalysisResult = match state.results.result.as_ref() {
+                        Some(r) => r as *const AnalysisResult,
+                        None => {
+                            ui.label("Select a repo (it will auto-run), or click Run.");
+                            return content_size;
+                        }
                     };
 
-                    match c.kind {
+                    match kind {
                         ComponentKind::Tree => {
+                            let res = unsafe { &*res_ptr };
                             actions.extend(tree_panel::tree_panel(ctx, ui, state, res));
                         }
                         ComponentKind::FileViewer => {
                             if ui.rect_contains_pointer(ui.max_rect()) {
-                                state.set_active_file_viewer_id(Some(c.id));
+                                state.set_active_file_viewer_id(Some(id));
                             }
-                            actions.extend(file_viewer::file_viewer(ctx, ui, state, c.id));
+                            actions.extend(file_viewer::file_viewer(ctx, ui, state, id));
                         }
                         ComponentKind::Summary => {
+                            let res: &AnalysisResult = unsafe { &*res_ptr };
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 summary_panel::summary_panel(ui, res);
                             });
@@ -154,7 +174,7 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     content_size
                 });
 
-                if let Some(w) = state.active_layout_mut().get_window_mut(c.id) {
+                if let Some(w) = state.active_layout_mut().get_window_mut(id) {
                     w.open = open;
 
                     if let Some(inner) = shown {
