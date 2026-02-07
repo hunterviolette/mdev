@@ -169,6 +169,9 @@ pub enum Action {
     ClearTerminal {
         terminal_id: ComponentId,
     },
+    InterruptTerminal {
+        terminal_id: ComponentId,
+    },
     SetTerminalShell {
         terminal_id: ComponentId,
         shell: TerminalShell,

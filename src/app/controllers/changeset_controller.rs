@@ -17,7 +17,7 @@ use crate::capabilities::{CapabilityRequest, CapabilityResponse, FileSource};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct ChangeSetPayload {
     version: u32,
     #[serde(default)]
@@ -28,7 +28,7 @@ struct ChangeSetPayload {
     post_commands: Vec<PostCommand>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(tag = "op")]
 enum Operation {
     #[serde(rename = "write")]
@@ -49,7 +49,7 @@ enum Operation {
     Edit { path: String, changes: Vec<EditChange> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct EditChange {
     action: EditAction,
     #[serde(default, rename = "match")]
@@ -60,7 +60,7 @@ struct EditChange {
     text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum EditAction {
     ReplaceBlock,
@@ -69,7 +69,7 @@ enum EditAction {
     DeleteBlock,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct EditMatch {
     #[serde(rename = "type")]
     match_type: String, // for now only "literal"
@@ -82,7 +82,7 @@ struct EditMatch {
     must_match: Option<String>, // "exactly_one" (default) | "at_least_one"
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct PostCommand {
     #[serde(default)]
     shell: Option<String>, // "Auto" | "Bash" | "PowerShell" ...
@@ -109,13 +109,12 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    /// Keep `changeset_appliers` in sync with all canvases.
+    /// Keep `changeset_appliers` in sync with the current layout.
     /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_changeset_appliers_from_layout(&mut self) {
         use crate::app::state::ChangeSetApplierState;
 
-        self.changeset_appliers.clear();
-
+        // Collect ChangeSetApplier component ids across ALL layouts/canvases.
         let mut ids: Vec<ComponentId> = self
             .all_layouts()
             .flat_map(|l| l.components.iter())
@@ -126,14 +125,16 @@ impl AppState {
         ids.sort_unstable();
         ids.dedup();
 
+        // Drop stale entries but keep existing payload/status for components that still exist.
+        self.changeset_appliers
+            .retain(|id, _| ids.binary_search(id).is_ok());
+
+        // Insert missing backing state.
         for id in ids {
-            self.changeset_appliers.insert(
-                id,
-                ChangeSetApplierState {
-                    payload: String::new(),
-                    status: None,
-                },
-            );
+            self.changeset_appliers.entry(id).or_insert(ChangeSetApplierState {
+                payload: String::new(),
+                status: None,
+            });
         }
     }
 }
@@ -185,8 +186,17 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
         log.push_str("(note) Applying against WORKTREE.\n\n");
     }
 
+    let total_ops = parsed.operations.len();
+    let mut ok_ops: usize = 0;
+    let mut failures: Vec<(usize, String, String)> = Vec::new();
+
     for (idx, op) in parsed.operations.iter().enumerate() {
         let step = idx + 1;
+
+        let record_fail = |failures: &mut Vec<(usize, String, String)>, step: usize, op: &Operation, err: String| {
+            let op_json = serde_json::to_string(op).unwrap_or_else(|_| "{\"op\":\"(unserializable)\"}".to_string());
+            failures.push((step, op_json, err));
+        };
 
         match op {
             Operation::Write { path, contents } => {
@@ -197,11 +207,14 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                     contents: contents.as_bytes().to_vec(),
                 });
                 match r {
-                    Ok(_) => log.push_str(&format!("[{step}] ok\n")),
+                    Ok(_) => {
+                        ok_ops = ok_ops.saturating_add(1);
+                        log.push_str(&format!("[{step}] ok\n"));
+                    }
                     Err(e) => {
-                        log.push_str(&format!("[{step}] FAILED: {:#}\n", e));
-                        set_applier_status(state, applier_id, log);
-                        return;
+                        let err = format!("{:#}", e);
+                        log.push_str(&format!("[{step}] FAILED: {err}\n"));
+                        record_fail(&mut failures, step, op, err);
                     }
                 }
             }
@@ -213,11 +226,14 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                     path: path.clone(),
                 });
                 match r {
-                    Ok(_) => log.push_str(&format!("[{step}] ok\n")),
+                    Ok(_) => {
+                        ok_ops = ok_ops.saturating_add(1);
+                        log.push_str(&format!("[{step}] ok\n"));
+                    }
                     Err(e) => {
-                        log.push_str(&format!("[{step}] FAILED: {:#}\n", e));
-                        set_applier_status(state, applier_id, log);
-                        return;
+                        let err = format!("{:#}", e);
+                        log.push_str(&format!("[{step}] FAILED: {err}\n"));
+                        record_fail(&mut failures, step, op, err);
                     }
                 }
             }
@@ -230,11 +246,14 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                     to: to.clone(),
                 });
                 match r {
-                    Ok(_) => log.push_str(&format!("[{step}] ok\n")),
+                    Ok(_) => {
+                        ok_ops = ok_ops.saturating_add(1);
+                        log.push_str(&format!("[{step}] ok\n"));
+                    }
                     Err(e) => {
-                        log.push_str(&format!("[{step}] FAILED: {:#}\n", e));
-                        set_applier_status(state, applier_id, log);
-                        return;
+                        let err = format!("{:#}", e);
+                        log.push_str(&format!("[{step}] FAILED: {err}\n"));
+                        record_fail(&mut failures, step, op, err);
                     }
                 }
             }
@@ -252,11 +271,14 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                 });
 
                 match r {
-                    Ok(_) => log.push_str(&format!("[{step}] ok\n")),
+                    Ok(_) => {
+                        ok_ops = ok_ops.saturating_add(1);
+                        log.push_str(&format!("[{step}] ok\n"));
+                    }
                     Err(e) => {
-                        log.push_str(&format!("[{step}] FAILED: {:#}\n", e));
-                        set_applier_status(state, applier_id, log);
-                        return;
+                        let err = format!("{:#}", e);
+                        log.push_str(&format!("[{step}] FAILED: {err}\n"));
+                        record_fail(&mut failures, step, op, err);
                     }
                 }
             }
@@ -265,21 +287,59 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                 log.push_str(&format!("[{step}] edit {path}\n"));
 
                 match apply_anchored_edits(state, &repo, path, changes) {
-                    Ok(summary) => {
-                        if !summary.is_empty() {
-                            log.push_str(&summary);
+                    Ok(report) => {
+                        if !report.applied_summary.is_empty() {
+                            log.push_str(&report.applied_summary);
                             if !log.ends_with('\n') {
                                 log.push('\n');
                             }
                         }
-                        log.push_str(&format!("[{step}] ok\n"));
+
+                        if report.failed.is_empty() {
+                            ok_ops = ok_ops.saturating_add(1);
+                            log.push_str(&format!("[{step}] ok\n"));
+                        } else {
+                            // Partial success: some actions applied, some failed.
+                            log.push_str(&format!("[{step}] PARTIAL: {} action(s) failed\n", report.failed.len()));
+                            for f in &report.failed {
+                                log.push_str(&format!("  - edit[{}] {} FAILED: {}\n", f.index, f.action, f.error));
+                            }
+
+                            let err = format!(
+                                "partial edit: {} action(s) failed\n{}",
+                                report.failed.len(),
+                                report
+                                    .failed
+                                    .iter()
+                                    .map(|f| format!("edit[{}] {}: {}", f.index, f.action, f.error))
+                                    .collect::<Vec<String>>()
+                                    .join("; ")
+                            );
+                            record_fail(&mut failures, step, op, err);
+                        }
                     }
                     Err(e) => {
-                        log.push_str(&format!("[{step}] FAILED: {:#}\n", e));
-                        set_applier_status(state, applier_id, log);
-                        return;
+                        // Fatal failure (read/write/etc). Nothing to partially apply.
+                        let err = format!("{:#}", e);
+                        log.push_str(&format!("[{step}] FAILED: {err}\n"));
+                        record_fail(&mut failures, step, op, err);
                     }
                 }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        if ok_ops == 0 {
+            let first_err = failures
+                .first()
+                .map(|(_, _, e)| e.as_str())
+                .unwrap_or("(unknown error)");
+            log.push_str(&format!("\nAll {total_ops} operations failed.\nFirst error: {first_err}\n"));
+        } else {
+            log.push_str("\nfailed_operations:\n");
+            for (step, op_json, err) in failures {
+                log.push_str(&format!("\n[{step}] {op_json}\nerror: {err}\n"));
             }
         }
     }
@@ -368,14 +428,28 @@ fn write_worktree_text(state: &mut AppState, repo: &std::path::PathBuf, path: &s
     Ok(())
 }
 
+/// Per-action report for anchored edits. Fatal errors (read/write) are returned as Err.
+#[derive(Debug, Clone)]
+struct AnchoredEditFailure {
+    index: usize,
+    action: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnchoredEditsReport {
+    applied_summary: String,
+    failed: Vec<AnchoredEditFailure>,
+}
+
 /// Apply anchored edits to a worktree file and write back the result.
-/// Returns a short human-readable summary for logs.
+/// Best-effort: attempts every change; records per-change failures; only fails hard on read/write.
 fn apply_anchored_edits(
     state: &mut AppState,
     repo: &std::path::PathBuf,
     path: &str,
     changes: &[EditChange],
-) -> Result<String> {
+) -> Result<AnchoredEditsReport> {
     let original = read_worktree_text(state, repo, path)?;
 
     // We may normalize CRLF->LF for matching+writing depending on match.mode.
@@ -393,98 +467,117 @@ fn apply_anchored_edits(
         original
     };
 
-    let mut summary = String::new();
+    let mut report = AnchoredEditsReport::default();
 
     for (i, ch) in changes.iter().enumerate() {
         let n = i + 1;
-        let action = &ch.action;
 
-        let m = ch
-            .match_
-            .as_ref()
-            .ok_or_else(|| anyhow!("edit[{n}] missing 'match'"))?;
-        ensure_literal_match(m, n)?;
-
-        let mode = match_mode(m);
-        let must = must_match_mode(m);
-
-        validate_match_mode(n, mode)?;
-        validate_must_match(n, must)?;
-
-        // Match against either literal text or normalized-newlines text.
-        let hay = if mode == "normalized_newlines" {
-            text.replace("\r\n", "\n")
-        } else {
-            text.clone()
-        };
-        let needle = normalize_for_match(&m.text, mode);
-
-        let found = count_occurrences(&hay, &needle);
-        enforce_must_match(n, found, must)?;
-
-        let occ = m.occurrence.unwrap_or(1);
-        if occ == 0 {
-            bail!("edit[{n}] match.occurrence must be >= 1");
+        let action_name = match ch.action {
+            EditAction::ReplaceBlock => "replace_block",
+            EditAction::InsertBefore => "insert_before",
+            EditAction::InsertAfter => "insert_after",
+            EditAction::DeleteBlock => "delete_block",
         }
-        if found > 0 && occ > found {
-            bail!("edit[{n}] occurrence={occ} out of range (found {found})");
-        }
+        .to_string();
 
-        // Apply change using spans in the current text representation.
-        // If mode==normalized_newlines and we are writing LF anyway, use LF spans.
-        let (start, end) = find_match_span(&hay, &needle, occ)
-            .ok_or_else(|| anyhow!("edit[{n}] match not found (occurrence={occ})"))?;
+        let attempt: Result<()> = (|| {
+            let m = ch
+                .match_
+                .as_ref()
+                .ok_or_else(|| anyhow!("edit[{n}] missing 'match'"))?;
+            ensure_literal_match(m, n)?;
 
-        match action {
-            EditAction::ReplaceBlock => {
-                let replacement = ch
-                    .replacement
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("edit[{n}] replace_block missing 'replacement'"))?;
+            let mode = match_mode(m);
+            let must = must_match_mode(m);
 
-                let mut base = hay;
-                base.replace_range(start..end, replacement);
-                text = base;
+            validate_match_mode(n, mode)?;
+            validate_must_match(n, must)?;
 
-                summary.push_str(&format!("  - edit[{n}] replace_block (occurrence={occ}, must_match={must}, mode={mode})\n"));
+            // Match against either literal text or normalized-newlines text.
+            let hay = if mode == "normalized_newlines" {
+                text.replace("\r\n", "\n")
+            } else {
+                text.clone()
+            };
+            let needle = normalize_for_match(&m.text, mode);
+
+            let found = count_occurrences(&hay, &needle);
+            enforce_must_match(n, found, must)?;
+
+            let occ = m.occurrence.unwrap_or(1);
+            if occ == 0 {
+                bail!("edit[{n}] match.occurrence must be >= 1");
             }
-            EditAction::InsertBefore => {
-                let insert_text = ch
-                    .text
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("edit[{n}] insert_before missing 'text'"))?;
-
-                let mut base = hay;
-                base.insert_str(start, insert_text);
-                text = base;
-
-                summary.push_str(&format!("  - edit[{n}] insert_before (occurrence={occ}, must_match={must}, mode={mode})\n"));
+            if found > 0 && occ > found {
+                bail!("edit[{n}] occurrence={occ} out of range (found {found})");
             }
-            EditAction::InsertAfter => {
-                let insert_text = ch
-                    .text
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("edit[{n}] insert_after missing 'text'"))?;
 
-                let mut base = hay;
-                base.insert_str(end, insert_text);
-                text = base;
+            let (start, end) = find_match_span(&hay, &needle, occ)
+                .ok_or_else(|| anyhow!("edit[{n}] match not found (occurrence={occ})"))?;
 
-                summary.push_str(&format!("  - edit[{n}] insert_after (occurrence={occ}, must_match={must}, mode={mode})\n"));
+            match ch.action {
+                EditAction::ReplaceBlock => {
+                    let replacement = ch.replacement.as_ref().ok_or_else(|| {
+                        anyhow!("edit[{n}] replace_block missing 'replacement'")
+                    })?;
+                    let mut base = hay;
+                    base.replace_range(start..end, replacement);
+                    text = base;
+                    report.applied_summary.push_str(&format!(
+                        "  - edit[{n}] replace_block (occurrence={occ}, must_match={must}, mode={mode})\n"
+                    ));
+                }
+                EditAction::InsertBefore => {
+                    let insert_text = ch
+                        .text
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("edit[{n}] insert_before missing 'text'"))?;
+                    let mut base = hay;
+                    base.insert_str(start, insert_text);
+                    text = base;
+                    report.applied_summary.push_str(&format!(
+                        "  - edit[{n}] insert_before (occurrence={occ}, must_match={must}, mode={mode})\n"
+                    ));
+                }
+                EditAction::InsertAfter => {
+                    let insert_text = ch
+                        .text
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("edit[{n}] insert_after missing 'text'"))?;
+                    let mut base = hay;
+                    base.insert_str(end, insert_text);
+                    text = base;
+                    report.applied_summary.push_str(&format!(
+                        "  - edit[{n}] insert_after (occurrence={occ}, must_match={must}, mode={mode})\n"
+                    ));
+                }
+                EditAction::DeleteBlock => {
+                    let mut base = hay;
+                    base.replace_range(start..end, "");
+                    text = base;
+                    report.applied_summary.push_str(&format!(
+                        "  - edit[{n}] delete_block (occurrence={occ}, must_match={must}, mode={mode})\n"
+                    ));
+                }
             }
-            EditAction::DeleteBlock => {
-                let mut base = hay;
-                base.replace_range(start..end, "");
-                text = base;
 
-                summary.push_str(&format!("  - edit[{n}] delete_block (occurrence={occ}, must_match={must}, mode={mode})\n"));
-            }
+            Ok(())
+        })();
+
+        if let Err(e) = attempt {
+            report.failed.push(AnchoredEditFailure {
+                index: n,
+                action: action_name,
+                error: format!("{:#}", e),
+            });
+            // Continue to next change.
+            continue;
         }
     }
 
     // If we normalized, we write LF back out (by design).
     write_worktree_text(state, repo, path, &text)?;
-    Ok(summary)
+    Ok(report)
 }
 
 fn match_mode(m: &EditMatch) -> &str {

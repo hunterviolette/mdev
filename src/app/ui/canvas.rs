@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use std::collections::HashSet;
+
 use super::super::actions::{Action, ComponentId, ComponentKind};
 use super::super::state::AppState;
 use crate::model::AnalysisResult;
@@ -53,7 +55,13 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                 .map(|c| (c.id, c.kind, c.title.clone()))
                 .collect();
 
+            let mut rendered_ids: HashSet<ComponentId> = HashSet::new();
+
             for (id, kind, title_base) in components {
+                if !rendered_ids.insert(id) {
+                    continue;
+                }
+
                 let Some(w0) = state.active_layout().get_window(id).cloned() else { continue };
                 if !w0.open {
                     continue;

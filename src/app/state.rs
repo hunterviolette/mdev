@@ -1,7 +1,9 @@
 // src/app/state.rs
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Receiver;
 
 use egui_extras::syntax_highlighting::CodeTheme;
 use std::collections::BTreeSet;
@@ -40,6 +42,13 @@ pub struct CommandPaletteState {
     pub query: String,
     pub selected: usize,
 }
+#[derive(Clone, Debug)]
+pub enum TerminalEvent {
+    Stdout(String),
+    Stderr(String),
+    Exit(i32),
+    Error(String),
+}
 
 pub struct TerminalState {
     pub shell: TerminalShell,
@@ -47,10 +56,15 @@ pub struct TerminalState {
     pub input: String,
     pub output: String,
     pub last_status: Option<i32>,
-}
 
-// Context exporter
-pub struct ContextExporterState {
+    /// True while a command is executing on a background thread.
+    pub running: bool,
+    /// Receives incremental output + exit status from the background thread.
+    pub pending_rx: Option<Receiver<TerminalEvent>>,
+    /// Handle to the currently running child (for Stop / Ctrl+C best-effort kill).
+    pub child: Option<Arc<Mutex<Child>>>,
+}
+    pub struct ContextExporterState {
     pub save_path: Option<PathBuf>,
     pub max_bytes_per_file: usize,
     pub skip_binary: bool,
@@ -533,6 +547,19 @@ pub struct DeferredActions {
 }
 
 impl AppState {
+    pub(crate) fn bump_next_component_id(&mut self) {
+        let max_id = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter().map(|c| c.id))
+            .max()
+            .unwrap_or(0);
+
+        let needed = max_id.saturating_add(1);
+        if self.next_component_id < needed {
+            self.next_component_id = needed;
+        }
+    }
+
     pub fn active_canvas_state(&self) -> &CanvasState {
         let idx = self.active_canvas.min(self.canvases.len().saturating_sub(1));
         &self.canvases[idx]
@@ -586,6 +613,19 @@ impl AppState {
         id
     }
 
+
+    fn bump_next_component_id_unused(&mut self) {
+        let max_id = self
+            .all_layouts()
+            .flat_map(|l| l.components.iter().map(|c| c.id))
+            .max()
+            .unwrap_or(0);
+
+        let needed = max_id.saturating_add(1);
+        if self.next_component_id < needed {
+            self.next_component_id = needed;
+        }
+    }
     pub fn all_layouts(&self) -> impl Iterator<Item = &LayoutConfig> {
         self.canvases.iter().map(|c| &c.layout)
     }

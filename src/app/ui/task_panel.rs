@@ -203,7 +203,7 @@ pub fn task_panel(
 
                         // Display: last 10 chars of the OpenAI conversation id (conv_...), if present.
                         // Hover: show full OpenAI id and internal ConversationId.
-                        let (display, hover) = match snap.conversation_id.as_deref() {
+                        let (display, _hover) = match snap.conversation_id.as_deref() {
                             Some(full) if !full.trim().is_empty() => {
                                 let tail = oai_id_tail_last_10(full);
                                 (tail, format!("OpenAI: {}\nInternal: Conversation {}", full, conversation_id))

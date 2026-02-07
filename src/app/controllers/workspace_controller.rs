@@ -425,7 +425,7 @@ impl AppState {
                     self.theme.prefs.syntect_theme = state_snap.theme_syntect;
                 }
 
-                self.next_component_id = if state_snap.next_component_id == 0 {
+                let provisional_next_component_id = if state_snap.next_component_id == 0 {
                     self.next_component_id
                 } else {
                     state_snap.next_component_id
@@ -462,6 +462,14 @@ impl AppState {
                     }];
                     self.active_canvas = 0;
                 }
+
+                let max_used_id = self
+                    .all_layouts()
+                    .flat_map(|l| l.components.iter().map(|c| c.id))
+                    .max()
+                    .unwrap_or(0);
+                self.next_component_id = provisional_next_component_id.max(max_used_id + 1);
+
 
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();

@@ -322,23 +322,32 @@ impl LayoutConfig {
     }
 
     pub fn merge_with_defaults(&mut self) {
-        let d = LayoutConfig::default();
 
-        // Ensure default components exist (Tree + one FV + Summary)
-        for dc in d.components {
-            if !self.components.iter().any(|c| c.id == dc.id) {
-                self.components.push(dc);
+        let mut ensure = |kind: ComponentKind, title: &str| {
+            if !self.components.iter().any(|c| c.kind == kind) {
+                let id = self.next_free_id();
+                self.components.push(ComponentInstance {
+                    id,
+                    kind,
+                    title: title.to_string(),
+                });
             }
-        }
+        };
 
-        // Ensure window layouts exist
-        for (id, wl) in d.windows {
-            self.windows.entry(id).or_insert(wl);
-        }
+        // Ensure default components exist by KIND
+        ensure(ComponentKind::Tree, "Tree");
+        ensure(ComponentKind::FileViewer, "File Viewer");
+        ensure(ComponentKind::Summary, "Summary");
+
+        // Ensure every component has a window layout (including newly added defaults)
+        self.ensure_window_layouts();
     }
 
     pub fn next_free_id(&self) -> ComponentId {
-        self.components.iter().map(|c| c.id).max().unwrap_or(0) + 1
+
+        let max_component_id = self.components.iter().map(|c| c.id).max().unwrap_or(0);
+        let max_window_id = self.windows.keys().copied().max().unwrap_or(0);
+        max_component_id.max(max_window_id) + 1
     }
 
     pub fn rescale_from(&mut self, saved_canvas: [f32; 2], current_canvas: [f32; 2]) {
