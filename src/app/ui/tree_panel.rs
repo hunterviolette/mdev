@@ -178,11 +178,7 @@ fn show_dir(
     }
 
     st.show_header(ui, |ui| {
-        // NOTE: egui checkboxes don’t support true tri-state without extra work.
-        // We follow your ask: "dir selects all files in it" using a single checkbox.
-        // Behavior:
-        // - checked => all files under dir are selected
-        // - unchecked => none selected (even if previously partial)
+
         let (all, _any) = dir_selection_state(state, node);
         let mut desired = all;
 
@@ -190,7 +186,7 @@ fn show_dir(
             set_dir_selected(state, node, desired);
         }
 
-        ui.add(egui::Label::new(label).wrap(false));
+        ui.add(egui::Label::new(label).wrap(true));
     })
     .body(|ui| {
         for f in &node.files {
@@ -216,12 +212,9 @@ pub fn tree_panel(
 
     let filter_text = state.ui.filter_text.clone();
     let max_exts = state.inputs.max_exts;
-
-    // One-shot expand/collapse command
-    // IMPORTANT: consume it so it doesn't override manual caret toggles every frame.
     let expand_cmd = state.tree.expand_cmd.take();
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut state.ui.show_top_level_stats, "Badges");
 
         ui.separator();
@@ -291,7 +284,7 @@ pub fn tree_panel(
                             }
                         }
 
-                        ui.add(egui::Label::new(root_label).wrap(false));
+                        ui.add(egui::Label::new(root_label).wrap(true));
                     })
                     .body(|ui| {
                         for f in &res.root.files {

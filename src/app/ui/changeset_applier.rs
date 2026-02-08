@@ -137,11 +137,13 @@ pub fn changeset_applier_panel(
 
     ui.add_space(8.0);
 
-    let available_h = ui.available_height().max(200.0);
-    let pane_h = ((available_h - 8.0) * 0.5).max(120.0);
+    let available_h = ui.available_height().max(1.0);
+    let available_w = ui.available_width().max(1.0);
+
+    let pane_h = ((available_h - 8.0).max(1.0) * 0.5).max(1.0);
 
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-    let desired_rows = ((pane_h / row_h).floor() as usize).max(6);
+    let desired_rows = ((pane_h / row_h).floor() as usize).max(1);
 
     // Payload pane
     ui.push_id("payload_pane", |ui| {
@@ -149,7 +151,7 @@ pub fn changeset_applier_panel(
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(6.0))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_source(("changeset_applier_payload_scroll", applier_id))
                     .auto_shrink([false, false])
                     .max_height(pane_h)
@@ -158,7 +160,7 @@ pub fn changeset_applier_panel(
                             egui::TextEdit::multiline(&mut st.payload)
                                 .id_source(("changeset_applier_payload_text", applier_id))
                                 .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
+                                .desired_width(available_w)
                                 .desired_rows(desired_rows)
                                 .hint_text("Paste JSON payload here..."),
                         );
@@ -175,7 +177,7 @@ pub fn changeset_applier_panel(
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(6.0))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_source(("changeset_applier_output_scroll", applier_id))
                     .auto_shrink([false, false])
                     .max_height(pane_h)
@@ -184,7 +186,7 @@ pub fn changeset_applier_panel(
                             egui::TextEdit::multiline(&mut output)
                                 .id_source(("changeset_applier_output_text", applier_id))
                                 .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
+                                .desired_width(available_w)
                                 .desired_rows(desired_rows)
                                 .interactive(false),
                         );

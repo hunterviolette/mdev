@@ -355,6 +355,8 @@ impl AppState {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [150.0, 150.0],
                 size: [860.0, 680.0],
             },

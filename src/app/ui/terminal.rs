@@ -156,7 +156,6 @@ pub fn terminal_panel(
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, output_h), egui::Sense::hover());
         ui.allocate_ui_at_rect(rect, |ui| {
-            ui.set_min_size(egui::vec2(full_w, output_h));
 
             ui.set_width(full_w);
             ui.set_max_width(full_w);

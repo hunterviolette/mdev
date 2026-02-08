@@ -205,10 +205,16 @@ pub struct WindowLayout {
     pub open: bool,
     pub locked: bool,
 
-    /// Canvas-local egui points: position of the WINDOW (outer top-left)
+    #[serde(default)]
+    pub pos_norm: Option<[f32; 2]>,
+
+    #[serde(default)]
+    pub size_norm: Option<[f32; 2]>,
+
+    #[serde(default)]
     pub pos: [f32; 2],
 
-    /// IMPORTANT: this is the window **content size** (what egui::Window::default_size expects)
+    #[serde(default)]
     pub size: [f32; 2],
 }
 
@@ -217,11 +223,56 @@ impl Default for WindowLayout {
         Self {
             open: true,
             locked: false,
+            pos_norm: None,
+            size_norm: None,
             pos: [40.0, 40.0],
             size: [500.0, 500.0],
         }
     }
 }
+
+impl WindowLayout {
+    fn norm_div(v: [f32; 2], canvas: [f32; 2]) -> [f32; 2] {
+        let cw = canvas[0].max(1.0);
+        let ch = canvas[1].max(1.0);
+        [v[0] / cw, v[1] / ch]
+    }
+
+    fn norm_mul(v: [f32; 2], canvas: [f32; 2]) -> [f32; 2] {
+        let cw = canvas[0].max(1.0);
+        let ch = canvas[1].max(1.0);
+        [v[0] * cw, v[1] * ch]
+    }
+
+    /// Ensure normalized fields exist, using legacy absolute fields as migration input.
+    pub fn ensure_normalized_from_legacy(&mut self, legacy_canvas: [f32; 2]) {
+        if self.pos_norm.is_none() {
+            self.pos_norm = Some(Self::norm_div(self.pos, legacy_canvas));
+        }
+        if self.size_norm.is_none() {
+            self.size_norm = Some(Self::norm_div(self.size, legacy_canvas));
+        }
+    }
+
+    /// Get window position/size in pixels for the *current* canvas size.
+    pub fn denormalized_px(&self, current_canvas: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+        match (self.pos_norm, self.size_norm) {
+            (Some(pn), Some(sn)) => (Self::norm_mul(pn, current_canvas), Self::norm_mul(sn, current_canvas)),
+            _ => (self.pos, self.size),
+        }
+    }
+
+    /// Update normalized fields from pixel position/size (user move/resize), for the *current* canvas size.
+    pub fn set_from_px(&mut self, pos_px: [f32; 2], size_px: [f32; 2], current_canvas: [f32; 2]) {
+        self.pos_norm = Some(Self::norm_div(pos_px, current_canvas));
+        self.size_norm = Some(Self::norm_div(size_px, current_canvas));
+
+        // Keep legacy fields in sync (helps with debugging; also keeps older code paths sane).
+        self.pos = pos_px;
+        self.size = size_px;
+    }
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutConfig {
@@ -260,6 +311,8 @@ impl Default for LayoutConfig {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [10.0, 20.0],
                 size: [360.0, 700.0],
             },
@@ -269,6 +322,8 @@ impl Default for LayoutConfig {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [380.0, 20.0],
                 size: [760.0, 700.0],
             },
@@ -278,6 +333,8 @@ impl Default for LayoutConfig {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [1150.0, 20.0],
                 size: [420.0, 700.0],
             },
@@ -307,10 +364,43 @@ impl LayoutConfig {
                 WindowLayout {
                     open: true,
                     locked: false,
+                    pos_norm: None,
+                    size_norm: None,
                     pos,
                     size,
                 },
             );
+        }
+    }
+
+    pub fn migrate_legacy_abs_to_normalized(&mut self, legacy_canvas: [f32; 2]) {
+        for w in self.windows.values_mut() {
+            w.ensure_normalized_from_legacy(legacy_canvas);
+        }
+    }
+
+
+    pub fn clamp_to_canvas_and_renormalize(&mut self, current_canvas: [f32; 2]) {
+        let cw = current_canvas[0].max(1.0);
+        let ch = current_canvas[1].max(1.0);
+
+        for w in self.windows.values_mut() {
+            // Ensure we have normalized fields first.
+            if w.pos_norm.is_none() || w.size_norm.is_none() {
+                w.ensure_normalized_from_legacy(current_canvas);
+            }
+
+            let (mut pos_px, mut size_px) = w.denormalized_px(current_canvas);
+
+            let min_px = 1.0;
+            size_px[0] = size_px[0].clamp(min_px, cw);
+            size_px[1] = size_px[1].clamp(min_px, ch);
+
+            // Clamp position so the window stays within the canvas, but don't force an extra margin.
+            pos_px[0] = pos_px[0].clamp(0.0, (cw - min_px).max(0.0));
+            pos_px[1] = pos_px[1].clamp(0.0, (ch - min_px).max(0.0));
+
+            w.set_from_px(pos_px, size_px, current_canvas);
         }
     }
 
@@ -351,33 +441,7 @@ impl LayoutConfig {
     }
 
     pub fn rescale_from(&mut self, saved_canvas: [f32; 2], current_canvas: [f32; 2]) {
-        let saved_w = saved_canvas[0].max(1.0);
-        let saved_h = saved_canvas[1].max(1.0);
-
-        let cur_w = current_canvas[0].max(1.0);
-        let cur_h = current_canvas[1].max(1.0);
-
-        // Avoid micro-rescale due to DPI rounding
-        let same = (saved_w - cur_w).abs() < 2.0 && (saved_h - cur_h).abs() < 2.0;
-        if same {
-            return;
-        }
-
-        let sx = cur_w / saved_w;
-        let sy = cur_h / saved_h;
-
-        for w in self.windows.values_mut() {
-            w.pos[0] *= sx;
-            w.pos[1] *= sy;
-
-            w.size[0] *= sx;
-            w.size[1] *= sy;
-
-            w.pos[0] = w.pos[0].clamp(0.0, (cur_w - 50.0).max(0.0));
-            w.pos[1] = w.pos[1].clamp(0.0, (cur_h - 50.0).max(0.0));
-
-            w.size[0] = w.size[0].clamp(150.0, cur_w);
-            w.size[1] = w.size[1].clamp(120.0, cur_h);
-        }
+        self.migrate_legacy_abs_to_normalized(saved_canvas);
+        self.clamp_to_canvas_and_renormalize(current_canvas);
     }
 }

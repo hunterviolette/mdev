@@ -15,6 +15,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             canvas_size,
             viewport_outer_pos,
             viewport_inner_size,
+            pixels_per_point,
         } => {
             let name = state.palette_last_name.take();
             state.current_workspace_name = name.clone().unwrap_or_else(|| "workspace".to_string());
@@ -22,6 +23,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 *canvas_size,
                 *viewport_outer_pos,
                 *viewport_inner_size,
+                *pixels_per_point,
                 name.as_deref(),
             );
             true
@@ -157,6 +159,7 @@ impl AppState {
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
         viewport_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
         name_opt: Option<&str>,
     ) {
         let name = name_opt.unwrap_or("workspace");
@@ -204,6 +207,24 @@ impl AppState {
 
         let execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot> = HashMap::new();
         let tasks: HashMap<ComponentId, TaskSnapshot> = HashMap::new();
+
+        {
+            let cw = canvas_size[0].max(1.0);
+            let ch = canvas_size[1].max(1.0);
+
+            let mut force_normalize = |layout: &mut crate::app::layout::LayoutConfig| {
+                for w in layout.windows.values_mut() {
+                    w.pos_norm = Some([w.pos[0] / cw, w.pos[1] / ch]);
+                    w.size_norm = Some([w.size[0] / cw, w.size[1] / ch]);
+                }
+            };
+
+            force_normalize(self.active_layout_mut());
+
+            for c in self.canvases.iter_mut() {
+                force_normalize(&mut c.layout);
+            }
+        }
 
         let state_snap = StateSnapshot {
             canvas_size,
@@ -321,18 +342,28 @@ impl AppState {
         };
 
         let mut target_inner_size = None;
-        if let PresetKind::FullState(st) = &preset.kind {
-            self.pending_viewport_restore = Some(ViewportRestore {
-                outer_pos: st.viewport_outer_pos,
-                inner_size: st.viewport_inner_size,
-            });
-            target_inner_size = st.viewport_inner_size;
+        let mut target_canvas_size = None;
+
+        match &preset.kind {
+            PresetKind::FullState(st) => {
+                self.pending_viewport_restore = Some(ViewportRestore {
+                    outer_pos: st.viewport_outer_pos,
+                    inner_size: st.viewport_inner_size,
+                });
+                target_inner_size = st.viewport_inner_size;
+                target_canvas_size = Some(st.canvas_size);
+            }
+            PresetKind::LayoutOnly(ls) => {
+                target_canvas_size = Some(ls.canvas_size);
+            }
         }
 
         self.pending_workspace_apply = Some(PendingWorkspaceApply {
             preset: preset.kind.clone(),
             target_inner_size,
+            target_canvas_size,
             wait_frames: 10,
+            timeout_frames: 120,
         });
 
         self.results.error = None;
@@ -346,29 +377,68 @@ impl AppState {
         &mut self,
         current_canvas_size: [f32; 2],
         current_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
     ) -> bool {
-        let Some(pending) = self.pending_workspace_apply.clone() else {
+        let Some(mut pending) = self.pending_workspace_apply.clone() else {
             return false;
         };
 
         // Wait a few frames for resize to settle.
         if pending.wait_frames > 0 {
-            self.pending_workspace_apply = Some(PendingWorkspaceApply {
-                wait_frames: pending.wait_frames - 1,
-                ..pending
-            });
+            pending.wait_frames = pending.wait_frames.saturating_sub(1);
+            self.pending_workspace_apply = Some(pending);
             return false;
         }
 
-        // If we have a target inner size, wait until we're close enough or time out.
+        let mut should_wait = false;
+
         if let (Some(target), Some(cur)) = (pending.target_inner_size, current_inner_size) {
             let dx = (target[0] - cur[0]).abs();
             let dy = (target[1] - cur[1]).abs();
+            // Keep the existing tolerance for native windowing quirks.
             if dx > 2.0 || dy > 2.0 {
-                // Keep trying; request repaints happens elsewhere.
-                return false;
+                should_wait = true;
             }
         }
+
+        if let Some(target) = pending.target_canvas_size {
+            let dx = (target[0] - current_canvas_size[0]).abs();
+            let dy = (target[1] - current_canvas_size[1]).abs();
+            // Canvas is already snapped/floored; require near-exact match.
+            // A mismatch here is what causes proportional window size drift on load.
+            if dx > 0.25 || dy > 0.25 {
+                should_wait = true;
+            }
+        }
+
+        if should_wait {
+            if pending.timeout_frames > 0 {
+                pending.timeout_frames = pending.timeout_frames.saturating_sub(1);
+                self.pending_workspace_apply = Some(pending);
+                return false;
+            }
+            // Timeout: fall back to current behavior (apply with current canvas size).
+        }
+
+        // Log the exact numbers used to denormalize/rescale layouts.
+        let saved_canvas_size: Option<[f32; 2]> = match &pending.preset {
+            PresetKind::LayoutOnly(ls) => Some(ls.canvas_size),
+            PresetKind::FullState(st) => Some(st.canvas_size),
+        };
+
+        tracing::info!(
+            target: "workspace_geom",
+            event = "apply",
+            current_canvas_w = current_canvas_size[0],
+            current_canvas_h = current_canvas_size[1],
+            saved_canvas_w = saved_canvas_size.map(|s| s[0]),
+            saved_canvas_h = saved_canvas_size.map(|s| s[1]),
+            current_inner_w = current_inner_size.map(|s| s[0]),
+            current_inner_h = current_inner_size.map(|s| s[1]),
+            target_inner_w = pending.target_inner_size.map(|s| s[0]),
+            target_inner_h = pending.target_inner_size.map(|s| s[1]),
+            pixels_per_point = pixels_per_point,
+        );
 
         // Apply
         self.apply_preset_kind(pending.preset, current_canvas_size);
@@ -377,12 +447,43 @@ impl AppState {
         true
     }
 
+    fn log_layout_windows(prefix: &str, layout: &crate::app::layout::LayoutConfig) {
+        tracing::info!(target: "workspace_geom", event = "layout_dump", phase = prefix, window_count = layout.windows.len());
+        for (id, w) in layout.windows.iter() {
+            tracing::info!(
+                target: "workspace_geom",
+                event = "layout_window",
+                phase = prefix,
+                id = *id,
+                pos_x = w.pos[0],
+                pos_y = w.pos[1],
+                size_w = w.size[0],
+                size_h = w.size[1],
+                pos_norm = ?w.pos_norm,
+                size_norm = ?w.size_norm
+            );
+        }
+    }
+
     fn apply_preset_kind(&mut self, kind: PresetKind, current_canvas_size: [f32; 2]) {
         match kind {
             PresetKind::LayoutOnly(layout_snap) => {
+                tracing::info!(target: "workspace_geom", event = "apply_path", kind = "layout_only", saved_canvas_w = layout_snap.canvas_size[0], saved_canvas_h = layout_snap.canvas_size[1], current_canvas_w = current_canvas_size[0], current_canvas_h = current_canvas_size[1]);
+
                 let mut layout = layout_snap.layout;
-                layout.rescale_from(layout_snap.canvas_size, current_canvas_size);
+
+                Self::log_layout_windows("layout_only/before_migrate", &layout);
+
+                layout.migrate_legacy_abs_to_normalized(layout_snap.canvas_size);
+                Self::log_layout_windows("layout_only/after_migrate", &layout);
+
+                layout.clamp_to_canvas_and_renormalize(current_canvas_size);
+                Self::log_layout_windows("layout_only/after_clamp", &layout);
+
+
                 layout.ensure_window_layouts();
+                Self::log_layout_windows("layout_only/after_ensure", &layout);
+
                 {
                     let canvas = self.active_canvas_state_mut();
                     canvas.layout = layout;
@@ -403,6 +504,8 @@ impl AppState {
             }
 
             PresetKind::FullState(state_snap) => {
+                tracing::info!(target: "workspace_geom", event = "apply_path", kind = "full_state", saved_canvas_w = state_snap.canvas_size[0], saved_canvas_h = state_snap.canvas_size[1], current_canvas_w = current_canvas_size[0], current_canvas_h = current_canvas_size[1]);
+
                 self.inputs.repo = state_snap.repo;
                 self.inputs.git_ref = state_snap.git_ref;
 
@@ -448,11 +551,18 @@ impl AppState {
                             }
                         })
                         .collect();
+
                     self.active_canvas = state_snap.active_canvas.min(self.canvases.len().saturating_sub(1));
+                    if let Some(c) = self.canvases.get(self.active_canvas) {
+                        Self::log_layout_windows("full_state/active_canvas_after_rescale_ensure", &c.layout);
+                    }
+
                 } else {
                     let mut layout = state_snap.layout;
                     layout.rescale_from(state_snap.canvas_size, current_canvas_size);
                     layout.ensure_window_layouts();
+                    Self::log_layout_windows("full_state/single_canvas_after_rescale_ensure", &layout);
+
                     self.canvases = vec![crate::app::state::CanvasState {
                         name: "Canvas 1".to_string(),
                         layout,

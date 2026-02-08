@@ -102,6 +102,8 @@ impl AppState {
             crate::app::layout::WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [180.0, 180.0],
                 size: [980.0, 720.0],
             },

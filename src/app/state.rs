@@ -33,7 +33,9 @@ pub struct ViewportRestore {
 pub struct PendingWorkspaceApply {
     pub preset: PresetKind,
     pub target_inner_size: Option<[f32; 2]>,
+    pub target_canvas_size: Option<[f32; 2]>,
     pub wait_frames: u8,
+    pub timeout_frames: u16,
 }
 
 #[derive(Clone, Debug, Default)]

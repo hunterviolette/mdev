@@ -299,6 +299,7 @@ pub enum Action {
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
         viewport_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
     },
     LoadWorkspace,
 

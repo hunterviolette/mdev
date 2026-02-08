@@ -325,6 +325,7 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
                             canvas_size: [1.0, 1.0],
                             viewport_outer_pos: None,
                             viewport_inner_size: None,
+                            pixels_per_point: 1.0,
                         }),
                         name,
                     )
@@ -521,6 +522,7 @@ pub fn command_palette(
     canvas_size: [f32; 2],
     viewport_outer_pos: Option<[f32; 2]>,
     viewport_inner_size: Option<[f32; 2]>,
+    pixels_per_point: f32,
 ) -> Vec<Action> {
     let mut actions = vec![];
 
@@ -635,6 +637,7 @@ pub fn command_palette(
                             canvas_size,
                             viewport_outer_pos,
                             viewport_inner_size,
+                            pixels_per_point,
                         };
                     }
 

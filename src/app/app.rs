@@ -8,8 +8,18 @@ fn canvas_rect_id() -> egui::Id {
 }
 
 fn current_canvas_size(ctx: &egui::Context) -> [f32; 2] {
-    let r = ctx.available_rect();
-    [r.width().max(1.0), r.height().max(1.0)]
+
+    let r = ctx
+        .data_mut(|d| d.get_persisted::<egui::Rect>(canvas_rect_id()))
+        .unwrap_or_else(|| ctx.available_rect());
+
+    let ppp = ctx.pixels_per_point().max(1.0);
+    let snap_floor = |v: f32| (v * ppp).floor() / ppp;
+
+    [
+        snap_floor(r.width().max(1.0)),
+        snap_floor(r.height().max(1.0)),
+    ]
 }
 
 fn viewport_outer_pos(ctx: &egui::Context) -> Option<[f32; 2]> {
@@ -83,7 +93,6 @@ impl eframe::App for AppState {
         }
 
 
-        // Top bar
         egui::TopBottomPanel::top("top").show(ctx, |ui_top| {
             let actions = ui::top_bar::top_bar(ctx, ui_top, self);
             for a in actions {
@@ -91,14 +100,20 @@ impl eframe::App for AppState {
             }
         });
 
-        // Personalization modal (theme + canvas tint)
         let actions = ui::personalization::personalization(ctx, self);
         for a in actions {
             self.apply_action(a);
         }
 
-        // Persist the "canvas rect" AFTER top panel has taken its space
-        let canvas_rect = ctx.available_rect();
+        let r = ctx.available_rect();
+        let ppp = ctx.pixels_per_point().max(1.0);
+        let snap_round = |v: f32| (v * ppp).round() / ppp;
+        let snap_floor = |v: f32| (v * ppp).floor() / ppp;
+
+        let origin = egui::pos2(snap_round(r.min.x), snap_round(r.min.y));
+        let size = egui::vec2(snap_floor(r.width().max(1.0)), snap_floor(r.height().max(1.0)));
+        let canvas_rect = egui::Rect::from_min_size(origin, size);
+
         ctx.data_mut(|d| d.insert_persisted(canvas_rect_id(), canvas_rect));
 
         // Apply viewport restore (best-effort)
@@ -120,7 +135,8 @@ impl eframe::App for AppState {
         // Workspace apply logic needs these every frame
         let canvas_size = current_canvas_size(ctx);
         let inner_size = current_viewport_inner_size(ctx);
-        let _applied = self.try_apply_pending_workspace(canvas_size, inner_size);
+        let ppp_now = ctx.pixels_per_point().max(1.0);
+        let _applied = self.try_apply_pending_workspace(canvas_size, inner_size, ppp_now);
 
         let actions = ui::canvas::canvas(ctx, self);
         for a in actions {
@@ -134,13 +150,13 @@ impl eframe::App for AppState {
             canvas_size,
             viewport_outer_pos(ctx),
             viewport_inner_size(ctx),
+            ppp_now,
         );
         for a in palette_actions {
             self.apply_action(a);
         }
 
         // Canvas tint popup (modal; freezes underlying canvas while open)
-        // Must be called every frame so it can draw.
         let tint_actions = ui::personalization::personalization(ctx, self);
         for a in tint_actions {
             self.apply_action(a);

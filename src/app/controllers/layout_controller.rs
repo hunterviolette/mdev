@@ -104,6 +104,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [60.0, 60.0],
                         size: [760.0, 700.0],
                     },
@@ -129,6 +131,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [200.0, 200.0],
                         size: [520.0, 260.0],
                     },
@@ -151,6 +155,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [180.0, 180.0],
                         size: [980.0, 720.0],
                     },
@@ -176,6 +182,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [120.0, 120.0],
                         size: [560.0, 260.0],
                     },
@@ -208,6 +216,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [160.0, 160.0],
                         size: [760.0, 620.0],
                     },
@@ -245,6 +255,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [140.0, 140.0],
                         size: [640.0, 520.0],
                     },
@@ -292,6 +304,8 @@ impl AppState {
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [80.0, 80.0],
                         size: [520.0, 700.0],
                     },
@@ -320,6 +334,8 @@ impl AppState {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [150.0, 150.0],
                 size: [860.0, 680.0],
             },
@@ -355,6 +371,8 @@ impl AppState {
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [60.0, 60.0],
                 size: [760.0, 700.0],
             },
