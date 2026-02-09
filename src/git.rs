@@ -877,3 +877,60 @@ pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
         }
     }
 }
+
+
+pub fn apply_git_patch_reverse(repo: &Path, patch_text: &str) -> Result<()> {
+    let mut patch = patch_text.replace("\r\n", "\n");
+    if !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+
+    let debug_path = repo.join(".describe_repo_last_patch_reverse.patch");
+    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
+        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
+    }
+
+    match run_git_with_input(
+        repo,
+        &["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn", "-"],
+        patch.as_bytes(),
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let check = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "apply",
+                    "--check",
+                    "--reverse",
+                    "--unidiff-zero",
+                    "--whitespace=nowarn",
+                ])
+                .arg(&debug_path)
+                .output();
+
+            let mut check_msg = String::new();
+            if let Ok(o) = check {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                check_msg.push_str(&format!(
+                    "git apply --check --reverse exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
+                    o.status.code(),
+                    stdout,
+                    stderr
+                ));
+            }
+
+            bail!(
+                "git apply --reverse failed.\n\
+                 debug_patch_file={}\n\
+                 underlying_error={:#}\n\
+                 {}",
+                debug_path.display(),
+                e,
+                check_msg
+            );
+        }
+    }
+}

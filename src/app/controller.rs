@@ -113,12 +113,6 @@ impl AppState {
         // Do NOT hydrate ExecuteLoopState here (on-demand view/controller).
         self.execute_loop_store = parsed.execute_loops.clone();
 
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         for (task_id, ts) in parsed.tasks.iter() {
             let exists = self
                 .all_layouts()
@@ -127,9 +121,6 @@ impl AppState {
                 continue;
             }
 
-            // Back-compat upgrade: older task store files won't have timestamps (default=0).
-            let created_at_ms = if ts.created_at_ms == 0 { now_ms } else { ts.created_at_ms };
-            let updated_at_ms = if ts.updated_at_ms == 0 { now_ms } else { ts.updated_at_ms };
 
             self.tasks.insert(
                 *task_id,
@@ -137,11 +128,11 @@ impl AppState {
                     bound_execute_loop: ts.bound_execute_loop,
                     paused: ts.paused,
                     execute_loop_ids: ts.execute_loop_ids.clone(),
-                    created_at_ms,
-                    updated_at_ms,
+                    created_at_ms: ts.created_at_ms,
+                    updated_at_ms: ts.updated_at_ms,
                     conversations: ts.conversations.clone(),
                     active_conversation: ts.active_conversation,
-                    next_conversation_id: if ts.next_conversation_id == 0 { 1 } else { ts.next_conversation_id },
+                    next_conversation_id: ts.next_conversation_id,
                 },
             );
 
@@ -293,7 +284,7 @@ impl AppState {
                     .map(|s| s.created_at_ms)
                     .unwrap_or(0);
 
-                // If missing (legacy/older), initialize to now_ms for this conversation.
+                // Initialize created_at_ms once per conversation.
                 let c_created_at_ms = if prev_created != 0 { prev_created } else { now_ms };
 
                 t.conversations.insert(

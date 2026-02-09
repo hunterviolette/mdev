@@ -18,7 +18,33 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.refresh_diff_viewer(*viewer_id);
             true
         }
-        _ => false,
+                Action::DiffViewerRevertPatch { viewer_id, patch } => {
+            let Some(repo) = state.inputs.repo.clone() else {
+                if let Some(v) = state.diff_viewers.get_mut(viewer_id) {
+                    v.last_error = Some("No repo selected.".into());
+                }
+                return true;
+            };
+
+            match state.broker.exec(crate::capabilities::CapabilityRequest::ApplyGitPatchReverse {
+                repo,
+                patch: patch.clone(),
+            }) {
+                Ok(_) => {
+                    if let Some(v) = state.diff_viewers.get_mut(viewer_id) {
+                        v.last_error = None;
+                        v.needs_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    if let Some(v) = state.diff_viewers.get_mut(viewer_id) {
+                        v.last_error = Some(format!("{:#}", e));
+                    }
+                }
+            }
+            true
+        }
+_ => false,
     }
 }
 

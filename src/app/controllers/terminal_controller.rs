@@ -1,10 +1,16 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind, TerminalShell};
 use crate::app::layout::{ComponentInstance, WindowLayout};
 use crate::app::state::{AppState, TerminalEvent, TerminalState};
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+
+pub(crate) fn vt_screen_to_string(p: &vt100::Parser) -> String {
+    p.screen().contents()
+}
+
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -17,24 +23,33 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
         Action::ClearTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
-                t.output.clear();
-                t.last_status = None;
-                t.running = false;
+                if let Some(vt) = t.vt.as_mut() {
+                    // Reset the VT screen state as well.
+                    *vt = vt100::Parser::new(30, 120, 2000);
+                }
+                t.rendered_output.clear();
                 t.pending_rx = None;
-                t.child = None;
+                t.pty_in = None;
+                t.pty_child = None;
+                t.pty_master = None;
             }
             true
         }
 
         Action::InterruptTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
-                if let Some(ch) = t.child.as_ref() {
-                    // Best-effort: kill. True Ctrl+C/SIGINT requires a PTY.
-                    let _ = ch.lock().ok().and_then(|mut c| c.kill().ok());
-                    t.output.push_str("\n[interrupt] sent stop/kill to running command\n");
-                } else {
-                    t.output.push_str("\n[interrupt] no running process\n");
+                // PTY-only: send Ctrl+C (0x03) to the session.
+                if let Some(pty_in) = t.pty_in.as_ref() {
+                    if let Ok(mut w) = pty_in.lock() {
+                        let _ = w.write_all(&[0x03]);
+                        let _ = w.flush();
+                        t.rendered_output.push_str("\n[interrupt] sent Ctrl+C\n");
+                        return true;
+                    }
                 }
+
+                t.rendered_output
+                    .push_str("\n[interrupt] terminal session not available\n");
             }
             true
         }
@@ -44,61 +59,49 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
+        Action::StartTerminalSession { terminal_id, rows, cols } => {
+            state.ensure_terminal_session(*terminal_id, *rows, *cols);
+            true
+        }
+
+        Action::ResizeTerminal { terminal_id, rows, cols } => {
+            if let Some(t) = state.terminals.get_mut(terminal_id) {
+                if let Some(master) = t.pty_master.as_ref() {
+                    if let Ok(mut m) = master.lock() {
+                        let _ = m.resize(PtySize {
+                            rows: *rows,
+                            cols: *cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                        t.pty_size = Some((*rows, *cols));
+                    }
+                }
+            }
+            true
+        }
+
+        Action::TerminalSendInput { terminal_id, data } => {
+            if let Some(t) = state.terminals.get_mut(terminal_id) {
+                // If somehow input arrives before session is started, ignore.
+                if let Some(pty_in) = t.pty_in.as_ref() {
+                    if let Ok(mut w) = pty_in.lock() {
+                        let _ = w.write_all(data);
+                        let _ = w.flush();
+                    }
+                }
+            }
+            true
+        }
+
         _ => false,
     }
 }
 
+
+
 impl AppState {
-    fn spawn_shell_streaming(
-        shell: &TerminalShell,
-        cmd: &str,
-        cwd: Option<&std::path::PathBuf>,
-    ) -> std::io::Result<std::process::Child> {
-        let mut c = match shell {
-            TerminalShell::PowerShell => {
-                let mut cc = Command::new("powershell");
-                cc.args(["-NoProfile", "-Command", cmd]);
-                cc
-            }
-            TerminalShell::Cmd => {
-                let mut cc = Command::new("cmd");
-                cc.args(["/C", cmd]);
-                cc
-            }
-            TerminalShell::Bash => {
-                let mut cc = Command::new("bash");
-                cc.args(["-lc", cmd]);
-                cc
-            }
-            TerminalShell::Zsh => {
-                let mut cc = Command::new("zsh");
-                cc.args(["-lc", cmd]);
-                cc
-            }
-            TerminalShell::Sh | TerminalShell::Auto => {
-                let mut cc = Command::new("sh");
-                cc.args(["-lc", cmd]);
-                cc
-            }
-        };
-
-        if let Some(dir) = cwd {
-            c.current_dir(dir);
-        }
-
-        c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-    }
-
-    fn terminal_prompt(shell: &TerminalShell, cwd: &Option<std::path::PathBuf>) -> String {
-        match (shell, cwd) {
-            (TerminalShell::PowerShell, Some(dir)) => format!("PS {}> ", dir.display()),
-            (TerminalShell::Cmd, Some(dir)) => format!("{}> ", dir.display()),
-            (_, Some(dir)) => format!("{}$ ", dir.display()),
-            (TerminalShell::PowerShell, None) => "PS > ".to_string(),
-            (TerminalShell::Cmd, None) => "> ".to_string(),
-            (_, None) => "$ ".to_string(),
-        }
-    }
+    // Terminal implementation is PTY-only (legacy non-PTY runner removed).
 
     /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_terminals_from_layout(&mut self) {
@@ -118,14 +121,15 @@ impl AppState {
             self.terminals.insert(
                 id,
                 TerminalState {
+                    vt: Some(vt100::Parser::new(30, 120, 2000)),
+                    rendered_output: String::new(),
+                    pty_master: None,
+                    pty_child: None,
+                    pty_size: None,
                     shell: TerminalShell::Auto,
                     cwd: self.inputs.repo.clone(),
-                    input: String::new(),
-                    output: String::new(),
-                    last_status: None,
-                    running: false,
                     pending_rx: None,
-                    child: None,
+                    pty_in: None,
                 },
             );
         }
@@ -167,18 +171,179 @@ impl AppState {
         self.terminals.insert(
             id,
             TerminalState {
+                vt: Some(vt100::Parser::new(30, 120, 2000)),
+                rendered_output: String::new(),
+                pty_master: None,
+                pty_child: None,
+                pty_size: None,
                 shell: TerminalShell::Auto,
                 cwd: self.inputs.repo.clone(),
-                input: String::new(),
-                output: String::new(),
-                last_status: None,
-                running: false,
                 pending_rx: None,
-                child: None,
+                pty_in: None,
             },
         );
 
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
+    }
+
+    fn spawn_shell_pty(
+        shell: &TerminalShell,
+        cwd: Option<&std::path::PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<(Box<dyn MasterPty + Send>, Box<dyn portable_pty::Child + Send>)> {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut cb = match shell {
+            TerminalShell::PowerShell => {
+                #[cfg(windows)]
+                let exe = "powershell.exe";
+                #[cfg(not(windows))]
+                let exe = "pwsh";
+
+                let mut b = CommandBuilder::new(exe);
+                b.arg("-NoLogo");
+                b.arg("-NoProfile");
+                b
+            }
+            TerminalShell::Cmd => {
+                #[cfg(windows)]
+                {
+                    CommandBuilder::new("cmd.exe")
+                }
+                #[cfg(not(windows))]
+                {
+                    // No cmd.exe; fall back to sh.
+                    CommandBuilder::new("sh")
+                }
+            }
+            TerminalShell::Bash => CommandBuilder::new("bash"),
+            TerminalShell::Zsh => CommandBuilder::new("zsh"),
+            TerminalShell::Sh => CommandBuilder::new("sh"),
+            TerminalShell::Auto => {
+                #[cfg(windows)]
+                let mut b = CommandBuilder::new("powershell.exe");
+                #[cfg(not(windows))]
+                let mut b = CommandBuilder::new("bash");
+                #[cfg(windows)]
+                {
+                    b.arg("-NoLogo");
+                    b.arg("-NoProfile");
+                }
+                b
+            }
+        };
+
+        if let Some(dir) = cwd {
+            cb.cwd(dir);
+        }
+
+        let child = pair.slave.spawn_command(cb)?;
+        Ok((pair.master, child))
+    }
+
+    fn ensure_terminal_session(&mut self, terminal_id: ComponentId, rows: u16, cols: u16) {
+        let Some(t) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+
+        // Already started -> resize if needed.
+        if t.pty_in.is_some() && t.pty_master.is_some() {
+            if t.pty_size != Some((rows, cols)) {
+                if let Some(master) = t.pty_master.as_ref() {
+                    if let Ok(mut m) = master.lock() {
+                        let _ = m.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                }
+                t.pty_size = Some((rows, cols));
+
+                if let Some(vt) = t.vt.as_mut() {
+                    *vt = vt100::Parser::new(rows, cols, 2000);
+                    t.rendered_output = vt_screen_to_string(vt);
+                }
+            }
+            return;
+        }
+
+        let cwd = t.cwd.clone().or_else(|| self.inputs.repo.clone());
+        let (tx, rx) = mpsc::channel();
+        t.pending_rx = Some(rx);
+
+        let (master, child) = match Self::spawn_shell_pty(&t.shell, cwd.as_ref(), rows, cols) {
+            Ok(v) => v,
+            Err(e) => {
+                t.rendered_output
+                    .push_str(&format!("Failed to spawn PTY shell: {e}\n"));
+                return;
+            }
+        };
+
+        let master = Arc::new(Mutex::new(master));
+        t.pty_master = Some(master.clone());
+        t.pty_child = Some(Arc::new(Mutex::new(child)));
+        t.pty_size = Some((rows, cols));
+
+        t.vt = Some(vt100::Parser::new(rows, cols, 2000));
+        t.rendered_output.clear();
+
+        // Create reader + writer from the master.
+        let (mut reader, writer) = {
+            let mut m = match master.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let r = match m.try_clone_reader() {
+                Ok(v) => v,
+                Err(e) => {
+                    t.rendered_output
+                        .push_str(&format!("Failed to open PTY reader: {e}\n"));
+                    t.pty_master = None;
+                    t.pty_child = None;
+                    return;
+                }
+            };
+            let w = match m.take_writer() {
+                Ok(v) => v,
+                Err(e) => {
+                    t.rendered_output
+                        .push_str(&format!("Failed to open PTY writer: {e}\n"));
+                    t.pty_master = None;
+                    t.pty_child = None;
+                    return;
+                }
+            };
+            (r, w)
+        };
+
+        t.pty_in = Some(Arc::new(Mutex::new(writer)));
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = tx.send(TerminalEvent::Stdout(s));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(TerminalEvent::Error(format!("pty read error: {e}")));
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     fn run_terminal_command(&mut self, terminal_id: ComponentId, cmd: &str) {
@@ -186,116 +351,45 @@ impl AppState {
             return;
         };
 
-        // Do not allow overlapping runs in the same terminal.
-        if t.running {
-            t.output
-                .push_str("\n[busy] command already running; wait for it to finish.\n");
-            return;
-        }
 
         let cwd = t.cwd.clone().or_else(|| self.inputs.repo.clone());
         let shell = t.shell.clone();
 
-        // Shell-like prompt prefix (best-effort; not a PTY).
-        let prompt = match (&shell, &cwd) {
-            (TerminalShell::PowerShell, Some(dir)) => format!("PS {}> ", dir.display()),
-            (TerminalShell::Cmd, Some(dir)) => format!("{}> ", dir.display()),
-            (_, Some(dir)) => format!("{}$ ", dir.display()),
-            (TerminalShell::PowerShell, None) => "PS > ".to_string(),
-            (TerminalShell::Cmd, None) => "> ".to_string(),
-            (_, None) => "$ ".to_string(),
-        };
-
-        t.output.push_str("\n");
-        t.output.push_str(&prompt);
-        t.output.push_str(cmd);
-        t.output.push_str("\n");
-
-        t.running = true;
-        t.last_status = None;
-
-        let (tx, rx) = mpsc::channel();
-        t.pending_rx = Some(rx);
-
-        // Build a real streaming child process (do NOT use Command::output()).
-        let c = match Self::spawn_shell_streaming(&shell, cmd, cwd.as_ref()) {
-            Ok(c) => c,
-            Err(e) => {
-                t.running = false;
-                t.pending_rx = None;
-                t.child = None;
-                t.output.push_str(&format!("Failed to spawn command: {}\n", e));
+        if let Some(pty_in) = t.pty_in.as_ref() {
+            if let Ok(mut w) = pty_in.lock() {
+                let _ = w.write_all(cmd.as_bytes());
+                let _ = w.write_all(b"\r\n");
+                let _ = w.flush();
                 return;
             }
+        }
+
+        let need_start = t.pty_in.is_none() || t.pty_master.is_none();
+        if need_start {
+        }
+
+        if need_start {
+            drop(t);
+            self.ensure_terminal_session(terminal_id, 30, 120);
+        }
+
+        let Some(t) = self.terminals.get_mut(&terminal_id) else {
+            return;
         };
 
-        let child_arc = Arc::new(Mutex::new(c));
-        t.child = Some(child_arc.clone());
-
-        thread::spawn(move || {
-            // Take stdout/stderr handles by temporarily locking.
-            let (stdout, stderr) = {
-                let mut ch = child_arc.lock().expect("child lock");
-                (ch.stdout.take(), ch.stderr.take())
-            };
-
-            if let Some(out) = stdout {
-                let txo = tx.clone();
-                thread::spawn(move || {
-                    let mut r = BufReader::new(out);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match r.read_line(&mut line) {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let _ = txo.send(TerminalEvent::Stdout(line.clone()));
-                            }
-                            Err(e) => {
-                                let _ = txo.send(TerminalEvent::Error(format!(
-                                    "stdout read error: {}",
-                                    e
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                });
+        if let Some(pty_in) = t.pty_in.as_ref() {
+            if let Ok(mut w) = pty_in.lock() {
+                let _ = w.write_all(cmd.as_bytes());
+                let _ = w.write_all(b"\r\n");
+                let _ = w.flush();
+                return;
             }
+        }
 
-            if let Some(err) = stderr {
-                let txe = tx.clone();
-                thread::spawn(move || {
-                    let mut r = BufReader::new(err);
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match r.read_line(&mut line) {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let _ = txe.send(TerminalEvent::Stderr(line.clone()));
-                            }
-                            Err(e) => {
-                                let _ = txe.send(TerminalEvent::Error(format!(
-                                    "stderr read error: {}",
-                                    e
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Wait for exit.
-            let code = {
-                let mut ch = child_arc.lock().expect("child lock");
-                match ch.wait() {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
-                }
-            };
-            let _ = tx.send(TerminalEvent::Exit(code));
-        });
+        if let Some(t) = self.terminals.get_mut(&terminal_id) {
+            t.rendered_output
+                .push_str("\n[error] PTY session unavailable; command not sent.\n");
+        }
+        return;
     }
 }

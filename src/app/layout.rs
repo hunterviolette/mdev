@@ -181,10 +181,6 @@ pub struct StateSnapshot {
     #[serde(default)]
     pub next_component_id: ComponentId,
 
-    /// Legacy single-canvas layout (kept for backward compatibility)
-    #[serde(default)]
-    pub layout: LayoutConfig,
-
     /// File viewers (per instance)
     #[serde(default)]
     pub file_viewers: HashMap<ComponentId, FileViewerSnapshot>,

@@ -1,9 +1,9 @@
 // src/app/state.rs
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver;
+use std::io::Write;
 
 use egui_extras::syntax_highlighting::CodeTheme;
 use std::collections::BTreeSet;
@@ -48,23 +48,22 @@ pub struct CommandPaletteState {
 pub enum TerminalEvent {
     Stdout(String),
     Stderr(String),
-    Exit(i32),
     Error(String),
 }
 
 pub struct TerminalState {
+    pub vt: Option<vt100::Parser>,
+    pub rendered_output: String,
+
+    pub pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    pub pty_child: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send>>>>,
+    pub pty_size: Option<(u16, u16)>,
+
     pub shell: TerminalShell,
     pub cwd: Option<PathBuf>,
-    pub input: String,
-    pub output: String,
-    pub last_status: Option<i32>,
 
-    /// True while a command is executing on a background thread.
-    pub running: bool,
-    /// Receives incremental output + exit status from the background thread.
     pub pending_rx: Option<Receiver<TerminalEvent>>,
-    /// Handle to the currently running child (for Stop / Ctrl+C best-effort kill).
-    pub child: Option<Arc<Mutex<Child>>>,
+    pub pty_in: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 }
     pub struct ContextExporterState {
     pub save_path: Option<PathBuf>,

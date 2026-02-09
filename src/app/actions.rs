@@ -109,6 +109,10 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
+    DiffViewerRevertPatch {
+        viewer_id: ComponentId,
+        patch: String,
+    },
 
     // ---------------------------
     // File viewer actions
@@ -175,6 +179,20 @@ pub enum Action {
     SetTerminalShell {
         terminal_id: ComponentId,
         shell: TerminalShell,
+    },
+    StartTerminalSession {
+        terminal_id: ComponentId,
+        rows: u16,
+        cols: u16,
+    },
+    ResizeTerminal {
+        terminal_id: ComponentId,
+        rows: u16,
+        cols: u16,
+    },
+    TerminalSendInput {
+        terminal_id: ComponentId,
+        data: Vec<u8>,
     },
 
     // ---------------------------

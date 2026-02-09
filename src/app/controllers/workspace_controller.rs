@@ -135,7 +135,6 @@ impl AppState {
                         canvas_bg_tint: None,
                         theme_dark: true,
                         theme_syntect: "SolarizedDark".to_string(),
-                        layout: crate::app::layout::LayoutConfig::default(),
                         file_viewers: HashMap::new(),
                         active_file_viewer: Some(2),
                         context_exporters: HashMap::new(),
@@ -159,7 +158,7 @@ impl AppState {
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
         viewport_inner_size: Option<[f32; 2]>,
-        pixels_per_point: f32,
+        _pixels_per_point: f32,
         name_opt: Option<&str>,
     ) {
         let name = name_opt.unwrap_or("workspace");
@@ -212,7 +211,7 @@ impl AppState {
             let cw = canvas_size[0].max(1.0);
             let ch = canvas_size[1].max(1.0);
 
-            let mut force_normalize = |layout: &mut crate::app::layout::LayoutConfig| {
+            let force_normalize = |layout: &mut crate::app::layout::LayoutConfig| {
                 for w in layout.windows.values_mut() {
                     w.pos_norm = Some([w.pos[0] / cw, w.pos[1] / ch]);
                     w.size_norm = Some([w.size[0] / cw, w.size[1] / ch]);
@@ -255,8 +254,6 @@ impl AppState {
                 .collect(),
             active_canvas: self.active_canvas,
             next_component_id: self.next_component_id,
-
-            layout: self.active_layout().clone(),
 
             file_viewers,
             active_file_viewer: self.active_file_viewer_id(),
@@ -474,9 +471,6 @@ impl AppState {
 
                 Self::log_layout_windows("layout_only/before_migrate", &layout);
 
-                layout.migrate_legacy_abs_to_normalized(layout_snap.canvas_size);
-                Self::log_layout_windows("layout_only/after_migrate", &layout);
-
                 layout.clamp_to_canvas_and_renormalize(current_canvas_size);
                 Self::log_layout_windows("layout_only/after_clamp", &layout);
 
@@ -558,19 +552,8 @@ impl AppState {
                     }
 
                 } else {
-                    let mut layout = state_snap.layout;
-                    layout.rescale_from(state_snap.canvas_size, current_canvas_size);
-                    layout.ensure_window_layouts();
-                    Self::log_layout_windows("full_state/single_canvas_after_rescale_ensure", &layout);
-
-                    self.canvases = vec![crate::app::state::CanvasState {
-                        name: "Canvas 1".to_string(),
-                        layout,
-                        active_file_viewer: state_snap.active_file_viewer,
-                        active_diff_viewer: None,
-                        layout_epoch: 1,
-                    }];
-                    self.active_canvas = 0;
+                    self.results.error = Some("Workspace preset is missing canvases (legacy single-canvas format is not supported).".into());
+                    return;
                 }
 
                 let max_used_id = self

@@ -13,11 +13,6 @@ use crate::app::state::{AppState, ExecuteLoopMessage, ExecuteLoopMode};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
-        // Backwards compatible: RunOnce behaves like Send
-        Action::ExecuteLoopRunOnce { loop_id } => {
-            send_turn(state, *loop_id);
-            true
-        }
 
         Action::ExecuteLoopSend { loop_id } => {
             send_turn(state, *loop_id);
