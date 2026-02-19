@@ -13,7 +13,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
         Action::OpenFile(path) => {
             state.deferred.open_file = Some(path.clone());
-            state.deferred.open_file_target_viewer = state.active_file_viewer;
+            state.deferred.open_file_target_viewer = state.active_file_viewer_id();
             true
         }
         _ => false,

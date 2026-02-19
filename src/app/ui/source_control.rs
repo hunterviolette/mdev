@@ -604,9 +604,8 @@ pub fn source_control_panel(
 
     ui.separator();
 
-    // --- Last output (single line; click to copy full output) ---
-    ui.horizontal(|ui| {
-        ui.label("Last output:");
+    {
+        let output_row_h = 24.0;
 
         let full = sc
             .last_output
@@ -627,24 +626,46 @@ pub fn source_control_panel(
             display.push('…');
         }
 
-        let resp = ui
-            .add(
-                egui::Label::new(egui::RichText::new(display).monospace())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(full.clone());
+        let (rect, _resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(1.0), output_row_h),
+            egui::Sense::hover(),
+        );
 
-        if resp.clicked() {
-            ui.output_mut(|o| o.copied_text = full.clone());
-        }
+        ui.allocate_ui_at_rect(rect, |ui| {
+            ui.set_min_height(output_row_h);
+            ui.set_max_height(output_row_h);
 
-        if let Some(err) = &sc.last_error {
-            let err_resp = ui.add(
-                egui::Label::new(egui::RichText::new("⚠ Error")).sense(egui::Sense::hover()),
-            );
-            err_resp.on_hover_text(err.clone());
-        }
-    });
+            ui.horizontal(|ui| {
+                ui.label("Last output:");
+
+                egui::ScrollArea::horizontal()
+                    .id_source(("sc_last_output_scroll", sc_id))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let resp = ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(display).monospace())
+                                    .wrap(false)
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(full.clone());
+
+                        if resp.clicked() {
+                            ui.output_mut(|o| o.copied_text = full.clone());
+                        }
+                    });
+
+                if let Some(err) = &sc.last_error {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new("⚠ Error"))
+                            .wrap(false)
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(err.clone());
+                }
+            });
+        });
+    }
 
     actions
 }

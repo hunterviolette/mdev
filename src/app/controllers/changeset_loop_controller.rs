@@ -13,11 +13,6 @@ use crate::app::state::{AppState, ExecuteLoopMessage, ExecuteLoopMode};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
-        // Backwards compatible: RunOnce behaves like Send
-        Action::ExecuteLoopRunOnce { loop_id } => {
-            send_turn(state, *loop_id);
-            true
-        }
 
         Action::ExecuteLoopSend { loop_id } => {
             send_turn(state, *loop_id);
@@ -248,8 +243,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     };
 
     let mode_header = match mode {
-        ExecuteLoopMode::Conversation => "MODE: conversation",
-        ExecuteLoopMode::ChangeSet => "MODE: changeset",
+        ExecuteLoopMode::Conversation => "Conversation mode: please discuss coding design and do not provide any changeset payloads",
+        ExecuteLoopMode::ChangeSet => "Changeset mode: please provide only strict JSON changeset format and do not waste any token's inserting comments into the code",
     };
 
     let user_payload = format!("{}\n\n{}", mode_header, draft.trim());

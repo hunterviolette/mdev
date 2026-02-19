@@ -7,7 +7,7 @@ use super::controllers::{
     changeset_loop_controller,
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
     file_viewer_controller, layout_controller, palette_controller, source_control_controller,
-    terminal_controller, tree_controller, canvas_tint, workspace_controller,
+    terminal_controller, tree_controller, personalization, workspace_controller,
     task_controller,
 };
 
@@ -113,26 +113,14 @@ impl AppState {
         // Do NOT hydrate ExecuteLoopState here (on-demand view/controller).
         self.execute_loop_store = parsed.execute_loops.clone();
 
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Hydrate tasks (existing component ids only; layout is workspace-owned)
         for (task_id, ts) in parsed.tasks.iter() {
-            if !self
-                .layout
-                .components
-                .iter()
-                .any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id)
-            {
+            let exists = self
+                .all_layouts()
+                .any(|l| l.components.iter().any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id));
+            if !exists {
                 continue;
             }
 
-            // Back-compat upgrade: older task store files won't have timestamps (default=0).
-            let created_at_ms = if ts.created_at_ms == 0 { now_ms } else { ts.created_at_ms };
-            let updated_at_ms = if ts.updated_at_ms == 0 { now_ms } else { ts.updated_at_ms };
 
             self.tasks.insert(
                 *task_id,
@@ -140,11 +128,11 @@ impl AppState {
                     bound_execute_loop: ts.bound_execute_loop,
                     paused: ts.paused,
                     execute_loop_ids: ts.execute_loop_ids.clone(),
-                    created_at_ms,
-                    updated_at_ms,
+                    created_at_ms: ts.created_at_ms,
+                    updated_at_ms: ts.updated_at_ms,
                     conversations: ts.conversations.clone(),
                     active_conversation: ts.active_conversation,
-                    next_conversation_id: if ts.next_conversation_id == 0 { 1 } else { ts.next_conversation_id },
+                    next_conversation_id: ts.next_conversation_id,
                 },
             );
 
@@ -296,7 +284,7 @@ impl AppState {
                     .map(|s| s.created_at_ms)
                     .unwrap_or(0);
 
-                // If missing (legacy/older), initialize to now_ms for this conversation.
+                // Initialize created_at_ms once per conversation.
                 let c_created_at_ms = if prev_created != 0 { prev_created } else { now_ms };
 
                 t.conversations.insert(
@@ -328,46 +316,50 @@ impl AppState {
         }
     }
 
-    /// Ensure the ExecuteLoop component/window exists in the layout and is open.
     pub fn ensure_execute_loop_component_open(&mut self, loop_id: crate::app::actions::ComponentId) {
         use crate::app::actions::ComponentKind;
         use crate::app::layout::{ComponentInstance, WindowLayout};
 
-        let exists = self
-            .layout
-            .components
-            .iter()
-            .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
-
-        if !exists {
-            self.layout.merge_with_defaults();
-            self.layout.components.push(ComponentInstance {
-                id: loop_id,
-                kind: ComponentKind::ExecuteLoop,
-                title: format!("Execute Loop {}", loop_id),
-            });
-            self.layout.windows.insert(
-                loop_id,
-                WindowLayout {
-                    open: true,
-                    locked: false,
-                    pos: [150.0, 150.0],
-                    size: [860.0, 680.0],
-                },
-            );
-            self.layout_epoch = self.layout_epoch.wrapping_add(1);
+        for (idx, canvas) in self.canvases.iter_mut().enumerate() {
+            let exists = canvas
+                .layout
+                .components
+                .iter()
+                .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
+            if exists {
+                if let Some(w) = canvas.layout.get_window_mut(loop_id) {
+                    w.open = true;
+                }
+                self.active_canvas = idx;
+                return;
+            }
         }
 
-        if let Some(w) = self.layout.get_window_mut(loop_id) {
-            w.open = true;
-        }
+        self.active_layout_mut().merge_with_defaults();
+        self.active_layout_mut().components.push(ComponentInstance {
+            id: loop_id,
+            kind: ComponentKind::ExecuteLoop,
+            title: format!("Execute Loop {}", loop_id),
+        });
+        self.active_layout_mut().windows.insert(
+            loop_id,
+            WindowLayout {
+                open: true,
+                locked: false,
+                pos_norm: None,
+                size_norm: None,
+                pos: [150.0, 150.0],
+                size: [860.0, 680.0],
+            },
+        );
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
     pub fn apply_action(&mut self, action: Action) {
         // Keep ordering stable (global -> domain -> layout/workspace)
         if palette_controller::handle(self, &action) {
             return;
         }
-        if canvas_tint::handle(self, &action) {
+        if personalization::handle(self, &action) {
             return;
         }
         if analysis_controller::handle(self, &action) {

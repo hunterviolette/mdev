@@ -118,6 +118,221 @@ fn filtered_rows(full: &[DiffRow], only_changes: bool, ctx: usize) -> Vec<DiffRo
     }
 }
 
+fn filtered_rows_with_idx(full: &[DiffRow], only_changes: bool, ctx: usize) -> Vec<(Option<usize>, DiffRow)> {
+    if !only_changes {
+        return full.iter().cloned().enumerate().map(|(i, r)| (Some(i), r)).collect();
+    }
+    if full.is_empty() {
+        return vec![];
+    }
+
+    let mut keep = vec![false; full.len()];
+    for (idx, r) in full.iter().enumerate() {
+        if r.kind != DiffRowKind::Equal {
+            let start = idx.saturating_sub(ctx);
+            let end = (idx + ctx).min(full.len() - 1);
+            for k in start..=end {
+                keep[k] = true;
+            }
+        }
+    }
+
+    let mut out: Vec<(Option<usize>, DiffRow)> = Vec::new();
+    let mut in_gap = false;
+
+    for (idx, r) in full.iter().enumerate() {
+        if keep[idx] {
+            in_gap = false;
+            out.push((Some(idx), r.clone()));
+        } else if !in_gap {
+            if !out.is_empty() {
+                out.push((
+                    None,
+                    DiffRow {
+                        left_no: None,
+                        right_no: None,
+                        left: Some("…".to_string()),
+                        right: Some("…".to_string()),
+                        kind: DiffRowKind::Equal,
+                    },
+                ));
+            }
+            in_gap = true;
+        }
+    }
+
+    let any_real = out.iter().any(|(_, r)| !is_gap_row(r));
+    if any_real {
+        out
+    } else {
+        vec![]
+    }
+}
+
+fn expand_change_block(full: &[DiffRow], idx: usize) -> (usize, usize) {
+    if full.is_empty() {
+        return (0, 0);
+    }
+    let mut a = idx;
+    let mut b = idx;
+
+    while a > 0 && full[a - 1].kind != DiffRowKind::Equal {
+        a -= 1;
+    }
+    while b + 1 < full.len() && full[b + 1].kind != DiffRowKind::Equal {
+        b += 1;
+    }
+    (a, b)
+}
+
+fn counts_for_hunk(rows: &[DiffRow]) -> (usize, usize) {
+    let mut old_n = 0usize;
+    let mut new_n = 0usize;
+    for r in rows {
+        match r.kind {
+            DiffRowKind::Equal => {
+                if r.left_no.is_some() { old_n += 1; }
+                if r.right_no.is_some() { new_n += 1; }
+            }
+            DiffRowKind::Add => {
+                if r.right_no.is_some() { new_n += 1; }
+            }
+            DiffRowKind::Delete => {
+                if r.left_no.is_some() { old_n += 1; }
+            }
+            DiffRowKind::Change => {
+                if r.left_no.is_some() { old_n += 1; }
+                if r.right_no.is_some() { new_n += 1; }
+            }
+        }
+    }
+    (old_n, new_n)
+}
+
+fn build_unified_patch_for_single_row(path: &str, row: &DiffRow) -> Option<String> {
+    if row.kind == DiffRowKind::Equal {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{0} b/{0}\n", path));
+    out.push_str(&format!("--- a/{0}\n", path));
+    out.push_str(&format!("+++ b/{0}\n", path));
+
+    match row.kind {
+        DiffRowKind::Add => {
+            // Added in worktree: reverse-apply should remove this line.
+            let n = row.right_no.unwrap_or(1).max(1);
+            out.push_str(&format!("@@ -{},0 +{},1 @@\n", n, n));
+            out.push_str("+");
+            out.push_str(row.right.as_deref().unwrap_or(""));
+            out.push('\n');
+        }
+        DiffRowKind::Delete => {
+            // Deleted in worktree: reverse-apply should re-add this line.
+            let n = row.left_no.unwrap_or(1).max(1);
+            out.push_str(&format!("@@ -{},1 +{},0 @@\n", n, n));
+            out.push_str("-");
+            out.push_str(row.left.as_deref().unwrap_or(""));
+            out.push('\n');
+        }
+        DiffRowKind::Change => {
+            // Modified line: reverse-apply should swap it back.
+            let old_n = row.left_no.unwrap_or(1).max(1);
+            let new_n = row.right_no.unwrap_or(1).max(1);
+            out.push_str(&format!("@@ -{},1 +{},1 @@\n", old_n, new_n));
+            out.push_str("-");
+            out.push_str(row.left.as_deref().unwrap_or(""));
+            out.push('\n');
+            out.push_str("+");
+            out.push_str(row.right.as_deref().unwrap_or(""));
+            out.push('\n');
+        }
+        DiffRowKind::Equal => return None,
+    }
+
+    Some(out)
+}
+
+fn build_unified_patch_for_range(path: &str, full: &[DiffRow], start: usize, end: usize, ctx: usize) -> Option<String> {
+    if full.is_empty() || start > end || end >= full.len() {
+        return None;
+    }
+
+    let mut left_ctx = 0usize;
+    let mut a = start;
+    while a > 0 && left_ctx < ctx {
+        if full[a - 1].kind == DiffRowKind::Equal {
+            left_ctx += 1;
+            a -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut right_ctx = 0usize;
+    let mut b = end;
+    while b + 1 < full.len() && right_ctx < ctx {
+        if full[b + 1].kind == DiffRowKind::Equal {
+            right_ctx += 1;
+            b += 1;
+        } else {
+            break;
+        }
+    }
+
+    let window = &full[a..=b];
+
+    let old_start = window.iter().find_map(|r| r.left_no).unwrap_or(0);
+    let new_start = window.iter().find_map(|r| r.right_no).unwrap_or(0);
+
+    let (old_count, new_count) = counts_for_hunk(window);
+
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{0} b/{0}\n", path));
+    out.push_str(&format!("--- a/{0}\n", path));
+    out.push_str(&format!("+++ b/{0}\n", path));
+    out.push_str(&format!("@@ -{},{} +{},{} @@\n", old_start, old_count, new_start, new_count));
+
+    for r in window {
+        match r.kind {
+            DiffRowKind::Equal => {
+                let t = r.right.as_deref().or(r.left.as_deref()).unwrap_or("");
+                out.push_str(" ");
+                out.push_str(t);
+                out.push('\n');
+            }
+            DiffRowKind::Add => {
+                let t = r.right.as_deref().unwrap_or("");
+                out.push_str("+");
+                out.push_str(t);
+                out.push('\n');
+            }
+            DiffRowKind::Delete => {
+                let t = r.left.as_deref().unwrap_or("");
+                out.push_str("-");
+                out.push_str(t);
+                out.push('\n');
+            }
+            DiffRowKind::Change => {
+                let lt = r.left.as_deref().unwrap_or("");
+                let rt = r.right.as_deref().unwrap_or("");
+                out.push_str("-");
+                out.push_str(lt);
+                out.push('\n');
+                out.push_str("+");
+                out.push_str(rt);
+                out.push('\n');
+            }
+        }
+    }
+
+    Some(out)
+}
+
+fn ctrl_shift(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.modifiers.ctrl && i.modifiers.shift)
+}
 pub fn diff_viewer_panel(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -206,7 +421,7 @@ pub fn diff_viewer_panel(
                 .max(16.0)
                 + 4.0;
 
-            let rows_to_show = filtered_rows(&v.rows, v.only_changes, v.context_lines);
+            let rows_to_show = filtered_rows_with_idx(&v.rows, v.only_changes, v.context_lines);
 
             let cw = monospace_char_width(ui);
             let ln_prefix_chars: f32 = 5.0; // "{:>4} "
@@ -222,8 +437,9 @@ pub fn diff_viewer_panel(
             let weak = ui.visuals().weak_text_color();
             let fallback = ui.visuals().text_color();
 
-            for row in rows_to_show.iter() {
+            for (full_idx, row) in rows_to_show.iter() {
                 let is_gap = is_gap_row(row);
+                let can_revert = !is_gap && row.kind != DiffRowKind::Equal && full_idx.is_some() && v.path.is_some();
 
                 ui.horizontal(|ui| {
                     let row_clip = ui.clip_rect();
@@ -291,6 +507,57 @@ pub fn diff_viewer_panel(
                     ui.add_space(gutter);
 
                     // RIGHT
+
+                    if can_revert {
+                        let icon_w = gutter.max(18.0);
+                        let center_x = rect_l.max.x + (gutter * 0.5);
+                        let icon_rect = egui::Rect::from_center_size(
+                            egui::pos2(center_x, rect_l.center().y),
+                            egui::vec2(icon_w, row_h),
+                        );
+
+                        let resp = ui
+                            .allocate_rect(icon_rect, egui::Sense::click())
+                            .on_hover_text("Click: revert this line\nCtrl+Shift+Click: revert contiguous block");
+
+                        let hovered = resp.hovered();
+                        let col = if hovered { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+
+                        // Draw bigger icon (do not rely on monospace default size).
+                        let font = egui::FontId::monospace((row_h * 0.85).clamp(14.0, 22.0));
+                        ui.painter().text(
+                            icon_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "↶",
+                            font,
+                            col,
+                        );
+
+                        if resp.clicked() {
+                            let Some(path) = v.path.clone() else { return; };
+                            let Some(idx0) = *full_idx else { return; };
+
+                            if ctrl_shift(ui) {
+                                let (a, b) = expand_change_block(&v.rows, idx0);
+                                if let Some(patch) = build_unified_patch_for_range(&path, &v.rows, a, b, 3) {
+                                    actions.push(Action::DiffViewerRevertPatch { viewer_id, patch });
+                                    actions.push(Action::RefreshDiffViewer { viewer_id });
+                                    for sc_id in state.source_controls.keys().copied() {
+                                        actions.push(Action::RefreshSourceControl { sc_id });
+                                    }
+                                }
+                            } else {
+                                if let Some(patch) = build_unified_patch_for_single_row(&path, &v.rows[idx0]) {
+                                    actions.push(Action::DiffViewerRevertPatch { viewer_id, patch });
+                                    actions.push(Action::RefreshDiffViewer { viewer_id });
+                                    for sc_id in state.source_controls.keys().copied() {
+                                        actions.push(Action::RefreshSourceControl { sc_id });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let (rect_r, _) = ui.allocate_exact_size(egui::vec2(col_w, row_h), egui::Sense::hover());
                     let clip_r = rect_r.intersect(row_clip);
                     let painter_r = ui.painter().with_clip_rect(clip_r);

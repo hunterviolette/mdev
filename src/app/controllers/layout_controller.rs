@@ -1,5 +1,5 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind};
-use crate::app::layout::{ComponentInstance, LayoutConfig, WindowLayout};
+use crate::app::layout::{ComponentInstance, WindowLayout};
 use crate::app::state::{AppState, ChangeSetApplierState, ContextExportMode, ContextExporterState};
 use crate::app::state::ExecuteLoopState;
 
@@ -10,7 +10,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::FocusFileViewer(id) => {
-            state.active_file_viewer = Some(*id);
+            state.set_active_file_viewer_id(Some(*id));
             true
         }
         Action::CloseComponent(id) => {
@@ -18,30 +18,45 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::ToggleLock(id) => {
-            if let Some(w) = state.layout.get_window_mut(*id) {
+            if let Some(w) = state.active_layout_mut().get_window_mut(*id) {
                 w.locked = !w.locked;
             }
             true
         }
         Action::ResetLayout => {
-            state.layout = LayoutConfig::default();
-            state.layout.merge_with_defaults();
-            state.layout_epoch = state.layout_epoch.wrapping_add(1);
-
-            // Ensure default FV exists
-            state
-                .file_viewers
-                .entry(2)
+            let (layout, fv_id) = state.remap_default_layout_ids();
+            state.active_canvas_state_mut().layout = layout;
+            state.file_viewers
+                .entry(fv_id)
                 .or_insert_with(crate::app::state::FileViewerState::new);
-            state.active_file_viewer = Some(2);
+            state.set_active_file_viewer_id(Some(fv_id));
+            state.set_active_diff_viewer_id(None);
 
-            // Ephemeral components rebuilt from layout
             state.rebuild_terminals_from_layout();
             state.rebuild_context_exporters_from_layout();
             state.rebuild_changeset_appliers_from_layout();
             state.rebuild_source_controls_from_layout();
             state.rebuild_diff_viewers_from_layout();
             state.rebuild_execute_loops_from_layout();
+            state.rebuild_tasks_from_layout();
+
+            state.layout_epoch = state.layout_epoch.wrapping_add(1);
+            true
+        }
+        Action::CanvasSelect { index } => {
+            state.canvas_select(*index);
+            true
+        }
+        Action::CanvasAdd => {
+            state.canvas_add();
+            true
+        }
+        Action::CanvasRename { index, name } => {
+            state.canvas_rename(*index, name.clone());
+            true
+        }
+        Action::CanvasDelete { index } => {
+            state.canvas_delete(*index);
             true
         }
         _ => false,
@@ -49,23 +64,75 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
+    pub fn remap_default_layout_ids(&mut self) -> (crate::app::layout::LayoutConfig, ComponentId) {
+        let mut layout = crate::app::layout::LayoutConfig::default();
+        layout.merge_with_defaults();
+
+        let mut map = std::collections::HashMap::<ComponentId, ComponentId>::new();
+        for c in layout.components.iter() {
+            map.insert(c.id, self.alloc_component_id());
+        }
+
+        for c in layout.components.iter_mut() {
+            if let Some(nid) = map.get(&c.id).cloned() {
+                c.id = nid;
+            }
+        }
+
+        let mut windows = std::collections::HashMap::new();
+        for (id, w) in layout.windows.iter() {
+            if let Some(nid) = map.get(id).cloned() {
+                windows.insert(nid, w.clone());
+            }
+        }
+        layout.windows = windows;
+
+        let fv_id = layout
+            .components
+            .iter()
+            .find(|c| c.kind == ComponentKind::FileViewer)
+            .map(|c| c.id)
+            .unwrap_or_else(|| {
+                let id = self.alloc_component_id();
+                layout.components.push(ComponentInstance {
+                    id,
+                    kind: ComponentKind::FileViewer,
+                    title: "File Viewer".to_string(),
+                });
+                layout.windows.insert(
+                    id,
+                    WindowLayout {
+                        open: true,
+                        locked: false,
+                        pos_norm: None,
+                        size_norm: None,
+                        pos: [60.0, 60.0],
+                        size: [760.0, 700.0],
+                    },
+                );
+                id
+            });
+
+        (layout, fv_id)
+    }
+
     fn add_component(&mut self, kind: ComponentKind) {
         match kind {
             ComponentKind::FileViewer => self.new_file_viewer(),
             ComponentKind::Terminal => self.new_terminal(),
             ComponentKind::Task => {
                 // Minimal: create a window/component like others (actual Task behavior handled elsewhere)
-                self.layout.merge_with_defaults();
-
-                let id = self.layout.next_free_id();
+                let id = self.alloc_component_id();
                 let title = format!("Task {}", id);
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
-                self.layout.windows.insert(
+                self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [200.0, 200.0],
                         size: [520.0, 260.0],
                     },
@@ -78,43 +145,45 @@ impl AppState {
             }
 
             ComponentKind::DiffViewer => {
-                self.layout.merge_with_defaults();
-
-                let id = self.layout.next_free_id();
+                        let id = self.alloc_component_id();
                 let title = format!("Diff Viewer {}", id);
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
 
-                self.layout.windows.insert(
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [180.0, 180.0],
                         size: [980.0, 720.0],
                     },
                 );
 
                 self.diff_viewers.insert(id, crate::app::state::DiffViewerState::new());
-                self.active_diff_viewer = Some(id);
+                self.set_active_diff_viewer_id(Some(id));
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
 
             ComponentKind::ContextExporter => {
-                self.layout.merge_with_defaults();
+                self.active_layout_mut().merge_with_defaults();
 
-                let id = self.layout.next_free_id();
+                let id = self.alloc_component_id();
                 let title = format!("Context Exporter {}", id);
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
 
-                self.layout.windows.insert(
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [120.0, 120.0],
                         size: [560.0, 260.0],
                     },
@@ -135,18 +204,20 @@ impl AppState {
             }
 
             ComponentKind::SourceControl => {
-                self.layout.merge_with_defaults();
+                self.active_layout_mut().merge_with_defaults();
 
-                let id = self.layout.next_free_id();
+                let id = self.alloc_component_id();
                 let title = format!("Source Control {}", id);
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
 
-                self.layout.windows.insert(
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [160.0, 160.0],
                         size: [760.0, 620.0],
                     },
@@ -172,18 +243,20 @@ impl AppState {
             }
 
             ComponentKind::ChangeSetApplier => {
-                self.layout.merge_with_defaults();
+                self.active_layout_mut().merge_with_defaults();
 
-                let id = self.layout.next_free_id();
+                let id = self.alloc_component_id();
                 let title = format!("ChangeSet Applier {}", id);
 
-                self.layout.components.push(ComponentInstance { id, kind, title });
+                self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
 
-                self.layout.windows.insert(
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [140.0, 140.0],
                         size: [640.0, 520.0],
                     },
@@ -206,9 +279,9 @@ impl AppState {
             }
 
             ComponentKind::Tree | ComponentKind::Summary => {
-                self.layout.merge_with_defaults();
+                self.active_layout_mut().merge_with_defaults();
 
-                let id = self.layout.next_free_id();
+                let id = self.alloc_component_id();
                 let title = match kind {
                     ComponentKind::Tree => format!("Tree {}", id),
                     ComponentKind::Summary => format!("Summary {}", id),
@@ -222,15 +295,17 @@ impl AppState {
                     | ComponentKind::DiffViewer => unreachable!(),
                 };
 
-                self.layout
+                self.active_layout_mut()
                     .components
                     .push(ComponentInstance { id, kind, title });
 
-                self.layout.windows.insert(
+                self.active_layout_mut().windows.insert(
                     id,
                     WindowLayout {
                         open: true,
                         locked: false,
+                        pos_norm: None,
+                        size_norm: None,
                         pos: [80.0, 80.0],
                         size: [520.0, 700.0],
                     },
@@ -243,22 +318,24 @@ impl AppState {
 
     /// Create a new Execute Loop component (chat thread) and return its id.
     pub fn new_execute_loop_component(&mut self) -> ComponentId {
-        self.layout.merge_with_defaults();
+        self.active_layout_mut().merge_with_defaults();
 
-        let id = self.layout.next_free_id();
+        let id = self.alloc_component_id();
         let title = format!("Execute Loop {}", id);
 
-        self.layout.components.push(ComponentInstance {
+        self.active_layout_mut().components.push(ComponentInstance {
             id,
             kind: ComponentKind::ExecuteLoop,
             title,
         });
 
-        self.layout.windows.insert(
+        self.active_layout_mut().windows.insert(
             id,
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [150.0, 150.0],
                 size: [860.0, 680.0],
             },
@@ -271,29 +348,31 @@ impl AppState {
     }
 
     fn new_file_viewer(&mut self) {
-        self.layout.merge_with_defaults();
+        self.active_layout_mut().merge_with_defaults();
 
-        let id = self.layout.next_free_id();
+        let id = self.alloc_component_id();
 
         let fv_count = self
-            .layout
+            .active_layout()
             .components
             .iter()
             .filter(|c| c.kind == ComponentKind::FileViewer)
             .count();
         let title = format!("File Viewer {}", fv_count + 1);
 
-        self.layout.components.push(ComponentInstance {
+        self.active_layout_mut().components.push(ComponentInstance {
             id,
             kind: ComponentKind::FileViewer,
             title,
         });
 
-        self.layout.windows.insert(
+        self.active_layout_mut().windows.insert(
             id,
             WindowLayout {
                 open: true,
                 locked: false,
+                pos_norm: None,
+                size_norm: None,
                 pos: [60.0, 60.0],
                 size: [760.0, 700.0],
             },
@@ -302,12 +381,12 @@ impl AppState {
         self.file_viewers
             .insert(id, crate::app::state::FileViewerState::new());
 
-        self.active_file_viewer = Some(id);
+        self.set_active_file_viewer_id(Some(id));
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
 
     fn close_component(&mut self, id: ComponentId) {
-        if let Some(w) = self.layout.get_window_mut(id) {
+        if let Some(w) = self.active_layout_mut().get_window_mut(id) {
             w.open = false;
         }
 
@@ -325,13 +404,18 @@ impl AppState {
         self.source_controls.remove(&id);
         self.diff_viewers.remove(&id);
 
-        if self.active_file_viewer == Some(id) {
-            self.active_file_viewer = self
-                .layout
-                .components
-                .iter()
-                .find(|c| c.kind == ComponentKind::FileViewer && c.id != id)
-                .map(|c| c.id);
+        for canvas in self.canvases.iter_mut() {
+            if canvas.active_file_viewer == Some(id) {
+                canvas.active_file_viewer = canvas
+                    .layout
+                    .components
+                    .iter()
+                    .find(|c| c.kind == ComponentKind::FileViewer && c.id != id)
+                    .map(|c| c.id);
+            }
+            if canvas.active_diff_viewer == Some(id) {
+                canvas.active_diff_viewer = None;
+            }
         }
     }
 }

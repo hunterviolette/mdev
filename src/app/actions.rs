@@ -109,6 +109,10 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
+    DiffViewerRevertPatch {
+        viewer_id: ComponentId,
+        patch: String,
+    },
 
     // ---------------------------
     // File viewer actions
@@ -169,9 +173,26 @@ pub enum Action {
     ClearTerminal {
         terminal_id: ComponentId,
     },
+    InterruptTerminal {
+        terminal_id: ComponentId,
+    },
     SetTerminalShell {
         terminal_id: ComponentId,
         shell: TerminalShell,
+    },
+    StartTerminalSession {
+        terminal_id: ComponentId,
+        rows: u16,
+        cols: u16,
+    },
+    ResizeTerminal {
+        terminal_id: ComponentId,
+        rows: u16,
+        cols: u16,
+    },
+    TerminalSendInput {
+        terminal_id: ComponentId,
+        data: Vec<u8>,
     },
 
     // ---------------------------
@@ -284,10 +305,19 @@ pub enum Action {
 
     ResetLayout,
 
+    // ---------------------------
+    // Canvases
+    // ---------------------------
+    CanvasSelect { index: usize },
+    CanvasAdd,
+    CanvasRename { index: usize, name: String },
+    CanvasDelete { index: usize },
+
     SaveWorkspace {
         canvas_size: [f32; 2],
         viewport_outer_pos: Option<[f32; 2]>,
         viewport_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
     },
     LoadWorkspace,
 

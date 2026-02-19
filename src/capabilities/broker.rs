@@ -87,6 +87,12 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
+            CapabilityRequest::ApplyGitPatchReverse { repo, patch } => {
+                git::apply_git_patch_reverse(&repo, &patch)
+                    .with_context(|| "apply_git_patch_reverse failed")?;
+                Ok(CapabilityResponse::Unit)
+            }
+
             CapabilityRequest::FileHistory { repo, path, max } => {
                 let bytes = git::file_history(&repo, &path, max)
                     .with_context(|| format!("file_history failed for {path}"))?;

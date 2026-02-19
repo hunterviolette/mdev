@@ -85,6 +85,11 @@ pub enum CapabilityRequest {
         patch: String,
     },
 
+    ApplyGitPatchReverse {
+        repo: PathBuf,
+        patch: String,
+    },
+
     FileHistory {
         repo: PathBuf,
         path: String,

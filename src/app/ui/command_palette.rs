@@ -28,10 +28,13 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
 
 fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
     if segments.is_empty() {
-        return vec!["workspace".into(), "component".into(), "ui".into()];
+        return vec!["workspace".into(), "component".into(), "shortcut".into(), "ui".into()];
     }
 
-    match segments[0].as_str() {
+    match match segments[0].as_str() {
+            "shortcuts" => "shortcut",
+            other => other,
+        } {
         "workspace" => {
             let mut names = state.list_workspaces();
             names.sort();
@@ -120,17 +123,105 @@ fn suggestions_for(state: &AppState, segments: &[String]) -> Vec<String> {
             }
         }
 
-        "ui" => {
-            // UI commands
+        "shortcut" => {
             if segments.len() == 1 {
-                vec!["ui/canvas_tint".into()]
+                vec![
+                    "shortcut/repo/select".into(),
+                    "shortcut/branch/select".into(),
+                    "shortcut/canvas/select".into(),
+                    "shortcut/canvas/add".into(),
+                    "shortcut/canvas/rename".into(),
+                    "shortcut/canvas/delete".into(),
+                ]
             } else {
-                // Only suggest existing commands (no legacy /clear)
-                vec!["ui/canvas_tint".into()]
+                match segments.get(1).map(|s| s.as_str()).unwrap_or("") {
+                    "branch" => {
+                        if segments.len() == 2 {
+                            return state
+                                .inputs
+                                .git_ref_options
+                                .iter()
+                                .map(|r| format!("shortcut/branch/select/{r}"))
+                                .collect();
+                        }
+                        vec![]
+                    }
+                    "canvas" => {
+                        if segments.len() == 2 {
+                            return vec![
+                                "shortcut/canvas/select".into(),
+                                "shortcut/canvas/add".into(),
+                                "shortcut/canvas/rename".into(),
+                                "shortcut/canvas/delete".into(),
+                            ];
+                        }
+
+                        if segments.len() >= 3 {
+                            match segments[2].as_str() {
+                                "select" | "delete" => {
+                                    let mut out = Vec::new();
+                                    for (i, c) in state.canvases.iter().enumerate() {
+                                        let hint = match i {
+                                            0 => " (Ctrl+1)",
+                                            1 => " (Ctrl+2)",
+                                            2 => " (Ctrl+3)",
+                                            3 => " (Ctrl+4)",
+                                            4 => " (Ctrl+5)",
+                                            5 => " (Ctrl+6)",
+                                            6 => " (Ctrl+7)",
+                                            7 => " (Ctrl+8)",
+                                            8 => " (Ctrl+9)",
+                                            9 => " (Ctrl+0)",
+                                            _ => "",
+                                        };
+                                        out.push(format!("shortcut/canvas/{}/{:02}-{}{}", segments[2], i, c.name, hint));
+                                    }
+                                    if out.is_empty() {
+                                        out.push(format!("shortcut/canvas/{}", segments[2]));
+                                    }
+                                    out
+                                }
+                                "rename" => {
+                                    let mut out = Vec::new();
+                                    for (i, c) in state.canvases.iter().enumerate() {
+                                        let hint = match i {
+                                            0 => " (Ctrl+1)",
+                                            1 => " (Ctrl+2)",
+                                            2 => " (Ctrl+3)",
+                                            3 => " (Ctrl+4)",
+                                            4 => " (Ctrl+5)",
+                                            5 => " (Ctrl+6)",
+                                            6 => " (Ctrl+7)",
+                                            7 => " (Ctrl+8)",
+                                            8 => " (Ctrl+9)",
+                                            9 => " (Ctrl+0)",
+                                            _ => "",
+                                        };
+                                        out.push(format!("shortcut/canvas/rename/{:02}-{}{}", i, c.name, hint));
+                                    }
+                                    if out.is_empty() {
+                                        out.push("shortcut/canvas/rename".into());
+                                    }
+                                    out
+                                }
+            
+_ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        }
+                    }
+                    "repo" => vec!["shortcut/repo/select".into()],
+                    _ => vec![],
+                }
             }
         }
 
-        _ => vec!["workspace".into(), "component".into(), "ui".into()],
+        "ui" => {
+            vec!["ui/personalization".into()]
+        }
+
+        _ => vec!["workspace".into(), "component".into(), "shortcut".into(), "ui".into()],
     }
 }
 
@@ -139,7 +230,10 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
         return (None, None);
     }
 
-    match segments[0].as_str() {
+    match match segments[0].as_str() {
+        "shortcuts" => "shortcut",
+        other => other,
+    } {
         "component" => {
             if segments.len() < 2 {
                 return (None, None);
@@ -151,6 +245,74 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
             (Some(Action::AddComponent { kind }), None)
         }
 
+        "shortcut" => {
+            if segments.len() < 2 {
+                return (None, None);
+            }
+
+            match segments[1].as_str() {
+                "repo" => (Some(Action::PickRepo), None),
+
+                "branch" => {
+                    if segments.len() >= 4 && segments[2].as_str() == "select" {
+                        let r = segments[3].clone();
+                        return (Some(Action::SetGitRef(r)), None);
+                    }
+                    (None, None)
+                }
+
+                "canvas" => {
+                    if segments.len() < 3 {
+                        return (None, None);
+                    }
+                    match segments[2].as_str() {
+                        "add" => (Some(Action::CanvasAdd), None),
+                        "select" => {
+                            if segments.len() >= 4 {
+                                let raw = segments[3].clone();
+                                let idx = raw.split('-').next().unwrap_or("").parse::<usize>().ok();
+                                if let Some(index) = idx {
+                                    return (Some(Action::CanvasSelect { index }), None);
+                                }
+                            }
+                            (None, None)
+                        }
+                        "delete" => {
+                            if segments.len() >= 4 {
+                                let raw = segments[3].clone();
+                                let idx = raw.split('-').next().unwrap_or("").parse::<usize>().ok();
+                                if let Some(index) = idx {
+                                    return (Some(Action::CanvasDelete { index }), None);
+                                }
+                            }
+                            (None, None)
+                        }
+                        "rename" => {
+                            if segments.len() >= 4 {
+                                let raw = segments[3].clone();
+                                let idx = raw.split('-').next().unwrap_or("").parse::<usize>().ok();
+                                if let Some(index) = idx {
+                                    let name = segments.get(4).cloned().unwrap_or_else(|| "".to_string());
+                                    return (Some(Action::CanvasRename { index, name }), None);
+                                }
+                            }
+                            if segments.len() >= 5 {
+                                let index = segments[3].parse::<usize>().ok();
+                                if let Some(index) = index {
+                                    let name = segments[4..].join("/");
+                                    return (Some(Action::CanvasRename { index, name }), None);
+                                }
+                            }
+                            (None, None)
+                        }
+                        _ => (None, None),
+                    }
+                }
+
+                _ => (None, None),
+            }
+        }
+
         "workspace" => {
             if segments.len() < 2 {
                 return (None, None);
@@ -160,9 +322,10 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
                     let name = segments.get(2).cloned();
                     (
                         Some(Action::SaveWorkspace {
-                            canvas_size: [1.0, 1.0], // patched at call site
+                            canvas_size: [1.0, 1.0],
                             viewport_outer_pos: None,
                             viewport_inner_size: None,
+                            pixels_per_point: 1.0,
                         }),
                         name,
                     )
@@ -180,9 +343,7 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
                 return (None, None);
             }
             match segments[1].as_str() {
-                "canvas_tint" => {
-                    (Some(Action::OpenCanvasTintPopup), None)
-                }
+                "personalization" => (Some(Action::OpenCanvasTintPopup), None),
                 _ => (None, None),
             }
         }
@@ -253,8 +414,15 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "component/task".into(),
         "component/diff_viewer".into(),
 
+        "shortcut/repo/select".into(),
+        "shortcut/branch/select".into(),
+        "shortcut/canvas/select".into(),
+        "shortcut/canvas/add".into(),
+        "shortcut/canvas/rename".into(),
+        "shortcut/canvas/delete".into(),
+
         // UI preferences
-        "ui/canvas_tint".into(),
+        "ui/personalization".into(),
     ];
 
     let mut names = state.list_workspaces();
@@ -264,14 +432,27 @@ fn all_commands(state: &AppState) -> Vec<String> {
         out.push(format!("workspace/load/{n}"));
     }
 
+    for r in state.inputs.git_ref_options.iter() {
+        out.push(format!("shortcut/branch/select/{r}"));
+        
+    }
+
+    for (i, c) in state.canvases.iter().enumerate() {
+        out.push(format!("shortcut/canvas/select/{:02}-{}", i, c.name));
+        out.push(format!("shortcut/canvas/delete/{:02}-{}", i, c.name));
+        out.push(format!("shortcut/canvas/rename/{:02}-{}", i, c.name));
+
+        
+        
+        
+    }
+
     out.sort();
     out.dedup();
     out
 }
 
 fn detect_command_lane(query: &str) -> Option<&'static str> {
-    // If the user starts a lane prefix, constrain suggestions to that lane.
-    // This prevents accidents like typing workspace/load/... and seeing workspace/save/... results.
     let q = query.trim().to_ascii_lowercase();
     if q.starts_with("workspace/load") {
         return Some("workspace/load");
@@ -279,6 +460,10 @@ fn detect_command_lane(query: &str) -> Option<&'static str> {
     if q.starts_with("workspace/save") {
         return Some("workspace/save");
     }
+    if q.starts_with("shortcut/") {
+        return Some("shortcut/");
+    }
+
     if q.starts_with("component/") {
         return Some("component/");
     }
@@ -303,6 +488,11 @@ fn constrain_to_lane(mut sugg: Vec<String>, lane: Option<&str>) -> Vec<String> {
 
     if lane == "workspace/save" {
         sugg.retain(|s| s == "workspace/save" || s.starts_with("workspace/save/"));
+        return sugg;
+    }
+
+    if lane == "shortcut/" {
+        sugg.retain(|s| s.starts_with("shortcut/"));
         return sugg;
     }
 
@@ -332,6 +522,7 @@ pub fn command_palette(
     canvas_size: [f32; 2],
     viewport_outer_pos: Option<[f32; 2]>,
     viewport_inner_size: Option<[f32; 2]>,
+    pixels_per_point: f32,
 ) -> Vec<Action> {
     let mut actions = vec![];
 
@@ -354,7 +545,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | component/context_exporter | component/changeset_applier | component/execute_loop | component/task | ui/canvas_tint",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | shortcut/canvas/add | shortcut/canvas/select/00-Default | shortcut/branch/select/main | ui/personalization",
                     ),
             );
             resp.request_focus();
@@ -446,6 +637,7 @@ pub fn command_palette(
                             canvas_size,
                             viewport_outer_pos,
                             viewport_inner_size,
+                            pixels_per_point,
                         };
                     }
 

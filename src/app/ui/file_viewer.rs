@@ -320,7 +320,6 @@ pub fn file_viewer(
 
     ui.allocate_ui_at_rect(code_rect, |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
 
             let v = state.file_viewers.get_mut(&viewer_id).unwrap();
 
