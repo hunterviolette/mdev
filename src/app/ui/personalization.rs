@@ -50,7 +50,11 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
     }
 
     let screen = ctx.screen_rect();
-    let popup_rect = centered_rect(screen, 480.0, 420.0);
+    let popup_rect = centered_rect(
+        screen,
+        (screen.width() - 32.0).min(640.0).max(480.0),
+        (screen.height() - 32.0).min(760.0).max(420.0),
+    );
 
     // Close on Esc.
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -116,6 +120,17 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                 .shadow(ui.style().visuals.popup_shadow)
                 .show(ui, |ui| {
                     ui.set_min_size(popup_rect.size());
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
 
                     ui.horizontal(|ui| {
                         ui.heading("Personalization");
@@ -195,6 +210,52 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                         ui.monospace(format!("[{},{},{},{}]", arr[0], arr[1], arr[2], arr[3]));
                     });
 
+                    ui.separator();
+                    ui.label("Startup layout:");
+
+                    let has_startup_override = state.startup_layout_override_exists();
+                    ui.horizontal(|ui| {
+                        ui.label("Using:");
+                        ui.monospace(if has_startup_override { "Local override" } else { "Compiled/hardcoded default" });
+                    });
+
+                    let screen_size = ctx.screen_rect().size();
+                    let canvas_size = [screen_size.x.max(1.0), screen_size.y.max(1.0)];
+                    let viewport_outer_pos = None;
+                    let viewport_inner_size = Some([screen_size.x.max(1.0), screen_size.y.max(1.0)]);
+                    let pixels_per_point = ctx.pixels_per_point();
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Use current layout as startup default").clicked() {
+                            actions.push(Action::SaveStartupLayoutOverride {
+                                canvas_size,
+                                viewport_outer_pos,
+                                viewport_inner_size,
+                                pixels_per_point,
+                            });
+                        }
+
+                        if ui
+                            .add_enabled(has_startup_override, egui::Button::new("Reset startup layout"))
+                            .clicked()
+                        {
+                            actions.push(Action::ClearStartupLayoutOverride);
+                        }
+                    });
+
+                    if cfg!(debug_assertions) {
+                        ui.add_space(4.0);
+                        if ui.button("Export current layout to assets/default_startup_layout.json").clicked() {
+                            actions.push(Action::ExportBuiltInStartupLayout {
+                                canvas_size,
+                                viewport_outer_pos,
+                                viewport_inner_size,
+                                pixels_per_point,
+                            });
+                        }
+                    }
+
+                    ui.add_space(8.0);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Reset").clicked() {
@@ -213,7 +274,10 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                             actions.push(Action::CloseCanvasTintPopup);
                         }
                     });
+                    });
+                    });
                 });
+            });
         });
 
     actions

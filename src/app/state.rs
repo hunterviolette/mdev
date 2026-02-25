@@ -568,17 +568,19 @@ impl AppState {
 
     pub fn active_canvas_state_mut(&mut self) -> &mut CanvasState {
         if self.canvases.is_empty() {
-            let layout = LayoutConfig::default();
+            let layout = LayoutConfig {
+                components: vec![],
+                windows: HashMap::new(),
+            };
             self.canvases.push(CanvasState {
                 name: "Canvas 1".to_string(),
-                layout: layout.clone(),
-                active_file_viewer: Some(2),
+                layout,
+                active_file_viewer: None,
                 active_diff_viewer: None,
                 layout_epoch: 0,
             });
             self.active_canvas = 0;
-            self.next_component_id = layout.next_free_id();
-            self.file_viewers.entry(2).or_insert_with(FileViewerState::new);
+            self.next_component_id = 1;
         }
         let idx = self.active_canvas.min(self.canvases.len().saturating_sub(1));
         &mut self.canvases[idx]
@@ -710,13 +712,9 @@ impl AppState {
     }
 
     pub fn new(platform: Arc<dyn Platform>) -> Self {
-        let layout = LayoutConfig::default();
         let broker = CapabilityBroker::new(platform.clone());
 
-        let mut file_viewers = HashMap::new();
-        file_viewers.insert(2, FileViewerState::new());
-
-        Self {
+        let mut state = Self {
             platform,
             broker,
 
@@ -755,15 +753,18 @@ impl AppState {
 
             canvases: vec![CanvasState {
                 name: "Canvas 1".to_string(),
-                layout: layout.clone(),
-                active_file_viewer: Some(2),
+                layout: LayoutConfig {
+                    components: vec![],
+                    windows: HashMap::new(),
+                },
+                active_file_viewer: None,
                 active_diff_viewer: None,
                 layout_epoch: 0,
             }],
             active_canvas: 0,
-            next_component_id: layout.next_free_id(),
+            next_component_id: 1,
 
-            file_viewers,
+            file_viewers: HashMap::new(),
 
             diff_viewers: HashMap::new(),
 
@@ -806,7 +807,10 @@ impl AppState {
 
             pending_open_file_path: None,
             pending_open_file_viewer: None,
-        }
+        };
+
+        state.load_workspace_from_appdata(None);
+        state
     }
 
     pub fn set_git_ref(&mut self, git_ref: String) {

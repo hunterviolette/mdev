@@ -1,0 +1,995 @@
+{
+  "version": 1,
+  "default_preset": "Startup",
+  "presets": [
+    {
+      "name": "Startup",
+      "kind": {
+        "type": "FullState",
+        "data": {
+          "context_exporters": {
+            "4": {
+              "mode": "TreeSelect"
+            }
+          },
+          "execute_loops": {},
+          "tasks": {},
+          "canvas_size": [
+            2560.0,
+            1377.0
+          ],
+          "viewport_outer_pos": null,
+          "viewport_inner_size": [
+            2560.0,
+            1377.0
+          ],
+          "repo": null,
+          "git_ref": "WORKTREE",
+          "exclude_regex": [
+            "\\.lock$",
+            "(^|/)package-lock\\.json$"
+          ],
+          "max_exts": 6,
+          "filter_text": "",
+          "show_top_level_stats": true,
+          "canvas_bg_tint": [
+            71,
+            132,
+            0,
+            59
+          ],
+          "theme_dark": true,
+          "theme_syntect": "SolarizedDark",
+          "canvases": [
+            {
+              "name": "Master",
+              "layout": {
+                "components": [
+                  {
+                    "id": 1,
+                    "kind": "Tree",
+                    "title": "Tree"
+                  },
+                  {
+                    "id": 2,
+                    "kind": "FileViewer",
+                    "title": "File Viewer"
+                  },
+                  {
+                    "id": 3,
+                    "kind": "Summary",
+                    "title": "Summary"
+                  },
+                  {
+                    "id": 4,
+                    "kind": "ContextExporter",
+                    "title": "Context Exporter 4"
+                  },
+                  {
+                    "id": 5,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 5"
+                  },
+                  {
+                    "id": 6,
+                    "kind": "FileViewer",
+                    "title": "File Viewer 2"
+                  },
+                  {
+                    "id": 7,
+                    "kind": "SourceControl",
+                    "title": "Source Control 7"
+                  },
+                  {
+                    "id": 8,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 8"
+                  },
+                  {
+                    "id": 9,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 9"
+                  },
+                  {
+                    "id": 10,
+                    "kind": "Task",
+                    "title": "Task 10"
+                  },
+                  {
+                    "id": 12,
+                    "kind": "ExecuteLoop",
+                    "title": "Execute Loop 12"
+                  },
+                  {
+                    "id": 14,
+                    "kind": "ExecuteLoop",
+                    "title": "Execute Loop 14"
+                  },
+                  {
+                    "id": 15,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 15"
+                  },
+                  {
+                    "id": 16,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 16"
+                  },
+                  {
+                    "id": 13,
+                    "kind": "ExecuteLoop",
+                    "title": "Execute Loop 13"
+                  },
+                  {
+                    "id": 6,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 6"
+                  },
+                  {
+                    "id": 13,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 13"
+                  },
+                  {
+                    "id": 17,
+                    "kind": "Terminal",
+                    "title": "Terminal 1"
+                  },
+                  {
+                    "id": 18,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 18"
+                  }
+                ],
+                "windows": {
+                  "16": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.16367188,
+                      0.180292
+                    ],
+                    "size_norm": [
+                      0.3828125,
+                      0.5276839
+                    ],
+                    "pos": [
+                      419.0,
+                      248.26208
+                    ],
+                    "size": [
+                      980.0,
+                      726.6208
+                    ]
+                  },
+                  "13": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.4832031,
+                      0.053013798
+                    ],
+                    "size_norm": [
+                      0.315625,
+                      0.85620916
+                    ],
+                    "pos": [
+                      1237.0,
+                      73.0
+                    ],
+                    "size": [
+                      808.0,
+                      1179.0
+                    ]
+                  },
+                  "10": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.16835937,
+                      0.0058097313
+                    ],
+                    "size_norm": [
+                      0.28984374,
+                      0.10965868
+                    ],
+                    "pos": [
+                      431.0,
+                      8.0
+                    ],
+                    "size": [
+                      742.0,
+                      151.0
+                    ]
+                  },
+                  "7": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.81289065,
+                      0.008714597
+                    ],
+                    "size_norm": [
+                      0.175,
+                      0.6928105
+                    ],
+                    "pos": [
+                      2081.0,
+                      12.0
+                    ],
+                    "size": [
+                      448.0,
+                      954.0
+                    ]
+                  },
+                  "12": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.17109375,
+                      0.2526336
+                    ],
+                    "size_norm": [
+                      0.3359375,
+                      0.5205783
+                    ],
+                    "pos": [
+                      438.0,
+                      347.87646
+                    ],
+                    "size": [
+                      860.0,
+                      716.83636
+                    ]
+                  },
+                  "14": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.038671874,
+                      0.10564678
+                    ],
+                    "size_norm": [
+                      0.6953125,
+                      0.851542
+                    ],
+                    "pos": [
+                      99.0,
+                      145.47562
+                    ],
+                    "size": [
+                      1780.0,
+                      1172.5734
+                    ]
+                  },
+                  "18": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.478125,
+                      0.010893246
+                    ],
+                    "size_norm": [
+                      0.3191406,
+                      0.89542484
+                    ],
+                    "pos": [
+                      1224.0,
+                      15.0
+                    ],
+                    "size": [
+                      817.0,
+                      1233.0
+                    ]
+                  },
+                  "5": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.48828125,
+                      0.046477847
+                    ],
+                    "size_norm": [
+                      0.3113281,
+                      0.9200154
+                    ],
+                    "pos": [
+                      1250.0,
+                      63.999996
+                    ],
+                    "size": [
+                      797.0,
+                      1266.8612
+                    ]
+                  },
+                  "6": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.0703125,
+                      0.13192098
+                    ],
+                    "size_norm": [
+                      0.3828125,
+                      0.5276839
+                    ],
+                    "pos": [
+                      180.0,
+                      181.6552
+                    ],
+                    "size": [
+                      980.0,
+                      726.6208
+                    ]
+                  },
+                  "9": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.06914063,
+                      0.06277562
+                    ],
+                    "size_norm": [
+                      0.3828125,
+                      0.5512006
+                    ],
+                    "pos": [
+                      177.0,
+                      86.44203
+                    ],
+                    "size": [
+                      980.0,
+                      759.00323
+                    ]
+                  },
+                  "8": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.0046875,
+                      0.06660341
+                    ],
+                    "size_norm": [
+                      0.44765624,
+                      0.88446105
+                    ],
+                    "pos": [
+                      12.0,
+                      91.71289
+                    ],
+                    "size": [
+                      1146.0,
+                      1217.9028
+                    ]
+                  },
+                  "4": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.8105469,
+                      0.7668845
+                    ],
+                    "size_norm": [
+                      0.18242188,
+                      0.13798112
+                    ],
+                    "pos": [
+                      2075.0,
+                      1056.0
+                    ],
+                    "size": [
+                      467.0,
+                      190.0
+                    ]
+                  },
+                  "17": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.16914062,
+                      0.6114742
+                    ],
+                    "size_norm": [
+                      0.296875,
+                      0.30501089
+                    ],
+                    "pos": [
+                      433.0,
+                      842.0
+                    ],
+                    "size": [
+                      760.0,
+                      420.0
+                    ]
+                  },
+                  "2": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.16875,
+                      0.21496005
+                    ],
+                    "size_norm": [
+                      0.296875,
+                      0.35076252
+                    ],
+                    "pos": [
+                      432.0,
+                      296.0
+                    ],
+                    "size": [
+                      760.0,
+                      483.0
+                    ]
+                  },
+                  "1": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.003515625,
+                      0.009440813
+                    ],
+                    "size_norm": [
+                      0.1515625,
+                      0.89615107
+                    ],
+                    "pos": [
+                      9.0,
+                      13.0
+                    ],
+                    "size": [
+                      388.0,
+                      1234.0
+                    ]
+                  },
+                  "15": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.18125,
+                      0.26300398
+                    ],
+                    "size_norm": [
+                      0.7300781,
+                      0.9152228
+                    ],
+                    "pos": [
+                      464.0,
+                      362.1565
+                    ],
+                    "size": [
+                      1869.0,
+                      1260.2618
+                    ]
+                  },
+                  "3": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.8222656,
+                      0.82450604
+                    ],
+                    "size_norm": [
+                      0.1640625,
+                      0.41578412
+                    ],
+                    "pos": [
+                      2105.0,
+                      1135.3448
+                    ],
+                    "size": [
+                      420.0,
+                      572.5347
+                    ]
+                  }
+                }
+              },
+              "active_file_viewer": 2,
+              "active_diff_viewer": 6
+            },
+            {
+              "name": "Commit",
+              "layout": {
+                "components": [
+                  {
+                    "id": 4,
+                    "kind": "DiffViewer",
+                    "title": "Diff Viewer 4"
+                  },
+                  {
+                    "id": 1,
+                    "kind": "Tree",
+                    "title": "Tree"
+                  },
+                  {
+                    "id": 2,
+                    "kind": "FileViewer",
+                    "title": "File Viewer"
+                  },
+                  {
+                    "id": 3,
+                    "kind": "Summary",
+                    "title": "Summary"
+                  },
+                  {
+                    "id": 5,
+                    "kind": "SourceControl",
+                    "title": "Source Control 5"
+                  }
+                ],
+                "windows": {
+                  "5": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.8335937,
+                      0.013071896
+                    ],
+                    "size_norm": [
+                      0.14960937,
+                      0.6189673
+                    ],
+                    "pos": [
+                      2134.0,
+                      18.0
+                    ],
+                    "size": [
+                      383.0,
+                      852.31793
+                    ]
+                  },
+                  "4": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.000390625,
+                      0.018881626
+                    ],
+                    "size_norm": [
+                      0.77617186,
+                      0.8622498
+                    ],
+                    "pos": [
+                      1.0,
+                      26.0
+                    ],
+                    "size": [
+                      1987.0,
+                      1187.318
+                    ]
+                  },
+                  "1": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.0109375,
+                      0.017589463
+                    ],
+                    "size_norm": [
+                      0.1517113,
+                      0.51302606
+                    ],
+                    "pos": [
+                      28.0,
+                      24.220692
+                    ],
+                    "size": [
+                      388.38092,
+                      706.4369
+                    ]
+                  },
+                  "2": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.1484375,
+                      0.017589463
+                    ],
+                    "size_norm": [
+                      0.296875,
+                      0.51302606
+                    ],
+                    "pos": [
+                      380.0,
+                      24.220692
+                    ],
+                    "size": [
+                      760.0,
+                      706.4369
+                    ]
+                  },
+                  "3": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.825,
+                      0.72839504
+                    ],
+                    "size_norm": [
+                      0.1640625,
+                      0.1637618
+                    ],
+                    "pos": [
+                      2112.0,
+                      1003.0
+                    ],
+                    "size": [
+                      420.0,
+                      225.5
+                    ]
+                  }
+                }
+              },
+              "active_file_viewer": 2,
+              "active_diff_viewer": 4
+            },
+            {
+              "name": "Auto Code",
+              "layout": {
+                "components": [
+                  {
+                    "id": 9,
+                    "kind": "Task",
+                    "title": "Task 9"
+                  },
+                  {
+                    "id": 1,
+                    "kind": "Tree",
+                    "title": "Tree"
+                  },
+                  {
+                    "id": 2,
+                    "kind": "FileViewer",
+                    "title": "File Viewer"
+                  },
+                  {
+                    "id": 3,
+                    "kind": "Summary",
+                    "title": "Summary"
+                  },
+                  {
+                    "id": 10,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 10"
+                  },
+                  {
+                    "id": 11,
+                    "kind": "ExecuteLoop",
+                    "title": "Execute Loop 11"
+                  },
+                  {
+                    "id": 12,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 12"
+                  },
+                  {
+                    "id": 14,
+                    "kind": "ChangeSetApplier",
+                    "title": "ChangeSet Applier 14"
+                  }
+                ],
+                "windows": {
+                  "11": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.006640625,
+                      0.22657952
+                    ],
+                    "size_norm": [
+                      0.5757812,
+                      0.69680464
+                    ],
+                    "pos": [
+                      17.0,
+                      312.0
+                    ],
+                    "size": [
+                      1474.0,
+                      959.5
+                    ]
+                  },
+                  "12": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.6136719,
+                      0.053013798
+                    ],
+                    "size_norm": [
+                      0.3671875,
+                      0.84118956
+                    ],
+                    "pos": [
+                      1571.0,
+                      73.0
+                    ],
+                    "size": [
+                      940.0,
+                      1158.318
+                    ]
+                  },
+                  "1": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.004296875,
+                      0.053013798
+                    ],
+                    "size_norm": [
+                      0.1517113,
+                      0.5083515
+                    ],
+                    "pos": [
+                      11.0,
+                      73.0
+                    ],
+                    "size": [
+                      388.38092,
+                      700.0
+                    ]
+                  },
+                  "14": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.6070312,
+                      0.04793028
+                    ],
+                    "size_norm": [
+                      0.38242188,
+                      0.86564994
+                    ],
+                    "pos": [
+                      1554.0,
+                      66.0
+                    ],
+                    "size": [
+                      979.0,
+                      1192.0
+                    ]
+                  },
+                  "2": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.28828126,
+                      0.051561367
+                    ],
+                    "size_norm": [
+                      0.296875,
+                      0.5083515
+                    ],
+                    "pos": [
+                      738.0,
+                      71.0
+                    ],
+                    "size": [
+                      760.0,
+                      700.0
+                    ]
+                  },
+                  "10": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.62421876,
+                      0.053740013
+                    ],
+                    "size_norm": [
+                      0.3605469,
+                      0.889846
+                    ],
+                    "pos": [
+                      1598.0,
+                      74.0
+                    ],
+                    "size": [
+                      923.0,
+                      1225.318
+                    ]
+                  },
+                  "9": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.003515625,
+                      0.009440813
+                    ],
+                    "size_norm": [
+                      0.390625,
+                      0.13385475
+                    ],
+                    "pos": [
+                      9.0,
+                      13.0
+                    ],
+                    "size": [
+                      1000.0,
+                      184.318
+                    ]
+                  },
+                  "3": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.44921875,
+                      0.043572985
+                    ],
+                    "size_norm": [
+                      0.1640625,
+                      0.5083515
+                    ],
+                    "pos": [
+                      1150.0,
+                      60.0
+                    ],
+                    "size": [
+                      420.0,
+                      700.0
+                    ]
+                  }
+                }
+              },
+              "active_file_viewer": 2,
+              "active_diff_viewer": null
+            },
+            {
+              "name": "Code",
+              "layout": {
+                "components": [
+                  {
+                    "id": 1,
+                    "kind": "Tree",
+                    "title": "Tree"
+                  },
+                  {
+                    "id": 2,
+                    "kind": "FileViewer",
+                    "title": "File Viewer"
+                  },
+                  {
+                    "id": 3,
+                    "kind": "Summary",
+                    "title": "Summary"
+                  },
+                  {
+                    "id": 7,
+                    "kind": "ExecuteLoop",
+                    "title": "Execute Loop 7"
+                  },
+                  {
+                    "id": 8,
+                    "kind": "FileViewer",
+                    "title": "File Viewer 2"
+                  }
+                ],
+                "windows": {
+                  "7": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.5761719,
+                      0.3580247
+                    ],
+                    "size_norm": [
+                      0.33320314,
+                      0.3139564
+                    ],
+                    "pos": [
+                      1475.0,
+                      493.0
+                    ],
+                    "size": [
+                      853.0,
+                      432.318
+                    ]
+                  },
+                  "1": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.001953125,
+                      0.057371095
+                    ],
+                    "size_norm": [
+                      0.1515625,
+                      0.86564994
+                    ],
+                    "pos": [
+                      5.0,
+                      79.0
+                    ],
+                    "size": [
+                      388.0,
+                      1192.0
+                    ]
+                  },
+                  "2": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.16992188,
+                      0.05882353
+                    ],
+                    "size_norm": [
+                      0.37890625,
+                      0.86419755
+                    ],
+                    "pos": [
+                      435.0,
+                      81.0
+                    ],
+                    "size": [
+                      970.0,
+                      1190.0
+                    ]
+                  },
+                  "3": {
+                    "open": false,
+                    "locked": false,
+                    "pos_norm": [
+                      0.44921875,
+                      0.043572985
+                    ],
+                    "size_norm": [
+                      0.1640625,
+                      0.5083515
+                    ],
+                    "pos": [
+                      1150.0,
+                      60.0
+                    ],
+                    "size": [
+                      420.0,
+                      700.0
+                    ]
+                  },
+                  "8": {
+                    "open": true,
+                    "locked": false,
+                    "pos_norm": [
+                      0.58984375,
+                      0.04066812
+                    ],
+                    "size_norm": [
+                      0.3625,
+                      0.88235295
+                    ],
+                    "pos": [
+                      1510.0,
+                      56.0
+                    ],
+                    "size": [
+                      928.0,
+                      1215.0
+                    ]
+                  }
+                }
+              },
+              "active_file_viewer": 8,
+              "active_diff_viewer": null
+            }
+          ],
+          "active_canvas": 0,
+          "next_component_id": 19,
+          "file_viewers": {
+            "2": {
+              "selected_file": null,
+              "selected_commit": null
+            },
+            "6": {
+              "selected_file": null,
+              "selected_commit": null
+            },
+            "8": {
+              "selected_file": null,
+              "selected_commit": null
+            }
+          },
+          "active_file_viewer": 2
+        }
+      }
+    }
+  ]
+}

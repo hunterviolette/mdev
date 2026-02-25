@@ -408,24 +408,6 @@ impl LayoutConfig {
     }
 
     pub fn merge_with_defaults(&mut self) {
-
-        let mut ensure = |kind: ComponentKind, title: &str| {
-            if !self.components.iter().any(|c| c.kind == kind) {
-                let id = self.next_free_id();
-                self.components.push(ComponentInstance {
-                    id,
-                    kind,
-                    title: title.to_string(),
-                });
-            }
-        };
-
-        // Ensure default components exist by KIND
-        ensure(ComponentKind::Tree, "Tree");
-        ensure(ComponentKind::FileViewer, "File Viewer");
-        ensure(ComponentKind::Summary, "Summary");
-
-        // Ensure every component has a window layout (including newly added defaults)
         self.ensure_window_layouts();
     }
 

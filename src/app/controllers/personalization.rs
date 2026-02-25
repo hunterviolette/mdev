@@ -25,6 +25,38 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.ui.canvas_bg_tint = *rgba;
             true
         }
+        Action::SaveStartupLayoutOverride {
+            canvas_size,
+            viewport_outer_pos,
+            viewport_inner_size,
+            pixels_per_point,
+        } => {
+            state.save_startup_layout_override_to_appdata(
+                *canvas_size,
+                *viewport_outer_pos,
+                *viewport_inner_size,
+                *pixels_per_point,
+            );
+            true
+        }
+        Action::ClearStartupLayoutOverride => {
+            state.clear_startup_layout_override_from_appdata();
+            true
+        }
+        Action::ExportBuiltInStartupLayout {
+            canvas_size,
+            viewport_outer_pos,
+            viewport_inner_size,
+            pixels_per_point,
+        } => {
+            state.export_built_in_startup_layout_to_repo_file(
+                *canvas_size,
+                *viewport_outer_pos,
+                *viewport_inner_size,
+                *pixels_per_point,
+            );
+            true
+        }
         
         _ => false,
     }

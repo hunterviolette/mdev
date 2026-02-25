@@ -24,23 +24,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::ResetLayout => {
-            let (layout, fv_id) = state.remap_default_layout_ids();
-            state.active_canvas_state_mut().layout = layout;
-            state.file_viewers
-                .entry(fv_id)
-                .or_insert_with(crate::app::state::FileViewerState::new);
-            state.set_active_file_viewer_id(Some(fv_id));
-            state.set_active_diff_viewer_id(None);
-
-            state.rebuild_terminals_from_layout();
-            state.rebuild_context_exporters_from_layout();
-            state.rebuild_changeset_appliers_from_layout();
-            state.rebuild_source_controls_from_layout();
-            state.rebuild_diff_viewers_from_layout();
-            state.rebuild_execute_loops_from_layout();
-            state.rebuild_tasks_from_layout();
-
-            state.layout_epoch = state.layout_epoch.wrapping_add(1);
+            state.load_workspace_from_appdata(None);
             true
         }
         Action::CanvasSelect { index } => {

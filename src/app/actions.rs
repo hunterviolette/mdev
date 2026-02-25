@@ -90,6 +90,19 @@ pub enum Action {
     /// - None disables the tint.
     /// - Some([r,g,b,a]) uses sRGBA bytes.
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
+    SaveStartupLayoutOverride {
+        canvas_size: [f32; 2],
+        viewport_outer_pos: Option<[f32; 2]>,
+        viewport_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
+    },
+    ClearStartupLayoutOverride,
+    ExportBuiltInStartupLayout {
+        canvas_size: [f32; 2],
+        viewport_outer_pos: Option<[f32; 2]>,
+        viewport_inner_size: Option<[f32; 2]>,
+        pixels_per_point: f32,
+    },
 
     // ---------------------------
     // Diff viewer actions
