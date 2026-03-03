@@ -1,4 +1,3 @@
-// src/app/ui/changeset_loop.rs
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
@@ -12,8 +11,6 @@ pub fn changeset_loop_panel(
 ) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::new();
 
-    // ExecuteLoop UI is a view over the global Task store.
-    // Pause/resume is written through Tasks; TaskStore is the source of truth.
     let mut bound_tasks: Vec<ComponentId> = state
         .tasks
         .iter()
@@ -31,15 +28,12 @@ pub fn changeset_loop_panel(
         return actions;
     };
 
-    // Mirror pause from Task -> ExecuteLoop (view-only).
     if let Some(p) = bound_paused {
         st.paused = p;
     }
 
-    // Track whether we should persist to RepoTaskStore.
     let mut did_mutate = false;
 
-    // Snapshot fields so we can detect UI edits and save.
     let before_model = st.model.clone();
     let before_instruction = st.instruction.clone();
     let before_mode = st.mode;
@@ -47,7 +41,6 @@ pub fn changeset_loop_panel(
     let before_auto_fill = st.auto_fill_first_changeset_applier;
 
 
-    // In ChangeSet mode, ExecuteLoop always auto-fills + auto-applies into the first ChangeSetApplier.
     if st.mode == ExecuteLoopMode::ChangeSet && !st.auto_fill_first_changeset_applier {
         st.auto_fill_first_changeset_applier = true;
         did_mutate = true;
@@ -130,7 +123,6 @@ pub fn changeset_loop_panel(
                     st.history_sync_rx = None;
                 }
                 Ok(Err(err)) => {
-                    // Non-fatal: keep local messages; show status.
                     st.last_status = Some(format!("History sync failed: {}", err));
                     st.history_sync_pending = false;
                     st.history_sync_rx = None;
@@ -151,14 +143,10 @@ pub fn changeset_loop_panel(
         }
     }
 
-    // ------------------------------------------------------------
-    // Poll in-flight OpenAI request (non-blocking)
-    // ------------------------------------------------------------
     if st.pending {
         if let Some(rx) = &st.pending_rx {
             match rx.try_recv() {
                 Ok(Ok(out)) => {
-                    // Persist OpenAI conversation id so subsequent turns can send only deltas.
                     st.conversation_id = Some(out.conversation_id.clone());
 
                     if let Some(sys_idx) = st.messages.iter().position(|m| m.role == "system") {
@@ -178,18 +166,14 @@ pub fn changeset_loop_panel(
                     st.pending_rx = None;
 
                     if st.mode == ExecuteLoopMode::ChangeSet {
-                        // Always auto-fill + auto-apply in ChangeSet mode.
                         if let Some((applier_id, ap)) = state.changeset_appliers.iter_mut().next() {
                             ap.payload = out.text.clone();
                             ap.status = Some(format!("Auto-filled from Execute Loop {}", loop_id));
 
-                            // Track this applier so we can log its result status changes.
                             st.last_auto_applier_id = Some(*applier_id);
                             st.last_auto_applier_status = ap.status.clone();
-                            // Mark that we are waiting on the apply result to decide next step.
                             st.awaiting_apply_result = true;
 
-                            // Stats: count an auto-apply attempt.
                             st.changesets_total = st.changesets_total.saturating_add(1);
 
                             actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
@@ -200,7 +184,6 @@ pub fn changeset_loop_panel(
                             );
                         }
 
-                        // Pause only if Step mode.
                         st.awaiting_review = !st.changeset_auto;
                     } else {
                         st.last_status = Some("Response received.".to_string());
@@ -218,7 +201,6 @@ pub fn changeset_loop_panel(
                     st.last_status = Some("Request failed.".to_string());
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // still waiting
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     st.pending = false;
@@ -231,13 +213,9 @@ pub fn changeset_loop_panel(
             st.pending = false;
         }
 
-        // keep repainting so we notice completion quickly
         ctx.request_repaint();
     }
 
-    // ------------------------------------------------------------
-    // Poll auto-apply result (ChangeSetApplier.status) and log into chat
-    // ------------------------------------------------------------
     if let Some(applier_id) = st.last_auto_applier_id {
         if let Some(ap) = state.changeset_appliers.get(&applier_id) {
             let cur = ap.status.clone();
@@ -254,8 +232,6 @@ pub fn changeset_loop_panel(
         }
     }
 
-    // If we are in ChangeSet mode and an auto-apply failed, feed the error back to the model.
-    // Heuristic: treat statuses containing "error" or "invalid" or "failed" as failures.
     if st.mode == ExecuteLoopMode::ChangeSet && st.awaiting_apply_result {
         if let Some(applier_id) = st.last_auto_applier_id {
             if let Some(ap) = state.changeset_appliers.get(&applier_id) {
@@ -271,7 +247,6 @@ pub fn changeset_loop_panel(
                     if is_done {
                         st.awaiting_apply_result = false;
 
-                        // Stats: record apply result.
                         if is_fail {
                             st.changesets_err = st.changesets_err.saturating_add(1);
                         } else {
@@ -286,7 +261,6 @@ pub fn changeset_loop_panel(
                             );
 
                             if st.changeset_auto {
-                                // Auto: immediately ask the model for a corrected ChangeSet.
                                 st.draft = prompt;
                                 st.include_context_next = true;
                                 st.last_status = Some(
@@ -294,7 +268,6 @@ pub fn changeset_loop_panel(
                                 );
                                 actions.push(Action::ExecuteLoopSend { loop_id });
                             } else {
-                                // Manual: pause and let user review / edit the prompt.
                                 st.awaiting_review = true;
                                 st.draft = prompt;
                                 st.last_status = Some(
@@ -302,10 +275,8 @@ pub fn changeset_loop_panel(
                                 );
                             }
                         } else {
-                            // Success: optionally run postprocess automatically in auto mode.
                             st.last_status = Some("Apply succeeded.".to_string());
                             if st.changeset_auto {
-                                // Kick off postprocess automatically.
                                 actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
                             }
                         }
@@ -315,9 +286,6 @@ pub fn changeset_loop_panel(
         }
     }
 
-    // ------------------------------------------------------------
-    // Poll postprocess command (non-blocking)
-    // ------------------------------------------------------------
     if st.postprocess_pending {
         if let Some(rx) = &st.postprocess_rx {
             match rx.try_recv() {
@@ -333,7 +301,6 @@ pub fn changeset_loop_panel(
 
                     st.last_status = Some("Postprocess OK.".to_string());
 
-                    // Stats: record postprocess success.
                     st.postprocess_ok = st.postprocess_ok.saturating_add(1);
                 }
                 Ok(Err(output)) => {
@@ -347,9 +314,7 @@ pub fn changeset_loop_panel(
                     });
                     did_mutate = true;
 
-                    // If we're in ChangeSet mode, feed the failure output back to the model.
 
-                    // Stats: record postprocess failure.
                     st.postprocess_err = st.postprocess_err.saturating_add(1);
                     if st.mode == ExecuteLoopMode::ChangeSet {
                         if st.changeset_auto {
@@ -373,7 +338,6 @@ pub fn changeset_loop_panel(
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // still running
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     st.postprocess_pending = false;
@@ -389,7 +353,6 @@ pub fn changeset_loop_panel(
         ctx.request_repaint();
     }
 
-    // One-shot best-effort model list fetch so the dropdown populates.
     {
         let once_id = egui::Id::new(("execute_loop_models_fetched", loop_id));
         let already = ctx.data(|d| d.get_temp::<bool>(once_id)).unwrap_or(false);
@@ -415,16 +378,11 @@ pub fn changeset_loop_panel(
         }
     }
 
-    // Header row
-    // Keep all child widgets constrained to the panel width.
-    // Some widgets (especially singleline text edits inside horizontals) can request very large widths
-    // and cause the component/window to expand horizontally.
     let panel_w = ui.available_width();
 
     ui.horizontal(|ui| {
         ui.heading(format!("Execute Loop {}", loop_id));
 
-        // Pause is controlled via bound Tasks (TaskStore source of truth).
         if !bound_tasks.is_empty() {
             ui.separator();
             ui.label("Task(s)");
@@ -488,7 +446,6 @@ pub fn changeset_loop_panel(
 
     ui.add_space(6.0);
 
-    // Model dropdown + refresh
     ui.horizontal(|ui| {
         ui.label("Model");
 
@@ -537,7 +494,6 @@ pub fn changeset_loop_panel(
 
     ui.add_space(6.0);
 
-    // Mode + toggles
     ui.horizontal(|ui| {
         ui.label("Mode");
 
@@ -558,7 +514,6 @@ pub fn changeset_loop_panel(
             ui.horizontal(|ui| {
                 if ui.selectable_label(st.changeset_auto, "Auto").clicked() {
                     st.changeset_auto = true;
-                    // If user flips to Auto while paused, unpause so it can continue.
                     st.awaiting_review = false;
                 }
                 if ui.selectable_label(!st.changeset_auto, "Step").clicked() {
@@ -577,7 +532,6 @@ pub fn changeset_loop_panel(
 
     ui.add_space(8.0);
 
-    // System instruction
     ui.label("System instruction");
     ui.add(
         egui::TextEdit::multiline(&mut st.instruction)
@@ -587,7 +541,6 @@ pub fn changeset_loop_panel(
 
     ui.add_space(8.0);
 
-    // Postprocess (ChangeSet mode)
     if st.mode == ExecuteLoopMode::ChangeSet {
         ui.label("Postprocess command");
         ui.horizontal(|ui| {
@@ -611,11 +564,9 @@ pub fn changeset_loop_panel(
         ui.add_space(8.0);
     }
 
-    // IMPORTANT: cap transcript height so the component doesn't expand.
     let reserved_bottom = if st.mode == ExecuteLoopMode::ChangeSet { 260.0 } else { 200.0 };
     let chat_max_h = (ui.available_height() - reserved_bottom).max(120.0);
 
-    // Conversation transcript
     ui.label("Conversation");
 
     let mut force_open_all: Option<bool> = None;
@@ -668,8 +619,6 @@ pub fn changeset_loop_panel(
                 })
                 .body(|ui| {
                     ui.add_space(4.0);
-                    // Use a selectable label so users can highlight/copy transcript text.
-                    // (Non-interactive TextEdit prevents selection.)
                     ui.add(
                         egui::Label::new(egui::RichText::new(m.content.clone()).monospace())
                             .selectable(true)
@@ -683,7 +632,6 @@ pub fn changeset_loop_panel(
 
     ui.add_space(10.0);
 
-    // Draft input
     ui.label("Your message");
     ui.add(
         egui::TextEdit::multiline(&mut st.draft)
@@ -701,17 +649,14 @@ pub fn changeset_loop_panel(
         if st.mode == ExecuteLoopMode::ChangeSet {
             ui.separator();
 
-            // Auto vs Step indicator (explicitly labeled as requested).
             ui.small(if st.changeset_auto { "Auto" } else { "Step" });
 
-            // Only allow stepping when paused and not busy.
             let can_step = st.awaiting_review && !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
             if ui
                 .add_enabled(!st.changeset_auto && can_step, egui::Button::new("Step"))
                 .on_hover_text("Advance one step (only enabled when paused)")
                 .clicked()
             {
-                // Unpause.
                 actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
 
                 if !st.draft.trim().is_empty() {
@@ -734,8 +679,6 @@ pub fn changeset_loop_panel(
         }
     });
 
-    // Persist ExecuteLoop UI edits + transcript mutations to RepoTaskStore.
-    // NOTE: pause/resume itself is persisted via Task snapshots.
     let ui_changed = st.model != before_model
         || st.instruction != before_instruction
         || st.mode != before_mode
@@ -745,7 +688,6 @@ pub fn changeset_loop_panel(
         || st.postprocess_cmd != before_postprocess_cmd;
 
     if did_mutate || ui_changed {
-        // Write-through to snapshot store (source of truth), then flush to disk.
         state.persist_execute_loop_snapshot(loop_id);
         state.task_store_dirty = true;
         state.save_repo_task_store();

@@ -1,4 +1,3 @@
-// src/app/actions.rs
 
 use crate::app::state::FileViewAt;
 
@@ -10,7 +9,6 @@ pub enum ExpandCmd {
 
 pub type ComponentId = u64;
 
-/// Durable identifier for a conversation owned by a Task (not tied to UI component ids).
 pub type ConversationId = u64;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
@@ -82,13 +80,8 @@ pub enum Action {
     // ---------------------------
     // UI prefs
     // ---------------------------
-    /// Open the "canvas tint" popup (launched via command palette).
     OpenCanvasTintPopup,
-    /// Close the "canvas tint" popup.
     CloseCanvasTintPopup,
-    /// Set the canvas background tint (stored in UiState and persisted in workspaces).
-    /// - None disables the tint.
-    /// - Some([r,g,b,a]) uses sRGBA bytes.
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
     SaveStartupLayoutOverride {
         canvas_size: [f32; 2],
@@ -107,11 +100,8 @@ pub enum Action {
     // ---------------------------
     // Diff viewer actions
     // ---------------------------
-    /// Open a repo-relative path in a Diff Viewer. If no Diff Viewer exists,
-    /// one is created; otherwise this attaches to the last active Diff Viewer.
     OpenDiffViewerForPath { path: String },
 
-    /// Open/attach a Diff Viewer for a path with explicit left/right refs.
     OpenDiffViewerForPathWithRefs {
         path: String,
         from_ref: String,
@@ -138,10 +128,6 @@ pub enum Action {
         viewer_id: ComponentId,
     },
 
-    /// Set a viewer's "View at" mode (the enum lives in state.rs).
-    /// - FollowTopBar: uses the global top bar ref
-    /// - WorkingTree: uses disk
-    /// - Commit: (generally set automatically when selecting a commit)
     SetViewerViewAt {
         viewer_id: ComponentId,
         view_at: FileViewAt,

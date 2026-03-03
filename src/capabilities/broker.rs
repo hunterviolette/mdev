@@ -124,9 +124,6 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
-            // -----------------------------------------------------------------
-            // Source control (git)
-            // -----------------------------------------------------------------
             CapabilityRequest::GitStatus { repo } => {
                 let st = git::git_status(&repo)?;
                 Ok(CapabilityResponse::GitStatus(st))
@@ -220,7 +217,6 @@ impl CapabilityBroker {
         }
     }
 
-    /// Convenience: map top-bar git_ref to a FileSource for file reads.
     pub fn file_source_from_ref(git_ref: &str) -> FileSource {
         if git_ref == WORKTREE_REF {
             FileSource::Worktree

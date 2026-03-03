@@ -1,4 +1,3 @@
-// src/app/ui/top_bar.rs
 use eframe::egui;
 
 use super::super::actions::Action;
@@ -41,11 +40,7 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
     let mut actions = vec![];
 
     ui.vertical(|ui| {
-        // =========================
-        // Row 1 (existing content)
-        // =========================
         ui.horizontal(|ui| {
-            // ----- Repository picker -----
             {
                 let label = "Select repository";
                 let font_id = ui.style().text_styles[&egui::TextStyle::Button].clone();
@@ -62,12 +57,10 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
 
             ui.separator();
 
-            // ----- Ref dropdown -----
             ui.label("Ref:");
 
             let has_opts = !state.inputs.git_ref_options.is_empty();
             if has_opts {
-                // Display "Working tree" when WORKTREE_REF is selected
                 let selected_label = if state.inputs.git_ref == WORKTREE_REF {
                     "Working tree".to_string()
                 } else {
@@ -96,15 +89,11 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
 
             ui.separator();
 
-            // ----- Command palette -----
             if ui.button("Command (Ctrl+Shift+E)").clicked() {
                 actions.push(Action::ToggleCommandPalette);
             }
         });
 
-        // ==========================================
-        // Row 2 (canvas tabs + controls)
-        // ==========================================
         {
             ui.add_space(4.0);
             ui.separator();
@@ -113,14 +102,12 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
             ui.horizontal(|ui| {
                 ui.label("Canvases:");
 
-                // New canvas button
                 if ui.button("+").on_hover_text("Add canvas").clicked() {
                     actions.push(Action::CanvasAdd);
                 }
 
                 ui.add_space(8.0);
 
-                // Tabs
                 egui::ScrollArea::horizontal()
                     .id_source("canvas_tabs_scroll")
                     .auto_shrink([false, true])
@@ -130,7 +117,6 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
                             let is_renaming = state.ui.canvas_rename_index == Some(i);
                             let mut switched = false;
 
-                            // Visual separation between tabs
                             if i > 0 {
                                 ui.add_space(6.0);
                                 ui.separator();
@@ -148,13 +134,11 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
                                             canvas_shortcut_label(i)
                                         ));
 
-                                    // Left click selects
                                     if resp.clicked() {
                                         actions.push(Action::CanvasSelect { index: i });
                                         switched = true;
                                     }
 
-                                    // Right click context menu: rename only for active canvas
                                     resp.context_menu(|ui| {
                                         if ui.button("New canvas").clicked() {
                                             actions.push(Action::CanvasAdd);
@@ -183,7 +167,6 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
                                     });
                                 });
 
-                                // Inline rename editor under the tab being renamed
                                 if is_renaming {
                                     ui.add_space(4.0);
 

@@ -7,7 +7,6 @@ use crate::app::ui::helpers::language_hint_for_path;
 use egui_extras::syntax_highlighting::highlight;
 
 fn bg_for(kind: DiffRowKind, is_left: bool) -> Option<egui::Color32> {
-    // Very subtle backgrounds (we paint them only behind used text width)
     let add_bg = egui::Color32::from_rgba_unmultiplied(0, 160, 70, 14);
     let del_bg = egui::Color32::from_rgba_unmultiplied(200, 50, 50, 14);
 
@@ -38,7 +37,6 @@ fn bg_for(kind: DiffRowKind, is_left: bool) -> Option<egui::Color32> {
 }
 
 fn accent_for(kind: DiffRowKind) -> Option<egui::Color32> {
-    // Thin stripe like VS Code gutter markers
     match kind {
         DiffRowKind::Equal => None,
         DiffRowKind::Add => Some(egui::Color32::from_rgb(0, 160, 70)),
@@ -221,7 +219,6 @@ fn build_unified_patch_for_single_row(path: &str, row: &DiffRow) -> Option<Strin
 
     match row.kind {
         DiffRowKind::Add => {
-            // Added in worktree: reverse-apply should remove this line.
             let n = row.right_no.unwrap_or(1).max(1);
             out.push_str(&format!("@@ -{},0 +{},1 @@\n", n, n));
             out.push_str("+");
@@ -229,7 +226,6 @@ fn build_unified_patch_for_single_row(path: &str, row: &DiffRow) -> Option<Strin
             out.push('\n');
         }
         DiffRowKind::Delete => {
-            // Deleted in worktree: reverse-apply should re-add this line.
             let n = row.left_no.unwrap_or(1).max(1);
             out.push_str(&format!("@@ -{},1 +{},0 @@\n", n, n));
             out.push_str("-");
@@ -237,7 +233,6 @@ fn build_unified_patch_for_single_row(path: &str, row: &DiffRow) -> Option<Strin
             out.push('\n');
         }
         DiffRowKind::Change => {
-            // Modified line: reverse-apply should swap it back.
             let old_n = row.left_no.unwrap_or(1).max(1);
             let new_n = row.right_no.unwrap_or(1).max(1);
             out.push_str(&format!("@@ -{},1 +{},1 @@\n", old_n, new_n));
@@ -389,7 +384,6 @@ pub fn diff_viewer_panel(
         .id_source(("diff_viewer_scroll", viewer_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // Ensure everything inside is clipped.
             let _scroll_clip = ui.painter().with_clip_rect(ui.clip_rect());
 
             let avail_w = ui.available_width().max(40.0);
@@ -444,7 +438,6 @@ pub fn diff_viewer_panel(
                 ui.horizontal(|ui| {
                     let row_clip = ui.clip_rect();
 
-                    // LEFT
                     let (rect_l, _) = ui.allocate_exact_size(egui::vec2(col_w, row_h), egui::Sense::hover());
                     let clip_l = rect_l.intersect(row_clip);
                     let painter_l = ui.painter().with_clip_rect(clip_l);
@@ -477,7 +470,6 @@ pub fn diff_viewer_panel(
                         }
                     }
 
-                    // paint line number + code at fixed y offset
                     let y = rect_l.min.y + 2.0;
                     painter_l.text(
                         egui::pos2(rect_l.min.x + 6.0, y),
@@ -496,7 +488,6 @@ pub fn diff_viewer_panel(
                             weak,
                         );
                     } else {
-                        // IMPORTANT: galley contains its own syntax colors; fallback is only for uncolored spans
                         painter_l.galley(
                             egui::pos2(rect_l.min.x + 6.0 + ln_px, y),
                             galley_l,
@@ -506,7 +497,6 @@ pub fn diff_viewer_panel(
 
                     ui.add_space(gutter);
 
-                    // RIGHT
 
                     if can_revert {
                         let icon_w = gutter.max(18.0);
@@ -523,7 +513,6 @@ pub fn diff_viewer_panel(
                         let hovered = resp.hovered();
                         let col = if hovered { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
 
-                        // Draw bigger icon (do not rely on monospace default size).
                         let font = egui::FontId::monospace((row_h * 0.85).clamp(14.0, 22.0));
                         ui.painter().text(
                             icon_rect.center(),

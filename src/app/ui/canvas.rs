@@ -41,7 +41,6 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
             let snap_round = |v: f32| (v * ppp).round() / ppp;
             let snap_floor = |v: f32| (v * ppp).floor() / ppp;
 
-            // Origin should round to nearest pixel; sizes should floor so we never exceed bounds.
             let origin = egui::pos2(
                 snap_round(canvas_rect.min.x),
                 snap_round(canvas_rect.min.y),
@@ -49,7 +48,6 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
             let max_canvas_w = snap_floor(clip_rect.width().max(1.0));
             let max_canvas_h = snap_floor(clip_rect.height().max(1.0));
 
-            // Slightly shrink the usable rect so rounding/clamping never spills outside by a fraction.
             let safe_canvas_rect = egui::Rect::from_min_size(origin, egui::vec2(max_canvas_w, max_canvas_h))
                 .shrink(0.5 / ppp);
 
@@ -164,7 +162,6 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     ui.set_min_size(content_size);
 
 
-                    // Allow some panels to run WITHOUT analysis results.
                     match kind {
                         ComponentKind::Terminal => {
                             actions.extend(terminal::terminal_panel(ctx, ui, state, id));
@@ -200,14 +197,11 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         _ => {}
                     }
 
-                    // For Tree/FileViewer/Summary we want analysis results
                     if !has_results {
                         ui.label("No analysis results yet");
                         return content_size;
                     }
 
-                    // IMPORTANT: do not hold an immutable borrow of `state.results` while calling panel fns
-                    // that take `&mut AppState`. Use a raw pointer to avoid borrow conflicts without cloning.
                     let res_ptr: *const AnalysisResult = match state.results.result.as_ref() {
                         Some(r) => r as *const AnalysisResult,
                         None => {
@@ -240,7 +234,6 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         | ComponentKind::Task
                         | ComponentKind::SourceControl
                         | ComponentKind::DiffViewer => {
-                            // handled above
                         }
                     }
 
@@ -255,7 +248,6 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         && (shown.response.dragged() || (pointer_down && shown.response.hovered()));
                     ctx.data_mut(|d| d.insert_temp(interacting_id, now_interacting));
 
-                    // If user closed the window via the window close button.
                     if !open {
                         if let Some(w) = state.active_layout_mut().get_window_mut(id) {
                             w.open = false;

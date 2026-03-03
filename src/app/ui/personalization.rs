@@ -24,13 +24,11 @@ fn apply_theme(ctx: &egui::Context, state: &mut AppState) {
         theme.clone().store_in_memory(ctx);
         state.theme.code_theme = theme;
 
-        // Keep theme apply cache in sync so the next frame doesn't redo work.
         state.theme.last_applied_dark = Some(state.theme.prefs.dark);
         state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     } else {
         state.theme.code_theme = CodeTheme::from_memory(ctx);
 
-        // Keep theme apply cache in sync so the next frame doesn't redo work.
         state.theme.last_applied_dark = Some(state.theme.prefs.dark);
         state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     }
@@ -56,7 +54,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
         (screen.height() - 32.0).min(760.0).max(420.0),
     );
 
-    // Close on Esc.
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::CloseCanvasTintPopup);
         return actions;
@@ -70,14 +67,12 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
         .show(ctx, |ui| {
             ui.set_min_size(screen.size());
 
-            // Visual dim over everything.
             ui.painter().rect_filled(
                 screen,
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
             );
 
-            // Create four interactive regions around popup_rect.
             let top = egui::Rect::from_min_max(screen.min, egui::pos2(screen.max.x, popup_rect.min.y));
             let bottom = egui::Rect::from_min_max(egui::pos2(screen.min.x, popup_rect.max.y), screen.max);
             let left = egui::Rect::from_min_max(
@@ -89,7 +84,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                 egui::pos2(screen.max.x, popup_rect.max.y),
             );
 
-            // Capture clicks (and drags) in these regions.
             for r in [top, bottom, left, right] {
                 if r.is_positive() {
                     let resp = ui.allocate_rect(r, egui::Sense::click_and_drag());
@@ -105,9 +99,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
         return actions;
     }
 
-    // -------------------------------
-    // Popup (on top)
-    // -------------------------------
     egui::Area::new(egui::Id::new("canvas_tint_popup"))
         .order(egui::Order::Foreground)
         .fixed_pos(popup_rect.min)
@@ -145,9 +136,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                     ui.label("Theme + visual workspace hints.");
                     ui.separator();
 
-                    // -------------------------------
-                    // Theme (moved from top bar)
-                    // -------------------------------
                     ui.label("Theme:");
                     let was_dark = state.theme.prefs.dark;
 
@@ -197,10 +185,8 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                         let arr = col.to_array();
                         let next = [arr[0], arr[1], arr[2], arr[3]];
 
-                        // Update draft immediately for stable UI.
                         state.ui.canvas_tint_draft = Some(next);
 
-                        // Apply immediately so the canvas tint updates live.
                         actions.push(Action::SetCanvasBgTint { rgba: Some(next) });
                     }
 

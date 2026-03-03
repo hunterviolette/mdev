@@ -4,9 +4,6 @@ use crate::capabilities::{CapabilityRequest, CapabilityResponse, FileSource};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
-        // ------------------------------------------------------------
-        // Open file (generic open; usually opens in active viewer)
-        // ------------------------------------------------------------
         Action::OpenFile(path) => {
             let viewer_id = state
                 .active_file_viewer_id()
@@ -21,9 +18,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        // ------------------------------------------------------------
-        // View mode changes
-        // ------------------------------------------------------------
         Action::SetViewerViewAt { viewer_id, view_at } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 v.view_at = *view_at;
@@ -49,9 +43,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        // ------------------------------------------------------------
-        // Editing
-        // ------------------------------------------------------------
         Action::ToggleEditWorkingTree { viewer_id } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 v.edit_working_tree = !v.edit_working_tree;
@@ -68,20 +59,15 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        // ------------------------------------------------------------
-        // Diff (do NOT auto-run on toggle)
-        // ------------------------------------------------------------
         Action::ToggleDiff { viewer_id } => {
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
                 let turning_on = !v.show_diff;
                 v.show_diff = turning_on;
 
-                // Clear stale results when opening/closing
                 v.diff_err = None;
                 v.diff_text.clear();
 
                 if turning_on {
-                    // Open picker immediately; Generate closes it, diff stays visible.
                     v.diff_picker_open = true;
 
                     if v.diff_base.is_none() {
@@ -91,7 +77,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         v.diff_target = Some(state.inputs.git_ref.clone());
                     }
                 } else {
-                    // Turning off diff also closes the picker.
                     v.diff_picker_open = false;
                 }
             }
@@ -116,11 +101,10 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        // Generate diff button
         Action::RefreshDiff { viewer_id } => {
             state.refresh_diff(*viewer_id);
             if let Some(v) = state.file_viewers.get_mut(viewer_id) {
-                v.diff_picker_open = false; // ✅ THIS IS THE KEY UX FIX
+                v.diff_picker_open = false; 
             }
             true
         }
@@ -135,8 +119,6 @@ fn open_path_in_viewer(state: &mut AppState, viewer_id: ComponentId, path: Strin
         v.file_content_err = None;
         v.edit_status = None;
 
-        // Optional: when switching files, keep diff mode off by default
-        // (prevents surprising "stale diff" feeling between files)
         v.show_diff = false;
         v.diff_picker_open = false;
         v.diff_text.clear();
@@ -206,7 +188,6 @@ impl AppState {
             }
         }
 
-        // History for picker (your repo returns Bytes you parse)
         match self.broker.exec(CapabilityRequest::FileHistory {
             repo,
             path: path.clone(),
@@ -296,7 +277,6 @@ impl AppState {
             return;
         }
 
-        // Allow None => "use top-bar ref"
         let from_ref = base.unwrap_or_else(|| self.inputs.git_ref.clone());
         let to_ref = target.unwrap_or_else(|| self.inputs.git_ref.clone());
 
@@ -344,9 +324,7 @@ impl AppState {
     }
 }
 
-/// Applies deferred “open file”, “select commit”, “refresh viewer” actions at end-of-frame.
 pub fn finalize_frame(state: &mut AppState) {
-    // 1) open file if deferred
     if let Some(path) = state.deferred.open_file.take() {
         let target = state
             .deferred
@@ -358,12 +336,10 @@ pub fn finalize_frame(state: &mut AppState) {
         if let Some(viewer_id) = target {
             open_path_in_viewer(state, viewer_id, path);
         } else {
-            // no viewer yet; keep it deferred
             state.deferred.open_file = Some(path);
         }
     }
 
-    // 2) select commit if deferred
     if let Some((viewer_id, commit)) = state.deferred.select_commit.take() {
         if let Some(v) = state.file_viewers.get_mut(&viewer_id) {
             v.selected_commit = commit;
@@ -372,7 +348,6 @@ pub fn finalize_frame(state: &mut AppState) {
         state.load_file_at_current_selection(viewer_id);
     }
 
-    // 3) refresh viewer if deferred
     if let Some(viewer_id) = state.deferred.refresh_viewer.take() {
         state.load_file_at_current_selection(viewer_id);
     }

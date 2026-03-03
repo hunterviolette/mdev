@@ -1,4 +1,3 @@
-// src/app/ui/tree_panel.rs
 use eframe::egui;
 
 use crate::format;
@@ -73,16 +72,12 @@ fn set_dir_selected(state: &mut AppState, node: &DirNode, selected: bool) {
     }
 }
 
-/// Render one file row:
-/// - checkbox gates context export selection
-/// - filename still opens file viewer (existing behavior)
 fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, f: &FileRow) {
     let viewers = file_viewer_choices(state);
     let popup_id = egui::Id::new(("open_in_popup", f.full_path.as_str()));
 
     let mut checked = state.tree.context_selected_files.contains(&f.full_path);
 
-    // NOTE: use a *focusable* widget for the filename so keyboard focus can leave the editor.
     let link_resp = ui
         .horizontal(|ui| {
             if ui.checkbox(&mut checked, "").clicked() {
@@ -97,7 +92,6 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
 
             let link_text = egui::RichText::new(&f.name).color(ui.visuals().hyperlink_color);
 
-            // Link is focusable (unlike Label + Sense::click)
             let resp = ui
                 .add(egui::Link::new(link_text))
                 .on_hover_text(&f.full_path)
@@ -108,7 +102,6 @@ fn file_row(ui: &mut egui::Ui, state: &mut AppState, actions: &mut Vec<Action>, 
         .inner;
 
     if link_resp.clicked() {
-        // Explicitly move keyboard focus away from the code editor
         link_resp.request_focus();
 
         if viewers.is_empty() {
@@ -269,7 +262,6 @@ pub fn tree_panel(
 
                 root_state
                     .show_header(ui, |ui| {
-                        // Root checkbox controls all files
                         let all_files = collect_all_files(res);
                         let mut all = !all_files.is_empty()
                             && all_files
@@ -310,8 +302,6 @@ pub fn tree_panel(
             });
     });
 
-    // Persist current selection for this ref each frame so reruns of analysis (same ref)
-    // do not blow away user selections.
     let key = state.inputs.git_ref.clone();
     state.tree
         .context_selected_by_ref

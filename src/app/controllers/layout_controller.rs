@@ -105,7 +105,6 @@ impl AppState {
             ComponentKind::FileViewer => self.new_file_viewer(),
             ComponentKind::Terminal => self.new_terminal(),
             ComponentKind::Task => {
-                // Minimal: create a window/component like others (actual Task behavior handled elsewhere)
                 let id = self.alloc_component_id();
                 let title = format!("Task {}", id);
 
@@ -122,7 +121,6 @@ impl AppState {
                     },
                 );
 
-                // Backing state is optional; if tasks map exists, ensure entry.
                 self.tasks.entry(id).or_default();
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
@@ -258,7 +256,6 @@ impl AppState {
             }
 
             ComponentKind::ExecuteLoop => {
-                // Create a new chat thread (Execute Loop).
                 self.new_execute_loop_component();
             }
 
@@ -300,7 +297,6 @@ impl AppState {
         }
     }
 
-    /// Create a new Execute Loop component (chat thread) and return its id.
     pub fn new_execute_loop_component(&mut self) -> ComponentId {
         self.active_layout_mut().merge_with_defaults();
 
@@ -374,11 +370,9 @@ impl AppState {
             w.open = false;
         }
 
-        // Clean up ephemeral component state (safe no-op if not present)
         self.context_exporters.remove(&id);
         self.terminals.remove(&id);
         self.changeset_appliers.remove(&id);
-        // Persist latest ExecuteLoop state (if any) before dropping the ephemeral view/controller.
         self.persist_execute_loop_snapshot(id);
         if self.task_store_dirty {
             self.save_repo_task_store();

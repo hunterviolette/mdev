@@ -1,8 +1,3 @@
-// src/app/openai.rs
-// OpenAI client:
-// - list_models(): used to populate dropdown
-// - chat_completion_text(): convenience wrapper
-// - chat_completion_messages(): implemented via Responses API (/v1/responses)
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
@@ -37,9 +32,6 @@ impl OpenAIClient {
     }
 
     pub fn create_conversation(&self, items: Vec<(String, String)>) -> Result<String> {
-        // POST /v1/conversations
-        // Body: { items: [ { role, content }, ... ] }
-        // Response: { id: "conv_..." , ... }
 
         let url = format!("{}/v1/conversations", self.base_url.trim_end_matches('/'));
 
@@ -74,8 +66,6 @@ impl OpenAIClient {
         Ok(id.to_string())
     }
 
-    /// Fetch conversation items and convert them into a simple (role, text) transcript.
-    /// Uses: GET /v1/conversations/{conversation_id}/items
     pub fn list_conversation_messages(&self, conversation_id: &str) -> Result<Vec<(String, String)>> {
         let url = format!(
             "{}/v1/conversations/{}/items",
@@ -104,10 +94,8 @@ impl OpenAIClient {
 
         let mut out: Vec<(String, String)> = Vec::new();
 
-        // Response shape is an item list: { data: [ ...items... ], ... }
         if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
             for item in data {
-                // We only care about message-like items with role + content.
                 let role = item
                     .get("role")
                     .and_then(|r| r.as_str())
@@ -120,7 +108,6 @@ impl OpenAIClient {
 
                 let mut text = String::new();
 
-                // Typical shape: content: [ { type: "input_text"|"output_text", text: "..." }, ... ]
                 if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
                     for part in content_arr {
                         if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
@@ -132,7 +119,6 @@ impl OpenAIClient {
                     }
                 }
 
-                // Fallback: some message items may contain a direct text field.
                 if text.is_empty() {
                     if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                         text = t.to_string();
@@ -148,11 +134,6 @@ impl OpenAIClient {
         Ok(out)
     }
 
-    /// Generate text using /v1/responses attached to a persistent conversation.
-    ///
-    /// - If `conversation_id` is None, creates a new conversation using `seed_items_if_new`.
-    /// - Sends only the `turn_items` as the input delta for this turn.
-    /// - Returns (assistant_text, conversation_id).
     pub fn chat_in_conversation(
         &self,
         model: &str,
@@ -256,7 +237,6 @@ impl OpenAIClient {
         Ok(ids)
     }
 
-    /// Convenience helper: system + user messages.
     pub fn chat_completion_text(&self, model: &str, system: &str, user: &str) -> Result<String> {
         self.chat_completion_messages(
             model,
@@ -268,17 +248,12 @@ impl OpenAIClient {
         )
     }
 
-    /// Text generation using the Responses API.
-    /// We keep the name for compatibility with the rest of the app.
     pub fn chat_completion_messages(
         &self,
         model: &str,
         messages: Vec<(String, String)>,
         temperature: f32,
     ) -> Result<String> {
-        // Request: POST /v1/responses
-        // Body: { model, input: [ {role, content}, ... ], temperature }
-        // Content may be a string per the API reference.
 
         let url = format!("{}/v1/responses", self.base_url.trim_end_matches('/'));
 
@@ -287,8 +262,6 @@ impl OpenAIClient {
             .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
             .collect();
 
-        // NOTE: Some models (e.g. certain GPT-5 variants) reject `temperature` on /v1/responses.
-        // To stay compatible across models, we omit it entirely here.
         let _ = temperature; // keep signature stable
         let body = serde_json::json!({
             "model": model,
@@ -307,17 +280,12 @@ impl OpenAIClient {
             return Err(anyhow!("OpenAI /v1/responses returned {}: {}", status, body_txt));
         }
 
-        // Parse a minimal subset and robustly extract output text.
         let v: serde_json::Value = resp.json().context("Failed to parse /v1/responses JSON")?;
 
-        // Typical structure:
-        // { output: [ { type: "message", role: "assistant", content: [ { type: "output_text", text: "..." } ] } ] }
-        // We'll aggregate any content parts that have a "text" field.
         let mut out = String::new();
 
         if let Some(output_items) = v.get("output").and_then(|o| o.as_array()) {
             for item in output_items {
-                // Only collect assistant message items when present.
                 let role_ok = item
                     .get("role")
                     .and_then(|r| r.as_str())
@@ -339,7 +307,6 @@ impl OpenAIClient {
                     }
                 }
 
-                // Some variants may embed text directly.
                 if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                     if !out.is_empty() {
                         out.push_str("\n");

@@ -100,13 +100,6 @@ impl AppState {
         }
     }
 
-    /// Generate the *current* context text using the same ExportContext capability as the
-    /// Context Exporter component, but writing to a temp file and reading it back.
-    ///
-    /// - If the Tree has context-selected files, we export only those.
-    /// - Otherwise we export the full repo for the currently selected git_ref.
-    ///
-    /// This is intended for ExecuteLoop autonomy (no user-provided path needed).
     pub(crate) fn generate_current_context_text(&mut self) -> Result<String> {
         let repo = self
             .inputs
@@ -114,7 +107,6 @@ impl AppState {
             .clone()
             .context("No repo selected.")?;
 
-        // If the user selected files in Tree, honor that selection.
         let include_files: Option<Vec<String>> = if self.tree.context_selected_files.is_empty() {
             None
         } else {
@@ -123,7 +115,6 @@ impl AppState {
             Some(v)
         };
 
-        // Temp output file
         let out_path = {
             use std::time::{SystemTime, UNIX_EPOCH};
             let ts = SystemTime::now()
@@ -135,8 +126,6 @@ impl AppState {
             p
         };
 
-        // Default to the same-ish defaults as the Context Exporter component state.
-        // (If you later want ExecuteLoop to expose these, thread them from its state.)
         let req = ContextExportReq {
             repo,
             out_path: out_path.clone(),
@@ -152,7 +141,6 @@ impl AppState {
                 let text = std::fs::read_to_string(&out_path)
                     .with_context(|| format!("Failed to read temp context file {}", out_path.display()))?;
 
-                // Best-effort cleanup.
                 let _ = std::fs::remove_file(&out_path);
 
                 Ok(text)

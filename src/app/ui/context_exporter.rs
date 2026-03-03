@@ -16,7 +16,6 @@ pub fn context_exporter(
         return actions;
     };
 
-    // Match other components: keep header visible and scroll the body.
     ui.heading("AI Context Export");
     ui.add_space(6.0);
 

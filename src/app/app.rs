@@ -40,7 +40,6 @@ impl eframe::App for AppState {
 
         theme::apply_from_state(ctx, self);
 
-        // Ctrl+Shift+E toggles palette
 
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
@@ -64,7 +63,6 @@ impl eframe::App for AppState {
             i.key_pressed(egui::Key::E) && i.modifiers.ctrl && i.modifiers.shift
         });
 
-        // Native window title
         let repo_name = self
             .inputs
             .repo
@@ -116,7 +114,6 @@ impl eframe::App for AppState {
 
         ctx.data_mut(|d| d.insert_persisted(canvas_rect_id(), canvas_rect));
 
-        // Apply viewport restore (best-effort)
         if let Some(vr) = self.pending_viewport_restore.take() {
             if let Some([x, y]) = vr.outer_pos {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
@@ -127,12 +124,10 @@ impl eframe::App for AppState {
             ctx.request_repaint();
         }
 
-        // If we’re waiting to apply a workspace, keep repainting until it settles.
         if self.pending_workspace_apply.is_some() {
             ctx.request_repaint();
         }
 
-        // Workspace apply logic needs these every frame
         let canvas_size = current_canvas_size(ctx);
         let inner_size = current_viewport_inner_size(ctx);
         let ppp_now = ctx.pixels_per_point().max(1.0);
@@ -143,7 +138,6 @@ impl eframe::App for AppState {
             self.apply_action(a);
         }
 
-        // Command palette (drawn on top)
         let palette_actions = ui::command_palette::command_palette(
             ctx,
             self,
@@ -156,7 +150,6 @@ impl eframe::App for AppState {
             self.apply_action(a);
         }
 
-        // Canvas tint popup (modal; freezes underlying canvas while open)
         let tint_actions = ui::personalization::personalization(ctx, self);
         for a in tint_actions {
             self.apply_action(a);

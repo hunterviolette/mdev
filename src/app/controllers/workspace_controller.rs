@@ -1,4 +1,3 @@
-// src/app/controllers/workspace_controller.rs
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -41,12 +40,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    // ---------------------------
-    // Platform-backed workspace paths
-    // ---------------------------
 
     fn app_data_dir(&self) -> anyhow::Result<PathBuf> {
-        // Use the platform boundary (native implementation uses directories::ProjectDirs).
         self.platform.app_data_dir("DescribeRepo")
     }
 
@@ -378,8 +373,6 @@ impl AppState {
             context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
         }
 
-        // Chats/tasks are persisted globally per-repo.
-        // Workspace remains layout/session config only.
         if self.task_store_dirty {
             self.save_repo_task_store();
         }
@@ -555,9 +548,6 @@ impl AppState {
         self.results.error = None;
     }
 
-    // ---------------------------
-    // Workspace apply (called from app each frame)
-    // ---------------------------
 
     pub fn try_apply_pending_workspace(
         &mut self,
@@ -569,7 +559,6 @@ impl AppState {
             return false;
         };
 
-        // Wait a few frames for resize to settle.
         if pending.wait_frames > 0 {
             pending.wait_frames = pending.wait_frames.saturating_sub(1);
             self.pending_workspace_apply = Some(pending);
@@ -581,7 +570,6 @@ impl AppState {
         if let (Some(target), Some(cur)) = (pending.target_inner_size, current_inner_size) {
             let dx = (target[0] - cur[0]).abs();
             let dy = (target[1] - cur[1]).abs();
-            // Keep the existing tolerance for native windowing quirks.
             if dx > 2.0 || dy > 2.0 {
                 should_wait = true;
             }
@@ -590,8 +578,6 @@ impl AppState {
         if let Some(target) = pending.target_canvas_size {
             let dx = (target[0] - current_canvas_size[0]).abs();
             let dy = (target[1] - current_canvas_size[1]).abs();
-            // Canvas is already snapped/floored; require near-exact match.
-            // A mismatch here is what causes proportional window size drift on load.
             if dx > 0.25 || dy > 0.25 {
                 should_wait = true;
             }
@@ -603,10 +589,8 @@ impl AppState {
                 self.pending_workspace_apply = Some(pending);
                 return false;
             }
-            // Timeout: fall back to current behavior (apply with current canvas size).
         }
 
-        // Log the exact numbers used to denormalize/rescale layouts.
         let saved_canvas_size: Option<[f32; 2]> = match &pending.preset {
             PresetKind::LayoutOnly(ls) => Some(ls.canvas_size),
             PresetKind::FullState(st) => Some(st.canvas_size),
@@ -626,7 +610,6 @@ impl AppState {
             pixels_per_point = pixels_per_point,
         );
 
-        // Apply
         self.apply_preset_kind(pending.preset, current_canvas_size);
 
         self.pending_workspace_apply = None;

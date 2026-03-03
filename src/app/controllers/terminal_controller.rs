@@ -24,7 +24,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         Action::ClearTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
                 if let Some(vt) = t.vt.as_mut() {
-                    // Reset the VT screen state as well.
                     *vt = vt100::Parser::new(30, 120, 2000);
                 }
                 t.rendered_output.clear();
@@ -38,7 +37,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
         Action::InterruptTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
-                // PTY-only: send Ctrl+C (0x03) to the session.
                 if let Some(pty_in) = t.pty_in.as_ref() {
                     if let Ok(mut w) = pty_in.lock() {
                         let _ = w.write_all(&[0x03]);
@@ -83,7 +81,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
         Action::TerminalSendInput { terminal_id, data } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
-                // If somehow input arrives before session is started, ignore.
                 if let Some(pty_in) = t.pty_in.as_ref() {
                     if let Ok(mut w) = pty_in.lock() {
                         let _ = w.write_all(data);
@@ -101,9 +98,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
 
 impl AppState {
-    // Terminal implementation is PTY-only (legacy non-PTY runner removed).
 
-    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_terminals_from_layout(&mut self) {
         self.terminals.clear();
 
@@ -135,7 +130,6 @@ impl AppState {
         }
     }
 
-    /// Used by layout controller when adding a Terminal component.
     pub fn new_terminal(&mut self) {
         self.active_layout_mut().merge_with_defaults();
 
@@ -219,7 +213,6 @@ impl AppState {
                 }
                 #[cfg(not(windows))]
                 {
-                    // No cmd.exe; fall back to sh.
                     CommandBuilder::new("sh")
                 }
             }
@@ -253,7 +246,6 @@ impl AppState {
             return;
         };
 
-        // Already started -> resize if needed.
         if t.pty_in.is_some() && t.pty_master.is_some() {
             if t.pty_size != Some((rows, cols)) {
                 if let Some(master) = t.pty_master.as_ref() {
@@ -297,7 +289,6 @@ impl AppState {
         t.vt = Some(vt100::Parser::new(rows, cols, 2000));
         t.rendered_output.clear();
 
-        // Create reader + writer from the master.
         let (mut reader, writer) = {
             let mut m = match master.lock() {
                 Ok(g) => g,

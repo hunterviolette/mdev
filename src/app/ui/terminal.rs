@@ -77,7 +77,6 @@ fn vt_layout_with_cursor(
 
     let padded_text = lines.join("\n");
 
-    // Compute byte index at (row, col) in the padded string.
     let mut idx: usize = 0;
     for (r, l) in lines.iter().enumerate() {
         if r == row {
@@ -161,7 +160,6 @@ pub fn terminal_panel(
 ) -> Vec<Action> {
     let mut actions = vec![];
 
-    // Snapshot (avoid holding mutable borrow across ui closures).
     let (current_shell, cwd_display) = match state.terminals.get(&terminal_id) {
         Some(t) => {
             let cwd_display = t
@@ -179,7 +177,6 @@ pub fn terminal_panel(
     };
 
     ui.scope(|ui| {
-        // PowerShell-like black surface
         let mut style = ui.style().as_ref().clone();
         style.visuals.extreme_bg_color = Color32::BLACK;
         style.visuals.window_fill = Color32::BLACK;
@@ -192,7 +189,6 @@ pub fn terminal_panel(
         ui.set_style(std::sync::Arc::new(style));
         ui.visuals_mut().override_text_color = Some(Color32::from_rgb(220, 220, 220));
 
-        // Header row
         ui.horizontal(|ui| {
             ui.label("Shell:");
 
@@ -230,11 +226,9 @@ pub fn terminal_panel(
 
         ui.add_space(6.0);
 
-        // Output area takes full remaining height
         let full_w = ui.available_width().max(10.0);
         let output_h = ui.available_height().max(120.0);
 
-        // Output area
         {
             let Some(t) = state.terminals.get_mut(&terminal_id) else {
                 ui.label("Missing terminal state.");
@@ -276,7 +270,6 @@ pub fn terminal_panel(
                 egui::Sense::click(),
             );
 
-            // Focusable terminal surface (required for keyboard input)
             let surface_id = egui::Id::new(("terminal_surface", terminal_id));
             let surface_resp = ui.interact(rect, surface_id, egui::Sense::focusable_noninteractive());
             if out_resp.clicked() || surface_resp.clicked() {
@@ -284,7 +277,6 @@ pub fn terminal_panel(
             }
             let surface_has_focus = ui.memory(|m| m.has_focus(surface_id));
 
-            // Auto-start / resize PTY based on visible size.
             let (rows, cols) = calc_rows_cols(ui, rect);
             if t.pty_in.is_none() || t.pty_master.is_none() {
                 actions.push(Action::StartTerminalSession {
@@ -300,7 +292,6 @@ pub fn terminal_panel(
                 });
             }
 
-            // Render
             ui.allocate_ui_at_rect(rect, |ui| {
                 ui.set_width(full_w);
                 ui.set_max_width(full_w);
@@ -341,7 +332,6 @@ pub fn terminal_panel(
             });
         }
 
-        // Keyboard input: stream keystrokes while terminal surface has focus.
         {
             let Some(t) = state.terminals.get_mut(&terminal_id) else {
                 return;
@@ -377,22 +367,18 @@ pub fn terminal_panel(
                         }
                     }
 
-                    // Enter
                     if i.consume_key(egui::Modifiers::NONE, Key::Enter) {
                         bytes_to_send.push(b'\r');
                     }
 
-                    // Backspace (DEL)
                     if i.consume_key(egui::Modifiers::NONE, Key::Backspace) {
                         bytes_to_send.push(0x7f);
                     }
 
-                    // Tab
                     if i.consume_key(egui::Modifiers::NONE, Key::Tab) {
                         bytes_to_send.push(b'\t');
                     }
 
-                    // Arrows / navigation
                     for k in [
                         Key::ArrowUp,
                         Key::ArrowDown,
@@ -410,7 +396,6 @@ pub fn terminal_panel(
                         }
                     }
 
-                    // Ctrl+C / Cmd+C => ETX
                     let mut mods = egui::Modifiers::NONE;
                     mods.ctrl = true;
                     if i.consume_key(mods, Key::C) {
@@ -422,7 +407,6 @@ pub fn terminal_panel(
                         bytes_to_send.push(0x03);
                     }
 
-                    // Ctrl+D => EOT
                     let mut mods = egui::Modifiers::NONE;
                     mods.ctrl = true;
                     if i.consume_key(mods, Key::D) {
@@ -431,7 +415,6 @@ pub fn terminal_panel(
                 });
 
                 if !bytes_to_send.is_empty() {
-                    // If the PTY isn't started yet, the controller will ignore; the auto-start above will kick in.
                     actions.push(Action::TerminalSendInput {
                         terminal_id,
                         data: bytes_to_send,

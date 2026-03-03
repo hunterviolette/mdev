@@ -40,7 +40,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Save ExecuteLoop + Task state globally per-repo.
     pub fn save_repo_task_store(&mut self) {
         let Some(repo) = self.inputs.repo.clone() else {
             self.task_store_dirty = false;
@@ -52,7 +51,6 @@ impl AppState {
             Err(_) => return,
         };
 
-        // Persist from repo-global snapshot store. ExecuteLoopState is ephemeral.
         let execute_loops = self.execute_loop_store.clone();
 
         let mut tasks = std::collections::HashMap::new();
@@ -88,7 +86,6 @@ impl AppState {
         self.task_store_dirty = false;
     }
 
-    /// Load ExecuteLoop + Task state globally per-repo.
     pub fn load_repo_task_store(&mut self) -> bool {
         let Some(repo) = self.inputs.repo.clone() else {
             return false;
@@ -109,8 +106,6 @@ impl AppState {
             Err(_) => return false,
         };
 
-        // Load persisted ExecuteLoop snapshots into repo-global store.
-        // Do NOT hydrate ExecuteLoopState here (on-demand view/controller).
         self.execute_loop_store = parsed.execute_loops.clone();
 
         for (task_id, ts) in parsed.tasks.iter() {
@@ -148,8 +143,6 @@ impl AppState {
     }
 
 
-    /// Ensure ExecuteLoopState exists and is hydrated from execute_loop_store.
-    /// Apply an ExecuteLoopSnapshot into the live ExecuteLoopState for a given loop component.
     pub fn apply_execute_loop_snapshot(
         &mut self,
         loop_id: crate::app::actions::ComponentId,
@@ -185,13 +178,11 @@ impl AppState {
             .or_insert_with(ExecuteLoopState::new);
 
         if let Some(snap) = self.execute_loop_store.get(&loop_id) {
-            // Clone to avoid holding an immutable borrow of the store across a mutable self call.
             let snap = snap.clone();
             self.apply_execute_loop_snapshot(loop_id, &snap);
         }
     }
 
-    /// Write-through current ExecuteLoopState into execute_loop_store.
     pub fn persist_execute_loop_snapshot(&mut self, loop_id: crate::app::actions::ComponentId) {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now_ms: u64 = SystemTime::now()
@@ -203,18 +194,14 @@ impl AppState {
             return;
         };
 
-        // Only bump Created/Updated on *assistant/OAI* messages.
-        // We avoid depending on exact message types by using Debug strings.
         let mut bump_oai_ts = false;
         if let Some(last) = st.messages.last() {
-            // Typical roles: Assistant, User, System. We treat any role containing "assistant" as OAI.
             let role_dbg = format!("{:?}", last);
             if role_dbg.to_ascii_lowercase().contains("assistant") {
                 bump_oai_ts = true;
             }
         }
 
-        // Preserve existing created_at_ms once set.
         let prev_created = self
             .execute_loop_store
             .get(&loop_id)
@@ -236,7 +223,6 @@ impl AppState {
 
         let updated_at_ms = if bump_oai_ts { now_ms } else { prev_updated };
 
-        // Determine which (task, conversation) should receive write-through updates.
         let mut task_conversation_writeback: Option<(
             crate::app::actions::ComponentId,
             crate::app::actions::ConversationId,
@@ -250,7 +236,6 @@ impl AppState {
             }
         }
 
-        // Persist loop snapshot (repo-global).
         self.execute_loop_store.insert(
             loop_id,
             ExecuteLoopSnapshot {
@@ -274,17 +259,14 @@ impl AppState {
             },
         );
 
-        // Persist Task-owned conversation snapshot (task-scoped durable view).
         if let Some((tid, cid)) = task_conversation_writeback {
             if let Some(t) = self.tasks.get_mut(&tid) {
-                // Preserve created_at once set; never derive it from the ExecuteLoop window (which can be reused).
                 let prev_created = t
                     .conversations
                     .get(&cid)
                     .map(|s| s.created_at_ms)
                     .unwrap_or(0);
 
-                // Initialize created_at_ms once per conversation.
                 let c_created_at_ms = if prev_created != 0 { prev_created } else { now_ms };
 
                 t.conversations.insert(
@@ -355,7 +337,6 @@ impl AppState {
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
     pub fn apply_action(&mut self, action: Action) {
-        // Keep ordering stable (global -> domain -> layout/workspace)
         if palette_controller::handle(self, &action) {
             return;
         }
@@ -402,11 +383,9 @@ impl AppState {
     }
 
     pub fn finalize_frame(&mut self) {
-        // Deferred effects (open file, select commit, refresh viewer)
         file_viewer_controller::finalize_frame(self);
     }
 
-    // helpers used by UI (left here to avoid churn)
     pub fn excludes_joined(&self) -> String {
         format::join_excludes(&self.inputs.exclude_regex)
     }

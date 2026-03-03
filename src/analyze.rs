@@ -62,7 +62,6 @@ pub fn analyze_repo(
     exclude: &[Regex],
     _max_exts_shown: usize,
 ) -> Result<AnalysisResult> {
-    // WORKTREE: include tracked + untracked (so file tree matches disk and context export can include new files)
     let mut files: Vec<String> = if git_ref == WORKTREE_REF {
         git::list_worktree_files(repo)?
     } else {

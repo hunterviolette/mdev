@@ -72,7 +72,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::CommitAndPush { sc_id } => {
-            // Compose existing operations instead of duplicating logic.
             commit(state, *sc_id);
             push_remote(state, *sc_id);
             true
@@ -160,7 +159,6 @@ fn refresh_lists(state: &mut AppState, sc_id: ComponentId) {
 fn refresh(state: &mut AppState, sc_id: ComponentId) {
     let Some(repo) = ensure_repo(state, sc_id) else { return; };
 
-    // Status
     let st = match state.broker.exec(CapabilityRequest::GitStatus { repo: repo.clone() }) {
         Ok(CapabilityResponse::GitStatus(v)) => v,
         Ok(_) => {
@@ -173,18 +171,15 @@ fn refresh(state: &mut AppState, sc_id: ComponentId) {
         }
     };
 
-    // Current branch (best-effort)
     let cur = match state.broker.exec(CapabilityRequest::GitCurrentBranch { repo: repo.clone() }) {
         Ok(CapabilityResponse::GitBranch(b)) => Some(b),
         Ok(_) => None,
         Err(_) => None,
     };
 
-    // Lists
     refresh_lists(state, sc_id);
 
     if let Some(sc) = state.source_controls.get_mut(&sc_id) {
-        // Files
         sc.files = st
             .files
             .into_iter()
@@ -197,14 +192,12 @@ fn refresh(state: &mut AppState, sc_id: ComponentId) {
             })
             .collect();
 
-        // Branch selection
         if sc.branch.is_empty() {
             if let Some(b) = cur {
                 sc.branch = b;
             }
         }
 
-        // Keep selection only for existing paths
         let existing: HashSet<String> = sc.files.iter().map(|f| f.path.clone()).collect();
         sc.selected.retain(|p| existing.contains(p));
     }
@@ -462,7 +455,6 @@ fn commit_and_push(state: &mut AppState, sc_id: ComponentId) {
     let branch_opt = if branch.is_empty() { None } else { Some(branch) };
     let remote_opt = if remote.is_empty() { None } else { Some(remote) };
 
-    // 1) Commit
     let commit_out = match state.broker.exec(CapabilityRequest::GitCommit {
         repo: repo.clone(),
         message: msg,
@@ -479,7 +471,6 @@ fn commit_and_push(state: &mut AppState, sc_id: ComponentId) {
         }
     };
 
-    // 2) Push
     let push_out = match state.broker.exec(CapabilityRequest::GitPush {
         repo: repo.clone(),
         remote: remote_opt,
@@ -517,7 +508,6 @@ fn push_remote(state: &mut AppState, sc_id: ComponentId) {
 
     match state.broker.exec(CapabilityRequest::GitPush { repo, remote, branch }) {
         Ok(CapabilityResponse::Text(out)) => {
-            // Append push output if we already have commit output.
             if let Some(sc) = state.source_controls.get_mut(&sc_id) {
                 if let Some(existing) = sc.last_output.take() {
                     sc.last_output = Some(format!("{}\n\n{}", existing, out));
@@ -533,7 +523,6 @@ fn push_remote(state: &mut AppState, sc_id: ComponentId) {
 }
 
 impl AppState {
-    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_source_controls_from_layout(&mut self) {
         self.source_controls.clear();
 

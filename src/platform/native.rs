@@ -30,7 +30,6 @@ impl Platform for NativePlatform {
     }
 
     fn app_data_dir(&self, app_name: &str) -> Result<PathBuf> {
-        // org/qualifier can be anything stable for your app. Keep it constant.
         let pd = ProjectDirs::from("com", "RepoAnalyzer", app_name)
             .context("Failed to resolve platform app data directory (ProjectDirs::from)")?;
         Ok(pd.data_dir().to_path_buf())

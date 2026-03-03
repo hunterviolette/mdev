@@ -55,7 +55,6 @@ fn diff_overlay(
 
                     let v = state.file_viewers.get(&viewer_id).unwrap();
 
-                    // Base
                     ui.horizontal(|ui| {
                         ui.label("From:");
                         let cur = v
@@ -94,7 +93,6 @@ fn diff_overlay(
                             });
                     });
 
-                    // Target
                     ui.horizontal(|ui| {
                         ui.label("To:");
                         let cur = v
@@ -183,9 +181,6 @@ pub fn file_viewer(
         return actions;
     };
 
-    // ─────────────────────────────────────────────────────────────
-    // Component title: filename + full path (restored)
-    // ─────────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.heading(basename(&path));
         ui.add_space(8.0);
@@ -194,9 +189,6 @@ pub fn file_viewer(
 
     ui.add_space(6.0);
 
-    // ─────────────────────────────────────────────────────────────
-    // Header toolbar: Top bar ref OR Working tree OR commit list
-    // ─────────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         let v = state.file_viewers.get(&viewer_id).unwrap();
 
@@ -224,7 +216,6 @@ pub fn file_viewer(
         egui::ComboBox::from_id_source(("file_view_at_combo", viewer_id, &path))
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
-                // Top bar ref
                 let is_topbar = v.view_at == FileViewAt::FollowTopBar;
                 if ui.selectable_label(is_topbar, "Top bar ref").clicked() {
                     actions.push(Action::SetViewerViewAt {
@@ -233,7 +224,6 @@ pub fn file_viewer(
                     });
                 }
 
-                // Working tree (ALWAYS available at file level)
                 let is_wt = v.view_at == FileViewAt::WorkingTree;
                 if ui.selectable_label(is_wt, "Working tree").clicked() {
                     actions.push(Action::SetViewerViewAt {
@@ -244,7 +234,6 @@ pub fn file_viewer(
 
                 ui.separator();
 
-                // Commit history (full file version at each commit)
                 if v.file_commits.is_empty() {
                     ui.weak("No history loaded for this file yet.");
                 } else {
@@ -265,7 +254,6 @@ pub fn file_viewer(
 
         ui.separator();
 
-        // Editing controls
         let is_editing = v.edit_working_tree;
         if ui.selectable_label(is_editing, "Edit working tree").clicked() {
             actions.push(Action::ToggleEditWorkingTree { viewer_id });
@@ -284,12 +272,10 @@ pub fn file_viewer(
 
         ui.separator();
 
-        // Diff toggle remains independent
         if ui.button(if v.show_diff { "Hide Diff" } else { "Show Diff" }).clicked() {
             actions.push(Action::ToggleDiff { viewer_id });
         }
 
-        // Reopen picker without turning diff off
         if v.show_diff && ui.small_button("Diff options…").clicked() {
             if let Some(v) = state.file_viewers.get_mut(&viewer_id) {
                 v.diff_picker_open = true;
@@ -297,7 +283,6 @@ pub fn file_viewer(
         }
     });
 
-    // Errors/status
     let v = state.file_viewers.get(&viewer_id).unwrap();
     if let Some(err) = &v.file_content_err {
         ui.colored_label(egui::Color32::LIGHT_RED, err);
@@ -308,9 +293,6 @@ pub fn file_viewer(
 
     ui.add_space(6.0);
 
-    // ─────────────────────────────────────────────────────────────
-    // Body
-    // ─────────────────────────────────────────────────────────────
     let remaining_h = ui.available_height().max(120.0);
     let available_w = ui.available_width();
 
@@ -336,7 +318,6 @@ pub fn file_viewer(
                     &mut v.editor,
                 );
             } else {
-                // If diff is enabled, show diff output (if any) as highlighted 'diff'
                 let (text, language): (&str, &str) =
                     if v.show_diff && (!v.diff_text.is_empty() || v.diff_err.is_some()) {
                         (v.diff_text.as_str(), "diff")
@@ -356,7 +337,6 @@ pub fn file_viewer(
         });
     });
 
-    // Diff picker overlay: ONLY when explicitly open
     let show_picker = state
         .file_viewers
         .get(&viewer_id)

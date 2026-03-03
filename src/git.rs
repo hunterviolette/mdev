@@ -1,4 +1,3 @@
-// src/git.rs
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -56,7 +55,6 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Dropdown refs: HEAD first, then local branches, then remotes (excluding */HEAD).
 pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     ensure_git_repo(repo)?;
 
@@ -77,11 +75,9 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     all.append(&mut local_refs);
     all.append(&mut remote_refs);
 
-    // stable cleanup
     all.sort();
     all.dedup();
 
-    // enforce HEAD first
     if let Some(pos) = all.iter().position(|s| s == "HEAD") {
         all.remove(pos);
     }
@@ -90,9 +86,6 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     Ok(all)
 }
 
-// -----------------------------------------------------------------------------
-// Source control (git) capabilities
-// -----------------------------------------------------------------------------
 
 fn run_git_text_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, String, String)> {
     let (code, stdout, stderr) = run_git_allow_fail(repo, args)?;
@@ -245,8 +238,6 @@ pub fn git_stage_all(repo: &Path) -> Result<()> {
 
 pub fn git_unstage_all(repo: &Path) -> Result<()> {
     ensure_git_repo(repo)?;
-    // `git restore` does not support `-A`. To unstage everything, provide a pathspec.
-    // Running from repo root, "." covers the whole worktree.
     let _ = run_git(repo, &["restore", "--staged", "--", "."])?;
     Ok(())
 }
@@ -383,13 +374,10 @@ pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
 }
 
 
-/// Returns raw bytes of file content at `spec` where spec is like "<ref>:<path>".
 pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
     run_git(repo, &["show", spec])
 }
 
-/// Returns history lines for a file at repo-relative `path`.
-/// If not a git repo, returns empty (so UI still works in plain working trees).
 pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     if ensure_git_installed().is_err() || ensure_git_repo(repo).is_err() {
         return Ok(Vec::new());
@@ -409,7 +397,6 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     )
 }
 
-/// --- FS fallback helpers (for plain working trees) ---
 
 fn normalize_rel_path(p: &Path) -> Option<String> {
     let s = p.to_string_lossy().replace('\\', "/");
@@ -456,7 +443,6 @@ fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
                 Err(_) => continue,
             };
 
-            // avoid symlink cycles / oddities
             if ft.is_symlink() {
                 continue;
             }
@@ -484,9 +470,6 @@ fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// List all repo-relative file paths from the working tree:
-/// - If git repo: tracked + untracked (respecting .gitignore)
-/// - Otherwise: filesystem walk fallback
 pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
     if ensure_git_installed().is_ok() && ensure_git_repo(repo).is_ok() {
         let bytes = run_git(
@@ -519,7 +502,6 @@ pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
         return Ok(out);
     }
 
-    // plain folder fallback
     list_files_recursive_fs(repo)
 }
 
@@ -534,8 +516,6 @@ fn exists_in_worktree(repo: &Path, rel_path: &str) -> bool {
     repo.join(Path::new(&rel)).is_file()
 }
 
-/// WORKTREE-aware single-file diff.
-/// NOTE: Diffs require git (and a git repo). This will error in plain working trees (intended).
 pub fn diff_file_between(
     repo: &Path,
     from_ref: &str,
@@ -545,7 +525,6 @@ pub fn diff_file_between(
     ensure_git_installed()?;
     ensure_git_repo(repo)?;
 
-    // Commit -> WORKTREE
     if to_ref == WORKTREE_REF {
         if from_ref != WORKTREE_REF && exists_in_ref(repo, from_ref, path).unwrap_or(false) {
             let args_owned: Vec<String> = vec![
@@ -559,7 +538,6 @@ pub fn diff_file_between(
             return run_git(repo, &args_refs);
         }
 
-        // untracked/added file in worktree
         if exists_in_worktree(repo, path) {
             let abs = repo.join(Path::new(&path.replace('\\', "/")));
             let try_null = {
@@ -593,7 +571,6 @@ pub fn diff_file_between(
         return Ok(Vec::new());
     }
 
-    // WORKTREE -> Commit
     if from_ref == WORKTREE_REF {
         if exists_in_ref(repo, to_ref, path).unwrap_or(false) {
             let args_owned: Vec<String> = vec![
@@ -610,7 +587,6 @@ pub fn diff_file_between(
         return Ok(Vec::new());
     }
 
-    // Normal ref..ref diff
     let range = format!("{from_ref}..{to_ref}");
     let args_owned: Vec<String> = vec![
         "diff".to_string(),
@@ -623,9 +599,6 @@ pub fn diff_file_between(
     run_git(repo, &args_refs)
 }
 
-// -----------------------------------------------------------------------------
-// Working tree read/write
-// -----------------------------------------------------------------------------
 
 fn safe_join_repo_path(repo: &Path, rel_path: &str) -> Result<PathBuf> {
     let rel = rel_path.trim_start_matches("./").replace('\\', "/");
@@ -649,9 +622,6 @@ pub fn write_worktree_file(repo: &Path, rel_path: &str, bytes: &[u8]) -> Result<
     std::fs::write(&p, bytes).with_context(|| format!("failed to write {}", p.display()))
 }
 
-// -----------------------------------------------------------------------------
-// Minimal FS operations (used by ChangeSet applier)
-// -----------------------------------------------------------------------------
 
 pub fn delete_worktree_path(repo: &Path, rel_path: &str) -> Result<()> {
     let p = safe_join_repo_path(repo, rel_path)?;
@@ -680,9 +650,6 @@ pub fn move_worktree_path(repo: &Path, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Context exporter
-// -----------------------------------------------------------------------------
 
 pub struct ContextExportOptions<'a> {
     pub git_ref: &'a str,                 // may be WORKTREE
@@ -697,7 +664,6 @@ fn is_excluded(ex: &[Regex], path: &str) -> bool {
 }
 
 fn is_probably_binary(bytes: &[u8]) -> bool {
-    // Simple heuristic: any NUL byte
     bytes.iter().any(|&b| b == 0)
 }
 
@@ -728,7 +694,6 @@ pub fn export_repo_context(
     out_path: &Path,
     opts: ContextExportOptions<'_>,
 ) -> Result<()> {
-    // Only require git when exporting a git ref.
     if opts.git_ref != WORKTREE_REF {
         ensure_git_installed()?;
         ensure_git_repo(repo)?;
@@ -785,9 +750,6 @@ pub fn export_repo_context(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Minimal extensions for patch-apply + file ops (DO NOT remove anything above)
-// -----------------------------------------------------------------------------
 
 pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
@@ -818,13 +780,11 @@ pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Res
 }
 
 pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
-    // Normalize to LF and ensure trailing newline. Do NOT rewrite hunks.
     let mut patch = patch_text.replace("\r\n", "\n");
     if !patch.ends_with('\n') {
         patch.push('\n');
     }
 
-    // Basic stats...
     let len = patch.len();
     let nl_count = patch.as_bytes().iter().filter(|&&b| b == b'\n').count();
     let has_diff_git = patch.contains("diff --git ");

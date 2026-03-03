@@ -1,4 +1,3 @@
-// src/app/state.rs
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,7 +19,6 @@ use super::actions::{ComponentId, ConversationId, ExpandCmd, TerminalShell};
 use super::actions::ComponentKind;
 use super::layout::{ExecuteLoopSnapshot, LayoutConfig, PresetKind};
 
-/// Special ref name used to indicate "show the working tree (uncommitted) version".
 pub const WORKTREE_REF: &str = "WORKTREE";
 
 #[derive(Clone, Debug)]
@@ -73,7 +71,6 @@ pub struct TerminalState {
     pub status: Option<String>,
 }
 
-// ChangeSet applier
 pub struct ChangeSetApplierState {
     pub payload: String,
     pub status: Option<String>,
@@ -81,9 +78,7 @@ pub struct ChangeSetApplierState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecuteLoopMode {
-    /// Normal assistant conversation (freeform).
     Conversation,
-    /// Ask the assistant to output ONLY a ChangeSet JSON.
     ChangeSet,
 }
 
@@ -140,79 +135,53 @@ impl Default for TaskState {
 }
 
 pub struct ExecuteLoopState {
-    /// Selected model id (shown in UI). Options are fetched from the OpenAI models API.
     pub model: String,
-    /// Task-level pause (disables auto-flow when true).
     pub paused: bool,
 
-    /// Persisted stats (best-effort; increment where you already detect outcomes).
     pub changesets_total: u32,
     pub changesets_ok: u32,
     pub changesets_err: u32,
     pub postprocess_ok: u32,
     pub postprocess_err: u32,
 
-    /// Cached options for dropdown. Empty => not yet fetched / failed.
     pub model_options: Vec<String>,
 
-    /// Current mode for the next assistant turn.
     pub mode: ExecuteLoopMode,
 
-    /// Optional “goal” instruction shown/used as a system prompt.
     pub instruction: String,
 
-    /// Conversation transcript (role = "system"|"user"|"assistant").
     pub messages: Vec<ExecuteLoopMessage>,
 
-    /// Draft text box input.
     pub draft: String,
 
-    /// If true, the next send injects fresh context (generated in-memory).
     pub include_context_next: bool,
 
-    /// OpenAI Conversations API id (conv_...). When set, we send only delta turns.
     pub conversation_id: Option<String>,
 
-    /// True while we are fetching conversation history from the server.
     pub history_sync_pending: bool,
-    /// Receives fetched conversation messages from the background thread.
     pub history_sync_rx: Option<std::sync::mpsc::Receiver<Result<Vec<ExecuteLoopMessage>, String>>>,
-    /// The last conversation id we successfully synced (prevents refetch every frame).
     pub history_synced_conversation_id: Option<String>,
 
-    /// If true, auto-fill the first ChangeSet Applier when in ChangeSet mode.
     pub auto_fill_first_changeset_applier: bool,
 
-    /// When in ChangeSet mode, after we get a response we switch to a review state.
     pub awaiting_review: bool,
 
-    /// ChangeSet mode: if true, do not pause for review after each response.
-    /// If false, the loop pauses after each ChangeSet response (awaiting_review=true) so you can step manually.
     pub changeset_auto: bool,
 
-    /// True while an OpenAI request is in-flight (done on a background thread).
     pub pending: bool,
-    /// Receives the next assistant response (or error) from the background thread.
     pub pending_rx: Option<std::sync::mpsc::Receiver<Result<ExecuteLoopTurnResult, String>>>,
 
-    /// Postprocess command to run after applying a ChangeSet (e.g. `cargo check`).
     pub postprocess_cmd: String,
-    /// True while postprocess command is running.
     pub postprocess_pending: bool,
-    /// Receives postprocess output (Ok=success output, Err=failure output).
     pub postprocess_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 
-    /// Last ChangeSetApplier we auto-applied into (so we can log apply results back into chat).
     pub last_auto_applier_id: Option<ComponentId>,
-    /// Last observed status string from that applier (dedupe repeated logs).
     pub last_auto_applier_status: Option<String>,
 
-    /// Internal: whether we are waiting on an auto-apply result to decide next steps.
     pub awaiting_apply_result: bool,
 
     pub last_status: Option<String>,
 
-    /// Legacy iterations (kept for compatibility / history). New UI primarily uses `messages`.
     pub iterations: Vec<ExecuteLoopIteration>,
 }
 
@@ -255,7 +224,6 @@ impl ExecuteLoopState {
     }
 }
 
-// Source control
 #[derive(Clone, Debug)]
 pub struct SourceControlFile {
     pub path: String,
@@ -280,13 +248,9 @@ pub struct SourceControlState {
     pub last_output: Option<String>,
     pub last_error: Option<String>,
 
-    // internal: trigger initial refresh
     pub needs_refresh: bool,
 }
 
-// -----------------------------------------------------------------
-// Diff viewer
-// -----------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffRowKind {
@@ -309,18 +273,13 @@ pub struct DiffRow {
 pub struct DiffViewerState {
     pub path: Option<String>,
 
-    /// Left side (old)
     pub from_ref: String,
-    /// Right side (new)
     pub to_ref: String,
 
-    /// Full, raw side-by-side rows (entire file)
     pub rows: Vec<DiffRow>,
 
-    /// UI: if true, show only hunks (changes + surrounding context)
     pub only_changes: bool,
 
-    /// UI: number of surrounding context lines when `only_changes` is enabled
     pub context_lines: usize,
 
     pub last_error: Option<String>,
@@ -328,7 +287,6 @@ pub struct DiffViewerState {
     pub needs_refresh: bool,
 }
 
-// Note: additional UI preferences for the diff viewer
 
 impl DiffViewerState {
     pub fn new() -> Self {
@@ -351,14 +309,10 @@ pub enum ContextExportMode {
     TreeSelect,
 }
 
-/// Per-file-viewer "where am I viewing this file from?"
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileViewAt {
-    /// Use the global top-bar selection (inputs.git_ref).
     FollowTopBar,
-    /// Always show the local working tree version.
     WorkingTree,
-    /// Show a specific commit (hash stored in `selected_commit`).
     Commit,
 }
 
@@ -398,13 +352,10 @@ pub struct AppState {
     pub changeset_appliers: HashMap<ComponentId, ChangeSetApplierState>,
     pub execute_loops: HashMap<ComponentId, ExecuteLoopState>,
 
-    /// Repo-global persisted ExecuteLoop snapshots (loaded at repo select).
-    /// ExecuteLoopState is ephemeral and is hydrated on-demand from this store.
     pub execute_loop_store: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
     pub tasks: HashMap<ComponentId, TaskState>,
 
-    /// Dirty flag for global per-repo task/chat store autosave.
     pub task_store_dirty: bool,
 
     pub source_controls: HashMap<ComponentId, SourceControlState>,
@@ -451,16 +402,12 @@ pub struct UiState {
 
     pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
 
-    // ---------------------------
-    // Canvas tabs rename UI (top bar)
-    // ---------------------------
     pub canvas_rename_index: Option<usize>,
     pub canvas_rename_draft: String,
 }
 
 impl UiState {
     pub fn task_panel_selected_loops_mut(&mut self) -> &mut HashMap<ComponentId, BTreeSet<ConversationId>> {
-        // Lazily allocate via Option to keep struct init stable.
         self.task_panel_selected_loops.get_or_insert_with(HashMap::new)
     }
 }
@@ -470,7 +417,6 @@ pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
     pub context_selected_files: HashSet<String>,
 
-    /// Preserve tree-select checkbox state per git ref label (HEAD/main/origin/.../WORKTREE).
     pub context_selected_by_ref: HashMap<String, HashSet<String>>,
 }
 
@@ -535,7 +481,6 @@ pub struct ThemeState {
     pub code_theme: CodeTheme,
     pub prefs: ThemePrefs,
 
-    // Cache: avoid rebuilding/storing CodeTheme every frame.
     pub last_applied_dark: Option<bool>,
     pub last_applied_syntect_theme: Option<String>,
 }
@@ -814,16 +759,13 @@ impl AppState {
     }
 
     pub fn set_git_ref(&mut self, git_ref: String) {
-        // Save selection for previous ref.
         let prev = self.inputs.git_ref.clone();
         self.tree
             .context_selected_by_ref
             .insert(prev, self.tree.context_selected_files.clone());
 
-        // Switch ref.
         self.inputs.git_ref = git_ref.clone();
 
-        // Restore selection for new ref if available.
         if let Some(saved) = self.tree.context_selected_by_ref.get(&git_ref).cloned() {
             self.tree.context_selected_files = saved;
         }
@@ -831,9 +773,6 @@ impl AppState {
         self.refresh_follow_top_bar_viewers();
     }
 
-    // -----------------------------------------------------------------
-    // Restored helpers (other code expects these to exist)
-    // -----------------------------------------------------------------
 
     pub(crate) fn rebuild_context_exporters_from_layout(&mut self) {
         let ids: std::collections::HashSet<ComponentId> = self
@@ -910,7 +849,6 @@ impl AppState {
         }
     }
 
-    /// NEW: when the chosen folder isn't a git repo, the app becomes "WORKTREE only".
     pub fn set_git_ref_options_worktree_only(&mut self) {
         self.inputs.git_ref_options = vec![WORKTREE_REF.to_string()];
         if self.inputs.git_ref != WORKTREE_REF {
@@ -918,10 +856,6 @@ impl AppState {
         }
     }
 
-    /// Rebuild Execute Loop backing state from the current layout.
-    ///
-    /// Execute Loops are ephemeral UI components; their backing state map must be
-    /// re-synced after workspace/layout load to avoid "missing/broken" state.
     pub fn rebuild_execute_loops_from_layout(&mut self) {
         let ids: std::collections::HashSet<ComponentId> = self
             .all_layouts()

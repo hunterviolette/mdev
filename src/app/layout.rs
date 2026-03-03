@@ -27,7 +27,6 @@ pub enum PresetKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutSnapshot {
-    /// IMPORTANT: layout coordinates are canvas-local
     pub canvas_size: [f32; 2],
     pub layout: LayoutConfig,
 }
@@ -43,9 +42,6 @@ pub struct ContextExporterSnapshot {
     pub mode: crate::app::state::ContextExportMode,
 }
 
-// ---------------------------
-// New: persisted ExecuteLoop + Task snapshots
-// ---------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteLoopSnapshot {
@@ -56,7 +52,6 @@ pub struct ExecuteLoopSnapshot {
     pub auto_fill_first_changeset_applier: bool,
     pub messages: Vec<crate::app::state::ExecuteLoopMessage>,
 
-    /// OpenAI Conversations API id (conv_...). Stored so loops can resume without resending history.
     #[serde(default)]
     pub conversation_id: Option<String>,
 
@@ -69,14 +64,12 @@ pub struct ExecuteLoopSnapshot {
     #[serde(default)]
     pub updated_at_ms: u64,
 
-    // Persisted ExecuteLoop UI toggles/inputs (backward compatible)
     #[serde(default)]
     pub changeset_auto: bool,
 
     #[serde(default)]
     pub postprocess_cmd: String,
 
-    // Best-effort stats (can be filled later; keep defaults for backward compat)
     #[serde(default)]
     pub changesets_total: u32,
 
@@ -130,45 +123,34 @@ pub struct CanvasSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    /// Context exporters (per instance)
-    /// Stored so exporter mode (EntireRepo vs TreeSelect) persists across workspace save/load.
     #[serde(default)]
     pub context_exporters: HashMap<ComponentId, ContextExporterSnapshot>,
 
-    /// Execute loops (per instance)
     #[serde(default)]
     pub execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
-    /// Tasks (per instance)
     #[serde(default)]
     pub tasks: HashMap<ComponentId, TaskSnapshot>,
 
-    /// IMPORTANT: layout coordinates are canvas-local
     pub canvas_size: [f32; 2],
 
-    /// Best-effort restore to same monitor/placement
     pub viewport_outer_pos: Option<[f32; 2]>,
     pub viewport_inner_size: Option<[f32; 2]>,
 
-    /// Inputs
     pub repo: Option<PathBuf>,
     pub git_ref: String,
     pub exclude_regex: Vec<String>,
     pub max_exts: usize,
 
-    /// UI prefs
     pub filter_text: String,
     pub show_top_level_stats: bool,
 
-    /// UI prefs: optional canvas background tint.
     #[serde(default)]
     pub canvas_bg_tint: Option<[u8; 4]>,
 
-    /// Theme prefs (persisted with workspace)
     #[serde(default)]
     pub theme_dark: bool,
 
-    /// Syntect theme name for code highlighting (egui_extras).
     #[serde(default)]
     pub theme_syntect: String,
 
@@ -181,7 +163,6 @@ pub struct StateSnapshot {
     #[serde(default)]
     pub next_component_id: ComponentId,
 
-    /// File viewers (per instance)
     #[serde(default)]
     pub file_viewers: HashMap<ComponentId, FileViewerSnapshot>,
 
@@ -240,7 +221,6 @@ impl WindowLayout {
         [v[0] * cw, v[1] * ch]
     }
 
-    /// Ensure normalized fields exist, using legacy absolute fields as migration input.
     pub fn ensure_normalized_from_legacy(&mut self, legacy_canvas: [f32; 2]) {
         if self.pos_norm.is_none() {
             self.pos_norm = Some(Self::norm_div(self.pos, legacy_canvas));
@@ -250,7 +230,6 @@ impl WindowLayout {
         }
     }
 
-    /// Get window position/size in pixels for the *current* canvas size.
     pub fn denormalized_px(&self, current_canvas: [f32; 2]) -> ([f32; 2], [f32; 2]) {
         match (self.pos_norm, self.size_norm) {
             (Some(pn), Some(sn)) => (Self::norm_mul(pn, current_canvas), Self::norm_mul(sn, current_canvas)),
@@ -258,12 +237,10 @@ impl WindowLayout {
         }
     }
 
-    /// Update normalized fields from pixel position/size (user move/resize), for the *current* canvas size.
     pub fn set_from_px(&mut self, pos_px: [f32; 2], size_px: [f32; 2], current_canvas: [f32; 2]) {
         self.pos_norm = Some(Self::norm_div(pos_px, current_canvas));
         self.size_norm = Some(Self::norm_div(size_px, current_canvas));
 
-        // Keep legacy fields in sync (helps with debugging; also keeps older code paths sane).
         self.pos = pos_px;
         self.size = size_px;
     }
@@ -278,7 +255,6 @@ pub struct LayoutConfig {
 
 impl Default for LayoutConfig {
     fn default() -> Self {
-        // Stable default IDs
         let tree_id: ComponentId = 1;
         let fv_id: ComponentId = 2;
         let sum_id: ComponentId = 3;
@@ -381,7 +357,6 @@ impl LayoutConfig {
         let ch = current_canvas[1].max(1.0);
 
         for w in self.windows.values_mut() {
-            // Ensure we have normalized fields first.
             if w.pos_norm.is_none() || w.size_norm.is_none() {
                 w.ensure_normalized_from_legacy(current_canvas);
             }
@@ -392,7 +367,6 @@ impl LayoutConfig {
             size_px[0] = size_px[0].clamp(min_px, cw);
             size_px[1] = size_px[1].clamp(min_px, ch);
 
-            // Clamp position so the window stays within the canvas, but don't force an extra margin.
             pos_px[0] = pos_px[0].clamp(0.0, (cw - min_px).max(0.0));
             pos_px[1] = pos_px[1].clamp(0.0, (ch - min_px).max(0.0));
 

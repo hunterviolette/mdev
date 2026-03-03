@@ -1,4 +1,3 @@
-// src/app/task_store.rs
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -32,8 +31,6 @@ impl RepoTaskStoreFile {
     }
 }
 
-/// Stable-ish key for a repo path. We keep it filename-safe and include a hash
-/// to avoid collisions.
 pub fn repo_key_for_path(repo: &Path) -> String {
     let s = repo
         .canonicalize()
@@ -45,7 +42,6 @@ pub fn repo_key_for_path(repo: &Path) -> String {
     s.hash(&mut h);
     let hash = h.finish();
 
-    // A readable prefix based on the last path segment (sanitized)
     let leaf = repo
         .file_name()
         .and_then(|x| x.to_str())
