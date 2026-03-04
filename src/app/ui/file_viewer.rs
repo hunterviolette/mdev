@@ -1,6 +1,4 @@
 use eframe::egui;
-use egui_extras::syntax_highlighting::highlight;
-
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::{AppState, FileViewAt, WORKTREE_REF};
 
@@ -290,6 +288,11 @@ pub fn file_viewer(
     if let Some(msg) = &v.edit_status {
         ui.label(msg);
     }
+    if v.file_load_pending {
+        ui.weak("Loading file...");
+    } else if v.history_load_pending {
+        ui.weak("Loading history...");
+    }
 
     ui.add_space(6.0);
 
@@ -313,26 +316,31 @@ pub fn file_viewer(
                     ui,
                     &state.theme.code_theme,
                     &editor_id_source,
-                    &path,
+                    language_hint_for_path(&path),
                     &mut v.edit_buffer,
                     &mut v.editor,
+                    code_editor::EditorMode::Editable,
                 );
             } else {
-                let (text, language): (&str, &str) =
+                let (text, language): (&mut String, &str) =
                     if v.show_diff && (!v.diff_text.is_empty() || v.diff_err.is_some()) {
-                        (v.diff_text.as_str(), "diff")
+                        (&mut v.diff_text, "diff")
                     } else {
-                        (v.file_content.as_str(), language_hint_for_path(&path))
+                        (&mut v.file_content, language_hint_for_path(&path))
                     };
 
-                let job = highlight(ctx, &state.theme.code_theme, text, language);
+                let viewer_id_source = format!("viewer:{:?}|path:{}|mode:view", viewer_id, path);
 
-                egui::ScrollArea::both()
-                    .id_source(("file_content_scroll", viewer_id, &path))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.label(job);
-                    });
+                let _changed = code_editor::code_editor(
+                    ctx,
+                    ui,
+                    &state.theme.code_theme,
+                    &viewer_id_source,
+                    language,
+                    text,
+                    &mut v.viewer_editor,
+                    code_editor::EditorMode::ReadOnly,
+                );
             }
         });
     });

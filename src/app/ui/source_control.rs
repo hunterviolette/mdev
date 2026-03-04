@@ -455,6 +455,10 @@ pub fn source_control_panel(
                 actions.push(Action::RefreshSourceControl { sc_id });
             }
 
+            if ui.button("Discard All").clicked() {
+                pending_discard = "__ALL__".to_string();
+                ui.ctx().data_mut(|d| d.insert_temp(pending_discard_id, pending_discard.clone()));
+            }
         });
     });
 
@@ -512,12 +516,48 @@ pub fn source_control_panel(
         if !pending_discard.is_empty() {
             let rect = centered_overlay_rect(bounds, 0.62, 0.40, [420.0, 180.0], [820.0, 360.0]);
 
-            let untracked = sc
-                .files
-                .iter()
-                .find(|x| x.path == pending_discard)
-                .map(|x| x.untracked)
-                .unwrap_or(false);
+            let discard_all = pending_discard == "__ALL__";
+
+            let mut discard_paths: Vec<(String, bool)> = Vec::new();
+
+            let (untracked, summary_label) = if discard_all {
+                let mut untracked_n: usize = 0;
+                let mut modified_n: usize = 0;
+
+                for f in sc.files.iter() {
+                    let is_unstaged = if f.untracked {
+                        true
+                    } else {
+                        let wt = f.worktree_status.as_str();
+                        !(wt.is_empty() || wt == " " || wt == ".")
+                    };
+
+                    if !is_unstaged {
+                        continue;
+                    }
+
+                    if f.untracked {
+                        untracked_n += 1;
+                    } else {
+                        modified_n += 1;
+                    }
+
+                    discard_paths.push((f.path.clone(), f.untracked));
+                }
+
+                discard_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+                (false, format!("Discard ALL unstaged changes? Restored: {}, Deleted untracked: {}", modified_n, untracked_n))
+            } else {
+                let untracked = sc
+                    .files
+                    .iter()
+                    .find(|x| x.path == pending_discard)
+                    .map(|x| x.untracked)
+                    .unwrap_or(false);
+
+                (untracked, "This will revert the file to the last committed state.".to_string())
+            };
 
             let open_now = popup_overlay(
                 ctx,
@@ -526,12 +566,29 @@ pub fn source_control_panel(
                 "Discard changes?",
                 rect,
                 |ui| {
-                    ui.label("This will revert the file to the last committed state.");
+                    ui.label(summary_label.as_str());
                     if untracked {
                         ui.label("This file is untracked, so it will be deleted.");
                     }
                     ui.add_space(10.0);
-                    ui.monospace(&pending_discard);
+
+                    if discard_all {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (p, is_untracked) in discard_paths.iter() {
+                                    if *is_untracked {
+                                        ui.monospace(format!("{}  (untracked)", p));
+                                    } else {
+                                        ui.monospace(p);
+                                    }
+                                }
+                            });
+                    } else {
+                        ui.monospace(&pending_discard);
+                    }
+
                     ui.add_space(12.0);
 
                     ui.horizontal(|ui| {
@@ -541,11 +598,15 @@ pub fn source_control_panel(
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Discard").clicked() {
-                                actions.push(Action::DiscardPath {
-                                    sc_id,
-                                    path: pending_discard.clone(),
-                                    untracked,
-                                });
+                                if discard_all {
+                                    actions.push(Action::DiscardAllUnstaged { sc_id });
+                                } else {
+                                    actions.push(Action::DiscardPath {
+                                        sc_id,
+                                        path: pending_discard.clone(),
+                                        untracked,
+                                    });
+                                }
                                 actions.push(Action::RefreshSourceControl { sc_id });
                                 pending_discard.clear();
                             }

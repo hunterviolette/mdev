@@ -3,7 +3,12 @@ use std::collections::HashMap;
 use eframe::egui;
 use egui_extras::syntax_highlighting::highlight;
 
-use crate::app::ui::helpers::language_hint_for_path;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorMode {
+    Editable,
+    ReadOnly,
+}
+
 
 #[derive(Clone, Debug)]
 pub struct CodeEditorState {
@@ -635,12 +640,15 @@ pub fn code_editor(
     ui: &mut egui::Ui,
     theme: &egui_extras::syntax_highlighting::CodeTheme,
     id_source: &str,
-    path_for_language: &str,
+    language_hint: &str,
     text: &mut String,
     st: &mut CodeEditorState,
+    mode: EditorMode,
 ) -> bool {
 
     st.begin_frame();
+
+    let editable = matches!(mode, EditorMode::Editable);
 
     let mut changed = false;
 
@@ -881,13 +889,13 @@ pub fn code_editor(
                         let ctrl = modifiers.ctrl || modifiers.command;
 
                         match key {
-                            egui::Key::Z if ctrl => {
+                            egui::Key::Z if ctrl && editable => {
                                 st.active_find_match_cc = None;
                                 if shift { st.redo(text); } else { st.undo(text); }
                                 changed = true;
                                 wants_repaint = true;
                             }
-                            egui::Key::Y if ctrl => {
+                            egui::Key::Y if ctrl && editable => {
                                 st.active_find_match_cc = None;
                                 st.redo(text);
                                 changed = true;
@@ -908,7 +916,7 @@ pub fn code_editor(
                             }
 
                             egui::Key::C if ctrl => pending_copy = true,
-                            egui::Key::X if ctrl => pending_cut = true,
+                            egui::Key::X if ctrl && editable => pending_cut = true,
 
                             egui::Key::A if ctrl => {
                                 st.active_find_match_cc = None;
@@ -916,26 +924,26 @@ pub fn code_editor(
                                 wants_repaint = true;
                             }
 
-                            egui::Key::Backspace => {
+                            egui::Key::Backspace if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 if ctrl { changed |= delete_prev_word(text, st); }
                                 else { changed |= delete_prev_char(text, st); }
                                 wants_repaint = true;
                             }
-                            egui::Key::Delete => {
+                            egui::Key::Delete if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= delete_next_char(text, st);
                                 wants_repaint = true;
                             }
-                            egui::Key::Enter => {
+                            egui::Key::Enter if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= insert_text(text, st, "\n");
                                 wants_repaint = true;
                             }
-                            egui::Key::Tab => {
+                            egui::Key::Tab if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= insert_text(text, st, "    ");
@@ -946,7 +954,7 @@ pub fn code_editor(
                         }
                     }
 
-                    egui::Event::Text(t) => {
+                    egui::Event::Text(t) if editable => {
                         if ctrl_down {
                             continue;
                         }
@@ -958,7 +966,7 @@ pub fn code_editor(
                         }
                     }
 
-                    egui::Event::Paste(t) => {
+                    egui::Event::Paste(t) if editable => {
                         st.active_find_match_cc = None;
                         st.take_undo_snapshot_if_needed(text);
                         changed |= insert_text(text, st, t);
@@ -1009,7 +1017,7 @@ pub fn code_editor(
             }
         }
 
-        if pending_replace {
+        if editable && pending_replace {
             if !matches.is_empty() {
                 let (a_bc, b_bc) = matches[st.find_match_index];
                 st.take_undo_snapshot_if_needed(text);
@@ -1027,7 +1035,7 @@ pub fn code_editor(
             }
         }
 
-        if pending_replace_all {
+        if editable && pending_replace_all {
             if !matches.is_empty() {
                 st.take_undo_snapshot_if_needed(text);
 
@@ -1072,7 +1080,7 @@ pub fn code_editor(
     ui.allocate_ui_at_rect(text_rect, |ui| {
         ui.set_clip_rect(text_rect);
 
-        let language = language_hint_for_path(path_for_language);
+        let language = language_hint;
         let lines: Vec<&str> = text.split('\n').collect();
 
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(16.0);
@@ -1297,7 +1305,7 @@ pub fn code_editor(
         }
     }
 
-    if pending_cut {
+    if editable && pending_cut {
         if let Some((a, b)) = selection_range(st) {
             if a != b {
                 let a_bc = cc_to_bc(text, a);

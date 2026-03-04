@@ -41,8 +41,8 @@ impl StatAgg {
 
 #[derive(Clone, Debug, Default)]
 pub struct DirStats {
-    pub agg: StatAgg,
-    pub ext_counts: HashMap<String, u64>,
+    pub ext_files: HashMap<String, u64>,
+    pub ext_loc: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]

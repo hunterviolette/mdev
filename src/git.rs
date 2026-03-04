@@ -388,7 +388,7 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
         &[
             "log",
             "--no-color",
-            "--pretty=format:%H|%ct|%s",
+            "--pretty=format:%H%x1f%ct%x1f%s",
             "-n",
             &max.to_string(),
             "--",
@@ -471,37 +471,6 @@ fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
 }
 
 pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
-    if ensure_git_installed().is_ok() && ensure_git_repo(repo).is_ok() {
-        let bytes = run_git(
-            repo,
-            &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        )?;
-
-        let mut out = Vec::new();
-        let mut start = 0usize;
-        for i in 0..bytes.len() {
-            if bytes[i] == 0u8 {
-                if i > start {
-                    let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
-                    if !s.trim().is_empty() {
-                        out.push(s);
-                    }
-                }
-                start = i + 1;
-            }
-        }
-        if start < bytes.len() {
-            let s = String::from_utf8_lossy(&bytes[start..]).to_string();
-            if !s.trim().is_empty() {
-                out.push(s);
-            }
-        }
-
-        out.sort();
-        out.dedup();
-        return Ok(out);
-    }
-
     list_files_recursive_fs(repo)
 }
 
@@ -620,6 +589,11 @@ pub fn write_worktree_file(repo: &Path, rel_path: &str, bytes: &[u8]) -> Result<
             .with_context(|| format!("failed to create dirs for {}", parent.display()))?;
     }
     std::fs::write(&p, bytes).with_context(|| format!("failed to write {}", p.display()))
+}
+
+pub fn create_worktree_dir(repo: &Path, rel_path: &str) -> Result<()> {
+    let p = safe_join_repo_path(repo, rel_path)?;
+    std::fs::create_dir_all(&p).with_context(|| format!("failed to create dir {}", p.display()))
 }
 
 

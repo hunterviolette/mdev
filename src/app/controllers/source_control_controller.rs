@@ -93,6 +93,11 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
+        Action::DiscardAllUnstaged { sc_id } => {
+            discard_all_unstaged(state, *sc_id);
+            true
+        }
+
         _ => false,
     }
 }
@@ -265,6 +270,76 @@ fn discard_path(state: &mut AppState, sc_id: ComponentId, path: &str, untracked:
         }
         Err(e) => set_err(state, sc_id, format!("Discard failed: {:#}", e)),
     }
+}
+
+fn discard_all_unstaged(state: &mut AppState, sc_id: ComponentId) {
+    let Some(repo) = ensure_repo(state, sc_id) else { return; };
+
+    let Some(sc) = state.source_controls.get(&sc_id) else {
+        return;
+    };
+
+    let mut restore_paths: Vec<String> = Vec::new();
+    let mut delete_untracked: Vec<String> = Vec::new();
+
+    for f in sc.files.iter() {
+        let is_unstaged = if f.untracked {
+            true
+        } else {
+            let wt = f.worktree_status.as_str();
+            !(wt.is_empty() || wt == " " || wt == ".")
+        };
+
+        if !is_unstaged {
+            continue;
+        }
+
+        if f.untracked {
+            delete_untracked.push(f.path.clone());
+        } else {
+            restore_paths.push(f.path.clone());
+        }
+    }
+
+    let mut any_err = false;
+
+    if !restore_paths.is_empty() {
+        match state
+            .broker
+            .exec(CapabilityRequest::GitRestorePaths { repo: repo.clone(), paths: restore_paths.clone() })
+        {
+            Ok(_) => {}
+            Err(e) => {
+                set_err(state, sc_id, format!("Discard all failed: {:#}", e));
+                any_err = true;
+            }
+        }
+    }
+
+    for p in delete_untracked.iter() {
+        match state.broker.exec(CapabilityRequest::DeleteWorktreePath { repo: repo.clone(), path: p.clone() }) {
+            Ok(_) => {}
+            Err(e) => {
+                set_err(state, sc_id, format!("Delete untracked failed: {:#}", e));
+                any_err = true;
+            }
+        }
+    }
+
+    if !any_err {
+        let msg = if restore_paths.is_empty() && delete_untracked.is_empty() {
+            "No unstaged changes to discard.".to_string()
+        } else {
+            format!(
+                "Discarded all unstaged changes. Restored: {}, Deleted untracked: {}",
+                restore_paths.len(),
+                delete_untracked.len()
+            )
+        };
+        set_ok(state, sc_id, msg);
+    }
+
+    refresh(state, sc_id);
 }
 
 fn stage_selected(state: &mut AppState, sc_id: ComponentId) {

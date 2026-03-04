@@ -2,6 +2,7 @@ use eframe::egui;
 
 use super::{theme, ui};
 use super::AppState;
+use super::state::WORKTREE_REF;
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -39,6 +40,29 @@ impl eframe::App for AppState {
         
 
         theme::apply_from_state(ctx, self);
+
+
+        let now_s = ctx.input(|i| i.time);
+        if self.inputs.repo.is_some() && self.inputs.git_ref == WORKTREE_REF {
+            if now_s - self.tree.last_git_status_refresh_s >= self.tree.git_status_interval_s {
+                self.tree.last_git_status_refresh_s = now_s;
+                self.refresh_tree_git_status();
+            }
+
+            if now_s - self.tree.last_auto_refresh_s >= self.tree.auto_refresh_interval_s {
+                self.tree.last_auto_refresh_s = now_s;
+                if !self.any_file_load_pending() {
+                    self.start_analysis_refresh_async();
+                }
+            }
+
+            if self.tree.analysis_refresh_pending {
+                ctx.request_repaint();
+            }
+            if self.poll_analysis_refresh() {
+                ctx.request_repaint();
+            }
+        }
 
 
         let canvas_shortcut = ctx.input(|i| {
@@ -156,5 +180,12 @@ impl eframe::App for AppState {
         }
 
         self.finalize_frame();
+
+        if self.poll_file_loads() {
+            ctx.request_repaint();
+        }
+        if self.any_file_load_pending() {
+            ctx.request_repaint();
+        }
     }
 }

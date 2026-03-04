@@ -6,6 +6,49 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 
+const BINARY_EXTS: &[&str] = &[
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".wav",
+    ".flac",
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+    ".eot",
+    ".jar",
+    ".class",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+];
+
+fn is_binary_ext(ext: &str) -> bool {
+    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+}
+
+
 fn decode_lines(blob: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(blob)
         .lines()
@@ -34,12 +77,6 @@ fn ext_of(path: &str) -> String {
     }
 }
 
-fn top_level_dir(path: &str) -> String {
-    match path.split_once('/') {
-        Some((top, _)) => top.to_string(),
-        None => ".".to_string(),
-    }
-}
 
 fn file_row(i: &FileInfo) -> FileRow {
     let name = i.path.split('/').last().unwrap_or(&i.path).to_string();
@@ -84,6 +121,18 @@ pub fn analyze_repo(
 
     for f in &files {
         let ext = ext_of(f);
+
+
+        if is_binary_ext(&ext) {
+            skipped_bin += 1;
+            infos.push(FileInfo {
+                path: f.clone(),
+                ext,
+                is_text: false,
+                loc: None,
+            });
+            continue;
+        }
 
         let blob: Vec<u8> = if git_ref == WORKTREE_REF {
             match git::read_worktree_file(repo, f) {
@@ -159,122 +208,83 @@ pub fn analyze_repo(
 }
 
 fn build_tree(infos: &[FileInfo]) -> DirNode {
-    let mut top_stats: HashMap<String, DirStats> = HashMap::new();
-    let mut root_stats = DirStats::default();
-
-    for i in infos {
-        root_stats.agg.add(i);
-        *root_stats.ext_counts.entry(i.ext.clone()).or_insert(0) += 1;
-
-        let top = top_level_dir(&i.path);
-        let ds = top_stats.entry(top).or_insert_with(DirStats::default);
-        ds.agg.add(i);
-        *ds.ext_counts.entry(i.ext.clone()).or_insert(0) += 1;
+    #[derive(Default)]
+    struct NodeBuild {
+        dirs: HashMap<String, NodeBuild>,
+        files: Vec<&'static FileInfo>,
+        stats: DirStats,
     }
 
-    let mut root = DirNode {
-        name: ".".to_string(),
-        full_path: "".to_string(),
-        children: vec![],
-        files: vec![],
-        stats: root_stats,
-    };
-
-    let mut by_top: HashMap<String, Vec<&FileInfo>> = HashMap::new();
-    for i in infos {
-        let top = top_level_dir(&i.path);
-        by_top.entry(top).or_default().push(i);
-    }
-
-    if let Some(root_files) = by_top.remove(".") {
-        for i in root_files {
-            root.files.push(file_row(i));
-        }
-        root.files.sort_by(|a, b| a.name.cmp(&b.name));
-    }
-
-    let mut tops: Vec<String> = by_top.keys().cloned().collect();
-    tops.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-
-    for top in tops {
-        let items = by_top.get(&top).unwrap();
-        let ds = top_stats.get(&top).cloned().unwrap_or_default();
-        root.children.push(build_subtree(top.clone(), items, ds));
-    }
-
-    root
-}
-
-#[derive(Default)]
-struct NodeBuild {
-    dirs: HashMap<String, NodeBuild>,
-    files: Vec<FileRow>,
-}
-
-fn build_subtree(top_name: String, items: &[&FileInfo], top_dir_stats: DirStats) -> DirNode {
-    let mut node = DirNode {
-        name: top_name.clone(),
-        full_path: top_name.clone(),
-        children: vec![],
-        files: vec![],
-        stats: top_dir_stats,
-    };
-
-    let mut nb = NodeBuild::default();
-
-    for i in items {
-        let rel = i
-            .path
-            .strip_prefix(&format!("{}/", top_name))
-            .unwrap_or(&i.path);
-        let parts: Vec<&str> = rel.split('/').collect();
-
-        if parts.len() == 1 {
-            nb.files.push(file_row(i));
-        } else {
-            let mut cur = &mut nb;
-            for d in &parts[..parts.len() - 1] {
-                cur = cur.dirs.entry((*d).to_string()).or_default();
+    fn add_to_stats(ds: &mut DirStats, i: &FileInfo) {
+        *ds.ext_files.entry(i.ext.clone()).or_insert(0) += 1;
+        if i.is_text {
+            if let Some(loc) = i.loc {
+                *ds.ext_loc.entry(i.ext.clone()).or_insert(0) += loc;
             }
-            cur.files.push(file_row(i));
         }
     }
 
     fn sort_node(n: &mut NodeBuild) {
-        n.files.sort_by(|a, b| a.name.cmp(&b.name));
+        n.files.sort_by(|a, b| {
+            let an = a.path.split('/').last().unwrap_or(a.path.as_str());
+            let bn = b.path.split('/').last().unwrap_or(b.path.as_str());
+            an.cmp(bn)
+        });
         for (_, child) in n.dirs.iter_mut() {
             sort_node(child);
         }
     }
-    sort_node(&mut nb);
 
-    fn build_children(parent_full: &str, map: &HashMap<String, NodeBuild>) -> Vec<DirNode> {
-        let mut keys: Vec<String> = map.keys().cloned().collect();
+    fn build_dirnode(name: String, full_path: String, nb: &NodeBuild) -> DirNode {
+        let mut files: Vec<FileRow> = nb.files.iter().map(|i| file_row(i)).collect();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut keys: Vec<String> = nb.dirs.keys().cloned().collect();
         keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
-        let mut out = vec![];
+        let mut children = Vec::with_capacity(keys.len());
         for k in keys {
-            let child = map.get(&k).unwrap();
-            let full = if parent_full.is_empty() {
+            let child = nb.dirs.get(&k).unwrap();
+            let child_full = if full_path.is_empty() {
                 k.clone()
             } else {
-                format!("{}/{}", parent_full, k)
+                format!("{}/{}", full_path, k)
             };
-
-            let dn = DirNode {
-                name: k.clone(),
-                full_path: full.clone(),
-                children: build_children(&full, &child.dirs),
-                files: child.files.clone(),
-                stats: DirStats::default(), // only root + top-level stats are meaningful currently
-            };
-
-            out.push(dn);
+            children.push(build_dirnode(k.clone(), child_full, child));
         }
-        out
+
+        DirNode {
+            name,
+            full_path,
+            children,
+            files,
+            stats: nb.stats.clone(),
+        }
     }
 
-    node.files = nb.files;
-    node.children = build_children(&node.full_path, &nb.dirs);
-    node
+    let mut root = NodeBuild::default();
+
+    for i in infos {
+        let i_static: &'static FileInfo = unsafe { &*(i as *const FileInfo) };
+
+        add_to_stats(&mut root.stats, i);
+
+        let mut cur = &mut root;
+        let parts: Vec<&str> = i.path.split('/').collect();
+        if parts.len() == 1 {
+            cur.files.push(i_static);
+            continue;
+        }
+
+        for d in &parts[..parts.len() - 1] {
+            cur = cur.dirs.entry((*d).to_string()).or_default();
+            add_to_stats(&mut cur.stats, i);
+        }
+
+        cur.files.push(i_static);
+    }
+
+    sort_node(&mut root);
+
+    build_dirnode(".".to_string(), "".to_string(), &root)
 }

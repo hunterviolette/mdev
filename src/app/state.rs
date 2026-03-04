@@ -8,6 +8,8 @@ use egui_extras::syntax_highlighting::CodeTheme;
 use std::collections::BTreeSet;
 
 use crate::capabilities::CapabilityBroker;
+use crate::capabilities::GitStatusEntry;
+
 use crate::model::{AnalysisResult, CommitEntry};
 use crate::platform::Platform;
 
@@ -416,9 +418,37 @@ impl UiState {
 pub struct TreeState {
     pub expand_cmd: Option<ExpandCmd>,
     pub context_selected_files: HashSet<String>,
-
     pub context_selected_by_ref: HashMap<String, HashSet<String>>,
+
+    pub context_initialized: bool,
+
+    pub modified_paths: HashSet<String>,
+    pub staged_paths: HashSet<String>,
+    pub untracked_paths: HashSet<String>,
+
+    pub git_status_by_path: HashMap<String, GitStatusEntry>,
+
+    pub last_auto_refresh_s: f64,
+    pub auto_refresh_interval_s: f64,
+
+    pub last_git_status_refresh_s: f64,
+    pub git_status_interval_s: f64,
+
+    pub analysis_refresh_pending: bool,
+    pub analysis_refresh_rx: Option<Receiver<Result<crate::model::AnalysisResult, String>>>,
+
+    pub rename_target: Option<String>,
+    pub rename_draft: String,
+
+    pub create_parent: Option<String>,
+    pub create_draft: String,
+    pub create_is_dir: bool,
+
+    pub confirm_delete_target: Option<String>,
+
+    pub modal_focus_request: bool,
 }
+
 
 pub struct FileViewerState {
     pub selected_file: Option<String>,
@@ -429,11 +459,21 @@ pub struct FileViewerState {
     pub file_content: String,
     pub file_content_err: Option<String>,
 
+    pub file_load_pending: bool,
+    pub file_load_rx: Option<std::sync::mpsc::Receiver<(u64, String, Result<Vec<u8>, String>)>>,
+    pub file_load_seq: u64,
+    pub file_load_path: Option<String>,
+
+    pub history_load_pending: bool,
+    pub history_load_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+
     pub edit_working_tree: bool,
     pub edit_buffer: String,
     pub edit_status: Option<String>,
 
     pub editor: CodeEditorState,
+    pub viewer_editor: CodeEditorState,
+
 
     pub show_diff: bool,
     pub diff_picker_open: bool,
@@ -455,11 +495,21 @@ impl FileViewerState {
             file_content: String::new(),
             file_content_err: None,
 
+            file_load_pending: false,
+            file_load_rx: None,
+            file_load_seq: 0,
+            file_load_path: None,
+
+            history_load_pending: false,
+            history_load_rx: None,
+
             edit_working_tree: false,
             edit_buffer: String::new(),
             edit_status: None,
 
             editor: CodeEditorState::default(),
+            viewer_editor: CodeEditorState::default(),
+
 
             show_diff: false,
             diff_picker_open: false,
@@ -694,6 +744,31 @@ impl AppState {
                 expand_cmd: None,
                 context_selected_files: HashSet::new(),
                 context_selected_by_ref: HashMap::new(),
+                context_initialized: false,
+
+                modified_paths: HashSet::new(),
+                staged_paths: HashSet::new(),
+                untracked_paths: HashSet::new(),
+                git_status_by_path: HashMap::new(),
+
+                last_auto_refresh_s: 0.0,
+                auto_refresh_interval_s: 1.0,
+
+                last_git_status_refresh_s: 0.0,
+                git_status_interval_s: 1.0,
+
+                analysis_refresh_pending: false,
+                analysis_refresh_rx: None,
+
+                rename_target: None,
+                rename_draft: String::new(),
+
+                create_parent: None,
+                create_draft: String::new(),
+                create_is_dir: false,
+
+                confirm_delete_target: None,
+                modal_focus_request: false,
             },
 
             canvases: vec![CanvasState {

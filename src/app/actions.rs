@@ -259,6 +259,10 @@ pub enum Action {
         path: String,
         untracked: bool,
     },
+
+    DiscardAllUnstaged {
+        sc_id: ComponentId,
+    },
     SetSourceControlBranch {
         sc_id: ComponentId,
         branch: String,
@@ -321,6 +325,11 @@ pub enum Action {
     LoadWorkspace,
 
     ToggleCommandPalette,
+
+    TreeDeletePath { path: String },
+    TreeRenamePath { from: String, to: String },
+    TreeCreateFile { path: String },
+    TreeCreateFolder { path: String },
 
     None,
 }

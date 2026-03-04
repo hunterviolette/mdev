@@ -1,6 +1,7 @@
 use crate::app::actions::{Action, ExpandCmd};
 use crate::app::state::{AppState, WORKTREE_REF};
 use crate::capabilities::{CapabilityRequest, CapabilityResponse};
+use regex::Regex;
 
 use std::collections::HashSet;
 
@@ -43,7 +44,6 @@ impl AppState {
 
         self.inputs.local_repo = Some(p.clone());
         self.inputs.repo = Some(p.clone());
-
 
         self.set_git_ref("HEAD".to_string());
 
@@ -88,6 +88,78 @@ impl AppState {
         }
     }
 
+    pub fn start_analysis_refresh_async(&mut self) {
+        if self.tree.analysis_refresh_pending {
+            return;
+        }
+        let Some(repo) = self.inputs.repo.clone() else {
+            return;
+        };
+        if self.inputs.git_ref != WORKTREE_REF {
+            return;
+        }
+
+        let git_ref = self.inputs.git_ref.clone();
+        let exclude = self.compile_excludes_raw();
+        let max_exts = self.inputs.max_exts;
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<crate::model::AnalysisResult, String>>();
+        self.tree.analysis_refresh_pending = true;
+        self.tree.analysis_refresh_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let compiled: Result<Vec<Regex>, String> = exclude
+                .into_iter()
+                .map(|p| Regex::new(&p).map_err(|e| format!("Bad exclude regex '{p}': {e}")))
+                .collect();
+
+            let res = match compiled {
+                Ok(c) => crate::analyze::analyze_repo(&repo, &git_ref, &c, max_exts)
+                    .map_err(|e| format!("{:#}", e)),
+                Err(e) => Err(e),
+            };
+
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn poll_analysis_refresh(&mut self) -> bool {
+        if !self.tree.analysis_refresh_pending {
+            return false;
+        }
+        let Some(rx) = &self.tree.analysis_refresh_rx else {
+            self.tree.analysis_refresh_pending = false;
+            return false;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(res)) => {
+                self.reconcile_context_selection(&res);
+                self.results.result = Some(res);
+                self.results.error = None;
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                if self.inputs.git_ref == WORKTREE_REF {
+                    self.refresh_tree_git_status();
+                }
+                true
+            }
+            Ok(Err(err)) => {
+                self.results.error = Some(err);
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.results.error = Some("Auto-refresh channel disconnected.".to_string());
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                true
+            }
+        }
+    }
+
     pub(crate) fn run_analysis(&mut self) {
         self.results.error = None;
         self.results.result = None;
@@ -123,15 +195,68 @@ impl AppState {
 
                 self.results.result = Some(res);
                 self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
+
+                if self.inputs.git_ref == WORKTREE_REF {
+                    self.refresh_tree_git_status();
+                }
             }
             Ok(_) => self.results.error = Some("Unexpected response from analysis.".into()),
             Err(e) => self.results.error = Some(format!("{:#}", e)),
         }
     }
 
+    pub fn refresh_tree_git_status(&mut self) {
+        let Some(repo) = self.inputs.repo.clone() else {
+            self.tree.modified_paths.clear();
+            self.tree.staged_paths.clear();
+            self.tree.untracked_paths.clear();
+            return;
+        };
+
+        if self.inputs.git_ref != WORKTREE_REF {
+            self.tree.modified_paths.clear();
+            self.tree.staged_paths.clear();
+            self.tree.untracked_paths.clear();
+            return;
+        }
+
+        let st = match self.broker.exec(CapabilityRequest::GitStatus { repo }) {
+            Ok(CapabilityResponse::GitStatus(v)) => v,
+            _ => {
+                self.tree.modified_paths.clear();
+                self.tree.staged_paths.clear();
+                self.tree.untracked_paths.clear();
+                self.tree.git_status_by_path.clear();
+                return;
+            }
+        };
+
+        self.tree.modified_paths.clear();
+        self.tree.staged_paths.clear();
+        self.tree.untracked_paths.clear();
+        self.tree.git_status_by_path.clear();
+
+        for f in st.files {
+            self.tree.git_status_by_path.insert(f.path.clone(), f.clone());
+
+            if f.untracked {
+                self.tree.untracked_paths.insert(f.path.clone());
+                self.tree.modified_paths.insert(f.path);
+                continue;
+            }
+            if f.staged {
+                self.tree.staged_paths.insert(f.path.clone());
+            }
+            if f.worktree_status.trim() != "" || f.index_status.trim() != "" {
+                self.tree.modified_paths.insert(f.path);
+            }
+        }
+    }
+
     fn reconcile_context_selection(&mut self, res: &crate::model::AnalysisResult) {
-        if self.tree.context_selected_files.is_empty() {
+        if !self.tree.context_initialized {
             self.set_context_selection_all(res);
+            self.tree.context_initialized = true;
             return;
         }
 

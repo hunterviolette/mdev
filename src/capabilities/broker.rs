@@ -69,6 +69,12 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
+            CapabilityRequest::CreateWorktreeDir { repo, path } => {
+                git::create_worktree_dir(&repo, &path)
+                    .with_context(|| format!("create_worktree_dir failed for {path}"))?;
+                Ok(CapabilityResponse::Unit)
+            }
+
             CapabilityRequest::DeleteWorktreePath { repo, path } => {
                 git::delete_worktree_path(&repo, &path)
                     .with_context(|| format!("delete_worktree_path failed for {path}"))?;

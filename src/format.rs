@@ -1,34 +1,42 @@
 use crate::model::DirStats;
 
 pub fn format_top_stats(ds: &DirStats, max_exts: usize) -> String {
-    let min_s = ds.agg.loc_min.map(|v| v.to_string()).unwrap_or("-".into());
-    let max_s = ds.agg.loc_max.map(|v| v.to_string()).unwrap_or("-".into());
+    let total_files: u64 = ds.ext_files.values().copied().sum();
 
-    let mut items: Vec<(&String, &u64)> = ds.ext_counts.iter().collect();
-    items.sort_by(|(e1, c1), (e2, c2)| c2.cmp(c1).then_with(|| e1.cmp(e2)));
+    let mut exts: Vec<&String> = ds.ext_files.keys().collect();
+    exts.sort_by(|a, b| {
+        let af = ds.ext_files.get(*a).copied().unwrap_or(0);
+        let bf = ds.ext_files.get(*b).copied().unwrap_or(0);
+        let al = ds.ext_loc.get(*a).copied().unwrap_or(0);
+        let bl = ds.ext_loc.get(*b).copied().unwrap_or(0);
+        bf.cmp(&af).then_with(|| bl.cmp(&al)).then_with(|| a.cmp(b))
+    });
 
-    let mut parts = Vec::new();
-    let mut other_sum = 0u64;
-    for (idx, (ext, cnt)) in items.iter().enumerate() {
+    let mut parts: Vec<String> = Vec::new();
+    let mut other_files: u64 = 0;
+    let mut other_loc: u64 = 0;
+
+    for (idx, ext) in exts.iter().enumerate() {
+        let files = ds.ext_files.get(*ext).copied().unwrap_or(0);
+        let loc = ds.ext_loc.get(*ext).copied().unwrap_or(0);
+
         if idx < max_exts {
-            parts.push(format!("{}:{}", ext, cnt));
+            parts.push(format!("{}:{}/{}", ext, files, loc));
         } else {
-            other_sum += **cnt;
+            other_files += files;
+            other_loc += loc;
         }
     }
-    if other_sum > 0 {
-        parts.push(format!("other:{}", other_sum));
+
+    if other_files > 0 {
+        parts.push(format!("other:{}/{}", other_files, other_loc));
     }
 
-    format!(
-        "files:{} text:{} avg:{:.1} min:{} max:{} | {}",
-        ds.agg.files_all,
-        ds.agg.files_text,
-        ds.agg.avg(),
-        min_s,
-        max_s,
-        parts.join(", ")
-    )
+    if parts.is_empty() {
+        format!("Files:{}", total_files)
+    } else {
+        format!("Files:{} | {}", total_files, parts.join(", "))
+    }
 }
 
 pub fn join_excludes(excludes: &[String]) -> String {

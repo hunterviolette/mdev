@@ -63,6 +63,11 @@ pub enum CapabilityRequest {
         contents: Vec<u8>,
     },
 
+    CreateWorktreeDir {
+        repo: PathBuf,
+        path: String, // repo-relative
+    },
+
     DeleteWorktreePath {
         repo: PathBuf,
         path: String, // repo-relative
