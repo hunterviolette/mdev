@@ -24,13 +24,11 @@ fn apply_theme(ctx: &egui::Context, state: &mut AppState) {
         theme.clone().store_in_memory(ctx);
         state.theme.code_theme = theme;
 
-        // Keep theme apply cache in sync so the next frame doesn't redo work.
         state.theme.last_applied_dark = Some(state.theme.prefs.dark);
         state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     } else {
         state.theme.code_theme = CodeTheme::from_memory(ctx);
 
-        // Keep theme apply cache in sync so the next frame doesn't redo work.
         state.theme.last_applied_dark = Some(state.theme.prefs.dark);
         state.theme.last_applied_syntect_theme = Some(state.theme.prefs.syntect_theme.clone());
     }
@@ -50,9 +48,12 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
     }
 
     let screen = ctx.screen_rect();
-    let popup_rect = centered_rect(screen, 480.0, 420.0);
+    let popup_rect = centered_rect(
+        screen,
+        (screen.width() - 32.0).min(640.0).max(480.0),
+        (screen.height() - 32.0).min(760.0).max(420.0),
+    );
 
-    // Close on Esc.
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::CloseCanvasTintPopup);
         return actions;
@@ -66,14 +67,12 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
         .show(ctx, |ui| {
             ui.set_min_size(screen.size());
 
-            // Visual dim over everything.
             ui.painter().rect_filled(
                 screen,
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
             );
 
-            // Create four interactive regions around popup_rect.
             let top = egui::Rect::from_min_max(screen.min, egui::pos2(screen.max.x, popup_rect.min.y));
             let bottom = egui::Rect::from_min_max(egui::pos2(screen.min.x, popup_rect.max.y), screen.max);
             let left = egui::Rect::from_min_max(
@@ -85,7 +84,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                 egui::pos2(screen.max.x, popup_rect.max.y),
             );
 
-            // Capture clicks (and drags) in these regions.
             for r in [top, bottom, left, right] {
                 if r.is_positive() {
                     let resp = ui.allocate_rect(r, egui::Sense::click_and_drag());
@@ -101,9 +99,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
         return actions;
     }
 
-    // -------------------------------
-    // Popup (on top)
-    // -------------------------------
     egui::Area::new(egui::Id::new("canvas_tint_popup"))
         .order(egui::Order::Foreground)
         .fixed_pos(popup_rect.min)
@@ -116,6 +111,17 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                 .shadow(ui.style().visuals.popup_shadow)
                 .show(ui, |ui| {
                     ui.set_min_size(popup_rect.size());
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
 
                     ui.horizontal(|ui| {
                         ui.heading("Personalization");
@@ -130,9 +136,6 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                     ui.label("Theme + visual workspace hints.");
                     ui.separator();
 
-                    // -------------------------------
-                    // Theme (moved from top bar)
-                    // -------------------------------
                     ui.label("Theme:");
                     let was_dark = state.theme.prefs.dark;
 
@@ -182,10 +185,8 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                         let arr = col.to_array();
                         let next = [arr[0], arr[1], arr[2], arr[3]];
 
-                        // Update draft immediately for stable UI.
                         state.ui.canvas_tint_draft = Some(next);
 
-                        // Apply immediately so the canvas tint updates live.
                         actions.push(Action::SetCanvasBgTint { rgba: Some(next) });
                     }
 
@@ -195,6 +196,52 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                         ui.monospace(format!("[{},{},{},{}]", arr[0], arr[1], arr[2], arr[3]));
                     });
 
+                    ui.separator();
+                    ui.label("Startup layout:");
+
+                    let has_startup_override = state.startup_layout_override_exists();
+                    ui.horizontal(|ui| {
+                        ui.label("Using:");
+                        ui.monospace(if has_startup_override { "Local override" } else { "Compiled/hardcoded default" });
+                    });
+
+                    let screen_size = ctx.screen_rect().size();
+                    let canvas_size = [screen_size.x.max(1.0), screen_size.y.max(1.0)];
+                    let viewport_outer_pos = None;
+                    let viewport_inner_size = Some([screen_size.x.max(1.0), screen_size.y.max(1.0)]);
+                    let pixels_per_point = ctx.pixels_per_point();
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Use current layout as startup default").clicked() {
+                            actions.push(Action::SaveStartupLayoutOverride {
+                                canvas_size,
+                                viewport_outer_pos,
+                                viewport_inner_size,
+                                pixels_per_point,
+                            });
+                        }
+
+                        if ui
+                            .add_enabled(has_startup_override, egui::Button::new("Reset startup layout"))
+                            .clicked()
+                        {
+                            actions.push(Action::ClearStartupLayoutOverride);
+                        }
+                    });
+
+                    if cfg!(debug_assertions) {
+                        ui.add_space(4.0);
+                        if ui.button("Export current layout to assets/default_startup_layout.json").clicked() {
+                            actions.push(Action::ExportBuiltInStartupLayout {
+                                canvas_size,
+                                viewport_outer_pos,
+                                viewport_inner_size,
+                                pixels_per_point,
+                            });
+                        }
+                    }
+
+                    ui.add_space(8.0);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Reset").clicked() {
@@ -213,7 +260,10 @@ pub fn personalization(ctx: &egui::Context, state: &mut AppState) -> Vec<Action>
                             actions.push(Action::CloseCanvasTintPopup);
                         }
                     });
+                    });
+                    });
                 });
+            });
         });
 
     actions

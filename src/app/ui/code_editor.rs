@@ -1,12 +1,15 @@
-// src/app/ui/code_editor.rs
 use std::collections::HashMap;
 
 use eframe::egui;
 use egui_extras::syntax_highlighting::highlight;
 
-use crate::app::ui::helpers::language_hint_for_path;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorMode {
+    Editable,
+    ReadOnly,
+}
 
-/// Persistent editor state (cursor, selection, caches).
+
 #[derive(Clone, Debug)]
 pub struct CodeEditorState {
     pub cursor_cc: usize,
@@ -15,13 +18,11 @@ pub struct CodeEditorState {
     pub line_cache: HashMap<usize, (u64, u32, egui::text::LayoutJob)>,
     pub has_focus: bool,
 
-    // Undo/Redo
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
     frame_snapshot_taken: bool,
     undo_capacity: usize,
 
-    // Find/Replace
     pub find_open: bool,
     pub find_query: String,
     pub replace_query: String,
@@ -29,17 +30,13 @@ pub struct CodeEditorState {
     pub find_match_case: bool, // "Aa" (exact case)
     pub find_whole_word: bool, // "W" (whole-word / exact match)
 
-    //  track the "current" find match (Prev/Next) so we can color it differently
     pub active_find_match_cc: Option<(usize, usize)>,
 
-    // Mouse selection
     mouse_selecting: bool,
     mouse_anchor_cc: Option<usize>, // persistent drag anchor across frames
 
-    // Scroll state (for PgUp/PgDn scrolling)
     scroll_offset: egui::Vec2,
 
-    // Scroll-to support (e.g. Find next/prev)
     pending_scroll_to_cc: Option<usize>,
 }
 
@@ -90,7 +87,6 @@ fn clamp_cc(s: &str, cc: usize) -> usize {
     cc.min(cc_len(s))
 }
 
-/// Convert char-index to byte-index (O(n), used only on edits/selection ops).
 fn cc_to_bc(s: &str, cc: usize) -> usize {
     if cc == 0 {
         return 0;
@@ -105,7 +101,6 @@ fn cc_to_bc(s: &str, cc: usize) -> usize {
     s.len()
 }
 
-/// Convert byte-index to char-index (O(n)).
 fn bc_to_cc(s: &str, bc: usize) -> usize {
     let mut cc = 0usize;
     for (bi, _ch) in s.char_indices() {
@@ -117,7 +112,6 @@ fn bc_to_cc(s: &str, bc: usize) -> usize {
     cc
 }
 
-/// Selection range in cc (if any).
 fn selection_range(st: &CodeEditorState) -> Option<(usize, usize)> {
     let a = st.selection_anchor_cc?;
     let b = st.cursor_cc;
@@ -290,7 +284,6 @@ fn move_word_right(text: &str, st: &mut CodeEditorState, selecting: bool) {
     st.cursor_cc = i.min(len);
 }
 
-/// Compute (line, col) from cc, clamped safely to the current text.
 fn cc_to_lc_safe(text: &str, cc: usize) -> (usize, usize) {
     let cc = clamp_cc(text, cc);
     let mut cur_cc = 0usize;
@@ -311,7 +304,6 @@ fn cc_to_lc_safe(text: &str, cc: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Numeric line metrics (no borrowing `text` slices).
 fn compute_line_metrics(text: &str) -> (Vec<usize>, Vec<usize>) {
     let mut starts: Vec<usize> = vec![0];
     let mut lens: Vec<usize> = Vec::new();
@@ -353,13 +345,11 @@ fn lc_to_cc_metrics(starts: &[usize], lens: &[usize], line: usize, col: usize) -
     starts[line] + col
 }
 
-// --- Scroll-to helpers (for Find next/prev, etc.) ---
 
 fn request_scroll_to_cc(st: &mut CodeEditorState, cc: usize) {
     st.pending_scroll_to_cc = Some(cc);
 }
 
-/// Ensure a given cc is visible by adjusting vertical scroll offset.
 fn apply_scroll_to_cc_if_needed(
     text: &str,
     st: &mut CodeEditorState,
@@ -450,7 +440,6 @@ impl CodeEditorState {
     }
 }
 
-// --- Find helpers ---
 
 fn ascii_eq_ignore_case(a: u8, b: u8) -> bool {
     if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() {
@@ -573,7 +562,6 @@ fn find_line_matches_cols(
     out
 }
 
-//  now records which match is the "active" find match
 fn select_match(text: &str, st: &mut CodeEditorState, a_bc: usize, b_bc: usize) {
     let a_cc = bc_to_cc(text, a_bc);
     let b_cc = bc_to_cc(text, b_bc);
@@ -581,7 +569,6 @@ fn select_match(text: &str, st: &mut CodeEditorState, a_bc: usize, b_bc: usize) 
     st.active_find_match_cc = Some((a_cc.min(b_cc), a_cc.max(b_cc)));
 }
 
-// --- Monospace measuring (fast + stable) ---
 
 fn monospace_char_width(ui: &egui::Ui) -> f32 {
     ui.fonts(|f| {
@@ -607,7 +594,6 @@ fn click_to_col(ui: &egui::Ui, line: &str, x: f32, line_left: f32) -> usize {
     (col.min(maxc)) as usize
 }
 
-// --- Key consumption helpers ---
 
 fn mods_none() -> egui::Modifiers {
     egui::Modifiers::NONE
@@ -649,18 +635,20 @@ fn consume_key_variants(i: &mut egui::InputState, key: egui::Key) {
     let _ = i.consume_key(mods_cmd_shift(), key);
 }
 
-/// Fast editor widget. Returns true if buffer changed this frame.
 pub fn code_editor(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     theme: &egui_extras::syntax_highlighting::CodeTheme,
     id_source: &str,
-    path_for_language: &str,
+    language_hint: &str,
     text: &mut String,
     st: &mut CodeEditorState,
+    mode: EditorMode,
 ) -> bool {
 
     st.begin_frame();
+
+    let editable = matches!(mode, EditorMode::Editable);
 
     let mut changed = false;
 
@@ -677,7 +665,6 @@ pub fn code_editor(
         st.has_focus = ui.memory(|m| m.has_focus(editor_id));
     }
 
-    // ---- Find/Replace bar ----
     let mut find_bar_height = 0.0;
     let mut pending_find_next = false;
     let mut pending_find_prev = false;
@@ -768,7 +755,6 @@ pub fn code_editor(
     let mut pending_cut = false;
     let mut pending_scroll_pages: i32 = 0;
 
-    // ---- Keyboard input (only when focused) ----
     if st.has_focus {
         ui.memory_mut(|m| {
             m.set_focus_lock_filter(
@@ -789,7 +775,6 @@ pub fn code_editor(
 
             let (starts, lens) = compute_line_metrics(text);
 
-            // PageUp / PageDown: SCROLL ONLY
             if i.key_pressed(egui::Key::PageUp) {
                 pending_scroll_pages -= 1;
                 consume_key_variants(i, egui::Key::PageUp);
@@ -801,7 +786,6 @@ pub fn code_editor(
                 wants_repaint = true;
             }
 
-            // Arrow Left / Right
             if i.key_pressed(egui::Key::ArrowLeft) {
                 st.active_find_match_cc = None;
                 let shift = i.modifiers.shift;
@@ -827,7 +811,6 @@ pub fn code_editor(
                 wants_repaint = true;
             }
 
-            // Arrow Up / Down
             if i.key_pressed(egui::Key::ArrowUp) {
                 st.active_find_match_cc = None;
                 let shift = i.modifiers.shift;
@@ -858,7 +841,6 @@ pub fn code_editor(
                 wants_repaint = true;
             }
 
-            // Home / End
             if i.key_pressed(egui::Key::Home) {
                 st.active_find_match_cc = None;
                 let shift = i.modifiers.shift;
@@ -897,7 +879,6 @@ pub fn code_editor(
                 wants_repaint = true;
             }
 
-            // --- Event-driven editing / clipboard ---
             for ev in i.events.iter() {
                 match ev {
                     egui::Event::Copy => pending_copy = true,
@@ -908,13 +889,13 @@ pub fn code_editor(
                         let ctrl = modifiers.ctrl || modifiers.command;
 
                         match key {
-                            egui::Key::Z if ctrl => {
+                            egui::Key::Z if ctrl && editable => {
                                 st.active_find_match_cc = None;
                                 if shift { st.redo(text); } else { st.undo(text); }
                                 changed = true;
                                 wants_repaint = true;
                             }
-                            egui::Key::Y if ctrl => {
+                            egui::Key::Y if ctrl && editable => {
                                 st.active_find_match_cc = None;
                                 st.redo(text);
                                 changed = true;
@@ -935,7 +916,7 @@ pub fn code_editor(
                             }
 
                             egui::Key::C if ctrl => pending_copy = true,
-                            egui::Key::X if ctrl => pending_cut = true,
+                            egui::Key::X if ctrl && editable => pending_cut = true,
 
                             egui::Key::A if ctrl => {
                                 st.active_find_match_cc = None;
@@ -943,26 +924,26 @@ pub fn code_editor(
                                 wants_repaint = true;
                             }
 
-                            egui::Key::Backspace => {
+                            egui::Key::Backspace if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 if ctrl { changed |= delete_prev_word(text, st); }
                                 else { changed |= delete_prev_char(text, st); }
                                 wants_repaint = true;
                             }
-                            egui::Key::Delete => {
+                            egui::Key::Delete if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= delete_next_char(text, st);
                                 wants_repaint = true;
                             }
-                            egui::Key::Enter => {
+                            egui::Key::Enter if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= insert_text(text, st, "\n");
                                 wants_repaint = true;
                             }
-                            egui::Key::Tab => {
+                            egui::Key::Tab if editable => {
                                 st.active_find_match_cc = None;
                                 st.take_undo_snapshot_if_needed(text);
                                 changed |= insert_text(text, st, "    ");
@@ -973,7 +954,7 @@ pub fn code_editor(
                         }
                     }
 
-                    egui::Event::Text(t) => {
+                    egui::Event::Text(t) if editable => {
                         if ctrl_down {
                             continue;
                         }
@@ -985,7 +966,7 @@ pub fn code_editor(
                         }
                     }
 
-                    egui::Event::Paste(t) => {
+                    egui::Event::Paste(t) if editable => {
                         st.active_find_match_cc = None;
                         st.take_undo_snapshot_if_needed(text);
                         changed |= insert_text(text, st, t);
@@ -1002,7 +983,6 @@ pub fn code_editor(
         }
     }
 
-    // ---- Find/Replace actions ----
     if st.find_open && !st.find_query.is_empty() {
         let matches = find_all_matches(
             text,
@@ -1037,7 +1017,7 @@ pub fn code_editor(
             }
         }
 
-        if pending_replace {
+        if editable && pending_replace {
             if !matches.is_empty() {
                 let (a_bc, b_bc) = matches[st.find_match_index];
                 st.take_undo_snapshot_if_needed(text);
@@ -1055,7 +1035,7 @@ pub fn code_editor(
             }
         }
 
-        if pending_replace_all {
+        if editable && pending_replace_all {
             if !matches.is_empty() {
                 st.take_undo_snapshot_if_needed(text);
 
@@ -1086,7 +1066,6 @@ pub fn code_editor(
         st.line_cache.clear();
     }
 
-    // ---- Render area below find bar ----
     let text_rect = if st.find_open {
         let top = outer_rect.top() + find_bar_height;
         egui::Rect::from_min_max(egui::pos2(outer_rect.left(), top), outer_rect.max)
@@ -1101,7 +1080,7 @@ pub fn code_editor(
     ui.allocate_ui_at_rect(text_rect, |ui| {
         ui.set_clip_rect(text_rect);
 
-        let language = language_hint_for_path(path_for_language);
+        let language = language_hint;
         let lines: Vec<&str> = text.split('\n').collect();
 
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(16.0);
@@ -1154,14 +1133,12 @@ pub fn code_editor(
                         st.has_focus = true;
                     }
 
-                    // current line highlight
                     if st.has_focus && caret_line == row {
                         let mut line_fill = ui.visuals().selection.bg_fill;
                         line_fill = line_fill.linear_multiply(0.18);
                         ui.painter().rect_filled(row_rect, 0.0, line_fill);
                     }
 
-                    // highlight all visible matches on this line (lighter)
                     if st.find_open && !st.find_query.is_empty() {
                         let mut match_fill = ui.visuals().selection.bg_fill;
                         match_fill = match_fill.linear_multiply(0.35);
@@ -1184,7 +1161,6 @@ pub fn code_editor(
                         }
                     }
 
-                    //  selection background: if it's the "active find match", use yellow
                     if let Some((a, b)) = selection_range(st) {
                         let sa = a.max(line_start_cc).min(line_end_cc);
                         let sb = b.max(line_start_cc).min(line_end_cc);
@@ -1215,15 +1191,12 @@ pub fn code_editor(
                         }
                     }
 
-                    // draw highlighted line
                     let galley = ui.fonts(|f| f.layout_job(job));
                     ui.painter().galley(row_rect.left_top(), galley, ui.visuals().text_color());
 
-                    // click / drag start
                     if (row_resp.clicked() || row_resp.drag_started()) && st.has_focus {
                         if let Some(pos) = pointer_pos {
                             if row_rect.contains(pos) {
-                                // any manual selection clears "active find match"
                                 st.active_find_match_cc = None;
 
                                 let col = click_to_col(ui, line, pos.x, row_rect.left());
@@ -1255,7 +1228,6 @@ pub fn code_editor(
                         }
                     }
 
-                    // drag selection
                     if st.mouse_selecting && pointer_down {
                         if let Some(pos) = pointer_pos {
                             if row_rect.contains(pos) {
@@ -1276,7 +1248,6 @@ pub fn code_editor(
                         }
                     }
 
-                    // end selection
                     if st.mouse_selecting && !pointer_down {
                         st.mouse_selecting = false;
                         st.mouse_anchor_cc = None;
@@ -1288,7 +1259,6 @@ pub fn code_editor(
                         }
                     }
 
-                    // caret
                     if st.has_focus {
                         let cur_cc = clamp_cc(text, st.cursor_cc);
                         if cur_cc >= line_start_cc && cur_cc <= line_end_cc {
@@ -1325,7 +1295,6 @@ pub fn code_editor(
         ctx.request_repaint();
     }
 
-    // Clipboard ops AFTER selection updated
     if pending_copy {
         if let Some((a, b)) = selection_range(st) {
             if a != b {
@@ -1336,7 +1305,7 @@ pub fn code_editor(
         }
     }
 
-    if pending_cut {
+    if editable && pending_cut {
         if let Some((a, b)) = selection_range(st) {
             if a != b {
                 let a_bc = cc_to_bc(text, a);

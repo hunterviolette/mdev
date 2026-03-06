@@ -5,14 +5,6 @@ use crate::app::actions::TerminalShell;
 
 use super::{CommandOutput, Platform};
 
-/// Future wasm32 implementation.
-///
-/// In a browser you can't:
-/// - access arbitrary local folders
-/// - spawn shell processes
-/// - write to arbitrary disk paths
-///
-/// So this is intentionally a stub to keep foundations clean.
 #[derive(Clone, Debug, Default)]
 pub struct WebPlatform;
 

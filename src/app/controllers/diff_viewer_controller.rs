@@ -67,10 +67,6 @@ impl AppState {
         self.refresh_diff_viewer(target_id);
     }
 
-    /// Open a path in a Diff Viewer.
-    /// - If there is an active Diff Viewer and it is open -> reuse it
-    /// - Else reuse the most recently open Diff Viewer
-    /// - Else create a new Diff Viewer component
     pub fn open_or_attach_diff_viewer(&mut self, path: String) {
         let mut target = self
             .active_diff_viewer_id()
@@ -180,7 +176,6 @@ impl AppState {
             source: old_source,
         }) {
             Ok(CapabilityResponse::Bytes(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-            // Missing file in old ref => treat as empty
             Err(_) => String::new(),
             Ok(_) => String::new(),
         };
@@ -212,7 +207,6 @@ impl AppState {
         }
     }
 
-    /// Keep `diff_viewers` in sync with the current layout.
     pub fn rebuild_diff_viewers_from_layout(&mut self) {
         self.diff_viewers.clear();
 
@@ -245,9 +239,6 @@ impl AppState {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Diff algorithm (LCS-based, correct + simple) -> side-by-side alignment
-// -----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
@@ -260,7 +251,6 @@ fn build_side_by_side_rows(old_text: &str, new_text: &str) -> Vec<DiffRow> {
     let a: Vec<&str> = old_text.lines().collect();
     let b: Vec<&str> = new_text.lines().collect();
 
-    // Correct op stream (no “whole file delete+add” for small edits)
     let ops = lcs_ops(&a, &b);
 
     let mut rows: Vec<DiffRow> = Vec::new();
@@ -269,7 +259,6 @@ fn build_side_by_side_rows(old_text: &str, new_text: &str) -> Vec<DiffRow> {
     let mut a_ln = 1usize;
     let mut b_ln = 1usize;
 
-    // Coalesce runs of deletes+inserts into Change rows (VS Code-like)
     let mut k = 0usize;
     while k < ops.len() {
         match ops[k] {
@@ -358,13 +347,10 @@ fn build_side_by_side_rows(old_text: &str, new_text: &str) -> Vec<DiffRow> {
     rows
 }
 
-/// Build a correct edit script using an LCS DP table.
-/// This is O(n*m) but is robust and produces stable, intuitive diffs.
 fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
     let n = a.len();
     let m = b.len();
 
-    // dp[i][j] = LCS length of a[i..] and b[j..]
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
 
     for i in (0..n).rev() {
@@ -377,7 +363,6 @@ fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
         }
     }
 
-    // Reconstruct edit script
     let mut ops = Vec::with_capacity(n + m);
     let mut i = 0usize;
     let mut j = 0usize;

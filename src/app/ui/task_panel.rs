@@ -1,4 +1,3 @@
-// src/app/ui/task_panel.rs
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId, ConversationId};
@@ -57,7 +56,6 @@ fn fmt_dt(ms: u64) -> String {
 }
 
 fn oai_id_tail_last_10(oai_id: &str) -> String {
-    // Char-safe tail (OpenAI ids are ASCII-ish, but keep this correct for Unicode anyway).
     let tail: String = oai_id.chars().rev().take(10).collect::<String>().chars().rev().collect();
     if oai_id.chars().count() > 10 {
         format!("…{}", tail)
@@ -74,14 +72,11 @@ pub fn task_panel(
 ) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::new();
 
-    // Local (non-persisted) multi-select state per task.
-    // Stored in AppState.ui to avoid `static mut` (and to keep selection stable across frames).
     let selected_conversations: &mut BTreeSet<ConversationId> = {
         let map = state.ui.task_panel_selected_loops_mut();
         map.entry(task_id).or_insert_with(BTreeSet::new)
     };
 
-    // Avoid holding a mutable borrow of `state.tasks` across UI closures.
     let (_task_paused, _task_bound_execute_loop, task_active_conversation) = {
         let task = state.tasks.entry(task_id).or_default();
         (task.paused, task.bound_execute_loop, task.active_conversation)
@@ -145,7 +140,6 @@ pub fn task_panel(
     ui.group(|ui| {
         ui.label("Chats (Conversations) — status / stats");
 
-        // List Task-owned durable conversations.
         let mut ids: Vec<ConversationId> = state
             .tasks
             .get(&task_id)
@@ -185,10 +179,8 @@ pub fn task_panel(
                     let post_total = snap.postprocess_ok + snap.postprocess_err;
                     let post_ok = snap.postprocess_ok;
 
-                    // Snapshot status (task-scoped durable view).
                     let status = status_string_from_snapshot(snap);
 
-                    // Selection checkbox
                     let mut is_sel = selected_conversations.contains(&conversation_id);
                     if ui.checkbox(&mut is_sel, "").changed() {
                         if is_sel {
@@ -201,8 +193,6 @@ pub fn task_panel(
                     ui.horizontal(|ui| {
                         let selected = task_active_conversation == Some(conversation_id);
 
-                        // Display: last 10 chars of the OpenAI conversation id (conv_...), if present.
-                        // Hover: show full OpenAI id and internal ConversationId.
                         let (display, _hover) = match snap.conversation_id.as_deref() {
                             Some(full) if !full.trim().is_empty() => {
                                 let tail = oai_id_tail_last_10(full);
@@ -216,7 +206,6 @@ pub fn task_panel(
 
                         let resp = ui.selectable_label(selected, display);
 
-                        // Hover: show full OpenAI conversation id + usage hint.
                         let resp = if let Some(full) = snap.conversation_id.as_deref().filter(|s| !s.trim().is_empty()) {
                             let hover = format!("{}\n\nLeft-click: open\nRight-click: copy id", full);
                             resp.on_hover_text(hover)
@@ -224,14 +213,12 @@ pub fn task_panel(
                             resp.on_hover_text("(no OpenAI conversation id yet)\n\nLeft-click: open\nRight-click: copy id")
                         };
 
-                        // Right-click: copy full OpenAI conversation id to clipboard.
                         if resp.clicked_by(eframe::egui::PointerButton::Secondary) {
                             if let Some(full) = snap.conversation_id.as_deref().filter(|s| !s.trim().is_empty()) {
                                 ui.output_mut(|o| o.copied_text = full.to_string());
                             }
                         }
 
-                        // Left-click: open (existing behavior).
                         if resp.clicked() {
                             actions.push(Action::TaskOpenConversation {
                                 task_id,

@@ -1,4 +1,3 @@
-// src/git.rs
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -56,7 +55,6 @@ fn split_lines(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Dropdown refs: HEAD first, then local branches, then remotes (excluding */HEAD).
 pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     ensure_git_repo(repo)?;
 
@@ -77,11 +75,9 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     all.append(&mut local_refs);
     all.append(&mut remote_refs);
 
-    // stable cleanup
     all.sort();
     all.dedup();
 
-    // enforce HEAD first
     if let Some(pos) = all.iter().position(|s| s == "HEAD") {
         all.remove(pos);
     }
@@ -90,9 +86,6 @@ pub fn list_git_refs_for_dropdown(repo: &Path) -> Result<Vec<String>> {
     Ok(all)
 }
 
-// -----------------------------------------------------------------------------
-// Source control (git) capabilities
-// -----------------------------------------------------------------------------
 
 fn run_git_text_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, String, String)> {
     let (code, stdout, stderr) = run_git_allow_fail(repo, args)?;
@@ -245,8 +238,6 @@ pub fn git_stage_all(repo: &Path) -> Result<()> {
 
 pub fn git_unstage_all(repo: &Path) -> Result<()> {
     ensure_git_repo(repo)?;
-    // `git restore` does not support `-A`. To unstage everything, provide a pathspec.
-    // Running from repo root, "." covers the whole worktree.
     let _ = run_git(repo, &["restore", "--staged", "--", "."])?;
     Ok(())
 }
@@ -383,13 +374,10 @@ pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
 }
 
 
-/// Returns raw bytes of file content at `spec` where spec is like "<ref>:<path>".
 pub fn show_file_at(repo: &Path, spec: &str) -> Result<Vec<u8>> {
     run_git(repo, &["show", spec])
 }
 
-/// Returns history lines for a file at repo-relative `path`.
-/// If not a git repo, returns empty (so UI still works in plain working trees).
 pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     if ensure_git_installed().is_err() || ensure_git_repo(repo).is_err() {
         return Ok(Vec::new());
@@ -400,7 +388,7 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
         &[
             "log",
             "--no-color",
-            "--pretty=format:%H|%ct|%s",
+            "--pretty=format:%H%x1f%ct%x1f%s",
             "-n",
             &max.to_string(),
             "--",
@@ -409,7 +397,6 @@ pub fn file_history(repo: &Path, path: &str, max: usize) -> Result<Vec<u8>> {
     )
 }
 
-/// --- FS fallback helpers (for plain working trees) ---
 
 fn normalize_rel_path(p: &Path) -> Option<String> {
     let s = p.to_string_lossy().replace('\\', "/");
@@ -456,7 +443,6 @@ fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
                 Err(_) => continue,
             };
 
-            // avoid symlink cycles / oddities
             if ft.is_symlink() {
                 continue;
             }
@@ -484,42 +470,7 @@ fn list_files_recursive_fs(root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// List all repo-relative file paths from the working tree:
-/// - If git repo: tracked + untracked (respecting .gitignore)
-/// - Otherwise: filesystem walk fallback
 pub fn list_worktree_files(repo: &Path) -> Result<Vec<String>> {
-    if ensure_git_installed().is_ok() && ensure_git_repo(repo).is_ok() {
-        let bytes = run_git(
-            repo,
-            &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        )?;
-
-        let mut out = Vec::new();
-        let mut start = 0usize;
-        for i in 0..bytes.len() {
-            if bytes[i] == 0u8 {
-                if i > start {
-                    let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
-                    if !s.trim().is_empty() {
-                        out.push(s);
-                    }
-                }
-                start = i + 1;
-            }
-        }
-        if start < bytes.len() {
-            let s = String::from_utf8_lossy(&bytes[start..]).to_string();
-            if !s.trim().is_empty() {
-                out.push(s);
-            }
-        }
-
-        out.sort();
-        out.dedup();
-        return Ok(out);
-    }
-
-    // plain folder fallback
     list_files_recursive_fs(repo)
 }
 
@@ -534,8 +485,6 @@ fn exists_in_worktree(repo: &Path, rel_path: &str) -> bool {
     repo.join(Path::new(&rel)).is_file()
 }
 
-/// WORKTREE-aware single-file diff.
-/// NOTE: Diffs require git (and a git repo). This will error in plain working trees (intended).
 pub fn diff_file_between(
     repo: &Path,
     from_ref: &str,
@@ -545,7 +494,6 @@ pub fn diff_file_between(
     ensure_git_installed()?;
     ensure_git_repo(repo)?;
 
-    // Commit -> WORKTREE
     if to_ref == WORKTREE_REF {
         if from_ref != WORKTREE_REF && exists_in_ref(repo, from_ref, path).unwrap_or(false) {
             let args_owned: Vec<String> = vec![
@@ -559,7 +507,6 @@ pub fn diff_file_between(
             return run_git(repo, &args_refs);
         }
 
-        // untracked/added file in worktree
         if exists_in_worktree(repo, path) {
             let abs = repo.join(Path::new(&path.replace('\\', "/")));
             let try_null = {
@@ -593,7 +540,6 @@ pub fn diff_file_between(
         return Ok(Vec::new());
     }
 
-    // WORKTREE -> Commit
     if from_ref == WORKTREE_REF {
         if exists_in_ref(repo, to_ref, path).unwrap_or(false) {
             let args_owned: Vec<String> = vec![
@@ -610,7 +556,6 @@ pub fn diff_file_between(
         return Ok(Vec::new());
     }
 
-    // Normal ref..ref diff
     let range = format!("{from_ref}..{to_ref}");
     let args_owned: Vec<String> = vec![
         "diff".to_string(),
@@ -623,9 +568,6 @@ pub fn diff_file_between(
     run_git(repo, &args_refs)
 }
 
-// -----------------------------------------------------------------------------
-// Working tree read/write
-// -----------------------------------------------------------------------------
 
 fn safe_join_repo_path(repo: &Path, rel_path: &str) -> Result<PathBuf> {
     let rel = rel_path.trim_start_matches("./").replace('\\', "/");
@@ -649,9 +591,11 @@ pub fn write_worktree_file(repo: &Path, rel_path: &str, bytes: &[u8]) -> Result<
     std::fs::write(&p, bytes).with_context(|| format!("failed to write {}", p.display()))
 }
 
-// -----------------------------------------------------------------------------
-// Minimal FS operations (used by ChangeSet applier)
-// -----------------------------------------------------------------------------
+pub fn create_worktree_dir(repo: &Path, rel_path: &str) -> Result<()> {
+    let p = safe_join_repo_path(repo, rel_path)?;
+    std::fs::create_dir_all(&p).with_context(|| format!("failed to create dir {}", p.display()))
+}
+
 
 pub fn delete_worktree_path(repo: &Path, rel_path: &str) -> Result<()> {
     let p = safe_join_repo_path(repo, rel_path)?;
@@ -680,40 +624,272 @@ pub fn move_worktree_path(repo: &Path, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Context exporter
-// -----------------------------------------------------------------------------
 
 pub struct ContextExportOptions<'a> {
     pub git_ref: &'a str,                 // may be WORKTREE
     pub exclude: &'a [Regex],
-    pub max_bytes_per_file: usize,
     pub skip_binary: bool,
+    pub skip_gitignore: bool,
+    pub include_staged_diff: bool,
+    pub include_unstaged_diff: bool,
     pub include_files: Option<&'a [String]>, // None => full repo selection
 }
+
+impl<'a> ContextExportOptions<'a> {
+    fn include_staged_diff_enabled(&self) -> bool {
+        self.git_ref == WORKTREE_REF && self.include_staged_diff
+    }
+
+    fn include_unstaged_diff_enabled(&self) -> bool {
+        self.git_ref == WORKTREE_REF && self.include_unstaged_diff
+    }
+
+}
+
 
 fn is_excluded(ex: &[Regex], path: &str) -> bool {
     ex.iter().any(|r| r.is_match(path))
 }
 
 fn is_probably_binary(bytes: &[u8]) -> bool {
-    // Simple heuristic: any NUL byte
     bytes.iter().any(|&b| b == 0)
 }
 
-fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
+const CONTEXT_EXPORT_MAX_BYTES_PER_FILE: usize = 200_000;
+
+const BINARY_EXTS: &[&str] = &[
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".wav",
+    ".flac",
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+    ".eot",
+    ".jar",
+    ".class",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+];
+
+fn ext_of_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext.is_empty() {
+        "".to_string()
+    } else {
+        format!(".{}", ext.to_lowercase())
+    }
+}
+
+fn is_binary_ext_for_path(path: &str) -> bool {
+    let ext = ext_of_path(path);
+    if ext.is_empty() {
+        return false;
+    }
+    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(&ext))
+}
+
+fn is_env_path(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    p == ".env" || p.ends_with("/.env") || p.contains("/.env.")
+}
+
+fn glob_to_regex_pattern(glob: &str) -> Option<String> {
+    let mut g = glob.trim();
+    if g.is_empty() {
+        return None;
+    }
+    if g.starts_with('#') {
+        return None;
+    }
+    if g.starts_with('!') {
+        return None;
+    }
+
+    let anchored = g.starts_with('/');
+    if anchored {
+        g = g.trim_start_matches('/');
+    }
+
+    let dir_only = g.ends_with('/');
+    if dir_only {
+        g = g.trim_end_matches('/');
+    }
+
+    if g.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    if anchored {
+        out.push('^');
+    } else {
+        out.push_str("(^|/)");
+    }
+
+    let mut chars = g.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    let _ = chars.next();
+                    out.push_str(".*");
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    if dir_only {
+        out.push_str("(/|$)");
+    } else {
+        out.push_str("($|/)");
+    }
+
+    Some(out)
+}
+
+fn compile_gitignore_like(repo: &Path) -> Vec<Regex> {
+    let path = repo.join(".gitignore");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rx_s) = glob_to_regex_pattern(l) {
+            if let Ok(rx) = Regex::new(&rx_s) {
+                out.push(rx);
+            }
+        }
+    }
+    out
+}
+
+fn write_section(out: &mut String, header: &str, bytes: &[u8]) {
+
+
+
+
+#[derive(Default)]
+struct TreeNode {
+    children: std::collections::BTreeMap<String, TreeNode>,
+    files: Vec<String>,
+}
+
+fn build_tree(paths: &[String]) -> TreeNode {
+    let mut root = TreeNode::default();
+
+    for p in paths {
+        let p = p.replace('\\', "/");
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut cur = &mut root;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                cur.files.push((*part).to_string());
+            } else {
+                cur = cur.children.entry((*part).to_string()).or_default();
+            }
+        }
+    }
+
+    root
+}
+
+fn render_tree(out: &mut String, node: &TreeNode, prefix: &str) {
+    let mut entries: Vec<(bool, String)> = Vec::new();
+
+    for (name, _) in node.children.iter() {
+        entries.push((true, name.clone()));
+    }
+    for f in node.files.iter() {
+        entries.push((false, f.clone()));
+    }
+
+    for (idx, (is_dir, name)) in entries.iter().enumerate() {
+        let last = idx + 1 == entries.len();
+        let branch = if last { "└── " } else { "├── " };
+        out.push_str(prefix);
+        out.push_str(branch);
+        out.push_str(name);
+        if *is_dir {
+            out.push('/');
+        }
+        out.push('\n');
+
+        if *is_dir {
+            if let Some(child) = node.children.get(name) {
+                let next_prefix = if last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+                render_tree(out, child, &next_prefix);
+            }
+        }
+    }
+}
+
+fn write_file_tree(out: &mut String, paths: &[String]) {
+    out.push_str("## File Tree\n");
+    out.push_str(".\n");
+
+    let tree = build_tree(paths);
+    render_tree(out, &tree, "");
+    out.push('\n');
+}
+
     out.push_str("\n");
     out.push_str("==== ");
     out.push_str(header);
     out.push_str(" ====\n");
 
-    if bytes.len() > limit {
+    if bytes.len() > CONTEXT_EXPORT_MAX_BYTES_PER_FILE {
         out.push_str(&format!(
             "[TRUNCATED] {} bytes (limit {})\n",
             bytes.len(),
-            limit
+            CONTEXT_EXPORT_MAX_BYTES_PER_FILE
         ));
-        out.push_str(&String::from_utf8_lossy(&bytes[..limit]));
+        out.push_str(&String::from_utf8_lossy(&bytes[..CONTEXT_EXPORT_MAX_BYTES_PER_FILE]));
         out.push_str("\n");
     } else {
         out.push_str(&String::from_utf8_lossy(bytes));
@@ -723,13 +899,110 @@ fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
     }
 }
 
+#[derive(Default)]
+struct ContextTreeNode {
+    children: std::collections::BTreeMap<String, ContextTreeNode>,
+    files: Vec<String>,
+}
+
+fn build_context_tree(paths: &[String]) -> ContextTreeNode {
+    let mut root = ContextTreeNode::default();
+
+    for p in paths {
+        let p = p.replace('\\', "/");
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut cur = &mut root;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                cur.files.push((*part).to_string());
+            } else {
+                cur = cur.children.entry((*part).to_string()).or_default();
+            }
+        }
+    }
+
+    root
+}
+
+fn render_context_tree(out: &mut String, node: &ContextTreeNode, prefix: &str) {
+    let mut entries: Vec<(bool, String)> = Vec::new();
+
+    for (name, _) in node.children.iter() {
+        entries.push((true, name.clone()));
+    }
+    for f in node.files.iter() {
+        entries.push((false, f.clone()));
+    }
+
+    for (idx, (is_dir, name)) in entries.iter().enumerate() {
+        let last = idx + 1 == entries.len();
+        let branch = if last { "└── " } else { "├── " };
+        out.push_str(prefix);
+        out.push_str(branch);
+        out.push_str(name);
+        if *is_dir {
+            out.push('/');
+        }
+        out.push('\n');
+
+        if *is_dir {
+            if let Some(child) = node.children.get(name) {
+                let next_prefix = if last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+                render_context_tree(out, child, &next_prefix);
+            }
+        }
+    }
+}
+
+fn write_file_tree(out: &mut String, paths: &[String]) {
+    out.push_str("## File Tree\n");
+    out.push_str(".\n");
+
+    let tree = build_context_tree(paths);
+    render_context_tree(out, &tree, "");
+    out.push('\n');
+}
+
+fn write_staged_diff_section(out: &mut String, path: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let header = format!("STAGED DIFF {}", path);
+    write_section(out, &header, bytes);
+}
+
+fn write_unstaged_diff_section(out: &mut String, path: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let header = format!("UNSTAGED DIFF {}", path);
+    write_section(out, &header, bytes);
+}
+
 pub fn export_repo_context(
     repo: &Path,
     out_path: &Path,
     opts: ContextExportOptions<'_>,
 ) -> Result<()> {
-    // Only require git when exporting a git ref.
     if opts.git_ref != WORKTREE_REF {
+        ensure_git_installed()?;
+        ensure_git_repo(repo)?;
+    }
+
+    if opts.include_staged_diff_enabled() {
+        ensure_git_installed()?;
+        ensure_git_repo(repo)?;
+    }
+
+    if opts.include_unstaged_diff_enabled() {
         ensure_git_installed()?;
         ensure_git_repo(repo)?;
     }
@@ -743,17 +1016,63 @@ pub fn export_repo_context(
         split_lines(&bytes)
     };
 
+    let gitignore_rx = if opts.skip_gitignore {
+        compile_gitignore_like(repo)
+    } else {
+        vec![]
+    };
+
     let mut out = String::new();
     out.push_str("## Repo Context Export\n");
     out.push_str(&format!("repo: {}\n", repo.display()));
     out.push_str(&format!("ref: {}\n", opts.git_ref));
+    out.push_str(&format!("include_staged_diff: {}\n", opts.include_staged_diff_enabled()));
+    out.push_str(&format!("include_unstaged_diff: {}\n", opts.include_unstaged_diff_enabled()));
     out.push_str(&format!("files: {}\n", files.len()));
     out.push_str("\n");
 
-    for f in files {
+    let mut tree_paths: Vec<String> = Vec::new();
+    for f in files.iter() {
         let f_norm = f.replace('\\', "/");
+
         if is_excluded(opts.exclude, &f_norm) {
             continue;
+        }
+
+        if !gitignore_rx.is_empty() && gitignore_rx.iter().any(|r| r.is_match(&f_norm)) {
+            continue;
+        }
+
+        if opts.skip_binary {
+            if is_binary_ext_for_path(&f_norm) {
+                continue;
+            }
+        }
+
+        tree_paths.push(f_norm);
+    }
+
+    write_file_tree(&mut out, &tree_paths);
+
+    for f in files {
+        let f_norm = f.replace('\\', "/");
+
+        if is_excluded(opts.exclude, &f_norm) {
+            continue;
+        }
+
+        if !gitignore_rx.is_empty() && gitignore_rx.iter().any(|r| r.is_match(&f_norm)) {
+            continue;
+        }
+
+        if opts.include_staged_diff_enabled() {
+            let diff = run_git(repo, &["diff", "--cached", "--no-color", "--", &f_norm]).unwrap_or_default();
+            write_staged_diff_section(&mut out, &f_norm, &diff);
+        }
+
+        if opts.include_unstaged_diff_enabled() {
+            let diff = run_git(repo, &["diff", "--no-color", "--", &f_norm]).unwrap_or_default();
+            write_unstaged_diff_section(&mut out, &f_norm, &diff);
         }
 
         let bytes = if opts.git_ref == WORKTREE_REF {
@@ -769,11 +1088,16 @@ pub fn export_repo_context(
             }
         };
 
-        if opts.skip_binary && is_probably_binary(&bytes) {
-            continue;
+        if opts.skip_binary {
+            if is_binary_ext_for_path(&f_norm) {
+                continue;
+            }
+            if is_probably_binary(&bytes) {
+                continue;
+            }
         }
 
-        write_section(&mut out, &f_norm, &bytes, opts.max_bytes_per_file);
+        write_section(&mut out, &f_norm, &bytes);
     }
 
     if let Some(parent) = out_path.parent() {
@@ -785,9 +1109,6 @@ pub fn export_repo_context(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Minimal extensions for patch-apply + file ops (DO NOT remove anything above)
-// -----------------------------------------------------------------------------
 
 pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
@@ -818,13 +1139,11 @@ pub fn run_git_with_input(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Res
 }
 
 pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
-    // Normalize to LF and ensure trailing newline. Do NOT rewrite hunks.
     let mut patch = patch_text.replace("\r\n", "\n");
     if !patch.ends_with('\n') {
         patch.push('\n');
     }
 
-    // Basic stats...
     let len = patch.len();
     let nl_count = patch.as_bytes().iter().filter(|&&b| b == b'\n').count();
     let has_diff_git = patch.contains("diff --git ");

@@ -1,14 +1,3 @@
-// src/app/controllers/changeset_controller.rs
-//
-// ChangeSet Applier controller.
-// - Parses the JSON payload from the ChangeSet Applier UI component
-// - Applies operations (write/move/delete/git_apply/edit)
-// - Writes detailed diagnostics into the applier "status" output so git_apply issues
-//   (corrupt patch / newline escaping / missing trailing newline) are debuggable.
-//
-// Key changes:
-// - Add op: "edit" so the model provides anchored edits instead of unified diffs.
-// - Make normalize_patch_text safer: only unescape "\\n" when the input has NO real newlines.
 
 use crate::app::actions::{Action, ComponentId, ComponentKind, TerminalShell};
 use crate::app::state::{AppState, WORKTREE_REF};
@@ -43,8 +32,6 @@ enum Operation {
     #[serde(rename = "git_apply")]
     GitApply { patch: String },
 
-    /// Anchored edits applied against the current WORKTREE file text.
-    /// The applier reads the file, applies the changes in-memory, then writes it back.
     #[serde(rename = "edit")]
     Edit { path: String, changes: Vec<EditChange> },
 }
@@ -109,12 +96,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    /// Keep `changeset_appliers` in sync with the current layout.
-    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_changeset_appliers_from_layout(&mut self) {
         use crate::app::state::ChangeSetApplierState;
 
-        // Collect ChangeSetApplier component ids across ALL layouts/canvases.
         let mut ids: Vec<ComponentId> = self
             .all_layouts()
             .flat_map(|l| l.components.iter())
@@ -125,11 +109,9 @@ impl AppState {
         ids.sort_unstable();
         ids.dedup();
 
-        // Drop stale entries but keep existing payload/status for components that still exist.
         self.changeset_appliers
             .retain(|id, _| ids.binary_search(id).is_ok());
 
-        // Insert missing backing state.
         for id in ids {
             self.changeset_appliers.entry(id).or_insert(ChangeSetApplierState {
                 payload: String::new(),
@@ -176,7 +158,6 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
         log.push_str(&format!("description: {d}\n\n"));
     }
 
-    // Helpful: include current ref in output (debugging when ref/view changes)
     log.push_str(&format!(
         "repo: {:?}\nref: {}\n\n",
         repo,
@@ -299,7 +280,6 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                             ok_ops = ok_ops.saturating_add(1);
                             log.push_str(&format!("[{step}] ok\n"));
                         } else {
-                            // Partial success: some actions applied, some failed.
                             log.push_str(&format!("[{step}] PARTIAL: {} action(s) failed\n", report.failed.len()));
                             for f in &report.failed {
                                 log.push_str(&format!("  - edit[{}] {} FAILED: {}\n", f.index, f.action, f.error));
@@ -319,7 +299,6 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
                         }
                     }
                     Err(e) => {
-                        // Fatal failure (read/write/etc). Nothing to partially apply.
                         let err = format!("{:#}", e);
                         log.push_str(&format!("[{step}] FAILED: {err}\n"));
                         record_fail(&mut failures, step, op, err);
@@ -344,7 +323,6 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
         }
     }
 
-    // post_commands (optional)
     if !parsed.post_commands.is_empty() {
         log.push_str("\npost_commands:\n");
     }
@@ -398,7 +376,6 @@ fn set_applier_status(state: &mut AppState, applier_id: ComponentId, status: Str
     }
 }
 
-/// Reads a WORKTREE file as UTF-8 text via the existing CapabilityRequest::ReadFile.
 fn read_worktree_text(state: &mut AppState, repo: &std::path::PathBuf, path: &str) -> Result<String> {
     let resp = state
         .broker
@@ -428,7 +405,6 @@ fn write_worktree_text(state: &mut AppState, repo: &std::path::PathBuf, path: &s
     Ok(())
 }
 
-/// Per-action report for anchored edits. Fatal errors (read/write) are returned as Err.
 #[derive(Debug, Clone)]
 struct AnchoredEditFailure {
     index: usize,
@@ -442,8 +418,6 @@ struct AnchoredEditsReport {
     failed: Vec<AnchoredEditFailure>,
 }
 
-/// Apply anchored edits to a worktree file and write back the result.
-/// Best-effort: attempts every change; records per-change failures; only fails hard on read/write.
 fn apply_anchored_edits(
     state: &mut AppState,
     repo: &std::path::PathBuf,
@@ -452,8 +426,6 @@ fn apply_anchored_edits(
 ) -> Result<AnchoredEditsReport> {
     let original = read_worktree_text(state, repo, path)?;
 
-    // We may normalize CRLF->LF for matching+writing depending on match.mode.
-    // If any change requests normalized_newlines, we apply all edits on the LF-normalized text.
     let any_normalize = changes.iter().any(|ch| {
         ch.match_
             .as_ref()
@@ -493,7 +465,6 @@ fn apply_anchored_edits(
             validate_match_mode(n, mode)?;
             validate_must_match(n, must)?;
 
-            // Match against either literal text or normalized-newlines text.
             let hay = if mode == "normalized_newlines" {
                 text.replace("\r\n", "\n")
             } else {
@@ -570,12 +541,10 @@ fn apply_anchored_edits(
                 action: action_name,
                 error: format!("{:#}", e),
             });
-            // Continue to next change.
             continue;
         }
     }
 
-    // If we normalized, we write LF back out (by design).
     write_worktree_text(state, repo, path, &text)?;
     Ok(report)
 }
@@ -653,7 +622,6 @@ fn ensure_literal_match(m: &EditMatch, idx: usize) -> Result<()> {
     Ok(())
 }
 
-/// Returns the byte span of the Nth occurrence (1-based) of `needle` in `haystack`.
 fn find_match_span(haystack: &str, needle: &str, occurrence: usize) -> Option<(usize, usize)> {
     if occurrence == 0 {
         return None;
@@ -668,7 +636,6 @@ fn find_match_span(haystack: &str, needle: &str, occurrence: usize) -> Option<(u
     None
 }
 
-/// Diagnostics meant to show whether the patch string is actually suitable for `git apply`.
 fn patch_diagnostics(label: &str, s: &str) -> String {
     let len = s.len();
     let nl_count = s.as_bytes().iter().filter(|&&b| b == b'\n').count();
@@ -680,7 +647,6 @@ fn patch_diagnostics(label: &str, s: &str) -> String {
     let has_real_newlines = s.contains('\n');
     let ends_with_newline = s.ends_with('\n');
 
-    // Render a one-line preview: show real newlines as "\n" for readability.
     let mut preview = s.chars().take(240).collect::<String>();
     preview = preview.replace('\r', "\\r");
     preview = preview.replace('\n', "\\n");
@@ -690,17 +656,9 @@ fn patch_diagnostics(label: &str, s: &str) -> String {
     )
 }
 
-/// Normalization strategy:
-/// - Always normalize CRLF -> LF
-/// - Only unescape literal "\\n" / "\\r\\n" when the input appears to be fully escaped
-///   (i.e., NO real newlines exist). This avoids corrupting patches (or code) that legitimately
-///   contain the two-character sequence "\n" in context lines.
-/// - Ensure a trailing newline (git apply can be finicky without it)
 fn normalize_patch_text(patch: &str) -> String {
-    // 1) normalize CRLF -> LF
     let mut out = patch.replace("\r\n", "\n");
 
-    // 2) only convert literal escapes if patch has no real newlines
     let has_real_newlines = out.contains('\n');
     let has_literal_backslash_n = out.contains("\\n") || out.contains("\\r\\n");
     if !has_real_newlines && has_literal_backslash_n {
@@ -708,7 +666,6 @@ fn normalize_patch_text(patch: &str) -> String {
         out = out.replace("\\n", "\n");
     }
 
-    // 3) ensure trailing newline
     if !out.ends_with('\n') {
         out.push('\n');
     }
@@ -716,7 +673,6 @@ fn normalize_patch_text(patch: &str) -> String {
     out
 }
 
-/// Map user-provided strings to TerminalShell.
 fn parse_shell(s: Option<&str>) -> TerminalShell {
     let Some(s) = s else {
         return TerminalShell::Auto;

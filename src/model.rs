@@ -41,9 +41,8 @@ impl StatAgg {
 
 #[derive(Clone, Debug, Default)]
 pub struct DirStats {
-    pub agg: StatAgg,
-    // counts ALL files (text+bin) by extension
-    pub ext_counts: HashMap<String, u64>,
+    pub ext_files: HashMap<String, u64>,
+    pub ext_loc: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +59,6 @@ pub struct DirNode {
     pub full_path: String, // repo-relative directory path ("" for root)
     pub children: Vec<DirNode>,
     pub files: Vec<FileRow>,
-    // only meaningful for root + top-level dirs
     pub stats: DirStats,
 }
 

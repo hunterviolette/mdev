@@ -1,9 +1,3 @@
-// src/app/controllers/changeset_loop_controller.rs
-// Execute Loop controller (conversation runner)
-// - Conversation + ChangeSet modes
-// - Dynamic context injection (same generator as Context Exporter, in-memory)
-// - Review cycle + auto apply/postprocess handled in UI
-// - Non-blocking OpenAI calls via background thread + channel
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -33,7 +27,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                     ExecuteLoopMode::ChangeSet => "Mode: ChangeSet".to_string(),
                 });
 
-                // Strong default: in ChangeSet mode, include context on the next send.
                 if *mode == ExecuteLoopMode::ChangeSet {
                     st.include_context_next = true;
                 }
@@ -72,7 +65,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 .unwrap_or_default()
                 .as_millis() as u64;
 
-            // Build the canonical cleared transcript (system-only) from the loop's instruction.
             let sys_content = state
                 .execute_loops
                 .get(loop_id)
@@ -84,7 +76,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 content: sys_content,
             }];
 
-            // 1) Clear the loop view state.
             if let Some(st) = state.execute_loops.get_mut(loop_id) {
                 st.messages = cleared_messages.clone();
                 st.draft.clear();
@@ -149,7 +140,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 fn send_turn(state: &mut AppState, loop_id: ComponentId) {
-    // Don't allow sending while already waiting.
     let busy = state
         .execute_loops
         .get(&loop_id)
@@ -184,7 +174,6 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         return;
     }
 
-    // Best-effort model list fetch once.
     let fetched_models = {
         let need_fetch = state
             .execute_loops
@@ -198,7 +187,6 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         }
     };
 
-    // Seed repo context only when starting a new conversation. After that, do not inject system items.
     let is_new_conversation = conversation_id.is_none();
 
     let ctx_text_opt = if is_new_conversation && include_context_next {
@@ -277,12 +265,9 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                         content: sys_content.clone(),
                     });
                 } else {
-                    // If there's already a system message at the top, replace it.
                     if st.messages[0].role == "system" {
                         st.messages[0].content = sys_content.clone();
                     } else {
-                        // Otherwise insert the system prompt at the beginning so ordering is:
-                        // system -> user -> assistant
                         st.messages.insert(
                             0,
                             ExecuteLoopMessage {
@@ -330,7 +315,6 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     }
 
     if _did_mutate {
-        // Write-through persistence for chats
         state.task_store_dirty = true;
         state.save_repo_task_store();
     }

@@ -7,8 +7,6 @@ use crate::app::state::AppState;
 use crate::app::state::WORKTREE_REF;
 
 fn overlay_bounds(ui: &egui::Ui) -> egui::Rect {
-    // Constrain overlays to the clipped region of this component so they stay
-    // centered and sized within the parent component (not relative to screen).
     ui.clip_rect().shrink(6.0)
 }
 
@@ -19,8 +17,6 @@ fn centered_overlay_rect(
     min: [f32; 2],
     max: [f32; 2],
 ) -> egui::Rect {
-    // IMPORTANT: if the parent component is smaller than our nominal minimums,
-    // allow the overlay to shrink so it always fits and stays centered.
     let pad = 8.0;
     let max_w_by_bounds = (bounds.width() - pad * 2.0).max(1.0);
     let max_h_by_bounds = (bounds.height() - pad * 2.0).max(1.0);
@@ -99,14 +95,11 @@ pub fn source_control_panel(
         return actions;
     };
 
-    // Auto-refresh once when the panel first appears so branch/remote options populate.
     if sc.needs_refresh {
         sc.needs_refresh = false;
         actions.push(Action::RefreshSourceControl { sc_id });
     }
 
-    // Auto-refresh periodically so the panel stays current without manual clicks.
-    // Uses egui temp-data so we don't need to add persistent fields to state.
     {
         let now = Instant::now();
         let last_id = egui::Id::new(("sc_last_auto_refresh", sc_id));
@@ -120,21 +113,15 @@ pub fn source_control_panel(
             }
         };
 
-        // Refresh at most once every 2 seconds.
         if now.duration_since(last) >= Duration::from_secs(4) {
             actions.push(Action::RefreshSourceControl { sc_id });
             ui.ctx().data_mut(|d| d.insert_temp(last_id, now));
         }
 
-        // Keep repainting often enough for the timer to fire.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
     }
 
 
-    // --- Header ---
-    // Keep header height stable so horizontal resizing does not change the
-    // remaining vertical space for the lists.
-    // We allocate a fixed-height header region and use wrapped rows inside.
     let row_h = ui.spacing().interact_size.y;
     let header_h = (row_h * 2.0) + (ui.spacing().item_spacing.y * 3.0) + 6.0;
 
@@ -142,7 +129,6 @@ pub fn source_control_panel(
         egui::vec2(ui.available_width(), header_h),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
-            // Line 1: selectors (Remote/Branch)
             ui.horizontal_wrapped(|ui| {
                 let remote_open_id = egui::Id::new(("sc_remote_popup_open", sc_id));
                 let branch_open_id = egui::Id::new(("sc_branch_popup_open", sc_id));
@@ -172,7 +158,6 @@ pub fn source_control_panel(
                 });
             });
 
-            // Line 2: buttons
             ui.horizontal_wrapped(|ui| {
                 let commit_modal_id = egui::Id::new(("sc_commit_modal", sc_id));
                 let commit_open = ui.ctx().data(|d| d.get_temp::<bool>(commit_modal_id).unwrap_or(false));
@@ -196,7 +181,6 @@ pub fn source_control_panel(
 
     ui.add_space(6.0);
 
-    // --- Remote popup (component-centered overlay) ---
     {
         let bounds = overlay_bounds(ui);
         let remote_open_id = egui::Id::new(("sc_remote_popup_open", sc_id));
@@ -233,7 +217,6 @@ pub fn source_control_panel(
         }
     }
 
-    // --- Branch popup (component-centered overlay; includes create new branch) ---
     {
         let bounds = ui.max_rect();
         let branch_open_id = egui::Id::new(("sc_branch_popup_open", sc_id));
@@ -320,7 +303,6 @@ pub fn source_control_panel(
         }
     }
 
-    // --- Commit modal (component-centered overlay) ---
     {
         let bounds = ui.max_rect();
         let commit_modal_id = egui::Id::new(("sc_commit_modal", sc_id));
@@ -378,10 +360,6 @@ pub fn source_control_panel(
     }
 
 
-    // Split into two queues.
-    // IMPORTANT: files like AM/MM must appear in BOTH queues.
-    // - Staged Changes: anything currently staged (index has content)
-    // - Changes: anything with worktree changes (right status) OR untracked
 
     let mut staged_files: Vec<_> = sc.files.iter().filter(|f| f.staged).collect();
 
@@ -393,7 +371,6 @@ pub fn source_control_panel(
                 return true;
             }
             let wt = f.worktree_status.as_str();
-            // In git porcelain-like status, '.' and ' ' both mean "no change".
             !(wt.is_empty() || wt == " " || wt == ".")
         })
         .collect();
@@ -401,16 +378,11 @@ pub fn source_control_panel(
     staged_files.sort_by(|a, b| a.path.cmp(&b.path));
     unstaged_files.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // --- Dynamic sizing (lists first) ---
-    // Give nearly all available height to Staged/Changes lists.
-    // Last output is rendered as a single-line row and should not grow with panel height.
     let avail_h = ui.available_height().max(1.0);
     let output_row_h = 24.0;
 
-    // Reserve for headings/buttons/separators etc.
     let reserve_h = 70.0;
 
-    // Remaining height goes to the file lists (split evenly).
     let lists_h_total = (avail_h - output_row_h - reserve_h).max(260.0);
     let list_h = (lists_h_total * 0.50).clamp(160.0, 4000.0);
 
@@ -420,9 +392,6 @@ pub fn source_control_panel(
         .data(|d| d.get_temp::<String>(pending_discard_id).unwrap_or_default());
 
 
-    // -------------------------
-    // Staged Changes
-    // -------------------------
     ui.horizontal(|ui| {
         ui.strong(format!("Staged Changes ({})", staged_files.len()));
 
@@ -448,12 +417,9 @@ pub fn source_control_panel(
             for f in staged_files.iter() {
                 ui.horizontal(|ui| {
 
-                    // Show combined code for context (e.g. AM/MM), but this list is the staged pipeline.
                     let code = format!("{}{}", f.index_status, f.worktree_status);
                     ui.monospace(code);
 
-                    // Clickable filename -> open/attach Diff Viewer
-                    // STAGED list (like VS Code): INDEX (staged) vs WORKTREE
                     if ui
                         .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
                         .clicked()
@@ -480,9 +446,6 @@ pub fn source_control_panel(
 
     ui.add_space(8.0);
 
-    // -------------------------
-    // Changes (unstaged)
-    // -------------------------
     ui.horizontal(|ui| {
         ui.strong(format!("Changes ({})", unstaged_files.len()));
 
@@ -492,6 +455,10 @@ pub fn source_control_panel(
                 actions.push(Action::RefreshSourceControl { sc_id });
             }
 
+            if ui.button("Discard All").clicked() {
+                pending_discard = "__ALL__".to_string();
+                ui.ctx().data_mut(|d| d.insert_temp(pending_discard_id, pending_discard.clone()));
+            }
         });
     });
 
@@ -511,8 +478,6 @@ pub fn source_control_panel(
                     let code = format!("{}{}", f.index_status, f.worktree_status);
                     ui.monospace(code);
 
-                    // Clickable filename -> open/attach Diff Viewer
-                    // UNSTAGED list (like VS Code): HEAD vs WORKTREE
                     if ui
                         .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
                         .clicked()
@@ -546,18 +511,53 @@ pub fn source_control_panel(
             }
         });
 
-    // --- Discard confirmation overlay (component-centered) ---
     {
         let bounds = ui.max_rect();
         if !pending_discard.is_empty() {
             let rect = centered_overlay_rect(bounds, 0.62, 0.40, [420.0, 180.0], [820.0, 360.0]);
 
-            let untracked = sc
-                .files
-                .iter()
-                .find(|x| x.path == pending_discard)
-                .map(|x| x.untracked)
-                .unwrap_or(false);
+            let discard_all = pending_discard == "__ALL__";
+
+            let mut discard_paths: Vec<(String, bool)> = Vec::new();
+
+            let (untracked, summary_label) = if discard_all {
+                let mut untracked_n: usize = 0;
+                let mut modified_n: usize = 0;
+
+                for f in sc.files.iter() {
+                    let is_unstaged = if f.untracked {
+                        true
+                    } else {
+                        let wt = f.worktree_status.as_str();
+                        !(wt.is_empty() || wt == " " || wt == ".")
+                    };
+
+                    if !is_unstaged {
+                        continue;
+                    }
+
+                    if f.untracked {
+                        untracked_n += 1;
+                    } else {
+                        modified_n += 1;
+                    }
+
+                    discard_paths.push((f.path.clone(), f.untracked));
+                }
+
+                discard_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+                (false, format!("Discard ALL unstaged changes? Restored: {}, Deleted untracked: {}", modified_n, untracked_n))
+            } else {
+                let untracked = sc
+                    .files
+                    .iter()
+                    .find(|x| x.path == pending_discard)
+                    .map(|x| x.untracked)
+                    .unwrap_or(false);
+
+                (untracked, "This will revert the file to the last committed state.".to_string())
+            };
 
             let open_now = popup_overlay(
                 ctx,
@@ -566,12 +566,29 @@ pub fn source_control_panel(
                 "Discard changes?",
                 rect,
                 |ui| {
-                    ui.label("This will revert the file to the last committed state.");
+                    ui.label(summary_label.as_str());
                     if untracked {
                         ui.label("This file is untracked, so it will be deleted.");
                     }
                     ui.add_space(10.0);
-                    ui.monospace(&pending_discard);
+
+                    if discard_all {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (p, is_untracked) in discard_paths.iter() {
+                                    if *is_untracked {
+                                        ui.monospace(format!("{}  (untracked)", p));
+                                    } else {
+                                        ui.monospace(p);
+                                    }
+                                }
+                            });
+                    } else {
+                        ui.monospace(&pending_discard);
+                    }
+
                     ui.add_space(12.0);
 
                     ui.horizontal(|ui| {
@@ -581,11 +598,15 @@ pub fn source_control_panel(
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Discard").clicked() {
-                                actions.push(Action::DiscardPath {
-                                    sc_id,
-                                    path: pending_discard.clone(),
-                                    untracked,
-                                });
+                                if discard_all {
+                                    actions.push(Action::DiscardAllUnstaged { sc_id });
+                                } else {
+                                    actions.push(Action::DiscardPath {
+                                        sc_id,
+                                        path: pending_discard.clone(),
+                                        untracked,
+                                    });
+                                }
                                 actions.push(Action::RefreshSourceControl { sc_id });
                                 pending_discard.clear();
                             }
@@ -612,7 +633,6 @@ pub fn source_control_panel(
             .clone()
             .unwrap_or_else(|| "(none)".to_string());
 
-        // Display only the first line, truncated.
         let mut display = full.lines().next().unwrap_or("").to_string();
         if display.is_empty() {
             display = "(none)".to_string();

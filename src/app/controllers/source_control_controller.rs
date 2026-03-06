@@ -72,7 +72,6 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::CommitAndPush { sc_id } => {
-            // Compose existing operations instead of duplicating logic.
             commit(state, *sc_id);
             push_remote(state, *sc_id);
             true
@@ -91,6 +90,11 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             untracked,
         } => {
             discard_path(state, *sc_id, path, *untracked);
+            true
+        }
+
+        Action::DiscardAllUnstaged { sc_id } => {
+            discard_all_unstaged(state, *sc_id);
             true
         }
 
@@ -160,7 +164,6 @@ fn refresh_lists(state: &mut AppState, sc_id: ComponentId) {
 fn refresh(state: &mut AppState, sc_id: ComponentId) {
     let Some(repo) = ensure_repo(state, sc_id) else { return; };
 
-    // Status
     let st = match state.broker.exec(CapabilityRequest::GitStatus { repo: repo.clone() }) {
         Ok(CapabilityResponse::GitStatus(v)) => v,
         Ok(_) => {
@@ -173,18 +176,15 @@ fn refresh(state: &mut AppState, sc_id: ComponentId) {
         }
     };
 
-    // Current branch (best-effort)
     let cur = match state.broker.exec(CapabilityRequest::GitCurrentBranch { repo: repo.clone() }) {
         Ok(CapabilityResponse::GitBranch(b)) => Some(b),
         Ok(_) => None,
         Err(_) => None,
     };
 
-    // Lists
     refresh_lists(state, sc_id);
 
     if let Some(sc) = state.source_controls.get_mut(&sc_id) {
-        // Files
         sc.files = st
             .files
             .into_iter()
@@ -197,14 +197,12 @@ fn refresh(state: &mut AppState, sc_id: ComponentId) {
             })
             .collect();
 
-        // Branch selection
         if sc.branch.is_empty() {
             if let Some(b) = cur {
                 sc.branch = b;
             }
         }
 
-        // Keep selection only for existing paths
         let existing: HashSet<String> = sc.files.iter().map(|f| f.path.clone()).collect();
         sc.selected.retain(|p| existing.contains(p));
     }
@@ -272,6 +270,76 @@ fn discard_path(state: &mut AppState, sc_id: ComponentId, path: &str, untracked:
         }
         Err(e) => set_err(state, sc_id, format!("Discard failed: {:#}", e)),
     }
+}
+
+fn discard_all_unstaged(state: &mut AppState, sc_id: ComponentId) {
+    let Some(repo) = ensure_repo(state, sc_id) else { return; };
+
+    let Some(sc) = state.source_controls.get(&sc_id) else {
+        return;
+    };
+
+    let mut restore_paths: Vec<String> = Vec::new();
+    let mut delete_untracked: Vec<String> = Vec::new();
+
+    for f in sc.files.iter() {
+        let is_unstaged = if f.untracked {
+            true
+        } else {
+            let wt = f.worktree_status.as_str();
+            !(wt.is_empty() || wt == " " || wt == ".")
+        };
+
+        if !is_unstaged {
+            continue;
+        }
+
+        if f.untracked {
+            delete_untracked.push(f.path.clone());
+        } else {
+            restore_paths.push(f.path.clone());
+        }
+    }
+
+    let mut any_err = false;
+
+    if !restore_paths.is_empty() {
+        match state
+            .broker
+            .exec(CapabilityRequest::GitRestorePaths { repo: repo.clone(), paths: restore_paths.clone() })
+        {
+            Ok(_) => {}
+            Err(e) => {
+                set_err(state, sc_id, format!("Discard all failed: {:#}", e));
+                any_err = true;
+            }
+        }
+    }
+
+    for p in delete_untracked.iter() {
+        match state.broker.exec(CapabilityRequest::DeleteWorktreePath { repo: repo.clone(), path: p.clone() }) {
+            Ok(_) => {}
+            Err(e) => {
+                set_err(state, sc_id, format!("Delete untracked failed: {:#}", e));
+                any_err = true;
+            }
+        }
+    }
+
+    if !any_err {
+        let msg = if restore_paths.is_empty() && delete_untracked.is_empty() {
+            "No unstaged changes to discard.".to_string()
+        } else {
+            format!(
+                "Discarded all unstaged changes. Restored: {}, Deleted untracked: {}",
+                restore_paths.len(),
+                delete_untracked.len()
+            )
+        };
+        set_ok(state, sc_id, msg);
+    }
+
+    refresh(state, sc_id);
 }
 
 fn stage_selected(state: &mut AppState, sc_id: ComponentId) {
@@ -462,7 +530,6 @@ fn commit_and_push(state: &mut AppState, sc_id: ComponentId) {
     let branch_opt = if branch.is_empty() { None } else { Some(branch) };
     let remote_opt = if remote.is_empty() { None } else { Some(remote) };
 
-    // 1) Commit
     let commit_out = match state.broker.exec(CapabilityRequest::GitCommit {
         repo: repo.clone(),
         message: msg,
@@ -479,7 +546,6 @@ fn commit_and_push(state: &mut AppState, sc_id: ComponentId) {
         }
     };
 
-    // 2) Push
     let push_out = match state.broker.exec(CapabilityRequest::GitPush {
         repo: repo.clone(),
         remote: remote_opt,
@@ -517,7 +583,6 @@ fn push_remote(state: &mut AppState, sc_id: ComponentId) {
 
     match state.broker.exec(CapabilityRequest::GitPush { repo, remote, branch }) {
         Ok(CapabilityResponse::Text(out)) => {
-            // Append push output if we already have commit output.
             if let Some(sc) = state.source_controls.get_mut(&sc_id) {
                 if let Some(existing) = sc.last_output.take() {
                     sc.last_output = Some(format!("{}\n\n{}", existing, out));
@@ -533,7 +598,6 @@ fn push_remote(state: &mut AppState, sc_id: ComponentId) {
 }
 
 impl AppState {
-    /// Called by layout/workspace controllers after layout changes.
     pub fn rebuild_source_controls_from_layout(&mut self) {
         self.source_controls.clear();
 

@@ -1,6 +1,7 @@
 use crate::app::actions::{Action, ExpandCmd};
 use crate::app::state::{AppState, WORKTREE_REF};
 use crate::capabilities::{CapabilityRequest, CapabilityResponse};
+use regex::Regex;
 
 use std::collections::HashSet;
 
@@ -44,11 +45,6 @@ impl AppState {
         self.inputs.local_repo = Some(p.clone());
         self.inputs.repo = Some(p.clone());
 
-        // If you want "new repo => select all by default" but "ref switch => preserve",
-        // clear selection here so first analysis run re-initializes it.
-        // self.tree.context_selected_files.clear();
-
-        // Default: try HEAD, but if not a git repo we will fall back to WORKTREE.
         self.set_git_ref("HEAD".to_string());
 
         self.results.result = None;
@@ -56,8 +52,6 @@ impl AppState {
 
         self.refresh_git_refs();
 
-        // Chats/tasks are persisted globally per-repo.
-        // Hydrate them as soon as the repo is selected.
         let _ = self.load_repo_task_store();
 
         self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
@@ -66,7 +60,6 @@ impl AppState {
 
     pub(crate) fn refresh_git_refs(&mut self) {
         let Some(repo) = self.inputs.repo.clone() else {
-            // No folder selected yet: safe defaults
             self.set_git_ref_options(vec!["HEAD".to_string(), WORKTREE_REF.to_string()]);
             if self.inputs.git_ref != "HEAD" {
                 self.set_git_ref("HEAD".to_string());
@@ -74,7 +67,6 @@ impl AppState {
             return;
         };
 
-        // If not a git repo, switch UI into WORKTREE-only mode.
         if self
             .broker
             .exec(CapabilityRequest::EnsureGitRepo { repo: repo.clone() })
@@ -90,9 +82,80 @@ impl AppState {
                 self.results.error = Some("Unexpected response listing git refs.".into());
             }
             Err(e) => {
-                // If listing refs fails, don't brick the app: just go worktree-only.
                 self.results.error = Some(format!("{:#}", e));
                 self.set_git_ref_options_worktree_only();
+            }
+        }
+    }
+
+    pub fn start_analysis_refresh_async(&mut self) {
+        if self.tree.analysis_refresh_pending {
+            return;
+        }
+        let Some(repo) = self.inputs.repo.clone() else {
+            return;
+        };
+        if self.inputs.git_ref != WORKTREE_REF {
+            return;
+        }
+
+        let git_ref = self.inputs.git_ref.clone();
+        let exclude = self.compile_excludes_raw();
+        let max_exts = self.inputs.max_exts;
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<crate::model::AnalysisResult, String>>();
+        self.tree.analysis_refresh_pending = true;
+        self.tree.analysis_refresh_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let compiled: Result<Vec<Regex>, String> = exclude
+                .into_iter()
+                .map(|p| Regex::new(&p).map_err(|e| format!("Bad exclude regex '{p}': {e}")))
+                .collect();
+
+            let res = match compiled {
+                Ok(c) => crate::analyze::analyze_repo(&repo, &git_ref, &c, max_exts)
+                    .map_err(|e| format!("{:#}", e)),
+                Err(e) => Err(e),
+            };
+
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn poll_analysis_refresh(&mut self) -> bool {
+        if !self.tree.analysis_refresh_pending {
+            return false;
+        }
+        let Some(rx) = &self.tree.analysis_refresh_rx else {
+            self.tree.analysis_refresh_pending = false;
+            return false;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(res)) => {
+                self.reconcile_context_selection(&res);
+                self.results.result = Some(res);
+                self.results.error = None;
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                if self.inputs.git_ref == WORKTREE_REF {
+                    self.refresh_tree_git_status();
+                }
+                true
+            }
+            Ok(Err(err)) => {
+                self.results.error = Some(err);
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.results.error = Some("Auto-refresh channel disconnected.".to_string());
+                self.tree.analysis_refresh_pending = false;
+                self.tree.analysis_refresh_rx = None;
+                true
             }
         }
     }
@@ -109,8 +172,6 @@ impl AppState {
             }
         };
 
-        // If the user selected a git ref but this folder isn't a git repo,
-        // force WORKTREE and keep going.
         if self.inputs.git_ref != WORKTREE_REF {
             if self
                 .broker
@@ -130,45 +191,85 @@ impl AppState {
             max_exts: self.inputs.max_exts,
         }) {
             Ok(CapabilityResponse::Analysis(res)) => {
-                // Preserve selection across ref switches; drop only files that no longer exist.
                 self.reconcile_context_selection(&res);
 
                 self.results.result = Some(res);
                 self.tree.expand_cmd = Some(ExpandCmd::ExpandAll);
+
+                if self.inputs.git_ref == WORKTREE_REF {
+                    self.refresh_tree_git_status();
+                }
             }
             Ok(_) => self.results.error = Some("Unexpected response from analysis.".into()),
             Err(e) => self.results.error = Some(format!("{:#}", e)),
         }
     }
 
-    /// Keeps any previously-selected files selected when the git ref changes.
-    /// If selected files don't exist in the newly analyzed result (deleted/missing),
-    /// they are removed from the selection.
-    /// If there is no prior selection (first run), default to selecting all.
-    fn reconcile_context_selection(&mut self, res: &crate::model::AnalysisResult) {
-        // First run / no prior selection: keep previous behavior (select all).
-        if self.tree.context_selected_files.is_empty() {
-            self.set_context_selection_all(res);
+    pub fn refresh_tree_git_status(&mut self) {
+        let Some(repo) = self.inputs.repo.clone() else {
+            self.tree.modified_paths.clear();
+            self.tree.staged_paths.clear();
+            self.tree.untracked_paths.clear();
+            return;
+        };
+
+        if self.inputs.git_ref != WORKTREE_REF {
+            self.tree.modified_paths.clear();
+            self.tree.staged_paths.clear();
+            self.tree.untracked_paths.clear();
             return;
         }
 
-        // Collect all file identifiers that exist at this ref.
-        // IMPORTANT: `FileRow` does not have `path`; it has `full_path`.
-        // We therefore reconcile selection using `full_path`.
+        let st = match self.broker.exec(CapabilityRequest::GitStatus { repo }) {
+            Ok(CapabilityResponse::GitStatus(v)) => v,
+            _ => {
+                self.tree.modified_paths.clear();
+                self.tree.staged_paths.clear();
+                self.tree.untracked_paths.clear();
+                self.tree.git_status_by_path.clear();
+                return;
+            }
+        };
+
+        self.tree.modified_paths.clear();
+        self.tree.staged_paths.clear();
+        self.tree.untracked_paths.clear();
+        self.tree.git_status_by_path.clear();
+
+        for f in st.files {
+            self.tree.git_status_by_path.insert(f.path.clone(), f.clone());
+
+            if f.untracked {
+                self.tree.untracked_paths.insert(f.path.clone());
+                self.tree.modified_paths.insert(f.path);
+                continue;
+            }
+            if f.staged {
+                self.tree.staged_paths.insert(f.path.clone());
+            }
+            if f.worktree_status.trim() != "" || f.index_status.trim() != "" {
+                self.tree.modified_paths.insert(f.path);
+            }
+        }
+    }
+
+    fn reconcile_context_selection(&mut self, res: &crate::model::AnalysisResult) {
+        if !self.tree.context_initialized {
+            self.set_context_selection_all(res);
+            self.tree.context_initialized = true;
+            return;
+        }
+
         let mut files = Vec::new();
         collect_all_file_full_paths(&res.root, &mut files);
         let exists: HashSet<String> = files.into_iter().collect();
 
-        // Retain only selected paths that still exist.
-        // (Assumes `context_selected_files` stores the same string as FileRow.full_path.)
         self.tree
             .context_selected_files
             .retain(|p| exists.contains(p));
     }
 }
 
-/// Local helper because the existing `collect_all_files` in `workspace_controller.rs` is private.
-/// Uses `FileRow.full_path` (per compiler error fields: name, full_path, loc_display, ext).
 fn collect_all_file_full_paths(node: &crate::model::DirNode, out: &mut Vec<String>) {
     for f in &node.files {
         out.push(f.full_path.clone());

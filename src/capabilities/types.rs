@@ -5,11 +5,8 @@ use crate::model::AnalysisResult;
 
 #[derive(Clone, Debug)]
 pub enum FileSource {
-    /// Read from `git show <ref>:<path>`
     GitRef(String),
-    /// Read from the git index (staged) via `git show :<path>`
     Index,
-    /// Read from disk (working tree)
     Worktree,
 }
 
@@ -19,14 +16,13 @@ pub struct ContextExportReq {
     pub out_path: PathBuf,
     pub git_ref: String,            // may be WORKTREE
     pub exclude_regex: Vec<String>, // raw patterns, compiled inside broker
-    pub max_bytes_per_file: usize,
     pub skip_binary: bool,
+    pub skip_gitignore: bool,
+    pub include_staged_diff: bool,
+    pub include_unstaged_diff: bool,
     pub include_files: Option<Vec<String>>, // None => entire repo
 }
 
-// -----------------------------------------------------------------
-// Source control (git) capability models
-// -----------------------------------------------------------------
 #[derive(Clone, Debug)]
 pub struct GitStatusEntry {
     pub path: String,
@@ -69,6 +65,11 @@ pub enum CapabilityRequest {
         contents: Vec<u8>,
     },
 
+    CreateWorktreeDir {
+        repo: PathBuf,
+        path: String, // repo-relative
+    },
+
     DeleteWorktreePath {
         repo: PathBuf,
         path: String, // repo-relative
@@ -105,9 +106,6 @@ pub enum CapabilityRequest {
 
     ExportContext(ContextExportReq),
 
-    // -----------------------------------------------------------------
-    // Source control (git) - brokered capabilities
-    // -----------------------------------------------------------------
     GitStatus { repo: PathBuf },
 
     GitStagePaths { repo: PathBuf, paths: Vec<String> },

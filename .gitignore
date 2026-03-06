@@ -3,3 +3,4 @@ Cargo.lock
 todo.md
 repo_context.txt
 .env
+tmp/*

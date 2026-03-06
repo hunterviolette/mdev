@@ -1,12 +1,8 @@
-// src/app/ui/changeset_applier.rs
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::AppState;
 
-/// Notes:
-/// - Prefer `edit` for small, anchored changes (more reliable than `git_apply`).
-/// - `post_commands` is kept but defaults to empty; run `cargo run` manually during development.
 pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
   "version": 1,
   "description": Schema example. Do not waste tokens/operations inserting or adjusting comments unless required.
@@ -145,7 +141,6 @@ pub fn changeset_applier_panel(
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
     let desired_rows = ((pane_h / row_h).floor() as usize).max(1);
 
-    // Payload pane
     ui.push_id("payload_pane", |ui| {
         ui.label("Payload");
         egui::Frame::group(ui.style())
@@ -170,7 +165,6 @@ pub fn changeset_applier_panel(
 
     ui.add_space(8.0);
 
-    // Output pane
     ui.push_id("output_pane", |ui| {
         ui.label("Output");
         let mut output = st.status.clone().unwrap_or_default();

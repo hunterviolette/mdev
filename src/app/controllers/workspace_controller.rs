@@ -1,4 +1,3 @@
-// src/app/controllers/workspace_controller.rs
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -7,7 +6,7 @@ use crate::app::layout::{
     ContextExporterSnapshot, ExecuteLoopSnapshot, FileViewerSnapshot, LayoutSnapshot, Preset,
     PresetKind, StateSnapshot, TaskSnapshot, WorkspaceFile,
 };
-use crate::app::state::{AppState, PendingWorkspaceApply, ViewportRestore};
+use crate::app::state::{AppState, PendingWorkspaceApply, ViewportRestore, WORKTREE_REF};
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -41,12 +40,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 }
 
 impl AppState {
-    // ---------------------------
-    // Platform-backed workspace paths
-    // ---------------------------
 
     fn app_data_dir(&self) -> anyhow::Result<PathBuf> {
-        // Use the platform boundary (native implementation uses directories::ProjectDirs).
         self.platform.app_data_dir("DescribeRepo")
     }
 
@@ -112,7 +107,193 @@ impl AppState {
         Ok(dir.join(format!("{safe}.json")))
     }
 
+    fn startup_layout_override_path(&self) -> anyhow::Result<PathBuf> {
+        let mut dir = self.app_data_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        dir.push("startup_layout_override.json");
+        Ok(dir)
+    }
+
+    pub fn startup_layout_override_exists(&self) -> bool {
+        self.startup_layout_override_path()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+
+    pub fn clear_startup_layout_override_from_appdata(&mut self) {
+        let path = match self.startup_layout_override_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.results.error = Some(format!("{:#}", e));
+                return;
+            }
+        };
+        match std::fs::remove_file(&path) {
+            Ok(_) => self.results.error = None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.results.error = None,
+            Err(e) => self.results.error = Some(format!("{:#}", e)),
+        }
+    }
+
+    fn build_startup_layout_workspace_file(
+        &mut self,
+        canvas_size: [f32; 2],
+        viewport_outer_pos: Option<[f32; 2]>,
+        viewport_inner_size: Option<[f32; 2]>,
+    ) -> WorkspaceFile {
+        let mut file_viewers = HashMap::new();
+        for (id, _) in self.file_viewers.iter() {
+            file_viewers.insert(
+                *id,
+                FileViewerSnapshot {
+                    selected_file: None,
+                    selected_commit: None,
+                },
+            );
+        }
+
+        let mut context_exporters = HashMap::new();
+        for (id, ex) in self.context_exporters.iter() {
+            context_exporters.insert(*id, ContextExporterSnapshot {
+                mode: ex.mode,
+                skip_binary: ex.skip_binary,
+                skip_gitignore: ex.skip_gitignore,
+                include_staged_diff: ex.include_staged_diff,
+                save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+            });
+        }
+
+        {
+            let cw = canvas_size[0].max(1.0);
+            let ch = canvas_size[1].max(1.0);
+            let force_normalize = |layout: &mut crate::app::layout::LayoutConfig| {
+                for w in layout.windows.values_mut() {
+                    w.pos_norm = Some([w.pos[0] / cw, w.pos[1] / ch]);
+                    w.size_norm = Some([w.size[0] / cw, w.size[1] / ch]);
+                }
+            };
+            force_normalize(self.active_layout_mut());
+            for c in self.canvases.iter_mut() {
+                force_normalize(&mut c.layout);
+            }
+        }
+
+        let state_snap = StateSnapshot {
+            canvas_size,
+            viewport_outer_pos,
+            viewport_inner_size,
+            repo: None,
+            git_ref: WORKTREE_REF.to_string(),
+            exclude_regex: self.inputs.exclude_regex.clone(),
+            max_exts: self.inputs.max_exts,
+            filter_text: self.ui.filter_text.clone(),
+            show_top_level_stats: self.ui.show_top_level_stats,
+            canvas_bg_tint: self.ui.canvas_bg_tint,
+            theme_dark: self.theme.prefs.dark,
+            theme_syntect: self.theme.prefs.syntect_theme.clone(),
+            canvases: self
+                .canvases
+                .iter()
+                .map(|c| crate::app::layout::CanvasSnapshot {
+                    name: c.name.clone(),
+                    layout: c.layout.clone(),
+                    active_file_viewer: c.active_file_viewer,
+                    active_diff_viewer: c.active_diff_viewer,
+                })
+                .collect(),
+            active_canvas: self.active_canvas,
+            next_component_id: self.next_component_id,
+            file_viewers,
+            active_file_viewer: self.active_file_viewer_id(),
+            context_exporters,
+            execute_loops: HashMap::new(),
+            tasks: HashMap::new(),
+        };
+
+        WorkspaceFile {
+            version: 1,
+            default_preset: Some("Startup".to_string()),
+            presets: vec![Preset {
+                name: "Startup".to_string(),
+                kind: PresetKind::FullState(state_snap),
+            }],
+        }
+    }
+
+    pub fn save_startup_layout_override_to_appdata(
+        &mut self,
+        canvas_size: [f32; 2],
+        viewport_outer_pos: Option<[f32; 2]>,
+        viewport_inner_size: Option<[f32; 2]>,
+        _pixels_per_point: f32,
+    ) {
+        let path = match self.startup_layout_override_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.results.error = Some(format!("{:#}", e));
+                return;
+            }
+        };
+
+        let ws_file = self.build_startup_layout_workspace_file(canvas_size, viewport_outer_pos, viewport_inner_size);
+        let text = match serde_json::to_string_pretty(&ws_file) {
+            Ok(t) => t,
+            Err(e) => {
+                self.results.error = Some(format!("{:#}", e));
+                return;
+            }
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, text) {
+            self.results.error = Some(format!("{:#}", e));
+            return;
+        }
+        self.results.error = None;
+    }
+
+    pub fn export_built_in_startup_layout_to_repo_file(
+        &mut self,
+        canvas_size: [f32; 2],
+        viewport_outer_pos: Option<[f32; 2]>,
+        viewport_inner_size: Option<[f32; 2]>,
+        _pixels_per_point: f32,
+    ) {
+        let path = PathBuf::from("assets").join("default_startup_layout.json");
+        let ws_file = self.build_startup_layout_workspace_file(canvas_size, viewport_outer_pos, viewport_inner_size);
+        let text = match serde_json::to_string_pretty(&ws_file) {
+            Ok(t) => t,
+            Err(e) => {
+                self.results.error = Some(format!("{:#}", e));
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, text) {
+            self.results.error = Some(format!("{:#}", e));
+            return;
+        }
+        self.results.error = None;
+    }
+
     fn load_default_workspace_file(&self) -> WorkspaceFile {
+        if let Ok(path) = self.startup_layout_override_path() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(parsed) = serde_json::from_slice::<WorkspaceFile>(&bytes) {
+                    return parsed;
+                }
+            }
+        }
+
+        if let Ok(parsed) = serde_json::from_str::<WorkspaceFile>(include_str!("../../../assets/default_startup_layout.json")) {
+            return parsed;
+        }
+
         WorkspaceFile {
             version: 1,
             default_preset: Some("Default".to_string()),
@@ -127,7 +308,7 @@ impl AppState {
                         viewport_outer_pos: None,
                         viewport_inner_size: None,
                         repo: None,
-                        git_ref: "HEAD".to_string(),
+                        git_ref: WORKTREE_REF.to_string(),
                         exclude_regex: vec![r"\.lock$".into(), r"(^|/)package-lock\.json$".into()],
                         max_exts: 6,
                         filter_text: "".to_string(),
@@ -195,11 +376,18 @@ impl AppState {
 
         let mut context_exporters = HashMap::new();
         for (id, ex) in self.context_exporters.iter() {
-            context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
+            context_exporters.insert(
+                *id,
+                ContextExporterSnapshot {
+                    mode: ex.mode,
+                    skip_binary: ex.skip_binary,
+                    skip_gitignore: ex.skip_gitignore,
+                    include_staged_diff: ex.include_staged_diff,
+                    save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+                },
+            );
         }
 
-        // Chats/tasks are persisted globally per-repo.
-        // Workspace remains layout/session config only.
         if self.task_store_dirty {
             self.save_repo_task_store();
         }
@@ -292,6 +480,16 @@ impl AppState {
 
     pub fn load_workspace_from_appdata(&mut self, name_opt: Option<&str>) {
         let name = name_opt.unwrap_or("workspace");
+        if name_opt.is_none() || name == "workspace" {
+            let def = self.load_default_workspace_file();
+            self.apply_workspace_preset(&def, Some("workspace"));
+            return;
+        }
+        if name_opt.is_none() || name == "workspace" {
+            let def = self.load_default_workspace_file();
+            self.apply_workspace_preset(&def, Some("workspace"));
+            return;
+        }
         let path = match self.workspace_path(name) {
             Ok(p) => p,
             Err(e) => {
@@ -303,7 +501,6 @@ impl AppState {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(_) => {
-                // If missing, create a default and load it.
                 let def = self.load_default_workspace_file();
                 let text = serde_json::to_string_pretty(&def).unwrap_or_default();
                 if let Some(parent) = path.parent() {
@@ -366,9 +563,6 @@ impl AppState {
         self.results.error = None;
     }
 
-    // ---------------------------
-    // Workspace apply (called from app each frame)
-    // ---------------------------
 
     pub fn try_apply_pending_workspace(
         &mut self,
@@ -380,7 +574,6 @@ impl AppState {
             return false;
         };
 
-        // Wait a few frames for resize to settle.
         if pending.wait_frames > 0 {
             pending.wait_frames = pending.wait_frames.saturating_sub(1);
             self.pending_workspace_apply = Some(pending);
@@ -392,7 +585,6 @@ impl AppState {
         if let (Some(target), Some(cur)) = (pending.target_inner_size, current_inner_size) {
             let dx = (target[0] - cur[0]).abs();
             let dy = (target[1] - cur[1]).abs();
-            // Keep the existing tolerance for native windowing quirks.
             if dx > 2.0 || dy > 2.0 {
                 should_wait = true;
             }
@@ -401,8 +593,6 @@ impl AppState {
         if let Some(target) = pending.target_canvas_size {
             let dx = (target[0] - current_canvas_size[0]).abs();
             let dy = (target[1] - current_canvas_size[1]).abs();
-            // Canvas is already snapped/floored; require near-exact match.
-            // A mismatch here is what causes proportional window size drift on load.
             if dx > 0.25 || dy > 0.25 {
                 should_wait = true;
             }
@@ -414,10 +604,8 @@ impl AppState {
                 self.pending_workspace_apply = Some(pending);
                 return false;
             }
-            // Timeout: fall back to current behavior (apply with current canvas size).
         }
 
-        // Log the exact numbers used to denormalize/rescale layouts.
         let saved_canvas_size: Option<[f32; 2]> = match &pending.preset {
             PresetKind::LayoutOnly(ls) => Some(ls.canvas_size),
             PresetKind::FullState(st) => Some(st.canvas_size),
@@ -437,7 +625,6 @@ impl AppState {
             pixels_per_point = pixels_per_point,
         );
 
-        // Apply
         self.apply_preset_kind(pending.preset, current_canvas_size);
 
         self.pending_workspace_apply = None;
@@ -575,6 +762,10 @@ impl AppState {
                 for (id, snap) in state_snap.context_exporters.iter() {
                     if let Some(ex) = self.context_exporters.get_mut(id) {
                         ex.mode = snap.mode;
+                        ex.skip_binary = snap.skip_binary;
+                        ex.skip_gitignore = snap.skip_gitignore;
+                        ex.include_staged_diff = snap.include_staged_diff;
+                        ex.save_path = snap.save_path.as_ref().map(std::path::PathBuf::from);
                     }
                 }
 
@@ -620,8 +811,6 @@ impl AppState {
                             self.load_file_at_current_selection(id);
                         }
                     }
-                } else {
-                    self.results.error = Some("Loaded state has no repo selected.".into());
                 }
             }
         }

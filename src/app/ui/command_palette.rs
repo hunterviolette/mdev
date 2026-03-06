@@ -352,9 +352,6 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
     }
 }
 
-// ---------------------------
-// Fuzzy search helpers
-// ---------------------------
 
 fn normalize_q(s: &str) -> String {
     s.trim().to_ascii_lowercase()
@@ -368,7 +365,6 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
 
     let c = candidate.to_ascii_lowercase();
 
-    // Token-based "all tokens must appear" scoring.
     let tokens: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
     if tokens.is_empty() {
         return Some(0);
@@ -377,14 +373,12 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     let mut score: i32 = 0;
     for t in tokens {
         if let Some(pos) = c.find(t) {
-            // Earlier match is better.
             score += 100 - (pos as i32).min(100);
         } else {
             return None;
         }
     }
 
-    // Prefer shorter candidates slightly.
     score -= (c.len() as i32).min(80);
     Some(score)
 }
@@ -421,7 +415,6 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "shortcut/canvas/rename".into(),
         "shortcut/canvas/delete".into(),
 
-        // UI preferences
         "ui/personalization".into(),
     ];
 
@@ -514,8 +507,6 @@ fn constrain_to_lane(mut sugg: Vec<String>, lane: Option<&str>) -> Vec<String> {
     sugg
 }
 
-/// Command palette UI.
-/// Returns actions to dispatch this frame.
 pub fn command_palette(
     ctx: &egui::Context,
     state: &mut AppState,
@@ -550,9 +541,7 @@ pub fn command_palette(
             );
             resp.request_focus();
 
-            // Fuzzy search over ALL commands. Arrow keys navigate; Enter executes selection.
 
-            // If the query changes via typing, reset selection.
             if resp.changed() {
                 state.palette.selected = 0;
             }
@@ -561,10 +550,8 @@ pub fn command_palette(
             let lane = detect_command_lane(&state.palette.query);
 
             let mut sugg = if state.palette.query.trim().is_empty() {
-                // When empty, show a stable "top" list (not the entire command universe).
                 all.into_iter().take(30).collect::<Vec<_>>()
             } else {
-                // Pull more, then constrain + truncate.
                 fuzzy_filter_sort(&state.palette.query, &all, 60)
             };
 
@@ -573,7 +560,6 @@ pub fn command_palette(
                 sugg.truncate(30);
             }
 
-            // Keyboard navigation
             let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
             let up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -600,7 +586,6 @@ pub fn command_palette(
 
                     let row = ui.selectable_label(selected, s);
 
-                    // When navigating with arrow keys, keep the selected row in view.
                     if selected {
                         ui.scroll_to_rect(row.rect, Some(egui::Align::Center));
                     }
@@ -612,7 +597,6 @@ pub fn command_palette(
                 }
             });
 
-            // On Enter, promote selected suggestion into the query before parsing.
             if enter {
                 if let Some(chosen) = sugg.get(state.palette.selected).cloned() {
                     state.palette.query = chosen;

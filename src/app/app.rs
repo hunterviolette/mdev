@@ -2,6 +2,7 @@ use eframe::egui;
 
 use super::{theme, ui};
 use super::AppState;
+use super::state::WORKTREE_REF;
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -40,7 +41,29 @@ impl eframe::App for AppState {
 
         theme::apply_from_state(ctx, self);
 
-        // Ctrl+Shift+E toggles palette
+
+        let now_s = ctx.input(|i| i.time);
+        if self.inputs.repo.is_some() && self.inputs.git_ref == WORKTREE_REF {
+            if now_s - self.tree.last_git_status_refresh_s >= self.tree.git_status_interval_s {
+                self.tree.last_git_status_refresh_s = now_s;
+                self.refresh_tree_git_status();
+            }
+
+            if now_s - self.tree.last_auto_refresh_s >= self.tree.auto_refresh_interval_s {
+                self.tree.last_auto_refresh_s = now_s;
+                if !self.any_file_load_pending() {
+                    self.start_analysis_refresh_async();
+                }
+            }
+
+            if self.tree.analysis_refresh_pending {
+                ctx.request_repaint();
+            }
+            if self.poll_analysis_refresh() {
+                ctx.request_repaint();
+            }
+        }
+
 
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
@@ -64,7 +87,6 @@ impl eframe::App for AppState {
             i.key_pressed(egui::Key::E) && i.modifiers.ctrl && i.modifiers.shift
         });
 
-        // Native window title
         let repo_name = self
             .inputs
             .repo
@@ -116,7 +138,6 @@ impl eframe::App for AppState {
 
         ctx.data_mut(|d| d.insert_persisted(canvas_rect_id(), canvas_rect));
 
-        // Apply viewport restore (best-effort)
         if let Some(vr) = self.pending_viewport_restore.take() {
             if let Some([x, y]) = vr.outer_pos {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
@@ -127,12 +148,10 @@ impl eframe::App for AppState {
             ctx.request_repaint();
         }
 
-        // If we’re waiting to apply a workspace, keep repainting until it settles.
         if self.pending_workspace_apply.is_some() {
             ctx.request_repaint();
         }
 
-        // Workspace apply logic needs these every frame
         let canvas_size = current_canvas_size(ctx);
         let inner_size = current_viewport_inner_size(ctx);
         let ppp_now = ctx.pixels_per_point().max(1.0);
@@ -143,7 +162,6 @@ impl eframe::App for AppState {
             self.apply_action(a);
         }
 
-        // Command palette (drawn on top)
         let palette_actions = ui::command_palette::command_palette(
             ctx,
             self,
@@ -156,12 +174,18 @@ impl eframe::App for AppState {
             self.apply_action(a);
         }
 
-        // Canvas tint popup (modal; freezes underlying canvas while open)
         let tint_actions = ui::personalization::personalization(ctx, self);
         for a in tint_actions {
             self.apply_action(a);
         }
 
         self.finalize_frame();
+
+        if self.poll_file_loads() {
+            ctx.request_repaint();
+        }
+        if self.any_file_load_pending() {
+            ctx.request_repaint();
+        }
     }
 }

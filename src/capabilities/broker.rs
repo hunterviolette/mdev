@@ -69,6 +69,12 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
+            CapabilityRequest::CreateWorktreeDir { repo, path } => {
+                git::create_worktree_dir(&repo, &path)
+                    .with_context(|| format!("create_worktree_dir failed for {path}"))?;
+                Ok(CapabilityResponse::Unit)
+            }
+
             CapabilityRequest::DeleteWorktreePath { repo, path } => {
                 git::delete_worktree_path(&repo, &path)
                     .with_context(|| format!("delete_worktree_path failed for {path}"))?;
@@ -115,8 +121,10 @@ impl CapabilityBroker {
                 let opts = git::ContextExportOptions {
                     git_ref: &r.git_ref,
                     exclude: &compiled,
-                    max_bytes_per_file: r.max_bytes_per_file,
                     skip_binary: r.skip_binary,
+                    skip_gitignore: r.skip_gitignore,
+                    include_staged_diff: r.include_staged_diff,
+                    include_unstaged_diff: r.include_unstaged_diff,
                     include_files: r.include_files.as_deref(),
                 };
                 git::export_repo_context(&r.repo, &r.out_path, opts)
@@ -124,9 +132,6 @@ impl CapabilityBroker {
                 Ok(CapabilityResponse::Unit)
             }
 
-            // -----------------------------------------------------------------
-            // Source control (git)
-            // -----------------------------------------------------------------
             CapabilityRequest::GitStatus { repo } => {
                 let st = git::git_status(&repo)?;
                 Ok(CapabilityResponse::GitStatus(st))
@@ -220,7 +225,6 @@ impl CapabilityBroker {
         }
     }
 
-    /// Convenience: map top-bar git_ref to a FileSource for file reads.
     pub fn file_source_from_ref(git_ref: &str) -> FileSource {
         if git_ref == WORKTREE_REF {
             FileSource::Worktree
