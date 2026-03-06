@@ -1,10 +1,19 @@
 use eframe::egui;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Key, TextFormat};
-use std::sync::mpsc::TryRecvError;
 
 use super::super::actions::{Action, ComponentId, TerminalShell};
 use super::super::state::AppState;
+use super::super::state::TerminalEvent;
+
+fn is_scroll_input(ui: &egui::Ui) -> bool {
+    ui.input(|i| {
+        let a = i.raw_scroll_delta;
+        let b = i.smooth_scroll_delta;
+        a != egui::Vec2::ZERO || b != egui::Vec2::ZERO
+    })
+}
+
 
 fn calc_rows_cols(ui: &egui::Ui, rect: egui::Rect) -> (u16, u16) {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -160,7 +169,10 @@ pub fn terminal_panel(
 ) -> Vec<Action> {
     let mut actions = vec![];
 
-    let (current_shell, cwd_display) = match state.terminals.get(&terminal_id) {
+    let surface_id = egui::Id::new(("terminal_surface", terminal_id));
+
+
+    let (current_shell, _cwd_display) = match state.terminals.get(&terminal_id) {
         Some(t) => {
             let cwd_display = t
                 .cwd
@@ -215,7 +227,18 @@ pub fn terminal_panel(
                     }
                 });
 
+                        ui.label("Scrollback:");
+            if let Some(t) = state.terminals.get_mut(&terminal_id) {
+                let mut v = t.scrollback_max_lines as i32;
+                ui.add(egui::DragValue::new(&mut v).clamp_range(100..=20000));
+                let v2 = (v.max(100) as usize).min(20000);
+                if v2 != t.scrollback_max_lines {
+                    t.scrollback_max_lines = v2;
+                }
+            }
             ui.separator();
+
+ui.separator();
 
             if ui.button("Clear").clicked() {
                 actions.push(Action::ClearTerminal { terminal_id });
@@ -236,33 +259,42 @@ pub fn terminal_panel(
             };
 
             const MAX_OUT_BYTES: usize = 2 * 1024 * 1024;
-            let mut finished = false;
+            let mut _finished = false;
 
-            if let Some(rx) = t.pending_rx.as_ref() {
-                loop {
-                    match rx.try_recv() {
-                        Ok(ev) => match ev {
-                            crate::app::state::TerminalEvent::Stdout(s)
-                            | crate::app::state::TerminalEvent::Stderr(s)
-                            | crate::app::state::TerminalEvent::Error(s) => {
-                                if let Some(vt) = t.vt.as_mut() {
-                                    vt.process(s.as_bytes());
-                                    t.rendered_output = crate::app::controllers::terminal_controller::vt_screen_to_string(vt);
-                                } else {
-                                    push_bounded(&mut t.rendered_output, &s, MAX_OUT_BYTES);
-                                }
+            let drained: Vec<TerminalEvent> = {
+                let mut v: Vec<TerminalEvent> = Vec::new();
+                if let Some(rx) = t.pending_rx.as_ref() {
+                    while let Ok(ev) = rx.try_recv() {
+                        v.push(ev);
+                    }
+                }
+                v
+            };
+
+            if !drained.is_empty() {
+                for ev in drained {
+                    match ev {
+                        TerminalEvent::Stdout(s) | TerminalEvent::Stderr(s) => {
+                            if let Some(vt) = t.vt.as_mut() {
+                                vt.process(s.as_bytes());
                             }
-
-                        },
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            finished = true;
-                            break;
+                        }
+                        TerminalEvent::Error(e) => {
+                            let msg = format!("\n[pty] {e}\n");
+                            if let Some(vt) = t.vt.as_mut() {
+                                vt.process(msg.as_bytes());
+                            }
                         }
                     }
                 }
-            }
 
+                if let Some(vt) = t.vt.as_mut() {
+                    if t.follow_output {
+                        vt.screen_mut().set_scrollback(0);
+                    }
+                    t.rendered_output = crate::app::controllers::terminal_controller::vt_screen_to_string(vt);
+                }
+            }
 
 
             let (rect, out_resp) = ui.allocate_exact_size(
@@ -270,13 +302,29 @@ pub fn terminal_panel(
                 egui::Sense::click(),
             );
 
-            let surface_id = egui::Id::new(("terminal_surface", terminal_id));
-            let surface_resp = ui.interact(rect, surface_id, egui::Sense::focusable_noninteractive());
+            let surface_resp = ui.interact(rect, surface_id, egui::Sense::click());
             if out_resp.clicked() || surface_resp.clicked() {
                 surface_resp.request_focus();
             }
-            let surface_has_focus = ui.memory(|m| m.has_focus(surface_id));
 
+            if ui
+                .input(|i| i.pointer.hover_pos().map(|p| rect.contains(p)).unwrap_or(false))
+                && is_scroll_input(ui)
+                && !ui.input(|i| i.pointer.primary_down())
+            {
+                t.follow_output = false;
+                if let Some(vt) = t.vt.as_mut() {
+                    let dy = ui.input(|i| i.raw_scroll_delta.y + i.smooth_scroll_delta.y);
+                    let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+                    let lines = (-dy / row_h).round() as i32;
+                    if lines != 0 {
+                        let cur = vt.screen().scrollback() as i32;
+                        let next = (cur + lines).max(0) as usize;
+                        vt.screen_mut().set_scrollback(next);
+                        t.rendered_output = crate::app::controllers::terminal_controller::vt_screen_to_string(vt);
+                    }
+                }
+            }
             let (rows, cols) = calc_rows_cols(ui, rect);
             if t.pty_in.is_none() || t.pty_master.is_none() {
                 actions.push(Action::StartTerminalSession {
@@ -292,52 +340,68 @@ pub fn terminal_panel(
                 });
             }
 
+            let mut want_terminal_focus = false;
+
+            let surface_has_focus = ui.memory(|m| m.has_focus(surface_id));
+
             ui.allocate_ui_at_rect(rect, |ui| {
                 ui.set_width(full_w);
                 ui.set_max_width(full_w);
 
-                egui::ScrollArea::both()
-                    .id_source(("terminal_output_scroll", terminal_id))
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            if t.vt.is_some() {
-                                let text = &t.rendered_output;
-                                if surface_has_focus {
-                                    let (_rows, cols) = t.pty_size.unwrap_or((30, 120));
-                                    let (cur_row, cur_col) = t
-                                        .vt
-                                        .as_ref()
-                                        .map(|p| p.screen().cursor_position())
-                                        .unwrap_or((0, 0));
-                                    let job = vt_layout_with_cursor(ui, text, cols, cur_row, cur_col);
-                                    ui.add(egui::Label::new(job).selectable(true).wrap(false));
-                                } else {
-                                    ui.add(
-                                        egui::Label::new(egui::RichText::new(text).monospace())
-                                            .selectable(false)
-                                            .wrap(false),
-                                    );
-                                }
-                            } else {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(&t.rendered_output).monospace())
-                                        .selectable(true)
-                                        .wrap(false),
-                                );
+                if ui.input(|i| i.pointer.primary_down() && i.pointer.delta() != egui::Vec2::ZERO) {
+                    t.follow_output = false;
+                }
+
+let text = &t.rendered_output;
+
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if t.vt.is_some() {
+                        if surface_has_focus {
+                            let (_rows, cols) = t.pty_size.unwrap_or((30, 120));
+                            let (cur_row, cur_col) = t
+                                .vt
+                                .as_ref()
+                                .map(|p| p.screen().cursor_position())
+                                .unwrap_or((0, 0));
+
+                            let job = vt_layout_with_cursor(ui, text, cols, cur_row, cur_col);
+                            let resp = ui.add(egui::Label::new(job).selectable(true).wrap(false));
+                            if resp.clicked() || resp.drag_started() {
+                                want_terminal_focus = true;
                             }
-                        });
-                    });
+                        } else {
+                            let resp = ui.add(
+                                egui::Label::new(egui::RichText::new(text).monospace())
+                                    .selectable(true)
+                                    .wrap(false),
+                            );
+                            if resp.clicked() || resp.drag_started() {
+                                want_terminal_focus = true;
+                            }
+                        }
+                    } else {
+                        let resp = ui.add(
+                            egui::Label::new(egui::RichText::new(text).monospace())
+                                .selectable(true)
+                                .wrap(false),
+                        );
+                        if resp.clicked() || resp.drag_started() {
+                            want_terminal_focus = true;
+                        }
+                    }
+                });
             });
+
+            if want_terminal_focus {
+                ui.memory_mut(|m| m.request_focus(surface_id));
+            }
         }
 
         {
-            let Some(t) = state.terminals.get_mut(&terminal_id) else {
+            let Some(_t) = state.terminals.get_mut(&terminal_id) else {
                 return;
             };
 
-            let surface_id = egui::Id::new(("terminal_surface", terminal_id));
             let surface_has_focus = ui.memory(|m| m.has_focus(surface_id));
 
             if surface_has_focus {
@@ -358,12 +422,47 @@ pub fn terminal_panel(
 
                 ctx.input_mut(|i| {
 
-                    let events = std::mem::take(&mut i.events);
-                    for e in events {
+                    i.events.retain(|e| {
                         match e {
-                            egui::Event::Text(s) => bytes_to_send.extend_from_slice(s.as_bytes()),
-                            egui::Event::Copy => bytes_to_send.push(0x03),
-                            other => i.events.push(other),
+                            egui::Event::Key {
+                                key: Key::C,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if (modifiers.ctrl && modifiers.shift) || (modifiers.command && modifiers.shift) => {
+                                bytes_to_send.push(0x03);
+                                false
+                            }
+                            egui::Event::Copy => {
+                                if i.modifiers.shift && (i.modifiers.ctrl || i.modifiers.command) {
+                                    bytes_to_send.push(0x03);
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => true,
+                        }
+                    });
+                    i.events.retain(|e| match e {
+                        egui::Event::Text(s) => {
+                            bytes_to_send.extend_from_slice(s.as_bytes());
+                            false
+                        }
+                        egui::Event::Paste(s) => {
+                            bytes_to_send.extend_from_slice(s.as_bytes());
+                            false
+                        }
+                        _ => true,
+                    });
+
+                    if !bytes_to_send.is_empty() {
+                        if let Some(t) = state.terminals.get_mut(&terminal_id) {
+                            t.follow_output = true;
+                            if let Some(vt) = t.vt.as_mut() {
+                                vt.screen_mut().set_scrollback(0);
+                                t.rendered_output = crate::app::controllers::terminal_controller::vt_screen_to_string(vt);
+                            }
                         }
                     }
 
@@ -394,17 +493,6 @@ pub fn terminal_panel(
                                 bytes_to_send.extend_from_slice(seq);
                             }
                         }
-                    }
-
-                    let mut mods = egui::Modifiers::NONE;
-                    mods.ctrl = true;
-                    if i.consume_key(mods, Key::C) {
-                        bytes_to_send.push(0x03);
-                    }
-                    let mut mods = egui::Modifiers::NONE;
-                    mods.command = true;
-                    if i.consume_key(mods, Key::C) {
-                        bytes_to_send.push(0x03);
                     }
 
                     let mut mods = egui::Modifiers::NONE;

@@ -16,8 +16,10 @@ pub struct ContextExportReq {
     pub out_path: PathBuf,
     pub git_ref: String,            // may be WORKTREE
     pub exclude_regex: Vec<String>, // raw patterns, compiled inside broker
-    pub max_bytes_per_file: usize,
     pub skip_binary: bool,
+    pub skip_gitignore: bool,
+    pub include_staged_diff: bool,
+    pub include_unstaged_diff: bool,
     pub include_files: Option<Vec<String>>, // None => entire repo
 }
 

@@ -203,11 +203,16 @@ pub enum Action {
     ContextGenerate {
         exporter_id: ComponentId,
     },
-    ContextSetMaxBytes {
-        exporter_id: ComponentId,
-        max: usize,
-    },
     ContextToggleSkipBinary {
+        exporter_id: ComponentId,
+    },
+    ContextToggleSkipGitignore {
+        exporter_id: ComponentId,
+    },
+    ContextToggleIncludeStagedDiff {
+        exporter_id: ComponentId,
+    },
+    ContextToggleIncludeUnstagedDiff {
         exporter_id: ComponentId,
     },
 

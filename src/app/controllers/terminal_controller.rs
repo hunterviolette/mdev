@@ -11,6 +11,82 @@ pub(crate) fn vt_screen_to_string(p: &vt100::Parser) -> String {
     p.screen().contents()
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                let _ = chars.next();
+                while let Some(c) = chars.next() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let _ = chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = chars.next();
+            }
+            None => {}
+        }
+    }
+
+    out
+}
+
+pub(crate) fn append_scrollback_lines(t: &mut TerminalState, chunk: &str) {
+    let cleaned = strip_ansi(chunk);
+
+    for ch in cleaned.chars() {
+        match ch {
+            '\r' => {
+                t.scrollback_partial.clear();
+            }
+            '\n' => {
+                let line = std::mem::take(&mut t.scrollback_partial);
+                t.scrollback.push_back(line);
+                while t.scrollback.len() > t.scrollback_max_lines {
+                    t.scrollback.pop_front();
+                }
+            }
+            _ => {
+                t.scrollback_partial.push(ch);
+            }
+        }
+    }
+}
+
+pub(crate) fn render_scrollback(t: &TerminalState) -> String {
+    let mut out = String::new();
+    for (i, line) in t.scrollback.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if !t.scrollback_partial.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&t.scrollback_partial);
+    }
+    out
+}
+
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -24,9 +100,11 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         Action::ClearTerminal { terminal_id } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
                 if let Some(vt) = t.vt.as_mut() {
-                    *vt = vt100::Parser::new(30, 120, 2000);
+                    *vt = vt100::Parser::new(30, 120, t.scrollback_max_lines);
                 }
                 t.rendered_output.clear();
+                t.scrollback.clear();
+                t.scrollback_partial.clear();
                 t.pending_rx = None;
                 t.pty_in = None;
                 t.pty_child = None;
@@ -65,7 +143,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         Action::ResizeTerminal { terminal_id, rows, cols } => {
             if let Some(t) = state.terminals.get_mut(terminal_id) {
                 if let Some(master) = t.pty_master.as_ref() {
-                    if let Ok(mut m) = master.lock() {
+                    if let Ok(m) = master.lock() {
                         let _ = m.resize(PtySize {
                             rows: *rows,
                             cols: *cols,
@@ -74,6 +152,11 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         });
                         t.pty_size = Some((*rows, *cols));
                     }
+                }
+
+                if let Some(vt) = t.vt.as_mut() {
+                    *vt = vt100::Parser::new(*rows, *cols, t.scrollback_max_lines);
+                    t.rendered_output = vt_screen_to_string(vt);
                 }
             }
             true
@@ -118,6 +201,10 @@ impl AppState {
                 TerminalState {
                     vt: Some(vt100::Parser::new(30, 120, 2000)),
                     rendered_output: String::new(),
+                    scrollback: std::collections::VecDeque::new(),
+                    scrollback_partial: String::new(),
+                    scrollback_max_lines: 2000,
+                    follow_output: true,
                     pty_master: None,
                     pty_child: None,
                     pty_size: None,
@@ -167,6 +254,10 @@ impl AppState {
             TerminalState {
                 vt: Some(vt100::Parser::new(30, 120, 2000)),
                 rendered_output: String::new(),
+                scrollback: std::collections::VecDeque::new(),
+                scrollback_partial: String::new(),
+                scrollback_max_lines: 2000,
+                follow_output: true,
                 pty_master: None,
                 pty_child: None,
                 pty_size: None,
@@ -249,7 +340,7 @@ impl AppState {
         if t.pty_in.is_some() && t.pty_master.is_some() {
             if t.pty_size != Some((rows, cols)) {
                 if let Some(master) = t.pty_master.as_ref() {
-                    if let Ok(mut m) = master.lock() {
+                    if let Ok(m) = master.lock() {
                         let _ = m.resize(PtySize {
                             rows,
                             cols,
@@ -261,7 +352,7 @@ impl AppState {
                 t.pty_size = Some((rows, cols));
 
                 if let Some(vt) = t.vt.as_mut() {
-                    *vt = vt100::Parser::new(rows, cols, 2000);
+                    *vt = vt100::Parser::new(rows, cols, t.scrollback_max_lines);
                     t.rendered_output = vt_screen_to_string(vt);
                 }
             }
@@ -286,11 +377,11 @@ impl AppState {
         t.pty_child = Some(Arc::new(Mutex::new(child)));
         t.pty_size = Some((rows, cols));
 
-        t.vt = Some(vt100::Parser::new(rows, cols, 2000));
+        t.vt = Some(vt100::Parser::new(rows, cols, t.scrollback_max_lines));
         t.rendered_output.clear();
 
         let (mut reader, writer) = {
-            let mut m = match master.lock() {
+            let m = match master.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
@@ -343,8 +434,8 @@ impl AppState {
         };
 
 
-        let cwd = t.cwd.clone().or_else(|| self.inputs.repo.clone());
-        let shell = t.shell.clone();
+        let _cwd = t.cwd.clone().or_else(|| self.inputs.repo.clone());
+        let _shell = t.shell.clone();
 
         if let Some(pty_in) = t.pty_in.as_ref() {
             if let Ok(mut w) = pty_in.lock() {

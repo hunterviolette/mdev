@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver;
@@ -55,6 +55,12 @@ pub struct TerminalState {
     pub vt: Option<vt100::Parser>,
     pub rendered_output: String,
 
+    pub scrollback: VecDeque<String>,
+    pub scrollback_partial: String,
+    pub scrollback_max_lines: usize,
+
+    pub follow_output: bool,
+
     pub pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub pty_child: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send>>>>,
     pub pty_size: Option<(u16, u16)>,
@@ -67,10 +73,14 @@ pub struct TerminalState {
 }
     pub struct ContextExporterState {
     pub save_path: Option<PathBuf>,
-    pub max_bytes_per_file: usize,
     pub skip_binary: bool,
+    pub skip_gitignore: bool,
+    pub include_staged_diff: bool,
+    pub include_unstaged_diff: bool,
     pub mode: ContextExportMode,
     pub status: Option<String>,
+    pub export_pending: bool,
+    pub export_rx: Option<std::sync::mpsc::Receiver<Result<u128, String>>>,
 }
 
 pub struct ChangeSetApplierState {
@@ -862,10 +872,14 @@ impl AppState {
         for id in ids {
             self.context_exporters.entry(id).or_insert_with(|| ContextExporterState {
                 save_path: None,
-                max_bytes_per_file: 200_000,
                 skip_binary: true,
+                skip_gitignore: true,
+                include_staged_diff: false,
+                include_unstaged_diff: false,
                 mode: ContextExportMode::TreeSelect,
                 status: None,
+                export_pending: false,
+                export_rx: None,
             });
         }
     }

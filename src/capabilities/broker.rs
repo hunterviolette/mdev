@@ -121,8 +121,10 @@ impl CapabilityBroker {
                 let opts = git::ContextExportOptions {
                     git_ref: &r.git_ref,
                     exclude: &compiled,
-                    max_bytes_per_file: r.max_bytes_per_file,
                     skip_binary: r.skip_binary,
+                    skip_gitignore: r.skip_gitignore,
+                    include_staged_diff: r.include_staged_diff,
+                    include_unstaged_diff: r.include_unstaged_diff,
                     include_files: r.include_files.as_deref(),
                 };
                 git::export_repo_context(&r.repo, &r.out_path, opts)

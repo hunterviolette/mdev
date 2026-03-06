@@ -628,10 +628,24 @@ pub fn move_worktree_path(repo: &Path, from: &str, to: &str) -> Result<()> {
 pub struct ContextExportOptions<'a> {
     pub git_ref: &'a str,                 // may be WORKTREE
     pub exclude: &'a [Regex],
-    pub max_bytes_per_file: usize,
     pub skip_binary: bool,
+    pub skip_gitignore: bool,
+    pub include_staged_diff: bool,
+    pub include_unstaged_diff: bool,
     pub include_files: Option<&'a [String]>, // None => full repo selection
 }
+
+impl<'a> ContextExportOptions<'a> {
+    fn include_staged_diff_enabled(&self) -> bool {
+        self.git_ref == WORKTREE_REF && self.include_staged_diff
+    }
+
+    fn include_unstaged_diff_enabled(&self) -> bool {
+        self.git_ref == WORKTREE_REF && self.include_unstaged_diff
+    }
+
+}
+
 
 fn is_excluded(ex: &[Regex], path: &str) -> bool {
     ex.iter().any(|r| r.is_match(path))
@@ -641,19 +655,241 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().any(|&b| b == 0)
 }
 
-fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
+const CONTEXT_EXPORT_MAX_BYTES_PER_FILE: usize = 200_000;
+
+const BINARY_EXTS: &[&str] = &[
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".mp3",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".wav",
+    ".flac",
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+    ".eot",
+    ".jar",
+    ".class",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+];
+
+fn ext_of_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext.is_empty() {
+        "".to_string()
+    } else {
+        format!(".{}", ext.to_lowercase())
+    }
+}
+
+fn is_binary_ext_for_path(path: &str) -> bool {
+    let ext = ext_of_path(path);
+    if ext.is_empty() {
+        return false;
+    }
+    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(&ext))
+}
+
+fn is_env_path(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    p == ".env" || p.ends_with("/.env") || p.contains("/.env.")
+}
+
+fn glob_to_regex_pattern(glob: &str) -> Option<String> {
+    let mut g = glob.trim();
+    if g.is_empty() {
+        return None;
+    }
+    if g.starts_with('#') {
+        return None;
+    }
+    if g.starts_with('!') {
+        return None;
+    }
+
+    let anchored = g.starts_with('/');
+    if anchored {
+        g = g.trim_start_matches('/');
+    }
+
+    let dir_only = g.ends_with('/');
+    if dir_only {
+        g = g.trim_end_matches('/');
+    }
+
+    if g.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    if anchored {
+        out.push('^');
+    } else {
+        out.push_str("(^|/)");
+    }
+
+    let mut chars = g.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    let _ = chars.next();
+                    out.push_str(".*");
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    if dir_only {
+        out.push_str("(/|$)");
+    } else {
+        out.push_str("($|/)");
+    }
+
+    Some(out)
+}
+
+fn compile_gitignore_like(repo: &Path) -> Vec<Regex> {
+    let path = repo.join(".gitignore");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rx_s) = glob_to_regex_pattern(l) {
+            if let Ok(rx) = Regex::new(&rx_s) {
+                out.push(rx);
+            }
+        }
+    }
+    out
+}
+
+fn write_section(out: &mut String, header: &str, bytes: &[u8]) {
+
+
+
+
+#[derive(Default)]
+struct TreeNode {
+    children: std::collections::BTreeMap<String, TreeNode>,
+    files: Vec<String>,
+}
+
+fn build_tree(paths: &[String]) -> TreeNode {
+    let mut root = TreeNode::default();
+
+    for p in paths {
+        let p = p.replace('\\', "/");
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut cur = &mut root;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                cur.files.push((*part).to_string());
+            } else {
+                cur = cur.children.entry((*part).to_string()).or_default();
+            }
+        }
+    }
+
+    root
+}
+
+fn render_tree(out: &mut String, node: &TreeNode, prefix: &str) {
+    let mut entries: Vec<(bool, String)> = Vec::new();
+
+    for (name, _) in node.children.iter() {
+        entries.push((true, name.clone()));
+    }
+    for f in node.files.iter() {
+        entries.push((false, f.clone()));
+    }
+
+    for (idx, (is_dir, name)) in entries.iter().enumerate() {
+        let last = idx + 1 == entries.len();
+        let branch = if last { "└── " } else { "├── " };
+        out.push_str(prefix);
+        out.push_str(branch);
+        out.push_str(name);
+        if *is_dir {
+            out.push('/');
+        }
+        out.push('\n');
+
+        if *is_dir {
+            if let Some(child) = node.children.get(name) {
+                let next_prefix = if last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+                render_tree(out, child, &next_prefix);
+            }
+        }
+    }
+}
+
+fn write_file_tree(out: &mut String, paths: &[String]) {
+    out.push_str("## File Tree\n");
+    out.push_str(".\n");
+
+    let tree = build_tree(paths);
+    render_tree(out, &tree, "");
+    out.push('\n');
+}
+
     out.push_str("\n");
     out.push_str("==== ");
     out.push_str(header);
     out.push_str(" ====\n");
 
-    if bytes.len() > limit {
+    if bytes.len() > CONTEXT_EXPORT_MAX_BYTES_PER_FILE {
         out.push_str(&format!(
             "[TRUNCATED] {} bytes (limit {})\n",
             bytes.len(),
-            limit
+            CONTEXT_EXPORT_MAX_BYTES_PER_FILE
         ));
-        out.push_str(&String::from_utf8_lossy(&bytes[..limit]));
+        out.push_str(&String::from_utf8_lossy(&bytes[..CONTEXT_EXPORT_MAX_BYTES_PER_FILE]));
         out.push_str("\n");
     } else {
         out.push_str(&String::from_utf8_lossy(bytes));
@@ -663,12 +899,110 @@ fn write_section(out: &mut String, header: &str, bytes: &[u8], limit: usize) {
     }
 }
 
+#[derive(Default)]
+struct ContextTreeNode {
+    children: std::collections::BTreeMap<String, ContextTreeNode>,
+    files: Vec<String>,
+}
+
+fn build_context_tree(paths: &[String]) -> ContextTreeNode {
+    let mut root = ContextTreeNode::default();
+
+    for p in paths {
+        let p = p.replace('\\', "/");
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut cur = &mut root;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                cur.files.push((*part).to_string());
+            } else {
+                cur = cur.children.entry((*part).to_string()).or_default();
+            }
+        }
+    }
+
+    root
+}
+
+fn render_context_tree(out: &mut String, node: &ContextTreeNode, prefix: &str) {
+    let mut entries: Vec<(bool, String)> = Vec::new();
+
+    for (name, _) in node.children.iter() {
+        entries.push((true, name.clone()));
+    }
+    for f in node.files.iter() {
+        entries.push((false, f.clone()));
+    }
+
+    for (idx, (is_dir, name)) in entries.iter().enumerate() {
+        let last = idx + 1 == entries.len();
+        let branch = if last { "└── " } else { "├── " };
+        out.push_str(prefix);
+        out.push_str(branch);
+        out.push_str(name);
+        if *is_dir {
+            out.push('/');
+        }
+        out.push('\n');
+
+        if *is_dir {
+            if let Some(child) = node.children.get(name) {
+                let next_prefix = if last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+                render_context_tree(out, child, &next_prefix);
+            }
+        }
+    }
+}
+
+fn write_file_tree(out: &mut String, paths: &[String]) {
+    out.push_str("## File Tree\n");
+    out.push_str(".\n");
+
+    let tree = build_context_tree(paths);
+    render_context_tree(out, &tree, "");
+    out.push('\n');
+}
+
+fn write_staged_diff_section(out: &mut String, path: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let header = format!("STAGED DIFF {}", path);
+    write_section(out, &header, bytes);
+}
+
+fn write_unstaged_diff_section(out: &mut String, path: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let header = format!("UNSTAGED DIFF {}", path);
+    write_section(out, &header, bytes);
+}
+
 pub fn export_repo_context(
     repo: &Path,
     out_path: &Path,
     opts: ContextExportOptions<'_>,
 ) -> Result<()> {
     if opts.git_ref != WORKTREE_REF {
+        ensure_git_installed()?;
+        ensure_git_repo(repo)?;
+    }
+
+    if opts.include_staged_diff_enabled() {
+        ensure_git_installed()?;
+        ensure_git_repo(repo)?;
+    }
+
+    if opts.include_unstaged_diff_enabled() {
         ensure_git_installed()?;
         ensure_git_repo(repo)?;
     }
@@ -682,17 +1016,63 @@ pub fn export_repo_context(
         split_lines(&bytes)
     };
 
+    let gitignore_rx = if opts.skip_gitignore {
+        compile_gitignore_like(repo)
+    } else {
+        vec![]
+    };
+
     let mut out = String::new();
     out.push_str("## Repo Context Export\n");
     out.push_str(&format!("repo: {}\n", repo.display()));
     out.push_str(&format!("ref: {}\n", opts.git_ref));
+    out.push_str(&format!("include_staged_diff: {}\n", opts.include_staged_diff_enabled()));
+    out.push_str(&format!("include_unstaged_diff: {}\n", opts.include_unstaged_diff_enabled()));
     out.push_str(&format!("files: {}\n", files.len()));
     out.push_str("\n");
 
-    for f in files {
+    let mut tree_paths: Vec<String> = Vec::new();
+    for f in files.iter() {
         let f_norm = f.replace('\\', "/");
+
         if is_excluded(opts.exclude, &f_norm) {
             continue;
+        }
+
+        if !gitignore_rx.is_empty() && gitignore_rx.iter().any(|r| r.is_match(&f_norm)) {
+            continue;
+        }
+
+        if opts.skip_binary {
+            if is_binary_ext_for_path(&f_norm) {
+                continue;
+            }
+        }
+
+        tree_paths.push(f_norm);
+    }
+
+    write_file_tree(&mut out, &tree_paths);
+
+    for f in files {
+        let f_norm = f.replace('\\', "/");
+
+        if is_excluded(opts.exclude, &f_norm) {
+            continue;
+        }
+
+        if !gitignore_rx.is_empty() && gitignore_rx.iter().any(|r| r.is_match(&f_norm)) {
+            continue;
+        }
+
+        if opts.include_staged_diff_enabled() {
+            let diff = run_git(repo, &["diff", "--cached", "--no-color", "--", &f_norm]).unwrap_or_default();
+            write_staged_diff_section(&mut out, &f_norm, &diff);
+        }
+
+        if opts.include_unstaged_diff_enabled() {
+            let diff = run_git(repo, &["diff", "--no-color", "--", &f_norm]).unwrap_or_default();
+            write_unstaged_diff_section(&mut out, &f_norm, &diff);
         }
 
         let bytes = if opts.git_ref == WORKTREE_REF {
@@ -708,11 +1088,16 @@ pub fn export_repo_context(
             }
         };
 
-        if opts.skip_binary && is_probably_binary(&bytes) {
-            continue;
+        if opts.skip_binary {
+            if is_binary_ext_for_path(&f_norm) {
+                continue;
+            }
+            if is_probably_binary(&bytes) {
+                continue;
+            }
         }
 
-        write_section(&mut out, &f_norm, &bytes, opts.max_bytes_per_file);
+        write_section(&mut out, &f_norm, &bytes);
     }
 
     if let Some(parent) = out_path.parent() {

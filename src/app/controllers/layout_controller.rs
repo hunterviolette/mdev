@@ -175,10 +175,14 @@ impl AppState {
                     id,
                     ContextExporterState {
                         save_path: None,
-                        max_bytes_per_file: 200_000,
                         skip_binary: true,
+                        skip_gitignore: true,
+                        include_staged_diff: false,
+                        include_unstaged_diff: false,
                         mode: ContextExportMode::EntireRepo,
                         status: None,
+                        export_pending: false,
+                        export_rx: None,
                     },
                 );
 

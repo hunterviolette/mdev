@@ -155,7 +155,13 @@ impl AppState {
 
         let mut context_exporters = HashMap::new();
         for (id, ex) in self.context_exporters.iter() {
-            context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
+            context_exporters.insert(*id, ContextExporterSnapshot {
+                mode: ex.mode,
+                skip_binary: ex.skip_binary,
+                skip_gitignore: ex.skip_gitignore,
+                include_staged_diff: ex.include_staged_diff,
+                save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+            });
         }
 
         {
@@ -370,7 +376,16 @@ impl AppState {
 
         let mut context_exporters = HashMap::new();
         for (id, ex) in self.context_exporters.iter() {
-            context_exporters.insert(*id, ContextExporterSnapshot { mode: ex.mode });
+            context_exporters.insert(
+                *id,
+                ContextExporterSnapshot {
+                    mode: ex.mode,
+                    skip_binary: ex.skip_binary,
+                    skip_gitignore: ex.skip_gitignore,
+                    include_staged_diff: ex.include_staged_diff,
+                    save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+                },
+            );
         }
 
         if self.task_store_dirty {
@@ -747,6 +762,10 @@ impl AppState {
                 for (id, snap) in state_snap.context_exporters.iter() {
                     if let Some(ex) = self.context_exporters.get_mut(id) {
                         ex.mode = snap.mode;
+                        ex.skip_binary = snap.skip_binary;
+                        ex.skip_gitignore = snap.skip_gitignore;
+                        ex.include_staged_diff = snap.include_staged_diff;
+                        ex.save_path = snap.save_path.as_ref().map(std::path::PathBuf::from);
                     }
                 }
 

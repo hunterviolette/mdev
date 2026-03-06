@@ -40,8 +40,21 @@ pub struct FileViewerSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextExporterSnapshot {
     pub mode: crate::app::state::ContextExportMode,
+
+    #[serde(default)]
+    pub skip_binary: bool,
+
+    #[serde(default = "default_true")]
+    pub skip_gitignore: bool,
+
+    #[serde(default)]
+    pub include_staged_diff: bool,
+
+    #[serde(default)]
+    pub save_path: Option<String>,
 }
 
+fn default_true() -> bool { true }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteLoopSnapshot {
