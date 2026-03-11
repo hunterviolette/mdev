@@ -167,6 +167,18 @@ impl AppState {
         st.postprocess_ok = snap.postprocess_ok;
         st.postprocess_err = snap.postprocess_err;
         st.paused = snap.paused;
+        st.transport = snap.transport;
+        st.browser_profile = snap.browser_profile.clone();
+        st.browser_cdp_url = snap.browser_cdp_url.clone();
+        st.browser_page_url_contains = snap.browser_page_url_contains.clone();
+        st.browser_target_url = snap.browser_target_url.clone();
+        st.browser_session_id = snap.browser_session_id.clone();
+        st.browser_status = snap.browser_status;
+        st.browser_last_probe = snap.browser_last_probe.clone();
+        st.browser_probe_pending = snap.browser_probe_pending;
+        st.browser_probe_error = snap.browser_probe_error.clone();
+        st.browser_attached = snap.browser_attached;
+        st.browser_auto_launch_edge = snap.browser_auto_launch_edge;
     }
 
     pub fn ensure_execute_loop_state_loaded(&mut self, loop_id: crate::app::actions::ComponentId) {
@@ -256,6 +268,21 @@ impl AppState {
                 changesets_err: st.changesets_err,
                 postprocess_ok: st.postprocess_ok,
                 postprocess_err: st.postprocess_err,
+                transport: st.transport,
+                browser_profile: st.browser_profile.clone(),
+                browser_bridge_dir: String::new(),
+                browser_cdp_url: st.browser_cdp_url.clone(),
+                browser_page_url_contains: st.browser_page_url_contains.clone(),
+                browser_target_url: st.browser_target_url.clone(),
+                browser_edge_executable: String::new(),
+                browser_user_data_dir: String::new(),
+                browser_session_id: st.browser_session_id.clone(),
+                browser_status: st.browser_status,
+                browser_last_probe: st.browser_last_probe.clone(),
+                browser_probe_pending: st.browser_probe_pending,
+                browser_probe_error: st.browser_probe_error.clone(),
+                browser_attached: st.browser_attached,
+                browser_auto_launch_edge: st.browser_auto_launch_edge,
             },
         );
 
@@ -289,6 +316,21 @@ impl AppState {
                         changesets_err: st.changesets_err,
                         postprocess_ok: st.postprocess_ok,
                         postprocess_err: st.postprocess_err,
+                        transport: st.transport,
+                        browser_profile: st.browser_profile.clone(),
+                        browser_bridge_dir: String::new(),
+                        browser_cdp_url: st.browser_cdp_url.clone(),
+                        browser_page_url_contains: st.browser_page_url_contains.clone(),
+                        browser_target_url: st.browser_target_url.clone(),
+                        browser_edge_executable: String::new(),
+                        browser_user_data_dir: String::new(),
+                        browser_session_id: st.browser_session_id.clone(),
+                        browser_status: st.browser_status,
+                        browser_last_probe: st.browser_last_probe.clone(),
+                        browser_probe_pending: st.browser_probe_pending,
+                        browser_probe_error: st.browser_probe_error.clone(),
+                        browser_attached: st.browser_attached,
+                        browser_auto_launch_edge: st.browser_auto_launch_edge,
                     },
                 );
 

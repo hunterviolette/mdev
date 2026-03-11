@@ -1,4 +1,4 @@
-### SWE AI-based IDE
+### AI SWE IDE
 
 Documentation coming soon 
 

@@ -1,7 +1,8 @@
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
-use crate::app::state::{AppState, ExecuteLoopMessage, ExecuteLoopMode};
+use crate::app::browser_bridge::browser_model_options;
+use crate::app::state::{AppState, BrowserBridgeStatus, ExecuteLoopMessage, ExecuteLoopMode, ExecuteLoopTransport};
 
 pub fn changeset_loop_panel(
     ctx: &egui::Context,
@@ -39,6 +40,7 @@ pub fn changeset_loop_panel(
     let before_mode = st.mode;
     let before_include_ctx = st.include_context_next;
     let before_auto_fill = st.auto_fill_first_changeset_applier;
+    let before_browser_target_url = st.browser_target_url.clone();
 
 
     if st.mode == ExecuteLoopMode::ChangeSet && !st.auto_fill_first_changeset_applier {
@@ -48,40 +50,49 @@ pub fn changeset_loop_panel(
     let before_changeset_auto = st.changeset_auto;
     let before_postprocess_cmd = st.postprocess_cmd.clone();
 
-    if !st.history_sync_pending {
+    if st.transport == ExecuteLoopTransport::Api && !st.history_sync_pending {
         if let Some(cid) = st.conversation_id.clone() {
-            let already_synced = st
-                .history_synced_conversation_id
-                .as_deref()
-                .map(|s| s == cid)
-                .unwrap_or(false);
+            if cid.starts_with("conv") {
+                let already_synced = st
+                    .history_synced_conversation_id
+                    .as_deref()
+                    .map(|s| s == cid)
+                    .unwrap_or(false);
 
-            if !already_synced {
-                let openai = state.openai.clone();
-                let (tx, rx) = std::sync::mpsc::channel::<
-                    Result<Vec<crate::app::state::ExecuteLoopMessage>, String>,
-                >();
+                if !already_synced {
+                    let openai = state.openai.clone();
+                    let (tx, rx) = std::sync::mpsc::channel::<
+                        Result<Vec<crate::app::state::ExecuteLoopMessage>, String>,
+                    >();
 
-                st.history_sync_pending = true;
-                st.history_sync_rx = Some(rx);
+                    st.history_sync_pending = true;
+                    st.history_sync_rx = Some(rx);
 
-                std::thread::spawn(move || {
-                    let res = openai
-                        .list_conversation_messages(&cid)
-                        .map(|pairs| {
-                            pairs
-                                .into_iter()
-                                .map(|(role, content)| crate::app::state::ExecuteLoopMessage {
-                                    role,
-                                    content,
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .map_err(|e| format!("{:#}", e));
-                    let _ = tx.send(res);
-                });
+                    std::thread::spawn(move || {
+                        let res = openai
+                            .list_conversation_messages(&cid)
+                            .map(|pairs| {
+                                pairs
+                                    .into_iter()
+                                    .map(|(role, content)| crate::app::state::ExecuteLoopMessage {
+                                        role,
+                                        content,
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .map_err(|e| format!("{:#}", e));
+                        let _ = tx.send(res);
+                    });
+                }
+            } else {
+                st.history_synced_conversation_id = Some(cid);
+                st.history_sync_pending = false;
+                st.history_sync_rx = None;
             }
         }
+    } else if st.transport == ExecuteLoopTransport::BrowserBridge {
+        st.history_sync_pending = false;
+        st.history_sync_rx = None;
     }
 
     if st.history_sync_pending {
@@ -147,7 +158,14 @@ pub fn changeset_loop_panel(
         if let Some(rx) = &st.pending_rx {
             match rx.try_recv() {
                 Ok(Ok(out)) => {
-                    st.conversation_id = Some(out.conversation_id.clone());
+                    if let Some(conversation_id) = out.conversation_id.clone() {
+                        st.conversation_id = Some(conversation_id);
+                    }
+                    if let Some(browser_session_id) = out.browser_session_id.clone() {
+                        st.browser_session_id = Some(browser_session_id);
+                        st.browser_status = BrowserBridgeStatus::Ready;
+                        st.browser_attached = true;
+                    }
 
                     if let Some(sys_idx) = st.messages.iter().position(|m| m.role == "system") {
                         if sys_idx != 0 {
@@ -359,19 +377,29 @@ pub fn changeset_loop_panel(
         if !already {
             ctx.data_mut(|d| d.insert_temp(once_id, true));
             if st.model_options.is_empty() {
-                match state.openai.list_models() {
-                    Ok(mut ms) => {
-                        ms.sort();
-                        ms.dedup();
-                        st.model_options = ms;
-                        if !st.model_options.is_empty()
-                            && !st.model_options.iter().any(|m| m == &st.model)
-                        {
-                            st.model = st.model_options[0].clone();
+                match st.transport {
+                    ExecuteLoopTransport::Api => {
+                        match state.openai.list_models() {
+                            Ok(mut ms) => {
+                                ms.sort();
+                                ms.dedup();
+                                st.model_options = ms;
+                                if !st.model_options.is_empty()
+                                    && !st.model_options.iter().any(|m| m == &st.model)
+                                {
+                                    st.model = st.model_options[0].clone();
+                                }
+                            }
+                            Err(e) => {
+                                st.last_status = Some(format!("Model list fetch failed: {:#}", e));
+                            }
                         }
                     }
-                    Err(e) => {
-                        st.last_status = Some(format!("Model list fetch failed: {:#}", e));
+                    ExecuteLoopTransport::BrowserBridge => {
+                        st.model_options = browser_model_options();
+                        if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model) {
+                            st.model = st.model_options[0].clone();
+                        }
                     }
                 }
             }
@@ -379,6 +407,32 @@ pub fn changeset_loop_panel(
     }
 
     let panel_w = ui.available_width();
+    let browser_status = match st.transport {
+        ExecuteLoopTransport::Api => BrowserBridgeStatus::Ready,
+        ExecuteLoopTransport::BrowserBridge => st.browser_status,
+    };
+
+    if st.transport == ExecuteLoopTransport::BrowserBridge && st.browser_session_id.is_some() && !st.pending && !st.postprocess_pending {
+        let probe_key = egui::Id::new(("execute_loop_browser_auto_probe_at", loop_id));
+        let now = ctx.input(|i| i.time);
+        let last_probe_at = ctx.data(|d| d.get_temp::<f64>(probe_key)).unwrap_or(0.0);
+        if now - last_probe_at >= 1.5 {
+            ctx.data_mut(|d| d.insert_temp(probe_key, now));
+            actions.push(Action::ExecuteLoopBrowserProbe { loop_id });
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+    let transport_summary = match st.transport {
+        ExecuteLoopTransport::Api => format!("API · {}", st.model),
+        ExecuteLoopTransport::BrowserBridge => {
+            let label = match browser_status {
+                BrowserBridgeStatus::Detached => "Browser bridge · detached",
+                BrowserBridgeStatus::Attached => "Browser bridge · attached",
+                BrowserBridgeStatus::Ready => "Browser bridge · ready",
+            };
+            label.to_string()
+        }
+    };
 
     ui.horizontal(|ui| {
         ui.heading(format!("Execute Loop {}", loop_id));
@@ -446,9 +500,50 @@ pub fn changeset_loop_panel(
 
     ui.add_space(6.0);
 
-    ui.horizontal(|ui| {
-        ui.label("Model");
+    ui.horizontal_wrapped(|ui| {
+        if st.transport == ExecuteLoopTransport::BrowserBridge {
+            let color = match browser_status {
+                BrowserBridgeStatus::Detached => egui::Color32::from_rgb(220, 70, 70),
+                BrowserBridgeStatus::Attached => egui::Color32::from_rgb(220, 190, 70),
+                BrowserBridgeStatus::Ready => egui::Color32::from_rgb(80, 200, 120),
+            };
+            let desired = egui::vec2(12.0, 12.0);
+            let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 5.0, color);
+        }
+        ui.small(transport_summary);
+        if st.transport == ExecuteLoopTransport::BrowserBridge {
+            if ui.button("Launch Browser").clicked() {
+                actions.push(Action::ExecuteLoopBrowserLaunchAndAttach { loop_id });
+            }
+            let can_open_tab = st.browser_session_id.is_some() && !st.browser_target_url.trim().is_empty();
+            if ui.add_enabled(can_open_tab, egui::Button::new("Open Tab")).clicked() {
+                actions.push(Action::ExecuteLoopBrowserOpenUrl { loop_id });
+            }
+            let can_detach_tab = st.browser_session_id.is_some();
+            if ui.add_enabled(can_detach_tab, egui::Button::new("Detach Tab")).clicked() {
+                actions.push(Action::ExecuteLoopBrowserDetach { loop_id });
+            }
+        }
+    });
 
+    ui.add_space(6.0);
+
+    if st.transport == ExecuteLoopTransport::BrowserBridge {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut st.browser_target_url)
+                    .desired_width((panel_w - 180.0).max(220.0))
+                    .hint_text("https://...")
+            );
+        });
+
+        ui.add_space(6.0);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Model");
         if !st.model_options.is_empty() {
             egui::ComboBox::from_id_source(("execute_loop_model_combo", loop_id))
                 .selected_text(st.model.clone())
@@ -461,29 +556,42 @@ pub fn changeset_loop_panel(
         } else {
             ui.add(
                 egui::TextEdit::singleline(&mut st.model)
-                    .hint_text("model id (click ↻ to fetch)")
+                    .hint_text("model id")
                     .desired_width(260.0),
             );
         }
 
         if ui
             .button("↻")
-            .on_hover_text("Fetch/refresh model list from API")
+            .on_hover_text(match st.transport {
+                ExecuteLoopTransport::Api => "Fetch/refresh model list from API",
+                ExecuteLoopTransport::BrowserBridge => "Refresh browser model alias",
+            })
             .clicked()
         {
-            match state.openai.list_models() {
-                Ok(mut ms) => {
-                    ms.sort();
-                    ms.dedup();
-                    st.model_options = ms;
-                    if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model)
-                    {
+            match st.transport {
+                ExecuteLoopTransport::Api => {
+                    match state.openai.list_models() {
+                        Ok(mut ms) => {
+                            ms.sort();
+                            ms.dedup();
+                            st.model_options = ms;
+                            if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model) {
+                                st.model = st.model_options[0].clone();
+                            }
+                            st.last_status = Some(format!("Fetched {} model(s)", st.model_options.len()));
+                        }
+                        Err(e) => {
+                            st.last_status = Some(format!("Model list fetch failed: {:#}", e));
+                        }
+                    }
+                }
+                ExecuteLoopTransport::BrowserBridge => {
+                    st.model_options = browser_model_options();
+                    if !st.model_options.is_empty() && !st.model_options.iter().any(|m| m == &st.model) {
                         st.model = st.model_options[0].clone();
                     }
-                    st.last_status = Some(format!("Fetched {} model(s)", st.model_options.len()));
-                }
-                Err(e) => {
-                    st.last_status = Some(format!("Model list fetch failed: {:#}", e));
+                    st.last_status = Some("Browser model alias refreshed.".to_string());
                 }
             }
 
@@ -632,58 +740,72 @@ pub fn changeset_loop_panel(
 
     ui.add_space(10.0);
 
-    ui.label("Your message");
-    ui.add(
-        egui::TextEdit::multiline(&mut st.draft)
-            .desired_rows(4)
-            .desired_width(panel_w)
-            .hint_text("Type a message…"),
-    );
-
-    ui.horizontal(|ui| {
-        let can_send = !st.awaiting_review && !st.pending && !st.postprocess_pending;
-        if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
-            actions.push(Action::ExecuteLoopSend { loop_id });
+    let browser_blocked = st.transport == ExecuteLoopTransport::BrowserBridge && browser_status != BrowserBridgeStatus::Ready;
+    if browser_blocked {
+        let status_text = match browser_status {
+            BrowserBridgeStatus::Detached => "Attach a browser session before sending messages or running the loop.",
+            BrowserBridgeStatus::Attached => "Browser session is attached but chat is not operable yet. Probe the page or open a valid chat tab.",
+            BrowserBridgeStatus::Ready => "",
+        };
+        if !status_text.is_empty() {
+            ui.small(status_text);
+            ui.add_space(4.0);
         }
+    } else {
+        ui.label("Your message");
+        ui.add(
+            egui::TextEdit::multiline(&mut st.draft)
+                .desired_rows(4)
+                .desired_width(panel_w)
+                .hint_text("Type a message…"),
+        );
 
-        if st.mode == ExecuteLoopMode::ChangeSet {
-            ui.separator();
+        ui.horizontal(|ui| {
+            let can_send = !st.awaiting_review && !st.pending && !st.postprocess_pending;
+            if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
+                actions.push(Action::ExecuteLoopSend { loop_id });
+            }
 
-            ui.small(if st.changeset_auto { "Auto" } else { "Step" });
+            if st.mode == ExecuteLoopMode::ChangeSet {
+                ui.separator();
 
-            let can_step = st.awaiting_review && !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
-            if ui
-                .add_enabled(!st.changeset_auto && can_step, egui::Button::new("Step"))
-                .on_hover_text("Advance one step (only enabled when paused)")
-                .clicked()
-            {
-                actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
+                ui.small(if st.changeset_auto { "Auto" } else { "Step" });
 
-                if !st.draft.trim().is_empty() {
-                    actions.push(Action::ExecuteLoopSend { loop_id });
-                } else if !st.postprocess_cmd.trim().is_empty() {
-                    actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+                let can_step = st.awaiting_review && !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
+                if ui
+                    .add_enabled(!st.changeset_auto && can_step, egui::Button::new("Step"))
+                    .on_hover_text("Advance one step (only enabled when paused)")
+                    .clicked()
+                {
+                    actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
+
+                    if !st.draft.trim().is_empty() {
+                        actions.push(Action::ExecuteLoopSend { loop_id });
+                    } else if !st.postprocess_cmd.trim().is_empty() {
+                        actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+                    }
                 }
             }
-        }
 
-        if st.pending {
-            ui.separator();
-            ui.small("Waiting for response…");
-        } else if st.postprocess_pending {
-            ui.separator();
-            ui.small("Running postprocess…");
-        } else if st.awaiting_review {
-            ui.separator();
-            ui.small("Paused — click Step to continue.");
-        }
-    });
+            if st.pending {
+                ui.separator();
+                ui.small("Waiting for response…");
+            } else if st.postprocess_pending {
+                ui.separator();
+                ui.small("Running postprocess…");
+            } else if st.awaiting_review {
+                ui.separator();
+                ui.small("Paused — click Step to continue.");
+            }
+        });
+    }
 
     let ui_changed = st.model != before_model
         || st.instruction != before_instruction
         || st.mode != before_mode
         || st.include_context_next != before_include_ctx
         || st.auto_fill_first_changeset_applier != before_auto_fill
+        || st.browser_target_url != before_browser_target_url
         || st.changeset_auto != before_changeset_auto
         || st.postprocess_cmd != before_postprocess_cmd;
 

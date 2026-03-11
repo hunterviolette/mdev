@@ -55,6 +55,10 @@ pub struct ContextExporterSnapshot {
 }
 
 fn default_true() -> bool { true }
+fn default_execute_loop_transport() -> crate::app::state::ExecuteLoopTransport {
+    crate::app::state::ExecuteLoopTransport::Api
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteLoopSnapshot {
@@ -97,6 +101,43 @@ pub struct ExecuteLoopSnapshot {
 
     #[serde(default)]
     pub postprocess_err: u32,
+
+    #[serde(default = "default_execute_loop_transport")]
+    pub transport: crate::app::state::ExecuteLoopTransport,
+
+    #[serde(default)]
+    pub browser_profile: String,
+
+    #[serde(default)]
+    pub browser_bridge_dir: String,
+
+    #[serde(default)]
+    pub browser_cdp_url: String,
+
+    #[serde(default)]
+    pub browser_page_url_contains: String,
+
+    #[serde(default)]
+    pub browser_target_url: String,
+
+    #[serde(default)]
+    pub browser_edge_executable: String,
+
+    #[serde(default)]
+    pub browser_user_data_dir: String,
+
+    #[serde(default)]
+    pub browser_session_id: Option<String>,
+    pub browser_status: crate::app::state::BrowserBridgeStatus,
+    pub browser_last_probe: Option<crate::app::state::BrowserProbeResult>,
+    pub browser_probe_pending: bool,
+    pub browser_probe_error: Option<String>,
+
+    #[serde(default)]
+    pub browser_attached: bool,
+
+    #[serde(default = "default_true")]
+    pub browser_auto_launch_edge: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

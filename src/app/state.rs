@@ -100,10 +100,31 @@ pub struct ExecuteLoopMessage {
     pub content: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrowserBridgeStatus {
+    Detached,
+    Attached,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserProbeResult {
+    pub session_id: String,
+    pub browser_connected: bool,
+    pub page_open: bool,
+    pub url: String,
+    pub profile: String,
+    pub chat_input_found: bool,
+    pub chat_input_visible: bool,
+    pub chat_submit_found: bool,
+    pub ready: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecuteLoopTurnResult {
     pub text: String,
-    pub conversation_id: String,
+    pub conversation_id: Option<String>,
+    pub browser_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +167,12 @@ impl Default for TaskState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExecuteLoopTransport {
+    Api,
+    BrowserBridge,
+}
+
 pub struct ExecuteLoopState {
     pub model: String,
     pub paused: bool,
@@ -157,6 +184,22 @@ pub struct ExecuteLoopState {
     pub postprocess_err: u32,
 
     pub model_options: Vec<String>,
+
+    pub transport: ExecuteLoopTransport,
+    pub browser_profile: String,
+    pub browser_bridge_dir: String,
+    pub browser_cdp_url: String,
+    pub browser_page_url_contains: String,
+    pub browser_target_url: String,
+    pub browser_edge_executable: String,
+    pub browser_user_data_dir: String,
+    pub browser_session_id: Option<String>,
+    pub browser_status: BrowserBridgeStatus,
+    pub browser_last_probe: Option<BrowserProbeResult>,
+    pub browser_probe_pending: bool,
+    pub browser_probe_error: Option<String>,
+    pub browser_attached: bool,
+    pub browser_auto_launch_edge: bool,
 
     pub mode: ExecuteLoopMode,
 
@@ -204,6 +247,21 @@ impl ExecuteLoopState {
         Self {
             model: "gpt-4o-mini".to_string(),
             model_options: vec![],
+            transport: ExecuteLoopTransport::Api,
+            browser_profile: String::new(),
+            browser_bridge_dir: String::new(),
+            browser_cdp_url: "http://127.0.0.1:9222".to_string(),
+            browser_page_url_contains: String::new(),
+            browser_target_url: String::new(),
+            browser_edge_executable: String::new(),
+            browser_user_data_dir: String::new(),
+            browser_session_id: None,
+            browser_status: BrowserBridgeStatus::Detached,
+            browser_last_probe: None,
+            browser_probe_pending: false,
+            browser_probe_error: None,
+            browser_attached: false,
+            browser_auto_launch_edge: true,
             mode: ExecuteLoopMode::Conversation,
             instruction,
             messages: vec![],

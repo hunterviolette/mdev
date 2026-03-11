@@ -53,7 +53,15 @@ pub enum Action {
     TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
     TaskOpenExecuteLoop { task_id: ComponentId },
     TaskCreateAndBindExecuteLoop { task_id: ComponentId },
-    TaskCreateConversationAndOpen { task_id: ComponentId },
+    TaskCreateConversationAndOpen {
+        task_id: ComponentId,
+        transport: crate::app::state::ExecuteLoopTransport,
+    },
+
+    ExecuteLoopBrowserLaunchAndAttach { loop_id: ComponentId },
+    ExecuteLoopBrowserProbe { loop_id: ComponentId },
+    ExecuteLoopBrowserOpenUrl { loop_id: ComponentId },
+    ExecuteLoopBrowserDetach { loop_id: ComponentId },
     TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
     TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
     TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },

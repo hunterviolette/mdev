@@ -77,7 +77,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        Action::TaskCreateConversationAndOpen { task_id } => {
+        Action::TaskCreateConversationAndOpen { task_id, transport } => {
             use crate::app::layout::ExecuteLoopSnapshot;
             use crate::app::state::ExecuteLoopState;
 
@@ -94,7 +94,14 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 t.next_conversation_id = t.next_conversation_id.saturating_add(1);
                 t.active_conversation = Some(cid);
 
-                let st = ExecuteLoopState::new();
+                let mut st = ExecuteLoopState::new();
+                st.transport = *transport;
+                if st.transport == crate::app::state::ExecuteLoopTransport::BrowserBridge {
+                    st.model = "browser-bridge".to_string();
+                    st.browser_attached = false;
+                    st.browser_session_id = None;
+                }
+
                 t.conversations.insert(
                     cid,
                     ExecuteLoopSnapshot {
@@ -115,6 +122,21 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         changesets_err: st.changesets_err,
                         postprocess_ok: st.postprocess_ok,
                         postprocess_err: st.postprocess_err,
+                        transport: st.transport,
+                        browser_profile: st.browser_profile,
+                        browser_bridge_dir: st.browser_bridge_dir,
+                        browser_cdp_url: st.browser_cdp_url,
+                        browser_page_url_contains: st.browser_page_url_contains,
+                        browser_target_url: st.browser_target_url,
+                        browser_edge_executable: st.browser_edge_executable,
+                        browser_user_data_dir: st.browser_user_data_dir,
+                        browser_session_id: st.browser_session_id,
+                        browser_status: st.browser_status,
+                        browser_last_probe: st.browser_last_probe,
+                        browser_probe_pending: st.browser_probe_pending,
+                        browser_probe_error: st.browser_probe_error,
+                        browser_attached: st.browser_attached,
+                        browser_auto_launch_edge: st.browser_auto_launch_edge,
                     },
                 );
 
