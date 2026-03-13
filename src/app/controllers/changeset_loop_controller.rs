@@ -1,9 +1,10 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::actions::{Action, ComponentId};
-use crate::app::browser_bridge::{browser_model_options, close_session_page, launch_and_attach, open_url_in_session, probe_session, send_chat_and_wait, BrowserTurnConfig};
+use crate::app::browser_bridge::{browser_model_options, close_session_page, launch_and_attach, open_url_in_session, probe_session, send_chat_and_wait, set_runtime_timeout_secs, timeout_runtime_now, BrowserTurnConfig};
 use crate::app::state::{AppState, BrowserBridgeStatus, ExecuteLoopMessage, ExecuteLoopMode, ExecuteLoopTransport};
 
 fn browser_runtime_dir(state: &AppState) -> PathBuf {
@@ -153,6 +154,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 profile: browser_profile.clone(),
                 session_id: None,
                 auto_launch_edge,
+                runtime_key: String::new(),
+                response_timeout_ms: st.browser_response_timeout_ms,
+                response_poll_ms: st.browser_response_poll_ms,
             };
 
             match launch_and_attach(&mut cfg) {
@@ -223,6 +227,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 profile: browser_profile.clone(),
                 session_id: Some(session_id),
                 auto_launch_edge: false,
+                runtime_key: String::new(),
+                response_timeout_ms: st.browser_response_timeout_ms,
+                response_poll_ms: st.browser_response_poll_ms,
             };
 
             match open_url_in_session(&mut cfg, &target_url) {
@@ -313,6 +320,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 profile: browser_profile.clone(),
                 session_id: Some(session_id),
                 auto_launch_edge: false,
+                runtime_key: String::new(),
+                response_timeout_ms: st.browser_response_timeout_ms,
+                response_poll_ms: st.browser_response_poll_ms,
             };
 
             match probe_session(&mut cfg) {
@@ -402,6 +412,9 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 profile: browser_profile.clone(),
                 session_id: Some(session_id),
                 auto_launch_edge: false,
+                runtime_key: String::new(),
+                response_timeout_ms: st.browser_response_timeout_ms,
+                response_poll_ms: st.browser_response_poll_ms,
             };
 
             let close_result = close_session_page(&mut cfg);
@@ -506,6 +519,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 st.awaiting_review = false;
                 st.pending = false;
                 st.pending_rx = None;
+                st.active_browser_runtime_key = None;
 
                 st.conversation_id = None;
 
@@ -678,6 +692,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
 
     let seed_items_for_api = seed_items_if_new.clone();
 
+    let mut active_browser_runtime_key: Option<String> = None;
+
     let (tx, rx) = mpsc::channel::<Result<crate::app::state::ExecuteLoopTurnResult, String>>();
 
     match transport {
@@ -707,7 +723,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                 }
                 return;
             }
-            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id) = {
+            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id, response_timeout_ms, response_poll_ms) = {
                 let Some(st) = state.execute_loops.get(&loop_id) else {
                     return;
                 };
@@ -717,6 +733,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                     st.browser_edge_executable.clone(),
                     st.browser_user_data_dir.clone(),
                     st.browser_session_id.clone(),
+                    st.browser_response_timeout_ms,
+                    st.browser_response_poll_ms,
                 )
             };
             let bridge_dir = resolve_browser_bridge_dir();
@@ -739,6 +757,13 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                 prompt.push_str("\n\n");
             }
 
+            let runtime_nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let runtime_key = format!("execute-loop-{}-{}", loop_id, runtime_nonce);
+            active_browser_runtime_key = Some(runtime_key.clone());
+            set_runtime_timeout_secs(&runtime_key, (response_timeout_ms.max(1000) + 999) / 1000);
             std::thread::spawn(move || {
                 let mut cfg = BrowserTurnConfig {
                     bridge_dir,
@@ -749,8 +774,12 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                     profile: browser_channel,
                     session_id,
                     auto_launch_edge: false,
+                    runtime_key: runtime_key.clone(),
+                    response_timeout_ms,
+                    response_poll_ms,
                 };
                 let res = send_chat_and_wait(&mut cfg, &prompt).map_err(|e| format!("{:#}", e));
+                timeout_runtime_now(&runtime_key);
                 let _ = tx.send(res);
             });
         }
@@ -812,6 +841,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
 
         st.pending = true;
         st.pending_rx = Some(rx);
+        st.active_browser_runtime_key = active_browser_runtime_key;
 
         st.last_status = Some("Waiting for response…".to_string());
         _did_mutate = true;

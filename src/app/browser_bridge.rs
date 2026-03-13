@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -9,9 +10,127 @@ use serde_json::{json, Value};
 use crate::app::state::ExecuteLoopTurnResult;
 
 static CLIENT: OnceLock<Mutex<BrowserBridgeClient>> = OnceLock::new();
+static RUNTIME_TIMEOUTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static RUNTIME_STARTED_AT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn client() -> &'static Mutex<BrowserBridgeClient> {
     CLIENT.get_or_init(|| Mutex::new(BrowserBridgeClient::new()))
+}
+
+fn runtime_timeouts() -> &'static Mutex<HashMap<String, u64>> {
+    RUNTIME_TIMEOUTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn runtime_started_at() -> &'static Mutex<HashMap<String, Instant>> {
+    RUNTIME_STARTED_AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn begin_runtime_timeout(runtime_key: &str, timeout_secs: u64) {
+    if runtime_key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut map) = runtime_timeouts().lock() {
+        map.insert(runtime_key.to_string(), timeout_secs.max(1));
+    }
+    if let Ok(mut map) = runtime_started_at().lock() {
+        map.insert(runtime_key.to_string(), Instant::now());
+    }
+}
+
+pub fn set_runtime_timeout_secs(runtime_key: &str, timeout_secs: u64) {
+    if runtime_key.trim().is_empty() || timeout_secs == 0 {
+        return;
+    }
+    if let Ok(mut map) = runtime_timeouts().lock() {
+        map.insert(runtime_key.to_string(), timeout_secs.max(1));
+    }
+}
+
+pub fn timeout_runtime_now(runtime_key: &str) {
+    if runtime_key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut map) = runtime_timeouts().lock() {
+        map.insert(runtime_key.to_string(), 1);
+    }
+    if let Ok(mut map) = runtime_started_at().lock() {
+        map.insert(runtime_key.to_string(), Instant::now() - Duration::from_secs(2));
+    }
+}
+
+fn set_session_response_timeout_ms_with_client(
+    client: &mut BrowserBridgeClient,
+    session_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let timeout_ms = timeout_ms.max(1000);
+    eprintln!(
+        "[browser_bridge] -> set_response_timeout session_id={} timeout_ms={}",
+        session_id,
+        timeout_ms
+    );
+
+    let resp = client.send_json(json!({
+        "cmd": "set_response_timeout",
+        "session_id": session_id,
+        "timeout_ms": timeout_ms
+    }))?;
+
+    let ack_timeout_ms = resp
+        .get("data")
+        .and_then(|v| v.get("timeout_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(timeout_ms);
+
+    eprintln!(
+        "[browser_bridge] <- set_response_timeout session_id={} timeout_ms={}",
+        session_id,
+        ack_timeout_ms
+    );
+
+    Ok(())
+}
+
+pub fn set_session_response_timeout_ms(
+    cfg: &BrowserTurnConfig,
+    session_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let mutex = client();
+    let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+
+    client.ensure_started(&cfg.bridge_dir)?;
+    set_session_response_timeout_ms_with_client(&mut client, session_id, timeout_ms)
+}
+
+pub fn active_response_timeout_ms(runtime_key: &str, fallback_ms: u64) -> u64 {
+    let timeout_secs = runtime_timeouts()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(runtime_key).copied())
+        .unwrap_or((fallback_ms.max(1000) + 999) / 1000)
+        .max(1);
+
+    timeout_secs * 1000
+}
+
+pub fn runtime_timeout_remaining_secs(runtime_key: &str, fallback_secs: u64) -> u64 {
+    let timeout_secs = runtime_timeouts()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(runtime_key).copied())
+        .unwrap_or(fallback_secs)
+        .max(1);
+
+    let started_at = runtime_started_at()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(runtime_key).copied());
+
+    match started_at {
+        Some(started_at) => timeout_secs.saturating_sub(started_at.elapsed().as_secs()),
+        None => timeout_secs,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +143,14 @@ pub struct BrowserTurnConfig {
     pub profile: String,
     pub session_id: Option<String>,
     pub auto_launch_edge: bool,
+    pub runtime_key: String,
+    pub response_timeout_ms: u64,
+    pub response_poll_ms: u64,
 }
+fn bridge_timeout_ms(cfg: &BrowserTurnConfig) -> u64 {
+    cfg.response_timeout_ms.max(1000)
+}
+
 
 struct BrowserBridgeClient {
     child: Option<Child>,
@@ -93,6 +219,11 @@ impl BrowserBridgeClient {
     fn send_json(&mut self, mut payload: Value) -> Result<Value> {
         let id = self.command_id();
         payload["id"] = Value::String(id.clone());
+        let cmd_name = payload
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         eprintln!("[browser_bridge] -> {}", payload);
 
@@ -131,7 +262,12 @@ impl BrowserBridgeClient {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown browser bridge error");
-            eprintln!("[browser_bridge] <- error {}", err);
+            let err_lower = err.to_ascii_lowercase();
+            let expected_read_timeout = cmd_name == "read_response"
+                && err_lower.contains("timed out waiting for completed response");
+            if !expected_read_timeout {
+                eprintln!("[browser_bridge] <- error {}", err);
+            }
             return Err(anyhow!(err.to_string()));
         }
     }
@@ -174,7 +310,7 @@ pub fn launch_and_attach(cfg: &mut BrowserTurnConfig) -> Result<String> {
         "profile": if cfg.profile.is_empty() { "auto" } else { &cfg.profile },
         "cdp_url": cfg.cdp_url,
         "page_url_contains": if cfg.page_url_contains.is_empty() { Value::Null } else { Value::String(cfg.page_url_contains.clone()) },
-        "timeout_ms": 60000
+        "timeout_ms": bridge_timeout_ms(cfg)
     }))?;
 
     let session_id = connect_resp
@@ -200,7 +336,7 @@ pub fn open_url_in_session(cfg: &mut BrowserTurnConfig, url: &str) -> Result<()>
         "cmd": "open_page",
         "session_id": session_id,
         "url": url,
-        "timeout_ms": 60000
+        "timeout_ms": bridge_timeout_ms(cfg)
     }))?;
 
     Ok(())
@@ -218,11 +354,42 @@ pub fn probe_session(cfg: &mut BrowserTurnConfig) -> Result<crate::app::state::B
         "cmd": "probe_page",
         "session_id": session_id,
         "profile": if cfg.profile.is_empty() { "auto" } else { &cfg.profile },
-        "timeout_ms": 5000
+        "timeout_ms": bridge_timeout_ms(cfg)
     }))?;
 
     let data = value.get("data").cloned().unwrap_or(value);
     Ok(serde_json::from_value(data)?)
+}
+
+
+fn response_attempt_timeout_ms(cfg: &BrowserTurnConfig, remaining_ms: u64) -> u64 {
+    remaining_ms.min(cfg.response_poll_ms.max(1000))
+}
+
+fn read_response_once(
+    client: &mut BrowserBridgeClient,
+    session_id: &str,
+    timeout_ms: u64,
+) -> Result<(usize, String)> {
+    let value = client.send_json(json!({
+        "cmd": "read_response",
+        "session_id": session_id,
+        "response_selector": Value::Null,
+        "timeout_ms": timeout_ms
+    }))?;
+
+    let data = value.get("data").cloned().unwrap_or(value);
+    let count = data
+        .get("response_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let text = data
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok((count, text))
 }
 
 pub fn close_session_page(cfg: &mut BrowserTurnConfig) -> Result<()> {
@@ -242,56 +409,84 @@ pub fn close_session_page(cfg: &mut BrowserTurnConfig) -> Result<()> {
 }
 
 pub fn send_chat_and_wait(cfg: &mut BrowserTurnConfig, text: &str) -> Result<ExecuteLoopTurnResult> {
-    let mutex = client();
-    let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    {
+        let mutex = client();
+        let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
 
-    client.ensure_started(&cfg.bridge_dir)?;
+        client.ensure_started(&cfg.bridge_dir)?;
 
-    if cfg.auto_launch_edge && cfg.session_id.is_none() {
-        client.maybe_launch_edge(&cfg.edge_executable, &cfg.user_data_dir, &cfg.cdp_url)?;
-    }
+        if cfg.auto_launch_edge && cfg.session_id.is_none() {
+            client.maybe_launch_edge(&cfg.edge_executable, &cfg.user_data_dir, &cfg.cdp_url)?;
+        }
 
-    if cfg.session_id.is_none() {
-        let connect_resp = client.send_json(json!({
-            "cmd": "connect_over_cdp",
-            "session_id": Value::Null,
-            "profile": if cfg.profile.is_empty() { "auto" } else { &cfg.profile },
-            "cdp_url": cfg.cdp_url,
-            "page_url_contains": cfg.page_url_contains,
-            "timeout_ms": 60000
+        if cfg.session_id.is_none() {
+            let connect_resp = client.send_json(json!({
+                "cmd": "connect_over_cdp",
+                "session_id": Value::Null,
+                "profile": if cfg.profile.is_empty() { "auto" } else { &cfg.profile },
+                "cdp_url": cfg.cdp_url,
+                "page_url_contains": cfg.page_url_contains,
+                "timeout_ms": bridge_timeout_ms(cfg)
+            }))?;
+
+            let session_id = connect_resp
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| connect_resp.get("data").and_then(|v| v.get("session_id")).and_then(|v| v.as_str()))
+                .ok_or_else(|| anyhow!("Browser bridge connect_over_cdp response missing session_id"))?;
+
+            cfg.session_id = Some(session_id.to_string());
+        }
+
+        let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
+
+        client.send_json(json!({
+            "cmd": "send_chat",
+            "session_id": session_id,
+            "text": text,
+            "timeout_ms": bridge_timeout_ms(cfg)
         }))?;
-
-        let session_id = connect_resp
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| connect_resp.get("data").and_then(|v| v.get("session_id")).and_then(|v| v.as_str()))
-            .ok_or_else(|| anyhow!("Browser bridge connect_over_cdp response missing session_id"))?;
-
-        cfg.session_id = Some(session_id.to_string());
     }
 
+    begin_runtime_timeout(&cfg.runtime_key, (cfg.response_timeout_ms.max(1000) + 999) / 1000);
+    let poll_ms = cfg.response_poll_ms.max(250);
+    let fallback_timeout_secs = (cfg.response_timeout_ms.max(1000) + 999) / 1000;
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
 
-    client.send_json(json!({
-        "cmd": "send_chat",
-        "session_id": session_id,
-        "text": text,
-        "timeout_ms": 30000
-    }))?;
+    let text = loop {
+        let remaining_secs = runtime_timeout_remaining_secs(&cfg.runtime_key, fallback_timeout_secs);
+        if remaining_secs == 0 {
+            return Err(anyhow!("Timed out waiting for browser response"));
+        }
 
-    let read_resp = client.send_json(json!({
-        "cmd": "read_response",
-        "session_id": session_id,
-        "timeout_ms": 180000,
-        "idle_ms": 2000
-    }))?;
+        let remaining_ms = remaining_secs.saturating_mul(1000).max(1000);
+        let patched_total_ms = active_response_timeout_ms(&cfg.runtime_key, cfg.response_timeout_ms.max(1000));
+        let slice_ms = response_attempt_timeout_ms(cfg, remaining_ms);
 
-    let text = read_resp
-        .get("data")
-        .and_then(|v| v.get("response"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Browser bridge read_response missing response text"))?
-        .to_string();
+
+        let read_result = {
+            let mutex = client();
+            let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+            client.ensure_started(&cfg.bridge_dir)?;
+            set_session_response_timeout_ms_with_client(&mut client, &session_id, patched_total_ms)?;
+            read_response_once(&mut client, &session_id, slice_ms)
+        };
+
+        match read_result {
+            Ok((_count, text)) => {
+                break text;
+            }
+            Err(err) => {
+                let msg = format!("{:#}", err);
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("timed out waiting for completed response") || lower.contains("waitforselector") {
+                    std::thread::sleep(Duration::from_millis(poll_ms));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    };
 
     Ok(ExecuteLoopTurnResult {
         text,

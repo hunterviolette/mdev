@@ -1,7 +1,13 @@
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright';
 import { randomUUID } from 'node:crypto';
-import type { ClosePageCommand, ConnectOverCdpCommand, OpenPageCommand, ProbePageCommand, SendChatCommand, StartSessionCommand, UploadFileCommand, ReadResponseCommand } from './protocol.js';
+import type { ClosePageCommand, ConnectOverCdpCommand, OpenPageCommand, ProbePageCommand, SendChatCommand, StartSessionCommand, UploadFileCommand, ReadResponseCommand, SetResponseTimeoutCommand } from './protocol.js';
 import { resolveInteractionProfile } from './profiles.js';
+
+type ResponseSnapshot = {
+  texts: string[];
+  count: number;
+  lastText: string;
+};
 
 export type SessionState = {
   sessionId: string;
@@ -16,6 +22,7 @@ export type SessionState = {
   chatSubmitSelector?: string;
   ownsBrowser: boolean;
   attachedViaCdp: boolean;
+  responseTimeoutMs?: number;
 };
 
 export class SessionManager {
@@ -40,6 +47,7 @@ export class SessionManager {
     const context = await chromium.launchPersistentContext(cmd.user_data_dir, persistentOptions);
     const page = context.pages()[0] ?? await context.newPage();
     page.setDefaultTimeout(timeout);
+    page.setDefaultNavigationTimeout(timeout);
     await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout });
 
     if (cmd.wait_for) {
@@ -60,7 +68,8 @@ export class SessionManager {
       chatInputSelector: profile.chatInputSelector,
       chatSubmitSelector: profile.chatSubmitSelector,
       ownsBrowser: true,
-      attachedViaCdp: false
+      attachedViaCdp: false,
+      responseTimeoutMs: undefined
     };
 
     this.sessions.set(sessionId, state);
@@ -75,11 +84,6 @@ export class SessionManager {
 
   async connectOverCdp(cmd: ConnectOverCdpCommand) {
     const sessionId = cmd.session_id ?? randomUUID();
-    console.error('[bridge] connectOverCdp start', {
-      sessionId,
-      cdpUrl: cmd.cdp_url,
-      pageUrlContains: cmd.page_url_contains
-    });
     const timeout = cmd.timeout_ms ?? 60000;
     const browser = await chromium.connectOverCDP(cmd.cdp_url, { timeout });
 
@@ -113,6 +117,7 @@ export class SessionManager {
     }
 
     page.setDefaultTimeout(timeout);
+    page.setDefaultNavigationTimeout(timeout);
 
     if (cmd.wait_for) {
       await page.waitForSelector(cmd.wait_for, { timeout });
@@ -132,15 +137,11 @@ export class SessionManager {
       chatInputSelector: profile.chatInputSelector,
       chatSubmitSelector: profile.chatSubmitSelector,
       ownsBrowser: false,
-      attachedViaCdp: true
+      attachedViaCdp: true,
+      responseTimeoutMs: undefined
     };
 
     this.sessions.set(sessionId, state);
-    console.error('[bridge] connectOverCdp stored session', {
-      sessionId,
-      sessionsSize: this.sessions.size,
-      pageUrl: page.url()
-    });
 
     return {
       session_id: sessionId,
@@ -155,6 +156,7 @@ export class SessionManager {
     const timeout = cmd.timeout_ms ?? 60000;
     const page = await state.context.newPage();
     page.setDefaultTimeout(timeout);
+    page.setDefaultNavigationTimeout(timeout);
     await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout });
     state.page = page;
     return {
@@ -165,21 +167,11 @@ export class SessionManager {
   }
 
   async probePage(cmd: ProbePageCommand) {
-    console.error('[bridge] probePage start', {
-      sessionId: cmd.session_id,
-      profile: cmd.profile
-    });
     const state = this.getSession(cmd.session_id);
-    const timeout = cmd.timeout_ms ?? 5000;
+    const timeout = cmd.timeout_ms ?? 60000;
     const page = state.page;
     const { name: resolvedProfileName, profile } = await resolveInteractionProfile(page, cmd.profile ?? state.profile ?? 'auto');
 
-    console.error('[bridge] probePage state', {
-      sessionId: state.sessionId,
-      pageUrl: state.page.url(),
-      pageClosed: state.page.isClosed(),
-      storedProfile: state.profile
-    });
 
     state.profile = resolvedProfileName;
     state.responseSelector = profile.responseSelector;
@@ -216,14 +208,13 @@ export class SessionManager {
         ready: false
       };
     }
-    const chatInput = page.locator(chatInputSelector).first();
-    const inputCount = await chatInput.count();
-    const chatInputFound = inputCount > 0;
-    const chatInputVisible = chatInputFound ? await chatInput.isVisible({ timeout }).catch(() => false) : false;
 
-    const submitLocator = state.chatSubmitSelector ? page.locator(state.chatSubmitSelector).first() : null;
-    const submitCount = submitLocator ? await submitLocator.count().catch(() => 0) : 0;
-    const chatSubmitFound = submitCount > 0;
+    const directChatInput = page.locator(chatInputSelector).first();
+    const directInputCount = await directChatInput.count().catch(() => 0);
+    const resolvedComposer = await this.findVisibleChatComposer(page, Math.min(timeout, 1000), chatInputSelector).catch(() => null);
+
+    const chatInputFound = directInputCount > 0 || resolvedComposer !== null;
+    const chatInputVisible = resolvedComposer !== null;
 
     return {
       session_id: state.sessionId,
@@ -233,8 +224,8 @@ export class SessionManager {
       profile: state.profile ?? 'auto',
       chat_input_found: chatInputFound,
       chat_input_visible: chatInputVisible,
-      chat_submit_found: chatSubmitFound,
-      ready: chatInputFound && chatInputVisible
+      chat_submit_found: chatInputVisible,
+      ready: chatInputVisible
     };
   }
 
@@ -337,7 +328,8 @@ export class SessionManager {
 
   async sendChat(cmd: SendChatCommand) {
     const state = this.getSession(cmd.session_id);
-    const timeout = cmd.timeout_ms ?? 30000;
+    state.responseTimeoutMs = undefined;
+    const timeout = cmd.timeout_ms ?? 60000;
     const inputSelector = cmd.input_selector ?? state.chatInputSelector;
     const submitSelector = cmd.submit_selector ?? state.chatSubmitSelector;
     const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector);
@@ -386,7 +378,7 @@ export class SessionManager {
 
   async uploadFile(cmd: UploadFileCommand) {
     const state = this.getSession(cmd.session_id);
-    const timeout = cmd.timeout_ms ?? 30000;
+    const timeout = cmd.timeout_ms ?? 60000;
     const inputSelector = cmd.input_selector ?? state.uploadInputSelector ?? 'input[type="file"]';
 
     const input = state.page.locator(inputSelector).first();
@@ -409,27 +401,92 @@ export class SessionManager {
     return { session_id: state.sessionId, uploaded: cmd.file_path, via: 'filechooser' };
   }
 
+  private async readResponseSnapshot(page: Page, selector: string): Promise<ResponseSnapshot> {
+    const snap = await page.locator(selector).evaluateAll((nodes) => {
+      const visibleNodes = nodes.filter((node) => {
+        const el = node as HTMLElement;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+
+      const texts = visibleNodes
+        .map((node) => (node.textContent ?? '').trim())
+        .filter((text) => text.length > 0);
+
+      return {
+        texts,
+        count: texts.length,
+        lastText: texts.length ? texts[texts.length - 1] : ''
+      };
+    }).catch(() => ({ texts: [], count: 0, lastText: '' }));
+
+    return snap;
+  }
+
+
+
+  private async waitForCompletedResponse(
+    state: SessionState,
+    selector: string,
+    timeoutMs: number
+  ): Promise<ResponseSnapshot> {
+    const start = Date.now();
+    const effectiveTimeoutMs = Math.max(timeoutMs, 1000);
+
+    while (true) {
+      if (Date.now() - start >= effectiveTimeoutMs) {
+        throw new Error(`Timed out waiting for completed response after ${effectiveTimeoutMs} ms`);
+      }
+
+      const ready = await state.page.evaluate(() => ({
+        ready: !document.querySelector('button[aria-label*="Stop" i]') &&
+               !!document.querySelector('div[contenteditable="true"], textarea, [role="textbox"]')
+      })).catch(() => ({ ready: false }));
+
+      const snap = await this.readResponseSnapshot(state.page, selector).catch(() => ({ texts: [], count: 0, lastText: '' }));
+      const hasResponse = snap.count > 0 && snap.lastText.length > 0;
+      const done = hasResponse && ready.ready;
+
+      if (done) {
+        state.responseTimeoutMs = undefined;
+        return snap;
+      }
+
+      await state.page.waitForTimeout(250);
+    }
+  }
+
+  setResponseTimeout(cmd: SetResponseTimeoutCommand) {
+    const state = this.getSession(cmd.session_id);
+    const prev = state.responseTimeoutMs ?? null;
+    const next = Math.max(1000, Math.trunc(cmd.timeout_ms || 0));
+    state.responseTimeoutMs = next;
+    console.error(`[bridge] setResponseTimeout sessionId=${state.sessionId} previousTimeoutMs=${prev} timeoutMs=${state.responseTimeoutMs}`);
+    return {
+      session_id: state.sessionId,
+      timeout_ms: state.responseTimeoutMs
+    };
+  }
+
   async readResponse(cmd: ReadResponseCommand) {
     const state = this.getSession(cmd.session_id);
     const timeout = cmd.timeout_ms ?? 120000;
-    const idleMs = cmd.idle_ms ?? 1200;
     const selector = cmd.response_selector ?? state.responseSelector;
 
-    await state.page.waitForSelector(selector, { timeout });
-    await this.waitForStableResponse(state.page, selector, timeout, idleMs);
-
-    const texts = await state.page.locator(selector).evaluateAll((nodes) =>
-      nodes
-        .map((node) => (node.textContent ?? '').trim())
-        .filter((text) => text.length > 0)
+    const snap = await this.waitForCompletedResponse(
+      state,
+      selector,
+      timeout
     );
-
-    const text = texts.length ? texts[texts.length - 1] : '';
 
     return {
       session_id: state.sessionId,
-      response: text,
-      response_count: texts.length
+      response: snap.lastText,
+      response_count: snap.count
     };
   }
 
@@ -449,21 +506,10 @@ export class SessionManager {
   }
 
   private getSession(sessionId: string): SessionState {
-    console.error('[bridge] getSession', {
-      sessionId,
-      sessionsSize: this.sessions.size,
-      known: Array.from(this.sessions.keys())
-    });
     const state = this.sessions.get(sessionId);
     if (!state) {
-      console.error('[bridge] getSession MISS', { sessionId });
       throw new Error(`Unknown session_id: ${sessionId}`);
     }
-    console.error('[bridge] getSession HIT', {
-      sessionId,
-      pageUrl: state.page.url(),
-      pageClosed: state.page.isClosed()
-    });
     return state;
   }
 
@@ -489,27 +535,4 @@ export class SessionManager {
     }
   }
 
-  private async waitForStableResponse(page: Page, selector: string, timeoutMs: number, idleMs: number) {
-    const start = Date.now();
-    let last = '';
-    let stableSince = Date.now();
-
-    while (Date.now() - start < timeoutMs) {
-      const current = await page.locator(selector).last().textContent().catch(() => null);
-      const value = (current ?? '').trim();
-
-      if (value !== last) {
-        last = value;
-        stableSince = Date.now();
-      }
-
-      if (value.length > 0 && Date.now() - stableSince >= idleMs) {
-        return;
-      }
-
-      await page.waitForTimeout(250);
-    }
-
-    throw new Error(`Timed out waiting for stable response for selector: ${selector}`);
-  }
 }

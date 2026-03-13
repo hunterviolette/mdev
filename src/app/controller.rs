@@ -179,6 +179,10 @@ impl AppState {
         st.browser_probe_error = snap.browser_probe_error.clone();
         st.browser_attached = snap.browser_attached;
         st.browser_auto_launch_edge = snap.browser_auto_launch_edge;
+        st.browser_response_timeout_ms = snap.browser_response_timeout_ms;
+        st.browser_response_poll_ms = snap.browser_response_poll_ms;
+        st.browser_response_timeout_input = ((snap.browser_response_timeout_ms.max(1000) + 999) / 1000).to_string();
+        st.browser_timeout_confirm_pending = false;
     }
 
     pub fn ensure_execute_loop_state_loaded(&mut self, loop_id: crate::app::actions::ComponentId) {
@@ -283,6 +287,8 @@ impl AppState {
                 browser_probe_error: st.browser_probe_error.clone(),
                 browser_attached: st.browser_attached,
                 browser_auto_launch_edge: st.browser_auto_launch_edge,
+                browser_response_timeout_ms: st.browser_response_timeout_ms,
+                browser_response_poll_ms: st.browser_response_poll_ms,
             },
         );
 
@@ -331,6 +337,8 @@ impl AppState {
                         browser_probe_error: st.browser_probe_error.clone(),
                         browser_attached: st.browser_attached,
                         browser_auto_launch_edge: st.browser_auto_launch_edge,
+                        browser_response_timeout_ms: st.browser_response_timeout_ms,
+                        browser_response_poll_ms: st.browser_response_poll_ms,
                     },
                 );
 

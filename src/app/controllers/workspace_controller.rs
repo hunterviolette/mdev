@@ -675,7 +675,7 @@ impl AppState {
 
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
-                self.rebuild_changeset_appliers_from_layout();
+                self.rebuild_tasks_from_layout();
                 self.rebuild_source_controls_from_layout();
                 self.rebuild_diff_viewers_from_layout();
                 self.rebuild_execute_loops_from_layout();

@@ -70,7 +70,13 @@ export type ReadResponseCommand = {
   session_id: string;
   response_selector?: string;
   timeout_ms?: number;
-  idle_ms?: number;
+};
+
+export type SetResponseTimeoutCommand = {
+  id: string;
+  cmd: "set_response_timeout";
+  session_id: string;
+  timeout_ms: number;
 };
 
 export type CloseSessionCommand = {
@@ -88,6 +94,7 @@ export type BridgeCommand =
   | SendChatCommand
   | UploadFileCommand
   | ReadResponseCommand
+  | SetResponseTimeoutCommand
   | CloseSessionCommand;
 
 export type OkResponse = {

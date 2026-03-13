@@ -10,7 +10,7 @@ export type InteractionProfile = {
 
 const profiles: Record<string, InteractionProfile> = {
   auto: {
-    responseSelector: '[data-message-author-role="assistant"], [data-testid="message-content"], message-content, .model-response-text, .response-container, .assistant, .assistant-message, [data-role="assistant"]',
+    responseSelector: '[data-message-author-role="assistant"]',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',
@@ -20,7 +20,7 @@ const profiles: Record<string, InteractionProfile> = {
 
 const autoCandidates: InteractionProfile[] = [
   {
-    responseSelector: '.relative.group.items-start .message-bubble',
+    responseSelector: '[data-message-author-role="assistant"], article[data-testid^="conversation-turn-"][data-message-author-role="assistant"], [data-testid^="conversation-turn-"] [data-message-author-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container, [data-role="assistant"]',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',

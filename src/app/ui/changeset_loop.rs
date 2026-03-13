@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
-use crate::app::browser_bridge::browser_model_options;
+use crate::app::browser_bridge::{browser_model_options, runtime_timeout_remaining_secs, set_runtime_timeout_secs, timeout_runtime_now};
 use crate::app::state::{AppState, BrowserBridgeStatus, ExecuteLoopMessage, ExecuteLoopMode, ExecuteLoopTransport};
 
 pub fn changeset_loop_panel(
@@ -49,6 +49,8 @@ pub fn changeset_loop_panel(
     }
     let before_changeset_auto = st.changeset_auto;
     let before_postprocess_cmd = st.postprocess_cmd.clone();
+    let before_browser_response_timeout_ms = st.browser_response_timeout_ms;
+    let before_browser_response_poll_ms = st.browser_response_poll_ms;
 
     if st.transport == ExecuteLoopTransport::Api && !st.history_sync_pending {
         if let Some(cid) = st.conversation_id.clone() {
@@ -182,27 +184,56 @@ pub fn changeset_loop_panel(
 
                     st.pending = false;
                     st.pending_rx = None;
+                    st.active_browser_runtime_key = None;
 
                     if st.mode == ExecuteLoopMode::ChangeSet {
                         if let Some((applier_id, ap)) = state.changeset_appliers.iter_mut().next() {
-                            ap.payload = out.text.clone();
-                            ap.status = Some(format!("Auto-filled from Execute Loop {}", loop_id));
+                            match crate::app::controllers::changeset_controller::normalize_and_validate_changeset_payload_text(&out.text) {
+                                Ok(normalized) => {
+                                    ap.payload = normalized;
+                                    ap.status = Some(format!("Validated ChangeSet from Execute Loop {}", loop_id));
 
-                            st.last_auto_applier_id = Some(*applier_id);
-                            st.last_auto_applier_status = ap.status.clone();
-                            st.awaiting_apply_result = true;
+                                    st.last_auto_applier_id = Some(*applier_id);
+                                    st.last_auto_applier_status = ap.status.clone();
+                                    st.changesets_total = st.changesets_total.saturating_add(1);
 
-                            st.changesets_total = st.changesets_total.saturating_add(1);
+                                    if st.changeset_auto {
+                                        st.awaiting_apply_result = true;
+                                        actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
+                                        st.last_status = Some("Valid ChangeSet received: auto-applying…".to_string());
+                                        st.awaiting_review = false;
+                                    } else {
+                                        st.awaiting_apply_result = false;
+                                        st.awaiting_review = true;
+                                        st.last_status = Some("Valid ChangeSet received: review before applying.".to_string());
+                                    }
+                                }
+                                Err(err) => {
+                                    ap.payload = out.text.clone();
+                                    ap.status = Some(format!("Rejected auto-apply: {}", err));
 
-                            actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
-                            st.last_status = Some("ChangeSet received: auto-applying…".to_string());
+                                    st.last_auto_applier_id = Some(*applier_id);
+                                    st.last_auto_applier_status = ap.status.clone();
+                                    st.awaiting_apply_result = false;
+                                    st.awaiting_review = true;
+                                    st.last_status = Some(format!(
+                                        "Assistant response was not a valid final ChangeSet. Not applied: {}",
+                                        err
+                                    ));
+
+                                    if st.changeset_auto {
+                                        st.draft = format!(
+                                            "Your previous response was not a valid ChangeSet JSON payload. Return only a valid ChangeSet JSON object, version 1, with at least one operation.\n\nVALIDATION ERROR:\n{}",
+                                            err
+                                        );
+                                    }
+                                }
+                            }
                         } else {
                             st.last_status = Some(
                                 "ChangeSet received, but no ChangeSet Applier exists.".to_string(),
                             );
                         }
-
-                        st.awaiting_review = !st.changeset_auto;
                     } else {
                         st.last_status = Some("Response received.".to_string());
                     }
@@ -216,6 +247,7 @@ pub fn changeset_loop_panel(
 
                     st.pending = false;
                     st.pending_rx = None;
+                    st.active_browser_runtime_key = None;
                     st.last_status = Some("Request failed.".to_string());
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -223,6 +255,7 @@ pub fn changeset_loop_panel(
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     st.pending = false;
                     st.pending_rx = None;
+                    st.active_browser_runtime_key = None;
                     st.last_status = Some("Request channel disconnected.".to_string());
                     did_mutate = true;
                 }
@@ -541,6 +574,109 @@ pub fn changeset_loop_panel(
 
         ui.add_space(6.0);
     }
+    if st.transport == ExecuteLoopTransport::BrowserBridge {
+        let runtime_key = st.active_browser_runtime_key.clone();
+        let poll_secs_f = (st.browser_response_poll_ms.max(250) as f64) / 1000.0;
+        let mut poll_secs_ui = poll_secs_f;
+        let applied_timeout_secs = (st.browser_response_timeout_ms.max(1000) + 999) / 1000;
+        let draft_timeout_secs = st.browser_response_timeout_input.trim().parse::<u64>().ok();
+        let input_valid = draft_timeout_secs
+            .map(|secs| (1..=9999).contains(&secs))
+            .unwrap_or(false);
+        let remaining_secs = runtime_key
+            .as_deref()
+            .map(|key| runtime_timeout_remaining_secs(key, applied_timeout_secs))
+            .unwrap_or(applied_timeout_secs);
+        let elapsed_secs = applied_timeout_secs.saturating_sub(remaining_secs);
+        let requires_timeout_confirm = st.pending
+            && draft_timeout_secs
+                .map(|secs| secs <= elapsed_secs)
+                .unwrap_or(false);
+        let can_apply_timeout = input_valid && (!requires_timeout_confirm || st.browser_timeout_confirm_pending);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Response timeout (s)");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut st.browser_response_timeout_input)
+                    .desired_width(80.0)
+                    .hint_text("seconds")
+            );
+            if resp.changed() {
+                st.browser_timeout_confirm_pending = false;
+            }
+            if ui
+                .add_enabled(input_valid, egui::Button::new(if requires_timeout_confirm && !st.browser_timeout_confirm_pending {
+                    "Update timeout"
+                } else if requires_timeout_confirm {
+                    "Confirm timeout update"
+                } else {
+                    "Update timeout"
+                }))
+                .clicked()
+            {
+                if requires_timeout_confirm && !st.browser_timeout_confirm_pending {
+                    st.browser_timeout_confirm_pending = true;
+                } else if let Some(next_secs) = draft_timeout_secs {
+                    let next_secs = next_secs.clamp(1, 9999);
+                    let next_ms = next_secs * 1000;
+                    st.browser_response_timeout_ms = next_ms;
+                    st.browser_response_timeout_input = next_secs.to_string();
+                    st.browser_timeout_confirm_pending = false;
+                    if let Some(runtime_key) = runtime_key.as_deref() {
+                        if next_secs <= elapsed_secs {
+                            timeout_runtime_now(runtime_key);
+                        } else {
+                            set_runtime_timeout_secs(runtime_key, next_secs);
+                        }
+                    }
+                }
+            }
+            if requires_timeout_confirm && st.browser_timeout_confirm_pending {
+                if ui.button("Cancel").clicked() {
+                    st.browser_timeout_confirm_pending = false;
+                }
+            }
+            ui.separator();
+            ui.small(format!("Applied: {}s", applied_timeout_secs));
+            ui.separator();
+            ui.label(format!("Time left: {}s", remaining_secs));
+        });
+
+        let msg = if st.browser_response_timeout_input.trim().is_empty() {
+            "Invalid timeout value".to_string()
+        } else {
+            match draft_timeout_secs {
+                Some(secs) if !(1..=9999).contains(&secs) => "Invalid timeout value".to_string(),
+                None => "Invalid timeout value".to_string(),
+                Some(secs) if requires_timeout_confirm && !st.browser_timeout_confirm_pending => {
+                    "Are you sure? This will timeout immediately.".to_string()
+                }
+                Some(secs) if requires_timeout_confirm && st.browser_timeout_confirm_pending => {
+                    format!("Confirm timeout update to {}s or cancel", secs)
+                }
+                Some(_) => String::new(),
+            }
+        };
+        if !msg.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.small(msg);
+            });
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Poll (s)");
+            let poll_resp = ui.add(
+                egui::DragValue::new(&mut poll_secs_ui)
+                    .speed(0.25)
+                    .clamp_range(0.25..=30.0),
+            );
+            if poll_resp.changed() {
+                st.browser_response_poll_ms = (poll_secs_ui.max(0.25) * 1000.0).round() as u64;
+            }
+        });
+
+        ui.add_space(6.0);
+    }
 
     ui.horizontal_wrapped(|ui| {
         ui.label("Model");
@@ -807,7 +943,9 @@ pub fn changeset_loop_panel(
         || st.auto_fill_first_changeset_applier != before_auto_fill
         || st.browser_target_url != before_browser_target_url
         || st.changeset_auto != before_changeset_auto
-        || st.postprocess_cmd != before_postprocess_cmd;
+        || st.postprocess_cmd != before_postprocess_cmd
+        || st.browser_response_timeout_ms != before_browser_response_timeout_ms
+        || st.browser_response_poll_ms != before_browser_response_poll_ms;
 
     if did_mutate || ui_changed {
         state.persist_execute_loop_snapshot(loop_id);

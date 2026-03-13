@@ -201,6 +201,11 @@ pub struct ExecuteLoopState {
     pub browser_probe_error: Option<String>,
     pub browser_attached: bool,
     pub browser_auto_launch_edge: bool,
+    pub browser_response_timeout_ms: u64,
+    pub browser_response_poll_ms: u64,
+    pub active_browser_runtime_key: Option<String>,
+    pub browser_response_timeout_input: String,
+    pub browser_timeout_confirm_pending: bool,
 
     pub mode: ExecuteLoopMode,
 
@@ -263,6 +268,11 @@ impl ExecuteLoopState {
             browser_probe_error: None,
             browser_attached: false,
             browser_auto_launch_edge: true,
+            browser_response_timeout_ms: 180_000,
+            browser_response_poll_ms: 2_000,
+            active_browser_runtime_key: None,
+            browser_response_timeout_input: "180".to_string(),
+            browser_timeout_confirm_pending: false,
             mode: ExecuteLoopMode::Conversation,
             instruction,
             messages: vec![],

@@ -141,7 +141,13 @@ pub struct ExecuteLoopSnapshot {
 
     #[serde(default = "default_true")]
     pub browser_auto_launch_edge: bool,
+
+
+    pub browser_response_timeout_ms: u64,
+
+    pub browser_response_poll_ms: u64,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSnapshot {

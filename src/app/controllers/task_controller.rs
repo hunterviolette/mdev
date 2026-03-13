@@ -137,6 +137,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         browser_probe_error: st.browser_probe_error,
                         browser_attached: st.browser_attached,
                         browser_auto_launch_edge: st.browser_auto_launch_edge,
+                        browser_response_timeout_ms: st.browser_response_timeout_ms,
+                        browser_response_poll_ms: st.browser_response_poll_ms,
                     },
                 );
 

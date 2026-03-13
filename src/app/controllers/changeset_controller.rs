@@ -78,6 +78,67 @@ struct PostCommand {
     cwd: Option<String>,
 }
 
+fn extract_json_object_slice(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+pub fn normalize_changeset_payload_text(raw: &str) -> Result<String> {
+
+    let mut s = raw.trim();
+
+    if let Some(rest) = s.strip_prefix("```") {
+        s = rest;
+        s = s.trim_start();
+        if s.len() >= 4 && s[..4].eq_ignore_ascii_case("json") {
+            s = &s[4..];
+        }
+        s = s.trim_start_matches(|c| c == '\r' || c == '\n' || c == ' ' || c == '\t');
+        if let Some(end) = s.rfind("```") {
+            s = &s[..end];
+        }
+        s = s.trim();
+    }
+
+    if s.len() >= 4 && s[..4].eq_ignore_ascii_case("json") {
+        let rest = &s[4..];
+        let rest_trimmed = rest.trim_start();
+        if rest_trimmed.starts_with('{') {
+            s = rest_trimmed;
+        }
+    }
+
+    let obj = extract_json_object_slice(s)
+        .ok_or_else(|| anyhow!("No JSON object found in payload."))?
+        .trim();
+
+    if obj.is_empty() {
+        bail!("ChangeSet payload is empty after normalization.");
+    }
+
+    Ok(obj.to_string())
+}
+
+pub fn normalize_and_validate_changeset_payload_text(raw: &str) -> Result<String> {
+    let normalized = normalize_changeset_payload_text(raw)?;
+    let parsed: ChangeSetPayload = serde_json::from_str(&normalized)
+        .map_err(|e| anyhow!("Invalid JSON: {e}"))?;
+
+    if parsed.version != 1 {
+        bail!("Unsupported payload version {} (expected 1).", parsed.version);
+    }
+
+    if parsed.operations.is_empty() {
+        bail!("ChangeSet payload contains no operations.");
+    }
+
+    Ok(normalized)
+}
+
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
         Action::ApplyChangeSet { applier_id } => {
@@ -136,7 +197,19 @@ fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
         None => return,
     };
 
-    let parsed: ChangeSetPayload = match serde_json::from_str(&payload_text) {
+    let normalized_payload_text = match normalize_changeset_payload_text(&payload_text) {
+        Ok(s) => s,
+        Err(e) => {
+            set_applier_status(state, applier_id, format!("Invalid JSON: {e}"));
+            return;
+        }
+    };
+
+    if let Some(st) = state.changeset_appliers.get_mut(&applier_id) {
+        st.payload = normalized_payload_text.clone();
+    }
+
+    let parsed: ChangeSetPayload = match serde_json::from_str(&normalized_payload_text) {
         Ok(p) => p,
         Err(e) => {
             set_applier_status(state, applier_id, format!("Invalid JSON: {e}"));
