@@ -52,6 +52,9 @@ pub struct ContextExporterSnapshot {
 
     #[serde(default)]
     pub save_path: Option<String>,
+
+    #[serde(default)]
+    pub selected_paths: Vec<String>,
 }
 
 fn default_true() -> bool { true }

@@ -18,7 +18,7 @@ pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
             "mode": "normalized_newlines",
             "must_match": "exactly_one",
             "occurrence": 1,
-            "text": "egui::ScrollArea::vertical()"
+            "text": "egui::ScrollArea::vertical().id_source("example_scroll_id")"
           },
           "text": "\n                .id_source(\"example_scroll_id\")"
         },
@@ -50,7 +50,7 @@ pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
             "type": "literal",
             "mode": "normalized_newlines",
             "must_match": "at_least_one",
-            "text": "TODO:"
+            "text": ""
           }
         }
       ]
@@ -142,7 +142,8 @@ pub fn changeset_applier_panel(
     let desired_rows = ((pane_h / row_h).floor() as usize).max(1);
 
     ui.push_id("payload_pane", |ui| {
-        ui.label("Payload");
+
+    ui.label("Payload (example)");
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(6.0))
             .show(ui, |ui| {

@@ -223,6 +223,9 @@ pub enum Action {
     ContextToggleIncludeUnstagedDiff {
         exporter_id: ComponentId,
     },
+    ContextRestoreSelectionDefaults {
+        exporter_id: ComponentId,
+    },
 
     // ---------------------------
     // Change-set applier (AI patch payloads)

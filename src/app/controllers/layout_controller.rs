@@ -181,6 +181,7 @@ impl AppState {
                         include_unstaged_diff: false,
                         mode: ContextExportMode::EntireRepo,
                         status: None,
+                        selection_defaults: std::collections::HashSet::new(),
                         export_pending: false,
                         export_rx: None,
                     },

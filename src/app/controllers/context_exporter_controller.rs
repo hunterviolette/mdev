@@ -45,6 +45,18 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
 
 
+        Action::ContextRestoreSelectionDefaults { exporter_id } => {
+            let defaults = match state.context_exporters.get(exporter_id) {
+                Some(ex) => ex.selection_defaults.clone(),
+                None => return false,
+            };
+
+            state.tree.context_selected_files = defaults.clone();
+            let key = state.inputs.git_ref.clone();
+            state.tree.context_selected_by_ref.insert(key, defaults);
+            true
+        }
+
         Action::ContextGenerate { exporter_id } => {
             state.start_context_export_async(*exporter_id);
             true

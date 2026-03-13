@@ -79,6 +79,7 @@ pub struct TerminalState {
     pub include_unstaged_diff: bool,
     pub mode: ContextExportMode,
     pub status: Option<String>,
+    pub selection_defaults: std::collections::HashSet<String>,
     pub export_pending: bool,
     pub export_rx: Option<std::sync::mpsc::Receiver<Result<u128, String>>>,
 }
@@ -936,6 +937,7 @@ impl AppState {
                 include_unstaged_diff: false,
                 mode: ContextExportMode::TreeSelect,
                 status: None,
+                selection_defaults: HashSet::new(),
                 export_pending: false,
                 export_rx: None,
             });
