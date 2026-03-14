@@ -342,6 +342,24 @@ pub fn open_url_in_session(cfg: &mut BrowserTurnConfig, url: &str) -> Result<()>
     Ok(())
 }
 
+pub fn upload_file(cfg: &mut BrowserTurnConfig, file_path: &std::path::Path) -> Result<()> {
+    let mutex = client();
+    let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+
+    client.ensure_started(&cfg.bridge_dir)?;
+
+    let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before upload_file"))?;
+
+    client.send_json(json!({
+        "cmd": "upload_file",
+        "session_id": session_id,
+        "file_path": file_path.to_string_lossy().to_string(),
+        "timeout_ms": bridge_timeout_ms(cfg)
+    }))?;
+
+    Ok(())
+}
+
 pub fn probe_session(cfg: &mut BrowserTurnConfig) -> Result<crate::app::state::BrowserProbeResult> {
     let mutex = client();
     let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;

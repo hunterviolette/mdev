@@ -314,7 +314,7 @@ impl AppState {
                 #[cfg(windows)]
                 let mut b = CommandBuilder::new("powershell.exe");
                 #[cfg(not(windows))]
-                let mut b = CommandBuilder::new("bash");
+                let b = CommandBuilder::new("bash");
                 #[cfg(windows)]
                 {
                     b.arg("-NoLogo");

@@ -95,10 +95,80 @@ pub enum ExecuteLoopMode {
     ChangeSet,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecuteLoopWorkflowStage {
+    Design,
+    Code,
+    Compile,
+    Test,
+    Review,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecuteLoopStageAutomation {
+    Manual,
+    Auto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopWorkflowStageConfig {
+    pub stage: ExecuteLoopWorkflowStage,
+    pub enabled: bool,
+    pub automation: ExecuteLoopStageAutomation,
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+impl ExecuteLoopWorkflowStageConfig {
+    pub fn new(
+        stage: ExecuteLoopWorkflowStage,
+        enabled: bool,
+        automation: ExecuteLoopStageAutomation,
+    ) -> Self {
+        Self {
+            stage,
+            enabled,
+            automation,
+            commands: vec![],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecuteLoopMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopManualMessageFragments {
+    pub include_system_instruction: bool,
+    pub include_repo_context: bool,
+    pub include_changeset_schema: bool,
+}
+
+impl Default for ExecuteLoopManualMessageFragments {
+    fn default() -> Self {
+        Self {
+            include_system_instruction: true,
+            include_repo_context: false,
+            include_changeset_schema: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopAutomaticMessageFragments {
+    pub apply_error: Option<String>,
+    pub changeset_validation_error: Option<String>,
+    pub compile_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopFragmentOverrides {
+    pub system_instruction: Option<String>,
+    pub changeset_schema: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,8 +277,6 @@ pub struct ExecuteLoopState {
     pub browser_response_timeout_input: String,
     pub browser_timeout_confirm_pending: bool,
 
-    pub mode: ExecuteLoopMode,
-
     pub instruction: String,
 
     pub messages: Vec<ExecuteLoopMessage>,
@@ -216,6 +284,10 @@ pub struct ExecuteLoopState {
     pub draft: String,
 
     pub include_context_next: bool,
+
+    pub manual_fragments: ExecuteLoopManualMessageFragments,
+    pub automatic_fragments: ExecuteLoopAutomaticMessageFragments,
+    pub fragment_overrides: ExecuteLoopFragmentOverrides,
 
     pub conversation_id: Option<String>,
 
@@ -228,6 +300,9 @@ pub struct ExecuteLoopState {
     pub awaiting_review: bool,
 
     pub changeset_auto: bool,
+
+    pub workflow_stages: Vec<ExecuteLoopWorkflowStageConfig>,
+    pub workflow_active_stage: ExecuteLoopWorkflowStage,
 
     pub pending: bool,
     pub pending_rx: Option<std::sync::mpsc::Receiver<Result<ExecuteLoopTurnResult, String>>>,
@@ -273,11 +348,17 @@ impl ExecuteLoopState {
             active_browser_runtime_key: None,
             browser_response_timeout_input: "180".to_string(),
             browser_timeout_confirm_pending: false,
-            mode: ExecuteLoopMode::Conversation,
             instruction,
             messages: vec![],
             draft: String::new(),
             include_context_next: true,
+            manual_fragments: ExecuteLoopManualMessageFragments {
+                include_system_instruction: true,
+                include_repo_context: true,
+                include_changeset_schema: false,
+            },
+            automatic_fragments: ExecuteLoopAutomaticMessageFragments::default(),
+            fragment_overrides: ExecuteLoopFragmentOverrides::default(),
             conversation_id: None,
             history_sync_pending: false,
             history_sync_rx: None,
@@ -285,6 +366,30 @@ impl ExecuteLoopState {
             auto_fill_first_changeset_applier: true,
             awaiting_review: false,
             changeset_auto: true,
+            workflow_stages: vec![
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Design,
+                    true,
+                    ExecuteLoopStageAutomation::Manual,
+                ),
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Code,
+                    true,
+                    ExecuteLoopStageAutomation::Auto,
+                ),
+                ExecuteLoopWorkflowStageConfig {
+                    stage: ExecuteLoopWorkflowStage::Compile,
+                    enabled: true,
+                    automation: ExecuteLoopStageAutomation::Auto,
+                    commands: vec!["cargo check".to_string()],
+                },
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Finished,
+                    true,
+                    ExecuteLoopStageAutomation::Manual,
+                ),
+            ],
+            workflow_active_stage: ExecuteLoopWorkflowStage::Design,
             paused: false,
             changesets_total: 0,
             changesets_ok: 0,
@@ -302,6 +407,214 @@ impl ExecuteLoopState {
             last_status: None,
             iterations: vec![],
         }
+    }
+}
+
+impl ExecuteLoopState {
+    pub fn ensure_default_changeset_workflow(&mut self) {
+        if self.workflow_stages.is_empty() {
+            self.workflow_stages = vec![
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Design,
+                    true,
+                    ExecuteLoopStageAutomation::Manual,
+                ),
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Code,
+                    true,
+                    if self.changeset_auto {
+                        ExecuteLoopStageAutomation::Auto
+                    } else {
+                        ExecuteLoopStageAutomation::Manual
+                    },
+                ),
+                ExecuteLoopWorkflowStageConfig {
+                    stage: ExecuteLoopWorkflowStage::Compile,
+                    enabled: true,
+                    automation: if self.changeset_auto {
+                        ExecuteLoopStageAutomation::Auto
+                    } else {
+                        ExecuteLoopStageAutomation::Manual
+                    },
+                    commands: self
+                        .postprocess_cmd
+                        .lines()
+                        .map(|line| line.trim())
+                        .filter(|line| !line.is_empty())
+                        .map(|line| line.to_string())
+                        .collect(),
+                },
+                ExecuteLoopWorkflowStageConfig::new(
+                    ExecuteLoopWorkflowStage::Finished,
+                    true,
+                    ExecuteLoopStageAutomation::Manual,
+                ),
+            ];
+        }
+
+        if !self.workflow_stages.iter().any(|cfg| cfg.stage == ExecuteLoopWorkflowStage::Finished) {
+            self.workflow_stages.push(ExecuteLoopWorkflowStageConfig::new(
+                ExecuteLoopWorkflowStage::Finished,
+                true,
+                ExecuteLoopStageAutomation::Manual,
+            ));
+        }
+
+        if let Some(idx) = self
+            .workflow_stages
+            .iter()
+            .position(|cfg| cfg.stage == ExecuteLoopWorkflowStage::Finished)
+        {
+            if idx + 1 != self.workflow_stages.len() {
+                let finished = self.workflow_stages.remove(idx);
+                self.workflow_stages.push(finished);
+            }
+        }
+
+        let active_exists = self
+            .workflow_stages
+            .iter()
+            .any(|cfg| cfg.enabled && cfg.stage == self.workflow_active_stage);
+        if !active_exists {
+            self.workflow_active_stage = self
+                .workflow_stages
+                .iter()
+                .find(|cfg| cfg.enabled)
+                .map(|cfg| cfg.stage)
+                .unwrap_or(ExecuteLoopWorkflowStage::Finished);
+        }
+
+        self.sync_legacy_changeset_fields();
+        self.sync_message_fragment_defaults_for_stage();
+    }
+
+    pub fn sync_legacy_changeset_fields(&mut self) {
+        if let Some(cfg) = self
+            .workflow_stages
+            .iter()
+            .find(|cfg| cfg.stage == ExecuteLoopWorkflowStage::Code)
+        {
+            self.changeset_auto = cfg.automation == ExecuteLoopStageAutomation::Auto;
+        }
+
+        if let Some(cfg) = self
+            .workflow_stages
+            .iter()
+            .find(|cfg| cfg.stage == ExecuteLoopWorkflowStage::Compile)
+        {
+            let joined = cfg
+                .commands
+                .iter()
+                .map(|cmd| cmd.trim())
+                .filter(|cmd| !cmd.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !joined.is_empty() {
+                self.postprocess_cmd = joined;
+            }
+        }
+    }
+
+    pub fn workflow_stage_config(
+        &self,
+        stage: ExecuteLoopWorkflowStage,
+    ) -> Option<&ExecuteLoopWorkflowStageConfig> {
+        self.workflow_stages.iter().find(|cfg| cfg.stage == stage)
+    }
+
+    pub fn workflow_stage_config_mut(
+        &mut self,
+        stage: ExecuteLoopWorkflowStage,
+    ) -> Option<&mut ExecuteLoopWorkflowStageConfig> {
+        self.workflow_stages.iter_mut().find(|cfg| cfg.stage == stage)
+    }
+
+    pub fn workflow_next_stage(
+        &self,
+        stage: ExecuteLoopWorkflowStage,
+    ) -> Option<ExecuteLoopWorkflowStage> {
+        let mut seen = false;
+        for cfg in self.workflow_stages.iter() {
+            if !cfg.enabled {
+                continue;
+            }
+            if seen {
+                return Some(cfg.stage);
+            }
+            if cfg.stage == stage {
+                seen = true;
+            }
+        }
+        None
+    }
+
+    pub fn workflow_set_active_stage(&mut self, stage: ExecuteLoopWorkflowStage) {
+        self.workflow_active_stage = stage;
+        self.awaiting_review = false;
+    }
+
+    pub fn workflow_stage_is_auto(&self, stage: ExecuteLoopWorkflowStage) -> bool {
+        self.workflow_stage_config(stage)
+            .map(|cfg| cfg.automation == ExecuteLoopStageAutomation::Auto)
+            .unwrap_or(false)
+    }
+
+    pub fn effective_mode(&self) -> ExecuteLoopMode {
+        match self.workflow_active_stage {
+            ExecuteLoopWorkflowStage::Design => ExecuteLoopMode::Conversation,
+            ExecuteLoopWorkflowStage::Code => ExecuteLoopMode::ChangeSet,
+            _ => ExecuteLoopMode::ChangeSet,
+        }
+    }
+
+    pub fn sync_message_fragment_defaults_for_stage(&mut self) {}
+
+    pub fn clear_automatic_message_fragments(&mut self) {
+        self.automatic_fragments = ExecuteLoopAutomaticMessageFragments::default();
+    }
+
+    pub fn clear_manual_message_fragments(&mut self) {
+        self.manual_fragments = ExecuteLoopManualMessageFragments::default();
+        self.include_context_next = false;
+    }
+
+    pub fn effective_system_instruction_fragment(&self) -> String {
+        self.fragment_overrides
+            .system_instruction
+            .as_deref()
+            .unwrap_or(self.instruction.as_str())
+            .trim()
+            .to_string()
+    }
+
+    pub fn effective_changeset_schema_fragment(&self) -> String {
+        self.fragment_overrides
+            .changeset_schema
+            .as_deref()
+            .unwrap_or(crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE)
+            .trim()
+            .to_string()
+    }
+
+    pub fn compile_command_list(&self) -> Vec<String> {
+        self.workflow_stage_config(ExecuteLoopWorkflowStage::Compile)
+            .map(|cfg| {
+                cfg.commands
+                    .iter()
+                    .map(|cmd| cmd.trim())
+                    .filter(|cmd| !cmd.is_empty())
+                    .map(|cmd| cmd.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cmds| !cmds.is_empty())
+            .unwrap_or_else(|| {
+                self.postprocess_cmd
+                    .lines()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+            })
     }
 }
 

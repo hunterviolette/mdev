@@ -2,7 +2,15 @@ use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
 use crate::app::browser_bridge::{browser_model_options, runtime_timeout_remaining_secs, set_runtime_timeout_secs, timeout_runtime_now};
-use crate::app::state::{AppState, BrowserBridgeStatus, ExecuteLoopMessage, ExecuteLoopMode, ExecuteLoopTransport};
+use crate::app::state::{
+    AppState,
+    BrowserBridgeStatus,
+    ExecuteLoopMessage,
+    ExecuteLoopMode,
+    ExecuteLoopStageAutomation,
+    ExecuteLoopTransport,
+    ExecuteLoopWorkflowStage,
+};
 
 pub fn changeset_loop_panel(
     ctx: &egui::Context,
@@ -34,21 +42,26 @@ pub fn changeset_loop_panel(
     }
 
     let mut did_mutate = false;
+    st.ensure_default_changeset_workflow();
+
 
     let before_model = st.model.clone();
     let before_instruction = st.instruction.clone();
-    let before_mode = st.mode;
+    let before_manual_fragments = st.manual_fragments.clone();
+    let before_automatic_fragments = st.automatic_fragments.clone();
+    let before_fragment_overrides = st.fragment_overrides.clone();
     let before_include_ctx = st.include_context_next;
     let before_auto_fill = st.auto_fill_first_changeset_applier;
     let before_browser_target_url = st.browser_target_url.clone();
 
 
-    if st.mode == ExecuteLoopMode::ChangeSet && !st.auto_fill_first_changeset_applier {
+    if !st.auto_fill_first_changeset_applier {
         st.auto_fill_first_changeset_applier = true;
         did_mutate = true;
     }
-    let before_changeset_auto = st.changeset_auto;
     let before_postprocess_cmd = st.postprocess_cmd.clone();
+    let before_workflow_stages = st.workflow_stages.clone();
+    let before_workflow_active_stage = st.workflow_active_stage;
     let before_browser_response_timeout_ms = st.browser_response_timeout_ms;
     let before_browser_response_poll_ms = st.browser_response_poll_ms;
 
@@ -186,7 +199,7 @@ pub fn changeset_loop_panel(
                     st.pending_rx = None;
                     st.active_browser_runtime_key = None;
 
-                    if st.mode == ExecuteLoopMode::ChangeSet {
+                    if st.effective_mode() == ExecuteLoopMode::ChangeSet {
                         if let Some((applier_id, ap)) = state.changeset_appliers.iter_mut().next() {
                             match crate::app::controllers::changeset_controller::normalize_and_validate_changeset_payload_text(&out.text) {
                                 Ok(normalized) => {
@@ -197,16 +210,12 @@ pub fn changeset_loop_panel(
                                     st.last_auto_applier_status = ap.status.clone();
                                     st.changesets_total = st.changesets_total.saturating_add(1);
 
-                                    if st.changeset_auto {
-                                        st.awaiting_apply_result = true;
-                                        actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
-                                        st.last_status = Some("Valid ChangeSet received: auto-applying…".to_string());
-                                        st.awaiting_review = false;
-                                    } else {
-                                        st.awaiting_apply_result = false;
-                                        st.awaiting_review = true;
-                                        st.last_status = Some("Valid ChangeSet received: review before applying.".to_string());
-                                    }
+                                    st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Code);
+                                    st.awaiting_apply_result = true;
+                                    actions.push(Action::ApplyChangeSet { applier_id: *applier_id });
+                                    st.last_status = Some("Valid ChangeSet received in Code stage: applying…".to_string());
+                                    st.awaiting_review = false;
+                                    st.automatic_fragments.changeset_validation_error = None;
                                 }
                                 Err(err) => {
                                     ap.payload = out.text.clone();
@@ -221,11 +230,14 @@ pub fn changeset_loop_panel(
                                         err
                                     ));
 
-                                    if st.changeset_auto {
-                                        st.draft = format!(
-                                            "Your previous response was not a valid ChangeSet JSON payload. Return only a valid ChangeSet JSON object, version 1, with at least one operation.\n\nVALIDATION ERROR:\n{}",
-                                            err
-                                        );
+                                    let validation_prompt = format!(
+                                        "Your previous response was not a valid ChangeSet JSON payload. Return only a valid ChangeSet JSON object, version 1, with at least one operation.\n\nVALIDATION ERROR:\n{}",
+                                        err
+                                    );
+                                    if st.workflow_stage_is_auto(ExecuteLoopWorkflowStage::Code) {
+                                        st.automatic_fragments.changeset_validation_error = Some(validation_prompt);
+                                    } else {
+                                        st.draft = validation_prompt;
                                     }
                                 }
                             }
@@ -283,7 +295,7 @@ pub fn changeset_loop_panel(
         }
     }
 
-    if st.mode == ExecuteLoopMode::ChangeSet && st.awaiting_apply_result {
+    if st.awaiting_apply_result {
         if let Some(applier_id) = st.last_auto_applier_id {
             if let Some(ap) = state.changeset_appliers.get(&applier_id) {
                 if let Some(status) = ap.status.clone() {
@@ -311,24 +323,39 @@ pub fn changeset_loop_panel(
                                 status
                             );
 
-                            if st.changeset_auto {
-                                st.draft = prompt;
-                                st.include_context_next = true;
+                            st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Code);
+                            if st.workflow_stage_is_auto(ExecuteLoopWorkflowStage::Code) {
+                                st.automatic_fragments.apply_error = Some(prompt.clone());
+                                st.include_context_next = st.manual_fragments.include_repo_context;
                                 st.last_status = Some(
                                     "Apply failed: requesting follow-up ChangeSet…".to_string(),
                                 );
                                 actions.push(Action::ExecuteLoopSend { loop_id });
                             } else {
                                 st.awaiting_review = true;
-                                st.draft = prompt;
+                                st.automatic_fragments.apply_error = Some(prompt.clone());
+                                st.draft = prompt.clone();
                                 st.last_status = Some(
-                                    "Apply failed (manual): review error then Send for follow-up.".to_string(),
+                                    "Apply failed (manual): review error then Run stage for follow-up.".to_string(),
                                 );
                             }
                         } else {
                             st.last_status = Some("Apply succeeded.".to_string());
-                            if st.changeset_auto {
-                                actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+                            st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Code);
+                            let next = st.workflow_next_stage(ExecuteLoopWorkflowStage::Code);
+                            if let Some(ExecuteLoopWorkflowStage::Compile) = next {
+                                st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Compile);
+                                if st.workflow_stage_is_auto(ExecuteLoopWorkflowStage::Compile) {
+                                    st.awaiting_review = false;
+                                    actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+                                } else {
+                                    st.awaiting_review = true;
+                                    st.last_status = Some("Apply succeeded. Compile stage is ready for manual run.".to_string());
+                                }
+                            } else {
+                                st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Finished);
+                                st.awaiting_review = true;
+                                st.last_status = Some("Workflow finished. Ready for review.".to_string());
                             }
                         }
                     }
@@ -346,13 +373,15 @@ pub fn changeset_loop_panel(
 
                     st.messages.push(ExecuteLoopMessage {
                         role: "system".to_string(),
-                        content: format!("POSTPROCESS OK ({})\n{}", st.postprocess_cmd, output),
+                        content: format!("COMPILE OK ({})\n{}", st.postprocess_cmd, output),
                     });
                     did_mutate = true;
 
-                    st.last_status = Some("Postprocess OK.".to_string());
+                    st.last_status = Some("Compile succeeded. Ready for review.".to_string());
 
                     st.postprocess_ok = st.postprocess_ok.saturating_add(1);
+                    st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Finished);
+                    st.awaiting_review = true;
                 }
                 Ok(Err(output)) => {
                     st.postprocess_pending = false;
@@ -367,25 +396,25 @@ pub fn changeset_loop_panel(
 
 
                     st.postprocess_err = st.postprocess_err.saturating_add(1);
-                    if st.mode == ExecuteLoopMode::ChangeSet {
-                        if st.changeset_auto {
-                            st.draft = format!(
-                                "Postprocess command failed after applying the previous ChangeSet.\n\nPOSTPROCESS OUTPUT:\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
-                                msg
-                            );
-                            st.include_context_next = true;
-                            st.last_status = Some(
-                                "Postprocess failed: requesting follow-up ChangeSet…".to_string(),
-                            );
-                            actions.push(Action::ExecuteLoopSend { loop_id });
-                        } else {
-                            st.awaiting_review = true;
-                            st.last_status = Some(
-                                "Postprocess failed (manual): review output then Send for follow-up.".to_string(),
-                            );
-                        }
+                    let compile_fragment = format!(
+                        "Postprocess command failed after applying the previous ChangeSet.\n\nPOSTPROCESS OUTPUT:\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
+                        msg
+                    );
+                    st.workflow_set_active_stage(ExecuteLoopWorkflowStage::Code);
+                    if st.workflow_stage_is_auto(ExecuteLoopWorkflowStage::Code) {
+                        st.automatic_fragments.compile_error = Some(compile_fragment);
+                        st.include_context_next = st.manual_fragments.include_repo_context;
+                        st.last_status = Some(
+                            "Compile failed: requesting follow-up ChangeSet…".to_string(),
+                        );
+                        actions.push(Action::ExecuteLoopSend { loop_id });
                     } else {
-                        st.last_status = Some("Postprocess failed.".to_string());
+                        st.awaiting_review = true;
+                        st.automatic_fragments.compile_error = Some(compile_fragment.clone());
+                        st.draft = compile_fragment;
+                        st.last_status = Some(
+                            "Compile failed (manual): review output then Run stage for follow-up.".to_string(),
+                        );
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -497,14 +526,6 @@ pub fn changeset_loop_panel(
             actions.push(Action::ExecuteLoopClearChat { loop_id });
         }
 
-        if ui
-            .button("Inject context")
-            .on_hover_text("Generate + inject repo context as a system message now")
-            .clicked()
-        {
-            actions.push(Action::ExecuteLoopInjectContext { loop_id });
-        }
-
         if st.pending {
             ui.separator();
             ui.small("Waiting…");
@@ -519,10 +540,7 @@ pub fn changeset_loop_panel(
 
         if st.awaiting_review {
             ui.separator();
-            ui.strong("Awaiting step");
-            if ui.button("Step").clicked() {
-                actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
-            }
+            ui.strong("Awaiting manual action");
         }
 
         if let Some(s) = &st.last_status {
@@ -592,7 +610,7 @@ pub fn changeset_loop_panel(
             && draft_timeout_secs
                 .map(|secs| secs <= elapsed_secs)
                 .unwrap_or(false);
-        let can_apply_timeout = input_valid && (!requires_timeout_confirm || st.browser_timeout_confirm_pending);
+        let _can_apply_timeout = input_valid && (!requires_timeout_confirm || st.browser_timeout_confirm_pending);
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Response timeout (s)");
@@ -640,6 +658,16 @@ pub fn changeset_loop_panel(
             ui.small(format!("Applied: {}s", applied_timeout_secs));
             ui.separator();
             ui.label(format!("Time left: {}s", remaining_secs));
+            ui.separator();
+            ui.label("Poll (s)");
+            let poll_resp = ui.add(
+                egui::DragValue::new(&mut poll_secs_ui)
+                    .speed(0.25)
+                    .clamp_range(0.25..=30.0),
+            );
+            if poll_resp.changed() {
+                st.browser_response_poll_ms = (poll_secs_ui.max(0.25) * 1000.0).round() as u64;
+            }
         });
 
         let msg = if st.browser_response_timeout_input.trim().is_empty() {
@@ -648,7 +676,7 @@ pub fn changeset_loop_panel(
             match draft_timeout_secs {
                 Some(secs) if !(1..=9999).contains(&secs) => "Invalid timeout value".to_string(),
                 None => "Invalid timeout value".to_string(),
-                Some(secs) if requires_timeout_confirm && !st.browser_timeout_confirm_pending => {
+                Some(_secs) if requires_timeout_confirm && !st.browser_timeout_confirm_pending => {
                     "Are you sure? This will timeout immediately.".to_string()
                 }
                 Some(secs) if requires_timeout_confirm && st.browser_timeout_confirm_pending => {
@@ -662,18 +690,6 @@ pub fn changeset_loop_panel(
                 ui.small(msg);
             });
         }
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Poll (s)");
-            let poll_resp = ui.add(
-                egui::DragValue::new(&mut poll_secs_ui)
-                    .speed(0.25)
-                    .clamp_range(0.25..=30.0),
-            );
-            if poll_resp.changed() {
-                st.browser_response_poll_ms = (poll_secs_ui.max(0.25) * 1000.0).round() as u64;
-            }
-        });
 
         ui.add_space(6.0);
     }
@@ -739,76 +755,176 @@ pub fn changeset_loop_panel(
     ui.add_space(6.0);
 
     ui.horizontal(|ui| {
-        ui.label("Mode");
-
-        let mut mode = st.mode;
-        ui.radio_value(&mut mode, ExecuteLoopMode::Conversation, "Conversation");
-        ui.radio_value(&mut mode, ExecuteLoopMode::ChangeSet, "ChangeSet");
-        if mode != st.mode {
-            actions.push(Action::ExecuteLoopSetMode { loop_id, mode });
-        }
-
-        ui.separator();
-        ui.checkbox(&mut st.include_context_next, "Include context on next send");
-
-        if st.mode == ExecuteLoopMode::ChangeSet {
-            ui.separator();
-            ui.label("Loop");
-
-            ui.horizontal(|ui| {
-                if ui.selectable_label(st.changeset_auto, "Auto").clicked() {
-                    st.changeset_auto = true;
-                    st.awaiting_review = false;
-                }
-                if ui.selectable_label(!st.changeset_auto, "Step").clicked() {
-                    st.changeset_auto = false;
-                }
-            });
-
-            ui.small(if st.changeset_auto {
-                "(runs continuously)"
-            } else {
-                "(pauses after each step)"
-            });
-        }
-
+        ui.label(format!(
+            "Workflow mode: {:?} (stage: {:?})",
+            st.effective_mode(),
+            st.workflow_active_stage
+        ));
     });
 
-    ui.add_space(8.0);
+    ui.label("Message fragments");
+    ui.horizontal_wrapped(|ui| {
+        if ui.checkbox(&mut st.manual_fragments.include_system_instruction, "System instructions").changed() {
+            did_mutate = true;
+        }
+        if ui.checkbox(&mut st.manual_fragments.include_repo_context, "Repo context").changed() {
+            st.include_context_next = st.manual_fragments.include_repo_context;
+            did_mutate = true;
+        }
+        if ui.checkbox(&mut st.manual_fragments.include_changeset_schema, "ChangeSet schema").changed() {
+            did_mutate = true;
+        }
+    });
 
-    ui.label("System instruction");
-    ui.add(
-        egui::TextEdit::multiline(&mut st.instruction)
-            .desired_rows(3)
-            .desired_width(panel_w),
-    );
-
-    ui.add_space(8.0);
-
-    if st.mode == ExecuteLoopMode::ChangeSet {
-        ui.label("Postprocess command");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut st.postprocess_cmd)
-                    .desired_width((panel_w - 80.0).max(120.0))
-                    .hint_text("e.g. cargo check"),
-            );
-
-            let can_run = !st.postprocess_pending && !st.pending;
-            if ui.add_enabled(can_run, egui::Button::new("Run")).clicked() {
-                actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
+    if st.manual_fragments.include_system_instruction {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("System instructions source");
+            let mut use_override = st.fragment_overrides.system_instruction.is_some();
+            egui::ComboBox::from_id_source(("system_instruction_override", loop_id))
+                .selected_text(if use_override { "Override" } else { "Default" })
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(!use_override, "Default").clicked() {
+                        st.fragment_overrides.system_instruction = None;
+                        use_override = false;
+                    }
+                    if ui.selectable_label(use_override, "Override").clicked() {
+                        let default_text = st.effective_system_instruction_fragment();
+                        st.fragment_overrides.system_instruction = Some(default_text);
+                        use_override = true;
+                    }
+                });
+            if ui.button("Reset to default").clicked() {
+                st.fragment_overrides.system_instruction = None;
             }
         });
-        ui.add(
-            egui::Label::new(
-                "Run this after the ChangeSet is applied. If it fails, the output will be sent back to the model for a follow-up ChangeSet (Auto), or paused for Step.",
-            )
-            .wrap(true),
-        );
-        ui.add_space(8.0);
+        if let Some(text) = st.fragment_overrides.system_instruction.as_mut() {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .desired_rows(4)
+                    .desired_width(panel_w),
+            );
+        }
     }
 
-    let reserved_bottom = if st.mode == ExecuteLoopMode::ChangeSet { 260.0 } else { 200.0 };
+    if st.manual_fragments.include_changeset_schema {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("ChangeSet schema source");
+            let mut use_override = st.fragment_overrides.changeset_schema.is_some();
+            egui::ComboBox::from_id_source(("changeset_schema_override", loop_id))
+                .selected_text(if use_override { "Override" } else { "Default" })
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(!use_override, "Default").clicked() {
+                        st.fragment_overrides.changeset_schema = None;
+                        use_override = false;
+                    }
+                    if ui.selectable_label(use_override, "Override").clicked() {
+                        let default_text = st.effective_changeset_schema_fragment();
+                        st.fragment_overrides.changeset_schema = Some(default_text);
+                        use_override = true;
+                    }
+                });
+            if ui.button("Reset to default").clicked() {
+                st.fragment_overrides.changeset_schema = None;
+            }
+        });
+        if let Some(text) = st.fragment_overrides.changeset_schema.as_mut() {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .desired_rows(6)
+                    .desired_width(panel_w),
+            );
+        }
+    }
+
+    let mut auto_labels: Vec<String> = Vec::new();
+    if st.automatic_fragments.apply_error.is_some() {
+        auto_labels.push("Apply error".to_string());
+    }
+    if st.automatic_fragments.changeset_validation_error.is_some() {
+        auto_labels.push("ChangeSet validation error".to_string());
+    }
+    if st.automatic_fragments.compile_error.is_some() {
+        auto_labels.push("Compile error".to_string());
+    }
+    if !auto_labels.is_empty() {
+        ui.small(format!("Automatic for next turn: {}", auto_labels.join(", ")));
+    }
+    ui.add_space(8.0);
+
+    ui.add_space(8.0);
+
+    ui.separator();
+    ui.label("Workflow");
+    ui.small(format!("Current stage: {:?} (mode: {:?})", st.workflow_active_stage, st.effective_mode()));
+    ui.add_space(4.0);
+
+    for idx in 0..st.workflow_stages.len() {
+        let stage = st.workflow_stages[idx].stage;
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let is_finished = stage == ExecuteLoopWorkflowStage::Finished;
+                let enabled_ref = &mut st.workflow_stages[idx].enabled;
+                if is_finished {
+                    *enabled_ref = true;
+                    ui.add_enabled(false, egui::Checkbox::new(enabled_ref, format!("{:?}", stage)));
+                } else {
+                    ui.checkbox(enabled_ref, format!("{:?}", stage));
+                }
+
+                let auto_supported = matches!(stage, ExecuteLoopWorkflowStage::Code | ExecuteLoopWorkflowStage::Compile);
+                egui::ComboBox::from_id_source(("workflow_stage_auto", loop_id, idx))
+                    .selected_text(match st.workflow_stages[idx].automation {
+                        ExecuteLoopStageAutomation::Manual => "Manual",
+                        ExecuteLoopStageAutomation::Auto => "Auto",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut st.workflow_stages[idx].automation,
+                            ExecuteLoopStageAutomation::Manual,
+                            "Manual",
+                        );
+                        if auto_supported {
+                            ui.selectable_value(
+                                &mut st.workflow_stages[idx].automation,
+                                ExecuteLoopStageAutomation::Auto,
+                                "Auto",
+                            );
+                        }
+                    });
+
+                if ui.small_button("Go").clicked() {
+                    actions.push(Action::ExecuteLoopWorkflowJumpToStage { loop_id, stage });
+                }
+            });
+
+            if stage == ExecuteLoopWorkflowStage::Compile {
+                let mut joined = st.workflow_stages[idx].commands.join("\n");
+                ui.label("Compile commands (one per line)");
+                if ui
+                    .add(
+                        egui::TextEdit::multiline(&mut joined)
+                            .desired_rows(3)
+                            .desired_width(panel_w)
+                            .hint_text("cd bridge && npm run build\ncargo run"),
+                    )
+                    .changed()
+                {
+                    st.workflow_stages[idx].commands = joined
+                        .lines()
+                        .map(|line| line.trim())
+                        .filter(|line| !line.is_empty())
+                        .map(|line| line.to_string())
+                        .collect();
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    st.ensure_default_changeset_workflow();
+    ui.add_space(8.0);
+
+    let reserved_bottom = 360.0;
     let chat_max_h = (ui.available_height() - reserved_bottom).max(120.0);
 
     ui.label("Conversation");
@@ -902,25 +1018,20 @@ pub fn changeset_loop_panel(
                 actions.push(Action::ExecuteLoopSend { loop_id });
             }
 
-            if st.mode == ExecuteLoopMode::ChangeSet {
-                ui.separator();
+            ui.separator();
 
-                ui.small(if st.changeset_auto { "Auto" } else { "Step" });
-
-                let can_step = st.awaiting_review && !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
-                if ui
-                    .add_enabled(!st.changeset_auto && can_step, egui::Button::new("Step"))
-                    .on_hover_text("Advance one step (only enabled when paused)")
-                    .clicked()
-                {
-                    actions.push(Action::ExecuteLoopMarkReviewed { loop_id });
-
-                    if !st.draft.trim().is_empty() {
-                        actions.push(Action::ExecuteLoopSend { loop_id });
-                    } else if !st.postprocess_cmd.trim().is_empty() {
-                        actions.push(Action::ExecuteLoopRunPostprocess { loop_id });
-                    }
-                }
+            let advance_label = match st.workflow_active_stage {
+                ExecuteLoopWorkflowStage::Design | ExecuteLoopWorkflowStage::Code => "Run stage",
+                ExecuteLoopWorkflowStage::Compile => "Run compile",
+                _ => "Advance",
+            };
+            let can_advance = !st.pending && !st.postprocess_pending && !st.awaiting_apply_result;
+            if ui
+                .add_enabled(can_advance, egui::Button::new(advance_label))
+                .on_hover_text("Run or advance the active workflow stage")
+                .clicked()
+            {
+                actions.push(Action::ExecuteLoopWorkflowAdvance { loop_id });
             }
 
             if st.pending {
@@ -928,22 +1039,25 @@ pub fn changeset_loop_panel(
                 ui.small("Waiting for response…");
             } else if st.postprocess_pending {
                 ui.separator();
-                ui.small("Running postprocess…");
+                ui.small("Running compile stage…");
             } else if st.awaiting_review {
                 ui.separator();
-                ui.small("Paused — click Step to continue.");
+                ui.small("Paused — workflow is waiting for manual review/intervention.");
             }
         });
     }
 
     let ui_changed = st.model != before_model
         || st.instruction != before_instruction
-        || st.mode != before_mode
+        || st.manual_fragments != before_manual_fragments
+        || st.automatic_fragments != before_automatic_fragments
+        || st.fragment_overrides != before_fragment_overrides
         || st.include_context_next != before_include_ctx
         || st.auto_fill_first_changeset_applier != before_auto_fill
         || st.browser_target_url != before_browser_target_url
-        || st.changeset_auto != before_changeset_auto
         || st.postprocess_cmd != before_postprocess_cmd
+        || st.workflow_stages != before_workflow_stages
+        || st.workflow_active_stage != before_workflow_active_stage
         || st.browser_response_timeout_ms != before_browser_response_timeout_ms
         || st.browser_response_poll_ms != before_browser_response_poll_ms;
 

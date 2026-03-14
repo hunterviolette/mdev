@@ -18,7 +18,8 @@ pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
             "mode": "normalized_newlines",
             "must_match": "exactly_one",
             "occurrence": 1,
-            "text": "egui::ScrollArea::vertical().id_source("example_scroll_id")"
+            "text": "egui::ScrollArea::vertical().id_source("example_scroll_id")
+                .id_source("example_scroll_id")"
           },
           "text": "\n                .id_source(\"example_scroll_id\")"
         },

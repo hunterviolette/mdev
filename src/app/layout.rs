@@ -57,6 +57,10 @@ pub struct ContextExporterSnapshot {
     pub selected_paths: Vec<String>,
 }
 
+fn default_execute_loop_workflow_stage_design() -> crate::app::state::ExecuteLoopWorkflowStage {
+    crate::app::state::ExecuteLoopWorkflowStage::Design
+}
+
 fn default_true() -> bool { true }
 fn default_execute_loop_transport() -> crate::app::state::ExecuteLoopTransport {
     crate::app::state::ExecuteLoopTransport::Api
@@ -67,8 +71,13 @@ fn default_execute_loop_transport() -> crate::app::state::ExecuteLoopTransport {
 pub struct ExecuteLoopSnapshot {
     pub model: String,
     pub instruction: String,
-    pub mode: crate::app::state::ExecuteLoopMode,
     pub include_context_next: bool,
+    #[serde(default)]
+    pub manual_fragments: crate::app::state::ExecuteLoopManualMessageFragments,
+    #[serde(default)]
+    pub automatic_fragments: crate::app::state::ExecuteLoopAutomaticMessageFragments,
+    #[serde(default)]
+    pub fragment_overrides: crate::app::state::ExecuteLoopFragmentOverrides,
     pub auto_fill_first_changeset_applier: bool,
     pub messages: Vec<crate::app::state::ExecuteLoopMessage>,
 
@@ -89,6 +98,12 @@ pub struct ExecuteLoopSnapshot {
 
     #[serde(default)]
     pub postprocess_cmd: String,
+
+    #[serde(default)]
+    pub workflow_stages: Vec<crate::app::state::ExecuteLoopWorkflowStageConfig>,
+
+    #[serde(default = "default_execute_loop_workflow_stage_design")]
+    pub workflow_active_stage: crate::app::state::ExecuteLoopWorkflowStage,
 
     #[serde(default)]
     pub changesets_total: u32,

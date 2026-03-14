@@ -190,7 +190,7 @@ pub fn task_panel(
                         None => continue,
                     };
 
-                    let mode = format!("{:?}", snap.mode);
+                    let mode = format!("{:?}", snap.workflow_active_stage);
                     let transport = match snap.transport {
                         ExecuteLoopTransport::Api => snap.model.clone(),
                         ExecuteLoopTransport::BrowserBridge => format!("browser:{}", if snap.browser_profile.trim().is_empty() { "generic" } else { &snap.browser_profile }),

@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::actions::{Action, ComponentId};
-use crate::app::browser_bridge::{browser_model_options, close_session_page, launch_and_attach, open_url_in_session, probe_session, send_chat_and_wait, set_runtime_timeout_secs, timeout_runtime_now, BrowserTurnConfig};
+use crate::app::browser_bridge::{browser_model_options, close_session_page, launch_and_attach, open_url_in_session, probe_session, send_chat_and_wait, set_runtime_timeout_secs, timeout_runtime_now, upload_file, BrowserTurnConfig};
 use crate::app::state::{AppState, BrowserBridgeStatus, ExecuteLoopMessage, ExecuteLoopMode, ExecuteLoopTransport};
 
 fn browser_runtime_dir(state: &AppState) -> PathBuf {
@@ -124,6 +124,48 @@ fn resolve_user_data_dir(state: &AppState, explicit: &str, browser_family: &str)
     dir.to_string_lossy().into_owned()
 }
 
+fn maybe_auto_start_next_workflow_stage(state: &mut AppState, loop_id: ComponentId) {
+    let Some(st) = state.execute_loops.get_mut(&loop_id) else {
+        return;
+    };
+
+    st.ensure_default_changeset_workflow();
+    let current = st.workflow_active_stage;
+    let next = st.workflow_next_stage(current).unwrap_or(crate::app::state::ExecuteLoopWorkflowStage::Finished);
+    st.workflow_set_active_stage(next);
+
+    match next {
+        crate::app::state::ExecuteLoopWorkflowStage::Compile => {
+            if st.workflow_stage_is_auto(next) {
+                st.last_status = Some("Compile stage ready: running configured commands…".to_string());
+            } else {
+                st.awaiting_review = true;
+                st.last_status = Some("Compile stage ready: manual run required.".to_string());
+            }
+        }
+        crate::app::state::ExecuteLoopWorkflowStage::Finished => {
+            st.last_status = Some("Workflow finished.".to_string());
+        }
+        _ => {
+            if st.workflow_stage_is_auto(next) {
+                st.last_status = Some(format!("Moved to {:?}: auto progression enabled.", next));
+            } else {
+                st.awaiting_review = true;
+                st.last_status = Some(format!("Moved to {:?}: waiting for manual action.", next));
+            }
+        }
+    }
+}
+
+fn compile_command_script(st: &crate::app::state::ExecuteLoopState) -> String {
+    let commands = st.compile_command_list();
+    if commands.is_empty() {
+        st.postprocess_cmd.clone()
+    } else {
+        commands.join("\n")
+    }
+}
+
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
 
@@ -139,7 +181,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             let edge_executable_override = st.browser_edge_executable.clone();
             let user_data_dir_override = st.browser_user_data_dir.clone();
             let cdp_url = st.browser_cdp_url.clone();
-            let page_url_contains = st.browser_page_url_contains.clone();
+            let _page_url_contains = st.browser_page_url_contains.clone();
             let auto_launch_edge = st.browser_auto_launch_edge;
             let bridge_dir = resolve_browser_bridge_dir();
             let (edge_executable, browser_profile) = resolve_browser_executable(&edge_executable_override);
@@ -208,7 +250,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                     stm.last_status = Some("Enter a URL before opening a new tab.".to_string());
                 }
                 return true;
-            };
+            }
 
             let bridge_dir = if st.browser_bridge_dir.trim().is_empty() {
                 resolve_browser_bridge_dir()
@@ -455,41 +497,51 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        Action::ExecuteLoopSetMode { loop_id, mode } => {
-            if let Some(st) = state.execute_loops.get_mut(loop_id) {
-                st.mode = *mode;
-                st.awaiting_review = false;
-                st.last_status = Some(match mode {
-                    ExecuteLoopMode::Conversation => "Mode: Conversation".to_string(),
-                    ExecuteLoopMode::ChangeSet => "Mode: ChangeSet".to_string(),
-                });
+        Action::ExecuteLoopWorkflowAdvance { loop_id } => {
+            let Some(st) = state.execute_loops.get_mut(loop_id) else {
+                return false;
+            };
+            st.ensure_default_changeset_workflow();
+            st.awaiting_review = false;
 
-                if *mode == ExecuteLoopMode::ChangeSet {
-                    st.include_context_next = true;
+            match st.workflow_active_stage {
+                crate::app::state::ExecuteLoopWorkflowStage::Design
+                | crate::app::state::ExecuteLoopWorkflowStage::Code => {
+                    if st.draft.trim().is_empty() {
+                        st.last_status = Some(format!("{:?} stage requires a draft/message.", st.workflow_active_stage));
+                    } else {
+                        send_turn(state, *loop_id);
+                    }
+                }
+                crate::app::state::ExecuteLoopWorkflowStage::Compile => {
+                    start_postprocess(state, *loop_id);
+                }
+                crate::app::state::ExecuteLoopWorkflowStage::Finished => {
+                    st.last_status = Some("Workflow already finished.".to_string());
+                }
+                _ => {
+                    st.last_status = Some(format!("{:?} stage is not automated yet.", st.workflow_active_stage));
+                    st.awaiting_review = true;
                 }
             }
             true
         }
 
-        Action::ExecuteLoopInjectContext { loop_id } => {
-
-            let ctx_text = match state.generate_current_context_text() {
-                Ok(t) => t,
-                Err(e) => {
-                    if let Some(st) = state.execute_loops.get_mut(loop_id) {
-                        st.last_status = Some(format!("Context generation failed: {:#}", e));
-                    }
-                    return true;
-                }
-            };
-
+        Action::ExecuteLoopWorkflowJumpToStage { loop_id, stage } => {
             if let Some(st) = state.execute_loops.get_mut(loop_id) {
-                if st.draft.trim().is_empty() {
-                    st.draft = format!("CONTEXT UPDATE:\n{}\n", ctx_text);
-                } else {
-                    st.draft = format!("CONTEXT UPDATE:\n{}\n\n{}", ctx_text, st.draft);
-                }
-                st.last_status = Some("Context prepared in draft (user message).".to_string());
+                st.ensure_default_changeset_workflow();
+                st.workflow_set_active_stage(*stage);
+                st.sync_message_fragment_defaults_for_stage();
+                st.last_status = Some(format!("Jumped to {:?} stage.", stage));
+            }
+            true
+        }
+
+        Action::ExecuteLoopInjectContext { loop_id } => {
+            if let Some(st) = state.execute_loops.get_mut(loop_id) {
+                st.manual_fragments.include_repo_context = true;
+                st.include_context_next = true;
+                st.last_status = Some("Repo context will be included in the next turn.".to_string());
             }
             true
         }
@@ -577,6 +629,211 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
     }
 }
 
+fn start_postprocess(state: &mut AppState, loop_id: ComponentId) {
+    let busy = state
+        .execute_loops
+        .get(&loop_id)
+        .map(|st| st.pending || st.postprocess_pending)
+        .unwrap_or(false);
+    if busy {
+        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+            st.last_status = Some("Already waiting…".to_string());
+        }
+        return;
+    }
+
+    let (repo, cmd) = {
+        let Some(st) = state.execute_loops.get_mut(&loop_id) else {
+            return;
+        };
+        st.ensure_default_changeset_workflow();
+        st.sync_legacy_changeset_fields();
+        let cmd = compile_command_script(st);
+        (state.inputs.repo.clone(), cmd)
+    };
+
+    let Some(repo) = repo else {
+        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+            st.last_status = Some("No repo selected for compile stage.".to_string());
+        }
+        return;
+    };
+
+    if cmd.trim().is_empty() {
+        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+            st.last_status = Some("No compile commands configured.".to_string());
+        }
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+        st.postprocess_pending = true;
+        st.postprocess_rx = Some(rx);
+        st.postprocess_cmd = cmd.clone();
+        st.last_status = Some("Running compile stage…".to_string());
+    }
+
+    std::thread::spawn(move || {
+        let out = run_command_best_effort(&cmd, &repo);
+        let _ = tx.send(out);
+    });
+}
+
+fn run_command_best_effort(cmd: &str, cwd: &PathBuf) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| format!("Failed to spawn cmd: {:#}", e))?;
+
+        let mut s = String::new();
+        s.push_str(&String::from_utf8_lossy(&output.stdout));
+        if !output.stderr.is_empty() {
+            if !s.is_empty() {
+                s.push_str("\n");
+            }
+            s.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+
+        if output.status.success() {
+            Ok(s)
+        } else {
+            Err(s)
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| format!("Failed to spawn sh: {:#}", e))?;
+
+        let mut s = String::new();
+        s.push_str(&String::from_utf8_lossy(&output.stdout));
+        if !output.stderr.is_empty() {
+            if !s.is_empty() {
+                s.push_str("\n");
+            }
+            s.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+
+        if output.status.success() {
+            Ok(s)
+        } else {
+            Err(s)
+        }
+    }
+}
+
+fn compose_user_turn_message(
+    st: &crate::app::state::ExecuteLoopState,
+    draft: &str,
+    repo_context: Option<&str>,
+    repo_context_attached: bool,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if st.manual_fragments.include_system_instruction {
+        let text = st.effective_system_instruction_fragment();
+        if !text.is_empty() {
+            parts.push(format!("SYSTEM INSTRUCTIONS:\n{}", text));
+        }
+    }
+
+    if st.manual_fragments.include_repo_context {
+        if repo_context_attached {
+            parts.push("REPO CONTEXT: Uploaded attachment for context".to_string());
+        } else if let Some(ctx) = repo_context {
+            if !ctx.trim().is_empty() {
+                parts.push(format!("REPO CONTEXT:\n{}", ctx.trim()));
+            }
+        }
+    }
+
+    if st.manual_fragments.include_changeset_schema {
+        let text = st.effective_changeset_schema_fragment();
+        if !text.is_empty() {
+            parts.push(format!("CHANGESET SCHEMA:\n{}", text));
+        }
+    }
+
+    if let Some(err) = &st.automatic_fragments.changeset_validation_error {
+        if !err.trim().is_empty() {
+            parts.push(format!("CHANGESET VALIDATION ERROR:\n{}", err.trim()));
+        }
+    }
+
+    if let Some(err) = &st.automatic_fragments.apply_error {
+        if !err.trim().is_empty() {
+            parts.push(format!("APPLY ERROR:\n{}", err.trim()));
+        }
+    }
+
+    if let Some(err) = &st.automatic_fragments.compile_error {
+        if !err.trim().is_empty() {
+            parts.push(format!("COMPILE ERROR:\n{}", err.trim()));
+        }
+    }
+
+    if !draft.trim().is_empty() {
+        parts.push(draft.trim().to_string());
+    }
+
+    parts.join("\n\n")
+}
+
+
+fn generate_current_context_file(state: &mut AppState) -> anyhow::Result<PathBuf> {
+    let repo = state
+        .inputs
+        .repo
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No repo selected."))?;
+
+    let include_files = if state.tree.context_selected_files.is_empty() {
+        None
+    } else {
+        let mut files: Vec<String> = state.tree.context_selected_files.iter().cloned().collect();
+        files.sort();
+        Some(files)
+    };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let out_path = std::env::temp_dir().join(format!("mdev-execute-loop-context-{}.txt", now_ms));
+
+    let req = crate::capabilities::types::ContextExportReq {
+        repo,
+        out_path: out_path.clone(),
+        git_ref: state.inputs.git_ref.clone(),
+        exclude_regex: state.inputs.exclude_regex.clone(),
+        skip_binary: true,
+        skip_gitignore: true,
+        include_staged_diff: true,
+        include_unstaged_diff: true,
+        include_files,
+    };
+
+    match state
+        .broker
+        .exec(crate::capabilities::types::CapabilityRequest::ExportContext(req))
+    {
+        Ok(crate::capabilities::types::CapabilityResponse::Unit) => Ok(out_path),
+        Ok(_) => Err(anyhow::anyhow!("Unexpected response from ExportContext")),
+        Err(e) => Err(e),
+    }
+}
+
 fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     let busy = state
         .execute_loops
@@ -590,33 +847,93 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         return;
     }
 
-    let (model, mode, instruction, draft, _existing_msgs, include_context_next, conversation_id) = {
+    let (
+        model,
+        mode,
+        instruction,
+        _draft,
+        _existing_msgs,
+        include_context_next,
+        conversation_id,
+        manual_include_repo_context,
+        compose_instruction,
+        compose_draft,
+        compose_manual_fragments,
+        compose_automatic_fragments,
+        compose_workflow_active_stage,
+        transport,
+    ) = {
         let Some(st) = state.execute_loops.get(&loop_id) else {
             return;
         };
         (
             st.model.clone(),
-            st.mode,
+            st.effective_mode(),
             st.instruction.clone(),
             st.draft.clone(),
             st.messages.clone(),
             st.include_context_next,
             st.conversation_id.clone(),
+            st.manual_fragments.include_repo_context,
+            st.instruction.clone(),
+            st.draft.clone(),
+            st.manual_fragments.clone(),
+            st.automatic_fragments.clone(),
+            st.workflow_active_stage,
+            st.transport,
         )
     };
 
-    if draft.trim().is_empty() {
-        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
-            st.last_status = Some("Nothing to send (draft is empty).".to_string());
-        }
-        return;
-    }
-
-    let transport = state
+    let transport_for_context = state
         .execute_loops
         .get(&loop_id)
         .map(|ls| ls.transport)
         .unwrap_or(ExecuteLoopTransport::Api);
+
+    let browser_repo_context_file = if transport_for_context == ExecuteLoopTransport::BrowserBridge && manual_include_repo_context {
+        match generate_current_context_file(state) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+                    st.last_status = Some(format!("Context generation failed: {:#}", e));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let repo_context_text = if manual_include_repo_context && browser_repo_context_file.is_none() {
+        state.generate_current_context_text().ok()
+    } else {
+        None
+    };
+
+    let composed_payload = {
+        let temp_state = crate::app::state::ExecuteLoopState {
+            instruction: compose_instruction,
+            draft: compose_draft,
+            manual_fragments: compose_manual_fragments,
+            automatic_fragments: compose_automatic_fragments,
+            workflow_active_stage: compose_workflow_active_stage,
+            ..crate::app::state::ExecuteLoopState::new()
+        };
+        compose_user_turn_message(
+            &temp_state,
+            &temp_state.draft,
+            repo_context_text.as_deref(),
+            browser_repo_context_file.is_some(),
+        )
+    };
+
+    if composed_payload.trim().is_empty() {
+        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+            st.last_status = Some("Nothing to send (message is empty).".to_string());
+        }
+        return;
+    }
+
 
     let fetched_models = {
         let need_fetch = state
@@ -640,13 +957,17 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     let is_new_conversation = conversation_id.is_none();
 
     let ctx_text_opt = if is_new_conversation && include_context_next {
-        match state.generate_current_context_text() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                if let Some(st) = state.execute_loops.get_mut(&loop_id) {
-                    st.last_status = Some(format!("Context generation failed: {:#}", e));
+        if transport == ExecuteLoopTransport::BrowserBridge {
+            None
+        } else {
+            match state.generate_current_context_text() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    if let Some(st) = state.execute_loops.get_mut(&loop_id) {
+                        st.last_status = Some(format!("Context generation failed: {:#}", e));
+                    }
+                    None
                 }
-                None
             }
         }
     } else {
@@ -654,27 +975,26 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     };
 
     let seed_items_if_new: Vec<(String, String)> = if is_new_conversation {
-        let schema = crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE;
         let mut sys = String::new();
+        sys.push_str("There are two modes. In conversation mode, discuss only and do not provide changesets. In changeset mode, provide only a JSON object.");
+
         if !instruction.trim().is_empty() {
+            sys.push_str("\n\n");
             sys.push_str(&instruction);
         }
 
         if let Some(ctx_text) = &ctx_text_opt {
-            sys.push_str("\n\nREPO CONTEXT (generated):\n");
-            sys.push_str(ctx_text);
+            if !ctx_text.trim().is_empty() {
+                sys.push_str("\n\nREPO CONTEXT (generated):\n");
+                sys.push_str(ctx_text);
+            }
         }
 
-        sys.push_str("\n\nCHANGESET MODE CONTRACT:\n");
-        sys.push_str("- When the user sends MODE: changeset, return ONLY ONE valid JSON object matching the ChangeSet schema.\n");
-        sys.push_str("\nSCHEMA EXAMPLE (copy this structure exactly):\n");
-        sys.push_str(schema);
-
         vec![
-          (
-            "system".to_string(),
-            sys
-          )
+            (
+                "system".to_string(),
+                sys,
+            )
         ]
     } else {
         Vec::new()
@@ -685,7 +1005,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
         ExecuteLoopMode::ChangeSet => "Changeset mode: please provide only strict JSON changeset format and do not waste any token's inserting comments into the code",
     };
 
-    let user_payload = format!("{}\n\n{}", mode_header, draft.trim());
+    let user_payload = format!("{}\n\n{}", mode_header, composed_payload.trim());
 
     let mut turn_items: Vec<(String, String)> = Vec::new();
     turn_items.push(("user".to_string(), user_payload));
@@ -778,7 +1098,21 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                     response_timeout_ms,
                     response_poll_ms,
                 };
+                let context_file_for_thread = browser_repo_context_file.clone();
+                if let Some(path) = context_file_for_thread.as_deref() {
+                    if let Err(e) = upload_file(&mut cfg, path) {
+                        let _ = tx.send(Err(format!("{:#}", e)));
+                        if let Some(path) = context_file_for_thread {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        timeout_runtime_now(&runtime_key);
+                        return;
+                    }
+                }
                 let res = send_chat_and_wait(&mut cfg, &prompt).map_err(|e| format!("{:#}", e));
+                if let Some(path) = context_file_for_thread {
+                    let _ = std::fs::remove_file(path);
+                }
                 timeout_runtime_now(&runtime_key);
                 let _ = tx.send(res);
             });
@@ -833,11 +1167,11 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
 
         st.messages.push(ExecuteLoopMessage {
             role: "user".to_string(),
-            content: st.draft.trim().to_string(),
+            content: composed_payload.trim().to_string(),
         });
         st.draft.clear();
-
-        st.include_context_next = false;
+        st.clear_automatic_message_fragments();
+        st.clear_manual_message_fragments();
 
         st.pending = true;
         st.pending_rx = Some(rx);
@@ -853,99 +1187,3 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
     }
 }
 
-fn start_postprocess(state: &mut AppState, loop_id: ComponentId) {
-    let (cmd, cwd, already_pending) = {
-        let Some(st) = state.execute_loops.get(&loop_id) else {
-            return;
-        };
-        let pending = st.postprocess_pending;
-        let cmd = st.postprocess_cmd.trim().to_string();
-        let cwd = state
-            .inputs
-            .local_repo
-            .clone()
-            .or_else(|| state.inputs.repo.clone())
-            .unwrap_or_else(|| PathBuf::from("."));
-        (cmd, cwd, pending)
-    };
-
-    if already_pending {
-        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
-            st.last_status = Some("Postprocess already running…".to_string());
-        }
-        return;
-    }
-
-    if cmd.is_empty() {
-        if let Some(st) = state.execute_loops.get_mut(&loop_id) {
-            st.last_status = Some("Postprocess command is empty.".to_string());
-        }
-        return;
-    }
-
-    let (tx, rx) = mpsc::channel::<Result<String, String>>();
-    let cmd_for_thread = cmd.clone();
-
-    std::thread::spawn(move || {
-        let out = run_command_best_effort(&cmd_for_thread, &cwd);
-        let _ = tx.send(out);
-    });
-
-    if let Some(st) = state.execute_loops.get_mut(&loop_id) {
-        st.postprocess_pending = true;
-        st.postprocess_rx = Some(rx);
-        st.last_status = Some(format!("Postprocess running: {}", cmd));
-    }
-}
-
-fn run_command_best_effort(cmd: &str, cwd: &PathBuf) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(cmd)
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("Failed to spawn cmd: {:#}", e))?;
-
-        let mut s = String::new();
-        s.push_str(&String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() {
-            if !s.is_empty() {
-                s.push_str("\n");
-            }
-            s.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-
-        if output.status.success() {
-            Ok(s)
-        } else {
-            Err(s)
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        let output = std::process::Command::new("sh")
-            .arg("-lc")
-            .arg(cmd)
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("Failed to spawn sh: {:#}", e))?;
-
-        let mut s = String::new();
-        s.push_str(&String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() {
-            if !s.is_empty() {
-                s.push_str("\n");
-            }
-            s.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-
-        if output.status.success() {
-            Ok(s)
-        } else {
-            Err(s)
-        }
-    }
-}

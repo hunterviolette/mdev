@@ -7,3 +7,4 @@ tmp/*
 bridge/node_modules
 bridge/dist
 bridge/package-lock.json
+.DS_Store

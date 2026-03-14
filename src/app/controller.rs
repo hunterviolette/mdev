@@ -154,14 +154,18 @@ impl AppState {
 
         st.model = snap.model.clone();
         st.instruction = snap.instruction.clone();
-        st.mode = snap.mode;
         st.include_context_next = snap.include_context_next;
+        st.manual_fragments = snap.manual_fragments.clone();
+        st.automatic_fragments = snap.automatic_fragments.clone();
+        st.fragment_overrides = snap.fragment_overrides.clone();
         st.auto_fill_first_changeset_applier = snap.auto_fill_first_changeset_applier;
         st.messages = snap.messages.clone();
         st.conversation_id = snap.conversation_id.clone();
         st.changesets_total = snap.changesets_total;
         st.changeset_auto = snap.changeset_auto;
         st.postprocess_cmd = snap.postprocess_cmd.clone();
+        st.workflow_stages = snap.workflow_stages.clone();
+        st.workflow_active_stage = snap.workflow_active_stage;
         st.changesets_ok = snap.changesets_ok;
         st.changesets_err = snap.changesets_err;
         st.postprocess_ok = snap.postprocess_ok;
@@ -183,6 +187,7 @@ impl AppState {
         st.browser_response_poll_ms = snap.browser_response_poll_ms;
         st.browser_response_timeout_input = ((snap.browser_response_timeout_ms.max(1000) + 999) / 1000).to_string();
         st.browser_timeout_confirm_pending = false;
+        st.ensure_default_changeset_workflow();
     }
 
     pub fn ensure_execute_loop_state_loaded(&mut self, loop_id: crate::app::actions::ComponentId) {
@@ -257,8 +262,10 @@ impl AppState {
             ExecuteLoopSnapshot {
                 model: st.model.clone(),
                 instruction: st.instruction.clone(),
-                mode: st.mode,
                 include_context_next: st.include_context_next,
+                manual_fragments: st.manual_fragments.clone(),
+                automatic_fragments: st.automatic_fragments.clone(),
+                fragment_overrides: st.fragment_overrides.clone(),
                 auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                 messages: st.messages.clone(),
                 conversation_id: None,
@@ -267,6 +274,8 @@ impl AppState {
                 updated_at_ms,
                 changeset_auto: st.changeset_auto,
                 postprocess_cmd: st.postprocess_cmd.clone(),
+                workflow_stages: st.workflow_stages.clone(),
+                workflow_active_stage: st.workflow_active_stage,
                 changesets_total: st.changesets_total,
                 changesets_ok: st.changesets_ok,
                 changesets_err: st.changesets_err,
@@ -307,8 +316,10 @@ impl AppState {
                     ExecuteLoopSnapshot {
                         model: st.model.clone(),
                         instruction: st.instruction.clone(),
-                        mode: st.mode,
                         include_context_next: st.include_context_next,
+                        manual_fragments: st.manual_fragments.clone(),
+                        automatic_fragments: st.automatic_fragments.clone(),
+                        fragment_overrides: st.fragment_overrides.clone(),
                         auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                         messages: st.messages.clone(),
                         conversation_id: st.conversation_id.clone(),
@@ -317,6 +328,8 @@ impl AppState {
                         updated_at_ms: now_ms,
                         changeset_auto: st.changeset_auto,
                         postprocess_cmd: st.postprocess_cmd.clone(),
+                        workflow_stages: st.workflow_stages.clone(),
+                        workflow_active_stage: st.workflow_active_stage,
                         changesets_total: st.changesets_total,
                         changesets_ok: st.changesets_ok,
                         changesets_err: st.changesets_err,

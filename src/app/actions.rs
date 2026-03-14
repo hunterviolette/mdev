@@ -39,11 +39,15 @@ pub enum TerminalShell {
 pub enum Action {
     ExecuteLoopRunOnce { loop_id: ComponentId },
     ExecuteLoopSend { loop_id: ComponentId },
-    ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
     ExecuteLoopInjectContext { loop_id: ComponentId },
     ExecuteLoopClearChat { loop_id: ComponentId },
     ExecuteLoopMarkReviewed { loop_id: ComponentId },
     ExecuteLoopRunPostprocess { loop_id: ComponentId },
+    ExecuteLoopWorkflowAdvance { loop_id: ComponentId },
+    ExecuteLoopWorkflowJumpToStage {
+        loop_id: ComponentId,
+        stage: crate::app::state::ExecuteLoopWorkflowStage,
+    },
     ExecuteLoopClear { loop_id: ComponentId },
 
     // ---------------------------
