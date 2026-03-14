@@ -78,6 +78,8 @@ pub struct ExecuteLoopSnapshot {
     pub automatic_fragments: crate::app::state::ExecuteLoopAutomaticMessageFragments,
     #[serde(default)]
     pub fragment_overrides: crate::app::state::ExecuteLoopFragmentOverrides,
+    #[serde(default)]
+    pub automation_policies: crate::app::state::ExecuteLoopAutomationPolicies,
     pub auto_fill_first_changeset_applier: bool,
     pub messages: Vec<crate::app::state::ExecuteLoopMessage>,
 

@@ -50,6 +50,7 @@ pub fn changeset_loop_panel(
     let before_manual_fragments = st.manual_fragments.clone();
     let before_automatic_fragments = st.automatic_fragments.clone();
     let before_fragment_overrides = st.fragment_overrides.clone();
+    let before_automation_policies = st.automation_policies.clone();
     let before_include_ctx = st.include_context_next;
     let before_auto_fill = st.auto_fill_first_changeset_applier;
     let before_browser_target_url = st.browser_target_url.clone();
@@ -762,8 +763,12 @@ pub fn changeset_loop_panel(
         ));
     });
 
-    ui.label("Message fragments");
+    let automation_policies_window_id = egui::Id::new(("execute_loop_automation_policies_window", loop_id));
+    let mut automation_policies_open = ctx
+        .data(|d| d.get_temp::<bool>(automation_policies_window_id).unwrap_or(false));
+
     ui.horizontal_wrapped(|ui| {
+        ui.label("Message fragments");
         if ui.checkbox(&mut st.manual_fragments.include_system_instruction, "System instructions").changed() {
             did_mutate = true;
         }
@@ -774,7 +779,108 @@ pub fn changeset_loop_panel(
         if ui.checkbox(&mut st.manual_fragments.include_changeset_schema, "ChangeSet schema").changed() {
             did_mutate = true;
         }
+        if ui.button("Automation policies").clicked() {
+            automation_policies_open = true;
+        }
     });
+
+    if automation_policies_open {
+        egui::Window::new("Automation policies")
+            .id(automation_policies_window_id)
+            .open(&mut automation_policies_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label("Manage loop-specific automation behavior.");
+                ui.add_space(8.0);
+
+                let mut should_reset_runtime = false;
+
+                if ui
+                    .checkbox(
+                        &mut st.automation_policies.apply_failure_focused_context.enabled,
+                        "Enable focused context after repeated apply failures",
+                    )
+                    .changed()
+                {
+                    did_mutate = true;
+                    should_reset_runtime = true;
+                }
+
+                ui.add_space(6.0);
+
+                let policy_enabled = st.automation_policies.apply_failure_focused_context.enabled;
+                ui.add_enabled_ui(policy_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Trigger after");
+                        let resp = ui.add(
+                            egui::DragValue::new(
+                                &mut st
+                                    .automation_policies
+                                    .apply_failure_focused_context
+                                    .consecutive_failure_threshold,
+                            )
+                            .clamp_range(1..=999)
+                            .speed(0.1),
+                        );
+                        ui.label("consecutive failures");
+                        if resp.changed() {
+                            did_mutate = true;
+                            should_reset_runtime = true;
+                        }
+                    });
+                });
+
+                if st
+                    .automation_policies
+                    .apply_failure_focused_context
+                    .consecutive_failure_threshold
+                    == 0
+                {
+                    st.automation_policies
+                        .apply_failure_focused_context
+                        .consecutive_failure_threshold = 1;
+                }
+
+                if should_reset_runtime {
+                    st.reset_apply_failure_focused_context_runtime();
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label("Runtime state");
+                ui.small(format!(
+                    "Tracked failure counts: {}",
+                    st.apply_failure_focused_context_counts.len()
+                ));
+                ui.small(format!(
+                    "Pending focused-context paths: {}",
+                    st.pending_focused_context_paths.len()
+                ));
+
+                if !st.pending_focused_context_paths.is_empty() {
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for path in st.pending_focused_context_paths.iter() {
+                                ui.monospace(path);
+                            }
+                        });
+                }
+
+                ui.add_space(10.0);
+                if ui.button("Reset runtime state").clicked() {
+                    st.reset_apply_failure_focused_context_runtime();
+                    did_mutate = true;
+                }
+            });
+    }
+
+    ctx.data_mut(|d| d.insert_temp(automation_policies_window_id, automation_policies_open));
 
     if st.manual_fragments.include_system_instruction {
         ui.horizontal_wrapped(|ui| {
@@ -1052,6 +1158,7 @@ pub fn changeset_loop_panel(
         || st.manual_fragments != before_manual_fragments
         || st.automatic_fragments != before_automatic_fragments
         || st.fragment_overrides != before_fragment_overrides
+        || st.automation_policies != before_automation_policies
         || st.include_context_next != before_include_ctx
         || st.auto_fill_first_changeset_applier != before_auto_fill
         || st.browser_target_url != before_browser_target_url

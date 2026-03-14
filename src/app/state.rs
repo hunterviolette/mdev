@@ -87,6 +87,8 @@ pub struct TerminalState {
 pub struct ChangeSetApplierState {
     pub payload: String,
     pub status: Option<String>,
+    pub last_attempted_paths: Vec<String>,
+    pub last_failed_paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +166,27 @@ pub struct ExecuteLoopAutomaticMessageFragments {
     pub changeset_validation_error: Option<String>,
     pub compile_error: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopApplyFailureFocusedContextPolicy {
+    pub enabled: bool,
+    pub consecutive_failure_threshold: u32,
+}
+
+impl Default for ExecuteLoopApplyFailureFocusedContextPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            consecutive_failure_threshold: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopAutomationPolicies {
+    #[serde(default)]
+    pub apply_failure_focused_context: ExecuteLoopApplyFailureFocusedContextPolicy,
+}
+
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteLoopFragmentOverrides {
@@ -288,6 +311,9 @@ pub struct ExecuteLoopState {
     pub manual_fragments: ExecuteLoopManualMessageFragments,
     pub automatic_fragments: ExecuteLoopAutomaticMessageFragments,
     pub fragment_overrides: ExecuteLoopFragmentOverrides,
+    pub automation_policies: ExecuteLoopAutomationPolicies,
+    pub apply_failure_focused_context_counts: HashMap<String, u32>,
+    pub pending_focused_context_paths: BTreeSet<String>,
 
     pub conversation_id: Option<String>,
 
@@ -359,6 +385,9 @@ impl ExecuteLoopState {
             },
             automatic_fragments: ExecuteLoopAutomaticMessageFragments::default(),
             fragment_overrides: ExecuteLoopFragmentOverrides::default(),
+            automation_policies: ExecuteLoopAutomationPolicies::default(),
+            apply_failure_focused_context_counts: HashMap::new(),
+            pending_focused_context_paths: BTreeSet::new(),
             conversation_id: None,
             history_sync_pending: false,
             history_sync_rx: None,
@@ -571,6 +600,60 @@ impl ExecuteLoopState {
 
     pub fn clear_automatic_message_fragments(&mut self) {
         self.automatic_fragments = ExecuteLoopAutomaticMessageFragments::default();
+    }
+
+    pub fn reset_apply_failure_focused_context_runtime(&mut self) {
+        self.apply_failure_focused_context_counts.clear();
+        self.pending_focused_context_paths.clear();
+    }
+
+    pub fn record_apply_failure_attempt(
+        &mut self,
+        attempted_paths: &[String],
+        failed_paths: &[String],
+    ) -> Vec<String> {
+        if !self.automation_policies.apply_failure_focused_context.enabled {
+            return Vec::new();
+        }
+
+        let threshold = self
+            .automation_policies
+            .apply_failure_focused_context
+            .consecutive_failure_threshold
+            .max(1);
+
+        let failed_lookup: HashSet<&str> = failed_paths.iter().map(|path| path.as_str()).collect();
+        for path in attempted_paths {
+            if !failed_lookup.contains(path.as_str()) {
+                self.apply_failure_focused_context_counts.remove(path);
+            }
+        }
+
+        let mut triggered = BTreeSet::new();
+        for path in failed_paths {
+            let next = self
+                .apply_failure_focused_context_counts
+                .get(path)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.apply_failure_focused_context_counts.insert(path.clone(), next);
+            if next >= threshold {
+                self.pending_focused_context_paths.insert(path.clone());
+                triggered.insert(path.clone());
+            }
+        }
+
+        triggered.into_iter().collect()
+    }
+
+    pub fn take_pending_focused_context_paths(&mut self) -> Vec<String> {
+        let paths: Vec<String> = self.pending_focused_context_paths.iter().cloned().collect();
+        for path in &paths {
+            self.apply_failure_focused_context_counts.remove(path);
+        }
+        self.pending_focused_context_paths.clear();
+        paths
     }
 
     pub fn clear_manual_message_fragments(&mut self) {

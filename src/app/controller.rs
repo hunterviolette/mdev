@@ -158,6 +158,8 @@ impl AppState {
         st.manual_fragments = snap.manual_fragments.clone();
         st.automatic_fragments = snap.automatic_fragments.clone();
         st.fragment_overrides = snap.fragment_overrides.clone();
+        st.automation_policies = snap.automation_policies.clone();
+        st.reset_apply_failure_focused_context_runtime();
         st.auto_fill_first_changeset_applier = snap.auto_fill_first_changeset_applier;
         st.messages = snap.messages.clone();
         st.conversation_id = snap.conversation_id.clone();
@@ -266,6 +268,7 @@ impl AppState {
                 manual_fragments: st.manual_fragments.clone(),
                 automatic_fragments: st.automatic_fragments.clone(),
                 fragment_overrides: st.fragment_overrides.clone(),
+                automation_policies: st.automation_policies.clone(),
                 auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                 messages: st.messages.clone(),
                 conversation_id: None,
@@ -320,6 +323,7 @@ impl AppState {
                         manual_fragments: st.manual_fragments.clone(),
                         automatic_fragments: st.automatic_fragments.clone(),
                         fragment_overrides: st.fragment_overrides.clone(),
+                        automation_policies: st.automation_policies.clone(),
                         auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                         messages: st.messages.clone(),
                         conversation_id: st.conversation_id.clone(),

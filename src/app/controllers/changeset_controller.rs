@@ -177,6 +177,8 @@ impl AppState {
             self.changeset_appliers.entry(id).or_insert(ChangeSetApplierState {
                 payload: String::new(),
                 status: None,
+                last_attempted_paths: Vec::new(),
+                last_failed_paths: Vec::new(),
             });
         }
     }
