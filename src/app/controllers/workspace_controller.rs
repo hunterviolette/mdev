@@ -161,6 +161,7 @@ impl AppState {
                 skip_gitignore: ex.skip_gitignore,
                 include_staged_diff: ex.include_staged_diff,
                 save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+                selected_paths: ex.selection_defaults.iter().cloned().collect(),
             });
         }
 
@@ -384,6 +385,7 @@ impl AppState {
                     skip_gitignore: ex.skip_gitignore,
                     include_staged_diff: ex.include_staged_diff,
                     save_path: ex.save_path.as_ref().map(|p| p.display().to_string()),
+                    selected_paths: self.tree.context_selected_files.iter().cloned().collect(),
                 },
             );
         }
@@ -673,7 +675,7 @@ impl AppState {
 
                 self.rebuild_terminals_from_layout();
                 self.rebuild_context_exporters_from_layout();
-                self.rebuild_changeset_appliers_from_layout();
+                self.rebuild_tasks_from_layout();
                 self.rebuild_source_controls_from_layout();
                 self.rebuild_diff_viewers_from_layout();
                 self.rebuild_execute_loops_from_layout();
@@ -766,7 +768,19 @@ impl AppState {
                         ex.skip_gitignore = snap.skip_gitignore;
                         ex.include_staged_diff = snap.include_staged_diff;
                         ex.save_path = snap.save_path.as_ref().map(std::path::PathBuf::from);
+                        ex.selection_defaults = snap.selected_paths.iter().cloned().collect();
                     }
+                }
+
+                if let Some(defaults) = state_snap
+                    .context_exporters
+                    .values()
+                    .find_map(|snap| (!snap.selected_paths.is_empty()).then(|| snap.selected_paths.clone()))
+                {
+                    let selected: std::collections::HashSet<String> = defaults.into_iter().collect();
+                    self.tree.context_selected_files = selected.clone();
+                    let key = self.inputs.git_ref.clone();
+                    self.tree.context_selected_by_ref.insert(key, selected);
                 }
 
                 let _ = self.load_repo_task_store();

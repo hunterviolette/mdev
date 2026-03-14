@@ -77,7 +77,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
 
-        Action::TaskCreateConversationAndOpen { task_id } => {
+        Action::TaskCreateConversationAndOpen { task_id, transport } => {
             use crate::app::layout::ExecuteLoopSnapshot;
             use crate::app::state::ExecuteLoopState;
 
@@ -94,14 +94,23 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 t.next_conversation_id = t.next_conversation_id.saturating_add(1);
                 t.active_conversation = Some(cid);
 
-                let st = ExecuteLoopState::new();
+                let mut st = ExecuteLoopState::new();
+                st.transport = *transport;
+                if st.transport == crate::app::state::ExecuteLoopTransport::BrowserBridge {
+                    st.model = "browser-bridge".to_string();
+                    st.browser_attached = false;
+                    st.browser_session_id = None;
+                }
+
                 t.conversations.insert(
                     cid,
                     ExecuteLoopSnapshot {
                         model: st.model,
                         instruction: st.instruction,
-                        mode: st.mode,
                         include_context_next: st.include_context_next,
+                        manual_fragments: st.manual_fragments.clone(),
+                        automatic_fragments: st.automatic_fragments.clone(),
+                        fragment_overrides: st.fragment_overrides.clone(),
                         auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                         messages: st.messages,
                         conversation_id: st.conversation_id,
@@ -110,11 +119,30 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         updated_at_ms: now_ms,
                         changeset_auto: st.changeset_auto,
                         postprocess_cmd: st.postprocess_cmd,
+                        workflow_stages: st.workflow_stages.clone(),
+                        workflow_active_stage: st.workflow_active_stage,
                         changesets_total: st.changesets_total,
                         changesets_ok: st.changesets_ok,
                         changesets_err: st.changesets_err,
                         postprocess_ok: st.postprocess_ok,
                         postprocess_err: st.postprocess_err,
+                        transport: st.transport,
+                        browser_profile: st.browser_profile,
+                        browser_bridge_dir: st.browser_bridge_dir,
+                        browser_cdp_url: st.browser_cdp_url,
+                        browser_page_url_contains: st.browser_page_url_contains,
+                        browser_target_url: st.browser_target_url,
+                        browser_edge_executable: st.browser_edge_executable,
+                        browser_user_data_dir: st.browser_user_data_dir,
+                        browser_session_id: st.browser_session_id,
+                        browser_status: st.browser_status,
+                        browser_last_probe: st.browser_last_probe,
+                        browser_probe_pending: st.browser_probe_pending,
+                        browser_probe_error: st.browser_probe_error,
+                        browser_attached: st.browser_attached,
+                        browser_auto_launch_edge: st.browser_auto_launch_edge,
+                        browser_response_timeout_ms: st.browser_response_timeout_ms,
+                        browser_response_poll_ms: st.browser_response_poll_ms,
                     },
                 );
 

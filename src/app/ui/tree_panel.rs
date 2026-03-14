@@ -783,6 +783,10 @@ pub fn tree_panel(
             }
         }
     }
+    for ex in state.context_exporters.values_mut() {
+        ex.selection_defaults = state.tree.context_selected_files.clone();
+    }
+
     let key = state.inputs.git_ref.clone();
     state.tree
         .context_selected_by_ref

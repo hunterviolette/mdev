@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId, ConversationId};
-use crate::app::state::AppState;
+use crate::app::state::{AppState, ExecuteLoopTransport};
 use std::collections::BTreeSet;
 
 fn status_string(loop_st: &crate::app::state::ExecuteLoopState) -> String {
@@ -125,12 +125,31 @@ pub fn task_panel(
 
         ui.add_space(8.0);
 
+        let transport_id = egui::Id::new(("task_new_chat_transport", task_id));
+        let mut new_transport = ui.ctx().data(|d| {
+            d.get_temp::<ExecuteLoopTransport>(transport_id)
+                .unwrap_or(ExecuteLoopTransport::Api)
+        });
+
+        ui.separator();
+        ui.label("New chat");
+        ui.radio_value(&mut new_transport, ExecuteLoopTransport::Api, "API");
+        ui.radio_value(&mut new_transport, ExecuteLoopTransport::BrowserBridge, "Browser bridge");
+
+
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(transport_id, new_transport);
+        });
+
         if ui
-            .button("New chat")
+            .button("Create")
             .on_hover_text("Create a new conversation and open it")
             .clicked()
         {
-            actions.push(Action::TaskCreateConversationAndOpen { task_id });
+            actions.push(Action::TaskCreateConversationAndOpen {
+                task_id,
+                transport: new_transport,
+            });
         }
     });
 
@@ -154,6 +173,7 @@ pub fn task_panel(
                 ui.strong("Conversation");
                 ui.strong("Status");
                 ui.strong("Mode");
+                ui.strong("Transport");
                 ui.strong("Msgs");
                 ui.strong("Apply ok/total");
                 ui.strong("Post ok/total");
@@ -170,7 +190,11 @@ pub fn task_panel(
                         None => continue,
                     };
 
-                    let mode = format!("{:?}", snap.mode);
+                    let mode = format!("{:?}", snap.workflow_active_stage);
+                    let transport = match snap.transport {
+                        ExecuteLoopTransport::Api => snap.model.clone(),
+                        ExecuteLoopTransport::BrowserBridge => format!("browser:{}", if snap.browser_profile.trim().is_empty() { "generic" } else { &snap.browser_profile }),
+                    };
                     let msgs = snap.messages.len();
 
                     let apply_total = snap.changesets_total;
@@ -229,6 +253,7 @@ pub fn task_panel(
 
                     ui.monospace(status);
                     ui.monospace(mode);
+                    ui.monospace(transport);
                     ui.monospace(msgs.to_string());
                     ui.monospace(format!("{}/{}", apply_ok, apply_total));
                     ui.monospace(format!("{}/{}", post_ok, post_total));

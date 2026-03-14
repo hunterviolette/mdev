@@ -4,3 +4,7 @@ todo.md
 repo_context.txt
 .env
 tmp/*
+bridge/node_modules
+bridge/dist
+bridge/package-lock.json
+.DS_Store

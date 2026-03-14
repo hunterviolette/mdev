@@ -183,6 +183,17 @@ pub fn context_exporter(
                         }
                     });
 
+                if ui
+                    .add_enabled(
+                        !ex.selection_defaults.is_empty(),
+                        egui::Button::new("Restore selection defaults"),
+                    )
+                    .on_hover_text("restores workspace defaults selections for context exporter to file tree")
+                    .clicked()
+                {
+                    actions.push(Action::ContextRestoreSelectionDefaults { exporter_id });
+                }
+
                 ui.separator();
 
                 ui.label("Ref:");

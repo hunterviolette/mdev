@@ -6,6 +6,7 @@ pub mod theme;
 pub mod ui;
 pub mod layout;
 pub mod openai;
+pub mod browser_bridge;
 pub mod task_store;
 
 mod app;

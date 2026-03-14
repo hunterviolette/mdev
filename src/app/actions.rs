@@ -39,11 +39,15 @@ pub enum TerminalShell {
 pub enum Action {
     ExecuteLoopRunOnce { loop_id: ComponentId },
     ExecuteLoopSend { loop_id: ComponentId },
-    ExecuteLoopSetMode { loop_id: ComponentId, mode: crate::app::state::ExecuteLoopMode },
     ExecuteLoopInjectContext { loop_id: ComponentId },
     ExecuteLoopClearChat { loop_id: ComponentId },
     ExecuteLoopMarkReviewed { loop_id: ComponentId },
     ExecuteLoopRunPostprocess { loop_id: ComponentId },
+    ExecuteLoopWorkflowAdvance { loop_id: ComponentId },
+    ExecuteLoopWorkflowJumpToStage {
+        loop_id: ComponentId,
+        stage: crate::app::state::ExecuteLoopWorkflowStage,
+    },
     ExecuteLoopClear { loop_id: ComponentId },
 
     // ---------------------------
@@ -53,7 +57,15 @@ pub enum Action {
     TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
     TaskOpenExecuteLoop { task_id: ComponentId },
     TaskCreateAndBindExecuteLoop { task_id: ComponentId },
-    TaskCreateConversationAndOpen { task_id: ComponentId },
+    TaskCreateConversationAndOpen {
+        task_id: ComponentId,
+        transport: crate::app::state::ExecuteLoopTransport,
+    },
+
+    ExecuteLoopBrowserLaunchAndAttach { loop_id: ComponentId },
+    ExecuteLoopBrowserProbe { loop_id: ComponentId },
+    ExecuteLoopBrowserOpenUrl { loop_id: ComponentId },
+    ExecuteLoopBrowserDetach { loop_id: ComponentId },
     TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
     TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
     TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
@@ -213,6 +225,9 @@ pub enum Action {
         exporter_id: ComponentId,
     },
     ContextToggleIncludeUnstagedDiff {
+        exporter_id: ComponentId,
+    },
+    ContextRestoreSelectionDefaults {
         exporter_id: ComponentId,
     },
 
