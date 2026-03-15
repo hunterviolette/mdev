@@ -15,8 +15,8 @@ env:
   NODE_VERSION: 20.19.0
 
 jobs:
-  build-macos:
-    runs-on: macos-13
+  build-macos-intel:
+    runs-on: macos-15-intel
 
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +46,10 @@ jobs:
       - name: Assemble .app bundle
         run: |
           set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
           APP_ROOT="dist/${APP_NAME}.app/Contents"
           MACOS_DIR="$APP_ROOT/MacOS"
+
           mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
 
           cp "target/release/${APP_NAME}" "$MACOS_DIR/${APP_NAME}"
@@ -55,8 +57,12 @@ jobs:
           cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
 
-          cat > "$APP_ROOT/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
+          export APP_ROOT VERSION
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          info = f"""<?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
             <dict>
@@ -71,14 +77,16 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>${GITHUB_REF_NAME#v}</string>
+              <string>{os.environ["VERSION"]}</string>
               <key>CFBundleVersion</key>
-              <string>${GITHUB_RUN_NUMBER}</string>
+              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
               <key>LSMinimumSystemVersion</key>
               <string>12.0</string>
             </dict>
           </plist>
-          PLIST
+          """
+          Path(os.environ["APP_ROOT"], "Info.plist").write_text(info, encoding="utf-8")
+          PY
 
       - name: Create DMG
         run: |
@@ -98,6 +106,98 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/mdev-macos-x64.dmg
+
+  build-macos-arm64:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bridge
+        working-directory: bridge
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust app
+        run: cargo build --release
+
+      - name: Download Node runtime
+        run: |
+          set -euo pipefail
+          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-arm64.tar.gz" -o node.tar.gz
+          mkdir -p node-dist
+          tar -xzf node.tar.gz -C node-dist
+
+      - name: Assemble .app bundle
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP_ROOT="dist/${APP_NAME}.app/Contents"
+          MACOS_DIR="$APP_ROOT/MacOS"
+
+          mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
+
+          cp "target/release/${APP_NAME}" "$MACOS_DIR/${APP_NAME}"
+          cp "node-dist/node-v${NODE_VERSION}-darwin-arm64/bin/node" "$MACOS_DIR/runtime/node"
+          cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
+          chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
+
+          export APP_ROOT VERSION
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          info = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+            <dict>
+              <key>CFBundleDisplayName</key>
+              <string>mdev</string>
+              <key>CFBundleExecutable</key>
+              <string>mdev</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.example.mdev</string>
+              <key>CFBundleName</key>
+              <string>mdev</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>{os.environ["VERSION"]}</string>
+              <key>CFBundleVersion</key>
+              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+            </dict>
+          </plist>
+          """
+          Path(os.environ["APP_ROOT"], "Info.plist").write_text(info, encoding="utf-8")
+          PY
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          mkdir -p dmg-src
+          cp -R "dist/${APP_NAME}.app" dmg-src/
+          ln -s /Applications dmg-src/Applications
+          hdiutil create -volname "mdev" -srcfolder dmg-src -ov -format UDZO "dist/${APP_NAME}-macos-arm64.dmg"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdev-macos-arm64
+          path: dist/mdev-macos-arm64.dmg
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/mdev-macos-arm64.dmg
 
   build-linux:
     runs-on: ubuntu-latest
@@ -141,15 +241,21 @@ jobs:
           chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
           ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
 
-          cat > "$ROOT/DEBIAN/control" <<CONTROL
-          Package: ${APP_NAME}
-          Version: ${VERSION}
+          export ROOT VERSION
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          control = f"""Package: {os.environ["APP_NAME"]}
+          Version: {os.environ["VERSION"]}
           Section: utils
           Priority: optional
           Architecture: amd64
           Maintainer: mdev release automation
           Description: mdev desktop application bundle
-          CONTROL
+          """
+          Path(os.environ["ROOT"], "DEBIAN", "control").write_text(control, encoding="utf-8")
+          PY
 
       - name: Build DEB
         run: |
@@ -220,14 +326,14 @@ jobs:
           AppVersion=$version
           DefaultDirName={autopf}\mdev
           DefaultGroupName=mdev
-          OutputDir=dist
+          OutputDir=.
           OutputBaseFilename=mdev-windows-x64-setup
           Compression=lzma
           SolidCompression=yes
           WizardStyle=modern
 
           [Files]
-          Source: "dist\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
           [Icons]
           Name: "{group}\mdev"; Filename: "{app}\mdev.exe"
@@ -259,7 +365,8 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs:
-      - build-macos
+      - build-macos-intel
+      - build-macos-arm64
       - build-linux
       - build-windows
 
@@ -274,5 +381,6 @@ jobs:
         with:
           files: |
             release-artifacts/mdev-macos-x64/mdev-macos-x64.dmg
+            release-artifacts/mdev-macos-arm64/mdev-macos-arm64.dmg
             release-artifacts/mdev-linux-amd64/mdev-linux-amd64.deb
             release-artifacts/mdev-windows-x64/mdev-windows-x64-setup.exe
