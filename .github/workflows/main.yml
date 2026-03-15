@@ -1,0 +1,278 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  APP_NAME: mdev
+  NODE_VERSION: 20.19.0
+
+jobs:
+  build-macos:
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bridge
+        working-directory: bridge
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust app
+        run: cargo build --release
+
+      - name: Download Node runtime
+        run: |
+          set -euo pipefail
+          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz" -o node.tar.gz
+          mkdir -p node-dist
+          tar -xzf node.tar.gz -C node-dist
+
+      - name: Assemble .app bundle
+        run: |
+          set -euo pipefail
+          APP_ROOT="dist/${APP_NAME}.app/Contents"
+          MACOS_DIR="$APP_ROOT/MacOS"
+          mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
+
+          cp target/release/${APP_NAME} "$MACOS_DIR/${APP_NAME}"
+          cp node-dist/node-v${NODE_VERSION}-darwin-x64/bin/node "$MACOS_DIR/runtime/node"
+          cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
+          chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
+
+          cat > "$APP_ROOT/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>CFBundleDisplayName</key>
+    <string>mdev</string>
+    <key>CFBundleExecutable</key>
+    <string>mdev</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.example.mdev</string>
+    <key>CFBundleName</key>
+    <string>mdev</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${GITHUB_REF_NAME#v}</string>
+    <key>CFBundleVersion</key>
+    <string>${GITHUB_RUN_NUMBER}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+  </dict>
+</plist>
+PLIST
+
+      - name: Create DMG
+        run: |
+          set -euo pipefail
+          mkdir -p dmg-src
+          cp -R "dist/${APP_NAME}.app" dmg-src/
+          ln -s /Applications dmg-src/Applications
+          hdiutil create -volname "mdev" -srcfolder dmg-src -ov -format UDZO "dist/${APP_NAME}-macos-x64.dmg"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdev-macos-x64
+          path: dist/mdev-macos-x64.dmg
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/mdev-macos-x64.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bridge
+        working-directory: bridge
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust app
+        run: cargo build --release
+
+      - name: Download Node runtime
+        run: |
+          set -euo pipefail
+          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o node.tar.gz
+          mkdir -p node-dist
+          tar -xzf node.tar.gz -C node-dist
+
+      - name: Assemble Debian package layout
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ROOT="dist/debroot"
+          APPDIR="$ROOT/opt/${APP_NAME}"
+          mkdir -p "$ROOT/DEBIAN" "$APPDIR/runtime" "$APPDIR/bridge/dist" "$ROOT/usr/bin"
+
+          cp target/release/${APP_NAME} "$APPDIR/${APP_NAME}"
+          cp node-dist/node-v${NODE_VERSION}-linux-x64/bin/node "$APPDIR/runtime/node"
+          cp -R bridge/dist/. "$APPDIR/bridge/dist/"
+          chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
+          ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
+
+          cat > "$ROOT/DEBIAN/control" <<CONTROL
+Package: ${APP_NAME}
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: mdev release automation
+Description: mdev desktop application bundle
+CONTROL
+
+      - name: Build DEB
+        run: |
+          set -euo pipefail
+          dpkg-deb --build dist/debroot "dist/${APP_NAME}-linux-amd64.deb"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdev-linux-amd64
+          path: dist/mdev-linux-amd64.deb
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/mdev-linux-amd64.deb
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bridge
+        working-directory: bridge
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Rust app
+        run: cargo build --release
+
+      - name: Download Node runtime
+        shell: pwsh
+        run: |
+          $zipName = "node-v$env:NODE_VERSION-win-x64.zip"
+          Invoke-WebRequest "https://nodejs.org/dist/v$env:NODE_VERSION/$zipName" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node-dist
+
+      - name: Assemble app folder
+        shell: pwsh
+        run: |
+          $root = "dist/app"
+          New-Item -ItemType Directory -Force -Path "$root/runtime" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root/bridge/dist" | Out-Null
+          Copy-Item "target/release/mdev.exe" "$root/mdev.exe"
+          Copy-Item "node-dist/node-v$env:NODE_VERSION-win-x64/node.exe" "$root/runtime/node.exe"
+          Copy-Item "bridge/dist/*" "$root/bridge/dist/" -Recurse
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y
+
+      - name: Write Inno Setup script
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          @"
+[Setup]
+AppId={{A3C1A4E3-8E0C-4B3A-9B8D-4B3A8E0C4B3A}
+AppName=mdev
+AppVersion=$version
+DefaultDirName={autopf}\mdev
+DefaultGroupName=mdev
+OutputDir=dist
+OutputBaseFilename=mdev-windows-x64-setup
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+
+[Files]
+Source: "dist\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{group}\mdev"; Filename: "{app}\mdev.exe"
+Name: "{autodesktop}\mdev"; Filename: "{app}\mdev.exe"; Tasks: desktopicon
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
+[Run]
+Filename: "{app}\mdev.exe"; Description: "Launch mdev"; Flags: nowait postinstall skipifsilent
+"@ | Set-Content -Path dist\mdev.iss
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" dist\mdev.iss
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdev-windows-x64
+          path: dist/mdev-windows-x64-setup.exe
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/mdev-windows-x64-setup.exe
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs:
+      - build-macos
+      - build-linux
+      - build-windows
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/mdev-macos-x64/mdev-macos-x64.dmg
+            release-artifacts/mdev-linux-amd64/mdev-linux-amd64.deb
+            release-artifacts/mdev-windows-x64/mdev-windows-x64-setup.exe
