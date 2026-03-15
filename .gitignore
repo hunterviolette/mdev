@@ -6,3 +6,5 @@ tmp/*
 bridge/node_modules
 bridge/dist
 .DS_Store
+adt-bridge/node_modules
+adt-bridge/dist
