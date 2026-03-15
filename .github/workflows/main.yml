@@ -50,35 +50,35 @@ jobs:
           MACOS_DIR="$APP_ROOT/MacOS"
           mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
 
-          cp target/release/${APP_NAME} "$MACOS_DIR/${APP_NAME}"
-          cp node-dist/node-v${NODE_VERSION}-darwin-x64/bin/node "$MACOS_DIR/runtime/node"
+          cp "target/release/${APP_NAME}" "$MACOS_DIR/${APP_NAME}"
+          cp "node-dist/node-v${NODE_VERSION}-darwin-x64/bin/node" "$MACOS_DIR/runtime/node"
           cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
 
-          cat > "$APP_ROOT/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>CFBundleDisplayName</key>
-    <string>mdev</string>
-    <key>CFBundleExecutable</key>
-    <string>mdev</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.example.mdev</string>
-    <key>CFBundleName</key>
-    <string>mdev</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${GITHUB_REF_NAME#v}</string>
-    <key>CFBundleVersion</key>
-    <string>${GITHUB_RUN_NUMBER}</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>12.0</string>
-  </dict>
-</plist>
-PLIST
+          cat > "$APP_ROOT/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+            <dict>
+              <key>CFBundleDisplayName</key>
+              <string>mdev</string>
+              <key>CFBundleExecutable</key>
+              <string>mdev</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.example.mdev</string>
+              <key>CFBundleName</key>
+              <string>mdev</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${GITHUB_REF_NAME#v}</string>
+              <key>CFBundleVersion</key>
+              <string>${GITHUB_RUN_NUMBER}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+            </dict>
+          </plist>
+          PLIST
 
       - name: Create DMG
         run: |
@@ -133,23 +133,23 @@ PLIST
           VERSION="${GITHUB_REF_NAME#v}"
           ROOT="dist/debroot"
           APPDIR="$ROOT/opt/${APP_NAME}"
-          mkdir -p "$ROOT/DEBIAN" "$APPDIR/runtime" "$APPDIR/bridge/dist" "$ROOT/usr/bin"
 
-          cp target/release/${APP_NAME} "$APPDIR/${APP_NAME}"
-          cp node-dist/node-v${NODE_VERSION}-linux-x64/bin/node "$APPDIR/runtime/node"
+          mkdir -p "$ROOT/DEBIAN" "$APPDIR/runtime" "$APPDIR/bridge/dist" "$ROOT/usr/bin"
+          cp "target/release/${APP_NAME}" "$APPDIR/${APP_NAME}"
+          cp "node-dist/node-v${NODE_VERSION}-linux-x64/bin/node" "$APPDIR/runtime/node"
           cp -R bridge/dist/. "$APPDIR/bridge/dist/"
           chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
           ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
 
           cat > "$ROOT/DEBIAN/control" <<CONTROL
-Package: ${APP_NAME}
-Version: ${VERSION}
-Section: utils
-Priority: optional
-Architecture: amd64
-Maintainer: mdev release automation
-Description: mdev desktop application bundle
-CONTROL
+          Package: ${APP_NAME}
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: mdev release automation
+          Description: mdev desktop application bundle
+          CONTROL
 
       - name: Build DEB
         run: |
@@ -214,31 +214,31 @@ CONTROL
         run: |
           $version = $env:GITHUB_REF_NAME.Substring(1)
           @"
-[Setup]
-AppId={{A3C1A4E3-8E0C-4B3A-9B8D-4B3A8E0C4B3A}
-AppName=mdev
-AppVersion=$version
-DefaultDirName={autopf}\mdev
-DefaultGroupName=mdev
-OutputDir=dist
-OutputBaseFilename=mdev-windows-x64-setup
-Compression=lzma
-SolidCompression=yes
-WizardStyle=modern
+          [Setup]
+          AppId={{A3C1A4E3-8E0C-4B3A-9B8D-4B3A8E0C4B3A}}
+          AppName=mdev
+          AppVersion=$version
+          DefaultDirName={autopf}\mdev
+          DefaultGroupName=mdev
+          OutputDir=dist
+          OutputBaseFilename=mdev-windows-x64-setup
+          Compression=lzma
+          SolidCompression=yes
+          WizardStyle=modern
 
-[Files]
-Source: "dist\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Files]
+          Source: "dist\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-[Icons]
-Name: "{group}\mdev"; Filename: "{app}\mdev.exe"
-Name: "{autodesktop}\mdev"; Filename: "{app}\mdev.exe"; Tasks: desktopicon
+          [Icons]
+          Name: "{group}\mdev"; Filename: "{app}\mdev.exe"
+          Name: "{autodesktop}\mdev"; Filename: "{app}\mdev.exe"; Tasks: desktopicon
 
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
 
-[Run]
-Filename: "{app}\mdev.exe"; Description: "Launch mdev"; Flags: nowait postinstall skipifsilent
-"@ | Set-Content -Path dist\mdev.iss
+          [Run]
+          Filename: "{app}\mdev.exe"; Description: "Launch mdev"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path dist\mdev.iss
 
       - name: Build installer
         shell: pwsh
