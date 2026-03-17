@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use crate::app::state::WORKTREE_REF;
@@ -94,6 +94,63 @@ fn run_git_text_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, String, S
         String::from_utf8_lossy(&stdout).to_string(),
         String::from_utf8_lossy(&stderr).to_string(),
     ))
+}
+
+fn parse_numstat_line(line: &str) -> Option<(String, u64, u64)> {
+    let mut parts = line.splitn(3, '\t');
+    let add = parts.next()?.trim();
+    let del = parts.next()?.trim();
+    let path = parts.next()?.trim();
+
+    if add == "-" || del == "-" || path.is_empty() {
+        return None;
+    }
+
+    Some((
+        path.to_string(),
+        add.parse::<u64>().ok()?,
+        del.parse::<u64>().ok()?,
+    ))
+}
+
+pub fn git_diff_stats(repo: &Path, staged: bool) -> Result<HashMap<String, (u64, u64)>> {
+    ensure_git_repo(repo)?;
+
+    let args: Vec<&str> = if staged {
+        vec!["diff", "--numstat", "--cached"]
+    } else {
+        vec!["diff", "--numstat"]
+    };
+
+    let out = run_git(repo, &args)?;
+    let mut stats = HashMap::new();
+
+    for line in String::from_utf8_lossy(&out).lines() {
+        if let Some((path, add, del)) = parse_numstat_line(line) {
+            let entry = stats.entry(path).or_insert((0u64, 0u64));
+            entry.0 = entry.0.saturating_add(add);
+            entry.1 = entry.1.saturating_add(del);
+        }
+    }
+
+    Ok(stats)
+}
+
+pub fn git_untracked_line_stats(repo: &Path, paths: &[String]) -> HashMap<String, (u64, u64)> {
+    let mut stats = HashMap::new();
+
+    for path in paths {
+        let full = repo.join(path);
+        let Ok(bytes) = std::fs::read(full) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        stats.insert(path.clone(), (text.lines().count() as u64, 0));
+    }
+
+    stats
 }
 
 pub fn git_list_local_branches(repo: &Path) -> Result<Vec<String>> {
@@ -272,7 +329,7 @@ pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
 
     ensure_git_repo(repo)?;
 
-    let out = run_git(repo, &["status", "--porcelain=v2", "-b", "-z"]).context("git status failed")?;
+    let out = run_git(repo, &["status", "--porcelain=v2", "-b", "-z", "--untracked-files=all"]).context("git status failed")?;
     let s = String::from_utf8_lossy(&out);
     let parts: Vec<&str> = s.split('\0').collect();
 
@@ -324,6 +381,8 @@ pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
                 worktree_status: "?".to_string(),
                 staged: false,
                 untracked: true,
+                additions: None,
+                deletions: None,
             });
             continue;
         }
@@ -349,6 +408,8 @@ pub fn git_status(repo: &Path) -> Result<crate::capabilities::GitStatusResult> {
                     worktree_status,
                     staged,
                     untracked,
+                    additions: None,
+                    deletions: None,
                 });
             }
             continue;

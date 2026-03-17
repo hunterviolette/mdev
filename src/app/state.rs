@@ -12,12 +12,13 @@ use crate::capabilities::GitStatusEntry;
 
 use crate::model::{AnalysisResult, CommitEntry};
 use crate::platform::Platform;
+use super::async_job::{AsyncLatestJob, AsyncQueuedJob};
 
 use super::openai::OpenAIClient;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ConversationId, ExpandCmd, TerminalShell};
+use super::actions::{ComponentId, ConversationId, ExpandCmd, TaskId, TerminalShell};
 use super::actions::ComponentKind;
 use super::layout::{ExecuteLoopSnapshot, LayoutConfig, PresetKind};
 
@@ -708,9 +709,39 @@ pub struct SourceControlFile {
     pub worktree_status: String,
     pub staged: bool,
     pub untracked: bool,
+    pub staged_additions: Option<u64>,
+    pub staged_deletions: Option<u64>,
+    pub unstaged_additions: Option<u64>,
+    pub unstaged_deletions: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
+pub struct SourceControlSnapshot {
+    pub branch: Option<String>,
+    pub branch_options: Vec<String>,
+    pub remote_options: Vec<String>,
+    pub files: Vec<SourceControlFile>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GitStatusSnapshot {
+    pub files: Vec<SourceControlFile>,
+    pub git_status_by_path: HashMap<String, GitStatusEntry>,
+    pub modified_paths: HashSet<String>,
+    pub staged_paths: HashSet<String>,
+    pub untracked_paths: HashSet<String>,
+    pub branch: Option<String>,
+    pub branch_options: Vec<String>,
+    pub remote_options: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffStatsSnapshot {
+    pub staged_by_path: HashMap<String, (u64, u64)>,
+    pub unstaged_by_path: HashMap<String, (u64, u64)>,
+    pub untracked_by_path: HashMap<String, (u64, u64)>,
+}
+
 pub struct SourceControlState {
     pub branch: String,
     pub branch_options: Vec<String>,
@@ -726,6 +757,8 @@ pub struct SourceControlState {
     pub last_error: Option<String>,
 
     pub needs_refresh: bool,
+    pub loading: bool,
+    pub refresh_job: AsyncLatestJob<SourceControlSnapshot>,
 }
 
 
@@ -747,6 +780,21 @@ pub struct DiffRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct DiffViewerFileSection {
+    pub path: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub rows: Vec<DiffRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffViewerPendingSection {
+    pub path: String,
+    pub from_ref: String,
+    pub to_ref: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct DiffViewerState {
     pub path: Option<String>,
 
@@ -754,6 +802,8 @@ pub struct DiffViewerState {
     pub to_ref: String,
 
     pub rows: Vec<DiffRow>,
+    pub file_sections: Vec<DiffViewerFileSection>,
+    pub aggregate_title: Option<String>,
 
     pub only_changes: bool,
 
@@ -762,8 +812,30 @@ pub struct DiffViewerState {
     pub last_error: Option<String>,
 
     pub needs_refresh: bool,
+    pub loading: bool,
+    pub loaded_files: usize,
+    pub total_files: usize,
 }
 
+
+impl SourceControlState {
+    pub fn new() -> Self {
+        Self {
+            branch: String::new(),
+            branch_options: vec![],
+            remote: "origin".to_string(),
+            remote_options: vec![],
+            commit_message: String::new(),
+            files: vec![],
+            selected: HashSet::new(),
+            last_output: None,
+            last_error: None,
+            needs_refresh: true,
+            loading: false,
+            refresh_job: AsyncLatestJob::default(),
+        }
+    }
+}
 
 impl DiffViewerState {
     pub fn new() -> Self {
@@ -772,10 +844,15 @@ impl DiffViewerState {
             from_ref: "HEAD".to_string(),
             to_ref: WORKTREE_REF.to_string(),
             rows: vec![],
+            file_sections: vec![],
+            aggregate_title: None,
             only_changes: true,
             context_lines: 3,
             last_error: None,
             needs_refresh: false,
+            loading: false,
+            loaded_files: 0,
+            total_files: 0,
         }
     }
 }
@@ -822,6 +899,7 @@ pub struct AppState {
     pub file_viewers: HashMap<ComponentId, FileViewerState>,
 
     pub diff_viewers: HashMap<ComponentId, DiffViewerState>,
+    pub diff_viewer_jobs: HashMap<ComponentId, AsyncQueuedJob<DiffViewerPendingSection, DiffViewerFileSection>>,
 
     pub terminals: HashMap<ComponentId, TerminalState>,
     pub context_exporters: HashMap<ComponentId, ContextExporterState>,
@@ -831,7 +909,8 @@ pub struct AppState {
 
     pub execute_loop_store: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
-    pub tasks: HashMap<ComponentId, TaskState>,
+    pub task_component_bindings: HashMap<ComponentId, TaskId>,
+    pub tasks: HashMap<TaskId, TaskState>,
 
     pub task_store_dirty: bool,
 
@@ -909,8 +988,9 @@ pub struct TreeState {
     pub last_git_status_refresh_s: f64,
     pub git_status_interval_s: f64,
 
-    pub analysis_refresh_pending: bool,
-    pub analysis_refresh_rx: Option<Receiver<Result<crate::model::AnalysisResult, String>>>,
+    pub analysis_job: AsyncLatestJob<crate::model::AnalysisResult>,
+    pub git_status_job: AsyncLatestJob<GitStatusSnapshot>,
+    pub diff_stats_job: AsyncLatestJob<DiffStatsSnapshot>,
 
     pub rename_target: Option<String>,
     pub rename_draft: String,
@@ -924,6 +1004,35 @@ pub struct TreeState {
     pub modal_focus_request: bool,
 }
 
+
+impl TreeState {
+    pub fn new() -> Self {
+        Self {
+            expand_cmd: None,
+            context_selected_files: HashSet::new(),
+            context_selected_by_ref: HashMap::new(),
+            context_initialized: false,
+            modified_paths: HashSet::new(),
+            staged_paths: HashSet::new(),
+            untracked_paths: HashSet::new(),
+            git_status_by_path: HashMap::new(),
+            last_auto_refresh_s: 0.0,
+            auto_refresh_interval_s: 4.0,
+            last_git_status_refresh_s: 0.0,
+            git_status_interval_s: 1.0,
+            analysis_job: AsyncLatestJob::default(),
+            git_status_job: AsyncLatestJob::default(),
+            diff_stats_job: AsyncLatestJob::default(),
+            rename_target: None,
+            rename_draft: String::new(),
+            create_parent: None,
+            create_draft: String::new(),
+            create_is_dir: false,
+            confirm_delete_target: None,
+            modal_focus_request: false,
+        }
+    }
+}
 
 pub struct FileViewerState {
     pub selected_file: Option<String>,
@@ -1086,6 +1195,24 @@ impl AppState {
         id
     }
 
+    pub fn default_repo_task_id(&self) -> TaskId {
+        1
+    }
+
+    pub fn task_id_for_component_ref(&self, component_id: ComponentId) -> TaskId {
+        self.task_component_bindings
+            .get(&component_id)
+            .copied()
+            .unwrap_or_else(|| self.default_repo_task_id())
+    }
+
+    pub fn ensure_task_id_for_component(&mut self, component_id: ComponentId) -> TaskId {
+        let task_id = self.default_repo_task_id();
+        self.task_component_bindings.insert(component_id, task_id);
+        self.tasks.entry(task_id).or_default();
+        task_id
+    }
+
 
     fn bump_next_component_id_unused(&mut self) {
         let max_id = self
@@ -1232,8 +1359,9 @@ impl AppState {
                 last_git_status_refresh_s: 0.0,
                 git_status_interval_s: 1.0,
 
-                analysis_refresh_pending: false,
-                analysis_refresh_rx: None,
+                analysis_job: AsyncLatestJob::default(),
+                git_status_job: AsyncLatestJob::default(),
+                diff_stats_job: AsyncLatestJob::default(),
 
                 rename_target: None,
                 rename_draft: String::new(),
@@ -1262,12 +1390,14 @@ impl AppState {
             file_viewers: HashMap::new(),
 
             diff_viewers: HashMap::new(),
+            diff_viewer_jobs: HashMap::new(),
 
             terminals: HashMap::new(),
             context_exporters: HashMap::new(),
             changeset_appliers: HashMap::new(),
             execute_loops: HashMap::new(),
             execute_loop_store: HashMap::new(),
+            task_component_bindings: HashMap::new(),
             tasks: HashMap::new(),
             task_store_dirty: false,
             source_controls: HashMap::new(),
@@ -1430,16 +1560,25 @@ impl AppState {
         let existing = std::mem::take(&mut self.tasks);
         self.tasks = HashMap::new();
 
-        let ids: Vec<ComponentId> = self
+        let component_ids: Vec<ComponentId> = self
             .all_layouts()
             .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::Task)
             .map(|c| c.id)
             .collect();
 
-        for id in ids {
-            let st = existing.get(&id).cloned().unwrap_or_default();
-            self.tasks.insert(id, st);
+        let component_id_set: HashSet<ComponentId> = component_ids.iter().copied().collect();
+        self.task_component_bindings
+            .retain(|component_id, _| component_id_set.contains(component_id));
+
+        if !component_ids.is_empty() {
+            let task_id = self.default_repo_task_id();
+            for component_id in component_ids {
+                self.task_component_bindings.insert(component_id, task_id);
+            }
+
+            let st = existing.get(&task_id).cloned().unwrap_or_default();
+            self.tasks.insert(task_id, st);
         }
     }
 

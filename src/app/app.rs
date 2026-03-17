@@ -56,12 +56,27 @@ impl eframe::App for AppState {
                 }
             }
 
-            if self.tree.analysis_refresh_pending {
+            if self.tree.analysis_job.is_pending() {
                 ctx.request_repaint();
             }
             if self.poll_analysis_refresh() {
                 ctx.request_repaint();
             }
+        }
+
+        if self.poll_git_status_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_stats_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_viewer_loads() {
+            ctx.request_repaint();
+        }
+        if self.diff_viewers.values().any(|v| v.loading)
+            || self.diff_viewer_jobs.values().any(|job| job.is_pending())
+        {
+            ctx.request_repaint();
         }
 
 

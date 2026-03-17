@@ -68,13 +68,14 @@ pub fn task_panel(
     _ctx: &egui::Context,
     ui: &mut egui::Ui,
     state: &mut AppState,
-    task_id: ComponentId,
+    task_component_id: ComponentId,
 ) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::new();
+    let task_id = state.ensure_task_id_for_component(task_component_id);
 
     let selected_conversations: &mut BTreeSet<ConversationId> = {
         let map = state.ui.task_panel_selected_loops_mut();
-        map.entry(task_id).or_insert_with(BTreeSet::new)
+        map.entry(task_component_id).or_insert_with(BTreeSet::new)
     };
 
     let (_task_paused, _task_bound_execute_loop, task_active_conversation) = {
@@ -125,7 +126,7 @@ pub fn task_panel(
 
         ui.add_space(8.0);
 
-        let transport_id = egui::Id::new(("task_new_chat_transport", task_id));
+        let transport_id = egui::Id::new(("task_new_chat_transport", task_component_id));
         let mut new_transport = ui.ctx().data(|d| {
             d.get_temp::<ExecuteLoopTransport>(transport_id)
                 .unwrap_or(ExecuteLoopTransport::Api)
@@ -166,7 +167,7 @@ pub fn task_panel(
             .unwrap_or_default();
         ids.sort();
 
-        egui::Grid::new(("conversation_stats_grid", task_id))
+        egui::Grid::new(("conversation_stats_grid", task_component_id))
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Sel");

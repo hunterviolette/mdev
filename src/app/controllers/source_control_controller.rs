@@ -1,5 +1,5 @@
 use crate::app::actions::{Action, ComponentId, ComponentKind};
-use crate::app::state::{AppState, SourceControlFile, SourceControlState};
+use crate::app::state::{AppState, SourceControlState};
 use crate::capabilities::{CapabilityRequest, CapabilityResponse};
 
 use std::collections::HashSet;
@@ -7,7 +7,7 @@ use std::collections::HashSet;
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
         Action::RefreshSourceControl { sc_id } => {
-            refresh(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::ToggleSourceControlSelect { sc_id, path } => {
@@ -16,18 +16,22 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
         Action::StageSelected { sc_id } => {
             stage_selected(state, *sc_id);
+            stage_selected_refresh(state, *sc_id);
             true
         }
         Action::UnstageSelected { sc_id } => {
             unstage_selected(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::StageAll { sc_id } => {
             stage_all(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::UnstageAll { sc_id } => {
             unstage_all(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::SetSourceControlBranch { sc_id, branch } => {
@@ -43,7 +47,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::RefreshSourceControlBranchRemoteLists { sc_id } => {
-            refresh_lists(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::CheckoutBranch {
@@ -61,6 +65,10 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             pull(state, *sc_id);
             true
         }
+        Action::PushRemote { sc_id } => {
+            push_remote(state, *sc_id);
+            true
+        }
         Action::SetCommitMessage { sc_id, msg } => {
             if let Some(sc) = state.source_controls.get_mut(sc_id) {
                 sc.commit_message = msg.clone();
@@ -69,11 +77,13 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
         }
         Action::CommitStaged { sc_id } => {
             commit(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::CommitAndPush { sc_id } => {
             commit(state, *sc_id);
             push_remote(state, *sc_id);
+            request_refresh(state, *sc_id);
             true
         }
         Action::StagePath { sc_id, path } => {
@@ -133,81 +143,12 @@ fn ensure_repo(state: &mut AppState, sc_id: ComponentId) -> Option<std::path::Pa
     Some(repo)
 }
 
-fn refresh_lists(state: &mut AppState, sc_id: ComponentId) {
-    let Some(repo) = ensure_repo(state, sc_id) else { return; };
-
-    let branches = match state.broker.exec(CapabilityRequest::GitListLocalBranches { repo: repo.clone() }) {
-        Ok(CapabilityResponse::GitBranches(v)) => v,
-        Ok(_) => vec![],
-        Err(_) => vec![],
-    };
-
-    let remotes = match state.broker.exec(CapabilityRequest::GitListRemotes { repo: repo.clone() }) {
-        Ok(CapabilityResponse::GitRemotes(v)) => v,
-        Ok(_) => vec![],
-        Err(_) => vec![],
-    };
-
-    if let Some(sc) = state.source_controls.get_mut(&sc_id) {
-        sc.branch_options = branches;
-        sc.remote_options = remotes;
-
-        if sc.remote.is_empty() {
-            sc.remote = "origin".to_string();
-        }
-        if !sc.remote_options.is_empty() && !sc.remote_options.iter().any(|r| r == &sc.remote) {
-            sc.remote = sc.remote_options[0].clone();
-        }
+fn request_refresh(state: &mut AppState, sc_id: ComponentId) {
+    if ensure_repo(state, sc_id).is_none() {
+        return;
     }
+    state.request_git_status_refresh();
 }
-
-fn refresh(state: &mut AppState, sc_id: ComponentId) {
-    let Some(repo) = ensure_repo(state, sc_id) else { return; };
-
-    let st = match state.broker.exec(CapabilityRequest::GitStatus { repo: repo.clone() }) {
-        Ok(CapabilityResponse::GitStatus(v)) => v,
-        Ok(_) => {
-            set_err(state, sc_id, "Unexpected response from GitStatus.".to_string());
-            return;
-        }
-        Err(e) => {
-            set_err(state, sc_id, format!("GitStatus failed: {:#}", e));
-            return;
-        }
-    };
-
-    let cur = match state.broker.exec(CapabilityRequest::GitCurrentBranch { repo: repo.clone() }) {
-        Ok(CapabilityResponse::GitBranch(b)) => Some(b),
-        Ok(_) => None,
-        Err(_) => None,
-    };
-
-    refresh_lists(state, sc_id);
-
-    if let Some(sc) = state.source_controls.get_mut(&sc_id) {
-        sc.files = st
-            .files
-            .into_iter()
-            .map(|f| SourceControlFile {
-                path: f.path,
-                index_status: f.index_status,
-                worktree_status: f.worktree_status,
-                staged: f.staged,
-                untracked: f.untracked,
-            })
-            .collect();
-
-        if sc.branch.is_empty() {
-            if let Some(b) = cur {
-                sc.branch = b;
-            }
-        }
-
-        let existing: HashSet<String> = sc.files.iter().map(|f| f.path.clone()).collect();
-        sc.selected.retain(|p| existing.contains(p));
-    }
-}
-
 
 fn toggle_select(state: &mut AppState, sc_id: ComponentId, path: &str) {
     if let Some(sc) = state.source_controls.get_mut(&sc_id) {
@@ -226,7 +167,7 @@ fn stage_path(state: &mut AppState, sc_id: ComponentId, path: &str) {
     match state.broker.exec(CapabilityRequest::GitStagePaths { repo, paths }) {
         Ok(_) => {
             set_ok(state, sc_id, format!("Staged: {}", path));
-            refresh(state, sc_id);
+            request_refresh(state, sc_id);
         }
         Err(e) => set_err(state, sc_id, format!("Stage failed: {:#}", e)),
     }
@@ -239,7 +180,7 @@ fn unstage_path(state: &mut AppState, sc_id: ComponentId, path: &str) {
     match state.broker.exec(CapabilityRequest::GitUnstagePaths { repo, paths }) {
         Ok(_) => {
             set_ok(state, sc_id, format!("Unstaged: {}", path));
-            refresh(state, sc_id);
+            request_refresh(state, sc_id);
         }
         Err(e) => set_err(state, sc_id, format!("Unstage failed: {:#}", e)),
     }
@@ -255,7 +196,7 @@ fn discard_path(state: &mut AppState, sc_id: ComponentId, path: &str, untracked:
         }) {
             Ok(_) => {
                 set_ok(state, sc_id, format!("Deleted untracked: {}", path));
-                refresh(state, sc_id);
+                request_refresh(state, sc_id);
             }
             Err(e) => set_err(state, sc_id, format!("Delete failed: {:#}", e)),
         }
@@ -266,7 +207,7 @@ fn discard_path(state: &mut AppState, sc_id: ComponentId, path: &str, untracked:
     match state.broker.exec(CapabilityRequest::GitRestorePaths { repo, paths }) {
         Ok(_) => {
             set_ok(state, sc_id, format!("Discarded changes: {}", path));
-            refresh(state, sc_id);
+            request_refresh(state, sc_id);
         }
         Err(e) => set_err(state, sc_id, format!("Discard failed: {:#}", e)),
     }
@@ -339,7 +280,7 @@ fn discard_all_unstaged(state: &mut AppState, sc_id: ComponentId) {
         set_ok(state, sc_id, msg);
     }
 
-    refresh(state, sc_id);
+    request_refresh(state, sc_id);
 }
 
 fn stage_selected(state: &mut AppState, sc_id: ComponentId) {
@@ -363,6 +304,10 @@ fn stage_selected(state: &mut AppState, sc_id: ComponentId) {
         Ok(_) => set_ok(state, sc_id, "Staged selected files.".to_string()),
         Err(e) => set_err(state, sc_id, format!("Stage failed: {:#}", e)),
     }
+}
+
+fn stage_selected_refresh(state: &mut AppState, sc_id: ComponentId) {
+    request_refresh(state, sc_id);
 }
 
 fn unstage_selected(state: &mut AppState, sc_id: ComponentId) {
@@ -625,6 +570,8 @@ impl AppState {
                     last_output: None,
                     last_error: None,
                     needs_refresh: true,
+                    loading: false,
+                    refresh_job: crate::app::async_job::AsyncLatestJob::default(),
                 },
             );
         }

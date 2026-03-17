@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ComponentKind, ConversationId};
+use super::actions::{ComponentId, ComponentKind, ConversationId, TaskId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -210,7 +210,10 @@ pub struct StateSnapshot {
     pub execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
     #[serde(default)]
-    pub tasks: HashMap<ComponentId, TaskSnapshot>,
+    pub task_component_bindings: HashMap<ComponentId, TaskId>,
+
+    #[serde(default)]
+    pub tasks: HashMap<TaskId, TaskSnapshot>,
 
     pub canvas_size: [f32; 2],
 

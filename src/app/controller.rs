@@ -111,7 +111,10 @@ impl AppState {
         for (task_id, ts) in parsed.tasks.iter() {
             let exists = self
                 .all_layouts()
-                .any(|l| l.components.iter().any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id));
+                .any(|l| l.components.iter().any(|c| {
+                    c.kind == crate::app::actions::ComponentKind::Task
+                        && self.task_id_for_component_ref(c.id) == *task_id
+                }));
             if !exists {
                 continue;
             }
@@ -369,17 +372,17 @@ impl AppState {
         use crate::app::actions::ComponentKind;
         use crate::app::layout::{ComponentInstance, WindowLayout};
 
-        for (idx, canvas) in self.canvases.iter_mut().enumerate() {
-            let exists = canvas
-                .layout
+        {
+            let active_layout = self.active_layout_mut();
+            let exists_here = active_layout
                 .components
                 .iter()
                 .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
-            if exists {
-                if let Some(w) = canvas.layout.get_window_mut(loop_id) {
+
+            if exists_here {
+                if let Some(w) = active_layout.get_window_mut(loop_id) {
                     w.open = true;
                 }
-                self.active_canvas = idx;
                 return;
             }
         }
@@ -447,6 +450,14 @@ impl AppState {
         if workspace_controller::handle(self, &action) {
             return;
         }
+    }
+
+    pub fn poll_git_status_refresh(&mut self) -> bool {
+        tree_controller::poll_git_status_refresh(self)
+    }
+
+    pub fn poll_diff_stats_refresh(&mut self) -> bool {
+        tree_controller::poll_diff_stats_refresh(self)
     }
 
     pub fn finalize_frame(&mut self) {

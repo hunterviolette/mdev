@@ -170,6 +170,10 @@ pub fn source_control_panel(
                     actions.push(Action::PullRemote { sc_id });
                     actions.push(Action::RefreshSourceControl { sc_id });
                 }
+                if ui.button("Push").clicked() {
+                    actions.push(Action::PushRemote { sc_id });
+                    actions.push(Action::RefreshSourceControl { sc_id });
+                }
 
                 let commit_label = if commit_open { "Commit (open)" } else { "Commit..." };
                 if ui.button(commit_label).clicked() {
@@ -361,7 +365,7 @@ pub fn source_control_panel(
 
 
 
-    let mut staged_files: Vec<_> = sc.files.iter().filter(|f| f.staged).collect();
+    let mut staged_files: Vec<_> = sc.files.iter().filter(|f| f.staged).cloned().collect();
 
     let mut unstaged_files: Vec<_> = sc
         .files
@@ -373,10 +377,15 @@ pub fn source_control_panel(
             let wt = f.worktree_status.as_str();
             !(wt.is_empty() || wt == " " || wt == ".")
         })
+        .cloned()
         .collect();
 
     staged_files.sort_by(|a, b| a.path.cmp(&b.path));
     unstaged_files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let sc_files_all = sc.files.clone();
+    let sc_last_output = sc.last_output.clone();
+    let sc_last_error = sc.last_error.clone();
 
     let avail_h = ui.available_height().max(1.0);
     let output_row_h = 24.0;
@@ -392,6 +401,7 @@ pub fn source_control_panel(
         .data(|d| d.get_temp::<String>(pending_discard_id).unwrap_or_default());
 
 
+
     ui.horizontal(|ui| {
         ui.strong(format!("Staged Changes ({})", staged_files.len()));
 
@@ -401,10 +411,13 @@ pub fn source_control_panel(
                 actions.push(Action::RefreshSourceControl { sc_id });
             }
 
+            if ui.button("Staged Diff").clicked() {
+                actions.push(Action::OpenDiffViewerForStaged { sc_id });
+            }
         });
     });
 
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_source(("sc_staged_scroll", sc_id))
         .auto_shrink([false, false])
         .max_height(list_h)
@@ -416,9 +429,23 @@ pub fn source_control_panel(
 
             for f in staged_files.iter() {
                 ui.horizontal(|ui| {
-
                     let code = format!("{}{}", f.index_status, f.worktree_status);
+                    let diff_stats = match (f.staged_additions, f.staged_deletions) {
+                        (Some(additions), Some(deletions)) => format!("+{} -{}", additions, deletions),
+                        _ => "…".to_string(),
+                    };
+
                     ui.monospace(code);
+
+                    if ui.button("Unstage").clicked() {
+                        actions.push(Action::UnstagePath {
+                            sc_id,
+                            path: f.path.clone(),
+                        });
+                        actions.push(Action::RefreshSourceControl { sc_id });
+                    }
+
+                    ui.monospace(diff_stats);
 
                     if ui
                         .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
@@ -430,16 +457,6 @@ pub fn source_control_panel(
                             to_ref: "INDEX".to_string(),
                         });
                     }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Unstage").clicked() {
-                            actions.push(Action::UnstagePath {
-                                sc_id,
-                                path: f.path.clone(),
-                            });
-                            actions.push(Action::RefreshSourceControl { sc_id });
-                        }
-                    });
                 });
             }
         });
@@ -459,10 +476,14 @@ pub fn source_control_panel(
                 pending_discard = "__ALL__".to_string();
                 ui.ctx().data_mut(|d| d.insert_temp(pending_discard_id, pending_discard.clone()));
             }
+
+            if ui.button("Unstaged Diff").clicked() {
+                actions.push(Action::OpenDiffViewerForUnstaged { sc_id });
+            }
         });
     });
 
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_source(("sc_unstaged_scroll", sc_id))
         .auto_shrink([false, false])
         .max_height(list_h)
@@ -474,9 +495,28 @@ pub fn source_control_panel(
 
             for f in unstaged_files.iter() {
                 ui.horizontal(|ui| {
-
                     let code = format!("{}{}", f.index_status, f.worktree_status);
+                    let diff_stats = match (f.unstaged_additions, f.unstaged_deletions) {
+                        (Some(additions), Some(deletions)) => format!("+{} -{}", additions, deletions),
+                        _ => "…".to_string(),
+                    };
+
                     ui.monospace(code);
+
+                    if ui.button("Stage").clicked() {
+                        actions.push(Action::StagePath {
+                            sc_id,
+                            path: f.path.clone(),
+                        });
+                        actions.push(Action::RefreshSourceControl { sc_id });
+                    }
+
+                    if ui.button("Discard").clicked() {
+                        pending_discard = f.path.clone();
+                        ui.ctx().data_mut(|d| d.insert_temp(pending_discard_id, pending_discard.clone()));
+                    }
+
+                    ui.monospace(diff_stats);
 
                     if ui
                         .add(egui::Link::new(egui::RichText::new(&f.path).monospace()))
@@ -492,21 +532,6 @@ pub fn source_control_panel(
                     if f.untracked {
                         ui.label("(untracked)");
                     }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stage").clicked() {
-                            actions.push(Action::StagePath {
-                                sc_id,
-                                path: f.path.clone(),
-                            });
-                            actions.push(Action::RefreshSourceControl { sc_id });
-                        }
-
-                        if ui.button("Discard").clicked() {
-                            pending_discard = f.path.clone();
-                            ui.ctx().data_mut(|d| d.insert_temp(pending_discard_id, pending_discard.clone()));
-                        }
-                    });
                 });
             }
         });
@@ -524,7 +549,7 @@ pub fn source_control_panel(
                 let mut untracked_n: usize = 0;
                 let mut modified_n: usize = 0;
 
-                for f in sc.files.iter() {
+                for f in sc_files_all.iter() {
                     let is_unstaged = if f.untracked {
                         true
                     } else {
@@ -549,8 +574,7 @@ pub fn source_control_panel(
 
                 (false, format!("Discard ALL unstaged changes? Restored: {}, Deleted untracked: {}", modified_n, untracked_n))
             } else {
-                let untracked = sc
-                    .files
+                let untracked = sc_files_all
                     .iter()
                     .find(|x| x.path == pending_discard)
                     .map(|x| x.untracked)
@@ -628,8 +652,7 @@ pub fn source_control_panel(
     {
         let output_row_h = 24.0;
 
-        let full = sc
-            .last_output
+        let full = sc_last_output
             .clone()
             .unwrap_or_else(|| "(none)".to_string());
 
@@ -675,7 +698,7 @@ pub fn source_control_panel(
                         }
                     });
 
-                if let Some(err) = &sc.last_error {
+                if let Some(err) = &sc_last_error {
                     ui.add(
                         egui::Label::new(egui::RichText::new("⚠ Error"))
                             .wrap(false)
