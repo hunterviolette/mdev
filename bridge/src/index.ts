@@ -48,6 +48,10 @@ async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
       const data = await manager.readResponse(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
     }
+    case 'set_poll_config': {
+      const data = await manager.setPollConfig(cmd as any);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
     case 'set_response_timeout': {
       const data = await manager.setResponseTimeout(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };

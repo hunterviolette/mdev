@@ -92,6 +92,10 @@ pub fn top_bar(_ctx: &egui::Context, ui: &mut egui::Ui, state: &mut AppState) ->
             if ui.button("Command (Ctrl+Shift+E)").clicked() {
                 actions.push(Action::ToggleCommandPalette);
             }
+
+            if ui.button("Global Settings").clicked() {
+                actions.push(Action::OpenGlobalSettings);
+            }
         });
 
         {

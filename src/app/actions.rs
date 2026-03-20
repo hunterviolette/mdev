@@ -94,6 +94,8 @@ pub enum Action {
     // ---------------------------
     OpenCanvasTintPopup,
     CloseCanvasTintPopup,
+    OpenGlobalSettings,
+    CloseGlobalSettings,
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
     SaveStartupLayoutOverride {
         canvas_size: [f32; 2],

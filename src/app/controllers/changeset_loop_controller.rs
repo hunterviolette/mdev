@@ -199,6 +199,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match launch_and_attach(&mut cfg) {
@@ -272,6 +273,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match open_url_in_session(&mut cfg, &target_url) {
@@ -365,6 +367,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match probe_session(&mut cfg) {
@@ -457,6 +460,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             let close_result = close_session_page(&mut cfg);
@@ -1043,7 +1047,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                 }
                 return;
             }
-            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id, response_timeout_ms, response_poll_ms) = {
+            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id, response_timeout_ms, _response_poll_ms) = {
                 let Some(st) = state.execute_loops.get(&loop_id) else {
                     return;
                 };
@@ -1084,6 +1088,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
             let runtime_key = format!("execute-loop-{}-{}", loop_id, runtime_nonce);
             active_browser_runtime_key = Some(runtime_key.clone());
             set_runtime_timeout_secs(&runtime_key, (response_timeout_ms.max(1000) + 999) / 1000);
+            let browser_response_poll_ms = state.perf.browser_response_poll_ms.max(250);
+            let browser_dom_poll_ms = state.perf.browser_dom_poll_ms.max(250);
             std::thread::spawn(move || {
                 let mut cfg = BrowserTurnConfig {
                     bridge_dir,
@@ -1096,7 +1102,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                     auto_launch_edge: false,
                     runtime_key: runtime_key.clone(),
                     response_timeout_ms,
-                    response_poll_ms,
+                    response_poll_ms: browser_response_poll_ms,
+                    dom_poll_ms: browser_dom_poll_ms,
                 };
                 let context_file_for_thread = browser_repo_context_file.clone();
                 if let Some(path) = context_file_for_thread.as_deref() {

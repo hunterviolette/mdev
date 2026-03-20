@@ -146,6 +146,7 @@ pub struct BrowserTurnConfig {
     pub runtime_key: String,
     pub response_timeout_ms: u64,
     pub response_poll_ms: u64,
+    pub dom_poll_ms: u64,
 }
 fn bridge_timeout_ms(cfg: &BrowserTurnConfig) -> u64 {
     cfg.response_timeout_ms.max(1000)
@@ -381,7 +382,7 @@ pub fn probe_session(cfg: &mut BrowserTurnConfig) -> Result<crate::app::state::B
 
 
 fn response_attempt_timeout_ms(cfg: &BrowserTurnConfig, remaining_ms: u64) -> u64 {
-    remaining_ms.min(cfg.response_poll_ms.max(1000))
+    remaining_ms.min(cfg.response_poll_ms.max(250))
 }
 
 fn read_response_once(
@@ -486,6 +487,12 @@ pub fn send_chat_and_wait(cfg: &mut BrowserTurnConfig, text: &str) -> Result<Exe
             let mutex = client();
             let mut client = mutex.lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
             client.ensure_started(&cfg.bridge_dir)?;
+            client.send_json(json!({
+                "cmd": "set_poll_config",
+                "session_id": session_id,
+                "response_poll_ms": cfg.response_poll_ms.max(250),
+                "dom_poll_ms": cfg.dom_poll_ms.max(250)
+            }))?;
             set_session_response_timeout_ms_with_client(&mut client, &session_id, patched_total_ms)?;
             read_response_once(&mut client, &session_id, slice_ms)
         };

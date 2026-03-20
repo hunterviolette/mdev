@@ -1,6 +1,7 @@
 pub mod canvas;
 pub mod command_palette;
 pub mod personalization;
+pub mod global_settings;
 pub mod file_viewer;
 pub mod helpers;
 pub mod summary_panel;

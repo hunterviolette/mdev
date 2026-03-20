@@ -4,7 +4,10 @@ import { parseProblems } from './problem_parser.js';
 import type {
   ActivateObjectCommand,
   ActivatePackageCommand,
+  CallEndpointCommand,
   ConnectCommand,
+  CreateObjectCommand,
+  CreateTransportCommand,
   GetProblemsCommand,
   ListPackageObjectsCommand,
   ReadObjectCommand,
@@ -24,11 +27,16 @@ export class SessionManager {
   async connect(cmd: ConnectCommand) {
     const sessionId = cmd.session_id ?? randomUUID();
     const client = new AdtClient(cmd.base_url, {
+      authType: cmd.auth_type,
+      transport: cmd.transport,
       username: cmd.username,
       password: cmd.password,
       authorization: cmd.authorization,
+      cookieHeader: cmd.cookie_header,
+      negotiateCommand: cmd.negotiate_command,
       client: cmd.client,
-      timeoutMs: cmd.timeout_ms
+      timeoutMs: cmd.timeout_ms,
+      sessionKey: sessionId
     });
 
     const discovery = await client.discovery();
@@ -45,7 +53,9 @@ export class SessionManager {
     return {
       session_id: sessionId,
       base_url: cmd.base_url,
-      discovery_status: discovery.status
+      discovery_status: discovery.status,
+      discovery_content_type: discovery.headers['content-type'] ?? '',
+      discovery_final_url: discovery.headers['x-final-url'] ?? cmd.base_url
     };
   }
 
@@ -81,13 +91,59 @@ export class SessionManager {
 
   async updateObject(cmd: UpdateObjectCommand) {
     const state = this.getSession(cmd.session_id);
-    const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle);
+    const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle, cmd.headers);
     if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`update_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
     }
     return {
       session_id: state.sessionId,
       object_uri: cmd.object_uri,
+      status: resp.status,
+      body: resp.body,
+      headers: resp.headers
+    };
+  }
+
+  async createObject(cmd: CreateObjectCommand) {
+    const state = this.getSession(cmd.session_id);
+    const resp = await state.client.createObject(cmd.collection_uri, cmd.body, cmd.content_type, cmd.accept, cmd.headers);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`create_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
+    }
+    return {
+      session_id: state.sessionId,
+      collection_uri: cmd.collection_uri,
+      status: resp.status,
+      body: resp.body,
+      headers: resp.headers
+    };
+  }
+
+  async createTransport(cmd: CreateTransportCommand) {
+    const state = this.getSession(cmd.session_id);
+    const resp = await state.client.createTransport(cmd.collection_uri, cmd.body, cmd.content_type, cmd.accept, cmd.headers);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`create_transport failed (${resp.status}): ${resp.body.slice(0, 500)}`);
+    }
+    return {
+      session_id: state.sessionId,
+      collection_uri: cmd.collection_uri,
+      status: resp.status,
+      body: resp.body,
+      headers: resp.headers
+    };
+  }
+
+  async callEndpoint(cmd: CallEndpointCommand) {
+    const state = this.getSession(cmd.session_id);
+    const resp = await state.client.callEndpoint(cmd.method, cmd.uri, cmd.body, cmd.content_type, cmd.accept, cmd.headers);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`call_endpoint failed (${resp.status}): ${resp.body.slice(0, 500)}`);
+    }
+    return {
+      session_id: state.sessionId,
+      method: cmd.method,
+      uri: cmd.uri,
       status: resp.status,
       body: resp.body,
       headers: resp.headers
@@ -168,6 +224,7 @@ export class SessionManager {
   async closeSession(sessionId: string) {
     const state = this.getSession(sessionId);
     this.sessions.delete(sessionId);
+    await state.client.close();
     return { session_id: state.sessionId, closed: true };
   }
 

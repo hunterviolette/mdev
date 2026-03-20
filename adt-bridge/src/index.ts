@@ -32,6 +32,18 @@ async function handleCommand(cmd: AdtCommand): Promise<AdtResponse> {
       const data = await manager.updateObject(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
     }
+    case 'create_object': {
+      const data = await manager.createObject(cmd);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
+    case 'create_transport': {
+      const data = await manager.createTransport(cmd);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
+    case 'call_endpoint': {
+      const data = await manager.callEndpoint(cmd);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
     case 'syntax_check': {
       const data = await manager.syntaxCheck(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };

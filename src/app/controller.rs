@@ -1,7 +1,7 @@
 use crate::{format};
 
 use super::actions::Action;
-use super::state::AppState;
+use super::state::{AppState, GlobalPerfConfig};
 
 use super::controllers::{
     changeset_loop_controller,
@@ -20,6 +20,41 @@ impl AppState {
         dir.push("task_store");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    fn global_perf_config_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        let mut dir = self.platform.app_data_dir("devApp")?;
+        std::fs::create_dir_all(&dir)?;
+        dir.push("global_perf_config.json");
+        Ok(dir)
+    }
+
+    pub fn load_global_perf_config_from_appdata(&mut self) {
+        let path = match self.global_perf_config_path() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+
+        let perf = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<GlobalPerfConfig>(&text).ok())
+            .unwrap_or_default()
+            .normalized();
+
+        self.perf = perf;
+    }
+
+    pub fn save_global_perf_config_to_appdata(&self) {
+        let path = match self.global_perf_config_path() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+
+        let Ok(text) = serde_json::to_string_pretty(&self.perf.normalized()) else {
+            return;
+        };
+
+        let _ = Self::atomic_write_json(&path, &text);
     }
 
     fn repo_task_store_path(&self, repo: &std::path::PathBuf) -> anyhow::Result<std::path::PathBuf> {

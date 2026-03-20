@@ -140,6 +140,8 @@ export class SessionManager {
       attachedViaCdp: true,
       responseTimeoutMs: undefined
     };
+      responsePollMs: 1000,
+      domPollMs: 1000
 
     this.sessions.set(sessionId, state);
 
@@ -287,7 +289,7 @@ export class SessionManager {
         }
       }
 
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(Math.max(250, Math.trunc(state.domPollMs ?? 1000)));
     }
 
     if (lastError) {
@@ -456,8 +458,19 @@ export class SessionManager {
         return snap;
       }
 
-      await state.page.waitForTimeout(250);
+      await state.page.waitForTimeout(Math.max(250, Math.trunc(state.responsePollMs ?? 1000)));
     }
+  }
+
+  setPollConfig(cmd: { session_id: string; response_poll_ms?: number; dom_poll_ms?: number }) {
+    const state = this.getSession(cmd.session_id);
+    state.responsePollMs = Math.max(250, Math.trunc(cmd.response_poll_ms || state.responsePollMs || 1000));
+    state.domPollMs = Math.max(250, Math.trunc(cmd.dom_poll_ms || state.domPollMs || 1000));
+    return {
+      session_id: state.sessionId,
+      response_poll_ms: state.responsePollMs,
+      dom_poll_ms: state.domPollMs
+    };
   }
 
   setResponseTimeout(cmd: SetResponseTimeoutCommand) {

@@ -43,13 +43,15 @@ impl eframe::App for AppState {
 
 
         let now_s = ctx.input(|i| i.time);
+        let git_status_interval_s = (self.perf.git_status_poll_ms.max(250) as f64) / 1000.0;
+        let analysis_refresh_interval_s = (self.perf.analysis_refresh_poll_ms.max(250) as f64) / 1000.0;
         if self.inputs.repo.is_some() && self.inputs.git_ref == WORKTREE_REF {
-            if now_s - self.tree.last_git_status_refresh_s >= self.tree.git_status_interval_s {
+            if now_s - self.tree.last_git_status_refresh_s >= git_status_interval_s {
                 self.tree.last_git_status_refresh_s = now_s;
                 self.refresh_tree_git_status();
             }
 
-            if now_s - self.tree.last_auto_refresh_s >= self.tree.auto_refresh_interval_s {
+            if now_s - self.tree.last_auto_refresh_s >= analysis_refresh_interval_s {
                 self.tree.last_auto_refresh_s = now_s;
                 if !self.any_file_load_pending() {
                     self.start_analysis_refresh_async();
@@ -123,6 +125,11 @@ impl eframe::App for AppState {
         });
 
         let actions = ui::personalization::personalization(ctx, self);
+        for a in actions {
+            self.apply_action(a);
+        }
+
+        let actions = ui::global_settings::global_settings(ctx, self);
         for a in actions {
             self.apply_action(a);
         }

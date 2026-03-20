@@ -218,7 +218,7 @@ _ => vec![],
         }
 
         "ui" => {
-            vec!["ui/personalization".into()]
+            vec!["ui/personalization".into(), "ui/global_settings".into()]
         }
 
         _ => vec!["workspace".into(), "component".into(), "shortcut".into(), "ui".into()],
@@ -344,6 +344,7 @@ fn parse_command(segments: &[String]) -> (Option<Action>, Option<String>) {
             }
             match segments[1].as_str() {
                 "personalization" => (Some(Action::OpenCanvasTintPopup), None),
+                "global_settings" | "global-settings" => (Some(Action::OpenGlobalSettings), None),
                 _ => (None, None),
             }
         }
@@ -416,6 +417,7 @@ fn all_commands(state: &AppState) -> Vec<String> {
         "shortcut/canvas/delete".into(),
 
         "ui/personalization".into(),
+        "ui/global_settings".into(),
     ];
 
     let mut names = state.list_workspaces();
@@ -489,6 +491,16 @@ fn constrain_to_lane(mut sugg: Vec<String>, lane: Option<&str>) -> Vec<String> {
         return sugg;
     }
 
+    if lane == "file/open" {
+        sugg.retain(|s| s == "file/open" || s.starts_with("file/open/"));
+        return sugg;
+    }
+
+    if lane == "file/" {
+        sugg.retain(|s| s.starts_with("file/"));
+        return sugg;
+    }
+
     if lane == "component/" {
         sugg.retain(|s| s.starts_with("component/"));
         return sugg;
@@ -536,7 +548,7 @@ pub fn command_palette(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .id(search_id)
                     .hint_text(
-                        "workspace/load/foo | workspace/save/my_layout | component/terminal | shortcut/canvas/add | shortcut/canvas/select/00-Default | shortcut/branch/select/main | ui/personalization",
+                        "workspace/load/foo | workspace/save/my_layout | component/terminal | shortcut/canvas/add | shortcut/canvas/select/00-Default | shortcut/branch/select/main | ui/personalization | ui/global_settings",
                     ),
             );
             resp.request_focus();

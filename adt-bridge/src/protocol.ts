@@ -3,9 +3,13 @@ export type ConnectCommand = {
   cmd: "connect";
   session_id?: string;
   base_url: string;
+  auth_type?: "basic" | "header" | "negotiate" | "cookie";
+  transport?: "fetch" | "curl";
   username?: string;
   password?: string;
   authorization?: string;
+  cookie_header?: string;
+  negotiate_command?: string;
   client?: string;
   timeout_ms?: number;
 };
@@ -34,6 +38,41 @@ export type UpdateObjectCommand = {
   source: string;
   content_type?: string;
   lock_handle?: string;
+  headers?: Record<string, string>;
+};
+
+export type CreateObjectCommand = {
+  id: string;
+  cmd: "create_object";
+  session_id: string;
+  collection_uri: string;
+  body: string;
+  content_type?: string;
+  accept?: string;
+  headers?: Record<string, string>;
+};
+
+export type CreateTransportCommand = {
+  id: string;
+  cmd: "create_transport";
+  session_id: string;
+  collection_uri: string;
+  body: string;
+  content_type?: string;
+  accept?: string;
+  headers?: Record<string, string>;
+};
+
+export type CallEndpointCommand = {
+  id: string;
+  cmd: "call_endpoint";
+  session_id: string;
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  uri: string;
+  body?: string;
+  content_type?: string;
+  accept?: string;
+  headers?: Record<string, string>;
 };
 
 export type SyntaxCheckCommand = {
@@ -76,6 +115,9 @@ export type AdtCommand =
   | ListPackageObjectsCommand
   | ReadObjectCommand
   | UpdateObjectCommand
+  | CreateObjectCommand
+  | CreateTransportCommand
+  | CallEndpointCommand
   | SyntaxCheckCommand
   | ActivateObjectCommand
   | ActivatePackageCommand

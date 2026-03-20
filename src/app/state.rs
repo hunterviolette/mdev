@@ -730,6 +730,7 @@ pub struct AppState {
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
+    pub perf: GlobalPerfConfig,
     pub tree: TreeState,
 
     pub canvases: Vec<CanvasState>,
@@ -781,6 +782,61 @@ pub struct InputsState {
     pub max_exts: usize,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GlobalPerfConfig {
+    #[serde(default = "GlobalPerfConfig::default_git_status_poll_ms")]
+    pub git_status_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_analysis_refresh_poll_ms")]
+    pub analysis_refresh_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_response_poll_ms")]
+    pub browser_response_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_dom_poll_ms")]
+    pub browser_dom_poll_ms: u64,
+}
+
+impl GlobalPerfConfig {
+    fn clamp_ms(value: u64) -> u64 {
+        value.max(250)
+    }
+
+    fn default_git_status_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_analysis_refresh_poll_ms() -> u64 {
+        4000
+    }
+
+    fn default_browser_response_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_browser_dom_poll_ms() -> u64 {
+        1000
+    }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            git_status_poll_ms: Self::clamp_ms(self.git_status_poll_ms),
+            analysis_refresh_poll_ms: Self::clamp_ms(self.analysis_refresh_poll_ms),
+            browser_response_poll_ms: Self::clamp_ms(self.browser_response_poll_ms),
+            browser_dom_poll_ms: Self::clamp_ms(self.browser_dom_poll_ms),
+        }
+    }
+}
+
+impl Default for GlobalPerfConfig {
+    fn default() -> Self {
+        Self {
+            git_status_poll_ms: Self::default_git_status_poll_ms(),
+            analysis_refresh_poll_ms: Self::default_analysis_refresh_poll_ms(),
+            browser_response_poll_ms: Self::default_browser_response_poll_ms(),
+            browser_dom_poll_ms: Self::default_browser_dom_poll_ms(),
+        }
+        .normalized()
+    }
+}
+
 pub struct ResultsState {
     pub result: Option<AnalysisResult>,
     pub error: Option<String>,
@@ -793,6 +849,11 @@ pub struct UiState {
     pub canvas_bg_tint: Option<[u8; 4]>,
     pub canvas_tint_popup_open: bool,
     pub canvas_tint_draft: Option<[u8; 4]>,
+    pub global_settings_open: bool,
+    pub global_settings_git_status_poll_s: u64,
+    pub global_settings_analysis_refresh_poll_s: u64,
+    pub global_settings_browser_response_poll_s: u64,
+    pub global_settings_browser_dom_poll_s: u64,
 
     pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
 
@@ -821,10 +882,8 @@ pub struct TreeState {
     pub git_status_by_path: HashMap<String, GitStatusEntry>,
 
     pub last_auto_refresh_s: f64,
-    pub auto_refresh_interval_s: f64,
 
     pub last_git_status_refresh_s: f64,
-    pub git_status_interval_s: f64,
 
     pub analysis_refresh_pending: bool,
     pub analysis_refresh_rx: Option<Receiver<Result<crate::model::AnalysisResult, String>>>,
@@ -1127,10 +1186,17 @@ impl AppState {
                 canvas_bg_tint: None,
                 canvas_tint_popup_open: false,
                 canvas_tint_draft: None,
+                global_settings_open: false,
+                global_settings_git_status_poll_s: 1,
+                global_settings_analysis_refresh_poll_s: 4,
+                global_settings_browser_response_poll_s: 1,
+                global_settings_browser_dom_poll_s: 1,
                 canvas_rename_index: None,
                 canvas_rename_draft: String::new(),
                 task_panel_selected_loops: None,
             },
+
+            perf: GlobalPerfConfig::default(),
 
             tree: TreeState {
                 expand_cmd: None,
@@ -1144,10 +1210,8 @@ impl AppState {
                 git_status_by_path: HashMap::new(),
 
                 last_auto_refresh_s: 0.0,
-                auto_refresh_interval_s: 1.0,
 
                 last_git_status_refresh_s: 0.0,
-                git_status_interval_s: 1.0,
 
                 analysis_refresh_pending: false,
                 analysis_refresh_rx: None,
@@ -1221,6 +1285,7 @@ impl AppState {
             pending_open_file_viewer: None,
         };
 
+        state.load_global_perf_config_from_appdata();
         state.load_workspace_from_appdata(None);
         state
     }
