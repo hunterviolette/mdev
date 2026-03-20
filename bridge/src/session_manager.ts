@@ -427,8 +427,6 @@ export class SessionManager {
     return snap;
   }
 
-
-
   private async waitForCompletedResponse(
     state: SessionState,
     selector: string,
@@ -534,5 +532,4 @@ export class SessionManager {
       await composer.page().waitForTimeout(100);
     }
   }
-
 }

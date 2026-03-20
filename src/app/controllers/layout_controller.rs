@@ -257,8 +257,16 @@ impl AppState {
                 self.changeset_appliers.insert(
                     id,
                     ChangeSetApplierState {
+                        mode: crate::gateway_model::GatewayMode::ChangeSet,
+                        sync_mode: crate::gateway_model::SyncMode::Tree,
                         payload: String::new(),
+                        sync_payload: String::new(),
+                        sync_skip_binary: true,
+                        sync_skip_gitignore: true,
                         status: None,
+                        last_changeset_payload: String::new(),
+                        result_payload: String::new(),
+                        changeset_show_result: false,
                         last_attempted_paths: Vec::new(),
                         last_failed_paths: Vec::new(),
                     },

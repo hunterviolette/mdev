@@ -718,7 +718,7 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 
 const CONTEXT_EXPORT_MAX_BYTES_PER_FILE: usize = 200_000;
 
-const BINARY_EXTS: &[&str] = &[
+pub(crate) const BINARY_EXTS: &[&str] = &[
     ".png",
     ".jpg",
     ".jpeg",
@@ -756,7 +756,7 @@ const BINARY_EXTS: &[&str] = &[
     ".bin",
 ];
 
-fn ext_of_path(path: &str) -> String {
+pub(crate) fn ext_of_path(path: &str) -> String {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -768,12 +768,16 @@ fn ext_of_path(path: &str) -> String {
     }
 }
 
-fn is_binary_ext_for_path(path: &str) -> bool {
+pub(crate) fn is_binary_ext(ext: &str) -> bool {
+    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+}
+
+pub(crate) fn is_binary_path(path: &str) -> bool {
     let ext = ext_of_path(path);
     if ext.is_empty() {
         return false;
     }
-    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(&ext))
+    is_binary_ext(&ext)
 }
 
 fn is_env_path(path: &str) -> bool {
@@ -1105,7 +1109,7 @@ pub fn export_repo_context(
         }
 
         if opts.skip_binary {
-            if is_binary_ext_for_path(&f_norm) {
+            if is_binary_path(&f_norm) {
                 continue;
             }
         }
@@ -1150,7 +1154,7 @@ pub fn export_repo_context(
         };
 
         if opts.skip_binary {
-            if is_binary_ext_for_path(&f_norm) {
+            if is_binary_path(&f_norm) {
                 continue;
             }
             if is_probably_binary(&bytes) {

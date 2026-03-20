@@ -74,7 +74,6 @@ pub enum Action {
     ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
     ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
 
-
     // ---------------------------
     // Repo + analysis
     // ---------------------------
@@ -241,6 +240,25 @@ pub enum Action {
     // ---------------------------
     // Change-set applier (AI patch payloads)
     // ---------------------------
+    SetChangeSetGatewayMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::GatewayMode,
+    },
+    SetChangeSetSyncMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::SyncMode,
+    },
+    SetChangeSetSyncSkipBinary {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    SetChangeSetSyncSkipGitignore {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    GenerateSyncPayload {
+        applier_id: ComponentId,
+    },
     ApplyChangeSet {
         applier_id: ComponentId,
     },

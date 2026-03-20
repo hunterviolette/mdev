@@ -9,7 +9,6 @@ fn canvas_rect_id() -> egui::Id {
 }
 
 fn current_canvas_size(ctx: &egui::Context) -> [f32; 2] {
-
     let r = ctx
         .data_mut(|d| d.get_persisted::<egui::Rect>(canvas_rect_id()))
         .unwrap_or_else(|| ctx.available_rect());
@@ -79,7 +78,6 @@ impl eframe::App for AppState {
             ctx.request_repaint();
         }
 
-
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
                 return None;
@@ -128,7 +126,6 @@ impl eframe::App for AppState {
         if let Some(idx) = canvas_shortcut {
             self.apply_action(super::actions::Action::CanvasSelect { index: idx });
         }
-
 
         egui::TopBottomPanel::top("top").show(ctx, |ui_top| {
             let actions = ui::top_bar::top_bar(ctx, ui_top, self);

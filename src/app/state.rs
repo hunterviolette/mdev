@@ -86,8 +86,16 @@ pub struct TerminalState {
 }
 
 pub struct ChangeSetApplierState {
+    pub mode: crate::gateway_model::GatewayMode,
+    pub sync_mode: crate::gateway_model::SyncMode,
     pub payload: String,
+    pub sync_payload: String,
+    pub sync_skip_binary: bool,
+    pub sync_skip_gitignore: bool,
     pub status: Option<String>,
+    pub last_changeset_payload: String,
+    pub result_payload: String,
+    pub changeset_show_result: bool,
     pub last_attempted_paths: Vec<String>,
     pub last_failed_paths: Vec<String>,
 }
@@ -675,7 +683,7 @@ impl ExecuteLoopState {
         self.fragment_overrides
             .changeset_schema
             .as_deref()
-            .unwrap_or(crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE)
+            .unwrap_or(crate::gateway_model::CHANGESET_SCHEMA_EXAMPLE)
             .trim()
             .to_string()
     }
