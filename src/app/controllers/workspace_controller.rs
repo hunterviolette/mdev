@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::app::actions::{Action, ComponentId, ComponentKind, ExpandCmd};
+use crate::app::actions::{Action, ComponentId, ComponentKind, ExpandCmd, TaskId};
 use crate::app::layout::{
     ContextExporterSnapshot, ExecuteLoopSnapshot, FileViewerSnapshot, LayoutSnapshot, Preset,
     PresetKind, StateSnapshot, TaskSnapshot, WorkspaceFile,
@@ -209,6 +209,7 @@ impl AppState {
             active_file_viewer: self.active_file_viewer_id(),
             context_exporters,
             execute_loops: HashMap::new(),
+            task_component_bindings: self.task_component_bindings.clone(),
             tasks: HashMap::new(),
         };
 
@@ -321,6 +322,7 @@ impl AppState {
                         active_file_viewer: Some(2),
                         context_exporters: HashMap::new(),
                         execute_loops: HashMap::new(),
+                        task_component_bindings: HashMap::new(),
                         tasks: HashMap::new(),
                     }),
                 },
@@ -395,7 +397,7 @@ impl AppState {
         }
 
         let execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot> = HashMap::new();
-        let tasks: HashMap<ComponentId, TaskSnapshot> = HashMap::new();
+        let tasks: HashMap<TaskId, TaskSnapshot> = HashMap::new();
 
         {
             let cw = canvas_size[0].max(1.0);
@@ -450,6 +452,7 @@ impl AppState {
 
             context_exporters,
             execute_loops,
+            task_component_bindings: self.task_component_bindings.clone(),
             tasks,
         };
 
@@ -710,6 +713,8 @@ impl AppState {
                 } else {
                     self.theme.prefs.syntect_theme = state_snap.theme_syntect;
                 }
+
+                self.task_component_bindings = state_snap.task_component_bindings.clone();
 
                 let provisional_next_component_id = if state_snap.next_component_id == 0 {
                     self.next_component_id

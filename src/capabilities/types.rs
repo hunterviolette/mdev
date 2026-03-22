@@ -30,6 +30,8 @@ pub struct GitStatusEntry {
     pub worktree_status: String,
     pub staged: bool,
     pub untracked: bool,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
