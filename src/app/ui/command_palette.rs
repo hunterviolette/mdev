@@ -22,6 +22,7 @@ fn component_from_str(s: &str) -> Option<ComponentKind> {
         "source_control" => Some(ComponentKind::SourceControl),
         "task" => Some(ComponentKind::Task),
         "diff_viewer" => Some(ComponentKind::DiffViewer),
+        "sap_adt" | "sapadt" | "sap" => Some(ComponentKind::SapAdt),
         _ => None,
     }
 }

@@ -10,8 +10,10 @@ import type {
   CreateTransportCommand,
   GetProblemsCommand,
   ListPackageObjectsCommand,
+  LockObjectCommand,
   ReadObjectCommand,
   SyntaxCheckCommand,
+  UnlockObjectCommand,
   UpdateObjectCommand
 } from './protocol.js';
 
@@ -21,12 +23,22 @@ export type AdtSessionState = {
   baseUrl: string;
 };
 
+function resolveBaseUrl(cmd: ConnectCommand): string {
+  const value = cmd.base_url ?? process.env.ADT_HOST_URL ?? process.env.ADT_HOST ?? '';
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error('ADT base_url is required');
+  }
+  return trimmed.replace(/\/$/, '');
+}
+
 export class SessionManager {
   private sessions = new Map<string, AdtSessionState>();
 
   async connect(cmd: ConnectCommand) {
     const sessionId = cmd.session_id ?? randomUUID();
-    const client = new AdtClient(cmd.base_url, {
+    const baseUrl = resolveBaseUrl(cmd);
+    const client = new AdtClient(baseUrl, {
       authType: cmd.auth_type,
       transport: cmd.transport,
       username: cmd.username,
@@ -47,15 +59,15 @@ export class SessionManager {
     this.sessions.set(sessionId, {
       sessionId,
       client,
-      baseUrl: cmd.base_url
+      baseUrl
     });
 
     return {
       session_id: sessionId,
-      base_url: cmd.base_url,
+      base_url: baseUrl,
       discovery_status: discovery.status,
       discovery_content_type: discovery.headers['content-type'] ?? '',
-      discovery_final_url: discovery.headers['x-final-url'] ?? cmd.base_url
+      discovery_final_url: discovery.headers['x-final-url'] ?? baseUrl
     };
   }
 
@@ -89,9 +101,49 @@ export class SessionManager {
     };
   }
 
+  async lockObject(cmd: LockObjectCommand) {
+    const state = this.getSession(cmd.session_id);
+    const resp = await state.client.lockObject(cmd.object_uri);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`lock_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
+    }
+    const lockHandle =
+      /<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/i.exec(resp.body)?.[1]?.trim() ||
+      /<lockHandle>([^<]+)<\/lockHandle>/i.exec(resp.body)?.[1]?.trim() ||
+      resp.headers['x-lockhandle'] ||
+      resp.headers['x-lock-handle'] ||
+      null;
+    if (!lockHandle) {
+      throw new Error(`lock_object succeeded but no lockHandle was returned: ${resp.body.slice(0, 500)}`);
+    }
+    return {
+      session_id: state.sessionId,
+      object_uri: cmd.object_uri,
+      status: resp.status,
+      lock_handle: lockHandle,
+      body: resp.body,
+      headers: resp.headers
+    };
+  }
+
+  async unlockObject(cmd: UnlockObjectCommand) {
+    const state = this.getSession(cmd.session_id);
+    const resp = await state.client.unlockObject(cmd.object_uri, cmd.lock_handle);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`unlock_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
+    }
+    return {
+      session_id: state.sessionId,
+      object_uri: cmd.object_uri,
+      status: resp.status,
+      body: resp.body,
+      headers: resp.headers
+    };
+  }
+
   async updateObject(cmd: UpdateObjectCommand) {
     const state = this.getSession(cmd.session_id);
-    const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle, cmd.headers);
+    const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle, cmd.corr_nr, cmd.headers);
     if (resp.status < 200 || resp.status >= 300) {
       throw new Error(`update_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
     }

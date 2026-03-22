@@ -23,6 +23,7 @@ pub enum ComponentKind {
     SourceControl,
     Task,
     DiffViewer,
+    SapAdt,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -241,6 +242,30 @@ pub enum Action {
     },
     ClearChangeSet {
         applier_id: ComponentId,
+    },
+
+    SapAdtConnect {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtLoadPackage {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtReadObject {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+
+    SapAdtCloneSelectedToWorktree {
+        sap_adt_id: ComponentId,
+    },
+
+    SapAdtPushWorktreeToAdt {
+        sap_adt_id: ComponentId,
+        path: String,
+    },
+    SapAdtActivateWorktreeObject {
+        sap_adt_id: ComponentId,
+        path: String,
     },
 
     // ---------------------------

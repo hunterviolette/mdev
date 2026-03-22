@@ -30,6 +30,21 @@ export type ReadObjectCommand = {
   accept?: string;
 };
 
+export type LockObjectCommand = {
+  id: string;
+  cmd: "lock_object";
+  session_id: string;
+  object_uri: string;
+};
+
+export type UnlockObjectCommand = {
+  id: string;
+  cmd: "unlock_object";
+  session_id: string;
+  object_uri: string;
+  lock_handle: string;
+};
+
 export type UpdateObjectCommand = {
   id: string;
   cmd: "update_object";
@@ -38,6 +53,7 @@ export type UpdateObjectCommand = {
   source: string;
   content_type?: string;
   lock_handle?: string;
+  corr_nr?: string;
   headers?: Record<string, string>;
 };
 
@@ -114,6 +130,8 @@ export type AdtCommand =
   | ConnectCommand
   | ListPackageObjectsCommand
   | ReadObjectCommand
+  | LockObjectCommand
+  | UnlockObjectCommand
   | UpdateObjectCommand
   | CreateObjectCommand
   | CreateTransportCommand

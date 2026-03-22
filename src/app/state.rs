@@ -244,6 +244,186 @@ pub enum ExecuteLoopTransport {
     BrowserBridge,
 }
 
+fn default_sap_adt_discovery_url() -> Option<String> {
+    let raw = std::env::var("ADT_BASE_HOST").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("/sap/bc/adt/discovery") {
+        return Some(trimmed.to_string());
+    }
+
+    Some(format!(
+        "{}/sap/bc/adt/discovery",
+        trimmed.trim_end_matches('/')
+    ))
+}
+
+fn default_sap_adt_browser_bridge_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_BRIDGE_DIR", "BROWSER_BRIDGE_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("bridge");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("bridge");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "bridge".to_string()
+}
+
+fn default_sap_adt_browser_channel() -> String {
+    for key in ["SAP_ADT_BROWSER_CHANNEL", "BROWSER_CHANNEL"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    "msedge".to_string()
+}
+
+fn default_sap_adt_browser_user_data_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_USER_DATA_DIR", "BROWSER_USER_DATA_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push("mdev-sap-adt-browser");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtTemplateLink {
+    pub rel: String,
+    pub template: String,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryCollection {
+    pub title: String,
+    pub href: String,
+    pub category_term: Option<String>,
+    pub category_scheme: Option<String>,
+    pub accepts: Vec<String>,
+    pub template_links: Vec<SapAdtTemplateLink>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryState {
+    pub workspaces: Vec<String>,
+    pub collections: Vec<SapAdtDiscoveryCollection>,
+    pub package_collection_href: Option<String>,
+    pub package_tree_href: Option<String>,
+    pub repository_search_href: Option<String>,
+    pub repository_search_template: Option<String>,
+    pub object_types_href: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtObjectSummary {
+    pub uri: String,
+    pub source_uri: Option<String>,
+    pub name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtState {
+    pub connected: bool,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub discovery_url: Option<String>,
+    pub discovery_xml: String,
+    pub discovery: Option<SapAdtDiscoveryState>,
+    pub cookie_header: Option<String>,
+    pub browser_session_id: Option<String>,
+    pub adt_session_id: Option<String>,
+    pub browser_bridge_dir: String,
+    pub browser_channel: String,
+    pub browser_user_data_dir: String,
+    pub package_query: String,
+    pub include_subpackages: bool,
+    pub package_tree_xml: String,
+    pub package_objects: Vec<SapAdtObjectSummary>,
+    pub selected_object_uri: Option<String>,
+    pub selected_object_metadata_uri: Option<String>,
+    pub selected_object_name: Option<String>,
+    pub selected_object_type: Option<String>,
+    pub selected_object_content: String,
+    pub selected_object_content_type: Option<String>,
+    pub selected_object_headers: Vec<(String, String)>,
+    pub selected_object_metadata: String,
+    pub selected_object_metadata_content_type: Option<String>,
+    pub clone_target_path: String,
+    pub corr_nr: String,
+}
+
+impl SapAdtState {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            last_status: None,
+            last_error: None,
+            discovery_url: default_sap_adt_discovery_url(),
+            discovery_xml: String::new(),
+            discovery: None,
+            cookie_header: None,
+            browser_session_id: None,
+            adt_session_id: None,
+            browser_bridge_dir: default_sap_adt_browser_bridge_dir(),
+            browser_channel: default_sap_adt_browser_channel(),
+            browser_user_data_dir: default_sap_adt_browser_user_data_dir(),
+            package_query: String::new(),
+            include_subpackages: true,
+            package_tree_xml: String::new(),
+            package_objects: Vec::new(),
+            selected_object_uri: None,
+            selected_object_metadata_uri: None,
+            selected_object_name: None,
+            selected_object_type: None,
+            selected_object_content: String::new(),
+            selected_object_content_type: None,
+            selected_object_headers: Vec::new(),
+            selected_object_metadata: String::new(),
+            selected_object_metadata_content_type: None,
+            clone_target_path: String::new(),
+            corr_nr: String::new(),
+        }
+    }
+}
+
 pub struct ExecuteLoopState {
     pub model: String,
     pub paused: bool,
@@ -754,6 +934,7 @@ pub struct AppState {
     pub task_store_dirty: bool,
 
     pub source_controls: HashMap<ComponentId, SourceControlState>,
+    pub sap_adts: HashMap<ComponentId, SapAdtState>,
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
@@ -1252,6 +1433,7 @@ impl AppState {
             tasks: HashMap::new(),
             task_store_dirty: false,
             source_controls: HashMap::new(),
+            sap_adts: HashMap::new(),
 
             theme: ThemeState {
                 code_theme: CodeTheme::dark(),

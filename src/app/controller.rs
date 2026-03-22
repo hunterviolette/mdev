@@ -6,7 +6,7 @@ use super::state::{AppState, GlobalPerfConfig};
 use super::controllers::{
     changeset_loop_controller,
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
-    file_viewer_controller, layout_controller, palette_controller, source_control_controller,
+    file_viewer_controller, layout_controller, palette_controller, sap_adt_controller, source_control_controller,
     terminal_controller, tree_controller, personalization, workspace_controller,
     task_controller,
 };
@@ -470,6 +470,9 @@ impl AppState {
             return;
         }
         if task_controller::handle(self, &action) {
+            return;
+        }
+        if sap_adt_controller::handle(self, &action) {
             return;
         }
         if layout_controller::handle(self, &action) {

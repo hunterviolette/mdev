@@ -28,6 +28,14 @@ async function handleCommand(cmd: AdtCommand): Promise<AdtResponse> {
       const data = await manager.readObject(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
     }
+    case 'lock_object': {
+      const data = await manager.lockObject(cmd);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
+    case 'unlock_object': {
+      const data = await manager.unlockObject(cmd);
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
     case 'update_object': {
       const data = await manager.updateObject(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };

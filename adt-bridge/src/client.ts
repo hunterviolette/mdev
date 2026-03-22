@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -35,6 +35,7 @@ export class AdtClient {
   readonly baseUrl: string;
   readonly auth: AuthConfig;
   private cookieJarPath?: string;
+  private csrfToken?: string;
 
   constructor(baseUrl: string, auth: AuthConfig) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -55,11 +56,37 @@ export class AdtClient {
   }
 
   private getTransport(): TransportType {
-    return this.auth.transport ?? 'fetch';
+    return this.auth.transport ?? 'curl';
   }
 
   private resolveUrl(pathOrUrl: string): string {
     return /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${this.baseUrl}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
+  }
+
+  private isMutatingMethod(method: string): boolean {
+    switch (method.toUpperCase()) {
+      case 'POST':
+      case 'PUT':
+      case 'PATCH':
+      case 'DELETE':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private async fetchCsrfToken(): Promise<string | undefined> {
+    const suffix = this.auth.client && this.auth.client.trim() ? `?sap-client=${encodeURIComponent(this.auth.client.trim())}` : '';
+    const resp = await this.fetchText('GET', `/sap/bc/adt/discovery${suffix}`, undefined, {
+      Accept: 'application/xml, text/xml, */*',
+      'X-CSRF-Token': 'Fetch'
+    });
+    const token = resp.headers['x-csrf-token'];
+    if (token && token.trim()) {
+      this.csrfToken = token.trim();
+      return this.csrfToken;
+    }
+    return undefined;
   }
 
   private buildBaseHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -80,31 +107,56 @@ export class AdtClient {
     if (this.cookieJarPath) {
       return this.cookieJarPath;
     }
-    const baseDir = path.join(os.tmpdir(), 'mdev-adt-bridge');
-    await mkdir(baseDir, { recursive: true });
-    const dir = await mkdtemp(path.join(baseDir, `${this.auth.sessionKey ?? 'session'}-`));
+    const dir = await mkdtemp(path.join(os.tmpdir(), `mdev-adt-${this.auth.sessionKey ?? 'session'}-`));
     this.cookieJarPath = path.join(dir, 'cookies.txt');
+    await writeFile(this.cookieJarPath, '', 'utf8');
     return this.cookieJarPath;
   }
 
-  private async buildCurlArgs(method: string, url: string, headerFile: string, bodyFile: string, body?: string, headers?: Record<string, string>): Promise<{ args: string[]; authAttached: boolean; authType: string }> {
-    const requestHeaders = this.buildBaseHeaders(headers);
-    const args: string[] = ['--silent', '--show-error', '--location', '--dump-header', headerFile, '--output', bodyFile, '--request', method, '--cookie', await this.ensureCookieJarPath(), '--cookie-jar', await this.ensureCookieJarPath()];
-    let authAttached = false;
-    const authType = this.getAuthType();
+  private ensureAdtContent(resp: AdtHttpResponse, url: string) {
+    if (resp.status >= 200 && resp.status < 300) {
+      return;
+    }
+    throw new Error(`ADT request failed (${resp.status}) for ${url}: ${resp.body.slice(0, 500)}`);
+  }
 
-    if (authType === 'basic' && this.auth.username) {
-      args.push('--user', `${this.auth.username}:${this.auth.password ?? ''}`);
+  private async fetchWithCurl(method: string, pathOrUrl: string, body?: string, headers?: Record<string, string>): Promise<AdtHttpResponse> {
+    const url = this.resolveUrl(pathOrUrl);
+    const requestHeaders = this.buildBaseHeaders(headers);
+    const authType = this.getAuthType();
+    const timeoutMs = Math.max(1000, this.auth.timeoutMs ?? 60000);
+    const workDir = await mkdtemp(path.join(os.tmpdir(), 'mdev-adt-curl-'));
+    const headerFile = path.join(workDir, 'headers.txt');
+    const bodyFile = path.join(workDir, 'body.txt');
+    const args: string[] = [
+      '--silent',
+      '--show-error',
+      '--location',
+      '--max-time',
+      String(Math.ceil(timeoutMs / 1000)),
+      '--dump-header',
+      headerFile,
+      '--output',
+      bodyFile,
+      '--request',
+      method
+    ];
+
+    let authAttached = false;
+
+    if (authType === 'cookie' && this.auth.cookieHeader && this.auth.cookieHeader.trim()) {
+      requestHeaders.Cookie = this.auth.cookieHeader.trim();
       authAttached = true;
+      const cookieJar = await this.ensureCookieJarPath();
+      args.push('--cookie', cookieJar, '--cookie-jar', cookieJar);
     } else if (authType === 'header' && this.auth.authorization && this.auth.authorization.trim()) {
       requestHeaders.Authorization = this.auth.authorization.trim();
       authAttached = true;
+    } else if (authType === 'basic' && this.auth.username) {
+      args.push('--user', `${this.auth.username}:${this.auth.password ?? ''}`);
+      authAttached = true;
     } else if (authType === 'negotiate') {
       args.push('--negotiate', '--user', ':');
-      authAttached = true;
-    }
-    if (authType === 'cookie' && this.auth.cookieHeader && this.auth.cookieHeader.trim()) {
-      requestHeaders.Cookie = this.auth.cookieHeader.trim();
       authAttached = true;
     }
 
@@ -113,147 +165,53 @@ export class AdtClient {
     }
 
     if (body !== undefined) {
-      args.push('--data-binary', '@-');
+      args.push('--data-binary', body);
     }
 
-    if (this.auth.timeoutMs && this.auth.timeoutMs > 0) {
-      args.push('--max-time', String(Math.max(1, Math.ceil(this.auth.timeoutMs / 1000))));
-    }
-
-    args.push('--write-out', '\n__CURL_STATUS__:%{http_code}\n__CURL_EFFECTIVE_URL__:%{url_effective}\n__CURL_CONTENT_TYPE__:%{content_type}\n');
     args.push(url);
-    return { args, authAttached, authType };
-  }
-
-  private parseCurlHeaders(rawHeaders: string): Record<string, string> {
-    const lines = rawHeaders.replace(/\r/g, '').split('\n');
-    const headerBlocks: string[][] = [];
-    let current: string[] = [];
-
-    for (const line of lines) {
-      if (!line.trim()) {
-        if (current.length > 0) {
-          headerBlocks.push(current);
-          current = [];
-        }
-        continue;
-      }
-      current.push(line);
-    }
-    if (current.length > 0) {
-      headerBlocks.push(current);
-    }
-
-    const finalBlock = headerBlocks.length > 0 ? headerBlocks[headerBlocks.length - 1] : [];
-    const headerMap: Record<string, string> = {};
-    for (const line of finalBlock.slice(1)) {
-      const idx = line.indexOf(':');
-      if (idx <= 0) {
-        continue;
-      }
-      const key = line.slice(0, idx).trim().toLowerCase();
-      const value = line.slice(idx + 1).trim();
-      if (key === 'set-cookie' && headerMap[key]) {
-        headerMap[key] = `${headerMap[key]}\n${value}`;
-      } else {
-        headerMap[key] = value;
-      }
-    }
-    return headerMap;
-  }
-
-  private ensureAdtContent(resp: CurlResult, url: string) {
-    const contentType = (resp.headers['content-type'] ?? '').toLowerCase();
-    const body = resp.body;
-    const looksLikeHtml = contentType.includes('text/html') || /^\s*<!doctype html/i.test(body) || /^\s*<html\b/i.test(body);
-    const looksLikeSamlLogin = /login\.microsoftonline\.com/i.test(body) || /<form[^>]+saml2/i.test(body) || /name=\"SAMLRequest\"/i.test(body) || /document\.forms\[0\]\.submit\(\)/i.test(body);
-    const looksLikeXml = /^\s*<\?xml\b/i.test(body) || /<(?:app:)?service\b/i.test(body) || /<(?:atom:)?feed\b/i.test(body) || /<(?:atom:)?entry\b/i.test(body);
-
-    if (looksLikeHtml || looksLikeSamlLogin || !looksLikeXml) {
-      throw new Error(`Authentication failed: endpoint did not return ADT XML content (status=${resp.status}, content-type=${contentType || 'unknown'}, url=${url})`);
-    }
-  }
-
-  private runCurl(args: string[], body?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    return new Promise((resolve, reject) => {
-      const child = spawn('curl', args, {
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-
-      child.stdout.on('data', chunk => {
-        stdout += chunk;
-      });
-
-      child.stderr.on('data', chunk => {
-        stderr += chunk;
-      });
-
-      child.on('error', err => {
-        reject(err);
-      });
-
-      child.on('close', code => {
-        resolve({
-          stdout,
-          stderr,
-          exitCode: code ?? -1
-        });
-      });
-
-      if (body !== undefined) {
-        child.stdin.write(body);
-      }
-      child.stdin.end();
-    });
-  }
-
-  private async fetchWithCurl(method: string, pathOrUrl: string, body?: string, headers?: Record<string, string>): Promise<AdtHttpResponse> {
-    const url = this.resolveUrl(pathOrUrl);
-    const workDir = await mkdtemp(path.join(os.tmpdir(), 'mdev-adt-curl-'));
-    const headerFile = path.join(workDir, 'headers.txt');
-    const bodyFile = path.join(workDir, 'body.txt');
 
     try {
-      const { args, authAttached, authType } = await this.buildCurlArgs(method, url, headerFile, bodyFile, body, headers);
-      const result = await this.runCurl(args, body);
-      const stderr = result.stderr ?? '';
-      const stdout = result.stdout ?? '';
-
-      if (result.exitCode !== 0) {
-        throw new Error(`curl exited with code ${result.exitCode} for ${url}: ${stderr || stdout.slice(0, 500)}`);
-      }
-
-      const rawHeaders = await readFile(headerFile, 'utf8');
-      const responseBody = await readFile(bodyFile, 'utf8');
-      const responseHeaders = this.parseCurlHeaders(rawHeaders);
-      const statusMatch = stdout.match(/__CURL_STATUS__:(\d{3})/);
-      const effectiveUrlMatch = stdout.match(/__CURL_EFFECTIVE_URL__:(.*)/);
-      const contentTypeMatch = stdout.match(/__CURL_CONTENT_TYPE__:(.*)/);
-      const status = statusMatch ? Number.parseInt(statusMatch[1], 10) : NaN;
-
-      if (!Number.isFinite(status)) {
-        throw new Error(`curl request failed to produce an HTTP status for ${url}: ${stderr || stdout.slice(0, 500)}`);
-      }
-
-      responseHeaders['x-final-url'] = effectiveUrlMatch ? effectiveUrlMatch[1].trim() : url;
-      if (contentTypeMatch && contentTypeMatch[1].trim()) {
-        responseHeaders['content-type'] = contentTypeMatch[1].trim().toLowerCase();
-      }
-      responseHeaders['x-request-auth-type'] = authType;
-      responseHeaders['x-request-auth-attached'] = authAttached ? 'true' : 'false';
-      responseHeaders['x-request-authorization-scheme'] = authAttached ? (authType === 'negotiate' ? 'Negotiate' : authType === 'basic' ? 'Basic' : authType === 'cookie' ? 'Cookie' : 'Custom') : 'none';
-
-      return {
-        status,
-        headers: responseHeaders,
-        body: responseBody
-      };
+      const result = await new Promise<CurlResult>((resolve, reject) => {
+        const child = spawn('curl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', chunk => {
+          stderr += String(chunk);
+        });
+        child.on('error', reject);
+        child.on('close', async code => {
+          try {
+            const rawHeaders = await readFile(headerFile, 'utf8').catch(() => '');
+            const responseBody = await readFile(bodyFile, 'utf8').catch(() => '');
+            const headerBlocks = rawHeaders.split(/\r?\n\r?\n/).filter(Boolean);
+            const lastBlock = headerBlocks.length > 0 ? headerBlocks[headerBlocks.length - 1] : '';
+            const lines = lastBlock.split(/\r?\n/).filter(Boolean);
+            const statusLine = lines.shift() ?? '';
+            const statusMatch = statusLine.match(/\s(\d{3})(?:\s|$)/);
+            const status = statusMatch ? Number.parseInt(statusMatch[1], 10) : (code === 0 ? 200 : 0);
+            const responseHeaders: Record<string, string> = {};
+            for (const line of lines) {
+              const idx = line.indexOf(':');
+              if (idx <= 0) {
+                continue;
+              }
+              responseHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+            }
+            responseHeaders['x-final-url'] = url;
+            responseHeaders['x-redirected'] = 'true';
+            responseHeaders['x-request-auth-type'] = authType;
+            responseHeaders['x-request-auth-attached'] = authAttached ? 'true' : 'false';
+            responseHeaders['x-request-authorization-scheme'] = authAttached ? (authType === 'basic' ? 'Basic' : authType === 'negotiate' ? 'Negotiate' : authType === 'header' ? 'Custom' : 'Cookie') : 'none';
+            if (code !== 0 && status === 0) {
+              reject(new Error(stderr.trim() || `curl exited with ${code}`));
+              return;
+            }
+            resolve({ status, headers: responseHeaders, body: responseBody });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      });
+      return result;
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }
@@ -298,7 +256,7 @@ export class AdtClient {
       responseHeaders['x-redirected'] = String(resp.redirected);
       responseHeaders['x-request-auth-type'] = authType;
       responseHeaders['x-request-auth-attached'] = authAttached ? 'true' : 'false';
-      responseHeaders['x-request-authorization-scheme'] = authAttached ? (authType === 'basic' ? 'Basic' : authType === 'cookie' ? 'Cookie' : 'Custom') : 'none';
+      responseHeaders['x-request-authorization-scheme'] = authAttached ? (authType === 'negotiate' ? 'Negotiate' : authType === 'basic' ? 'Basic' : authType === 'cookie' ? 'Cookie' : 'Custom') : 'none';
 
       return {
         status: resp.status,
@@ -312,53 +270,173 @@ export class AdtClient {
   }
 
   private async fetchText(method: string, pathOrUrl: string, body?: string, headers?: Record<string, string>): Promise<AdtHttpResponse> {
-    if (this.getTransport() === 'curl') {
-      return this.fetchWithCurl(method, pathOrUrl, body, headers);
+    const finalHeaders: Record<string, string> = {
+      ...(headers ?? {})
+    };
+
+    if (this.isMutatingMethod(method)) {
+      if (!this.csrfToken) {
+        await this.fetchCsrfToken();
+      }
+      if (this.csrfToken && !finalHeaders['X-CSRF-Token'] && !finalHeaders['x-csrf-token']) {
+        finalHeaders['X-CSRF-Token'] = this.csrfToken;
+      }
     }
-    return this.fetchWithNode(method, pathOrUrl, body, headers);
+
+    let resp = this.getTransport() === 'curl'
+      ? await this.fetchWithCurl(method, pathOrUrl, body, finalHeaders)
+      : await this.fetchWithNode(method, pathOrUrl, body, finalHeaders);
+
+    const respToken = resp.headers['x-csrf-token'];
+    if (respToken && respToken.trim()) {
+      this.csrfToken = respToken.trim();
+    }
+
+    const csrfFailed =
+      this.isMutatingMethod(method) &&
+      resp.status === 403 &&
+      /csrf token validation failed/i.test(resp.body);
+
+    if (csrfFailed) {
+      this.csrfToken = undefined;
+      await this.fetchCsrfToken();
+
+      const retryHeaders: Record<string, string> = {
+        ...(headers ?? {})
+      };
+      if (this.csrfToken) {
+        retryHeaders['X-CSRF-Token'] = this.csrfToken;
+      }
+
+      resp = this.getTransport() === 'curl'
+        ? await this.fetchWithCurl(method, pathOrUrl, body, retryHeaders)
+        : await this.fetchWithNode(method, pathOrUrl, body, retryHeaders);
+
+      const retryToken = resp.headers['x-csrf-token'];
+      if (retryToken && retryToken.trim()) {
+        this.csrfToken = retryToken.trim();
+      }
+    }
+
+    return resp;
   }
 
   async discovery() {
     const suffix = this.auth.client && this.auth.client.trim() ? `?sap-client=${encodeURIComponent(this.auth.client.trim())}` : '';
-    const resp = await this.fetchText('GET', `/sap/bc/adt/discovery${suffix}`, undefined, { Accept: 'application/xml, text/xml, */*' });
+    const url = `/sap/bc/adt/discovery${suffix}`;
+    const resp = await this.fetchText('GET', url, undefined, { Accept: 'application/xml, text/xml, */*' });
     if (this.getTransport() === 'curl') {
-      this.ensureAdtContent(resp, resp.headers['x-final-url'] ?? this.resolveUrl(`/sap/bc/adt/discovery${suffix}`));
+      this.ensureAdtContent(resp, resp.headers['x-final-url'] ?? this.resolveUrl(url));
     }
     return resp;
   }
 
   async listPackageObjects(packageName: string, includeSubpackages = false) {
-    const qp = new URLSearchParams();
-    qp.set('packagename', packageName);
+    const attempts: Array<Array<[string, string]>> = [];
+
     if (includeSubpackages) {
-      qp.set('type', 'all');
+      attempts.push([
+        ['packagename', packageName],
+        ['type', 'all']
+      ]);
+    } else {
+      attempts.push([
+        ['packagename', packageName],
+        ['type', 'package']
+      ]);
     }
-    if (this.auth.client && this.auth.client.trim()) {
-      qp.set('sap-client', this.auth.client.trim());
+
+    attempts.push([
+      ['packagename', packageName]
+    ]);
+    attempts.push([
+      ['packagename', packageName],
+      ['type', 'all']
+    ]);
+    attempts.push([
+      ['packagename', packageName],
+      ['type', 'package']
+    ]);
+    attempts.push([
+      ['packagename', packageName],
+      ['type', 'flat']
+    ]);
+
+    let lastResp: AdtHttpResponse | undefined;
+
+    for (const pairs of attempts) {
+      const qp = new URLSearchParams();
+      for (const [key, value] of pairs) {
+        qp.set(key, value);
+      }
+      if (this.auth.client && this.auth.client.trim()) {
+        qp.set('sap-client', this.auth.client.trim());
+      }
+
+      const resp = await this.fetchText(
+        'GET',
+        `/sap/bc/adt/packages/$tree?${qp.toString()}`,
+        undefined,
+        { Accept: 'application/xml, text/xml, */*' }
+      );
+
+      lastResp = resp;
+      const body = resp.body ?? '';
+      const looksEmptyTree = /<[^>]*packageTree\b[^>]*\/>/i.test(body) && !/\buri\s*=\s*"/i.test(body);
+      if (!looksEmptyTree) {
+        return resp;
+      }
     }
-    const resp = await this.fetchText(
+
+    return lastResp ?? this.fetchText(
       'GET',
-      `/sap/bc/adt/packages/$tree?${qp.toString()}`,
+      `/sap/bc/adt/packages/$tree?packagename=${encodeURIComponent(packageName)}`,
       undefined,
       { Accept: 'application/xml, text/xml, */*' }
     );
-    return resp;
   }
 
   async readObject(objectUri: string, accept = 'text/plain, application/xml, */*') {
     return this.fetchText('GET', objectUri, undefined, { Accept: accept });
   }
 
-  async updateObject(objectUri: string, source: string, contentType = 'text/plain; charset=utf-8', lockHandle?: string, extraHeaders?: Record<string, string>) {
+  async lockObject(objectUri: string) {
+    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}_action=LOCK&accessMode=MODIFY`;
+    return this.fetchText('POST', path, undefined, {
+      'X-sap-adt-sessiontype': 'stateful',
+      Accept: 'application/xml, text/xml, */*'
+    });
+  }
+
+  async unlockObject(objectUri: string, lockHandle: string) {
+    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}lockHandle=${encodeURIComponent(lockHandle)}`;
+    return this.fetchText('POST', path, '', {
+      'X-sap-adt-sessiontype': 'stateless',
+      Accept: 'application/xml, text/xml, */*'
+    });
+  }
+
+  async updateObject(objectUri: string, source: string, contentType = 'text/plain; charset=utf-8', lockHandle?: string, corrNr?: string, extraHeaders?: Record<string, string>) {
     const headers: Record<string, string> = {
       'Content-Type': contentType,
       Accept: 'application/xml, text/plain, */*',
       ...(extraHeaders ?? {})
     };
+    let finalUri = objectUri;
+    const params: string[] = [];
     if (lockHandle && lockHandle.trim()) {
-      headers['X-lockHandle'] = lockHandle.trim();
+      const trimmed = lockHandle.trim();
+      headers['X-sap-adt-lockhandle'] = trimmed;
+      headers['X-lockHandle'] = trimmed;
+      params.push(`lockHandle=${encodeURIComponent(trimmed)}`);
     }
-    return this.fetchText('PUT', objectUri, source, headers);
+    if (corrNr && corrNr.trim()) {
+      params.push(`corrNr=${encodeURIComponent(corrNr.trim())}`);
+    }
+    if (params.length > 0) {
+      finalUri = `${objectUri}${objectUri.includes('?') ? '&' : '?'}${params.join('&')}`;
+    }
+    return this.fetchText('PUT', finalUri, source, headers);
   }
 
   async createObject(collectionUri: string, body: string, contentType = 'application/xml; charset=utf-8', accept = 'application/xml, text/xml, */*', extraHeaders?: Record<string, string>) {
@@ -370,35 +448,27 @@ export class AdtClient {
   }
 
   async createTransport(collectionUri: string, body: string, contentType = 'application/xml; charset=utf-8', accept = 'application/xml, text/xml, */*', extraHeaders?: Record<string, string>) {
-    return this.fetchText('POST', collectionUri, body, {
-      'Content-Type': contentType,
-      Accept: accept,
-      ...(extraHeaders ?? {})
-    });
+    return this.createObject(collectionUri, body, contentType, accept, extraHeaders);
   }
 
-  async callEndpoint(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', uri: string, body?: string, contentType?: string, accept = 'application/xml, text/plain, */*', extraHeaders?: Record<string, string>) {
-    const headers: Record<string, string> = {
-      Accept: accept,
-      ...(extraHeaders ?? {})
+  async callEndpoint(method: string, uri: string, body?: string, contentType?: string, accept?: string, headers?: Record<string, string>) {
+    const mergedHeaders: Record<string, string> = {
+      ...(headers ?? {})
     };
-    if (contentType && contentType.trim()) {
-      headers['Content-Type'] = contentType;
+    if (contentType) {
+      mergedHeaders['Content-Type'] = contentType;
     }
-    return this.fetchText(method, uri, body, headers);
+    if (accept) {
+      mergedHeaders.Accept = accept;
+    }
+    return this.fetchText(method, uri, body, mergedHeaders);
   }
 
   async syntaxCheck(objectUri: string) {
-    const body = `<?xml version="1.0" encoding="UTF-8"?><checkrun><object uri="${escapeXmlAttr(objectUri)}" /></checkrun>`;
-    return this.fetchText(
-      'POST',
-      '/sap/bc/adt/checkruns',
-      body,
-      {
-        'Content-Type': 'application/xml; charset=utf-8',
-        Accept: 'application/xml, text/xml, */*'
-      }
-    );
+    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}check=true`;
+    return this.fetchText('GET', path, undefined, {
+      Accept: 'application/xml, text/xml, */*'
+    });
   }
 
   async activateObject(objectUri: string) {
@@ -450,5 +520,3 @@ function escapeXmlAttr(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
-
- 

@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright';
 import { randomUUID } from 'node:crypto';
-import type { ClosePageCommand, ConnectOverCdpCommand, OpenPageCommand, ProbePageCommand, SendChatCommand, StartSessionCommand, UploadFileCommand, ReadResponseCommand, SetResponseTimeoutCommand } from './protocol.js';
+import type { ClosePageCommand, ConnectOverCdpCommand, GetCookiesCommand, OpenPageCommand, ProbePageCommand, SendChatCommand, StartSessionCommand, UploadFileCommand, ReadResponseCommand, SetPollConfigCommand, SetResponseTimeoutCommand } from './protocol.js';
 import { resolveInteractionProfile } from './profiles.js';
 
 type ResponseSnapshot = {
@@ -23,6 +23,8 @@ export type SessionState = {
   ownsBrowser: boolean;
   attachedViaCdp: boolean;
   responseTimeoutMs?: number;
+  responsePollMs: number;
+  domPollMs: number;
 };
 
 export class SessionManager {
@@ -32,33 +34,33 @@ export class SessionManager {
     const sessionId = cmd.session_id ?? randomUUID();
     const timeout = cmd.timeout_ms ?? 60000;
 
-    if (!cmd.user_data_dir) {
-      throw new Error('start_session requires user_data_dir for persistent browser sessions');
-    }
-
-    const persistentOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
+    const launchOptions: Parameters<typeof chromium.launch>[0] = {
       headless: !(cmd.headed ?? false)
     };
 
     if (cmd.browser_channel && cmd.browser_channel !== 'chromium') {
-      persistentOptions.channel = cmd.browser_channel;
+      launchOptions.channel = cmd.browser_channel;
     }
 
-    const context = await chromium.launchPersistentContext(cmd.user_data_dir, persistentOptions);
-    const page = context.pages()[0] ?? await context.newPage();
+    const browser = await chromium.launch(launchOptions);
+    const context = await browser.newContext();
+    const page = await context.newPage();
     page.setDefaultTimeout(timeout);
     page.setDefaultNavigationTimeout(timeout);
-    await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout });
+
+    if (cmd.url && cmd.url.trim()) {
+      await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout });
+    }
 
     if (cmd.wait_for) {
       await page.waitForSelector(cmd.wait_for, { timeout });
     }
 
-    const { name: resolvedProfileName, profile } = await resolveInteractionProfile(page, 'auto');
+    const { name: resolvedProfileName, profile } = await resolveInteractionProfile(page, cmd.profile ?? 'auto');
 
     const state: SessionState = {
       sessionId,
-      browser: undefined,
+      browser,
       context,
       page,
       profile: resolvedProfileName,
@@ -69,16 +71,32 @@ export class SessionManager {
       chatSubmitSelector: profile.chatSubmitSelector,
       ownsBrowser: true,
       attachedViaCdp: false,
-      responseTimeoutMs: undefined
+      responseTimeoutMs: undefined,
+      responsePollMs: 1000,
+      domPollMs: 1000
     };
 
     this.sessions.set(sessionId, state);
 
+    let currentUrl = '';
+    try {
+      currentUrl = page.url();
+    } catch {
+      currentUrl = cmd.url ?? '';
+    }
+
+    let currentTitle = '';
+    try {
+      currentTitle = await page.title();
+    } catch {
+      currentTitle = '';
+    }
+
     return {
       session_id: sessionId,
       attached_via_cdp: false,
-      url: page.url(),
-      title: await page.title()
+      url: currentUrl,
+      title: currentTitle
     };
   }
 
@@ -138,10 +156,10 @@ export class SessionManager {
       chatSubmitSelector: profile.chatSubmitSelector,
       ownsBrowser: false,
       attachedViaCdp: true,
-      responseTimeoutMs: undefined
-    };
+      responseTimeoutMs: undefined,
       responsePollMs: 1000,
       domPollMs: 1000
+    };
 
     this.sessions.set(sessionId, state);
 
@@ -213,7 +231,7 @@ export class SessionManager {
 
     const directChatInput = page.locator(chatInputSelector).first();
     const directInputCount = await directChatInput.count().catch(() => 0);
-    const resolvedComposer = await this.findVisibleChatComposer(page, Math.min(timeout, 1000), chatInputSelector).catch(() => null);
+    const resolvedComposer = await this.findVisibleChatComposer(page, Math.min(timeout, 1000), chatInputSelector, state.domPollMs).catch(() => null);
 
     const chatInputFound = directInputCount > 0 || resolvedComposer !== null;
     const chatInputVisible = resolvedComposer !== null;
@@ -250,7 +268,7 @@ export class SessionManager {
     };
   }
 
-  private async findVisibleChatComposer(page: Page, timeoutMs: number, preferredSelector?: string): Promise<Locator> {
+  private async findVisibleChatComposer(page: Page, timeoutMs: number, preferredSelector?: string, domPollMs = 1000): Promise<Locator> {
     const deadline = Date.now() + timeoutMs;
     const selectors = [
       preferredSelector,
@@ -289,7 +307,7 @@ export class SessionManager {
         }
       }
 
-      await page.waitForTimeout(Math.max(250, Math.trunc(state.domPollMs ?? 1000)));
+      await page.waitForTimeout(Math.max(250, Math.trunc(domPollMs || 1000)));
     }
 
     if (lastError) {
@@ -334,7 +352,7 @@ export class SessionManager {
     const timeout = cmd.timeout_ms ?? 60000;
     const inputSelector = cmd.input_selector ?? state.chatInputSelector;
     const submitSelector = cmd.submit_selector ?? state.chatSubmitSelector;
-    const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector);
+    const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
 
     await this.writeChatComposerText(state.page, composer, cmd.text);
 
@@ -462,7 +480,7 @@ export class SessionManager {
     }
   }
 
-  setPollConfig(cmd: { session_id: string; response_poll_ms?: number; dom_poll_ms?: number }) {
+  setPollConfig(cmd: SetPollConfigCommand) {
     const state = this.getSession(cmd.session_id);
     state.responsePollMs = Math.max(250, Math.trunc(cmd.response_poll_ms || state.responsePollMs || 1000));
     state.domPollMs = Math.max(250, Math.trunc(cmd.dom_poll_ms || state.domPollMs || 1000));
@@ -500,6 +518,86 @@ export class SessionManager {
       session_id: state.sessionId,
       response: snap.lastText,
       response_count: snap.count
+    };
+  }
+
+  private buildCookieHeader(cookies: Awaited<ReturnType<BrowserContext['cookies']>>, urls?: string[]) {
+    const nowSeconds = Math.trunc(Date.now() / 1000);
+    const preferredUrl = urls && urls.length > 0 ? urls[0] : undefined;
+    const preferred = preferredUrl ? new URL(preferredUrl) : null;
+    const wantedCookieNames = [/^MYSAPSSO2$/i, /^SAP_SESSIONID_/i, /^sap-usercontext$/i];
+
+    const filtered = cookies.filter((cookie) => {
+      if (!cookie.name || !cookie.value) {
+        return false;
+      }
+      if (cookie.expires > 0 && cookie.expires <= nowSeconds) {
+        return false;
+      }
+      if (!wantedCookieNames.some((rx) => rx.test(cookie.name))) {
+        return false;
+      }
+      return true;
+    });
+
+    const scored = filtered.map((cookie, index) => {
+      let score = 0;
+
+      if (preferred) {
+        const normalizedDomain = cookie.domain.replace(/^\./, '');
+        if (preferred.hostname === normalizedDomain) {
+          score += 8;
+        } else if (preferred.hostname.endsWith(`.${normalizedDomain}`)) {
+          score += 4;
+        }
+
+        if (preferred.pathname.startsWith(cookie.path || '/')) {
+          score += Math.min((cookie.path || '/').length, 32);
+        }
+
+        if ((preferred.protocol === 'https:' && cookie.secure) || !cookie.secure) {
+          score += 2;
+        }
+      }
+
+      if (cookie.httpOnly) {
+        score += 1;
+      }
+
+      return { cookie, index, score };
+    });
+
+    const byName = new Map<string, { cookie: (typeof scored)[number]['cookie']; index: number; score: number }>();
+    for (const entry of scored) {
+      const existing = byName.get(entry.cookie.name);
+      if (!existing || entry.score > existing.score || (entry.score === existing.score && entry.index < existing.index)) {
+        byName.set(entry.cookie.name, entry);
+      }
+    }
+
+    const selected = [...byName.values()]
+      .sort((a, b) => a.index - b.index)
+      .map((entry) => entry.cookie);
+
+    return {
+      cookies: selected,
+      cookie_names: selected.map((cookie) => cookie.name),
+      cookie_header: selected.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ')
+    };
+  }
+
+  async getCookies(cmd: GetCookiesCommand) {
+    const state = this.getSession(cmd.session_id);
+    const rawCookies = cmd.urls && cmd.urls.length > 0
+      ? await state.context.cookies(cmd.urls)
+      : await state.context.cookies();
+    const cookieData = this.buildCookieHeader(rawCookies, cmd.urls);
+
+    return {
+      session_id: state.sessionId,
+      cookies: cookieData.cookies,
+      cookie_names: cookieData.cookie_names,
+      cookie_header: cookieData.cookie_header
     };
   }
 

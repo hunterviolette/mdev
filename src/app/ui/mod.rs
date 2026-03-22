@@ -15,3 +15,4 @@ pub mod changeset_loop;
 pub mod source_control;
 pub mod diff_viewer;
 pub mod task_panel;
+pub mod sap_adt;

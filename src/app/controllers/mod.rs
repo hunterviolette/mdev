@@ -12,3 +12,4 @@ pub mod source_control_controller;
 pub mod diff_viewer_controller;
 pub mod changeset_loop_controller;
 pub mod task_controller;
+pub mod sap_adt_controller;
