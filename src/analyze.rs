@@ -6,49 +6,6 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 
-const BINARY_EXTS: &[&str] = &[
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".webp",
-    ".ico",
-    ".pdf",
-    ".zip",
-    ".gz",
-    ".tgz",
-    ".bz2",
-    ".xz",
-    ".7z",
-    ".rar",
-    ".tar",
-    ".mp3",
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".mkv",
-    ".wav",
-    ".flac",
-    ".ttf",
-    ".otf",
-    ".woff",
-    ".woff2",
-    ".eot",
-    ".jar",
-    ".class",
-    ".exe",
-    ".dll",
-    ".so",
-    ".dylib",
-    ".bin",
-];
-
-fn is_binary_ext(ext: &str) -> bool {
-    BINARY_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
-}
-
-
 fn decode_lines(blob: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(blob)
         .lines()
@@ -66,17 +23,13 @@ fn count_loc(blob: &[u8]) -> u64 {
 }
 
 fn ext_of(path: &str) -> String {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = git::ext_of_path(path);
     if ext.is_empty() {
         "(no ext)".to_string()
     } else {
-        format!(".{}", ext.to_lowercase())
+        ext
     }
 }
-
 
 fn file_row(i: &FileInfo) -> FileRow {
     let name = i.path.split('/').last().unwrap_or(&i.path).to_string();
@@ -122,8 +75,7 @@ pub fn analyze_repo(
     for f in &files {
         let ext = ext_of(f);
 
-
-        if is_binary_ext(&ext) {
+        if git::is_binary_ext(&ext) {
             skipped_bin += 1;
             infos.push(FileInfo {
                 path: f.clone(),

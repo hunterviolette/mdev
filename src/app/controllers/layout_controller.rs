@@ -106,7 +106,8 @@ impl AppState {
             ComponentKind::Terminal => self.new_terminal(),
             ComponentKind::Task => {
                 let id = self.alloc_component_id();
-                let title = format!("Task {}", id);
+                let task_id = self.default_repo_task_id();
+                let title = format!("Task {}", task_id);
 
                 self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
                 self.active_layout_mut().windows.insert(
@@ -121,7 +122,9 @@ impl AppState {
                     },
                 );
 
-                self.tasks.entry(id).or_default();
+                self.task_component_bindings.insert(id, task_id);
+                self.tasks.entry(task_id).or_default();
+                self.task_store_dirty = true;
 
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
@@ -262,6 +265,8 @@ impl AppState {
                         last_output: None,
                         last_error: None,
                         needs_refresh: true,
+                        loading: false,
+                        refresh_job: crate::app::async_job::AsyncLatestJob::default(),
                     },
                 );
 
@@ -291,8 +296,18 @@ impl AppState {
                 self.changeset_appliers.insert(
                     id,
                     ChangeSetApplierState {
+                        mode: crate::gateway_model::GatewayMode::ChangeSet,
+                        sync_mode: crate::gateway_model::SyncMode::Tree,
                         payload: String::new(),
+                        sync_payload: String::new(),
+                        sync_skip_binary: true,
+                        sync_skip_gitignore: true,
                         status: None,
+                        last_changeset_payload: String::new(),
+                        result_payload: String::new(),
+                        changeset_show_result: false,
+                        last_attempted_paths: Vec::new(),
+                        last_failed_paths: Vec::new(),
                     },
                 );
 

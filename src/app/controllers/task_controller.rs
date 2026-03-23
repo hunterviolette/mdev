@@ -111,6 +111,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                         manual_fragments: st.manual_fragments.clone(),
                         automatic_fragments: st.automatic_fragments.clone(),
                         fragment_overrides: st.fragment_overrides.clone(),
+                        automation_policies: st.automation_policies.clone(),
                         auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                         messages: st.messages,
                         conversation_id: st.conversation_id,

@@ -8,6 +8,7 @@ pub enum ExpandCmd {
 }
 
 pub type ComponentId = u64;
+pub type TaskId = u64;
 
 pub type ConversationId = u64;
 
@@ -54,12 +55,12 @@ pub enum Action {
     // ---------------------------
     // Task
     // ---------------------------
-    TaskSetPaused { task_id: ComponentId, paused: bool },
-    TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
-    TaskOpenExecuteLoop { task_id: ComponentId },
-    TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+    TaskSetPaused { task_id: TaskId, paused: bool },
+    TaskBindExecuteLoop { task_id: TaskId, loop_id: ComponentId },
+    TaskOpenExecuteLoop { task_id: TaskId },
+    TaskCreateAndBindExecuteLoop { task_id: TaskId },
     TaskCreateConversationAndOpen {
-        task_id: ComponentId,
+        task_id: TaskId,
         transport: crate::app::state::ExecuteLoopTransport,
     },
 
@@ -67,13 +68,12 @@ pub enum Action {
     ExecuteLoopBrowserProbe { loop_id: ComponentId },
     ExecuteLoopBrowserOpenUrl { loop_id: ComponentId },
     ExecuteLoopBrowserDetach { loop_id: ComponentId },
-    TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
-    TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
-    TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
+    TaskOpenConversation { task_id: TaskId, conversation_id: ConversationId },
+    TaskConversationsDelete { task_id: TaskId, conversation_ids: Vec<ConversationId> },
+    TaskConversationsSetPaused { task_id: TaskId, conversation_ids: Vec<ConversationId>, paused: bool },
     ExecuteLoopDelete { loop_id: ComponentId },
     ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
     ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
-
 
     // ---------------------------
     // Repo + analysis
@@ -121,6 +121,12 @@ pub enum Action {
         path: String,
         from_ref: String,
         to_ref: String,
+    },
+    OpenDiffViewerForStaged {
+        sc_id: ComponentId,
+    },
+    OpenDiffViewerForUnstaged {
+        sc_id: ComponentId,
     },
 
     RefreshDiffViewer {
@@ -237,6 +243,25 @@ pub enum Action {
     // ---------------------------
     // Change-set applier (AI patch payloads)
     // ---------------------------
+    SetChangeSetGatewayMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::GatewayMode,
+    },
+    SetChangeSetSyncMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::SyncMode,
+    },
+    SetChangeSetSyncSkipBinary {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    SetChangeSetSyncSkipGitignore {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    GenerateSyncPayload {
+        applier_id: ComponentId,
+    },
     ApplyChangeSet {
         applier_id: ComponentId,
     },
@@ -337,6 +362,9 @@ pub enum Action {
         sc_id: ComponentId,
     },
     PullRemote {
+        sc_id: ComponentId,
+    },
+    PushRemote {
         sc_id: ComponentId,
     },
     SetCommitMessage {

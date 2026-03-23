@@ -9,7 +9,6 @@ fn canvas_rect_id() -> egui::Id {
 }
 
 fn current_canvas_size(ctx: &egui::Context) -> [f32; 2] {
-
     let r = ctx
         .data_mut(|d| d.get_persisted::<egui::Rect>(canvas_rect_id()))
         .unwrap_or_else(|| ctx.available_rect());
@@ -58,7 +57,7 @@ impl eframe::App for AppState {
                 }
             }
 
-            if self.tree.analysis_refresh_pending {
+            if self.tree.analysis_job.is_pending() {
                 ctx.request_repaint();
             }
             if self.poll_analysis_refresh() {
@@ -66,6 +65,20 @@ impl eframe::App for AppState {
             }
         }
 
+        if self.poll_git_status_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_stats_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_viewer_loads() {
+            ctx.request_repaint();
+        }
+        if self.diff_viewers.values().any(|v| v.loading)
+            || self.diff_viewer_jobs.values().any(|job| job.is_pending())
+        {
+            ctx.request_repaint();
+        }
 
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
@@ -115,7 +128,6 @@ impl eframe::App for AppState {
         if let Some(idx) = canvas_shortcut {
             self.apply_action(super::actions::Action::CanvasSelect { index: idx });
         }
-
 
         egui::TopBottomPanel::top("top").show(ctx, |ui_top| {
             let actions = ui::top_bar::top_bar(ctx, ui_top, self);
