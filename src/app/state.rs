@@ -16,6 +16,7 @@ use crate::platform::Platform;
 use super::openai::OpenAIClient;
 
 use serde::{Deserialize, Serialize};
+use crate::app::sap_adt_manifest::SapAdtObjectManifest;
 
 use super::actions::{ComponentId, ConversationId, ExpandCmd, TerminalShell};
 use super::actions::ComponentKind;
@@ -359,6 +360,28 @@ pub struct SapAdtObjectSummary {
     pub description: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtHttpTrace {
+    pub label: String,
+    pub method: String,
+    pub url: String,
+    pub request_headers: Vec<(String, String)>,
+    pub request_body: String,
+    pub response_status: Option<u16>,
+    pub response_headers: Vec<(String, String)>,
+    pub response_body: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtAcceptProbe {
+    pub accept: String,
+    pub status: Option<u16>,
+    pub content_type: Option<String>,
+    pub response_preview: String,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SapAdtState {
     pub connected: bool,
@@ -381,6 +404,8 @@ pub struct SapAdtState {
     pub selected_object_metadata_uri: Option<String>,
     pub selected_object_name: Option<String>,
     pub selected_object_type: Option<String>,
+    pub selected_manifest: Option<SapAdtObjectManifest>,
+    pub selected_resource_id: Option<String>,
     pub selected_object_content: String,
     pub selected_object_content_type: Option<String>,
     pub selected_object_headers: Vec<(String, String)>,
@@ -388,6 +413,9 @@ pub struct SapAdtState {
     pub selected_object_metadata_content_type: Option<String>,
     pub clone_target_path: String,
     pub corr_nr: String,
+    pub debug_http_enabled: bool,
+    pub last_http_trace: Option<SapAdtHttpTrace>,
+    pub accept_probe_results: Vec<SapAdtAcceptProbe>,
 }
 
 impl SapAdtState {
@@ -413,6 +441,8 @@ impl SapAdtState {
             selected_object_metadata_uri: None,
             selected_object_name: None,
             selected_object_type: None,
+            selected_manifest: None,
+            selected_resource_id: None,
             selected_object_content: String::new(),
             selected_object_content_type: None,
             selected_object_headers: Vec::new(),
@@ -420,6 +450,9 @@ impl SapAdtState {
             selected_object_metadata_content_type: None,
             clone_target_path: String::new(),
             corr_nr: String::new(),
+            debug_http_enabled: true,
+            last_http_trace: None,
+            accept_probe_results: Vec::new(),
         }
     }
 }

@@ -53,7 +53,7 @@ pub fn sap_adt_panel(
     }
 
     ui.horizontal(|ui| {
-        ui.label("Object/Package:");
+        ui.label("Package or object:");
         ui.add(
             egui::TextEdit::singleline(&mut st.package_query)
                 .desired_width(220.0)
@@ -61,7 +61,7 @@ pub fn sap_adt_panel(
         );
         ui.checkbox(&mut st.include_subpackages, "Include subpackages");
 
-        if ui.button("Load package").clicked() {
+        if ui.button("Browse").clicked() {
             actions.push(Action::SapAdtLoadPackage { sap_adt_id });
         }
 
@@ -83,15 +83,15 @@ pub fn sap_adt_panel(
         |ui| {
             ui.columns(2, |columns| {
                 columns[0].vertical(|ui| {
-                    ui.label("Package contents");
+                    ui.label("Package tree / search results");
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_source(("sap_adt_package_objects_scroll", sap_adt_id))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for obj in &st.package_objects {
-                                    let selected = st.selected_object_uri.as_deref() == Some(obj.uri.as_str())
-                                        || st.selected_object_uri.as_deref() == obj.source_uri.as_deref();
+                                    let selected = st.selected_object_name.as_deref() == Some(obj.name.as_str())
+                                        && st.selected_object_type.as_deref() == Some(obj.object_type.as_str());
                                     let label = format!("[{}] {}", obj.object_type, obj.name);
                                     if ui.selectable_label(selected, label).clicked() {
                                         actions.push(Action::SapAdtReadObject {
@@ -133,9 +133,13 @@ pub fn sap_adt_panel(
                             ui.separator();
                             ui.small(format!("Type: {}", kind));
                         }
-                        if let Some(content_type) = &st.selected_object_content_type {
-                            ui.separator();
-                            ui.small(format!("Content-Type: {}", content_type));
+                        if let Some(manifest) = &st.selected_manifest {
+                            if let Some(resource) = manifest.selected_resource(st.selected_resource_id.as_deref()) {
+                                if let Some(content_type) = &resource.content_type {
+                                    ui.separator();
+                                    ui.small(format!("Content-Type: {}", content_type));
+                                }
+                            }
                         }
                     });
 
@@ -144,9 +148,9 @@ pub fn sap_adt_panel(
                         ui.add(
                             egui::TextEdit::singleline(&mut st.clone_target_path)
                                 .desired_width(360.0)
-                                .hint_text("sap_adt/package__type__object.abap"),
+                                .hint_text("sap_adt/package__type__object"),
                         );
-                        let can_clone = st.selected_object_uri.is_some() && !st.selected_object_content.is_empty();
+                        let can_clone = st.selected_manifest.is_some();
                         if ui
                             .add_enabled(can_clone, egui::Button::new("Clone to worktree"))
                             .clicked()
@@ -187,21 +191,214 @@ pub fn sap_adt_panel(
                         }
                     });
 
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        egui::ScrollArea::both()
-                            .id_source(("sap_adt_object_content_scroll", sap_adt_id))
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut st.debug_http_enabled, "HTTP debug");
+                        let debug_uri = st
+                            .selected_object_metadata_uri
+                            .clone()
+                            .or_else(|| st.selected_object_uri.clone())
+                            .unwrap_or_default();
+                        let can_debug = !debug_uri.trim().is_empty();
+                        if ui
+                            .add_enabled(can_debug, egui::Button::new("Run Accept matrix"))
+                            .clicked()
+                        {
+                            actions.push(Action::SapAdtDebugAcceptMatrix {
+                                sap_adt_id,
+                                object_uri: debug_uri.clone(),
+                            });
+                        }
+                        if ui.button("Clear debug").clicked() {
+                            actions.push(Action::SapAdtClearHttpTrace { sap_adt_id });
+                        }
+                    });
+
+                    if !st.accept_probe_results.is_empty() {
+                        ui.separator();
+                        ui.label("Accept matrix");
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_source(("sap_adt_accept_matrix_scroll", sap_adt_id))
+                                .auto_shrink([false, false])
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    for probe in st.accept_probe_results.iter() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.monospace(format!("Accept: {}", probe.accept));
+                                            if let Some(status) = probe.status {
+                                                ui.separator();
+                                                ui.small(format!("Status: {}", status));
+                                            }
+                                            if let Some(content_type) = &probe.content_type {
+                                                ui.separator();
+                                                ui.small(format!("Content-Type: {}", content_type));
+                                            }
+                                        });
+                                        if let Some(error) = &probe.error {
+                                            let mut text = error.clone();
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut text)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(3)
+                                                    .interactive(false),
+                                            );
+                                        } else if !probe.response_preview.is_empty() {
+                                            let mut text = probe.response_preview.clone();
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut text)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(4)
+                                                    .interactive(false),
+                                            );
+                                        }
+                                        ui.separator();
+                                    }
+                                });
+                        });
+                    }
+
+                    if let Some(trace) = st.last_http_trace.as_ref() {
+                        ui.separator();
+                        ui.label("Last ADT HTTP trace");
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small(format!("Label: {}", trace.label));
+                                ui.separator();
+                                ui.small(format!("Method: {}", trace.method));
+                                if let Some(status) = trace.response_status {
+                                    ui.separator();
+                                    ui.small(format!("Status: {}", status));
+                                }
+                            });
+                            let mut url = trace.url.clone();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut url)
+                                    .desired_width(f32::INFINITY)
+                                    .interactive(false),
+                            );
+
+                            let mut request_headers = trace
+                                .request_headers
+                                .iter()
+                                .map(|(k, v)| format!("{}: {}", k, v))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.label("Request headers");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut request_headers)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(4)
+                                    .interactive(false),
+                            );
+
+                            let mut response_headers = trace
+                                .response_headers
+                                .iter()
+                                .map(|(k, v)| format!("{}: {}", k, v))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.label("Response headers");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut response_headers)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(4)
+                                    .interactive(false),
+                            );
+
+                            if !trace.request_body.is_empty() {
+                                let mut request_body = trace.request_body.clone();
+                                ui.label("Request body");
                                 ui.add(
-                                    egui::TextEdit::multiline(&mut st.selected_object_content)
-                                        .id_source(("sap_adt_object_content_text", sap_adt_id))
+                                    egui::TextEdit::multiline(&mut request_body)
                                         .font(egui::TextStyle::Monospace)
                                         .desired_width(f32::INFINITY)
-                                        .desired_rows(32)
+                                        .desired_rows(6)
                                         .interactive(false),
                                 );
+                            }
+
+                            if let Some(error) = &trace.error {
+                                let mut error_text = error.clone();
+                                ui.label("Error");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut error_text)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(6)
+                                        .interactive(false),
+                                );
+                            } else {
+                                let mut response_body = trace.response_body.clone();
+                                ui.label("Response body");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut response_body)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(8)
+                                        .interactive(false),
+                                );
+                            }
+                        });
+                    }
+
+                    if let Some(manifest) = st.selected_manifest.as_ref() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(format!("Metadata: {}", manifest.metadata_uri));
+                            ui.separator();
+                            ui.small(format!("Resources: {}", manifest.resources.len()));
+                            ui.separator();
+                            ui.small(format!("Documents: {}", manifest.documents.len()));
+                        });
+
+                        ui.columns(2, |columns| {
+                            columns[0].vertical(|ui| {
+                                ui.label("Discovered resources");
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_source(("sap_adt_resource_list_scroll", sap_adt_id))
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            for resource in manifest.resources.iter() {
+                                                let selected = st.selected_resource_id.as_deref() == Some(resource.id.as_str());
+                                                let label = format!("{} [{}{}{}]", resource.path, resource.role, if resource.editable { ", editable" } else { "" }, if resource.readable { ", readable" } else { "" });
+                                                if ui.selectable_label(selected, label).clicked() {
+                                                    st.selected_resource_id = Some(resource.id.clone());
+                                                }
+                                            }
+                                        });
+                                });
                             });
-                    });
+
+                            columns[1].vertical(|ui| {
+                                ui.label("Resource content");
+                                let mut body = manifest
+                                    .selected_resource(st.selected_resource_id.as_deref())
+                                    .map(|r| r.body.clone())
+                                    .unwrap_or_default();
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    egui::ScrollArea::both()
+                                        .id_source(("sap_adt_object_content_scroll", sap_adt_id))
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut body)
+                                                    .id_source(("sap_adt_object_content_text", sap_adt_id))
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(32)
+                                                    .interactive(false),
+                                            );
+                                        });
+                                });
+                            });
+                        });
+                    } else {
+                        ui.label("No SAP ADT manifest loaded.");
+                    }
                 });
             });
         },

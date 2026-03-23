@@ -1,7 +1,7 @@
 use crate::app::actions::Action;
+use crate::app::sap_adt_manifest::SapAdtObjectManifest;
 use crate::app::state::{AppState, WORKTREE_REF};
 use crate::capabilities::{CapabilityRequest, CapabilityResponse, FileSource};
-use serde_json::{json, Value};
 
 fn normalize_bridge_dir(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -66,6 +66,122 @@ fn default_clone_target_path(
     format!("sap_adt/{}__{}__{}.{}", package, object_type, object_name, ext)
 }
 
+fn normalize_repo_relative_path(path: &str) -> String {
+    path.trim().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn manifest_candidate_paths(path: &str) -> Vec<String> {
+    let normalized = normalize_repo_relative_path(path);
+    let mut out = Vec::new();
+
+    let push_candidate = |out: &mut Vec<String>, candidate: String| {
+        if !candidate.trim().is_empty() && !out.iter().any(|existing| existing == &candidate) {
+            out.push(candidate);
+        }
+    };
+
+    if normalized.ends_with("/manifest.adt.json") || normalized == "manifest.adt.json" {
+        push_candidate(&mut out, normalized.clone());
+    } else if !normalized.is_empty() {
+        push_candidate(&mut out, format!("{}/manifest.adt.json", normalized));
+    }
+
+    let mut cursor = std::path::Path::new(&normalized);
+    while let Some(parent) = cursor.parent() {
+        let candidate = parent.join("manifest.adt.json").to_string_lossy().replace('\\', "/");
+        push_candidate(&mut out, candidate);
+        cursor = parent;
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+    }
+
+    push_candidate(&mut out, "manifest.adt.json".to_string());
+    out
+}
+
+fn load_manifest_for_local_path(
+    state: &mut AppState,
+    path: &str,
+) -> anyhow::Result<(String, SapAdtObjectManifest, usize, String)> {
+    let original_path = normalize_repo_relative_path(path);
+    let mut last_err: Option<String> = None;
+
+    for manifest_path in manifest_candidate_paths(&original_path) {
+        match read_worktree_text(state, &manifest_path) {
+            Ok(text) => {
+                let manifest: SapAdtObjectManifest = serde_json::from_str(&text)
+                    .map_err(|err| anyhow::anyhow!("Invalid manifest JSON in {}: {}", manifest_path, err))?;
+
+                let manifest_dir = manifest_path
+                    .strip_suffix("/manifest.adt.json")
+                    .unwrap_or("")
+                    .trim_matches('/')
+                    .to_string();
+
+                let relative_path = if original_path == manifest_path || original_path == manifest_dir {
+                    None
+                } else if manifest_dir.is_empty() {
+                    Some(original_path.as_str())
+                } else {
+                    original_path.strip_prefix(&(manifest_dir.clone() + "/"))
+                };
+
+                let resource_index = if let Some(rel) = relative_path {
+                    if rel.is_empty() {
+                        None
+                    } else {
+                        manifest.resources.iter().position(|resource| resource.path == rel)
+                    }
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    manifest
+                        .primary_resource_id()
+                        .and_then(|id| manifest.resources.iter().position(|resource| resource.id == id))
+                })
+                .ok_or_else(|| anyhow::anyhow!("Manifest {} does not contain a pushable resource", manifest_path))?;
+
+                let resource_rel_path = manifest
+                    .resources
+                    .get(resource_index)
+                    .map(|resource| resource.path.clone())
+                    .ok_or_else(|| anyhow::anyhow!("Manifest {} resource index out of range", manifest_path))?;
+
+                let resource_local_path = if manifest_dir.is_empty() {
+                    resource_rel_path
+                } else {
+                    format!("{}/{}", manifest_dir, resource_rel_path)
+                };
+
+                return Ok((manifest_path, manifest, resource_index, resource_local_path));
+            }
+            Err(err) => {
+                last_err = Some(format!("{:#}", err));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Could not locate manifest.adt.json for {}{}",
+        original_path,
+        last_err
+            .as_deref()
+            .map(|err| format!(" ({})", err))
+            .unwrap_or_default()
+    ))
+}
+
+fn write_manifest_to_worktree(
+    state: &mut AppState,
+    manifest_path: &str,
+    manifest: &SapAdtObjectManifest,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    write_worktree_bytes(state, manifest_path, bytes)
+}
+
 fn write_worktree_bytes(state: &mut AppState, path: &str, contents: Vec<u8>) -> anyhow::Result<()> {
     let repo = state
         .inputs
@@ -126,6 +242,25 @@ fn extract_server_etag_from_adt_error(body: &str) -> Option<String> {
     }
 }
 
+fn manifest_dir_from_manifest_path(manifest_path: &str) -> String {
+    manifest_path
+        .strip_suffix("/manifest.adt.json")
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn join_manifest_relative_path(manifest_dir: &str, relative_path: &str) -> String {
+    let relative_path = relative_path.trim().trim_start_matches('/');
+    if manifest_dir.is_empty() {
+        relative_path.to_string()
+    } else if relative_path.is_empty() {
+        manifest_dir.to_string()
+    } else {
+        format!("{}/{}", manifest_dir, relative_path)
+    }
+}
+
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
         Action::SapAdtConnect { sap_adt_id } => {
@@ -160,7 +295,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             };
 
             sap.last_error = None;
-            sap.last_status = Some("Loading package objects".to_string());
+            sap.last_status = Some("Loading package tree".to_string());
 
             let package_name = sap.package_query.trim().to_string();
             let include_subpackages = sap.include_subpackages;
@@ -194,7 +329,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                     sap.clone_target_path.clear();
                     if object_count == 0 {
                         sap.last_error = Some(format!(
-                            "Package tree loaded but 0 objects were recognized from {} bytes of ADT XML. Inspect 'Package tree XML' to verify the response shape and cargo logs for the XML preview/exception details.",
+                            "Package tree loaded but 0 objects were recognized from {} bytes of ADT XML. The package tree endpoint may have returned an empty tree, or the response shape may need parser support. Inspect 'Package tree XML' to verify the response shape and cargo logs for the XML preview/exception details.",
                             xml_len
                         ));
                         sap.last_status = Some(format!(
@@ -241,82 +376,197 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 .find(|o| o.uri == *object_uri || o.source_uri.as_deref() == Some(object_uri.as_str()))
                 .cloned();
 
-            let metadata_uri = selected
-                .as_ref()
-                .map(|o| o.uri.clone())
-                .unwrap_or_else(|| object_uri.clone());
-
-            let metadata_accept = match selected.as_ref().map(|o| o.object_type.as_str()) {
-                Some("PROG/P") => "application/vnd.sap.adt.programs.programs.v2+xml, application/xml, text/xml, */*",
-                _ => "application/xml, text/xml, */*",
-            };
-
-            match crate::app::adt_bridge::read_object(sap, &metadata_uri, Some(metadata_accept)) {
-                Ok(metadata_result) => {
-                    let metadata_xml = metadata_result.body.clone();
-                    let metadata_content_type = metadata_result.content_type.clone();
-
-                    let resolved_source_uri = crate::app::adt_bridge::extract_object_source_uri(&metadata_xml)
-                        .and_then(|source_uri| match source_uri {
-                            Some(source_uri) => crate::app::adt_bridge::resolve_relative_object_uri(&metadata_uri, &source_uri),
-                            None => Ok(selected
-                                .as_ref()
-                                .and_then(|o| o.source_uri.clone())
-                                .unwrap_or_else(|| object_uri.clone())),
-                        });
-
-                    match resolved_source_uri.and_then(|source_uri| {
-                        crate::app::adt_bridge::read_object(sap, &source_uri, Some("text/plain, text/*, */*"))
-                    }) {
-                        Ok(source_result) => {
-                            let clone_target_path = default_clone_target_path(
-                                selected.as_ref().map(|o| o.name.as_str()),
-                                selected.as_ref().map(|o| o.object_type.as_str()),
-                                selected.as_ref().and_then(|o| o.package_name.as_deref()),
-                                source_result.content_type.as_deref(),
-                            );
-                            sap.selected_object_uri = Some(source_result.object_uri.clone());
-                            sap.selected_object_metadata_uri = Some(metadata_uri.clone());
-                            sap.selected_object_name = selected.as_ref().map(|o| o.name.clone());
-                            sap.selected_object_type = selected.as_ref().map(|o| o.object_type.clone());
-                            sap.selected_object_content = source_result.body;
-                            sap.selected_object_content_type = source_result.content_type;
-                            sap.selected_object_headers = source_result.headers;
-                            sap.selected_object_metadata = metadata_xml;
-                            sap.selected_object_metadata_content_type = metadata_content_type;
-                            sap.clone_target_path = clone_target_path;
-                            sap.last_status = Some("SAP object loaded".to_string());
-                        }
-                        Err(err) => {
-                            sap.selected_object_uri = None;
-                            sap.selected_object_metadata_uri = Some(metadata_uri.clone());
-                            sap.selected_object_name = selected.as_ref().map(|o| o.name.clone());
-                            sap.selected_object_type = selected.as_ref().map(|o| o.object_type.clone());
-                            sap.selected_object_content.clear();
-                            sap.selected_object_content_type = None;
-                            sap.selected_object_headers.clear();
-                            sap.selected_object_metadata = metadata_xml;
-                            sap.selected_object_metadata_content_type = metadata_content_type;
-                            sap.clone_target_path.clear();
-                            sap.last_error = Some(format!("{:#}", err));
-                            sap.last_status = Some("Object read failed".to_string());
-                        }
-                    }
-                }
-                Err(err) => {
+            if let Some(selected) = selected.as_ref() {
+                let is_package_node = selected.object_type == "DEVC/K"
+                    || selected.uri.starts_with("/sap/bc/adt/packages/");
+                if is_package_node {
                     sap.selected_object_uri = None;
-                    sap.selected_object_metadata_uri = None;
+                    sap.selected_object_metadata_uri = Some(selected.uri.clone());
+                    sap.selected_object_name = Some(selected.name.clone());
+                    sap.selected_object_type = Some(selected.object_type.clone());
                     sap.selected_object_content.clear();
                     sap.selected_object_content_type = None;
                     sap.selected_object_headers.clear();
                     sap.selected_object_metadata.clear();
                     sap.selected_object_metadata_content_type = None;
+                    sap.selected_manifest = None;
+                    sap.selected_resource_id = None;
+                    sap.clone_target_path.clear();
+                    sap.last_error = Some("Package nodes are browse-only until package-content expansion is resolved.".to_string());
+                    sap.last_status = Some("Package selected".to_string());
+                    return true;
+                }
+            }
+
+            if let Some(selected) = selected.as_ref() {
+                let is_package_node = selected.object_type == "DEVC/K"
+                    || selected.uri.starts_with("/sap/bc/adt/packages/");
+                if is_package_node {
+                    sap.selected_object_uri = None;
+                    sap.selected_object_metadata_uri = Some(selected.uri.clone());
+                    sap.selected_object_name = Some(selected.name.clone());
+                    sap.selected_object_type = Some(selected.object_type.clone());
+                    sap.selected_object_content.clear();
+                    sap.selected_object_content_type = None;
+                    sap.selected_object_headers.clear();
+                    sap.selected_object_metadata.clear();
+                    sap.selected_object_metadata_content_type = None;
+                    sap.selected_manifest = None;
+                    sap.selected_resource_id = None;
+                    sap.clone_target_path.clear();
+                    sap.last_error = Some("Package nodes are browse-only until package-content expansion is resolved.".to_string());
+                    sap.last_status = Some("Package selected".to_string());
+                    return true;
+                }
+            }
+
+            if let Some(selected) = selected.as_ref() {
+                let uri = selected.uri.as_str();
+                let is_real_leaf_uri = uri.starts_with("/sap/bc/adt/programs/")
+                    || uri.starts_with("/sap/bc/adt/oo/classes/")
+                    || uri.starts_with("/sap/bc/adt/oo/interfaces/")
+                    || uri.starts_with("/sap/bc/adt/ddic/")
+                    || uri.starts_with("/sap/bc/adt/ddls/")
+                    || uri.starts_with("/sap/bc/adt/cds/")
+                    || uri.starts_with("/sap/bc/adt/functions/")
+                    || uri.starts_with("/sap/bc/adt/vit/wb/object_type/");
+
+                let is_structural_node = !is_real_leaf_uri
+                    && (selected.object_type.starts_with("DEVC/")
+                        || uri.starts_with("/sap/bc/adt/packages/")
+                        || uri.trim().is_empty());
+
+                if is_structural_node {
+                    sap.selected_object_uri = None;
+                    sap.selected_object_metadata_uri = Some(selected.uri.clone());
+                    sap.selected_object_name = Some(selected.name.clone());
+                    sap.selected_object_type = Some(selected.object_type.clone());
+                    sap.selected_object_content.clear();
+                    sap.selected_object_content_type = None;
+                    sap.selected_object_headers.clear();
+                    sap.selected_object_metadata.clear();
+                    sap.selected_object_metadata_content_type = None;
+                    sap.selected_manifest = None;
+                    sap.selected_resource_id = None;
+                    sap.clone_target_path.clear();
+                    sap.last_error = Some("Structural package nodes are browse-only. Select a leaf object to import it.".to_string());
+                    sap.last_status = Some("Package node selected".to_string());
+                    return true;
+                }
+            }
+
+            let metadata_uri = selected
+                .as_ref()
+                .and_then(|o| o.source_uri.clone().or_else(|| Some(o.uri.clone())))
+                .unwrap_or_else(|| object_uri.clone());
+
+            match crate::app::adt_bridge::crawl_object_manifest(
+                sap,
+                &metadata_uri,
+                selected.as_ref().map(|o| o.name.as_str()),
+                selected.as_ref().map(|o| o.object_type.as_str()),
+                selected.as_ref().and_then(|o| o.package_name.as_deref()),
+            ) {
+                Ok(manifest) => {
+                    let selected_resource_id = manifest.primary_resource_id();
+                    let clone_target_path = crate::app::adt_bridge::manifest_directory_name(
+                        manifest.object_name.as_deref(),
+                        manifest.object_type.as_deref(),
+                        manifest.package_name.as_deref(),
+                    );
+
+                    let selected_resource = selected_resource_id
+                        .as_deref()
+                        .and_then(|id| manifest.resources.iter().find(|resource| resource.id == id))
+                        .or_else(|| manifest.resources.first());
+
+                    sap.selected_object_uri = selected_resource.map(|resource| resource.uri.clone());
+                    sap.selected_object_metadata_uri = Some(manifest.metadata_uri.clone());
+                    sap.selected_object_name = selected
+                        .as_ref()
+                        .map(|o| o.name.clone())
+                        .or_else(|| manifest.object_name.clone());
+                    sap.selected_object_type = selected
+                        .as_ref()
+                        .map(|o| o.object_type.clone())
+                        .or_else(|| manifest.object_type.clone());
+                    sap.selected_object_content = selected_resource
+                        .map(|resource| resource.body.clone())
+                        .unwrap_or_default();
+                    sap.selected_object_content_type = selected_resource
+                        .and_then(|resource| resource.content_type.clone());
+                    sap.selected_object_headers = selected_resource
+                        .map(|resource| resource.headers.clone())
+                        .unwrap_or_default();
+                    sap.selected_object_metadata = manifest.metadata_xml.clone();
+                    sap.selected_object_metadata_content_type = Some("application/xml".to_string());
+                    sap.selected_manifest = Some(manifest);
+                    sap.selected_resource_id = selected_resource_id;
+                    sap.clone_target_path = clone_target_path;
+                    sap.last_error = None;
+                    sap.last_status = Some("SAP object loaded".to_string());
+                }
+                Err(err) => {
+                    sap.selected_object_uri = None;
+                    sap.selected_object_metadata_uri = None;
+                    sap.selected_object_name = selected.as_ref().map(|o| o.name.clone());
+                    sap.selected_object_type = selected.as_ref().map(|o| o.object_type.clone());
+                    sap.selected_object_content.clear();
+                    sap.selected_object_content_type = None;
+                    sap.selected_object_headers.clear();
+                    sap.selected_object_metadata.clear();
+                    sap.selected_object_metadata_content_type = None;
+                    sap.selected_manifest = None;
+                    sap.selected_resource_id = None;
                     sap.clone_target_path.clear();
                     sap.last_error = Some(format!("{:#}", err));
                     sap.last_status = Some("Object read failed".to_string());
                 }
             }
 
+            true
+        }
+
+        Action::SapAdtDebugAcceptMatrix {
+            sap_adt_id,
+            object_uri,
+        } => {
+            let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                return true;
+            };
+
+            sap.last_error = None;
+            sap.last_status = Some("Running ADT Accept matrix".to_string());
+            sap.accept_probe_results.clear();
+
+            match crate::app::adt_bridge::debug_accept_matrix(sap, object_uri) {
+                Ok(results) => {
+                    let failures = results.iter().filter(|r| r.error.is_some()).count();
+                    sap.accept_probe_results = results;
+                    sap.last_error = None;
+                    sap.last_status = Some(format!(
+                        "ADT Accept matrix complete: {} probe(s), {} failure(s)",
+                        sap.accept_probe_results.len(),
+                        failures
+                    ));
+                }
+                Err(err) => {
+                    sap.accept_probe_results.clear();
+                    sap.last_error = Some(format!("{:#}", err));
+                    sap.last_status = Some("ADT Accept matrix failed".to_string());
+                }
+            }
+
+            true
+        }
+        Action::SapAdtClearHttpTrace { sap_adt_id } => {
+            let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                return true;
+            };
+            sap.last_http_trace = None;
+            sap.accept_probe_results.clear();
+            sap.last_error = None;
+            sap.last_status = Some("ADT debug trace cleared".to_string());
             true
         }
         Action::SapAdtCloneSelectedToWorktree { sap_adt_id } => {
@@ -340,61 +590,78 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 return true;
             };
 
-            let source_uri = sap.selected_object_uri.clone();
-            let metadata_uri = sap.selected_object_metadata_uri.clone();
-            let object_name = sap.selected_object_name.clone();
-            let object_type = sap.selected_object_type.clone();
-            let target_path = if sap.clone_target_path.trim().is_empty() {
-                default_clone_target_path(
-                    sap.selected_object_name.as_deref(),
-                    sap.selected_object_type.as_deref(),
-                    Some(sap.package_query.as_str()),
-                    sap.selected_object_content_type.as_deref(),
+            let Some(mut manifest) = sap.selected_manifest.clone() else {
+                sap.last_error = Some("No SAP ADT manifest is currently loaded".to_string());
+                sap.last_status = Some("Clone failed".to_string());
+                return true;
+            };
+
+            if manifest.schema_version == 0 {
+                manifest.schema_version = 1;
+            }
+
+            let manifest_dir = if sap.clone_target_path.trim().is_empty() {
+                crate::app::adt_bridge::manifest_directory_name(
+                    manifest.object_name.as_deref().or(sap.selected_object_name.as_deref()),
+                    manifest.object_type.as_deref().or(sap.selected_object_type.as_deref()),
+                    manifest.package_name.as_deref(),
                 )
             } else {
                 sap.clone_target_path.trim().replace('\\', "/")
             };
-            let source_body = sap.selected_object_content.clone();
-            let source_content_type = sap.selected_object_content_type.clone();
-            let metadata_xml = sap.selected_object_metadata.clone();
-            let metadata_content_type = sap.selected_object_metadata_content_type.clone();
-            let headers = sap.selected_object_headers.clone();
-
-            if source_uri.as_deref().unwrap_or_default().is_empty() {
-                sap.last_error = Some("No SAP ADT object is currently loaded".to_string());
-                sap.last_status = Some("Clone failed".to_string());
-                return true;
-            }
+            let manifest_dir = manifest_dir.trim().trim_end_matches('/').to_string();
+            let manifest_path = format!("{}/manifest.adt.json", manifest_dir);
 
             let _ = state.broker.exec(CapabilityRequest::CreateWorktreeDir {
                 repo,
                 path: "sap_adt".to_string(),
             });
 
-            let sidecar_path = format!("{}.adt.json", target_path);
-            let etag = header_value(&headers, "etag");
-            let sidecar = json!({
-                "version": 1,
-                "object_name": object_name,
-                "object_type": object_type,
-                "metadata_uri": metadata_uri,
-                "source_uri": source_uri,
-                "source_content_type": source_content_type,
-                "metadata_content_type": metadata_content_type,
-                "corr_nr": sap.corr_nr.trim(),
-                "etag": etag,
-                "headers": headers,
-                "metadata_xml": metadata_xml
-            });
+            let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+            for doc in manifest.documents.iter() {
+                let rel = doc.path.trim().trim_start_matches('/');
+                if !rel.is_empty() {
+                    writes.push((format!("{}/{}", manifest_dir, rel), doc.body.clone().into_bytes()));
+                }
+            }
+            for resource in manifest.resources.iter() {
+                let rel = resource.path.trim().trim_start_matches('/');
+                if !rel.is_empty() {
+                    writes.push((format!("{}/{}", manifest_dir, rel), resource.body.clone().into_bytes()));
+                }
+            }
 
-            match write_worktree_bytes(state, &target_path, source_body.into_bytes())
-                .and_then(|_| write_worktree_bytes(state, &sidecar_path, serde_json::to_vec_pretty(&sidecar)?))
-            {
+            let manifest_bytes = match serde_json::to_vec_pretty(&manifest) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                        sap.last_error = Some(format!("{:#}", err));
+                        sap.last_status = Some("Clone failed".to_string());
+                    }
+                    return true;
+                }
+            };
+            writes.push((manifest_path.clone(), manifest_bytes));
+
+            let mut result = Ok(());
+            for (path, bytes) in writes {
+                if let Err(err) = write_worktree_bytes(state, &path, bytes) {
+                    result = Err(err);
+                    break;
+                }
+            }
+
+            match result {
                 Ok(()) => {
                     if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.clone_target_path = target_path.clone();
+                        sap.clone_target_path = manifest_dir.clone();
                         sap.last_error = None;
-                        sap.last_status = Some(format!("Cloned SAP object to {}", target_path));
+                        sap.last_status = Some(format!(
+                            "Cloned SAP manifest to {} ({} resources, {} documents)",
+                            manifest_dir,
+                            manifest.resources.len(),
+                            manifest.documents.len()
+                        ));
                     }
                     state.start_analysis_refresh_async();
                 }
@@ -417,129 +684,97 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 return true;
             }
 
-            let source_path = path.trim().replace('\\', "/");
-            let sidecar_path = format!("{}.adt.json", source_path);
-
-            let source_text = match read_worktree_text(state, &source_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.last_error = Some(format!("{:#}", err));
-                        sap.last_status = Some("Push failed".to_string());
-                    }
-                    return true;
-                }
-            };
-
-            let sidecar_text = match read_worktree_text(state, &sidecar_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.last_error = Some(format!("{:#}", err));
-                        sap.last_status = Some("Push failed".to_string());
-                    }
-                    return true;
-                }
-            };
-
-            let mut sidecar: Value = match serde_json::from_str(&sidecar_text) {
+            let (manifest_path, mut manifest, resource_index, _) = match load_manifest_for_local_path(state, path) {
                 Ok(value) => value,
                 Err(err) => {
                     if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.last_error = Some(format!("Invalid sidecar JSON in {}: {}", sidecar_path, err));
+                        sap.last_error = Some(format!("{:#}", err));
                         sap.last_status = Some("Push failed".to_string());
                     }
                     return true;
                 }
             };
 
-            let source_uri = sidecar
-                .get("source_uri")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let metadata_uri = sidecar
-                .get("metadata_uri")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let lock_uri = if !metadata_uri.is_empty() {
-                metadata_uri.clone()
+            let manifest_dir = manifest_dir_from_manifest_path(&manifest_path);
+            let requested_path = normalize_repo_relative_path(path);
+            let requested_relative_path = if requested_path == manifest_path || requested_path == manifest_dir {
+                None
+            } else if manifest_dir.is_empty() {
+                Some(requested_path.as_str())
             } else {
-                source_uri.clone()
+                requested_path.strip_prefix(&(manifest_dir.clone() + "/"))
             };
-            let content_type = sidecar
-                .get("source_content_type")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| Some("text/plain; charset=utf-8".to_string()));
-            let corr_nr = sidecar
-                .get("corr_nr")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    state
-                        .sap_adts
-                        .get(sap_adt_id)
-                        .map(|sap| sap.corr_nr.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                });
-            let if_match = sidecar
-                .get("etag")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    let xml = sidecar.get("metadata_xml").and_then(|v| v.as_str()).unwrap_or_default();
-                    let marker = "etag=\"";
-                    xml.find(marker).and_then(|idx| {
-                        let start = idx + marker.len();
-                        xml[start..].find('"').map(|end| xml[start..start + end].to_string())
-                    })
-                });
-            let lock_handle = sidecar
-                .get("lock_handle")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    sidecar
-                        .get("headers")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| {
-                            let headers = arr
-                                .iter()
-                                .filter_map(|item| {
-                                    let pair = item.as_array()?;
-                                    if pair.len() != 2 {
-                                        return None;
-                                    }
-                                    Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string()))
-                                })
-                                .collect::<Vec<_>>();
-                            header_value(&headers, "lock_handle")
-                                .or_else(|| header_value(&headers, "lock-handle"))
-                                .or_else(|| header_value(&headers, "x-lock-handle"))
-                                .or_else(|| header_value(&headers, "x-lockhandle"))
-                        })
-                });
 
-            if source_uri.is_empty() {
-                if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                    sap.last_error = Some(format!("{} is missing source_uri", sidecar_path));
-                    sap.last_status = Some("Push failed".to_string());
-                }
-                return true;
+            let requested_resource_index = requested_relative_path
+                .and_then(|rel| manifest.resources.iter().position(|resource| resource.path == rel && resource.editable))
+                .or_else(|| manifest.resources.get(resource_index).and_then(|resource| {
+                    if resource.editable {
+                        Some(resource_index)
+                    } else {
+                        None
+                    }
+                }));
+
+            let metadata_uri = manifest.metadata_uri.trim().to_string();
+            let object_name = manifest.object_name.clone();
+            let object_type = manifest.object_type.clone();
+            let package_name = manifest.package_name.clone();
+            let clone_target_path = manifest_dir.clone();
+
+            let mut pending_updates: Vec<(usize, String)> = Vec::new();
+
+            if let Some(index) = requested_resource_index {
+                let Some(resource) = manifest.resources.get(index) else {
+                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                        sap.last_error = Some("Manifest resource index is out of range".to_string());
+                        sap.last_status = Some("Push failed".to_string());
+                    }
+                    return true;
+                };
+                let local_path = join_manifest_relative_path(&manifest_dir, &resource.path);
+                let source_text = match read_worktree_text(state, &local_path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                            sap.last_error = Some(format!("{:#}", err));
+                            sap.last_status = Some("Push failed".to_string());
+                        }
+                        return true;
+                    }
+                };
+                pending_updates.push((index, source_text));
             }
 
-            if lock_uri.is_empty() {
+            for index in 0..manifest.resources.len() {
+                let Some(resource) = manifest.resources.get(index) else {
+                    continue;
+                };
+                if !resource.editable || resource.uri.trim().is_empty() {
+                    continue;
+                }
+                if pending_updates.iter().any(|(pending_index, _)| *pending_index == index) {
+                    continue;
+                }
+                let local_path = join_manifest_relative_path(&manifest_dir, &resource.path);
+                let source_text = match read_worktree_text(state, &local_path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                            sap.last_error = Some(format!("{:#}", err));
+                            sap.last_status = Some("Push failed".to_string());
+                        }
+                        return true;
+                    }
+                };
+                if source_text != resource.body {
+                    pending_updates.push((index, source_text));
+                }
+            }
+
+            if pending_updates.is_empty() {
                 if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                    sap.last_error = Some(format!("{} is missing metadata_uri/source_uri", sidecar_path));
-                    sap.last_status = Some("Push failed".to_string());
+                    sap.last_error = None;
+                    sap.last_status = Some("No local SAP ADT changes to push".to_string());
                 }
                 return true;
             }
@@ -549,119 +784,219 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                     return true;
                 };
                 sap.last_error = None;
-                sap.last_status = Some("Pushing local SAP ADT changes".to_string());
+                sap.last_status = Some(format!("Pushing {} local SAP ADT resource(s)", pending_updates.len()));
             }
 
+            let corr_nr = state
+                .sap_adts
+                .get(sap_adt_id)
+                .map(|sap| sap.corr_nr.trim().to_string())
+                .filter(|value| !value.is_empty());
 
-            let mut effective_if_match = if_match.clone();
-            let mut update_result = {
-                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
-                    return true;
-                };
-                crate::app::adt_bridge::update_object(
-                    sap,
-                    &source_uri,
-                    &source_text,
-                    content_type.as_deref(),
-                    lock_handle.as_deref(),
-                    corr_nr.as_deref(),
-                    effective_if_match.as_deref(),
-                )
-            };
+            let mut pushed_resource_uris: Vec<String> = Vec::new();
 
-            if let Err(err) = &update_result {
-                let err_text = format!("{:#}", err);
-                if err_text.contains("412") {
-                    if let Some(server_etag) = extract_server_etag_from_adt_error(&err_text) {
-                        effective_if_match = Some(server_etag.clone());
-                        sidecar["etag"] = Value::String(server_etag);
-                        if let Ok(text) = serde_json::to_string_pretty(&sidecar) {
-                            let _ = write_worktree_bytes(state, &sidecar_path, text.into_bytes());
+            for (current_index, source_text) in pending_updates {
+                let (source_uri, content_type, lock_handle, fallback_etag) = match manifest.resources.get(current_index) {
+                    Some(resource) => (
+                        resource.uri.trim().to_string(),
+                        resource
+                            .content_type
+                            .clone()
+                            .or_else(|| Some("text/plain; charset=utf-8".to_string())),
+                        resource.lock_handle.clone(),
+                        resource.etag.clone().or_else(|| manifest.etag.clone()),
+                    ),
+                    None => {
+                        if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                            sap.last_error = Some("Manifest resource index is out of range".to_string());
+                            sap.last_status = Some("Push failed".to_string());
                         }
-                        update_result = {
-                            let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
-                                return true;
+                        return true;
+                    }
+                };
+
+                if source_uri.is_empty() {
+                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                        sap.last_error = Some(format!("{} has a manifest resource with no uri", manifest_path));
+                        sap.last_status = Some("Push failed".to_string());
+                    }
+                    return true;
+                }
+
+                let mut effective_if_match = fallback_etag.clone();
+                let mut update_result = {
+                    let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                        return true;
+                    };
+                    crate::app::adt_bridge::update_object(
+                        sap,
+                        &source_uri,
+                        &source_text,
+                        content_type.as_deref(),
+                        lock_handle.as_deref(),
+                        corr_nr.as_deref(),
+                        effective_if_match.as_deref(),
+                    )
+                };
+
+                if let Err(err) = &update_result {
+                    let err_text = format!("{:#}", err);
+                    if err_text.contains("412") {
+                        if let Some(server_etag) = extract_server_etag_from_adt_error(&err_text) {
+                            effective_if_match = Some(server_etag.clone());
+                            if let Some(resource) = manifest.resources.get_mut(current_index) {
+                                resource.etag = Some(server_etag.clone());
+                            }
+                            manifest.etag = Some(server_etag);
+                            let _ = write_manifest_to_worktree(state, &manifest_path, &manifest);
+                            update_result = {
+                                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                                    return true;
+                                };
+                                crate::app::adt_bridge::update_object(
+                                    sap,
+                                    &source_uri,
+                                    &source_text,
+                                    content_type.as_deref(),
+                                    lock_handle.as_deref(),
+                                    corr_nr.as_deref(),
+                                    effective_if_match.as_deref(),
+                                )
                             };
-                            crate::app::adt_bridge::update_object(
-                                sap,
-                                &source_uri,
-                                &source_text,
-                                content_type.as_deref(),
-                                lock_handle.as_deref(),
-                                corr_nr.as_deref(),
-                                effective_if_match.as_deref(),
-                            )
-                        };
+                        }
                     }
                 }
-            }
 
-            match update_result {
-                Ok(update_result) => {
+                let update_result = match update_result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                            sap.last_error = Some(format!("{:#}", err));
+                            sap.last_status = Some("Push failed".to_string());
+                        }
+                        return true;
+                    }
+                };
+
+                if let Some(resource) = manifest.resources.get_mut(current_index) {
+                    resource.body = source_text;
+                    resource.headers = update_result.headers.clone();
                     if let Some(handle) = header_value(&update_result.headers, "lock_handle")
                         .or_else(|| header_value(&update_result.headers, "lock-handle"))
                         .or_else(|| header_value(&update_result.headers, "x-lock-handle"))
                         .or_else(|| header_value(&update_result.headers, "x-lockhandle"))
+                        .or_else(|| lock_handle.clone())
                     {
-                        sidecar["lock_handle"] = Value::String(handle);
-                    } else if let Some(handle) = lock_handle.clone() {
-                        sidecar["lock_handle"] = Value::String(handle);
+                        resource.lock_handle = Some(handle);
                     }
                     if let Some(etag) = header_value(&update_result.headers, "etag")
                         .or_else(|| effective_if_match.clone())
                     {
-                        sidecar["etag"] = Value::String(etag);
+                        resource.etag = Some(etag.clone());
+                        manifest.etag = Some(etag);
                     }
-                    sidecar["headers"] = Value::Array(
-                        update_result
-                            .headers
-                            .iter()
-                            .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), Value::String(v.clone())]))
-                            .collect(),
-                    );
+                }
 
-                    if let Ok(text) = serde_json::to_string_pretty(&sidecar) {
-                        let _ = write_worktree_bytes(state, &sidecar_path, text.into_bytes());
-                    }
+                pushed_resource_uris.push(source_uri);
+            }
 
-                    let syntax_result = {
-                        let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
-                            return true;
-                        };
-                        crate::app::adt_bridge::syntax_check(sap, &source_uri)
+            if let Err(err) = write_manifest_to_worktree(state, &manifest_path, &manifest) {
+                if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                    sap.last_error = Some(format!("Push succeeded, but manifest write failed: {:#}", err));
+                    sap.last_status = Some("Push incomplete".to_string());
+                }
+                return true;
+            }
+
+            let check_uri = if !metadata_uri.is_empty() {
+                metadata_uri.clone()
+            } else {
+                pushed_resource_uris.first().cloned().unwrap_or_default()
+            };
+
+            let syntax_result = {
+                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                    return true;
+                };
+                crate::app::adt_bridge::syntax_check(sap, &check_uri)
+            };
+
+            let refresh_result = {
+                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                    return true;
+                };
+                crate::app::adt_bridge::crawl_object_manifest(
+                    sap,
+                    &check_uri,
+                    object_name.as_deref(),
+                    object_type.as_deref(),
+                    package_name.as_deref(),
+                )
+            };
+
+            let selection_uri = requested_resource_index
+                .and_then(|index| manifest.resources.get(index))
+                .map(|resource| resource.uri.clone())
+                .filter(|uri| !uri.trim().is_empty())
+                .or_else(|| pushed_resource_uris.last().cloned());
+
+            let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                return true;
+            };
+
+            match syntax_result {
+                Ok(check) => {
+                    sap.last_error = None;
+                    let suffix = if check.body.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", check.body.trim())
                     };
+                    sap.last_status = Some(format!(
+                        "Pushed {} SAP ADT resource(s) and syntax checked{}",
+                        pushed_resource_uris.len(),
+                        suffix
+                    ));
 
-                    let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
-                        return true;
-                    };
+                    match refresh_result {
+                        Ok(refreshed) => {
+                            let selected_resource_id = selection_uri
+                                .as_deref()
+                                .and_then(|uri| refreshed.resources.iter().find(|resource| resource.uri == uri))
+                                .map(|resource| resource.id.clone())
+                                .or_else(|| refreshed.primary_resource_id());
 
-                    match syntax_result {
-                        Ok(check) => {
-                            sap.last_error = None;
-                            let suffix = if check.body.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", check.body.trim())
-                            };
-                            sap.last_status = Some(format!("Pushed to ADT and syntax checked{}", suffix));
-                            sap.selected_object_uri = Some(source_uri.clone());
-                            if !metadata_uri.is_empty() {
-                                sap.selected_object_metadata_uri = Some(metadata_uri);
-                            }
-                            sap.selected_object_content = source_text;
-                            sap.selected_object_headers = update_result.headers;
+                            let selected_resource = selected_resource_id
+                                .as_deref()
+                                .and_then(|id| refreshed.resources.iter().find(|resource| resource.id == id))
+                                .or_else(|| refreshed.resources.first());
+
+                            sap.selected_object_uri = selected_resource.map(|resource| resource.uri.clone());
+                            sap.selected_object_metadata_uri = Some(refreshed.metadata_uri.clone());
+                            sap.selected_object_name = refreshed.object_name.clone().or_else(|| object_name.clone());
+                            sap.selected_object_type = refreshed.object_type.clone().or_else(|| object_type.clone());
+                            sap.selected_object_content = selected_resource
+                                .map(|resource| resource.body.clone())
+                                .unwrap_or_default();
+                            sap.selected_object_content_type = selected_resource
+                                .and_then(|resource| resource.content_type.clone());
+                            sap.selected_object_headers = selected_resource
+                                .map(|resource| resource.headers.clone())
+                                .unwrap_or_default();
+                            sap.selected_object_metadata = refreshed.metadata_xml.clone();
+                            sap.selected_object_metadata_content_type = Some("application/xml".to_string());
+                            sap.selected_manifest = Some(refreshed);
+                            sap.selected_resource_id = selected_resource_id;
+                            sap.clone_target_path = clone_target_path;
                         }
                         Err(err) => {
-                            sap.last_error = Some(format!("{:#}", err));
-                            sap.last_status = Some("Pushed to ADT but syntax check failed".to_string());
+                            sap.last_error = Some(format!("Push succeeded, but manifest refresh failed: {:#}", err));
                         }
                     }
                 }
                 Err(err) => {
-                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.last_error = Some(format!("{:#}", err));
-                        sap.last_status = Some("Push failed".to_string());
-                    }
+                    sap.last_error = Some(format!("{:#}", err));
+                    sap.last_status = Some("Pushed to ADT but syntax check failed".to_string());
                 }
             }
 
@@ -676,10 +1011,8 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 return true;
             }
 
-            let source_path = path.trim().replace('\\', "/");
-            let sidecar_path = format!("{}.adt.json", source_path);
-            let sidecar_text = match read_worktree_text(state, &sidecar_path) {
-                Ok(text) => text,
+            let (manifest_path, manifest, resource_index, _) = match load_manifest_for_local_path(state, path) {
+                Ok(value) => value,
                 Err(err) => {
                     if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
                         sap.last_error = Some(format!("{:#}", err));
@@ -689,54 +1022,92 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 }
             };
 
-            let sidecar: Value = match serde_json::from_str(&sidecar_text) {
-                Ok(value) => value,
-                Err(err) => {
-                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                        sap.last_error = Some(format!("Invalid sidecar JSON in {}: {}", sidecar_path, err));
-                        sap.last_status = Some("Activate failed".to_string());
-                    }
-                    return true;
-                }
+            let object_name = manifest.object_name.clone();
+            let object_type = manifest.object_type.clone();
+            let package_name = manifest.package_name.clone();
+            let fallback_source_uri = manifest
+                .resources
+                .get(resource_index)
+                .map(|resource| resource.uri.clone())
+                .unwrap_or_default();
+            let activate_uri = if !manifest.metadata_uri.trim().is_empty() {
+                manifest.metadata_uri.trim().to_string()
+            } else {
+                fallback_source_uri.clone()
             };
-
-            let activate_uri = sidecar
-                .get("metadata_uri")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| sidecar.get("source_uri").and_then(|v| v.as_str()))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
 
             if activate_uri.is_empty() {
                 if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
-                    sap.last_error = Some(format!("{} is missing metadata_uri/source_uri", sidecar_path));
+                    sap.last_error = Some(format!("{} is missing metadata_uri/source_uri", manifest_path));
                     sap.last_status = Some("Activate failed".to_string());
                 }
                 return true;
             }
 
-            let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
-                return true;
+            {
+                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                    return true;
+                };
+                sap.last_error = None;
+                sap.last_status = Some("Activating SAP object".to_string());
+            }
+
+            let activate_result = {
+                let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                    return true;
+                };
+                crate::app::adt_bridge::activate_object(sap, &activate_uri)
             };
 
-            sap.last_error = None;
-            sap.last_status = Some("Activating SAP object".to_string());
-
-            match crate::app::adt_bridge::activate_object(sap, &activate_uri) {
+            match activate_result {
                 Ok(result) => {
                     let suffix = if result.body.trim().is_empty() {
                         String::new()
                     } else {
                         format!(": {}", result.body.trim())
                     };
+
+                    let refresh_result = {
+                        let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                            return true;
+                        };
+                        crate::app::adt_bridge::crawl_object_manifest(
+                            sap,
+                            &activate_uri,
+                            object_name.as_deref(),
+                            object_type.as_deref(),
+                            package_name.as_deref(),
+                        )
+                    };
+
+                    let Some(sap) = state.sap_adts.get_mut(sap_adt_id) else {
+                        return true;
+                    };
                     sap.last_error = None;
                     sap.last_status = Some(format!("Activated SAP object{}", suffix));
+
+                    if let Ok(refreshed) = refresh_result {
+                        let selected_resource_id = refreshed
+                            .resources
+                            .iter()
+                            .find(|resource| resource.uri == fallback_source_uri)
+                            .map(|resource| resource.id.clone())
+                            .or_else(|| refreshed.primary_resource_id());
+                        sap.selected_object_name = refreshed.object_name.clone().or_else(|| object_name.clone());
+                        sap.selected_object_type = refreshed.object_type.clone().or_else(|| object_type.clone());
+                        sap.selected_manifest = Some(refreshed);
+                        sap.selected_resource_id = selected_resource_id;
+                        sap.clone_target_path = manifest_path
+                            .strip_suffix("/manifest.adt.json")
+                            .unwrap_or("")
+                            .to_string();
+                    }
                 }
                 Err(err) => {
-                    sap.last_error = Some(format!("{:#}", err));
-                    sap.last_status = Some("Activate failed".to_string());
+                    if let Some(sap) = state.sap_adts.get_mut(sap_adt_id) {
+                        sap.last_error = Some(format!("{:#}", err));
+                        sap.last_status = Some("Activate failed".to_string());
+                    }
                 }
             }
 

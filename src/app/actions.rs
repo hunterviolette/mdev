@@ -255,6 +255,14 @@ pub enum Action {
         object_uri: String,
     },
 
+    SapAdtDebugAcceptMatrix {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+    SapAdtClearHttpTrace {
+        sap_adt_id: ComponentId,
+    },
+
     SapAdtCloneSelectedToWorktree {
         sap_adt_id: ComponentId,
     },
