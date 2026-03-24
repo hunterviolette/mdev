@@ -12,7 +12,7 @@ use crate::capabilities::GitStatusEntry;
 
 use crate::model::{AnalysisResult, CommitEntry};
 use crate::platform::Platform;
-use super::async_job::{AsyncLatestJob, AsyncQueuedJob};
+use super::async_job::{AsyncLatestJob, AsyncParallelJob, AsyncQueuedJob};
 
 use super::openai::OpenAIClient;
 
@@ -393,28 +393,88 @@ pub struct SapAdtObjectSummary {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SapAdtHttpTrace {
-    pub label: String,
-    pub method: String,
-    pub url: String,
-    pub request_headers: Vec<(String, String)>,
-    pub request_body: String,
-    pub response_status: Option<u16>,
-    pub response_headers: Vec<(String, String)>,
-    pub response_body: String,
-    pub error: Option<String>,
+pub struct SapAdtExportRow {
+    pub object_name: String,
+    pub object_type: String,
+    pub manifest_path: String,
+    pub changed_files: usize,
+    pub pushed_files: usize,
+    pub syntax_ok: bool,
+    pub activation_ok: bool,
+    pub message: String,
+    pub transport: Option<String>,
+    pub export_candidates: Vec<SapAdtExportCandidate>,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SapAdtAcceptProbe {
-    pub accept: String,
-    pub status: Option<u16>,
-    pub content_type: Option<String>,
-    pub response_preview: String,
-    pub error: Option<String>,
+pub struct SapAdtExportCandidate {
+    pub resource_id: String,
+    pub uri: String,
+    pub path: String,
+    pub etag: Option<String>,
+    pub content_type: String,
+    pub activatable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtObjectOperationRow {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtLogEntry {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug)]
+pub struct SapAdtImportJobInput {
+    pub object_uri: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub clone_target_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtImportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobInput {
+    pub manifest_path: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub auto_activate: bool,
+    pub corr_nr: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+    pub row: SapAdtExportRow,
+}
+
 pub struct SapAdtState {
     pub connected: bool,
     pub last_status: Option<String>,
@@ -432,6 +492,10 @@ pub struct SapAdtState {
     pub include_subpackages: bool,
     pub package_tree_xml: String,
     pub package_objects: Vec<SapAdtObjectSummary>,
+    pub import_popup_open: bool,
+    pub export_popup_open: bool,
+    pub logs_popup_open: bool,
+    pub import_selected_object_uris: HashSet<String>,
     pub selected_object_uri: Option<String>,
     pub selected_object_metadata_uri: Option<String>,
     pub selected_object_name: Option<String>,
@@ -445,9 +509,15 @@ pub struct SapAdtState {
     pub selected_object_metadata_content_type: Option<String>,
     pub clone_target_path: String,
     pub corr_nr: String,
-    pub debug_http_enabled: bool,
-    pub last_http_trace: Option<SapAdtHttpTrace>,
-    pub accept_probe_results: Vec<SapAdtAcceptProbe>,
+    pub export_selected_manifest_paths: HashSet<String>,
+    pub export_results_scan: Vec<SapAdtExportRow>,
+    pub export_results: Vec<SapAdtExportRow>,
+    pub object_operations: Vec<SapAdtObjectOperationRow>,
+    pub logs: Vec<SapAdtLogEntry>,
+    pub import_job: AsyncParallelJob<SapAdtImportJobInput, SapAdtImportJobResult>,
+    pub export_job: AsyncParallelJob<SapAdtExportJobInput, SapAdtExportJobResult>,
+    pub export_auto_activate: bool,
+    pub export_show_only_changed: bool,
 }
 
 impl SapAdtState {
@@ -469,6 +539,10 @@ impl SapAdtState {
             include_subpackages: true,
             package_tree_xml: String::new(),
             package_objects: Vec::new(),
+            import_popup_open: false,
+            export_popup_open: false,
+            logs_popup_open: false,
+            import_selected_object_uris: HashSet::new(),
             selected_object_uri: None,
             selected_object_metadata_uri: None,
             selected_object_name: None,
@@ -482,9 +556,15 @@ impl SapAdtState {
             selected_object_metadata_content_type: None,
             clone_target_path: String::new(),
             corr_nr: String::new(),
-            debug_http_enabled: true,
-            last_http_trace: None,
-            accept_probe_results: Vec::new(),
+            export_selected_manifest_paths: HashSet::new(),
+            export_results_scan: Vec::new(),
+            export_results: Vec::new(),
+            object_operations: Vec::new(),
+            logs: Vec::new(),
+            import_job: AsyncParallelJob::default(),
+            export_job: AsyncParallelJob::default(),
+            export_auto_activate: true,
+            export_show_only_changed: true,
         }
     }
 }
@@ -1298,9 +1378,7 @@ impl TreeState {
             untracked_paths: HashSet::new(),
             git_status_by_path: HashMap::new(),
             last_auto_refresh_s: 0.0,
-            auto_refresh_interval_s: 4.0,
             last_git_status_refresh_s: 0.0,
-            git_status_interval_s: 1.0,
             analysis_job: AsyncLatestJob::default(),
             git_status_job: AsyncLatestJob::default(),
             diff_stats_job: AsyncLatestJob::default(),

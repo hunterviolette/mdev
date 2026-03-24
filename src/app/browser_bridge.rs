@@ -630,7 +630,7 @@ pub fn get_session_cookies(cfg: &mut BrowserTurnConfig, urls: &[String]) -> Resu
     let poll = std::time::Duration::from_millis(1_000);
     let url_list = urls.join(", ");
     let mut attempt: u32 = 0;
-    let mut last_header = String::new();
+    let mut last_header: Option<String> = None;
 
     loop {
         attempt += 1;
@@ -720,9 +720,10 @@ pub fn get_session_cookies(cfg: &mut BrowserTurnConfig, urls: &[String]) -> Resu
             );
         }
 
-        last_header = cookie_header;
+        last_header = Some(cookie_header);
 
         if started.elapsed() >= timeout {
+            let last_header = last_header.unwrap_or_default();
             eprintln!(
                 "[sap_adt] cookie harvest timeout session_id={} elapsed_ms={} last_cookie_header={}",
                 session_id,

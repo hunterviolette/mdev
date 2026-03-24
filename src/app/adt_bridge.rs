@@ -1244,11 +1244,6 @@ fn collect_tag_texts(block: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-fn compact_xml_preview(xml: &str, limit: usize) -> String {
-    let compact = xml.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact.chars().take(limit).collect()
-}
-
 fn extract_adt_exception_message(xml: &str) -> Option<String> {
     let type_re = Regex::new(r#"<type\b[^>]*id=\"([^\"]+)\"[^>]*/?>"#).ok()?;
     let message_re = Regex::new(r#"(?s)<(?:[^\s>]+:)?(?:localizedMessage|message)\b[^>]*>(.*?)</(?:[^\s>]+:)?(?:localizedMessage|message)>"#).ok()?;
@@ -1457,65 +1452,6 @@ fn ensure_transport_session(sap: &mut SapAdtState) -> Result<String> {
     connect_transport_session(sap, &cookie_header)
 }
 
-fn xml_debug_tag_samples(xml: &str, limit: usize) -> Vec<String> {
-    let bytes = xml.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-
-    while i < bytes.len() && out.len() < limit {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-
-        let start = i + 1;
-        if start >= bytes.len() {
-            break;
-        }
-
-        let first = bytes[start];
-        if first == b'/' || first == b'!' || first == b'?' {
-            i += 1;
-            continue;
-        }
-
-        let mut end = start;
-        while end < bytes.len() {
-            let ch = bytes[end];
-            if ch == b' ' || ch == b'\t' || ch == b'\r' || ch == b'\n' || ch == b'>' || ch == b'/' {
-                break;
-            }
-            end += 1;
-        }
-
-        if end > start {
-            let tag = &xml[start..end];
-            if !out.iter().any(|existing| existing == tag) {
-                out.push(tag.to_string());
-            }
-        }
-
-        i = end;
-    }
-
-    out
-}
-
-fn xml_debug_excerpt_lines(xml: &str, limit: usize) -> Vec<String> {
-    xml.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(limit)
-        .map(|line| {
-            if line.len() > 220 {
-                format!("{}...", &line[..220])
-            } else {
-                line.to_string()
-            }
-        })
-        .collect()
-}
-
 fn xml_tag_text(block: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -1523,63 +1459,6 @@ fn xml_tag_text(block: &str, tag: &str) -> Option<String> {
     let rest = &block[start..];
     let end = rest.find(&close)?;
     Some(rest[..end].trim().to_string())
-}
-
-fn log_matching_asxml_repository_node(xml: &str, package_name: &str, package_uri: &str) {
-    let open = "<SEU_ADT_REPOSITORY_OBJ_NODE>";
-    let close = "</SEU_ADT_REPOSITORY_OBJ_NODE>";
-    let mut cursor = 0usize;
-    let package_name_upper = package_name.trim().to_ascii_uppercase();
-    let package_uri_lower = package_uri.trim().to_ascii_lowercase();
-
-    while let Some(start_rel) = xml[cursor..].find(open) {
-        let start = cursor + start_rel + open.len();
-        let rest = &xml[start..];
-        let Some(end_rel) = rest.find(close) else {
-            break;
-        };
-        let block = &rest[..end_rel];
-
-        let object_name = xml_tag_text(block, "OBJECT_NAME").unwrap_or_default();
-        let tech_name = xml_tag_text(block, "TECH_NAME").unwrap_or_default();
-        let object_uri = xml_tag_text(block, "OBJECT_URI").unwrap_or_default();
-
-        let matches_name = object_name.trim().eq_ignore_ascii_case(&package_name_upper)
-            || tech_name.trim().eq_ignore_ascii_case(&package_name_upper);
-        let matches_uri = object_uri.trim().eq_ignore_ascii_case(&package_uri_lower);
-
-        if matches_name || matches_uri {
-            let node_id = xml_tag_text(block, "NODE_ID").unwrap_or_default();
-            let parent_name = xml_tag_text(block, "PARENT_NAME").unwrap_or_default();
-            let expandable = xml_tag_text(block, "EXPANDABLE").unwrap_or_default();
-            let object_type = xml_tag_text(block, "OBJECT_TYPE").unwrap_or_default();
-            let object_vit_uri = xml_tag_text(block, "OBJECT_VIT_URI").unwrap_or_default();
-            let description = xml_tag_text(block, "DESCRIPTION").unwrap_or_default();
-            eprintln!(
-                "[sap_adt] matching package node package={} object_type={} object_name={} tech_name={} object_uri={} object_vit_uri={} node_id={} parent_name={} expandable={} description={} block={}",
-                package_name,
-                object_type,
-                object_name,
-                tech_name,
-                object_uri,
-                object_vit_uri,
-                node_id,
-                parent_name,
-                expandable,
-                description,
-                block
-            );
-            return;
-        }
-
-        cursor = start + end_rel + close.len();
-    }
-
-    eprintln!(
-        "[sap_adt] matching package node not found package={} package_uri={}",
-        package_name,
-        package_uri
-    );
 }
 
 fn looks_like_generated_include_name(name: &str) -> bool {
@@ -1772,17 +1651,6 @@ pub fn parse_package_tree_xml(xml: &str) -> Result<Vec<SapAdtObjectSummary>> {
                 .then_with(|| a.uri.cmp(&b.uri))
         });
 
-        let preview: Vec<String> = out
-            .iter()
-            .take(20)
-            .map(|item| format!("{} {} {}", item.object_type, item.name, item.uri))
-            .collect();
-        eprintln!(
-            "[sap_adt] parse_package_tree_xml recognized={} preview={}",
-            out.len(),
-            preview.join(" | ")
-        );
-
         return Ok(out);
     }
 
@@ -1849,30 +1717,6 @@ pub fn parse_package_tree_xml(xml: &str) -> Result<Vec<SapAdtObjectSummary>> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.uri.cmp(&b.uri))
     });
-
-    if out.is_empty() {
-        let tags = xml_debug_tag_samples(xml, 40);
-        let lines = xml_debug_excerpt_lines(xml, 20);
-        eprintln!(
-            "[sap_adt] parse_package_tree_xml recognized=0 xml_bytes={} tag_samples={}",
-            xml.len(),
-            tags.join(" | ")
-        );
-        for (idx, line) in lines.iter().enumerate() {
-            eprintln!("[sap_adt] parse_package_tree_xml line[{}]={}", idx, line);
-        }
-    } else {
-        let preview: Vec<String> = out
-            .iter()
-            .take(20)
-            .map(|item| format!("{} {} {}", item.object_type, item.name, item.uri))
-            .collect();
-        eprintln!(
-            "[sap_adt] parse_package_tree_xml recognized={} preview={}",
-            out.len(),
-            preview.join(" | ")
-        );
-    }
 
     Ok(out)
 }
@@ -1997,15 +1841,6 @@ fn load_package_tree_xml(
             .ok_or_else(|| anyhow!("ADT package tree response missing body"))?
             .to_string();
 
-        let preview = compact_xml_preview(&xml, 400);
-        eprintln!(
-            "[sap_adt] package tree package={} include_subpackages={} xml_bytes={} xml_preview={}",
-            package_name,
-            include_subpackages,
-            xml.len(),
-            preview
-        );
-
         if let Some(message) = extract_adt_exception_message(&xml) {
             eprintln!(
                 "[sap_adt] package tree exception package={} include_subpackages={} message={}",
@@ -2059,13 +1894,6 @@ fn load_package_metadata_summary(
         .or_else(|| extract_xml_attr_value(&xml, "type"))
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| anyhow!("ADT package metadata did not expose a package type"))?;
-
-    eprintln!(
-        "[sap_adt] package metadata package={} uri={} type={}",
-        package_name,
-        package_uri,
-        package_type
-    );
 
     Ok((package_uri, package_type))
 }
@@ -2122,11 +1950,6 @@ fn load_nodestructure_xml(
         .ok_or_else(|| anyhow!("nodestructure response missing body"))?
         .to_string();
 
-    eprintln!(
-        "[sap_adt] nodestructure success package={} package_uri={} package_type={} bytes={}",
-        package_name, package_uri, package_type, xml.len()
-    );
-
     Ok(xml)
 }
 
@@ -2168,15 +1991,6 @@ fn search_repository_objects_xml(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("ADT repository search response missing body"))?
             .to_string();
-
-        let preview = compact_xml_preview(&xml, 400);
-        eprintln!(
-            "[sap_adt] repository search package={} query={} xml_bytes={} xml_preview={}",
-            package_name,
-            query,
-            xml.len(),
-            preview
-        );
 
         if let Some(message) = extract_adt_exception_message(&xml) {
             eprintln!(
@@ -2257,13 +2071,6 @@ pub fn list_package_objects(sap: &mut SapAdtState, package_name: &str, include_s
     let base_url = bridge_base_url(&discovery_url)?;
     let bridge_dir = transport_bridge_dir(sap);
 
-    eprintln!(
-        "[sap_adt] list_package_objects start package={} include_subpackages={} session_id={}",
-        package_name,
-        include_subpackages,
-        session_id
-    );
-
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
     client.ensure_started(&bridge_dir, &base_url)?;
@@ -2321,201 +2128,31 @@ fn json_headers_to_pairs(value: Option<&serde_json::Value>) -> Vec<(String, Stri
         .unwrap_or_default()
 }
 
-fn print_terminal_headers(headers: &[(String, String)]) {
-    if headers.is_empty() {
-        eprintln!("(none)");
-        return;
-    }
-    for (k, v) in headers {
-        eprintln!("{}: {}", k, v);
-    }
-}
-
-fn print_terminal_body(label: &str, body: &str) {
-    eprintln!("{}", label);
-    if body.is_empty() {
-        eprintln!("(empty)");
-    } else {
-        eprintln!("{}", body);
-    }
-}
-
-fn dump_adt_trace_to_terminal(trace: &crate::app::state::SapAdtHttpTrace) {
-    eprintln!("\n================ SAP ADT HTTP TRACE ================");
-    eprintln!("label: {}", trace.label);
-    eprintln!("method: {}", trace.method);
-    eprintln!("url: {}", trace.url);
-    match trace.response_status {
-        Some(status) => eprintln!("status: {}", status),
-        None => eprintln!("status: (none)"),
-    }
-    eprintln!("---------------- request headers ----------------");
-    print_terminal_headers(&trace.request_headers);
-    eprintln!("---------------- request body -------------------");
-    print_terminal_body("", &trace.request_body);
-    eprintln!("--------------- response headers ----------------");
-    print_terminal_headers(&trace.response_headers);
-    eprintln!("---------------- response body ------------------");
-    print_terminal_body("", &trace.response_body);
-    eprintln!("-------------------- error ----------------------");
-    match &trace.error {
-        Some(error) if !error.is_empty() => eprintln!("{}", error),
-        _ => eprintln!("(none)"),
-    }
-    eprintln!("=================================================\n");
-}
-
-fn record_adt_trace(
-    sap: &mut SapAdtState,
+fn log_adt_http(
     label: &str,
     method: &str,
     url: &str,
-    request_headers: Vec<(String, String)>,
-    request_body: String,
     response_status: Option<u16>,
-    response_headers: Vec<(String, String)>,
-    response_body: String,
-    error: Option<String>,
+    error: Option<&str>,
 ) {
-    let trace = crate::app::state::SapAdtHttpTrace {
-        label: label.to_string(),
-        method: method.to_string(),
-        url: url.to_string(),
-        request_headers,
-        request_body,
-        response_status,
-        response_headers,
-        response_body,
-        error,
-    };
+    let status = response_status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "ERR".to_string());
 
-    dump_adt_trace_to_terminal(&trace);
+    let error_suffix = error
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" error={}", s.replace('\n', " ")))
+        .unwrap_or_default();
 
-    if sap.debug_http_enabled {
-        sap.last_http_trace = Some(trace);
-    }
-}
-
-pub fn debug_accept_matrix(
-    sap: &mut SapAdtState,
-    object_uri: &str,
-) -> Result<Vec<crate::app::state::SapAdtAcceptProbe>> {
-    let object_uri = object_uri.trim();
-    if object_uri.is_empty() {
-        return Err(anyhow!("Object URI is required"));
-    }
-
-    let session_id = ensure_transport_session(sap)?;
-    let discovery_url = require_discovery_url(sap)?;
-    let base_url = bridge_base_url(&discovery_url)?;
-    let bridge_dir = transport_bridge_dir(sap);
-
-    let mutex = bridge_client();
-    let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
-    client.ensure_started(&bridge_dir, &base_url)?;
-
-    let accepts = [
-        "application/vnd.sap.adt.basic.object.properties+xml",
-        "application/vnd.sap.adt.basic.object.properties+xml, application/xml, text/xml, */*",
-        "application/xml, text/xml, */*",
-        "text/plain, text/*",
-        "*/*",
-    ];
-
-    let mut results = Vec::new();
-
-    for accept in accepts {
-        let request_headers = vec![("accept".to_string(), accept.to_string())];
-        let resp = client.send_json(json!({
-            "cmd": "read_object",
-            "session_id": session_id,
-            "object_uri": object_uri,
-            "accept": accept
-        }));
-
-        match resp {
-            Ok(resp) => {
-                let data = resp.get("data").unwrap_or(&resp);
-                let status = data
-                    .get("status")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u16)
-                    .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
-                let headers = json_headers_to_pairs(data.get("headers").or_else(|| resp.get("headers")));
-                let body = data
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let content_type = data
-                    .get("content_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        headers.iter().find_map(|(k, v)| {
-                            if k.eq_ignore_ascii_case("content-type") {
-                                Some(v.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                let response_preview = body.chars().take(400).collect::<String>();
-
-                record_adt_trace(
-                    sap,
-                    "debug_accept_matrix",
-                    "GET",
-                    object_uri,
-                    request_headers,
-                    String::new(),
-                    status,
-                    headers.clone(),
-                    body.clone(),
-                    None,
-                );
-
-                results.push(crate::app::state::SapAdtAcceptProbe {
-                    accept: accept.to_string(),
-                    status,
-                    content_type,
-                    response_preview,
-                    error: None,
-                });
-            }
-            Err(err) => {
-                let error_text = format!("{:#}", err);
-                let status = regex::Regex::new(r"\(([0-9]{3})\)")
-                    .ok()
-                    .and_then(|re| re.captures(&error_text))
-                    .and_then(|caps| caps.get(1))
-                    .and_then(|m| m.as_str().parse::<u16>().ok());
-
-                record_adt_trace(
-                    sap,
-                    "debug_accept_matrix",
-                    "GET",
-                    object_uri,
-                    request_headers,
-                    String::new(),
-                    status,
-                    Vec::new(),
-                    String::new(),
-                    Some(error_text.clone()),
-                );
-
-                results.push(crate::app::state::SapAdtAcceptProbe {
-                    accept: accept.to_string(),
-                    status,
-                    content_type: None,
-                    response_preview: String::new(),
-                    error: Some(error_text),
-                });
-            }
-        }
-    }
-
-    Ok(results)
+    eprintln!(
+        "[sap_adt] http label={} method={} status={} url={}{}",
+        label,
+        method,
+        status,
+        url,
+        error_suffix
+    );
 }
 
 pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>) -> Result<AdtReadObjectResult> {
@@ -2534,7 +2171,6 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let accept_value = accept.unwrap_or("application/vnd.sap.adt.basic.object.properties+xml, text/plain, text/*, application/xml, text/xml, */*");
-    let request_headers = vec![("accept".to_string(), accept_value.to_string())];
     let resp = client.send_json(json!({
         "cmd": "read_object",
         "session_id": session_id,
@@ -2557,16 +2193,11 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "read_object",
                 "GET",
                 object_uri,
-                request_headers,
-                String::new(),
                 status,
-                headers.clone(),
-                body.clone(),
                 None,
             );
 
@@ -2585,17 +2216,12 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "read_object",
                 "GET",
                 object_uri,
-                request_headers,
-                String::new(),
                 status,
-                Vec::new(),
-                String::new(),
-                Some(error_text.clone()),
+                Some(&error_text),
             );
 
             Err(anyhow!(error_text))
@@ -2644,16 +2270,11 @@ pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObj
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "lock_object",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                headers.clone(),
-                body.clone(),
                 None,
             );
 
@@ -2672,17 +2293,12 @@ pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObj
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "lock_object",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                Vec::new(),
-                String::new(),
-                Some(error_text.clone()),
+                Some(&error_text),
             );
 
             Err(anyhow!(error_text))
@@ -2719,13 +2335,6 @@ pub fn update_object(
     }
 
     let content_type_value = content_type.unwrap_or("text/plain; charset=utf-8").to_string();
-    let mut request_headers = vec![("content-type".to_string(), content_type_value.clone())];
-    if let Some(if_match) = if_match.filter(|s| !s.trim().is_empty()) {
-        request_headers.push(("if-match".to_string(), if_match.to_string()));
-    }
-    if let Some(lock_handle) = lock_handle.filter(|s| !s.trim().is_empty()) {
-        request_headers.push(("x-sap-adt-lockhandle".to_string(), lock_handle.to_string()));
-    }
 
     let resp = client.send_json(json!({
         "cmd": "update_object",
@@ -2753,16 +2362,11 @@ pub fn update_object(
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "update_object",
                 "PUT",
                 object_uri,
-                request_headers,
-                body.to_string(),
                 status,
-                headers.clone(),
-                body_text.clone(),
                 None,
             );
 
@@ -2776,17 +2380,12 @@ pub fn update_object(
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "update_object",
                 "PUT",
                 object_uri,
-                request_headers,
-                body.to_string(),
                 status,
-                Vec::new(),
-                String::new(),
-                Some(error_text.clone()),
+                Some(&error_text),
             );
 
             Err(anyhow!(error_text))
@@ -2830,16 +2429,11 @@ pub fn syntax_check(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckR
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "syntax_check",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                headers,
-                body.clone(),
                 None,
             );
 
@@ -2853,17 +2447,12 @@ pub fn syntax_check(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckR
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "syntax_check",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                Vec::new(),
-                String::new(),
-                Some(error_text.clone()),
+                Some(&error_text),
             );
 
             Err(anyhow!(error_text))
@@ -2907,16 +2496,11 @@ pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtAct
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "activate_object",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                headers,
-                body.clone(),
                 None,
             );
 
@@ -2930,17 +2514,12 @@ pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtAct
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
 
-            record_adt_trace(
-                sap,
+            log_adt_http(
                 "activate_object",
                 "POST",
                 object_uri,
-                Vec::new(),
-                String::new(),
                 status,
-                Vec::new(),
-                String::new(),
-                Some(error_text.clone()),
+                Some(&error_text),
             );
 
             Err(anyhow!(error_text))

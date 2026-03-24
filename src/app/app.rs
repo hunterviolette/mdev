@@ -80,6 +80,10 @@ impl eframe::App for AppState {
             ctx.request_repaint();
         }
 
+        if self.sap_adts.values().any(|sap| sap.import_job.is_pending() || sap.export_job.is_pending()) {
+            ctx.request_repaint();
+        }
+
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
                 return None;

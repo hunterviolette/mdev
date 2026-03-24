@@ -500,6 +500,8 @@ impl AppState {
 
     pub fn finalize_frame(&mut self) {
         file_viewer_controller::finalize_frame(self);
+        sap_adt_controller::finalize_frame(self);
+        sap_adt_controller::finalize_frame(self);
     }
 
     pub fn excludes_joined(&self) -> String {

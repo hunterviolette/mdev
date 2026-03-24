@@ -97,6 +97,12 @@ pub enum Action {
     CloseCanvasTintPopup,
     OpenGlobalSettings,
     CloseGlobalSettings,
+    OpenSapAdtImportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtImportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtExportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtExportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtLogsPopup { sap_adt_id: ComponentId },
+    CloseSapAdtLogsPopup { sap_adt_id: ComponentId },
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
     SaveStartupLayoutOverride {
         canvas_size: [f32; 2],
@@ -280,14 +286,6 @@ pub enum Action {
         object_uri: String,
     },
 
-    SapAdtDebugAcceptMatrix {
-        sap_adt_id: ComponentId,
-        object_uri: String,
-    },
-    SapAdtClearHttpTrace {
-        sap_adt_id: ComponentId,
-    },
-
     SapAdtCloneSelectedToWorktree {
         sap_adt_id: ComponentId,
     },
@@ -299,6 +297,23 @@ pub enum Action {
     SapAdtActivateWorktreeObject {
         sap_adt_id: ComponentId,
         path: String,
+    },
+    SapAdtToggleImportObjectSelection {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+    SapAdtImportSelectedPackageObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtScanExportObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtToggleExportManifestSelection {
+        sap_adt_id: ComponentId,
+        manifest_path: String,
+    },
+    SapAdtExportSelectedWorktreeObjects {
+        sap_adt_id: ComponentId,
     },
 
     // ---------------------------
