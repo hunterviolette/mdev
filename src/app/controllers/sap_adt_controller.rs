@@ -2,6 +2,60 @@ use crate::app::actions::Action;
 use crate::app::state::{AppState, SapAdtExportJobInput, SapAdtExportJobResult, SapAdtImportJobInput, SapAdtImportJobResult, SapAdtLogEntry, SapAdtObjectOperationRow};
 use crate::capabilities::{CapabilityBroker, CapabilityRequest};
 
+fn summarize_activation_details(details: &str) -> String {
+    let mut important = Vec::new();
+
+    for line in details.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.chars().all(|c| c == '=') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("activation of worklist")
+            || lower.starts_with("technical log for mass activation")
+            || lower.starts_with("see log ")
+            || lower.starts_with("checks ddl source ")
+            || lower.starts_with("end of activation of worklist")
+        {
+            continue;
+        }
+        if lower.contains("line ")
+            || lower.contains("column ")
+            || lower.contains("was not activated")
+            || lower.contains("contains errors")
+            || lower.contains(" unknown")
+            || lower.contains("syntax error")
+            || lower.contains("contains error")
+            || lower.contains(" is unknown")
+        {
+            important.push(line.to_string());
+        }
+    }
+
+    important.dedup();
+    important.join("\n")
+}
+
+fn summarize_export_message(row: &crate::app::state::SapAdtExportRow) -> String {
+    if row.activation_ok {
+        return row.message.clone();
+    }
+
+    let activation_summary = summarize_activation_details(&row.activation_details);
+    if !activation_summary.is_empty() {
+        return format!("Activation failed\n{}", activation_summary);
+    }
+
+    if !row.syntax_details.trim().is_empty() {
+        return format!("Syntax check failed\n{}", row.syntax_details.trim());
+    }
+
+    row.message.clone()
+}
+
 fn push_sap_adt_activity(
     state: &mut AppState,
     sap_adt_id: crate::app::actions::ComponentId,
@@ -51,6 +105,8 @@ fn sync_export_activity_rows(state: &mut AppState, sap_adt_id: crate::app::actio
     for row in results {
         let state_text = if row.activation_ok {
             "activated".to_string()
+        } else if !row.activation_details.trim().is_empty() || !row.syntax_details.trim().is_empty() {
+            "error".to_string()
         } else if row.syntax_ok {
             "saved".to_string()
         } else if row.pushed_files > 0 {
@@ -61,7 +117,7 @@ fn sync_export_activity_rows(state: &mut AppState, sap_adt_id: crate::app::actio
             "idle".to_string()
         };
 
-        let message_text = row.message.clone();
+        let message_text = summarize_export_message(&row);
 
         push_sap_adt_activity(
             state,
@@ -512,6 +568,8 @@ fn run_export_job(
 
     let state = if row.activation_ok {
         "activated".to_string()
+    } else if !row.activation_details.trim().is_empty() || !row.syntax_details.trim().is_empty() {
+        "error".to_string()
     } else if row.syntax_ok || row.pushed_files > 0 {
         "saved".to_string()
     } else if row.message.trim().eq_ignore_ascii_case("No local SAP ADT changes to push") || row.message.to_ascii_lowercase().contains("no changes to push") {
@@ -520,13 +578,15 @@ fn run_export_job(
         "error".to_string()
     };
 
+    let export_message = summarize_export_message(&row);
+
     Ok(SapAdtExportJobResult {
         key: item.manifest_path,
         object_name: item.object_name,
         object_type: item.object_type,
         action: "export".to_string(),
         state,
-        message: row.message.clone(),
+        message: export_message,
         row,
     })
 }

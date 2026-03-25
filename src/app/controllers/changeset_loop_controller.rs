@@ -18,95 +18,11 @@ fn browser_runtime_dir(state: &AppState) -> PathBuf {
 }
 
 fn resolve_browser_bridge_dir() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("bridge");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("bridge");
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    "bridge".to_string()
+    crate::app::browser_bridge::resolve_browser_bridge_dir_with_override("")
 }
 
 fn resolve_browser_executable(explicit: &str) -> (String, String) {
-    let explicit = explicit.trim();
-    if !explicit.is_empty() {
-        let lower = explicit.to_ascii_lowercase();
-        let channel = if lower.contains("edge") || lower.contains("msedge") {
-            "msedge"
-        } else if lower.contains("chrome") {
-            "chrome"
-        } else {
-            "chromium"
-        };
-        return (explicit.to_string(), channel.to_string());
-    }
-
-    if cfg!(target_os = "windows") {
-        for key in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
-            if let Ok(root) = std::env::var(key) {
-                let edge = PathBuf::from(&root).join("Microsoft/Edge/Application/msedge.exe");
-                if edge.exists() {
-                    return (edge.to_string_lossy().into_owned(), "msedge".to_string());
-                }
-                let chrome = PathBuf::from(&root).join("Google/Chrome/Application/chrome.exe");
-                if chrome.exists() {
-                    return (chrome.to_string_lossy().into_owned(), "chrome".to_string());
-                }
-                let chromium = PathBuf::from(&root).join("Chromium/Application/chrome.exe");
-                if chromium.exists() {
-                    return (chromium.to_string_lossy().into_owned(), "chromium".to_string());
-                }
-            }
-        }
-        return ("msedge.exe".to_string(), "msedge".to_string());
-    }
-
-    if cfg!(target_os = "macos") {
-        let edge = PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
-        if edge.exists() {
-            return (edge.to_string_lossy().into_owned(), "msedge".to_string());
-        }
-        let chrome = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-        if chrome.exists() {
-            return (chrome.to_string_lossy().into_owned(), "chrome".to_string());
-        }
-        let chromium = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
-        if chromium.exists() {
-            return (chromium.to_string_lossy().into_owned(), "chromium".to_string());
-        }
-        return ("Microsoft Edge".to_string(), "msedge".to_string());
-    }
-
-    for candidate in [
-        ("microsoft-edge", "msedge"),
-        ("microsoft-edge-stable", "msedge"),
-        ("msedge", "msedge"),
-        ("google-chrome", "chrome"),
-        ("google-chrome-stable", "chrome"),
-        ("chromium-browser", "chromium"),
-        ("chromium", "chromium")
-    ] {
-        if std::process::Command::new("which")
-            .arg(candidate.0)
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-        {
-            return (candidate.0.to_string(), candidate.1.to_string());
-        }
-    }
-
-    ("microsoft-edge".to_string(), "msedge".to_string())
+    crate::app::browser_bridge::resolve_browser_executable(explicit)
 }
 
 fn resolve_user_data_dir(state: &AppState, explicit: &str, browser_family: &str) -> String {

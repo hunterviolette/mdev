@@ -420,6 +420,16 @@ impl AppState {
                 }
                 return;
             }
+
+            let occupied_by_other_kind = active_layout
+                .components
+                .iter()
+                .any(|c| c.id == loop_id && c.kind != ComponentKind::ExecuteLoop);
+
+            if occupied_by_other_kind {
+                active_layout.components.retain(|c| c.id != loop_id);
+                active_layout.windows.remove(&loop_id);
+            }
         }
 
         self.active_layout_mut().merge_with_defaults();

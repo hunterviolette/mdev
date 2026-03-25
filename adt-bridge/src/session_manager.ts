@@ -32,6 +32,32 @@ function resolveBaseUrl(cmd: ConnectCommand): string {
   return trimmed.replace(/\/$/, '');
 }
 
+function mergeProblems<T extends { severity?: string; message?: string; line?: number; column?: number; code?: string }>(base: T[], extra: T[]): T[] {
+  const out: T[] = [];
+  const seen = new Set<string>();
+
+  for (const item of [...base, ...extra]) {
+    const key = [
+      item.severity ?? '',
+      item.code ?? '',
+      item.line ?? '',
+      item.column ?? '',
+      item.message ?? ''
+    ].join('|');
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(item);
+  }
+
+  return out;
+}
+
+function hasLocationProblems(items: Array<{ line?: number; column?: number }>): boolean {
+  return items.some(item => Number.isFinite(item.line) || Number.isFinite(item.column));
+}
+
 export class SessionManager {
   private sessions = new Map<string, AdtSessionState>();
 
@@ -144,14 +170,14 @@ export class SessionManager {
   async updateObject(cmd: UpdateObjectCommand) {
     const state = this.getSession(cmd.session_id);
     const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle, cmd.corr_nr, cmd.headers);
-    if (resp.status < 200 || resp.status >= 300) {
-      throw new Error(`update_object failed (${resp.status}): ${resp.body.slice(0, 500)}`);
-    }
+    const problems = parseProblems(resp.body);
     return {
       session_id: state.sessionId,
       object_uri: cmd.object_uri,
       status: resp.status,
-      body: resp.body,
+      ok: resp.status >= 200 && resp.status < 300 && problems.length === 0,
+      problems,
+      xml: resp.body,
       headers: resp.headers
     };
   }
@@ -210,7 +236,7 @@ export class SessionManager {
       session_id: state.sessionId,
       object_uri: cmd.object_uri,
       status: resp.status,
-      ok: resp.status >= 200 && resp.status < 300,
+      ok: resp.status >= 200 && resp.status < 300 && problems.length === 0,
       problems,
       xml: resp.body,
       headers: resp.headers
@@ -220,15 +246,62 @@ export class SessionManager {
   async activateObject(cmd: ActivateObjectCommand) {
     const state = this.getSession(cmd.session_id);
     const resp = await state.client.activateObject(cmd.object_uri);
-    const problems = parseProblems(resp.body);
+    let problems = parseProblems(resp.body);
+
+    let checkruns:
+      | {
+          status?: number;
+          xml?: string;
+          problems?: ReturnType<typeof parseProblems>;
+          error?: string;
+        }
+      | undefined;
+
+    const activationHttpFailed = resp.status < 200 || resp.status >= 300;
+    const activationFailed = activationHttpFailed || problems.length > 0;
+
+    if (!activationHttpFailed && activationFailed) {
+      try {
+        const checkResp = await state.client.runCheckruns(cmd.object_uri);
+        console.error(`[sap_adt] http label=run_checkruns method=POST status=${checkResp.status} url=/sap/bc/adt/checkruns?reporters=abapCheckRun`);
+        const checkProblems = parseProblems(checkResp.body);
+        checkruns = {
+          status: checkResp.status,
+          xml: checkResp.body,
+          problems: checkProblems
+        };
+
+        if (checkProblems.length > 0) {
+          if (hasLocationProblems(checkProblems)) {
+            problems = checkProblems;
+          } else if (problems.length === 0) {
+            problems = checkProblems;
+          } else {
+            problems = mergeProblems(problems, checkProblems);
+          }
+        }
+      } catch (err) {
+        console.error(`[sap_adt] http label=run_checkruns method=POST status=0 url=/sap/bc/adt/checkruns?reporters=abapCheckRun error=${err instanceof Error ? err.message : String(err)}`);
+        checkruns = {
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+
+    const activated = resp.status >= 200 && resp.status < 300 && problems.length === 0;
+
     return {
       session_id: state.sessionId,
       object_uri: cmd.object_uri,
       status: resp.status,
-      activated: resp.status >= 200 && resp.status < 300 && problems.length === 0,
+      activated,
       problems,
       xml: resp.body,
-      headers: resp.headers
+      headers: resp.headers,
+      debug: {
+        command: 'activate_object',
+        checkruns
+      }
     };
   }
 

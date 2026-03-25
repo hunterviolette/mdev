@@ -21,6 +21,24 @@ function attr(tag: string, name: string): string | undefined {
   return tag.match(rx)?.[1];
 }
 
+function parseStartLocation(uri: string | undefined): { line?: number; column?: number } {
+  if (!uri) {
+    return {};
+  }
+
+  const match = uri.match(/#start=(\d+),(\d+)/i);
+  if (!match) {
+    return {};
+  }
+
+  const line = Number.parseInt(match[1] ?? '', 10);
+  const column = Number.parseInt(match[2] ?? '', 10);
+  return {
+    line: Number.isFinite(line) ? line : undefined,
+    column: Number.isFinite(column) ? column : undefined
+  };
+}
+
 export function parseProblems(xml: string): AdtProblem[] {
   const out: AdtProblem[] = [];
 
@@ -44,10 +62,40 @@ export function parseProblems(xml: string): AdtProblem[] {
     return out;
   }
 
-  const genericTag = /<(?:[^\s>]+:)?(?:problem|item|entry)\b([^>]*)>([\s\S]*?)<\/(?:[^\s>]+:)?(?:problem|item|entry)>/gi;
+  const checkMessageTag = /<(?:[^\s>]+:)?checkMessage\b([^>]*)>([\s\S]*?)<\/(?:[^\s>]+:)?checkMessage>/gi;
+  for (const m of xml.matchAll(checkMessageTag)) {
+    const attrs = m[1] ?? '';
+    const bodyXml = m[2] ?? '';
+    const uri = attr(attrs, 'uri');
+    const startLoc = parseStartLocation(uri);
+    const shortText = attr(attrs, 'shortText')
+      ?? bodyXml.match(/<(?:[^\s>]+:)?shortText\b[^>]*>([\s\S]*?)<\/(?:[^\s>]+:)?shortText>/i)?.[1]
+      ?? bodyXml.match(/<(?:[^\s>]+:)?txt\b[^>]*>([\s\S]*?)<\/(?:[^\s>]+:)?txt>/i)?.[1]
+      ?? '';
+    const body = decodeXml(shortText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+    if (!body) {
+      continue;
+    }
+    out.push({
+      severity: (attr(attrs, 'severity') ?? attr(attrs, 'type') ?? 'error').toLowerCase(),
+      message: body,
+      line: startLoc.line,
+      column: startLoc.column,
+      object_uri: uri,
+      code: attr(attrs, 'code') ?? attr(attrs, 'msgid')
+    });
+  }
+
+  if (out.length > 0) {
+    return out;
+  }
+
+  const genericTag = /<(?:[^\s>]+:)?(?:problem|item|entry|msg)\b([^>]*)>([\s\S]*?)<\/(?:[^\s>]+:)?(?:problem|item|entry|msg)>/gi;
   for (const m of xml.matchAll(genericTag)) {
     const attrs = m[1] ?? '';
-    const body = decodeXml((m[2] ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+    const rawBody = m[2] ?? '';
+    const shortText = rawBody.match(/<(?:[^\s>]+:)?shortText\b[^>]*>[\s\S]*?<(?:[^\s>]+:)?txt\b[^>]*>([\s\S]*?)<\/(?:[^\s>]+:)?txt>[\s\S]*?<\/(?:[^\s>]+:)?shortText>/i)?.[1];
+    const body = decodeXml(((shortText ?? rawBody) ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
     if (!body) {
       continue;
     }
@@ -58,7 +106,7 @@ export function parseProblems(xml: string): AdtProblem[] {
       message: body,
       line: Number.isFinite(line) ? line : undefined,
       column: Number.isFinite(column) ? column : undefined,
-      object_uri: attr(attrs, 'objectUri') ?? attr(attrs, 'uri'),
+      object_uri: attr(attrs, 'objectUri') ?? attr(attrs, 'uri') ?? attr(attrs, 'href'),
       code: attr(attrs, 'code')
     });
   }

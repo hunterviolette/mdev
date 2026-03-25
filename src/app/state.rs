@@ -402,6 +402,8 @@ pub struct SapAdtExportRow {
     pub syntax_ok: bool,
     pub activation_ok: bool,
     pub message: String,
+    pub syntax_details: String,
+    pub activation_details: String,
     pub transport: Option<String>,
     pub export_candidates: Vec<SapAdtExportCandidate>,
 }

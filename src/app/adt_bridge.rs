@@ -43,18 +43,27 @@ pub struct AdtLockObjectResult {
 
 #[derive(Clone, Debug)]
 pub struct AdtUpdateObjectResult {
+    pub status: Option<u16>,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    pub problems: Vec<String>,
+    pub ok: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct AdtCheckResult {
+    pub status: Option<u16>,
     pub body: String,
+    pub problems: Vec<String>,
+    pub ok: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct AdtActivateResult {
+    pub status: Option<u16>,
     pub body: String,
+    pub problems: Vec<String>,
+    pub ok: bool,
 }
 
 pub fn resolve_relative_object_uri(base_object_uri: &str, child_uri: &str) -> Result<String> {
@@ -1068,6 +1077,10 @@ fn browser_profile_for_adt(sap: &SapAdtState) -> String {
     }
 }
 
+fn browser_executable_for_adt() -> String {
+    browser_bridge::resolve_browser_executable("").0
+}
+
 fn normalize_bridge_dir(raw: &str) -> String {
     let trimmed = raw.trim();
     let unquoted = trimmed
@@ -1079,51 +1092,19 @@ fn normalize_bridge_dir(raw: &str) -> String {
 
 fn resolve_browser_bridge_dir(sap: &SapAdtState) -> String {
     let normalized = normalize_bridge_dir(&sap.browser_bridge_dir);
-    if !normalized.is_empty() && std::path::Path::new(&normalized).is_dir() {
-        return normalized;
-    }
-
-    let browser_dir = std::path::Path::new(&normalized);
-    if let Some(parent) = browser_dir.parent() {
-        let candidate = parent.join("adt-bridge");
-        if candidate.is_dir() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("adt-bridge");
-            if candidate.is_dir() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("adt-bridge");
-        if candidate.is_dir() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    normalized
+    browser_bridge::resolve_browser_bridge_dir_with_override(&normalized)
 }
 
 fn browser_cfg_from_state(sap: &SapAdtState) -> BrowserTurnConfig {
     BrowserTurnConfig {
         bridge_dir: resolve_browser_bridge_dir(sap),
-        edge_executable: if cfg!(target_os = "windows") {
-            "msedge".to_string()
-        } else {
-            "msedge".to_string()
-        },
+        edge_executable: browser_executable_for_adt(),
         user_data_dir: sap.browser_user_data_dir.clone(),
         cdp_url: "http://127.0.0.1:9222".to_string(),
-        page_url_contains: "sap".to_string(),
+        page_url_contains: String::new(),
         profile: browser_profile_for_adt(sap),
         session_id: sap.browser_session_id.clone(),
-        auto_launch_edge: false,
+        auto_launch_edge: true,
         runtime_key: "sap_adt".to_string(),
         response_timeout_ms: 60_000,
         response_poll_ms: 1_000,
@@ -1174,8 +1155,10 @@ fn refresh_cookie_header(sap: &mut SapAdtState, discovery_url: &str) -> Result<S
 
     let mut cfg = browser_cfg_from_state(sap);
     if cfg.session_id.is_none() {
-        browser_bridge::launch_browser(&mut cfg, Some(discovery_url))
-            .context("Failed to launch browser bridge session for SAP ADT")?;
+        browser_bridge::launch_and_attach(&mut cfg)
+            .context("Failed to attach browser bridge session for SAP ADT")?;
+        browser_bridge::open_url_in_session(&mut cfg, discovery_url)
+            .context("Failed to open SAP ADT discovery URL in browser bridge session")?;
     }
 
     let urls = cookie_urls_for_discovery(discovery_url);
@@ -2306,6 +2289,26 @@ pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObj
     }
 }
 
+fn extract_server_etag_from_adt_error(body: &str) -> Option<String> {
+    let marker = "object ETag ";
+    let start = body.find(marker)? + marker.len();
+    let rest = &body[start..];
+    let end = rest
+        .find(' ')
+        .or_else(|| rest.find('<'))
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim().trim_matches('"');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn normalize_if_match_value(value: &str) -> String {
+    value.trim().trim_matches('"').to_string()
+}
+
 pub fn update_object(
     sap: &mut SapAdtState,
     object_uri: &str,
@@ -2331,26 +2334,52 @@ pub fn update_object(
 
     let mut headers = serde_json::Map::new();
     if let Some(if_match) = if_match.filter(|s| !s.trim().is_empty()) {
-        headers.insert("If-Match".to_string(), serde_json::Value::String(if_match.to_string()));
+        headers.insert(
+            "If-Match".to_string(),
+            serde_json::Value::String(normalize_if_match_value(if_match)),
+        );
     }
 
     let content_type_value = content_type.unwrap_or("text/plain; charset=utf-8").to_string();
 
-    let resp = client.send_json(json!({
-        "cmd": "update_object",
-        "session_id": session_id,
-        "object_uri": object_uri,
-        "source": body,
-        "content_type": content_type_value,
-        "lock_handle": lock_handle,
-        "corr_nr": corr_nr,
-        "headers": headers
-    }));
+    let send_update = |client: &mut AdtBridgeClient, headers: &serde_json::Map<String, serde_json::Value>| {
+        client.send_json(json!({
+            "cmd": "update_object",
+            "session_id": session_id,
+            "object_uri": object_uri,
+            "source": body,
+            "content_type": content_type_value,
+            "lock_handle": lock_handle,
+            "corr_nr": corr_nr,
+            "headers": headers
+        }))
+    };
+
+    let mut resp = send_update(&mut client, &headers);
+
+    if let Err(err) = &resp {
+        let error_text = format!("{:#}", err);
+        let status = regex::Regex::new(r"\(([0-9]{3})\)")
+            .ok()
+            .and_then(|re| re.captures(&error_text))
+            .and_then(|caps| caps.get(1))
+            .and_then(|m| m.as_str().parse::<u16>().ok());
+
+        if status == Some(412) {
+            if let Some(server_etag) = extract_server_etag_from_adt_error(&error_text) {
+                headers.insert(
+                    "If-Match".to_string(),
+                    serde_json::Value::String(server_etag),
+                );
+                resp = send_update(&mut client, &headers);
+            }
+        }
+    }
 
     match resp {
         Ok(resp) => {
-            let data = resp.get("data").ok_or_else(|| anyhow!("ADT update_object response missing data"))?;
-            let headers = json_headers_to_pairs(data.get("headers"));
+            let data = resp.get("data").unwrap_or(&resp);
+            let headers = json_headers_to_pairs(data.get("headers").or_else(|| resp.get("headers")));
             let body_text = data
                 .get("body")
                 .and_then(|v| v.as_str())
@@ -2361,103 +2390,289 @@ pub fn update_object(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
+            let mut problems = problem_messages_from_json(data.get("problems"));
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&body_text);
+            }
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body_text) {
+                    problems.push(message);
+                }
+            }
+            let ok = data
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| status.map(|s| (200..300).contains(&s)).unwrap_or(false) && problems.is_empty());
 
             log_adt_http(
                 "update_object",
                 "PUT",
                 object_uri,
                 status,
-                None,
+                if ok { None } else { Some(&body_text) },
             );
 
-            Ok(AdtUpdateObjectResult { headers, body: body_text })
+            Ok(AdtUpdateObjectResult {
+                status,
+                headers,
+                body: body_text,
+                problems,
+                ok,
+            })
         }
         Err(err) => {
             let error_text = format!("{:#}", err);
-            let status = regex::Regex::new(r"\(([0-9]{3})\)")
-                .ok()
-                .and_then(|re| re.captures(&error_text))
-                .and_then(|caps| caps.get(1))
-                .and_then(|m| m.as_str().parse::<u16>().ok());
+            let status = extract_status_from_error_text(&error_text);
+            let body = extract_xml_payload_from_error_text(&error_text);
+            let mut problems = extract_adt_problem_messages(&body);
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body) {
+                    problems.push(message);
+                }
+            }
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&error_text);
+            }
+            if problems.is_empty() {
+                problems.push(body.clone());
+            }
 
             log_adt_http(
                 "update_object",
                 "PUT",
                 object_uri,
                 status,
-                Some(&error_text),
+                Some(&body),
             );
 
-            Err(anyhow!(error_text))
+            Ok(AdtUpdateObjectResult {
+                status,
+                headers: Vec::new(),
+                body,
+                problems,
+                ok: false,
+            })
         }
     }
 }
 
-pub fn syntax_check(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckResult> {
+pub fn problem_messages_from_array(items: &[serde_json::Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        if !item.is_object() {
+            continue;
+        }
+        let severity = item.get("severity").and_then(|v| v.as_str()).unwrap_or("E");
+        let message = item.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if message.is_empty() {
+            continue;
+        }
+        let line = item.get("line").and_then(|v| v.as_u64());
+        let column = item.get("column").and_then(|v| v.as_u64());
+        let rendered = match (line, column) {
+            (Some(line), Some(column)) => format!("{}: line {}, column {}: {}", severity, line, column, message),
+            (Some(line), None) => format!("{}: line {}: {}", severity, line, message),
+            _ => format!("{}: {}", severity, message),
+        };
+        out.push(rendered);
+    }
+    out
+}
+
+fn has_source_locations(items: &[String]) -> bool {
+    items.iter().any(|item| item.contains("line "))
+}
+
+fn merge_problem_message_lists(primary: &[String], secondary: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in primary.iter().chain(secondary.iter()) {
+        let key = item.trim().to_string();
+        if key.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(key);
+    }
+    out
+}
+
+pub fn extract_adt_problem_messages(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if xml.trim().is_empty() {
+        return out;
+    }
+
+    let tag_re = Regex::new(r#"(?s)<(?:[A-Za-z0-9_\-]+:)?(?:message|msg|checkMessage)\b([^>]*)>(.*?)</(?:[A-Za-z0-9_\-]+:)?(?:message|msg|checkMessage)>"#).ok();
+    let attr_re = Regex::new(r#"([A-Za-z0-9_\-:]+)="([^"]*)""#).ok();
+    let strip_re = Regex::new(r#"<[^>]+>"#).ok();
+
+    let decode_xml = |s: &str| {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    };
+
+    if let Some(tag_re) = tag_re {
+        for caps in tag_re.captures_iter(xml) {
+            let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let body = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+            let mut severity = String::new();
+            let mut line = String::new();
+            let mut column = String::new();
+            let mut code = String::new();
+
+            if let Some(attr_re) = &attr_re {
+                for attr_caps in attr_re.captures_iter(attrs) {
+                    let name = attr_caps.get(1).map(|m| m.as_str()).unwrap_or_default().to_ascii_lowercase();
+                    let value = decode_xml(attr_caps.get(2).map(|m| m.as_str()).unwrap_or_default()).trim().to_string();
+                    match name.as_str() {
+                        "severity" => severity = value,
+                        "line" => line = value,
+                        "column" => column = value,
+                        "code" => code = value,
+                        _ => {}
+                    }
+                }
+            }
+
+            let plain_body = if let Some(strip_re) = &strip_re {
+                strip_re.replace_all(body, " ").into_owned()
+            } else {
+                body.to_string()
+            };
+            let plain_body = decode_xml(&plain_body).split_whitespace().collect::<Vec<_>>().join(" ");
+
+            let mut parts = Vec::new();
+            if !severity.is_empty() {
+                parts.push(severity);
+            }
+            if !code.is_empty() {
+                parts.push(code);
+            }
+            if !line.is_empty() || !column.is_empty() {
+                parts.push(match (line.is_empty(), column.is_empty()) {
+                    (false, false) => format!("line {}, column {}", line, column),
+                    (false, true) => format!("line {}", line),
+                    (true, false) => format!("column {}", column),
+                    (true, true) => String::new(),
+                });
+            }
+            if !plain_body.is_empty() {
+                parts.push(plain_body);
+            }
+
+            let message = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(": ");
+            if !message.is_empty() {
+                out.push(message);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        let lowered = xml.to_ascii_lowercase();
+        if lowered.contains("<message") || lowered.contains("syntax error") || lowered.contains("activation error") || lowered.contains("error") {
+            let fallback = decode_xml(xml).split_whitespace().collect::<Vec<_>>().join(" ");
+            if !fallback.is_empty() {
+                out.push(fallback);
+            }
+        }
+    }
+
+    out
+}
+
+fn problem_messages_from_json(value: Option<&Value>) -> Vec<String> {
+    let Some(items) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .map(|problem| {
+            let severity = problem
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let code = problem
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let line = problem.get("line").and_then(|v| v.as_u64());
+            let column = problem.get("column").and_then(|v| v.as_u64());
+            let message = problem
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            let mut parts = Vec::new();
+            if !severity.is_empty() {
+                parts.push(severity);
+            }
+            if !code.is_empty() {
+                parts.push(code);
+            }
+            match (line, column) {
+                (Some(line), Some(column)) => parts.push(format!("line {}, column {}", line, column)),
+                (Some(line), None) => parts.push(format!("line {}", line)),
+                (None, Some(column)) => parts.push(format!("column {}", column)),
+                (None, None) => {}
+            }
+            if !message.is_empty() {
+                parts.push(message);
+            }
+
+            let joined = parts.join(": ");
+            if joined.is_empty() {
+                problem.to_string()
+            } else {
+                joined
+            }
+        })
+        .collect()
+}
+
+fn extract_xml_payload_from_error_text(error_text: &str) -> String {
+    if let Some(idx) = error_text.find("<?xml") {
+        return error_text[idx..].trim().to_string();
+    }
+    if let Some(idx) = error_text.find("<exc:exception") {
+        return error_text[idx..].trim().to_string();
+    }
+    if let Some(idx) = error_text.find("<checkReport") {
+        return error_text[idx..].trim().to_string();
+    }
+    error_text.trim().to_string()
+}
+
+fn extract_status_from_error_text(error_text: &str) -> Option<u16> {
+    regex::Regex::new(r"\(([0-9]{3})\)")
+        .ok()
+        .and_then(|re| re.captures(error_text))
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<u16>().ok())
+}
+
+pub fn syntax_check(_sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckResult> {
     let object_uri = object_uri.trim();
     if object_uri.is_empty() {
         return Err(anyhow!("Object URI is required"));
     }
 
-    let session_id = ensure_transport_session(sap)?;
-    let discovery_url = require_discovery_url(sap)?;
-    let base_url = bridge_base_url(&discovery_url)?;
-    let bridge_dir = transport_bridge_dir(sap);
-
-    let mutex = bridge_client();
-    let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
-    client.ensure_started(&bridge_dir, &base_url)?;
-
-    let resp = client.send_json(json!({
-        "cmd": "syntax_check",
-        "session_id": session_id,
-        "object_uri": object_uri
-    }));
-
-    match resp {
-        Ok(resp) => {
-            let data = resp.get("data").unwrap_or(&resp);
-            let body = data
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let headers = json_headers_to_pairs(data.get("headers").or_else(|| resp.get("headers")));
-            let status = data
-                .get("status")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u16)
-                .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
-
-            log_adt_http(
-                "syntax_check",
-                "POST",
-                object_uri,
-                status,
-                None,
-            );
-
-            Ok(AdtCheckResult { body })
-        }
-        Err(err) => {
-            let error_text = format!("{:#}", err);
-            let status = regex::Regex::new(r"\(([0-9]{3})\)")
-                .ok()
-                .and_then(|re| re.captures(&error_text))
-                .and_then(|caps| caps.get(1))
-                .and_then(|m| m.as_str().parse::<u16>().ok());
-
-            log_adt_http(
-                "syntax_check",
-                "POST",
-                object_uri,
-                status,
-                Some(&error_text),
-            );
-
-            Err(anyhow!(error_text))
-        }
-    }
+    Ok(AdtCheckResult {
+        status: Some(204),
+        body: String::new(),
+        problems: Vec::new(),
+        ok: true,
+    })
 }
 
 pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtActivateResult> {
@@ -2485,44 +2700,103 @@ pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtAct
         Ok(resp) => {
             let data = resp.get("data").unwrap_or(&resp);
             let body = data
-                .get("body")
+                .get("xml")
                 .and_then(|v| v.as_str())
+                .or_else(|| data.get("body").and_then(|v| v.as_str()))
                 .unwrap_or_default()
                 .to_string();
-            let headers = json_headers_to_pairs(data.get("headers").or_else(|| resp.get("headers")));
             let status = data
                 .get("status")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
+            let status = data
+                .get("status")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16)
+                .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
+            let activation_http_failed = status.map(|s| s < 200 || s >= 300).unwrap_or(false);
+
+            let mut problems = problem_messages_from_json(data.get("problems"));
+            let checkruns_xml_problems: Vec<String> = data
+                .get("debug")
+                .and_then(|v| v.get("checkruns"))
+                .and_then(|v| v.get("xml"))
+                .and_then(|v| v.as_str())
+                .map(extract_adt_problem_messages)
+                .unwrap_or_default();
+            let checkruns_problems: Vec<String> = data
+                .get("debug")
+                .and_then(|v| v.get("checkruns"))
+                .and_then(|v| v.get("problems"))
+                .and_then(|v| v.as_array())
+                .map(|items| problem_messages_from_array(items))
+                .unwrap_or_default();
+            if !activation_http_failed {
+                if has_source_locations(&checkruns_problems) {
+                    problems = checkruns_problems;
+                } else if !checkruns_problems.is_empty() {
+                    problems = merge_problem_message_lists(&checkruns_problems, &problems);
+                } else if has_source_locations(&checkruns_xml_problems) {
+                    problems = checkruns_xml_problems;
+                } else if !checkruns_xml_problems.is_empty() {
+                    problems = merge_problem_message_lists(&checkruns_xml_problems, &problems);
+                }
+            }
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&body);
+            }
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body) {
+                    problems.push(message);
+                }
+            }
+            let ok = data
+                .get("activated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| status.map(|s| (200..300).contains(&s)).unwrap_or(false) && problems.is_empty());
 
             log_adt_http(
                 "activate_object",
                 "POST",
                 object_uri,
                 status,
-                None,
+                if ok { None } else { Some(&body) },
             );
 
-            Ok(AdtActivateResult { body })
+            Ok(AdtActivateResult { status, body, problems, ok })
         }
         Err(err) => {
             let error_text = format!("{:#}", err);
-            let status = regex::Regex::new(r"\(([0-9]{3})\)")
-                .ok()
-                .and_then(|re| re.captures(&error_text))
-                .and_then(|caps| caps.get(1))
-                .and_then(|m| m.as_str().parse::<u16>().ok());
+            let status = extract_status_from_error_text(&error_text);
+            let body = extract_xml_payload_from_error_text(&error_text);
+            let mut problems = extract_adt_problem_messages(&body);
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body) {
+                    problems.push(message);
+                }
+            }
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&error_text);
+            }
+            if problems.is_empty() {
+                problems.push(body.clone());
+            }
 
             log_adt_http(
                 "activate_object",
                 "POST",
                 object_uri,
                 status,
-                Some(&error_text),
+                Some(&body),
             );
 
-            Err(anyhow!(error_text))
+            Ok(AdtActivateResult {
+                status,
+                body,
+                problems,
+                ok: false,
+            })
         }
     }
 }

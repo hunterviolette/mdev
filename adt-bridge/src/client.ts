@@ -472,14 +472,27 @@ export class AdtClient {
   }
 
   async activateObject(objectUri: string) {
-    const body = `<?xml version="1.0" encoding="UTF-8"?><adtcore:activationRequest xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference uri="${escapeXmlAttr(objectUri)}" /></adtcore:activationRequest>`;
+    const body = `<?xml version="1.0" encoding="UTF-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="${escapeXmlAttr(objectUri)}" /></adtcore:objectReferences>`;
     return this.fetchText(
       'POST',
-      '/sap/bc/adt/activation',
+      '/sap/bc/adt/activation?method=activate&preauditRequested=true',
       body,
       {
         'Content-Type': 'application/xml; charset=utf-8',
         Accept: 'application/xml, text/xml, */*'
+      }
+    );
+  }
+
+  async runCheckruns(objectUri: string) {
+    const body = `<?xml version="1.0" encoding="UTF-8"?><chkrun:checkObjectList xmlns:chkrun="http://www.sap.com/adt/checkrun" xmlns:adtcore="http://www.sap.com/adt/core"><chkrun:checkObject adtcore:uri="${escapeXmlAttr(objectUri)}" chkrun:version="inactive"/></chkrun:checkObjectList>`;
+    return this.fetchText(
+      'POST',
+      '/sap/bc/adt/checkruns?reporters=abapCheckRun',
+      body,
+      {
+        'Content-Type': 'application/vnd.sap.adt.checkobjects+xml',
+        Accept: 'application/vnd.sap.adt.checkmessages+xml'
       }
     );
   }

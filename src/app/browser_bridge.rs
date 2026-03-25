@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -24,6 +25,105 @@ fn runtime_timeouts() -> &'static Mutex<HashMap<String, u64>> {
 
 fn runtime_started_at() -> &'static Mutex<HashMap<String, Instant>> {
     RUNTIME_STARTED_AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn resolve_browser_bridge_dir_with_override(explicit: &str) -> String {
+    let trimmed = explicit.trim();
+    let normalized = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string();
+
+    if !normalized.is_empty() && std::path::Path::new(&normalized).exists() {
+        return normalized;
+    }
+
+    if !normalized.is_empty() {
+        let browser_dir = PathBuf::from(&normalized);
+        if let Some(parent) = browser_dir.parent() {
+            let candidate = parent.join("bridge");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("bridge");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("bridge");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "bridge".to_string()
+}
+
+pub fn resolve_browser_executable(explicit: &str) -> (String, String) {
+    let explicit = explicit.trim();
+    if !explicit.is_empty() {
+        let lower = explicit.to_ascii_lowercase();
+        let channel = if lower.contains("edge") || lower.contains("msedge") {
+            "msedge"
+        } else if lower.contains("chrome") {
+            "chrome"
+        } else {
+            "chromium"
+        };
+        return (explicit.to_string(), channel.to_string());
+    }
+
+    if cfg!(target_os = "windows") {
+        for key in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
+            if let Ok(root) = std::env::var(key) {
+                let edge = PathBuf::from(&root).join("Microsoft/Edge/Application/msedge.exe");
+                if edge.exists() {
+                    return (edge.to_string_lossy().into_owned(), "msedge".to_string());
+                }
+                let chrome = PathBuf::from(&root).join("Google/Chrome/Application/chrome.exe");
+                if chrome.exists() {
+                    return (chrome.to_string_lossy().into_owned(), "chrome".to_string());
+                }
+                let chromium = PathBuf::from(&root).join("Chromium/Application/chrome.exe");
+                if chromium.exists() {
+                    return (chromium.to_string_lossy().into_owned(), "chromium".to_string());
+                }
+            }
+        }
+        return ("msedge.exe".to_string(), "msedge".to_string());
+    }
+
+    for candidate in [
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            let lower = candidate.to_ascii_lowercase();
+            let channel = if lower.contains("edge") {
+                "msedge"
+            } else if lower.contains("chrome") {
+                "chrome"
+            } else {
+                "chromium"
+            };
+            return (candidate.to_string(), channel.to_string());
+        }
+    }
+
+    ("msedge".to_string(), "msedge".to_string())
 }
 
 pub fn begin_runtime_timeout(runtime_key: &str, timeout_secs: u64) {

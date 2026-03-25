@@ -154,42 +154,52 @@ impl AppState {
             }
 
             ComponentKind::SapAdt => {
-                let existing_id = self
-                    .all_layouts()
-                    .flat_map(|l| l.components.iter())
-                    .find(|c| c.kind == ComponentKind::SapAdt)
-                    .map(|c| c.id)
-                    .or_else(|| self.sap_adts.keys().copied().next());
-                let id = match existing_id {
-                    Some(id) => id,
-                    None => self.alloc_component_id(),
-                };
-                let title = "SAP ADT".to_string();
+                self.active_layout_mut().merge_with_defaults();
 
-                let already_present = self
+                let existing_id = self
                     .active_layout()
                     .components
                     .iter()
-                    .any(|c| c.id == id && c.kind == ComponentKind::SapAdt);
+                    .find(|c| c.kind == ComponentKind::SapAdt)
+                    .map(|c| c.id);
 
-                if !already_present {
+                if let Some(id) = existing_id {
+                    if let Some(w) = self.active_layout_mut().get_window_mut(id) {
+                        w.open = true;
+                    }
+
+                    if let Some(idx) = self
+                        .active_layout()
+                        .components
+                        .iter()
+                        .position(|c| c.id == id && c.kind == ComponentKind::SapAdt)
+                    {
+                        let component = self.active_layout_mut().components.remove(idx);
+                        self.active_layout_mut().components.push(component);
+                    }
+
+                    self.layout_epoch = self.layout_epoch.wrapping_add(1);
+                } else {
+                    let id = self.alloc_component_id();
+                    let title = format!("SAP ADT {}", id);
+
                     self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
+
+                    self.active_layout_mut().windows.insert(
+                        id,
+                        WindowLayout {
+                            open: true,
+                            locked: false,
+                            pos_norm: None,
+                            size_norm: None,
+                            pos: [220.0, 220.0],
+                            size: [760.0, 520.0],
+                        },
+                    );
+
+                    self.sap_adts.entry(id).or_insert_with(crate::app::state::SapAdtState::new);
+                    self.layout_epoch = self.layout_epoch.wrapping_add(1);
                 }
-
-                self.active_layout_mut().windows.insert(
-                    id,
-                    WindowLayout {
-                        open: true,
-                        locked: false,
-                        pos_norm: None,
-                        size_norm: None,
-                        pos: [220.0, 220.0],
-                        size: [760.0, 520.0],
-                    },
-                );
-
-                self.sap_adts.entry(id).or_insert_with(crate::app::state::SapAdtState::new);
-                self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
 

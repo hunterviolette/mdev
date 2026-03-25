@@ -119,6 +119,8 @@ pub fn scan_export_objects(state: &mut AppState, sap_adt_id: ComponentId) {
                 syntax_ok: false,
                 activation_ok: false,
                 message: String::new(),
+                syntax_details: String::new(),
+                activation_details: String::new(),
                 transport: transport.clone(),
                 export_candidates: export_candidates_from_manifest(&manifest),
             });
@@ -186,6 +188,8 @@ pub fn export_selected_worktree_objects(state: &mut AppState, sap_adt_id: Compon
                     syntax_ok: false,
                     activation_ok: false,
                     message: format!("Failed to read manifest: {:#}", err),
+                    syntax_details: String::new(),
+                    activation_details: String::new(),
                     transport: None,
                     export_candidates: Vec::new(),
                 });
@@ -243,6 +247,8 @@ pub fn export_selected_worktree_objects(state: &mut AppState, sap_adt_id: Compon
             syntax_ok: push_ok,
             activation_ok,
             message: final_message,
+            syntax_details: String::new(),
+            activation_details: String::new(),
             transport,
             export_candidates: export_candidates_from_manifest(&manifest),
         });
@@ -255,6 +261,144 @@ pub fn export_selected_worktree_objects(state: &mut AppState, sap_adt_id: Compon
         } else {
             sap.last_status = Some(format!("Exported and activated {} SAP ADT object(s)", success_count));
         }
+    }
+}
+
+fn primary_export_target_uri(
+    metadata_uri: &str,
+    pushed_resource_uris: &[String],
+    manifest: &crate::app::sap_adt_manifest::SapAdtObjectManifest,
+) -> String {
+    if let Some(uri) = pushed_resource_uris.iter().find(|uri| !uri.trim().is_empty()) {
+        return uri.trim().to_string();
+    }
+
+    if let Some(uri) = manifest
+        .resources
+        .iter()
+        .find(|resource| resource.editable && resource.activatable && !resource.uri.trim().is_empty())
+        .map(|resource| resource.uri.trim().to_string())
+    {
+        return uri;
+    }
+
+    if let Some(uri) = manifest
+        .resources
+        .iter()
+        .find(|resource| resource.editable && !resource.uri.trim().is_empty())
+        .map(|resource| resource.uri.trim().to_string())
+    {
+        return uri;
+    }
+
+    metadata_uri.trim().to_string()
+}
+
+fn load_manifest_document_body(
+    broker: &crate::capabilities::CapabilityBroker,
+    repo: &std::path::PathBuf,
+    manifest_dir: &str,
+    path: &str,
+) -> anyhow::Result<String> {
+    let full_path = if manifest_dir.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}/{}", manifest_dir.trim_end_matches('/'), path.trim_start_matches('/'))
+    };
+    let resp = broker.exec(crate::capabilities::CapabilityRequest::ReadFile {
+        repo: repo.clone(),
+        path: full_path.clone(),
+        source: crate::capabilities::FileSource::Worktree,
+    })?;
+    match resp {
+        crate::capabilities::CapabilityResponse::Bytes(bytes) => String::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {}", full_path, e)),
+        other => Err(anyhow::anyhow!("Unexpected capability response reading {}: {:?}", full_path, other)),
+    }
+}
+
+fn document_problem_text(xml: &str) -> String {
+    let problems = crate::app::adt_bridge::extract_adt_problem_messages(xml);
+    if problems.is_empty() {
+        xml.trim().to_string()
+    } else {
+        problems.join("\n")
+    }
+}
+
+fn refresh_manifest_after_activation(
+    sap: &mut crate::app::state::SapAdtState,
+    metadata_uri: &str,
+    object_name: &str,
+    object_type: &str,
+    package_name: Option<&str>,
+    clone_target_path: &str,
+) -> Option<crate::app::sap_adt_manifest::SapAdtObjectManifest> {
+    let refreshed = crate::app::adt_bridge::crawl_object_manifest(
+        sap,
+        metadata_uri,
+        Some(object_name),
+        Some(object_type),
+        package_name,
+    ).ok()?;
+
+    let selection_uri = sap.selected_object_uri.clone();
+    let selected_resource_id = selection_uri
+        .as_deref()
+        .and_then(|uri| refreshed.resources.iter().find(|resource| resource.uri == uri))
+        .map(|resource| resource.id.clone())
+        .or_else(|| refreshed.primary_resource_id());
+
+    let selected_resource = selected_resource_id
+        .as_deref()
+        .and_then(|id| refreshed.resources.iter().find(|resource| resource.id == id))
+        .or_else(|| refreshed.resources.first());
+
+    sap.selected_object_uri = selected_resource.map(|resource| resource.uri.clone());
+    sap.selected_object_metadata_uri = Some(refreshed.metadata_uri.clone());
+    sap.selected_object_name = refreshed.object_name.clone().or_else(|| Some(object_name.to_string()));
+    sap.selected_object_type = refreshed.object_type.clone().or_else(|| Some(object_type.to_string()));
+    sap.selected_object_content = selected_resource.map(|resource| resource.body.clone()).unwrap_or_default();
+    sap.selected_object_content_type = selected_resource.and_then(|resource| resource.content_type.clone());
+    sap.selected_object_headers = selected_resource.map(|resource| resource.headers.clone()).unwrap_or_default();
+    sap.selected_object_metadata = refreshed.metadata_xml.clone();
+    sap.selected_object_metadata_content_type = Some("application/xml".to_string());
+    sap.selected_resource_id = selected_resource_id;
+    sap.clone_target_path = clone_target_path.to_string();
+    sap.selected_manifest = Some(refreshed.clone());
+
+    Some(refreshed)
+}
+
+fn best_activation_log_details(
+    broker: &crate::capabilities::CapabilityBroker,
+    repo: &std::path::PathBuf,
+    manifest_dir: &str,
+    manifest: &crate::app::sap_adt_manifest::SapAdtObjectManifest,
+) -> Option<String> {
+    let doc = manifest
+        .documents
+        .iter()
+        .find(|doc| {
+            let uri = doc.uri.to_ascii_lowercase();
+            let path = doc.path.to_ascii_lowercase();
+            let content_type = doc.content_type.clone().unwrap_or_default().to_ascii_lowercase();
+            uri.contains("/logs/") || path.contains("document_") || content_type.contains("logs+xml")
+        })?;
+
+    let body = if !doc.body.is_empty() {
+        doc.body.clone()
+    } else if !doc.path.is_empty() {
+        load_manifest_document_body(broker, repo, manifest_dir, &doc.path).ok()?
+    } else {
+        return None;
+    };
+
+    let details = document_problem_text(&body);
+    if details.trim().is_empty() {
+        None
+    } else {
+        Some(details)
     }
 }
 
@@ -351,6 +495,8 @@ pub fn export_manifest_impl(
             syntax_ok: false,
             activation_ok: false,
             message: "No local SAP ADT changes to push".to_string(),
+            syntax_details: String::new(),
+            activation_details: String::new(),
             transport: corr_nr,
             export_candidates,
         });
@@ -444,16 +590,18 @@ pub fn export_manifest_impl(
         Err(err) => return Err(err.into()),
     }
 
-    let check_uri = if !metadata_uri.is_empty() {
-        metadata_uri.clone()
-    } else {
-        pushed_resource_uris.first().cloned().unwrap_or_default()
-    };
+    let check_uri = primary_export_target_uri(&metadata_uri, &pushed_resource_uris, &manifest);
 
     let syntax_result = crate::app::adt_bridge::syntax_check(sap, &check_uri);
+    let refresh_manifest_uri = if metadata_uri.trim().is_empty() {
+        check_uri.clone()
+    } else {
+        metadata_uri.clone()
+    };
+
     let refresh_result = crate::app::adt_bridge::crawl_object_manifest(
         sap,
-        &check_uri,
+        &refresh_manifest_uri,
         Some(object_name.as_str()),
         Some(object_type.as_str()),
         package_name.as_deref(),
@@ -462,14 +610,31 @@ pub fn export_manifest_impl(
     let mut syntax_ok = false;
     let mut activation_ok = false;
     let mut message = String::new();
+    let mut syntax_details = String::new();
+    let mut activation_details = String::new();
 
     match syntax_result {
         Ok(check) => {
-            syntax_ok = true;
-            if check.body.trim().is_empty() {
-                message = format!("Pushed {} SAP ADT resource(s)", pushed_resource_uris.len());
+            syntax_ok = check.ok;
+            syntax_details = if check.problems.is_empty() {
+                String::new()
             } else {
-                message = format!("Pushed {} SAP ADT resource(s) and syntax checked: {}", pushed_resource_uris.len(), check.body.trim());
+                check.problems.join("\n")
+            };
+
+            if syntax_ok {
+                if check.body.trim().is_empty() {
+                    message = format!("Pushed {} SAP ADT resource(s)", pushed_resource_uris.len());
+                } else {
+                    message = format!("Pushed {} SAP ADT resource(s) and syntax checked: {}", pushed_resource_uris.len(), check.body.trim());
+                }
+            } else if !syntax_details.is_empty() {
+                message = format!("Syntax check failed: {}", syntax_details.replace('\n', " | "));
+            } else if !check.body.trim().is_empty() {
+                syntax_details = check.body.clone();
+                message = format!("Syntax check failed: {}", check.body.trim());
+            } else {
+                message = "Syntax check failed".to_string();
             }
 
             if let Ok(refreshed) = refresh_result {
@@ -496,29 +661,105 @@ pub fn export_manifest_impl(
                 sap.selected_object_metadata_content_type = Some("application/xml".to_string());
                 sap.selected_manifest = Some(refreshed);
                 sap.selected_resource_id = selected_resource_id;
-                sap.clone_target_path = clone_target_path;
+                sap.clone_target_path = clone_target_path.clone();
             }
         }
         Err(err) => {
-            message = format!("{:#}", err);
+            syntax_details = format!("{:#}", err);
+            message = syntax_details.clone();
         }
     }
 
     if syntax_ok && auto_activate && !check_uri.trim().is_empty() {
         match crate::app::adt_bridge::activate_object(sap, &check_uri) {
             Ok(result) => {
-                activation_ok = true;
-                if result.body.trim().is_empty() {
-                    message = format!("{} and activated", message);
+                activation_ok = result.ok;
+                activation_details = if result.problems.is_empty() {
+                    String::new()
                 } else {
-                    message = format!("{} and activated: {}", message, result.body.trim());
+                    result.problems.join("\n")
+                };
+                let has_location_details = activation_details
+                    .lines()
+                    .any(|line| line.contains("line ") || line.contains("column "));
+                let has_checkruns_locations = result
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("line ") || p.contains("column "));
+
+                let refreshed_manifest = refresh_manifest_after_activation(
+                    sap,
+                    &refresh_manifest_uri,
+                    &object_name,
+                    &object_type,
+                    package_name.as_deref(),
+                    &clone_target_path,
+                );
+
+                if !has_location_details {
+                    if let Some(refreshed) = refreshed_manifest.as_ref() {
+                        if let Some(log_details) = best_activation_log_details(broker, repo, &clone_target_path, refreshed) {
+                            if activation_details.trim().is_empty() {
+                                activation_details = log_details;
+                            }
+                        }
+                    } else if activation_details.trim().is_empty() && !result.body.trim().is_empty() {
+                        activation_details = document_problem_text(&result.body);
+                    }
+                }
+
+                if activation_ok && activation_details.trim().is_empty() {
+                    if result.body.trim().is_empty() {
+                        message = format!("{} and activated", message);
+                    } else {
+                        message = format!("{} and activated: {}", message, result.body.trim());
+                    }
+                } else if !activation_details.is_empty() {
+                    activation_ok = false;
+                    if has_checkruns_locations {
+                        message = "Activation failed".to_string();
+                    } else {
+                        message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                    }
+                } else if !result.body.trim().is_empty() {
+                    activation_ok = false;
+                    activation_details = document_problem_text(&result.body);
+                    message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                } else {
+                    activation_ok = false;
+                    message = "Activation failed".to_string();
                 }
             }
             Err(err) => {
+                activation_ok = false;
+                activation_details = format!("{:#}", err);
+
+                let refreshed_manifest = refresh_manifest_after_activation(
+                    sap,
+                    &refresh_manifest_uri,
+                    &object_name,
+                    &object_type,
+                    package_name.as_deref(),
+                    &clone_target_path,
+                );
+
+                let has_checkruns_locations = activation_details.contains("line ") || activation_details.contains("column ");
+                if !has_checkruns_locations {
+                    if let Some(refreshed) = refreshed_manifest.as_ref() {
+                        if let Some(log_details) = best_activation_log_details(broker, repo, &clone_target_path, refreshed) {
+                            if activation_details.trim().is_empty() {
+                                activation_details = log_details;
+                            } else if !log_details.trim().is_empty() {
+                                activation_details = format!("{}\n{}", activation_details.trim(), log_details.trim());
+                            }
+                        }
+                    }
+                }
+
                 if message.trim().is_empty() {
-                    message = format!("{:#}", err);
+                    message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
                 } else {
-                    message = format!("{}; activation failed: {:#}", message, err);
+                    message = format!("{}; activation failed: {}", message, activation_details.replace('\n', " | "));
                 }
             }
         }
@@ -533,6 +774,8 @@ pub fn export_manifest_impl(
         syntax_ok,
         activation_ok,
         message,
+        syntax_details,
+        activation_details,
         transport: corr_nr,
         export_candidates,
     })

@@ -144,10 +144,10 @@ pub fn sap_adt_panel(
 ) -> Vec<Action> {
     let mut actions = vec![];
 
-    let Some(st) = state.sap_adts.get_mut(&sap_adt_id) else {
-        ui.label("Missing SAP ADT state.");
-        return actions;
-    };
+    let st = state
+        .sap_adts
+        .entry(sap_adt_id)
+        .or_insert_with(crate::app::state::SapAdtState::new);
 
     ui.horizontal(|ui| {
         let color = if st.connected { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_RED };

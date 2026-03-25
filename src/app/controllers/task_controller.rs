@@ -181,13 +181,27 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 (t.bound_execute_loop, t.conversations.get(conversation_id).cloned())
             };
 
-            if loop_id_opt.is_none() {
+            let needs_new_loop_id = match loop_id_opt {
+                Some(existing_id) => state
+                    .active_layout()
+                    .components
+                    .iter()
+                    .find(|c| c.id == existing_id)
+                    .map(|c| c.kind != crate::app::actions::ComponentKind::ExecuteLoop)
+                    .unwrap_or(false),
+                None => true,
+            };
+
+            if needs_new_loop_id {
                 let new_id = state.new_execute_loop_component();
                 state.persist_execute_loop_snapshot(new_id);
                 loop_id_opt = Some(new_id);
 
                 if let Some(t) = state.tasks.get_mut(task_id) {
                     t.bound_execute_loop = Some(new_id);
+                    if !t.execute_loop_ids.iter().any(|x| *x == new_id) {
+                        t.execute_loop_ids.push(new_id);
+                    }
                 }
             }
 

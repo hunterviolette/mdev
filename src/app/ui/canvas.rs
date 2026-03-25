@@ -259,6 +259,26 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         }
                     }
 
+                    let bring_to_front = kind == ComponentKind::SapAdt
+                        && !w0.locked
+                        && (shown.response.clicked() || shown.response.dragged());
+
+                    if bring_to_front {
+                        if let Some(idx) = state
+                            .active_layout()
+                            .components
+                            .iter()
+                            .position(|c| c.id == id)
+                        {
+                            let is_already_front = idx + 1 == state.active_layout().components.len();
+                            if !is_already_front {
+                                let component = state.active_layout_mut().components.remove(idx);
+                                state.active_layout_mut().components.push(component);
+                                state.layout_epoch = state.layout_epoch.wrapping_add(1);
+                            }
+                        }
+                    }
+
                     if let Some(w) = state.active_layout_mut().get_window_mut(id) {
 
                         let outer_rect = shown.response.rect;
