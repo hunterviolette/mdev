@@ -10,25 +10,22 @@ fn lookup<'a>(rows: &'a [SapAdtObjectOperationRow], key: &str) -> (&'a str, &'a 
     ("idle", "")
 }
 
-fn fallback_state(row: &SapAdtExportRow) -> (&str, &str) {
-    if row.activation_ok {
-        return ("activated", row.message.as_str());
-    }
-    if row.syntax_ok || row.pushed_files > 0 {
-        return ("saved", row.message.as_str());
-    }
-    if !row.message.trim().is_empty() {
-        return ("error", row.message.as_str());
+fn fallback_state(row: &SapAdtExportRow) -> (&str, String) {
+    let state = row.workflow.overall_state_text();
+    let hover = row.workflow.hover_text();
+    if !hover.trim().is_empty() {
+        return (state, hover);
     }
     if row.changed_files > 0 {
-        return ("changed", "");
+        return ("changed", String::new());
     }
-    ("idle", "")
+    ("idle", String::new())
 }
 
 fn status_color(state: &str) -> egui::Color32 {
     match state {
         "error" | "syntax_error" => egui::Color32::LIGHT_RED,
+        "warning" => egui::Color32::from_rgb(230, 190, 60),
         "imported" | "exported" | "activated" | "saved" | "ok" => egui::Color32::LIGHT_GREEN,
         "running" | "queued" | "reading" | "saving" | "activating" | "importing" | "exporting" => egui::Color32::LIGHT_BLUE,
         _ => egui::Color32::LIGHT_GRAY,
@@ -95,7 +92,14 @@ pub fn sap_adt_export_panel(
                         if from_activity.0 == "idle" {
                             fallback_state(row)
                         } else {
-                            from_activity
+                            let workflow_hover = row.workflow.hover_text();
+                            if workflow_hover.trim().is_empty() {
+                                (from_activity.0, from_activity.1.to_string())
+                            } else if from_activity.1.trim().is_empty() {
+                                (from_activity.0, workflow_hover)
+                            } else {
+                                (from_activity.0, format!("{}\n\n{}", from_activity.1, workflow_hover))
+                            }
                         }
                     };
 

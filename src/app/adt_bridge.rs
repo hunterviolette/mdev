@@ -50,6 +50,25 @@ pub struct AdtUpdateObjectResult {
     pub ok: bool,
 }
 
+fn should_persist_manifest_header(name: &str) -> bool {
+    !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "x-final-url"
+            | "x-redirected"
+            | "x-request-auth-type"
+            | "x-request-auth-attached"
+            | "x-request-authorization-scheme"
+    )
+}
+
+fn sanitize_manifest_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_persist_manifest_header(name))
+        .cloned()
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct AdtCheckResult {
     pub status: Option<u16>,
@@ -717,7 +736,7 @@ pub fn crawl_object_manifest(
             .content_type
             .clone()
             .or_else(|| Some("application/xml".to_string())),
-        headers: metadata_result.headers.clone(),
+        headers: sanitize_manifest_headers(&metadata_result.headers),
         path: "metadata.xml".to_string(),
         body: metadata_xml.clone(),
     }];
@@ -801,7 +820,7 @@ pub fn crawl_object_manifest(
                         .or_else(|| manifest_header_value(&read_result.headers, "lock-handle"))
                         .or_else(|| manifest_header_value(&read_result.headers, "x-lock-handle"))
                         .or_else(|| manifest_header_value(&read_result.headers, "x-lockhandle")),
-                    headers: read_result.headers.clone(),
+                    headers: sanitize_manifest_headers(&read_result.headers),
                     path,
                     readable,
                     editable,
@@ -816,7 +835,7 @@ pub fn crawl_object_manifest(
                     uri: resolved_uri,
                     title: title.clone(),
                     content_type: read_result.content_type.clone().or(content_type.clone()),
-                    headers: read_result.headers,
+                    headers: sanitize_manifest_headers(&read_result.headers),
                     path,
                     body: read_result.body,
                 });
@@ -863,7 +882,7 @@ pub fn crawl_object_manifest(
                             .or_else(|| manifest_header_value(&read_result.headers, "lock-handle"))
                             .or_else(|| manifest_header_value(&read_result.headers, "x-lock-handle"))
                             .or_else(|| manifest_header_value(&read_result.headers, "x-lockhandle")),
-                        headers: read_result.headers,
+                        headers: sanitize_manifest_headers(&read_result.headers),
                         path: manifest_resource_path_for_link(
                             &metadata_xml,
                             0,

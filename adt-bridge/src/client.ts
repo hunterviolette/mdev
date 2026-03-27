@@ -408,26 +408,52 @@ export class AdtClient {
     });
   }
 
-  async unlockObject(objectUri: string, lockHandle: string) {
-    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}lockHandle=${encodeURIComponent(lockHandle)}`;
-    return this.fetchText('POST', path, '', {
-      'X-sap-adt-sessiontype': 'stateless',
-      Accept: 'application/xml, text/xml, */*'
+  async lockDdlSource(objectUri: string) {
+    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}_action=LOCK&accessMode=MODIFY`;
+    return this.fetchText('POST', path, undefined, {
+      'X-sap-adt-sessiontype': 'stateful',
+      Accept: 'application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result;q=0.8, application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.result2;q=0.9'
     });
+  }
+
+  async formatDdlIdentifiers(source: string) {
+    return this.fetchText('POST', '/sap/bc/adt/ddic/ddl/formatter/identifiers', source, {
+      'X-sap-adt-sessiontype': 'stateful',
+      Accept: 'text/plain',
+      'Content-Type': 'text/plain'
+    });
+  }
+
+  async unlockObject(objectUri: string, lockHandle: string) {
+    const path = `${objectUri}${objectUri.includes('?') ? '&' : '?'}_action=UNLOCK&lockHandle=${encodeURIComponent(lockHandle)}`;
+    const headers: Record<string, string> = {
+      Accept: 'application/xml, text/xml, */*'
+    };
+    if (/\/ddic\/ddl\/sources\//i.test(objectUri)) {
+      headers['X-sap-adt-sessiontype'] = 'stateful';
+    }
+    return this.fetchText('POST', path, '', headers);
   }
 
   async updateObject(objectUri: string, source: string, contentType = 'text/plain; charset=utf-8', lockHandle?: string, corrNr?: string, extraHeaders?: Record<string, string>) {
     const headers: Record<string, string> = {
       'Content-Type': contentType,
-      Accept: 'application/xml, text/plain, */*',
       ...(extraHeaders ?? {})
     };
+    const isDdlSource = /\/ddic\/ddl\/sources\//i.test(objectUri);
+    if (isDdlSource) {
+      headers['X-sap-adt-sessiontype'] = 'stateful';
+      if (!headers.Accept && !headers.accept) {
+        headers.Accept = 'text/plain';
+      }
+    }
+    delete headers['If-Match'];
+    delete headers['if-match'];
+
     let finalUri = objectUri;
     const params: string[] = [];
     if (lockHandle && lockHandle.trim()) {
       const trimmed = lockHandle.trim();
-      headers['X-sap-adt-lockhandle'] = trimmed;
-      headers['X-lockHandle'] = trimmed;
       params.push(`lockHandle=${encodeURIComponent(trimmed)}`);
     }
     if (corrNr && corrNr.trim()) {

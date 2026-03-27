@@ -39,14 +39,49 @@ fn summarize_activation_details(details: &str) -> String {
     important.join("\n")
 }
 
+fn activation_details_have_errors(details: &str) -> bool {
+    details.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.contains("was not activated")
+            || lower.contains("contains errors")
+            || lower.contains("contains error")
+            || lower.contains("syntax error")
+            || lower.contains(" is unknown")
+            || lower.contains(" unknown")
+            || lower.contains("exception")
+            || lower.contains("not caught")
+    })
+}
+
+fn activation_details_have_warnings(details: &str) -> bool {
+    details.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.starts_with("w:")
+            || lower.contains(" warning")
+            || lower.starts_with("warning")
+    })
+}
+
 fn summarize_export_message(row: &crate::app::state::SapAdtExportRow) -> String {
-    if row.activation_ok {
-        return row.message.clone();
+    let workflow_message = row.workflow.hover_text();
+    if !workflow_message.trim().is_empty() {
+        return workflow_message;
     }
 
     let activation_summary = summarize_activation_details(&row.activation_details);
+
+    if row.activation_ok {
+        if !activation_summary.is_empty() {
+            return format!("Activated with warnings\n{}", activation_summary);
+        }
+        return row.message.clone();
+    }
+
     if !activation_summary.is_empty() {
-        return format!("Activation failed\n{}", activation_summary);
+        if activation_details_have_errors(&row.activation_details) {
+            return format!("Activation failed\n{}", activation_summary);
+        }
+        return format!("Activated with warnings\n{}", activation_summary);
     }
 
     if !row.syntax_details.trim().is_empty() {
@@ -103,20 +138,7 @@ fn sync_export_activity_rows(state: &mut AppState, sap_adt_id: crate::app::actio
     };
 
     for row in results {
-        let state_text = if row.activation_ok {
-            "activated".to_string()
-        } else if !row.activation_details.trim().is_empty() || !row.syntax_details.trim().is_empty() {
-            "error".to_string()
-        } else if row.syntax_ok {
-            "saved".to_string()
-        } else if row.pushed_files > 0 {
-            "saved".to_string()
-        } else if !row.message.trim().is_empty() {
-            "error".to_string()
-        } else {
-            "idle".to_string()
-        };
-
+        let state_text = row.workflow.overall_state_text().to_string();
         let message_text = summarize_export_message(&row);
 
         push_sap_adt_activity(
@@ -387,12 +409,13 @@ fn start_import_queue(state: &mut AppState, sap_adt_id: crate::app::actions::Com
         return;
     };
 
-    let (connected, package_objects, selected_uris, already_pending) = match state.sap_adts.get(&sap_adt_id) {
+    let (connected, package_objects, selected_uris, already_pending, include_xml_artifacts) = match state.sap_adts.get(&sap_adt_id) {
         Some(sap) => (
             sap.connected,
             sap.package_objects.clone(),
             sap.import_selected_object_uris.clone(),
             sap.import_job.is_pending(),
+            sap.import_include_xml_artifacts,
         ),
         None => return,
     };
@@ -436,6 +459,7 @@ fn start_import_queue(state: &mut AppState, sap_adt_id: crate::app::actions::Com
                 Some(object.object_type.as_str()),
                 object.package_name.as_deref(),
             )),
+            include_xml_artifacts,
         });
     }
 
@@ -457,6 +481,16 @@ fn start_import_queue(state: &mut AppState, sap_adt_id: crate::app::actions::Com
     let _ = state.broker.exec(CapabilityRequest::EnsureGitRepo { repo });
 }
 
+fn should_persist_sap_adt_resource(resource: &crate::app::sap_adt_manifest::SapAdtManifestResource, include_xml_artifacts: bool) -> bool {
+    if include_xml_artifacts {
+        return true;
+    }
+
+    let content_type = resource.content_type.clone().unwrap_or_default().to_ascii_lowercase();
+    let path = resource.path.to_ascii_lowercase();
+    !content_type.contains("xml") && !path.ends_with(".xml")
+}
+
 fn run_import_job(
     broker: CapabilityBroker,
     discovery_url: String,
@@ -473,13 +507,19 @@ fn run_import_job(
     sap.adt_session_id = adt_session_id;
     sap.connected = true;
 
-    let manifest = crate::app::adt_bridge::crawl_object_manifest(
+    let mut manifest = crate::app::adt_bridge::crawl_object_manifest(
         &mut sap,
         &item.object_uri,
         Some(item.object_name.as_str()),
         Some(item.object_type.as_str()),
         item.package_name.as_deref(),
     ).map_err(|e| format!("{:#}", e))?;
+
+    if !item.include_xml_artifacts {
+        manifest.metadata_xml.clear();
+        manifest.documents.clear();
+        manifest.resources.retain(|resource| should_persist_sap_adt_resource(resource, false));
+    }
 
     let manifest_dir = item
         .clone_target_path
@@ -535,7 +575,11 @@ fn run_import_job(
         object_type: item.object_type,
         action: "import".to_string(),
         state: "imported".to_string(),
-        message: format!("Imported into {}", manifest_dir),
+        message: if item.include_xml_artifacts {
+            format!("Imported into {}", manifest_dir)
+        } else {
+            format!("Imported into {} (XML artifacts excluded)", manifest_dir)
+        },
     })
 }
 
@@ -566,18 +610,7 @@ fn run_export_job(
         item.corr_nr.as_deref(),
     )?;
 
-    let state = if row.activation_ok {
-        "activated".to_string()
-    } else if !row.activation_details.trim().is_empty() || !row.syntax_details.trim().is_empty() {
-        "error".to_string()
-    } else if row.syntax_ok || row.pushed_files > 0 {
-        "saved".to_string()
-    } else if row.message.trim().eq_ignore_ascii_case("No local SAP ADT changes to push") || row.message.to_ascii_lowercase().contains("no changes to push") {
-        "warning".to_string()
-    } else {
-        "error".to_string()
-    };
-
+    let state = row.workflow.overall_state_text().to_string();
     let export_message = summarize_export_message(&row);
 
     Ok(SapAdtExportJobResult {

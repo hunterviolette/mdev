@@ -392,6 +392,116 @@ pub struct SapAdtObjectSummary {
     pub description: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowOutcome {
+    Pending,
+    Running,
+    Success,
+    Warning,
+    Error,
+    Skipped,
+}
+
+impl Default for WorkflowOutcome {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowStep {
+    pub key: String,
+    pub label: String,
+    pub outcome: WorkflowOutcome,
+    pub summary: String,
+    pub details: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowRun {
+    pub kind: String,
+    pub subject: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowRun {
+    pub fn push_step(
+        &mut self,
+        key: impl Into<String>,
+        label: impl Into<String>,
+        outcome: WorkflowOutcome,
+        summary: impl Into<String>,
+        details: impl Into<String>,
+    ) {
+        self.steps.push(WorkflowStep {
+            key: key.into(),
+            label: label.into(),
+            outcome,
+            summary: summary.into(),
+            details: details.into(),
+        });
+    }
+
+    pub fn overall_outcome(&self) -> WorkflowOutcome {
+        if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Error) {
+            WorkflowOutcome::Error
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Warning) {
+            WorkflowOutcome::Warning
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Running) {
+            WorkflowOutcome::Running
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Success) {
+            WorkflowOutcome::Success
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Skipped) {
+            WorkflowOutcome::Skipped
+        } else {
+            WorkflowOutcome::Pending
+        }
+    }
+
+    pub fn overall_state_text(&self) -> &'static str {
+        match self.overall_outcome() {
+            WorkflowOutcome::Pending => "idle",
+            WorkflowOutcome::Running => "running",
+            WorkflowOutcome::Success => "activated",
+            WorkflowOutcome::Warning => "warning",
+            WorkflowOutcome::Error => "error",
+            WorkflowOutcome::Skipped => "skipped",
+        }
+    }
+
+    pub fn headline(&self) -> String {
+        for step in self.steps.iter().rev() {
+            if !step.summary.trim().is_empty() {
+                return step.summary.clone();
+            }
+        }
+        String::new()
+    }
+
+    pub fn hover_text(&self) -> String {
+        let mut lines = Vec::new();
+        for step in &self.steps {
+            let state = match step.outcome {
+                WorkflowOutcome::Pending => "pending",
+                WorkflowOutcome::Running => "running",
+                WorkflowOutcome::Success => "success",
+                WorkflowOutcome::Warning => "warning",
+                WorkflowOutcome::Error => "error",
+                WorkflowOutcome::Skipped => "skipped",
+            };
+            let mut line = format!("{} - {}", step.label, state);
+            if !step.summary.trim().is_empty() {
+                line.push_str(&format!(": {}", step.summary.trim()));
+            }
+            lines.push(line);
+            if !step.details.trim().is_empty() {
+                lines.push(step.details.trim().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SapAdtExportRow {
     pub object_name: String,
@@ -406,6 +516,7 @@ pub struct SapAdtExportRow {
     pub activation_details: String,
     pub transport: Option<String>,
     pub export_candidates: Vec<SapAdtExportCandidate>,
+    pub workflow: WorkflowRun,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -445,6 +556,7 @@ pub struct SapAdtImportJobInput {
     pub object_type: String,
     pub package_name: Option<String>,
     pub clone_target_path: Option<String>,
+    pub include_xml_artifacts: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +630,7 @@ pub struct SapAdtState {
     pub logs: Vec<SapAdtLogEntry>,
     pub import_job: AsyncParallelJob<SapAdtImportJobInput, SapAdtImportJobResult>,
     pub export_job: AsyncParallelJob<SapAdtExportJobInput, SapAdtExportJobResult>,
+    pub import_include_xml_artifacts: bool,
     pub export_auto_activate: bool,
     pub export_show_only_changed: bool,
 }
@@ -565,6 +678,7 @@ impl SapAdtState {
             logs: Vec::new(),
             import_job: AsyncParallelJob::default(),
             export_job: AsyncParallelJob::default(),
+            import_include_xml_artifacts: false,
             export_auto_activate: true,
             export_show_only_changed: true,
         }

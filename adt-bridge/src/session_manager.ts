@@ -58,6 +58,64 @@ function hasLocationProblems(items: Array<{ line?: number; column?: number }>): 
   return items.some(item => Number.isFinite(item.line) || Number.isFinite(item.column));
 }
 
+type AdtResolvedRoute = {
+  routeFamily: 'source_main_at_root' | 'direct_resource' | 'root_to_source_main';
+  lockUri: string;
+  writeUri: string;
+};
+
+function resolveAdtRoute(objectUri: string): AdtResolvedRoute {
+  const trimmed = objectUri.trim();
+  if (!trimmed) {
+    return {
+      routeFamily: 'direct_resource',
+      lockUri: trimmed,
+      writeUri: trimmed,
+    };
+  }
+
+  const [base, suffix = ''] = trimmed.split(/([?#].*)/, 2);
+  const normalizedBase = base.replace(/\/$/, '');
+
+  if (/\/source\/main$/i.test(normalizedBase)) {
+    return {
+      routeFamily: 'source_main_at_root',
+      lockUri: normalizedBase.replace(/\/source\/main$/i, ''),
+      writeUri: `${normalizedBase}${suffix}`,
+    };
+  }
+
+  if (/\/includes\//i.test(normalizedBase)) {
+    return {
+      routeFamily: 'direct_resource',
+      lockUri: normalizedBase.replace(/\/includes\/.*$/i, ''),
+      writeUri: `${normalizedBase}${suffix}`,
+    };
+  }
+
+  if (/\/(programs\/programs|ddic\/ddl\/sources|oo\/classes)\//i.test(normalizedBase)) {
+    return {
+      routeFamily: 'root_to_source_main',
+      lockUri: normalizedBase,
+      writeUri: `${normalizedBase}/source/main${suffix}`,
+    };
+  }
+
+  return {
+    routeFamily: 'direct_resource',
+    lockUri: normalizedBase,
+    writeUri: `${normalizedBase}${suffix}`,
+  };
+}
+
+function previewText(value: string | undefined, max = 240): string {
+  return (value ?? '').replace(/[\r\n\t]+/g, ' ').slice(0, max);
+}
+
+function isDdlSourceUri(uri: string): boolean {
+  return /\/ddic\/ddl\/sources\//i.test(uri);
+}
+
 export class SessionManager {
   private sessions = new Map<string, AdtSessionState>();
 
@@ -169,17 +227,93 @@ export class SessionManager {
 
   async updateObject(cmd: UpdateObjectCommand) {
     const state = this.getSession(cmd.session_id);
-    const resp = await state.client.updateObject(cmd.object_uri, cmd.source, cmd.content_type, cmd.lock_handle, cmd.corr_nr, cmd.headers);
-    const problems = parseProblems(resp.body);
-    return {
-      session_id: state.sessionId,
-      object_uri: cmd.object_uri,
-      status: resp.status,
-      ok: resp.status >= 200 && resp.status < 300 && problems.length === 0,
-      problems,
-      xml: resp.body,
-      headers: resp.headers
-    };
+    const route = resolveAdtRoute(cmd.object_uri);
+    const sourceUri = route.writeUri;
+    const lockUri = route.lockUri;
+    const headers = { ...(cmd.headers ?? {}) } as Record<string, string>;
+    delete headers['If-Match'];
+    delete headers['if-match'];
+
+    console.error(
+      `[adt-bridge] updateObject start objectUri=${cmd.object_uri} routeFamily=${route.routeFamily} sourceUri=${sourceUri} lockUri=${lockUri} contentType=${cmd.content_type ?? ''} inputCorrNr=${cmd.corr_nr ?? ''} sourceBytes=${cmd.source.length}`
+    );
+
+    let lockHandle: string | undefined;
+    let corrNr: string | undefined = cmd.corr_nr?.trim() || undefined;
+
+    try {
+      const lockResp = isDdlSourceUri(lockUri)
+        ? await state.client.lockDdlSource(lockUri)
+        : await state.client.lockObject(lockUri);
+      lockHandle =
+        /<LOCK_HANDLE>([^<]+)<\/LOCK_HANDLE>/i.exec(lockResp.body)?.[1]?.trim() ||
+        /<lockHandle>([^<]+)<\/lockHandle>/i.exec(lockResp.body)?.[1]?.trim() ||
+        lockResp.headers['x-lock-handle'] ||
+        lockResp.headers['x-lockhandle'] ||
+        undefined;
+      corrNr =
+        /<CORRNR>([^<]+)<\/CORRNR>/i.exec(lockResp.body)?.[1]?.trim() ||
+        /<corrNr>([^<]+)<\/corrNr>/i.exec(lockResp.body)?.[1]?.trim() ||
+        corrNr;
+
+      console.error(
+        `[adt-bridge] updateObject lock status=${lockResp.status} routeFamily=${route.routeFamily} lockUri=${lockUri} sourceUri=${sourceUri} lockHandle=${lockHandle ?? ''} corrNr=${corrNr ?? ''} body=${previewText(lockResp.body)}`
+      );
+      if (lockResp.status >= 400) {
+        throw new Error(`updateObject lock failed (${lockResp.status}) for ${lockUri}: ${previewText(lockResp.body)}`);
+      }
+      if (!lockHandle) {
+        throw new Error(`updateObject lock did not return LOCK_HANDLE for ${lockUri}`);
+      }
+
+      let sourceToWrite = cmd.source;
+      if (isDdlSourceUri(lockUri)) {
+        const fmtResp = await state.client.formatDdlIdentifiers(cmd.source);
+        console.error(
+          `[adt-bridge] updateObject ddl-formatter status=${fmtResp.status} sourceUri=${sourceUri} body=${previewText(fmtResp.body)}`
+        );
+        if (fmtResp.status >= 200 && fmtResp.status < 300 && fmtResp.body.trim()) {
+          sourceToWrite = fmtResp.body;
+        }
+      }
+
+      const resp = await state.client.updateObject(
+        sourceUri,
+        sourceToWrite,
+        cmd.content_type,
+        lockHandle,
+        corrNr,
+        headers
+      );
+
+      console.error(
+        `[adt-bridge] updateObject put status=${resp.status} routeFamily=${route.routeFamily} sourceUri=${sourceUri} lockHandle=${lockHandle} corrNr=${corrNr ?? ''} body=${previewText(resp.body)}`
+      );
+      if (resp.status >= 400) {
+        throw new Error(`updateObject put failed (${resp.status}) for ${sourceUri}: ${previewText(resp.body)}`);
+      }
+
+      const problems = parseProblems(resp.body);
+      return {
+        session_id: state.sessionId,
+        object_uri: cmd.object_uri,
+        status: resp.status,
+        ok: resp.status >= 200 && resp.status < 300 && problems.length === 0,
+        problems,
+        xml: resp.body,
+        headers: {
+          ...resp.headers,
+          'x-adt-route-family': route.routeFamily,
+          'x-adt-lock-uri': lockUri,
+          'x-adt-write-uri': sourceUri,
+        }
+      };
+    } finally {
+      if (lockHandle) {
+        console.error(`[adt-bridge] updateObject unlock routeFamily=${route.routeFamily} lockUri=${lockUri} sourceUri=${sourceUri} lockHandle=${lockHandle}`);
+        await state.client.unlockObject(lockUri, lockHandle).catch(() => undefined);
+      }
+    }
   }
 
   async createObject(cmd: CreateObjectCommand) {

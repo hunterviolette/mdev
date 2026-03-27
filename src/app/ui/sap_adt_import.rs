@@ -37,6 +37,7 @@ pub fn sap_adt_import_panel(
             ui.label("Package");
             ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut st.package_query));
             ui.checkbox(&mut st.include_subpackages, "Include subpackages");
+            ui.checkbox(&mut st.import_include_xml_artifacts, "Include XML artifacts");
             if ui.button("Load").clicked() {
                 actions.push(Action::SapAdtLoadPackage { sap_adt_id });
             }

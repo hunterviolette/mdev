@@ -179,10 +179,16 @@ export class SessionManager {
     page.setDefaultNavigationTimeout(timeout);
     await page.goto(cmd.url, { waitUntil: 'domcontentloaded', timeout });
     state.page = page;
+    let title = '';
+    try {
+      title = await page.title();
+    } catch {
+    }
+
     return {
       session_id: state.sessionId,
       url: page.url(),
-      title: await page.title()
+      title
     };
   }
 

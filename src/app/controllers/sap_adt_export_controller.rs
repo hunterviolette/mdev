@@ -26,23 +26,9 @@ fn is_exportable_source_resource(resource: &SapAdtManifestResource) -> bool {
             .as_deref()
             .map(|s| s.to_ascii_lowercase().starts_with("text/plain"))
             .unwrap_or(false)
-        && resource.etag.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
-fn infer_transport_from_manifest(manifest: &SapAdtObjectManifest) -> Option<String> {
-    for document in &manifest.documents {
-        if document.uri.ends_with("/transports") || document.title.as_deref() == Some("Related Transport Requests") {
-            if let Some(start) = document.body.find("<CORRNR>") {
-                let rest = &document.body[start + 8..];
-                if let Some(end) = rest.find("</CORRNR>") {
-                    let corrnr = rest[..end].trim();
-                    if !corrnr.is_empty() {
-                        return Some(corrnr.to_string());
-                    }
-                }
-            }
-        }
-    }
+fn infer_transport_from_manifest(_manifest: &SapAdtObjectManifest) -> Option<String> {
     None
 }
 
@@ -55,7 +41,7 @@ fn export_candidates_from_manifest(manifest: &SapAdtObjectManifest) -> Vec<crate
             resource_id: resource.id.clone(),
             uri: resource.uri.clone(),
             path: resource.path.clone(),
-            etag: resource.etag.clone(),
+            etag: None,
             content_type: resource.content_type.clone().unwrap_or_else(|| "text/plain".to_string()),
             activatable: resource.activatable,
         })
@@ -123,6 +109,7 @@ pub fn scan_export_objects(state: &mut AppState, sap_adt_id: ComponentId) {
                 activation_details: String::new(),
                 transport: transport.clone(),
                 export_candidates: export_candidates_from_manifest(&manifest),
+                workflow: crate::app::state::WorkflowRun::default(),
             });
         }
     }
@@ -192,6 +179,7 @@ pub fn export_selected_worktree_objects(state: &mut AppState, sap_adt_id: Compon
                     activation_details: String::new(),
                     transport: None,
                     export_candidates: Vec::new(),
+                    workflow: crate::app::state::WorkflowRun::default(),
                 });
                 continue;
             }
@@ -251,6 +239,7 @@ pub fn export_selected_worktree_objects(state: &mut AppState, sap_adt_id: Compon
             activation_details: String::new(),
             transport,
             export_candidates: export_candidates_from_manifest(&manifest),
+            workflow: crate::app::state::WorkflowRun::default(),
         });
     }
 
@@ -292,6 +281,20 @@ fn primary_export_target_uri(
     }
 
     metadata_uri.trim().to_string()
+}
+
+fn activation_details_have_errors(details: &str) -> bool {
+    details.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.contains("was not activated")
+            || lower.contains("contains errors")
+            || lower.contains("contains error")
+            || lower.contains("syntax error")
+            || lower.contains(" is unknown")
+            || lower.contains(" unknown")
+            || lower.starts_with("e:")
+            || lower.starts_with("error")
+    })
 }
 
 fn load_manifest_document_body(
@@ -402,6 +405,168 @@ fn best_activation_log_details(
     }
 }
 
+fn activation_details_have_warnings(details: &str) -> bool {
+    details.lines().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.starts_with("w:")
+            || lower.contains(" warning")
+            || lower.starts_with("warning")
+    })
+}
+
+fn activation_result_is_warning_only(details: &str, body: &str) -> bool {
+    !activation_details_have_errors(details)
+        && (activation_details_have_warnings(details)
+            || (!body.trim().is_empty() && !activation_details_have_errors(body)))
+}
+
+fn build_export_workflow(
+    object_name: &str,
+    changed_files: usize,
+    pushed_files: usize,
+    syntax_ok: bool,
+    syntax_details: &str,
+    activation_ok: bool,
+    activation_details: &str,
+    auto_activate: bool,
+    message: &str,
+) -> crate::app::state::WorkflowRun {
+    use crate::app::state::{WorkflowOutcome, WorkflowRun};
+
+    let mut workflow = WorkflowRun {
+        kind: "sap_export".to_string(),
+        subject: object_name.to_string(),
+        steps: Vec::new(),
+    };
+
+    workflow.push_step(
+        "select_resources",
+        "Select resources",
+        WorkflowOutcome::Success,
+        format!("{} changed file(s) found", changed_files),
+        String::new(),
+    );
+
+    if pushed_files > 0 {
+        workflow.push_step(
+            "push_source",
+            "Push source",
+            WorkflowOutcome::Success,
+            format!("Pushed {} file(s)", pushed_files),
+            String::new(),
+        );
+    } else if !syntax_ok && !syntax_details.trim().is_empty() {
+        workflow.push_step(
+            "push_source",
+            "Push source",
+            WorkflowOutcome::Error,
+            "Push failed".to_string(),
+            message.to_string(),
+        );
+    } else if changed_files == 0 {
+        workflow.push_step(
+            "push_source",
+            "Push source",
+            WorkflowOutcome::Skipped,
+            "No local SAP ADT changes to push".to_string(),
+            String::new(),
+        );
+    } else {
+        workflow.push_step(
+            "push_source",
+            "Push source",
+            WorkflowOutcome::Warning,
+            message.to_string(),
+            String::new(),
+        );
+    }
+
+    if syntax_ok {
+        workflow.push_step(
+            "syntax_check",
+            "Syntax check",
+            WorkflowOutcome::Success,
+            "Syntax check passed".to_string(),
+            String::new(),
+        );
+    } else if !syntax_details.trim().is_empty() {
+        workflow.push_step(
+            "syntax_check",
+            "Syntax check",
+            WorkflowOutcome::Error,
+            "Syntax check failed".to_string(),
+            syntax_details.to_string(),
+        );
+    } else {
+        workflow.push_step(
+            "syntax_check",
+            "Syntax check",
+            WorkflowOutcome::Skipped,
+            "Syntax check not run".to_string(),
+            String::new(),
+        );
+    }
+
+    if auto_activate {
+        if activation_ok && activation_details.trim().is_empty() {
+            workflow.push_step(
+                "activate",
+                "Activate",
+                WorkflowOutcome::Success,
+                "Activated".to_string(),
+                String::new(),
+            );
+        } else if activation_ok && activation_details_have_warnings(activation_details) && !activation_details_have_errors(activation_details) {
+            workflow.push_step(
+                "activate",
+                "Activate",
+                WorkflowOutcome::Warning,
+                "Activated with warnings".to_string(),
+                activation_details.to_string(),
+            );
+        } else if !activation_details.trim().is_empty() {
+            workflow.push_step(
+                "activate",
+                "Activate",
+                WorkflowOutcome::Error,
+                "Activation failed".to_string(),
+                activation_details.to_string(),
+            );
+        } else if activation_ok {
+            workflow.push_step(
+                "activate",
+                "Activate",
+                WorkflowOutcome::Success,
+                "Activated".to_string(),
+                String::new(),
+            );
+        } else {
+            workflow.push_step(
+                "activate",
+                "Activate",
+                WorkflowOutcome::Error,
+                "Activation failed".to_string(),
+                message.to_string(),
+            );
+        }
+    } else {
+        workflow.push_step(
+            "activate",
+            "Activate",
+            WorkflowOutcome::Skipped,
+            "Auto-activate disabled".to_string(),
+            activation_details.to_string(),
+        );
+    }
+
+    workflow
+}
+
+fn debug_preview(text: &str, max_chars: usize) -> String {
+    let compact = text.replace(['\r', '\n', '\t'], " ");
+    compact.chars().take(max_chars).collect()
+}
+
 pub fn export_manifest_job(
     broker: &crate::capabilities::CapabilityBroker,
     repo: &std::path::PathBuf,
@@ -443,16 +608,60 @@ pub fn export_manifest_impl(
     let clone_target_path = manifest_dir.clone();
     let corr_nr = corr_nr.map(|value| value.to_string()).filter(|value| !value.trim().is_empty());
 
-    let mut pending_updates: Vec<(usize, String)> = Vec::new();
+    let export_candidates = export_candidates_from_manifest(&manifest);
+    let mut pushed_resource_uris: Vec<String> = Vec::new();
 
-    for index in 0..manifest.resources.len() {
-        let Some(resource) = manifest.resources.get(index) else {
-            continue;
+    for current_index in 0..manifest.resources.len() {
+        let (source_uri, local_path, content_type, lock_handle, fallback_etag) = match manifest.resources.get(current_index) {
+            Some(resource) if resource.editable && !resource.uri.trim().is_empty() => {
+                let in_export_candidates = export_candidates.iter().any(|candidate| {
+                    (!candidate.resource_id.is_empty() && candidate.resource_id == resource.id)
+                        || (!candidate.uri.trim().is_empty() && candidate.uri.trim() == resource.uri.trim())
+                });
+                if !in_export_candidates {
+                    eprintln!(
+                        "[sap-adt-export] skipping non-export-candidate index={} id={} path={} uri={}",
+                        current_index,
+                        resource.id,
+                        resource.path,
+                        resource.uri,
+                    );
+                    continue;
+                }
+                (
+                    resource.uri.trim().to_string(),
+                    join_manifest_relative_path(&manifest_dir, &resource.path),
+                    resource
+                        .content_type
+                        .clone()
+                        .or_else(|| Some("text/plain; charset=utf-8".to_string())),
+                    resource.lock_handle.clone(),
+                    resource.etag.clone().or_else(|| manifest.etag.clone()),
+                )
+            }
+            _ => continue,
         };
-        if !resource.editable || resource.uri.trim().is_empty() {
-            continue;
+
+        if let Some(resource) = manifest.resources.get(current_index) {
+            let in_export_candidates = export_candidates.iter().any(|candidate| {
+                (!candidate.resource_id.is_empty() && candidate.resource_id == resource.id)
+                    || (!candidate.uri.trim().is_empty() && candidate.uri.trim() == resource.uri.trim())
+            });
+            eprintln!(
+                "[sap-adt-export] considering index={} id={} path={} uri={} editable={} activatable={} content_type={} fallback_etag={} lock_handle_present={} in_export_candidates={}",
+                current_index,
+                resource.id,
+                resource.path,
+                resource.uri,
+                resource.editable,
+                resource.activatable,
+                resource.content_type.clone().unwrap_or_default(),
+                fallback_etag.clone().unwrap_or_default(),
+                lock_handle.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false),
+                in_export_candidates,
+            );
         }
-        let local_path = join_manifest_relative_path(&manifest_dir, &resource.path);
+
         let resp = broker.exec(crate::capabilities::CapabilityRequest::ReadFile {
             repo: repo.clone(),
             path: local_path.clone(),
@@ -463,10 +672,15 @@ pub fn export_manifest_impl(
         };
         let source_text = String::from_utf8(local_bytes)
             .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {}", local_path, e))?;
-        if source_text != resource.body {
-            pending_updates.push((index, source_text));
-        }
-    }
+
+        eprintln!(
+            "[sap-adt-export] local-read index={} path={} bytes={} source_uri={} content_type={}",
+            current_index,
+            local_path,
+            source_text.len(),
+            source_uri,
+            content_type.clone().unwrap_or_default(),
+        );
 
     let export_candidates = manifest
         .resources
@@ -485,48 +699,24 @@ pub fn export_manifest_impl(
         })
         .collect::<Vec<_>>();
 
-    if pending_updates.is_empty() {
-        return Ok(crate::app::state::SapAdtExportRow {
-            object_name,
-            object_type,
-            manifest_path: manifest_path.to_string(),
-            changed_files: 0,
-            pushed_files: 0,
-            syntax_ok: false,
-            activation_ok: false,
-            message: "No local SAP ADT changes to push".to_string(),
-            syntax_details: String::new(),
-            activation_details: String::new(),
-            transport: corr_nr,
-            export_candidates,
-        });
-    }
-
-    let mut pushed_resource_uris: Vec<String> = Vec::new();
-
-    for (current_index, source_text) in pending_updates.iter() {
-        let (source_uri, content_type, lock_handle, fallback_etag) = match manifest.resources.get(*current_index) {
-            Some(resource) => (
-                resource.uri.trim().to_string(),
-                resource
-                    .content_type
-                    .clone()
-                    .or_else(|| Some("text/plain; charset=utf-8".to_string())),
-                resource.lock_handle.clone(),
-                resource.etag.clone().or_else(|| manifest.etag.clone()),
-            ),
-            None => return Err(anyhow::anyhow!("Manifest resource index is out of range")),
-        };
-
         if source_uri.is_empty() {
             return Err(anyhow::anyhow!("{} has a manifest resource with no uri", manifest_path));
         }
 
         let mut effective_if_match = fallback_etag.clone();
+        eprintln!(
+            "[sap-adt-export] update start index={} source_uri={} corr_nr={} if_match={} lock_handle_present={} body_preview={}",
+            current_index,
+            source_uri,
+            corr_nr.clone().unwrap_or_default(),
+            fallback_etag.clone().unwrap_or_default(),
+            lock_handle.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false),
+            debug_preview(&source_text, 160),
+        );
         let mut update_result = crate::app::adt_bridge::update_object(
             sap,
             &source_uri,
-            source_text,
+            &source_text,
             content_type.as_deref(),
             lock_handle.as_deref(),
             corr_nr.as_deref(),
@@ -535,17 +725,23 @@ pub fn export_manifest_impl(
 
         if let Err(err) = &update_result {
             let err_text = format!("{:#}", err);
+            eprintln!(
+                "[sap-adt-export] update error index={} source_uri={} error_preview={}",
+                current_index,
+                source_uri,
+                debug_preview(&err_text, 300),
+            );
             if err_text.contains("412") {
                 if let Some(server_etag) = extract_server_etag_from_adt_error(&err_text) {
                     effective_if_match = Some(server_etag.clone());
-                    if let Some(resource) = manifest.resources.get_mut(*current_index) {
+                    if let Some(resource) = manifest.resources.get_mut(current_index) {
                         resource.etag = Some(server_etag.clone());
                         manifest.etag = Some(server_etag);
                     }
                     update_result = crate::app::adt_bridge::update_object(
                         sap,
                         &source_uri,
-                        source_text,
+                        &source_text,
                         content_type.as_deref(),
                         lock_handle.as_deref(),
                         corr_nr.as_deref(),
@@ -556,10 +752,34 @@ pub fn export_manifest_impl(
         }
 
         let update_result = update_result?;
+        if !update_result.ok {
+            return Err(anyhow::anyhow!(
+                "ADT update failed for {} (status={}): {}",
+                source_uri,
+                update_result
+                    .status
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                debug_preview(&update_result.body, 300),
+            ));
+        }
 
-        if let Some(resource) = manifest.resources.get_mut(*current_index) {
-            resource.body = source_text.clone();
-            resource.headers = update_result.headers.clone();
+        eprintln!(
+            "[sap-adt-export] update ok index={} source_uri={} response_etag={} response_lock_handle={} response_headers={} response_preview={}",
+            current_index,
+            source_uri,
+            header_value(&update_result.headers, "etag").unwrap_or_default(),
+            header_value(&update_result.headers, "lock_handle")
+                .or_else(|| header_value(&update_result.headers, "lock-handle"))
+                .or_else(|| header_value(&update_result.headers, "x-lock-handle"))
+                .or_else(|| header_value(&update_result.headers, "x-lockhandle"))
+                .unwrap_or_default(),
+            update_result.headers.len(),
+            debug_preview(&update_result.body, 300),
+        );
+
+        if let Some(resource) = manifest.resources.get_mut(current_index) {
+            resource.headers = sanitize_manifest_headers(&update_result.headers);
             if let Some(handle) = header_value(&update_result.headers, "lock_handle")
                 .or_else(|| header_value(&update_result.headers, "lock-handle"))
                 .or_else(|| header_value(&update_result.headers, "x-lock-handle"))
@@ -708,6 +928,10 @@ pub fn export_manifest_impl(
                     }
                 }
 
+                if !activation_ok && activation_result_is_warning_only(&activation_details, &result.body) {
+                    activation_ok = true;
+                }
+
                 if activation_ok && activation_details.trim().is_empty() {
                     if result.body.trim().is_empty() {
                         message = format!("{} and activated", message);
@@ -715,16 +939,27 @@ pub fn export_manifest_impl(
                         message = format!("{} and activated: {}", message, result.body.trim());
                     }
                 } else if !activation_details.is_empty() {
-                    activation_ok = false;
-                    if has_checkruns_locations {
-                        message = "Activation failed".to_string();
+                    if activation_ok && !activation_details_have_errors(&activation_details) {
+                        message = format!("{} and activated with warnings: {}", message, activation_details.replace('\n', " | "));
                     } else {
-                        message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                        activation_ok = false;
+                        if has_checkruns_locations {
+                            message = "Activation failed".to_string();
+                        } else {
+                            message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                        }
                     }
                 } else if !result.body.trim().is_empty() {
-                    activation_ok = false;
-                    activation_details = document_problem_text(&result.body);
-                    message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                    let body_details = document_problem_text(&result.body);
+                    if activation_ok || activation_result_is_warning_only(&body_details, &result.body) {
+                        activation_ok = true;
+                        activation_details = body_details.clone();
+                        message = format!("{} and activated with warnings: {}", message, body_details.replace('\n', " | "));
+                    } else {
+                        activation_ok = false;
+                        activation_details = body_details;
+                        message = format!("Activation failed: {}", activation_details.replace('\n', " | "));
+                    }
                 } else {
                     activation_ok = false;
                     message = "Activation failed".to_string();
@@ -765,12 +1000,26 @@ pub fn export_manifest_impl(
         }
     }
 
+    let changed_files = pushed_resource_uris.len();
+    let pushed_files = pushed_resource_uris.len();
+    let workflow = build_export_workflow(
+        &object_name,
+        changed_files,
+        pushed_files,
+        syntax_ok,
+        &syntax_details,
+        activation_ok,
+        &activation_details,
+        auto_activate,
+        &message,
+    );
+
     Ok(crate::app::state::SapAdtExportRow {
         object_name,
         object_type,
         manifest_path: manifest_path.to_string(),
-        changed_files: pending_updates.len(),
-        pushed_files: pushed_resource_uris.len(),
+        changed_files,
+        pushed_files,
         syntax_ok,
         activation_ok,
         message,
@@ -778,6 +1027,7 @@ pub fn export_manifest_impl(
         activation_details,
         transport: corr_nr,
         export_candidates,
+        workflow,
     })
 }
 
@@ -918,8 +1168,7 @@ pub fn push_worktree_to_adt(state: &mut AppState, sap_adt_id: ComponentId, path:
         };
 
         if let Some(resource) = manifest.resources.get_mut(current_index) {
-            resource.body = source_text;
-            resource.headers = update_result.headers.clone();
+            resource.headers = sanitize_manifest_headers(&update_result.headers);
             if let Some(handle) = header_value(&update_result.headers, "lock_handle")
                 .or_else(|| header_value(&update_result.headers, "lock-handle"))
                 .or_else(|| header_value(&update_result.headers, "x-lock-handle"))
@@ -1187,6 +1436,25 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.clone())
+}
+
+fn should_persist_manifest_header(name: &str) -> bool {
+    !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "x-final-url"
+            | "x-redirected"
+            | "x-request-auth-type"
+            | "x-request-auth-attached"
+            | "x-request-authorization-scheme"
+    )
+}
+
+fn sanitize_manifest_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_persist_manifest_header(name))
+        .cloned()
+        .collect()
 }
 
 fn write_manifest_to_worktree(state: &mut AppState, manifest_path: &str, manifest: &SapAdtObjectManifest) -> Result<()> {

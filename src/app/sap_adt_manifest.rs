@@ -14,13 +14,13 @@ pub struct SapAdtObjectManifest {
     pub object_type: Option<String>,
     #[serde(default)]
     pub package_name: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub etag: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub metadata_xml: String,
     #[serde(default)]
     pub resources: Vec<SapAdtManifestResource>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub documents: Vec<SapAdtManifestDocument>,
 }
 
@@ -36,11 +36,11 @@ pub struct SapAdtManifestResource {
     pub title: Option<String>,
     #[serde(default)]
     pub content_type: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub etag: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub lock_handle: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub path: String,
@@ -52,7 +52,7 @@ pub struct SapAdtManifestResource {
     pub activatable: bool,
     #[serde(default)]
     pub role: String,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub body: String,
 }
 
@@ -66,11 +66,11 @@ pub struct SapAdtManifestDocument {
     pub title: Option<String>,
     #[serde(default)]
     pub content_type: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub path: String,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub body: String,
 }
 
