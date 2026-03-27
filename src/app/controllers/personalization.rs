@@ -19,6 +19,19 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             state.ui.canvas_tint_draft = None;
             true
         }
+        Action::OpenGlobalSettings => {
+            state.ui.global_settings_open = true;
+            state.ui.global_settings_git_status_poll_s = (state.perf.git_status_poll_ms / 1000).clamp(1, 999);
+            state.ui.global_settings_analysis_refresh_poll_s = (state.perf.analysis_refresh_poll_ms / 1000).clamp(1, 999);
+            state.ui.global_settings_browser_response_poll_s = (state.perf.browser_response_poll_ms / 1000).clamp(1, 999);
+            state.ui.global_settings_browser_dom_poll_s = (state.perf.browser_dom_poll_ms / 1000).clamp(1, 999);
+            state.palette.open = false;
+            true
+        }
+        Action::CloseGlobalSettings => {
+            state.ui.global_settings_open = false;
+            true
+        }
         Action::SetCanvasBgTint { rgba } => {
             state.ui.canvas_bg_tint = *rgba;
             true

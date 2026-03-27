@@ -541,21 +541,17 @@ impl AppState {
         };
 
         let mut target_inner_size = None;
-        let mut target_canvas_size = None;
-
-        match &preset.kind {
+        let target_canvas_size = match &preset.kind {
             PresetKind::FullState(st) => {
                 self.pending_viewport_restore = Some(ViewportRestore {
                     outer_pos: st.viewport_outer_pos,
                     inner_size: st.viewport_inner_size,
                 });
                 target_inner_size = st.viewport_inner_size;
-                target_canvas_size = Some(st.canvas_size);
+                Some(st.canvas_size)
             }
-            PresetKind::LayoutOnly(ls) => {
-                target_canvas_size = Some(ls.canvas_size);
-            }
-        }
+            PresetKind::LayoutOnly(ls) => Some(ls.canvas_size),
+        };
 
         self.pending_workspace_apply = Some(PendingWorkspaceApply {
             preset: preset.kind.clone(),

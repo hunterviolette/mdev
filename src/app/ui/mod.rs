@@ -1,6 +1,7 @@
 pub mod canvas;
 pub mod command_palette;
 pub mod personalization;
+pub mod global_settings;
 pub mod file_viewer;
 pub mod helpers;
 pub mod summary_panel;
@@ -14,3 +15,6 @@ pub mod changeset_loop;
 pub mod source_control;
 pub mod diff_viewer;
 pub mod task_panel;
+pub mod sap_adt;
+pub mod sap_adt_import;
+pub mod sap_adt_export;

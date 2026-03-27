@@ -7,7 +7,7 @@ use super::super::state::AppState;
 use crate::model::AnalysisResult;
 
 
-use super::{changeset_applier, context_exporter, diff_viewer, changeset_loop, file_viewer, source_control, summary_panel, task_panel, terminal, tree_panel};
+use super::{changeset_applier, context_exporter, diff_viewer, changeset_loop, file_viewer, sap_adt, source_control, summary_panel, task_panel, terminal, tree_panel};
 
 fn canvas_rect_id() -> egui::Id {
     egui::Id::new("canvas_rect_after_top_panel")
@@ -194,6 +194,10 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                             actions.extend(diff_viewer::diff_viewer_panel(ctx, ui, state, id));
                             return content_size;
                         }
+                        ComponentKind::SapAdt => {
+                            actions.extend(sap_adt::sap_adt_panel(ctx, ui, state, id));
+                            return content_size;
+                        }
                         _ => {}
                     }
 
@@ -233,7 +237,8 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                         | ComponentKind::ExecuteLoop
                         | ComponentKind::Task
                         | ComponentKind::SourceControl
-                        | ComponentKind::DiffViewer => {
+                        | ComponentKind::DiffViewer
+                        | ComponentKind::SapAdt => {
                         }
                     }
 
@@ -251,6 +256,26 @@ pub fn canvas(ctx: &egui::Context, state: &mut AppState) -> Vec<Action> {
                     if !open {
                         if let Some(w) = state.active_layout_mut().get_window_mut(id) {
                             w.open = false;
+                        }
+                    }
+
+                    let bring_to_front = kind == ComponentKind::SapAdt
+                        && !w0.locked
+                        && (shown.response.clicked() || shown.response.dragged());
+
+                    if bring_to_front {
+                        if let Some(idx) = state
+                            .active_layout()
+                            .components
+                            .iter()
+                            .position(|c| c.id == id)
+                        {
+                            let is_already_front = idx + 1 == state.active_layout().components.len();
+                            if !is_already_front {
+                                let component = state.active_layout_mut().components.remove(idx);
+                                state.active_layout_mut().components.push(component);
+                                state.layout_epoch = state.layout_epoch.wrapping_add(1);
+                            }
                         }
                     }
 

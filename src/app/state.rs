@@ -12,11 +12,12 @@ use crate::capabilities::GitStatusEntry;
 
 use crate::model::{AnalysisResult, CommitEntry};
 use crate::platform::Platform;
-use super::async_job::{AsyncLatestJob, AsyncQueuedJob};
+use super::async_job::{AsyncLatestJob, AsyncParallelJob, AsyncQueuedJob};
 
 use super::openai::OpenAIClient;
 
 use serde::{Deserialize, Serialize};
+use crate::app::sap_adt_manifest::SapAdtObjectManifest;
 
 use super::actions::{ComponentId, ConversationId, ExpandCmd, TaskId, TerminalShell};
 use super::actions::ComponentKind;
@@ -274,6 +275,414 @@ impl Default for TaskState {
 pub enum ExecuteLoopTransport {
     Api,
     BrowserBridge,
+}
+
+fn default_sap_adt_discovery_url() -> Option<String> {
+    let raw = std::env::var("ADT_BASE_HOST").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("/sap/bc/adt/discovery") {
+        return Some(trimmed.to_string());
+    }
+
+    Some(format!(
+        "{}/sap/bc/adt/discovery",
+        trimmed.trim_end_matches('/')
+    ))
+}
+
+fn default_sap_adt_browser_bridge_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_BRIDGE_DIR", "BROWSER_BRIDGE_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("bridge");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("bridge");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "bridge".to_string()
+}
+
+fn default_sap_adt_browser_channel() -> String {
+    for key in ["SAP_ADT_BROWSER_CHANNEL", "BROWSER_CHANNEL"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    "msedge".to_string()
+}
+
+fn default_sap_adt_browser_user_data_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_USER_DATA_DIR", "BROWSER_USER_DATA_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push("mdev-sap-adt-browser");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtTemplateLink {
+    pub rel: String,
+    pub template: String,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryCollection {
+    pub title: String,
+    pub href: String,
+    pub category_term: Option<String>,
+    pub category_scheme: Option<String>,
+    pub accepts: Vec<String>,
+    pub template_links: Vec<SapAdtTemplateLink>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryState {
+    pub workspaces: Vec<String>,
+    pub collections: Vec<SapAdtDiscoveryCollection>,
+    pub package_collection_href: Option<String>,
+    pub package_tree_href: Option<String>,
+    pub repository_search_href: Option<String>,
+    pub repository_search_template: Option<String>,
+    pub object_types_href: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtObjectSummary {
+    pub uri: String,
+    pub source_uri: Option<String>,
+    pub name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowOutcome {
+    Pending,
+    Running,
+    Success,
+    Warning,
+    Error,
+    Skipped,
+}
+
+impl Default for WorkflowOutcome {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowStep {
+    pub key: String,
+    pub label: String,
+    pub outcome: WorkflowOutcome,
+    pub summary: String,
+    pub details: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowRun {
+    pub kind: String,
+    pub subject: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowRun {
+    pub fn push_step(
+        &mut self,
+        key: impl Into<String>,
+        label: impl Into<String>,
+        outcome: WorkflowOutcome,
+        summary: impl Into<String>,
+        details: impl Into<String>,
+    ) {
+        self.steps.push(WorkflowStep {
+            key: key.into(),
+            label: label.into(),
+            outcome,
+            summary: summary.into(),
+            details: details.into(),
+        });
+    }
+
+    pub fn overall_outcome(&self) -> WorkflowOutcome {
+        if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Error) {
+            WorkflowOutcome::Error
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Warning) {
+            WorkflowOutcome::Warning
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Running) {
+            WorkflowOutcome::Running
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Success) {
+            WorkflowOutcome::Success
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Skipped) {
+            WorkflowOutcome::Skipped
+        } else {
+            WorkflowOutcome::Pending
+        }
+    }
+
+    pub fn overall_state_text(&self) -> &'static str {
+        match self.overall_outcome() {
+            WorkflowOutcome::Pending => "idle",
+            WorkflowOutcome::Running => "running",
+            WorkflowOutcome::Success => "activated",
+            WorkflowOutcome::Warning => "warning",
+            WorkflowOutcome::Error => "error",
+            WorkflowOutcome::Skipped => "skipped",
+        }
+    }
+
+    pub fn headline(&self) -> String {
+        for step in self.steps.iter().rev() {
+            if !step.summary.trim().is_empty() {
+                return step.summary.clone();
+            }
+        }
+        String::new()
+    }
+
+    pub fn hover_text(&self) -> String {
+        let mut lines = Vec::new();
+        for step in &self.steps {
+            let state = match step.outcome {
+                WorkflowOutcome::Pending => "pending",
+                WorkflowOutcome::Running => "running",
+                WorkflowOutcome::Success => "success",
+                WorkflowOutcome::Warning => "warning",
+                WorkflowOutcome::Error => "error",
+                WorkflowOutcome::Skipped => "skipped",
+            };
+            let mut line = format!("{} - {}", step.label, state);
+            if !step.summary.trim().is_empty() {
+                line.push_str(&format!(": {}", step.summary.trim()));
+            }
+            lines.push(line);
+            if !step.details.trim().is_empty() {
+                lines.push(step.details.trim().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtExportRow {
+    pub object_name: String,
+    pub object_type: String,
+    pub manifest_path: String,
+    pub changed_files: usize,
+    pub pushed_files: usize,
+    pub syntax_ok: bool,
+    pub activation_ok: bool,
+    pub message: String,
+    pub syntax_details: String,
+    pub activation_details: String,
+    pub transport: Option<String>,
+    pub export_candidates: Vec<SapAdtExportCandidate>,
+    pub workflow: WorkflowRun,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtExportCandidate {
+    pub resource_id: String,
+    pub uri: String,
+    pub path: String,
+    pub etag: Option<String>,
+    pub content_type: String,
+    pub activatable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtObjectOperationRow {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtLogEntry {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtImportJobInput {
+    pub object_uri: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub clone_target_path: Option<String>,
+    pub include_xml_artifacts: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtImportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobInput {
+    pub manifest_path: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub auto_activate: bool,
+    pub corr_nr: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+    pub row: SapAdtExportRow,
+}
+
+pub struct SapAdtState {
+    pub connected: bool,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub discovery_url: Option<String>,
+    pub discovery_xml: String,
+    pub discovery: Option<SapAdtDiscoveryState>,
+    pub cookie_header: Option<String>,
+    pub browser_session_id: Option<String>,
+    pub adt_session_id: Option<String>,
+    pub browser_bridge_dir: String,
+    pub browser_channel: String,
+    pub browser_user_data_dir: String,
+    pub package_query: String,
+    pub include_subpackages: bool,
+    pub package_tree_xml: String,
+    pub package_objects: Vec<SapAdtObjectSummary>,
+    pub import_popup_open: bool,
+    pub export_popup_open: bool,
+    pub logs_popup_open: bool,
+    pub import_selected_object_uris: HashSet<String>,
+    pub selected_object_uri: Option<String>,
+    pub selected_object_metadata_uri: Option<String>,
+    pub selected_object_name: Option<String>,
+    pub selected_object_type: Option<String>,
+    pub selected_manifest: Option<SapAdtObjectManifest>,
+    pub selected_resource_id: Option<String>,
+    pub selected_object_content: String,
+    pub selected_object_content_type: Option<String>,
+    pub selected_object_headers: Vec<(String, String)>,
+    pub selected_object_metadata: String,
+    pub selected_object_metadata_content_type: Option<String>,
+    pub clone_target_path: String,
+    pub corr_nr: String,
+    pub export_selected_manifest_paths: HashSet<String>,
+    pub export_results_scan: Vec<SapAdtExportRow>,
+    pub export_results: Vec<SapAdtExportRow>,
+    pub object_operations: Vec<SapAdtObjectOperationRow>,
+    pub logs: Vec<SapAdtLogEntry>,
+    pub import_job: AsyncParallelJob<SapAdtImportJobInput, SapAdtImportJobResult>,
+    pub export_job: AsyncParallelJob<SapAdtExportJobInput, SapAdtExportJobResult>,
+    pub import_include_xml_artifacts: bool,
+    pub export_auto_activate: bool,
+    pub export_show_only_changed: bool,
+}
+
+impl SapAdtState {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            last_status: None,
+            last_error: None,
+            discovery_url: default_sap_adt_discovery_url(),
+            discovery_xml: String::new(),
+            discovery: None,
+            cookie_header: None,
+            browser_session_id: None,
+            adt_session_id: None,
+            browser_bridge_dir: default_sap_adt_browser_bridge_dir(),
+            browser_channel: default_sap_adt_browser_channel(),
+            browser_user_data_dir: default_sap_adt_browser_user_data_dir(),
+            package_query: String::new(),
+            include_subpackages: true,
+            package_tree_xml: String::new(),
+            package_objects: Vec::new(),
+            import_popup_open: false,
+            export_popup_open: false,
+            logs_popup_open: false,
+            import_selected_object_uris: HashSet::new(),
+            selected_object_uri: None,
+            selected_object_metadata_uri: None,
+            selected_object_name: None,
+            selected_object_type: None,
+            selected_manifest: None,
+            selected_resource_id: None,
+            selected_object_content: String::new(),
+            selected_object_content_type: None,
+            selected_object_headers: Vec::new(),
+            selected_object_metadata: String::new(),
+            selected_object_metadata_content_type: None,
+            clone_target_path: String::new(),
+            corr_nr: String::new(),
+            export_selected_manifest_paths: HashSet::new(),
+            export_results_scan: Vec::new(),
+            export_results: Vec::new(),
+            object_operations: Vec::new(),
+            logs: Vec::new(),
+            import_job: AsyncParallelJob::default(),
+            export_job: AsyncParallelJob::default(),
+            import_include_xml_artifacts: false,
+            export_auto_activate: true,
+            export_show_only_changed: true,
+        }
+    }
 }
 
 pub struct ExecuteLoopState {
@@ -898,6 +1307,7 @@ pub struct AppState {
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
+    pub perf: GlobalPerfConfig,
     pub tree: TreeState,
 
     pub canvases: Vec<CanvasState>,
@@ -923,6 +1333,7 @@ pub struct AppState {
     pub task_store_dirty: bool,
 
     pub source_controls: HashMap<ComponentId, SourceControlState>,
+    pub sap_adts: HashMap<ComponentId, SapAdtState>,
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
@@ -951,6 +1362,61 @@ pub struct InputsState {
     pub max_exts: usize,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GlobalPerfConfig {
+    #[serde(default = "GlobalPerfConfig::default_git_status_poll_ms")]
+    pub git_status_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_analysis_refresh_poll_ms")]
+    pub analysis_refresh_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_response_poll_ms")]
+    pub browser_response_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_dom_poll_ms")]
+    pub browser_dom_poll_ms: u64,
+}
+
+impl GlobalPerfConfig {
+    fn clamp_ms(value: u64) -> u64 {
+        value.max(250)
+    }
+
+    fn default_git_status_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_analysis_refresh_poll_ms() -> u64 {
+        4000
+    }
+
+    fn default_browser_response_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_browser_dom_poll_ms() -> u64 {
+        1000
+    }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            git_status_poll_ms: Self::clamp_ms(self.git_status_poll_ms),
+            analysis_refresh_poll_ms: Self::clamp_ms(self.analysis_refresh_poll_ms),
+            browser_response_poll_ms: Self::clamp_ms(self.browser_response_poll_ms),
+            browser_dom_poll_ms: Self::clamp_ms(self.browser_dom_poll_ms),
+        }
+    }
+}
+
+impl Default for GlobalPerfConfig {
+    fn default() -> Self {
+        Self {
+            git_status_poll_ms: Self::default_git_status_poll_ms(),
+            analysis_refresh_poll_ms: Self::default_analysis_refresh_poll_ms(),
+            browser_response_poll_ms: Self::default_browser_response_poll_ms(),
+            browser_dom_poll_ms: Self::default_browser_dom_poll_ms(),
+        }
+        .normalized()
+    }
+}
+
 pub struct ResultsState {
     pub result: Option<AnalysisResult>,
     pub error: Option<String>,
@@ -963,6 +1429,11 @@ pub struct UiState {
     pub canvas_bg_tint: Option<[u8; 4]>,
     pub canvas_tint_popup_open: bool,
     pub canvas_tint_draft: Option<[u8; 4]>,
+    pub global_settings_open: bool,
+    pub global_settings_git_status_poll_s: u64,
+    pub global_settings_analysis_refresh_poll_s: u64,
+    pub global_settings_browser_response_poll_s: u64,
+    pub global_settings_browser_dom_poll_s: u64,
 
     pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
 
@@ -991,10 +1462,8 @@ pub struct TreeState {
     pub git_status_by_path: HashMap<String, GitStatusEntry>,
 
     pub last_auto_refresh_s: f64,
-    pub auto_refresh_interval_s: f64,
 
     pub last_git_status_refresh_s: f64,
-    pub git_status_interval_s: f64,
 
     pub analysis_job: AsyncLatestJob<crate::model::AnalysisResult>,
     pub git_status_job: AsyncLatestJob<GitStatusSnapshot>,
@@ -1025,9 +1494,7 @@ impl TreeState {
             untracked_paths: HashSet::new(),
             git_status_by_path: HashMap::new(),
             last_auto_refresh_s: 0.0,
-            auto_refresh_interval_s: 4.0,
             last_git_status_refresh_s: 0.0,
-            git_status_interval_s: 1.0,
             analysis_job: AsyncLatestJob::default(),
             git_status_job: AsyncLatestJob::default(),
             diff_stats_job: AsyncLatestJob::default(),
@@ -1345,10 +1812,17 @@ impl AppState {
                 canvas_bg_tint: None,
                 canvas_tint_popup_open: false,
                 canvas_tint_draft: None,
+                global_settings_open: false,
+                global_settings_git_status_poll_s: 1,
+                global_settings_analysis_refresh_poll_s: 4,
+                global_settings_browser_response_poll_s: 1,
+                global_settings_browser_dom_poll_s: 1,
                 canvas_rename_index: None,
                 canvas_rename_draft: String::new(),
                 task_panel_selected_loops: None,
             },
+
+            perf: GlobalPerfConfig::default(),
 
             tree: TreeState {
                 expand_cmd: None,
@@ -1362,10 +1836,8 @@ impl AppState {
                 git_status_by_path: HashMap::new(),
 
                 last_auto_refresh_s: 0.0,
-                auto_refresh_interval_s: 1.0,
 
                 last_git_status_refresh_s: 0.0,
-                git_status_interval_s: 1.0,
 
                 analysis_job: AsyncLatestJob::default(),
                 git_status_job: AsyncLatestJob::default(),
@@ -1409,6 +1881,7 @@ impl AppState {
             tasks: HashMap::new(),
             task_store_dirty: false,
             source_controls: HashMap::new(),
+            sap_adts: HashMap::new(),
 
             theme: ThemeState {
                 code_theme: CodeTheme::dark(),
@@ -1442,6 +1915,7 @@ impl AppState {
             pending_open_file_viewer: None,
         };
 
+        state.load_global_perf_config_from_appdata();
         state.load_workspace_from_appdata(None);
         state
     }

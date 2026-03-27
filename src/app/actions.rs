@@ -24,6 +24,7 @@ pub enum ComponentKind {
     SourceControl,
     Task,
     DiffViewer,
+    SapAdt,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -94,6 +95,14 @@ pub enum Action {
     // ---------------------------
     OpenCanvasTintPopup,
     CloseCanvasTintPopup,
+    OpenGlobalSettings,
+    CloseGlobalSettings,
+    OpenSapAdtImportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtImportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtExportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtExportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtLogsPopup { sap_adt_id: ComponentId },
+    CloseSapAdtLogsPopup { sap_adt_id: ComponentId },
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
     SaveStartupLayoutOverride {
         canvas_size: [f32; 2],
@@ -264,6 +273,47 @@ pub enum Action {
     },
     ClearChangeSet {
         applier_id: ComponentId,
+    },
+
+    SapAdtConnect {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtLoadPackage {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtReadObject {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+
+    SapAdtCloneSelectedToWorktree {
+        sap_adt_id: ComponentId,
+    },
+
+    SapAdtPushWorktreeToAdt {
+        sap_adt_id: ComponentId,
+        path: String,
+    },
+    SapAdtActivateWorktreeObject {
+        sap_adt_id: ComponentId,
+        path: String,
+    },
+    SapAdtToggleImportObjectSelection {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+    SapAdtImportSelectedPackageObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtScanExportObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtToggleExportManifestSelection {
+        sap_adt_id: ComponentId,
+        manifest_path: String,
+    },
+    SapAdtExportSelectedWorktreeObjects {
+        sap_adt_id: ComponentId,
     },
 
     // ---------------------------

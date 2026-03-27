@@ -153,6 +153,55 @@ impl AppState {
                 self.layout_epoch = self.layout_epoch.wrapping_add(1);
             }
 
+            ComponentKind::SapAdt => {
+                self.active_layout_mut().merge_with_defaults();
+
+                let existing_id = self
+                    .active_layout()
+                    .components
+                    .iter()
+                    .find(|c| c.kind == ComponentKind::SapAdt)
+                    .map(|c| c.id);
+
+                if let Some(id) = existing_id {
+                    if let Some(w) = self.active_layout_mut().get_window_mut(id) {
+                        w.open = true;
+                    }
+
+                    if let Some(idx) = self
+                        .active_layout()
+                        .components
+                        .iter()
+                        .position(|c| c.id == id && c.kind == ComponentKind::SapAdt)
+                    {
+                        let component = self.active_layout_mut().components.remove(idx);
+                        self.active_layout_mut().components.push(component);
+                    }
+
+                    self.layout_epoch = self.layout_epoch.wrapping_add(1);
+                } else {
+                    let id = self.alloc_component_id();
+                    let title = format!("SAP ADT {}", id);
+
+                    self.active_layout_mut().components.push(ComponentInstance { id, kind, title });
+
+                    self.active_layout_mut().windows.insert(
+                        id,
+                        WindowLayout {
+                            open: true,
+                            locked: false,
+                            pos_norm: None,
+                            size_norm: None,
+                            pos: [220.0, 220.0],
+                            size: [760.0, 520.0],
+                        },
+                    );
+
+                    self.sap_adts.entry(id).or_insert_with(crate::app::state::SapAdtState::new);
+                    self.layout_epoch = self.layout_epoch.wrapping_add(1);
+                }
+            }
+
 
             ComponentKind::ContextExporter => {
                 self.active_layout_mut().merge_with_defaults();
@@ -293,7 +342,8 @@ impl AppState {
                     | ComponentKind::ChangeSetApplier
                     | ComponentKind::ExecuteLoop
                     | ComponentKind::Task
-                    | ComponentKind::DiffViewer => unreachable!(),
+                    | ComponentKind::DiffViewer
+                    | ComponentKind::SapAdt => unreachable!(),
                 };
 
                 self.active_layout_mut()

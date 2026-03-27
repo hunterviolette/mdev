@@ -3,7 +3,7 @@ export type StartSessionCommand = {
   cmd: "start_session";
   session_id?: string;
   profile?: string;
-  url: string;
+  url?: string;
   headed?: boolean;
   user_data_dir?: string;
   browser_channel?: "chromium" | "chrome" | "msedge";
@@ -72,11 +72,26 @@ export type ReadResponseCommand = {
   timeout_ms?: number;
 };
 
+export type SetPollConfigCommand = {
+  id: string;
+  cmd: "set_poll_config";
+  session_id: string;
+  response_poll_ms?: number;
+  dom_poll_ms?: number;
+};
+
 export type SetResponseTimeoutCommand = {
   id: string;
   cmd: "set_response_timeout";
   session_id: string;
   timeout_ms: number;
+};
+
+export type GetCookiesCommand = {
+  id: string;
+  cmd: "get_cookies";
+  session_id: string;
+  urls?: string[];
 };
 
 export type CloseSessionCommand = {
@@ -94,7 +109,9 @@ export type BridgeCommand =
   | SendChatCommand
   | UploadFileCommand
   | ReadResponseCommand
+  | SetPollConfigCommand
   | SetResponseTimeoutCommand
+  | GetCookiesCommand
   | CloseSessionCommand;
 
 export type OkResponse = {
