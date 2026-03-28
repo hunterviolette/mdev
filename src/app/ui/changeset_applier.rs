@@ -2,73 +2,9 @@ use eframe::egui;
 
 use crate::app::actions::{Action, ComponentId};
 use crate::app::state::AppState;
-
-pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
-  "version": 1,
-  "description": Schema example. Do not waste tokens/operations inserting or adjusting comments unless required.
-  "operations": [
-    {
-      "op": "edit",
-      "path": "src/app/ui/changeset_applier.rs",
-      "changes": [
-        {
-          "action": "insert_after",
-          "match": {
-            "type": "literal",
-            "mode": "normalized_newlines",
-            "must_match": "exactly_one",
-            "occurrence": 1,
-            "text": "egui::ScrollArea::vertical().id_source("example_scroll_id")
-                .id_source("example_scroll_id")"
-          },
-          "text": "\n                .id_source(\"example_scroll_id\")"
-        },
-        {
-          "action": "insert_before",
-          "match": {
-            "type": "literal",
-            "mode": "normalized_newlines",
-            "must_match": "exactly_one",
-            "occurrence": 1,
-            "text": "ui.label(\"Payload\");"
-          },
-          "text": "    // inserted comment (example)\n"
-        },
-        {
-          "action": "replace_block",
-          "match": {
-            "type": "literal",
-            "mode": "normalized_newlines",
-            "must_match": "exactly_one",
-            "occurrence": 1,
-            "text": "ui.label(\"Payload\");"
-          },
-          "replacement": "ui.label(\"Payload (example)\");"
-        },
-        {
-          "action": "delete_block",
-          "match": {
-            "type": "literal",
-            "mode": "normalized_newlines",
-            "must_match": "at_least_one",
-            "text": ""
-          }
-        }
-      ]
-    },
-
-    { "op": "write", "path": "tmp/changeset_example.txt", "contents": "hello from write\n" },
-    { "op": "move", "from": "tmp/changeset_example.txt", "to": "tmp/changeset_example_moved.txt" },
-    { "op": "delete", "path": "tmp/changeset_example_moved.txt" }
-  ]
-}"#;
-
-//   "post_commands": [
-//     { "shell": "Auto", "cmd": "cargo build", "cwd": "." }
-//   ]
+use crate::gateway_model::{GatewayMode, SyncMode, CHANGESET_SCHEMA_EXAMPLE};
 
 pub fn changeset_applier_panel(
-
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     state: &mut AppState,
@@ -76,119 +12,258 @@ pub fn changeset_applier_panel(
 ) -> Vec<Action> {
     let mut actions = vec![];
 
+    let git_ref = state.inputs.git_ref.clone();
+    let has_repo = state.inputs.repo.is_some();
+
     let Some(st) = state.changeset_appliers.get_mut(&applier_id) else {
         ui.label("Missing ChangeSetApplier state.");
         return actions;
     };
 
-    let panel_nonce = ui.next_auto_id();
+    ui.push_id(("changeset_applier", applier_id), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Payload:");
 
-    ui.push_id(("changeset_applier", applier_id, panel_nonce), |ui| {
-    ui.heading("ChangeSet Applier
-");
-    ui.add_space(6.0);
+            let cur_payload = match st.mode {
+                GatewayMode::ChangeSet => "CHANGESET",
+                GatewayMode::Sync => "SYNC",
+            };
 
-    ui.label("Paste a JSON payload (from an AI chat or manual) and apply it to the repo working tree.");
-    ui.add_space(6.0);
+            egui::ComboBox::from_id_source(("changeset_payload_type", applier_id))
+                .selected_text(cur_payload)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(st.mode == GatewayMode::ChangeSet, "CHANGESET")
+                        .clicked()
+                    {
+                        actions.push(Action::SetChangeSetGatewayMode {
+                            applier_id,
+                            mode: GatewayMode::ChangeSet,
+                        });
+                    }
+                    if ui
+                        .selectable_label(st.mode == GatewayMode::Sync, "SYNC")
+                        .clicked()
+                    {
+                        actions.push(Action::SetChangeSetGatewayMode {
+                            applier_id,
+                            mode: GatewayMode::Sync,
+                        });
+                    }
+                });
 
-    ui.push_id("header_buttons", |ui| {
-        ui.horizontal(|ui| {
-            ui.push_id("copy_schema", |ui| {
-                if ui.button("Copy schema + example").clicked() {
-                    ctx.output_mut(|o| o.copied_text = CHANGESET_SCHEMA_EXAMPLE.to_string());
-                    st.status = Some("Copied schema/example to clipboard.".into());
+            if st.mode == GatewayMode::Sync {
+                ui.separator();
+                ui.label("Mode:");
+
+                let cur_mode = match st.sync_mode {
+                    SyncMode::Entire => "ENTIRE REPO",
+                    SyncMode::Tree => "TREE SELECT",
+                    SyncMode::Diff => "DIFF",
+                };
+
+                egui::ComboBox::from_id_source(("changeset_sync_mode", applier_id))
+                    .selected_text(cur_mode)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(st.sync_mode == SyncMode::Entire, "ENTIRE REPO")
+                            .clicked()
+                        {
+                            actions.push(Action::SetChangeSetSyncMode {
+                                applier_id,
+                                mode: SyncMode::Entire,
+                            });
+                        }
+                        if ui
+                            .selectable_label(st.sync_mode == SyncMode::Tree, "TREE SELECT")
+                            .clicked()
+                        {
+                            actions.push(Action::SetChangeSetSyncMode {
+                                applier_id,
+                                mode: SyncMode::Tree,
+                            });
+                        }
+                        if ui
+                            .selectable_label(st.sync_mode == SyncMode::Diff, "DIFF")
+                            .clicked()
+                        {
+                            actions.push(Action::SetChangeSetSyncMode {
+                                applier_id,
+                                mode: SyncMode::Diff,
+                            });
+                        }
+                    });
+
+                ui.separator();
+                ui.label("Ref:");
+                ui.monospace(&git_ref);
+
+                let mut skip_binary = st.sync_skip_binary;
+                if ui.checkbox(&mut skip_binary, "Skip binary").clicked() {
+                    actions.push(Action::SetChangeSetSyncSkipBinary {
+                        applier_id,
+                        value: skip_binary,
+                    });
                 }
-            });
 
-            let has_output = st
-                .status
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
+                let mut skip_gitignore = st.sync_skip_gitignore;
+                if ui.checkbox(&mut skip_gitignore, "Skip .gitignore").clicked() {
+                    actions.push(Action::SetChangeSetSyncSkipGitignore {
+                        applier_id,
+                        value: skip_gitignore,
+                    });
+                }
 
-            ui.push_id("copy_output", |ui| {
-                if ui
-                    .add_enabled(has_output, egui::Button::new("Copy output"))
-                    .clicked()
-                {
-                    if let Some(s) = &st.status {
-                        ctx.output_mut(|o| o.copied_text = s.clone());
+                if git_ref != crate::app::state::WORKTREE_REF {
+                    ui.separator();
+                    ui.weak("(diff mode requires Ref=WORKTREE)");
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+
+        if st.mode == GatewayMode::ChangeSet {
+            if st.changeset_show_result {
+                ui.label("The main box is showing the last apply result. Use Copy last changeset to reuse the payload.");
+            } else {
+                ui.label("Paste a JSON changeset payload and apply it to the repo working tree.");
+            }
+        } else {
+            ui.label("Generate a Sync payload from the current selection. The main box shows the generated artifact.");
+        }
+
+        ui.add_space(8.0);
+
+        let visible_text = if st.mode == GatewayMode::ChangeSet {
+            if st.changeset_show_result {
+                st.result_payload.clone()
+            } else {
+                st.payload.clone()
+            }
+        } else {
+            st.sync_payload.clone()
+        };
+        let has_visible_text = !visible_text.trim().is_empty();
+        let has_last_changeset = !st.last_changeset_payload.trim().is_empty();
+
+        ui.push_id("header_buttons", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if st.mode == GatewayMode::ChangeSet && !st.changeset_show_result {
+                    if ui.button("Copy changeset schema").clicked() {
+                        let schema = CHANGESET_SCHEMA_EXAMPLE.to_string();
+                        ctx.output_mut(|o| o.copied_text = schema.clone());
+                        st.payload = schema;
+                        st.changeset_show_result = false;
                     }
                 }
-            });
 
-            ui.push_id("clear", |ui| {
-                if ui.button("Clear").clicked() {
+                if ui
+                    .add_enabled(has_visible_text, egui::Button::new("Copy visible"))
+                    .clicked()
+                {
+                    ctx.output_mut(|o| o.copied_text = visible_text.clone());
+                }
+
+                if st.mode == GatewayMode::ChangeSet && st.changeset_show_result {
+                    if ui
+                        .add_enabled(has_last_changeset, egui::Button::new("Copy last changeset"))
+                        .clicked()
+                    {
+                        ctx.output_mut(|o| o.copied_text = st.last_changeset_payload.clone());
+                    }
+                }
+
+                if st.mode == GatewayMode::Sync {
+                    if ui.button("Generate payload").clicked() {
+                        actions.push(Action::GenerateSyncPayload { applier_id });
+                    }
+                }
+
+                if st.mode == GatewayMode::ChangeSet && !st.changeset_show_result {
+                    let can_apply = has_repo && !st.payload.trim().is_empty();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        actions.push(Action::ApplyChangeSet { applier_id });
+                    }
+                }
+
+                if st.mode == GatewayMode::ChangeSet && st.changeset_show_result {
+                    if ui.button("New changeset").clicked() {
+                        actions.push(Action::ClearChangeSet { applier_id });
+                    }
+                } else if ui.button("Clear").clicked() {
                     actions.push(Action::ClearChangeSet { applier_id });
                 }
             });
-
-            let can_apply = state.inputs.repo.is_some() && !st.payload.trim().is_empty();
-            ui.push_id("apply", |ui| {
-                if ui.add_enabled(can_apply, egui::Button::new("Apply")).clicked() {
-                    actions.push(Action::ApplyChangeSet { applier_id });
-                }
-            });
         });
-    });
 
-    ui.add_space(8.0);
+        ui.add_space(8.0);
 
-    let available_h = ui.available_height().max(1.0);
-    let available_w = ui.available_width().max(1.0);
+        let pane_w = ui.available_width().max(1.0);
 
-    let pane_h = ((available_h - 8.0).max(1.0) * 0.5).max(1.0);
+        let is_changeset_result = st.mode == GatewayMode::ChangeSet && st.changeset_show_result;
 
-    let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-    let desired_rows = ((pane_h / row_h).floor() as usize).max(1);
+        let pane_label = if st.mode == GatewayMode::ChangeSet {
+            if is_changeset_result {
+                "Output"
+            } else {
+                "ChangeSet"
+            }
+        } else {
+            "Generated artifact"
+        };
 
-    ui.push_id("payload_pane", |ui| {
+        ui.push_id("payload_pane", |ui| {
+            ui.label(pane_label);
+            ui.add_space(4.0);
 
-    ui.label("Payload (example)");
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(6.0))
-            .show(ui, |ui| {
-                egui::ScrollArea::both()
-                    .id_source(("changeset_applier_payload_scroll", applier_id))
-                    .auto_shrink([false, false])
-                    .max_height(pane_h)
-                    .show(ui, |ui| {
-                        ui.add(
+            let pane_h = (ui.max_rect().bottom() - ui.cursor().top()).max(1.0);
+            let pane_size = egui::vec2(pane_w, pane_h);
+            let (pane_rect, _) = ui.allocate_exact_size(pane_size, egui::Sense::hover());
+
+            let frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(6.0));
+            frame.paint(pane_rect);
+
+            let inner_rect = frame.inner_margin.shrink_rect(pane_rect);
+            let mut inner_ui = ui.child_ui(inner_rect, *ui.layout());
+
+            egui::ScrollArea::both()
+                .id_source(("changeset_applier_scroll", applier_id))
+                .auto_shrink([false, false])
+                .show(&mut inner_ui, |ui| {
+                    if st.mode == GatewayMode::ChangeSet && !st.changeset_show_result {
+                        ui.add_sized(
+                            ui.available_size(),
                             egui::TextEdit::multiline(&mut st.payload)
                                 .id_source(("changeset_applier_payload_text", applier_id))
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(available_w)
-                                .desired_rows(desired_rows)
-                                .hint_text("Paste JSON payload here..."),
+                                .font(egui::TextStyle::Monospace),
                         );
-                    });
-            });
-    });
-
-    ui.add_space(8.0);
-
-    ui.push_id("output_pane", |ui| {
-        ui.label("Output");
-        let mut output = st.status.clone().unwrap_or_default();
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(6.0))
-            .show(ui, |ui| {
-                egui::ScrollArea::both()
-                    .id_source(("changeset_applier_output_scroll", applier_id))
-                    .auto_shrink([false, false])
-                    .max_height(pane_h)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut output)
-                                .id_source(("changeset_applier_output_text", applier_id))
+                    } else if st.mode == GatewayMode::ChangeSet {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut st.result_payload)
+                                .id_source(("changeset_applier_payload_text", applier_id))
                                 .font(egui::TextStyle::Monospace)
-                                .desired_width(available_w)
-                                .desired_rows(desired_rows)
-                                .interactive(false),
+                                .interactive(false)
+                                .desired_width(f32::INFINITY),
                         );
-                    });
-            });
+                    } else {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut st.sync_payload)
+                                .id_source(("changeset_applier_payload_text", applier_id))
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false)
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                });
         });
+
+
     });
 
     actions

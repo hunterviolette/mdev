@@ -9,6 +9,7 @@ use crate::platform::Platform;
 
 use super::types::*;
 
+#[derive(Clone)]
 pub struct CapabilityBroker {
     platform: Arc<dyn Platform>,
 }

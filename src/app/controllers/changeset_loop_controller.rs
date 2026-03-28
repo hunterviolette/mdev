@@ -18,95 +18,11 @@ fn browser_runtime_dir(state: &AppState) -> PathBuf {
 }
 
 fn resolve_browser_bridge_dir() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("bridge");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join("bridge");
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    "bridge".to_string()
+    crate::app::browser_bridge::resolve_browser_bridge_dir_with_override("")
 }
 
 fn resolve_browser_executable(explicit: &str) -> (String, String) {
-    let explicit = explicit.trim();
-    if !explicit.is_empty() {
-        let lower = explicit.to_ascii_lowercase();
-        let channel = if lower.contains("edge") || lower.contains("msedge") {
-            "msedge"
-        } else if lower.contains("chrome") {
-            "chrome"
-        } else {
-            "chromium"
-        };
-        return (explicit.to_string(), channel.to_string());
-    }
-
-    if cfg!(target_os = "windows") {
-        for key in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
-            if let Ok(root) = std::env::var(key) {
-                let edge = PathBuf::from(&root).join("Microsoft/Edge/Application/msedge.exe");
-                if edge.exists() {
-                    return (edge.to_string_lossy().into_owned(), "msedge".to_string());
-                }
-                let chrome = PathBuf::from(&root).join("Google/Chrome/Application/chrome.exe");
-                if chrome.exists() {
-                    return (chrome.to_string_lossy().into_owned(), "chrome".to_string());
-                }
-                let chromium = PathBuf::from(&root).join("Chromium/Application/chrome.exe");
-                if chromium.exists() {
-                    return (chromium.to_string_lossy().into_owned(), "chromium".to_string());
-                }
-            }
-        }
-        return ("msedge.exe".to_string(), "msedge".to_string());
-    }
-
-    if cfg!(target_os = "macos") {
-        let edge = PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
-        if edge.exists() {
-            return (edge.to_string_lossy().into_owned(), "msedge".to_string());
-        }
-        let chrome = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-        if chrome.exists() {
-            return (chrome.to_string_lossy().into_owned(), "chrome".to_string());
-        }
-        let chromium = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
-        if chromium.exists() {
-            return (chromium.to_string_lossy().into_owned(), "chromium".to_string());
-        }
-        return ("Microsoft Edge".to_string(), "msedge".to_string());
-    }
-
-    for candidate in [
-        ("microsoft-edge", "msedge"),
-        ("microsoft-edge-stable", "msedge"),
-        ("msedge", "msedge"),
-        ("google-chrome", "chrome"),
-        ("google-chrome-stable", "chrome"),
-        ("chromium-browser", "chromium"),
-        ("chromium", "chromium")
-    ] {
-        if std::process::Command::new("which")
-            .arg(candidate.0)
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-        {
-            return (candidate.0.to_string(), candidate.1.to_string());
-        }
-    }
-
-    ("microsoft-edge".to_string(), "msedge".to_string())
+    crate::app::browser_bridge::resolve_browser_executable(explicit)
 }
 
 fn resolve_user_data_dir(state: &AppState, explicit: &str, browser_family: &str) -> String {
@@ -199,6 +115,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match launch_and_attach(&mut cfg) {
@@ -272,6 +189,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match open_url_in_session(&mut cfg, &target_url) {
@@ -365,6 +283,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             match probe_session(&mut cfg) {
@@ -457,6 +376,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 runtime_key: String::new(),
                 response_timeout_ms: st.browser_response_timeout_ms,
                 response_poll_ms: st.browser_response_poll_ms,
+                dom_poll_ms: state.perf.browser_dom_poll_ms.max(250),
             };
 
             let close_result = close_session_page(&mut cfg);
@@ -1043,7 +963,7 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                 }
                 return;
             }
-            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id, response_timeout_ms, response_poll_ms) = {
+            let (cdp_url, page_match, edge_exe_override, user_data_dir_override, session_id, response_timeout_ms, _response_poll_ms) = {
                 let Some(st) = state.execute_loops.get(&loop_id) else {
                     return;
                 };
@@ -1084,6 +1004,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
             let runtime_key = format!("execute-loop-{}-{}", loop_id, runtime_nonce);
             active_browser_runtime_key = Some(runtime_key.clone());
             set_runtime_timeout_secs(&runtime_key, (response_timeout_ms.max(1000) + 999) / 1000);
+            let browser_response_poll_ms = state.perf.browser_response_poll_ms.max(250);
+            let browser_dom_poll_ms = state.perf.browser_dom_poll_ms.max(250);
             std::thread::spawn(move || {
                 let mut cfg = BrowserTurnConfig {
                     bridge_dir,
@@ -1096,7 +1018,8 @@ fn send_turn(state: &mut AppState, loop_id: ComponentId) {
                     auto_launch_edge: false,
                     runtime_key: runtime_key.clone(),
                     response_timeout_ms,
-                    response_poll_ms,
+                    response_poll_ms: browser_response_poll_ms,
+                    dom_poll_ms: browser_dom_poll_ms,
                 };
                 let context_file_for_thread = browser_repo_context_file.clone();
                 if let Some(path) = context_file_for_thread.as_deref() {

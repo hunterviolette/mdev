@@ -5,6 +5,7 @@ mod model;
 mod app;
 mod platform;
 mod capabilities;
+mod gateway_model;
 
 use std::sync::Arc;
 

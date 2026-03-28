@@ -5,8 +5,11 @@ pub mod state;
 pub mod theme;
 pub mod ui;
 pub mod layout;
+pub mod sap_adt_manifest;
 pub mod openai;
 pub mod browser_bridge;
+pub mod adt_bridge;
+pub mod async_job;
 pub mod task_store;
 
 mod app;

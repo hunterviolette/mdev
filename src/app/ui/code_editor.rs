@@ -1088,6 +1088,8 @@ pub fn code_editor(
         usable_scroll_height = (text_rect.height()).max(row_height);
 
         let cw = monospace_char_width(ui);
+        let longest_line_cc = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+        let content_width = (longest_line_cc as f32 * cw + 16.0).max(text_rect.width()).max(1.0);
 
         let pointer_down = ui.input(|i| i.pointer.primary_down());
         let pointer_pos = ui.input(|i| i.pointer.interact_pos());
@@ -1097,8 +1099,9 @@ pub fn code_editor(
             .auto_shrink([false, false])
             .scroll_offset(st.scroll_offset)
             .show_rows(ui, row_height, lines.len().max(1), |ui, row_range| {
-                let wrap_w = ui.available_width().max(1.0);
-                let bucket: u32 = (wrap_w / 16.0).floor().max(1.0) as u32;
+                ui.set_min_width(content_width);
+                ui.set_width(content_width);
+                let bucket: u32 = 0;
 
                 let mut line_start_cc = 0usize;
                 for i in 0..row_range.start.min(lines.len()) {
@@ -1116,15 +1119,14 @@ pub fn code_editor(
                         Some((ver, b, job)) if *ver == st.buffer_version && *b == bucket => job.clone(),
                         _ => {
                             let mut job = highlight(ctx, theme, line, language);
-                            job.wrap.max_width = wrap_w;
+                            job.wrap.max_width = f32::INFINITY;
                             st.line_cache.insert(row, (st.buffer_version, bucket, job.clone()));
                             job
                         }
                     };
 
-                    let w = ui.available_width().max(1.0);
                     let (row_rect, row_resp) = ui.allocate_exact_size(
-                        egui::vec2(w, row_height),
+                        egui::vec2(content_width, row_height),
                         egui::Sense::click_and_drag(),
                     );
 

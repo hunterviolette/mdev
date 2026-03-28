@@ -8,6 +8,7 @@ pub enum ExpandCmd {
 }
 
 pub type ComponentId = u64;
+pub type TaskId = u64;
 
 pub type ConversationId = u64;
 
@@ -23,6 +24,7 @@ pub enum ComponentKind {
     SourceControl,
     Task,
     DiffViewer,
+    SapAdt,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -53,12 +55,12 @@ pub enum Action {
     // ---------------------------
     // Task
     // ---------------------------
-    TaskSetPaused { task_id: ComponentId, paused: bool },
-    TaskBindExecuteLoop { task_id: ComponentId, loop_id: ComponentId },
-    TaskOpenExecuteLoop { task_id: ComponentId },
-    TaskCreateAndBindExecuteLoop { task_id: ComponentId },
+    TaskSetPaused { task_id: TaskId, paused: bool },
+    TaskBindExecuteLoop { task_id: TaskId, loop_id: ComponentId },
+    TaskOpenExecuteLoop { task_id: TaskId },
+    TaskCreateAndBindExecuteLoop { task_id: TaskId },
     TaskCreateConversationAndOpen {
-        task_id: ComponentId,
+        task_id: TaskId,
         transport: crate::app::state::ExecuteLoopTransport,
     },
 
@@ -66,13 +68,12 @@ pub enum Action {
     ExecuteLoopBrowserProbe { loop_id: ComponentId },
     ExecuteLoopBrowserOpenUrl { loop_id: ComponentId },
     ExecuteLoopBrowserDetach { loop_id: ComponentId },
-    TaskOpenConversation { task_id: ComponentId, conversation_id: ConversationId },
-    TaskConversationsDelete { task_id: ComponentId, conversation_ids: Vec<ConversationId> },
-    TaskConversationsSetPaused { task_id: ComponentId, conversation_ids: Vec<ConversationId>, paused: bool },
+    TaskOpenConversation { task_id: TaskId, conversation_id: ConversationId },
+    TaskConversationsDelete { task_id: TaskId, conversation_ids: Vec<ConversationId> },
+    TaskConversationsSetPaused { task_id: TaskId, conversation_ids: Vec<ConversationId>, paused: bool },
     ExecuteLoopDelete { loop_id: ComponentId },
     ExecuteLoopsDelete { loop_ids: Vec<ComponentId> },
     ExecuteLoopsSetPaused { loop_ids: Vec<ComponentId>, paused: bool },
-
 
     // ---------------------------
     // Repo + analysis
@@ -94,6 +95,14 @@ pub enum Action {
     // ---------------------------
     OpenCanvasTintPopup,
     CloseCanvasTintPopup,
+    OpenGlobalSettings,
+    CloseGlobalSettings,
+    OpenSapAdtImportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtImportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtExportPopup { sap_adt_id: ComponentId },
+    CloseSapAdtExportPopup { sap_adt_id: ComponentId },
+    OpenSapAdtLogsPopup { sap_adt_id: ComponentId },
+    CloseSapAdtLogsPopup { sap_adt_id: ComponentId },
     SetCanvasBgTint { rgba: Option<[u8; 4]> },
     SaveStartupLayoutOverride {
         canvas_size: [f32; 2],
@@ -118,6 +127,12 @@ pub enum Action {
         path: String,
         from_ref: String,
         to_ref: String,
+    },
+    OpenDiffViewerForStaged {
+        sc_id: ComponentId,
+    },
+    OpenDiffViewerForUnstaged {
+        sc_id: ComponentId,
     },
 
     RefreshDiffViewer {
@@ -234,11 +249,71 @@ pub enum Action {
     // ---------------------------
     // Change-set applier (AI patch payloads)
     // ---------------------------
+    SetChangeSetGatewayMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::GatewayMode,
+    },
+    SetChangeSetSyncMode {
+        applier_id: ComponentId,
+        mode: crate::gateway_model::SyncMode,
+    },
+    SetChangeSetSyncSkipBinary {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    SetChangeSetSyncSkipGitignore {
+        applier_id: ComponentId,
+        value: bool,
+    },
+    GenerateSyncPayload {
+        applier_id: ComponentId,
+    },
     ApplyChangeSet {
         applier_id: ComponentId,
     },
     ClearChangeSet {
         applier_id: ComponentId,
+    },
+
+    SapAdtConnect {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtLoadPackage {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtReadObject {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+
+    SapAdtCloneSelectedToWorktree {
+        sap_adt_id: ComponentId,
+    },
+
+    SapAdtPushWorktreeToAdt {
+        sap_adt_id: ComponentId,
+        path: String,
+    },
+    SapAdtActivateWorktreeObject {
+        sap_adt_id: ComponentId,
+        path: String,
+    },
+    SapAdtToggleImportObjectSelection {
+        sap_adt_id: ComponentId,
+        object_uri: String,
+    },
+    SapAdtImportSelectedPackageObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtScanExportObjects {
+        sap_adt_id: ComponentId,
+    },
+    SapAdtToggleExportManifestSelection {
+        sap_adt_id: ComponentId,
+        manifest_path: String,
+    },
+    SapAdtExportSelectedWorktreeObjects {
+        sap_adt_id: ComponentId,
     },
 
     // ---------------------------
@@ -302,6 +377,9 @@ pub enum Action {
         sc_id: ComponentId,
     },
     PullRemote {
+        sc_id: ComponentId,
+    },
+    PushRemote {
         sc_id: ComponentId,
     },
     SetCommitMessage {

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::actions::ComponentId;
+use crate::app::actions::{ComponentId, TaskId};
 use crate::app::layout::{ExecuteLoopSnapshot, TaskSnapshot};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,7 +17,7 @@ pub struct RepoTaskStoreFile {
     pub execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
     #[serde(default)]
-    pub tasks: HashMap<ComponentId, TaskSnapshot>,
+    pub tasks: HashMap<TaskId, TaskSnapshot>,
 }
 
 impl RepoTaskStoreFile {

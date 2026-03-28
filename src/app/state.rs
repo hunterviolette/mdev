@@ -12,12 +12,14 @@ use crate::capabilities::GitStatusEntry;
 
 use crate::model::{AnalysisResult, CommitEntry};
 use crate::platform::Platform;
+use super::async_job::{AsyncLatestJob, AsyncParallelJob, AsyncQueuedJob};
 
 use super::openai::OpenAIClient;
 
 use serde::{Deserialize, Serialize};
+use crate::app::sap_adt_manifest::SapAdtObjectManifest;
 
-use super::actions::{ComponentId, ConversationId, ExpandCmd, TerminalShell};
+use super::actions::{ComponentId, ConversationId, ExpandCmd, TaskId, TerminalShell};
 use super::actions::ComponentKind;
 use super::layout::{ExecuteLoopSnapshot, LayoutConfig, PresetKind};
 
@@ -85,8 +87,18 @@ pub struct TerminalState {
 }
 
 pub struct ChangeSetApplierState {
+    pub mode: crate::gateway_model::GatewayMode,
+    pub sync_mode: crate::gateway_model::SyncMode,
     pub payload: String,
+    pub sync_payload: String,
+    pub sync_skip_binary: bool,
+    pub sync_skip_gitignore: bool,
     pub status: Option<String>,
+    pub last_changeset_payload: String,
+    pub result_payload: String,
+    pub changeset_show_result: bool,
+    pub last_attempted_paths: Vec<String>,
+    pub last_failed_paths: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +176,27 @@ pub struct ExecuteLoopAutomaticMessageFragments {
     pub changeset_validation_error: Option<String>,
     pub compile_error: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopApplyFailureFocusedContextPolicy {
+    pub enabled: bool,
+    pub consecutive_failure_threshold: u32,
+}
+
+impl Default for ExecuteLoopApplyFailureFocusedContextPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            consecutive_failure_threshold: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLoopAutomationPolicies {
+    #[serde(default)]
+    pub apply_failure_focused_context: ExecuteLoopApplyFailureFocusedContextPolicy,
+}
+
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteLoopFragmentOverrides {
@@ -244,6 +277,414 @@ pub enum ExecuteLoopTransport {
     BrowserBridge,
 }
 
+fn default_sap_adt_discovery_url() -> Option<String> {
+    let raw = std::env::var("ADT_BASE_HOST").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("/sap/bc/adt/discovery") {
+        return Some(trimmed.to_string());
+    }
+
+    Some(format!(
+        "{}/sap/bc/adt/discovery",
+        trimmed.trim_end_matches('/')
+    ))
+}
+
+fn default_sap_adt_browser_bridge_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_BRIDGE_DIR", "BROWSER_BRIDGE_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("bridge");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("bridge");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "bridge".to_string()
+}
+
+fn default_sap_adt_browser_channel() -> String {
+    for key in ["SAP_ADT_BROWSER_CHANNEL", "BROWSER_CHANNEL"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    "msedge".to_string()
+}
+
+fn default_sap_adt_browser_user_data_dir() -> String {
+    for key in ["SAP_ADT_BROWSER_USER_DATA_DIR", "BROWSER_USER_DATA_DIR"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push("mdev-sap-adt-browser");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtTemplateLink {
+    pub rel: String,
+    pub template: String,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryCollection {
+    pub title: String,
+    pub href: String,
+    pub category_term: Option<String>,
+    pub category_scheme: Option<String>,
+    pub accepts: Vec<String>,
+    pub template_links: Vec<SapAdtTemplateLink>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtDiscoveryState {
+    pub workspaces: Vec<String>,
+    pub collections: Vec<SapAdtDiscoveryCollection>,
+    pub package_collection_href: Option<String>,
+    pub package_tree_href: Option<String>,
+    pub repository_search_href: Option<String>,
+    pub repository_search_template: Option<String>,
+    pub object_types_href: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtObjectSummary {
+    pub uri: String,
+    pub source_uri: Option<String>,
+    pub name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowOutcome {
+    Pending,
+    Running,
+    Success,
+    Warning,
+    Error,
+    Skipped,
+}
+
+impl Default for WorkflowOutcome {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowStep {
+    pub key: String,
+    pub label: String,
+    pub outcome: WorkflowOutcome,
+    pub summary: String,
+    pub details: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowRun {
+    pub kind: String,
+    pub subject: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl WorkflowRun {
+    pub fn push_step(
+        &mut self,
+        key: impl Into<String>,
+        label: impl Into<String>,
+        outcome: WorkflowOutcome,
+        summary: impl Into<String>,
+        details: impl Into<String>,
+    ) {
+        self.steps.push(WorkflowStep {
+            key: key.into(),
+            label: label.into(),
+            outcome,
+            summary: summary.into(),
+            details: details.into(),
+        });
+    }
+
+    pub fn overall_outcome(&self) -> WorkflowOutcome {
+        if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Error) {
+            WorkflowOutcome::Error
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Warning) {
+            WorkflowOutcome::Warning
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Running) {
+            WorkflowOutcome::Running
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Success) {
+            WorkflowOutcome::Success
+        } else if self.steps.iter().any(|step| step.outcome == WorkflowOutcome::Skipped) {
+            WorkflowOutcome::Skipped
+        } else {
+            WorkflowOutcome::Pending
+        }
+    }
+
+    pub fn overall_state_text(&self) -> &'static str {
+        match self.overall_outcome() {
+            WorkflowOutcome::Pending => "idle",
+            WorkflowOutcome::Running => "running",
+            WorkflowOutcome::Success => "activated",
+            WorkflowOutcome::Warning => "warning",
+            WorkflowOutcome::Error => "error",
+            WorkflowOutcome::Skipped => "skipped",
+        }
+    }
+
+    pub fn headline(&self) -> String {
+        for step in self.steps.iter().rev() {
+            if !step.summary.trim().is_empty() {
+                return step.summary.clone();
+            }
+        }
+        String::new()
+    }
+
+    pub fn hover_text(&self) -> String {
+        let mut lines = Vec::new();
+        for step in &self.steps {
+            let state = match step.outcome {
+                WorkflowOutcome::Pending => "pending",
+                WorkflowOutcome::Running => "running",
+                WorkflowOutcome::Success => "success",
+                WorkflowOutcome::Warning => "warning",
+                WorkflowOutcome::Error => "error",
+                WorkflowOutcome::Skipped => "skipped",
+            };
+            let mut line = format!("{} - {}", step.label, state);
+            if !step.summary.trim().is_empty() {
+                line.push_str(&format!(": {}", step.summary.trim()));
+            }
+            lines.push(line);
+            if !step.details.trim().is_empty() {
+                lines.push(step.details.trim().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtExportRow {
+    pub object_name: String,
+    pub object_type: String,
+    pub manifest_path: String,
+    pub changed_files: usize,
+    pub pushed_files: usize,
+    pub syntax_ok: bool,
+    pub activation_ok: bool,
+    pub message: String,
+    pub syntax_details: String,
+    pub activation_details: String,
+    pub transport: Option<String>,
+    pub export_candidates: Vec<SapAdtExportCandidate>,
+    pub workflow: WorkflowRun,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtExportCandidate {
+    pub resource_id: String,
+    pub uri: String,
+    pub path: String,
+    pub etag: Option<String>,
+    pub content_type: String,
+    pub activatable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtObjectOperationRow {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SapAdtLogEntry {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtImportJobInput {
+    pub object_uri: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub package_name: Option<String>,
+    pub clone_target_path: Option<String>,
+    pub include_xml_artifacts: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtImportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobInput {
+    pub manifest_path: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub auto_activate: bool,
+    pub corr_nr: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SapAdtExportJobResult {
+    pub key: String,
+    pub object_name: String,
+    pub object_type: String,
+    pub action: String,
+    pub state: String,
+    pub message: String,
+    pub row: SapAdtExportRow,
+}
+
+pub struct SapAdtState {
+    pub connected: bool,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub discovery_url: Option<String>,
+    pub discovery_xml: String,
+    pub discovery: Option<SapAdtDiscoveryState>,
+    pub cookie_header: Option<String>,
+    pub browser_session_id: Option<String>,
+    pub adt_session_id: Option<String>,
+    pub browser_bridge_dir: String,
+    pub browser_channel: String,
+    pub browser_user_data_dir: String,
+    pub package_query: String,
+    pub include_subpackages: bool,
+    pub package_tree_xml: String,
+    pub package_objects: Vec<SapAdtObjectSummary>,
+    pub import_popup_open: bool,
+    pub export_popup_open: bool,
+    pub logs_popup_open: bool,
+    pub import_selected_object_uris: HashSet<String>,
+    pub selected_object_uri: Option<String>,
+    pub selected_object_metadata_uri: Option<String>,
+    pub selected_object_name: Option<String>,
+    pub selected_object_type: Option<String>,
+    pub selected_manifest: Option<SapAdtObjectManifest>,
+    pub selected_resource_id: Option<String>,
+    pub selected_object_content: String,
+    pub selected_object_content_type: Option<String>,
+    pub selected_object_headers: Vec<(String, String)>,
+    pub selected_object_metadata: String,
+    pub selected_object_metadata_content_type: Option<String>,
+    pub clone_target_path: String,
+    pub corr_nr: String,
+    pub export_selected_manifest_paths: HashSet<String>,
+    pub export_results_scan: Vec<SapAdtExportRow>,
+    pub export_results: Vec<SapAdtExportRow>,
+    pub object_operations: Vec<SapAdtObjectOperationRow>,
+    pub logs: Vec<SapAdtLogEntry>,
+    pub import_job: AsyncParallelJob<SapAdtImportJobInput, SapAdtImportJobResult>,
+    pub export_job: AsyncParallelJob<SapAdtExportJobInput, SapAdtExportJobResult>,
+    pub import_include_xml_artifacts: bool,
+    pub export_auto_activate: bool,
+    pub export_show_only_changed: bool,
+}
+
+impl SapAdtState {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            last_status: None,
+            last_error: None,
+            discovery_url: default_sap_adt_discovery_url(),
+            discovery_xml: String::new(),
+            discovery: None,
+            cookie_header: None,
+            browser_session_id: None,
+            adt_session_id: None,
+            browser_bridge_dir: default_sap_adt_browser_bridge_dir(),
+            browser_channel: default_sap_adt_browser_channel(),
+            browser_user_data_dir: default_sap_adt_browser_user_data_dir(),
+            package_query: String::new(),
+            include_subpackages: true,
+            package_tree_xml: String::new(),
+            package_objects: Vec::new(),
+            import_popup_open: false,
+            export_popup_open: false,
+            logs_popup_open: false,
+            import_selected_object_uris: HashSet::new(),
+            selected_object_uri: None,
+            selected_object_metadata_uri: None,
+            selected_object_name: None,
+            selected_object_type: None,
+            selected_manifest: None,
+            selected_resource_id: None,
+            selected_object_content: String::new(),
+            selected_object_content_type: None,
+            selected_object_headers: Vec::new(),
+            selected_object_metadata: String::new(),
+            selected_object_metadata_content_type: None,
+            clone_target_path: String::new(),
+            corr_nr: String::new(),
+            export_selected_manifest_paths: HashSet::new(),
+            export_results_scan: Vec::new(),
+            export_results: Vec::new(),
+            object_operations: Vec::new(),
+            logs: Vec::new(),
+            import_job: AsyncParallelJob::default(),
+            export_job: AsyncParallelJob::default(),
+            import_include_xml_artifacts: false,
+            export_auto_activate: true,
+            export_show_only_changed: true,
+        }
+    }
+}
+
 pub struct ExecuteLoopState {
     pub model: String,
     pub paused: bool,
@@ -288,6 +729,9 @@ pub struct ExecuteLoopState {
     pub manual_fragments: ExecuteLoopManualMessageFragments,
     pub automatic_fragments: ExecuteLoopAutomaticMessageFragments,
     pub fragment_overrides: ExecuteLoopFragmentOverrides,
+    pub automation_policies: ExecuteLoopAutomationPolicies,
+    pub apply_failure_focused_context_counts: HashMap<String, u32>,
+    pub pending_focused_context_paths: BTreeSet<String>,
 
     pub conversation_id: Option<String>,
 
@@ -359,6 +803,9 @@ impl ExecuteLoopState {
             },
             automatic_fragments: ExecuteLoopAutomaticMessageFragments::default(),
             fragment_overrides: ExecuteLoopFragmentOverrides::default(),
+            automation_policies: ExecuteLoopAutomationPolicies::default(),
+            apply_failure_focused_context_counts: HashMap::new(),
+            pending_focused_context_paths: BTreeSet::new(),
             conversation_id: None,
             history_sync_pending: false,
             history_sync_rx: None,
@@ -573,6 +1020,60 @@ impl ExecuteLoopState {
         self.automatic_fragments = ExecuteLoopAutomaticMessageFragments::default();
     }
 
+    pub fn reset_apply_failure_focused_context_runtime(&mut self) {
+        self.apply_failure_focused_context_counts.clear();
+        self.pending_focused_context_paths.clear();
+    }
+
+    pub fn record_apply_failure_attempt(
+        &mut self,
+        attempted_paths: &[String],
+        failed_paths: &[String],
+    ) -> Vec<String> {
+        if !self.automation_policies.apply_failure_focused_context.enabled {
+            return Vec::new();
+        }
+
+        let threshold = self
+            .automation_policies
+            .apply_failure_focused_context
+            .consecutive_failure_threshold
+            .max(1);
+
+        let failed_lookup: HashSet<&str> = failed_paths.iter().map(|path| path.as_str()).collect();
+        for path in attempted_paths {
+            if !failed_lookup.contains(path.as_str()) {
+                self.apply_failure_focused_context_counts.remove(path);
+            }
+        }
+
+        let mut triggered = BTreeSet::new();
+        for path in failed_paths {
+            let next = self
+                .apply_failure_focused_context_counts
+                .get(path)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.apply_failure_focused_context_counts.insert(path.clone(), next);
+            if next >= threshold {
+                self.pending_focused_context_paths.insert(path.clone());
+                triggered.insert(path.clone());
+            }
+        }
+
+        triggered.into_iter().collect()
+    }
+
+    pub fn take_pending_focused_context_paths(&mut self) -> Vec<String> {
+        let paths: Vec<String> = self.pending_focused_context_paths.iter().cloned().collect();
+        for path in &paths {
+            self.apply_failure_focused_context_counts.remove(path);
+        }
+        self.pending_focused_context_paths.clear();
+        paths
+    }
+
     pub fn clear_manual_message_fragments(&mut self) {
         self.manual_fragments = ExecuteLoopManualMessageFragments::default();
         self.include_context_next = false;
@@ -591,7 +1092,7 @@ impl ExecuteLoopState {
         self.fragment_overrides
             .changeset_schema
             .as_deref()
-            .unwrap_or(crate::app::ui::changeset_applier::CHANGESET_SCHEMA_EXAMPLE)
+            .unwrap_or(crate::gateway_model::CHANGESET_SCHEMA_EXAMPLE)
             .trim()
             .to_string()
     }
@@ -625,9 +1126,39 @@ pub struct SourceControlFile {
     pub worktree_status: String,
     pub staged: bool,
     pub untracked: bool,
+    pub staged_additions: Option<u64>,
+    pub staged_deletions: Option<u64>,
+    pub unstaged_additions: Option<u64>,
+    pub unstaged_deletions: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
+pub struct SourceControlSnapshot {
+    pub branch: Option<String>,
+    pub branch_options: Vec<String>,
+    pub remote_options: Vec<String>,
+    pub files: Vec<SourceControlFile>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GitStatusSnapshot {
+    pub files: Vec<SourceControlFile>,
+    pub git_status_by_path: HashMap<String, GitStatusEntry>,
+    pub modified_paths: HashSet<String>,
+    pub staged_paths: HashSet<String>,
+    pub untracked_paths: HashSet<String>,
+    pub branch: Option<String>,
+    pub branch_options: Vec<String>,
+    pub remote_options: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffStatsSnapshot {
+    pub staged_by_path: HashMap<String, (u64, u64)>,
+    pub unstaged_by_path: HashMap<String, (u64, u64)>,
+    pub untracked_by_path: HashMap<String, (u64, u64)>,
+}
+
 pub struct SourceControlState {
     pub branch: String,
     pub branch_options: Vec<String>,
@@ -643,6 +1174,8 @@ pub struct SourceControlState {
     pub last_error: Option<String>,
 
     pub needs_refresh: bool,
+    pub loading: bool,
+    pub refresh_job: AsyncLatestJob<SourceControlSnapshot>,
 }
 
 
@@ -664,6 +1197,21 @@ pub struct DiffRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct DiffViewerFileSection {
+    pub path: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub rows: Vec<DiffRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiffViewerPendingSection {
+    pub path: String,
+    pub from_ref: String,
+    pub to_ref: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct DiffViewerState {
     pub path: Option<String>,
 
@@ -671,6 +1219,8 @@ pub struct DiffViewerState {
     pub to_ref: String,
 
     pub rows: Vec<DiffRow>,
+    pub file_sections: Vec<DiffViewerFileSection>,
+    pub aggregate_title: Option<String>,
 
     pub only_changes: bool,
 
@@ -679,8 +1229,30 @@ pub struct DiffViewerState {
     pub last_error: Option<String>,
 
     pub needs_refresh: bool,
+    pub loading: bool,
+    pub loaded_files: usize,
+    pub total_files: usize,
 }
 
+
+impl SourceControlState {
+    pub fn new() -> Self {
+        Self {
+            branch: String::new(),
+            branch_options: vec![],
+            remote: "origin".to_string(),
+            remote_options: vec![],
+            commit_message: String::new(),
+            files: vec![],
+            selected: HashSet::new(),
+            last_output: None,
+            last_error: None,
+            needs_refresh: true,
+            loading: false,
+            refresh_job: AsyncLatestJob::default(),
+        }
+    }
+}
 
 impl DiffViewerState {
     pub fn new() -> Self {
@@ -689,10 +1261,15 @@ impl DiffViewerState {
             from_ref: "HEAD".to_string(),
             to_ref: WORKTREE_REF.to_string(),
             rows: vec![],
+            file_sections: vec![],
+            aggregate_title: None,
             only_changes: true,
             context_lines: 3,
             last_error: None,
             needs_refresh: false,
+            loading: false,
+            loaded_files: 0,
+            total_files: 0,
         }
     }
 }
@@ -730,6 +1307,7 @@ pub struct AppState {
     pub inputs: InputsState,
     pub results: ResultsState,
     pub ui: UiState,
+    pub perf: GlobalPerfConfig,
     pub tree: TreeState,
 
     pub canvases: Vec<CanvasState>,
@@ -739,6 +1317,7 @@ pub struct AppState {
     pub file_viewers: HashMap<ComponentId, FileViewerState>,
 
     pub diff_viewers: HashMap<ComponentId, DiffViewerState>,
+    pub diff_viewer_jobs: HashMap<ComponentId, AsyncQueuedJob<DiffViewerPendingSection, DiffViewerFileSection>>,
 
     pub terminals: HashMap<ComponentId, TerminalState>,
     pub context_exporters: HashMap<ComponentId, ContextExporterState>,
@@ -748,11 +1327,13 @@ pub struct AppState {
 
     pub execute_loop_store: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
-    pub tasks: HashMap<ComponentId, TaskState>,
+    pub task_component_bindings: HashMap<ComponentId, TaskId>,
+    pub tasks: HashMap<TaskId, TaskState>,
 
     pub task_store_dirty: bool,
 
     pub source_controls: HashMap<ComponentId, SourceControlState>,
+    pub sap_adts: HashMap<ComponentId, SapAdtState>,
 
     pub theme: ThemeState,
     pub deferred: DeferredActions,
@@ -781,6 +1362,61 @@ pub struct InputsState {
     pub max_exts: usize,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GlobalPerfConfig {
+    #[serde(default = "GlobalPerfConfig::default_git_status_poll_ms")]
+    pub git_status_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_analysis_refresh_poll_ms")]
+    pub analysis_refresh_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_response_poll_ms")]
+    pub browser_response_poll_ms: u64,
+    #[serde(default = "GlobalPerfConfig::default_browser_dom_poll_ms")]
+    pub browser_dom_poll_ms: u64,
+}
+
+impl GlobalPerfConfig {
+    fn clamp_ms(value: u64) -> u64 {
+        value.max(250)
+    }
+
+    fn default_git_status_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_analysis_refresh_poll_ms() -> u64 {
+        4000
+    }
+
+    fn default_browser_response_poll_ms() -> u64 {
+        1000
+    }
+
+    fn default_browser_dom_poll_ms() -> u64 {
+        1000
+    }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            git_status_poll_ms: Self::clamp_ms(self.git_status_poll_ms),
+            analysis_refresh_poll_ms: Self::clamp_ms(self.analysis_refresh_poll_ms),
+            browser_response_poll_ms: Self::clamp_ms(self.browser_response_poll_ms),
+            browser_dom_poll_ms: Self::clamp_ms(self.browser_dom_poll_ms),
+        }
+    }
+}
+
+impl Default for GlobalPerfConfig {
+    fn default() -> Self {
+        Self {
+            git_status_poll_ms: Self::default_git_status_poll_ms(),
+            analysis_refresh_poll_ms: Self::default_analysis_refresh_poll_ms(),
+            browser_response_poll_ms: Self::default_browser_response_poll_ms(),
+            browser_dom_poll_ms: Self::default_browser_dom_poll_ms(),
+        }
+        .normalized()
+    }
+}
+
 pub struct ResultsState {
     pub result: Option<AnalysisResult>,
     pub error: Option<String>,
@@ -793,6 +1429,11 @@ pub struct UiState {
     pub canvas_bg_tint: Option<[u8; 4]>,
     pub canvas_tint_popup_open: bool,
     pub canvas_tint_draft: Option<[u8; 4]>,
+    pub global_settings_open: bool,
+    pub global_settings_git_status_poll_s: u64,
+    pub global_settings_analysis_refresh_poll_s: u64,
+    pub global_settings_browser_response_poll_s: u64,
+    pub global_settings_browser_dom_poll_s: u64,
 
     pub task_panel_selected_loops: Option<HashMap<ComponentId, BTreeSet<ConversationId>>>,
 
@@ -821,13 +1462,12 @@ pub struct TreeState {
     pub git_status_by_path: HashMap<String, GitStatusEntry>,
 
     pub last_auto_refresh_s: f64,
-    pub auto_refresh_interval_s: f64,
 
     pub last_git_status_refresh_s: f64,
-    pub git_status_interval_s: f64,
 
-    pub analysis_refresh_pending: bool,
-    pub analysis_refresh_rx: Option<Receiver<Result<crate::model::AnalysisResult, String>>>,
+    pub analysis_job: AsyncLatestJob<crate::model::AnalysisResult>,
+    pub git_status_job: AsyncLatestJob<GitStatusSnapshot>,
+    pub diff_stats_job: AsyncLatestJob<DiffStatsSnapshot>,
 
     pub rename_target: Option<String>,
     pub rename_draft: String,
@@ -841,6 +1481,33 @@ pub struct TreeState {
     pub modal_focus_request: bool,
 }
 
+
+impl TreeState {
+    pub fn new() -> Self {
+        Self {
+            expand_cmd: None,
+            context_selected_files: HashSet::new(),
+            context_selected_by_ref: HashMap::new(),
+            context_initialized: false,
+            modified_paths: HashSet::new(),
+            staged_paths: HashSet::new(),
+            untracked_paths: HashSet::new(),
+            git_status_by_path: HashMap::new(),
+            last_auto_refresh_s: 0.0,
+            last_git_status_refresh_s: 0.0,
+            analysis_job: AsyncLatestJob::default(),
+            git_status_job: AsyncLatestJob::default(),
+            diff_stats_job: AsyncLatestJob::default(),
+            rename_target: None,
+            rename_draft: String::new(),
+            create_parent: None,
+            create_draft: String::new(),
+            create_is_dir: false,
+            confirm_delete_target: None,
+            modal_focus_request: false,
+        }
+    }
+}
 
 pub struct FileViewerState {
     pub selected_file: Option<String>,
@@ -1003,6 +1670,24 @@ impl AppState {
         id
     }
 
+    pub fn default_repo_task_id(&self) -> TaskId {
+        1
+    }
+
+    pub fn task_id_for_component_ref(&self, component_id: ComponentId) -> TaskId {
+        self.task_component_bindings
+            .get(&component_id)
+            .copied()
+            .unwrap_or_else(|| self.default_repo_task_id())
+    }
+
+    pub fn ensure_task_id_for_component(&mut self, component_id: ComponentId) -> TaskId {
+        let task_id = self.default_repo_task_id();
+        self.task_component_bindings.insert(component_id, task_id);
+        self.tasks.entry(task_id).or_default();
+        task_id
+    }
+
 
     fn bump_next_component_id_unused(&mut self) {
         let max_id = self
@@ -1127,10 +1812,17 @@ impl AppState {
                 canvas_bg_tint: None,
                 canvas_tint_popup_open: false,
                 canvas_tint_draft: None,
+                global_settings_open: false,
+                global_settings_git_status_poll_s: 1,
+                global_settings_analysis_refresh_poll_s: 4,
+                global_settings_browser_response_poll_s: 1,
+                global_settings_browser_dom_poll_s: 1,
                 canvas_rename_index: None,
                 canvas_rename_draft: String::new(),
                 task_panel_selected_loops: None,
             },
+
+            perf: GlobalPerfConfig::default(),
 
             tree: TreeState {
                 expand_cmd: None,
@@ -1144,13 +1836,12 @@ impl AppState {
                 git_status_by_path: HashMap::new(),
 
                 last_auto_refresh_s: 0.0,
-                auto_refresh_interval_s: 1.0,
 
                 last_git_status_refresh_s: 0.0,
-                git_status_interval_s: 1.0,
 
-                analysis_refresh_pending: false,
-                analysis_refresh_rx: None,
+                analysis_job: AsyncLatestJob::default(),
+                git_status_job: AsyncLatestJob::default(),
+                diff_stats_job: AsyncLatestJob::default(),
 
                 rename_target: None,
                 rename_draft: String::new(),
@@ -1179,15 +1870,18 @@ impl AppState {
             file_viewers: HashMap::new(),
 
             diff_viewers: HashMap::new(),
+            diff_viewer_jobs: HashMap::new(),
 
             terminals: HashMap::new(),
             context_exporters: HashMap::new(),
             changeset_appliers: HashMap::new(),
             execute_loops: HashMap::new(),
             execute_loop_store: HashMap::new(),
+            task_component_bindings: HashMap::new(),
             tasks: HashMap::new(),
             task_store_dirty: false,
             source_controls: HashMap::new(),
+            sap_adts: HashMap::new(),
 
             theme: ThemeState {
                 code_theme: CodeTheme::dark(),
@@ -1221,6 +1915,7 @@ impl AppState {
             pending_open_file_viewer: None,
         };
 
+        state.load_global_perf_config_from_appdata();
         state.load_workspace_from_appdata(None);
         state
     }
@@ -1347,16 +2042,25 @@ impl AppState {
         let existing = std::mem::take(&mut self.tasks);
         self.tasks = HashMap::new();
 
-        let ids: Vec<ComponentId> = self
+        let component_ids: Vec<ComponentId> = self
             .all_layouts()
             .flat_map(|l| l.components.iter())
             .filter(|c| c.kind == ComponentKind::Task)
             .map(|c| c.id)
             .collect();
 
-        for id in ids {
-            let st = existing.get(&id).cloned().unwrap_or_default();
-            self.tasks.insert(id, st);
+        let component_id_set: HashSet<ComponentId> = component_ids.iter().copied().collect();
+        self.task_component_bindings
+            .retain(|component_id, _| component_id_set.contains(component_id));
+
+        if !component_ids.is_empty() {
+            let task_id = self.default_repo_task_id();
+            for component_id in component_ids {
+                self.task_component_bindings.insert(component_id, task_id);
+            }
+
+            let st = existing.get(&task_id).cloned().unwrap_or_default();
+            self.tasks.insert(task_id, st);
         }
     }
 

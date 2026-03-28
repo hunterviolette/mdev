@@ -65,6 +65,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
 
                 v.diff_err = None;
                 v.diff_text.clear();
+                v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
 
                 if turning_on {
                     v.diff_picker_open = true;
@@ -87,6 +88,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 v.diff_base = sel.clone();
                 v.diff_err = None;
                 v.diff_text.clear();
+                v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
             }
             true
         }
@@ -96,6 +98,7 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
                 v.diff_target = sel.clone();
                 v.diff_err = None;
                 v.diff_text.clear();
+                v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
             }
             true
         }
@@ -445,18 +448,21 @@ impl AppState {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
                     v.diff_text = text;
                     v.diff_err = None;
+                    v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
                 }
             }
             Ok(_) => {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
                     v.diff_err = Some("Unexpected response generating diff.".into());
                     v.diff_text.clear();
+                    v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
                 }
             }
             Err(e) => {
                 if let Some(v) = self.file_viewers.get_mut(&viewer_id) {
                     v.diff_err = Some(format!("{:#}", e));
                     v.diff_text.clear();
+                    v.viewer_editor = crate::app::ui::code_editor::CodeEditorState::default();
                 }
             }
         }

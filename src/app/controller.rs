@@ -1,12 +1,12 @@
 use crate::{format};
 
 use super::actions::Action;
-use super::state::AppState;
+use super::state::{AppState, GlobalPerfConfig};
 
 use super::controllers::{
     changeset_loop_controller,
     analysis_controller, changeset_controller, context_exporter_controller, diff_viewer_controller,
-    file_viewer_controller, layout_controller, palette_controller, source_control_controller,
+    file_viewer_controller, layout_controller, palette_controller, sap_adt_controller, source_control_controller,
     terminal_controller, tree_controller, personalization, workspace_controller,
     task_controller,
 };
@@ -20,6 +20,41 @@ impl AppState {
         dir.push("task_store");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    fn global_perf_config_path(&self) -> anyhow::Result<std::path::PathBuf> {
+        let mut dir = self.platform.app_data_dir("devApp")?;
+        std::fs::create_dir_all(&dir)?;
+        dir.push("global_perf_config.json");
+        Ok(dir)
+    }
+
+    pub fn load_global_perf_config_from_appdata(&mut self) {
+        let path = match self.global_perf_config_path() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+
+        let perf = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<GlobalPerfConfig>(&text).ok())
+            .unwrap_or_default()
+            .normalized();
+
+        self.perf = perf;
+    }
+
+    pub fn save_global_perf_config_to_appdata(&self) {
+        let path = match self.global_perf_config_path() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+
+        let Ok(text) = serde_json::to_string_pretty(&self.perf.normalized()) else {
+            return;
+        };
+
+        let _ = Self::atomic_write_json(&path, &text);
     }
 
     fn repo_task_store_path(&self, repo: &std::path::PathBuf) -> anyhow::Result<std::path::PathBuf> {
@@ -111,7 +146,10 @@ impl AppState {
         for (task_id, ts) in parsed.tasks.iter() {
             let exists = self
                 .all_layouts()
-                .any(|l| l.components.iter().any(|c| c.kind == crate::app::actions::ComponentKind::Task && c.id == *task_id));
+                .any(|l| l.components.iter().any(|c| {
+                    c.kind == crate::app::actions::ComponentKind::Task
+                        && self.task_id_for_component_ref(c.id) == *task_id
+                }));
             if !exists {
                 continue;
             }
@@ -158,6 +196,8 @@ impl AppState {
         st.manual_fragments = snap.manual_fragments.clone();
         st.automatic_fragments = snap.automatic_fragments.clone();
         st.fragment_overrides = snap.fragment_overrides.clone();
+        st.automation_policies = snap.automation_policies.clone();
+        st.reset_apply_failure_focused_context_runtime();
         st.auto_fill_first_changeset_applier = snap.auto_fill_first_changeset_applier;
         st.messages = snap.messages.clone();
         st.conversation_id = snap.conversation_id.clone();
@@ -266,6 +306,7 @@ impl AppState {
                 manual_fragments: st.manual_fragments.clone(),
                 automatic_fragments: st.automatic_fragments.clone(),
                 fragment_overrides: st.fragment_overrides.clone(),
+                automation_policies: st.automation_policies.clone(),
                 auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                 messages: st.messages.clone(),
                 conversation_id: None,
@@ -320,6 +361,7 @@ impl AppState {
                         manual_fragments: st.manual_fragments.clone(),
                         automatic_fragments: st.automatic_fragments.clone(),
                         fragment_overrides: st.fragment_overrides.clone(),
+                        automation_policies: st.automation_policies.clone(),
                         auto_fill_first_changeset_applier: st.auto_fill_first_changeset_applier,
                         messages: st.messages.clone(),
                         conversation_id: st.conversation_id.clone(),
@@ -365,18 +407,28 @@ impl AppState {
         use crate::app::actions::ComponentKind;
         use crate::app::layout::{ComponentInstance, WindowLayout};
 
-        for (idx, canvas) in self.canvases.iter_mut().enumerate() {
-            let exists = canvas
-                .layout
+        {
+            let active_layout = self.active_layout_mut();
+            let exists_here = active_layout
                 .components
                 .iter()
                 .any(|c| c.kind == ComponentKind::ExecuteLoop && c.id == loop_id);
-            if exists {
-                if let Some(w) = canvas.layout.get_window_mut(loop_id) {
+
+            if exists_here {
+                if let Some(w) = active_layout.get_window_mut(loop_id) {
                     w.open = true;
                 }
-                self.active_canvas = idx;
                 return;
+            }
+
+            let occupied_by_other_kind = active_layout
+                .components
+                .iter()
+                .any(|c| c.id == loop_id && c.kind != ComponentKind::ExecuteLoop);
+
+            if occupied_by_other_kind {
+                active_layout.components.retain(|c| c.id != loop_id);
+                active_layout.windows.remove(&loop_id);
             }
         }
 
@@ -437,6 +489,9 @@ impl AppState {
         if task_controller::handle(self, &action) {
             return;
         }
+        if sap_adt_controller::handle(self, &action) {
+            return;
+        }
         if layout_controller::handle(self, &action) {
             return;
         }
@@ -445,8 +500,18 @@ impl AppState {
         }
     }
 
+    pub fn poll_git_status_refresh(&mut self) -> bool {
+        tree_controller::poll_git_status_refresh(self)
+    }
+
+    pub fn poll_diff_stats_refresh(&mut self) -> bool {
+        tree_controller::poll_diff_stats_refresh(self)
+    }
+
     pub fn finalize_frame(&mut self) {
         file_viewer_controller::finalize_frame(self);
+        sap_adt_controller::finalize_frame(self);
+        sap_adt_controller::finalize_frame(self);
     }
 
     pub fn excludes_joined(&self) -> String {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::actions::{ComponentId, ComponentKind, ConversationId};
+use super::actions::{ComponentId, ComponentKind, ConversationId, TaskId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -78,6 +78,8 @@ pub struct ExecuteLoopSnapshot {
     pub automatic_fragments: crate::app::state::ExecuteLoopAutomaticMessageFragments,
     #[serde(default)]
     pub fragment_overrides: crate::app::state::ExecuteLoopFragmentOverrides,
+    #[serde(default)]
+    pub automation_policies: crate::app::state::ExecuteLoopAutomationPolicies,
     pub auto_fill_first_changeset_applier: bool,
     pub messages: Vec<crate::app::state::ExecuteLoopMessage>,
 
@@ -208,7 +210,10 @@ pub struct StateSnapshot {
     pub execute_loops: HashMap<ComponentId, ExecuteLoopSnapshot>,
 
     #[serde(default)]
-    pub tasks: HashMap<ComponentId, TaskSnapshot>,
+    pub task_component_bindings: HashMap<ComponentId, TaskId>,
+
+    #[serde(default)]
+    pub tasks: HashMap<TaskId, TaskSnapshot>,
 
     pub canvas_size: [f32; 2],
 

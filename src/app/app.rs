@@ -9,7 +9,6 @@ fn canvas_rect_id() -> egui::Id {
 }
 
 fn current_canvas_size(ctx: &egui::Context) -> [f32; 2] {
-
     let r = ctx
         .data_mut(|d| d.get_persisted::<egui::Rect>(canvas_rect_id()))
         .unwrap_or_else(|| ctx.available_rect());
@@ -43,20 +42,22 @@ impl eframe::App for AppState {
 
 
         let now_s = ctx.input(|i| i.time);
+        let git_status_interval_s = (self.perf.git_status_poll_ms.max(250) as f64) / 1000.0;
+        let analysis_refresh_interval_s = (self.perf.analysis_refresh_poll_ms.max(250) as f64) / 1000.0;
         if self.inputs.repo.is_some() && self.inputs.git_ref == WORKTREE_REF {
-            if now_s - self.tree.last_git_status_refresh_s >= self.tree.git_status_interval_s {
+            if now_s - self.tree.last_git_status_refresh_s >= git_status_interval_s {
                 self.tree.last_git_status_refresh_s = now_s;
                 self.refresh_tree_git_status();
             }
 
-            if now_s - self.tree.last_auto_refresh_s >= self.tree.auto_refresh_interval_s {
+            if now_s - self.tree.last_auto_refresh_s >= analysis_refresh_interval_s {
                 self.tree.last_auto_refresh_s = now_s;
                 if !self.any_file_load_pending() {
                     self.start_analysis_refresh_async();
                 }
             }
 
-            if self.tree.analysis_refresh_pending {
+            if self.tree.analysis_job.is_pending() {
                 ctx.request_repaint();
             }
             if self.poll_analysis_refresh() {
@@ -64,6 +65,24 @@ impl eframe::App for AppState {
             }
         }
 
+        if self.poll_git_status_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_stats_refresh() {
+            ctx.request_repaint();
+        }
+        if self.poll_diff_viewer_loads() {
+            ctx.request_repaint();
+        }
+        if self.diff_viewers.values().any(|v| v.loading)
+            || self.diff_viewer_jobs.values().any(|job| job.is_pending())
+        {
+            ctx.request_repaint();
+        }
+
+        if self.sap_adts.values().any(|sap| sap.import_job.is_pending() || sap.export_job.is_pending()) {
+            ctx.request_repaint();
+        }
 
         let canvas_shortcut = ctx.input(|i| {
             if !i.modifiers.ctrl {
@@ -114,7 +133,6 @@ impl eframe::App for AppState {
             self.apply_action(super::actions::Action::CanvasSelect { index: idx });
         }
 
-
         egui::TopBottomPanel::top("top").show(ctx, |ui_top| {
             let actions = ui::top_bar::top_bar(ctx, ui_top, self);
             for a in actions {
@@ -123,6 +141,11 @@ impl eframe::App for AppState {
         });
 
         let actions = ui::personalization::personalization(ctx, self);
+        for a in actions {
+            self.apply_action(a);
+        }
+
+        let actions = ui::global_settings::global_settings(ctx, self);
         for a in actions {
             self.apply_action(a);
         }
