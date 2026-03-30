@@ -1,12 +1,15 @@
-
 use crate::app::actions::{Action, ComponentId, ComponentKind};
 use crate::app::state::AppState;
 use crate::gateway_model::{self, GatewayMode, SyncMode};
 
+use anyhow::Result;
+use serde_json::json;
+
+use crate::app::workflow_api::{ensure_run_for_repo, WorkflowApiClient};
+
 pub fn normalize_and_validate_changeset_payload_text(raw: &str) -> anyhow::Result<String> {
     gateway_model::changeset::normalize_and_validate_payload_text(raw)
 }
-
 
 pub fn handle(state: &mut AppState, action: &Action) -> bool {
     match action {
@@ -42,11 +45,11 @@ pub fn handle(state: &mut AppState, action: &Action) -> bool {
             true
         }
         Action::GenerateSyncPayload { applier_id } => {
-            gateway_model::sync::generate_payload(state, *applier_id);
+            invoke_payload_gateway(state, *applier_id);
             true
         }
         Action::ApplyChangeSet { applier_id } => {
-            apply_changeset(state, *applier_id);
+            invoke_payload_gateway(state, *applier_id);
             true
         }
         Action::ClearChangeSet { applier_id } => {
@@ -80,8 +83,7 @@ impl AppState {
         ids.sort_unstable();
         ids.dedup();
 
-        self.changeset_appliers
-            .retain(|id, _| ids.binary_search(id).is_ok());
+        self.changeset_appliers.retain(|id, _| ids.binary_search(id).is_ok());
 
         for id in ids {
             self.changeset_appliers.entry(id).or_insert(ChangeSetApplierState {
@@ -102,8 +104,9 @@ impl AppState {
     }
 }
 
-fn apply_changeset(state: &mut AppState, applier_id: ComponentId) {
-    gateway_model::changeset::apply(state, applier_id)
+fn build_api_client() -> WorkflowApiClient {
+    let base = std::env::var("MDEV_WORKFLOW_API_BASE").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+    WorkflowApiClient::new(base)
 }
 
 fn set_applier_status(state: &mut AppState, applier_id: ComponentId, status: String) {
@@ -112,3 +115,113 @@ fn set_applier_status(state: &mut AppState, applier_id: ComponentId, status: Str
     }
 }
 
+fn invoke_payload_gateway(state: &mut AppState, applier_id: ComponentId) {
+    let Some(repo) = state.inputs.repo.clone() else {
+        set_applier_status(state, applier_id, "No repo selected. Pick a folder first.".to_string());
+        return;
+    };
+
+    let (mode, sync_mode, payload_text, sync_skip_binary, sync_skip_gitignore) =
+        match state.changeset_appliers.get(&applier_id) {
+            Some(st) => (
+                st.mode,
+                st.sync_mode,
+                st.payload.clone(),
+                st.sync_skip_binary,
+                st.sync_skip_gitignore,
+            ),
+            None => return,
+        };
+
+    let api = build_api_client();
+    let result: Result<serde_json::Value> = (|| {
+        let run_id = ensure_run_for_repo(&api, &repo, "Payload gateway")?;
+
+        let mode_str = match mode {
+            GatewayMode::ChangeSet => "changeset_apply",
+            GatewayMode::Sync => "sync_generate",
+        };
+
+        let sync_mode_str = match sync_mode {
+            SyncMode::Entire => "entire",
+            SyncMode::Tree => "tree",
+            SyncMode::Diff => "diff",
+        };
+
+        let response = api.invoke_payload_gateway(
+            &run_id,
+            Some("payload_gateway"),
+            json!({
+                "repo_ref": repo.to_string_lossy().replace('\\', "/"),
+                "git_ref": state.inputs.git_ref,
+                "exclude_regex": state.inputs.exclude_regex,
+                "mode": mode_str,
+                "sync_mode": sync_mode_str,
+                "payload_text": payload_text,
+                "tree_selection": state.tree.context_selected_files.iter().cloned().collect::<Vec<_>>(),
+                "sync_skip_binary": sync_skip_binary,
+                "sync_skip_gitignore": sync_skip_gitignore
+            }),
+        )?;
+
+        Ok(json!({
+            "run_id": run_id,
+            "response": response,
+            "mode": mode_str,
+        }))
+    })();
+
+    match result {
+        Ok(bundle) => {
+            let run_id = bundle.get("run_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let response = bundle.get("response").cloned().unwrap_or_else(|| json!({}));
+
+            match mode {
+                GatewayMode::Sync => {
+                    let payload_text = response.get("payload_text").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    if let Some(st) = state.changeset_appliers.get_mut(&applier_id) {
+                        st.sync_payload = payload_text;
+                        st.status = Some(format!("Sync payload generated via workflow API. run_id={}", run_id));
+                    }
+                }
+                GatewayMode::ChangeSet => {
+                    let summary = response.get("summary").and_then(|v| v.as_str()).unwrap_or("Payload gateway completed").to_string();
+                    let normalized = response.get("normalized_payload").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    let lines = response
+                        .get("lines")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"))
+                        .unwrap_or_default();
+                    let failed = response
+                        .get("failed")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let attempted = response
+                        .get("attempted")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+
+                    if let Some(st) = state.changeset_appliers.get_mut(&applier_id) {
+                        if !normalized.is_empty() {
+                            st.payload = normalized.clone();
+                            st.last_changeset_payload = normalized;
+                        }
+                        st.last_attempted_paths = attempted;
+                        st.last_failed_paths = failed;
+                        st.status = Some(format!("{} run_id={}", summary, run_id));
+                        st.result_payload = if lines.is_empty() { summary.clone() } else { format!("{}\n\n{}", summary, lines) };
+                        st.changeset_show_result = true;
+                    }
+                    if state.inputs.git_ref == crate::app::state::WORKTREE_REF {
+                        state.refresh_tree_git_status();
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            set_applier_status(state, applier_id, format!("Payload gateway failed: {err:#}"));
+        }
+    }
+}

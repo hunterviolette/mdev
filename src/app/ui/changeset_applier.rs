@@ -23,6 +23,10 @@ pub fn changeset_applier_panel(
     ui.push_id(("changeset_applier", applier_id), |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label("Payload:");
+            if let Some(status) = st.status.as_deref() {
+                ui.separator();
+                ui.monospace(status);
+            }
 
             let cur_payload = match st.mode {
                 GatewayMode::ChangeSet => "CHANGESET",

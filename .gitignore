@@ -1,6 +1,5 @@
-target/*
+target/
 todo.md
-repo_context.txt
 .env
 tmp/*
 bridge/node_modules
@@ -8,3 +7,9 @@ bridge/dist
 .DS_Store
 adt-bridge/node_modules
 adt-bridge/dist
+web/node_modules
+web/dist
+api/target
+api/.data/*
+.data/*
+*lock*
