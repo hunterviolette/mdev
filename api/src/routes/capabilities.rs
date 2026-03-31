@@ -2,12 +2,13 @@ use axum::{extract::{Path, State}, routing::{get, post}, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
     executor::{append_event, execute_context_export, execute_model_inference_send_prompt, execute_payload_gateway, execute_terminal_command, update_run_context, update_run_status, CHANGESET_SCHEMA_EXAMPLE},
-    inference::{browser::adapter as browser_adapter, BrowserProbeResult, InferenceConfig, InferenceTransport},
+    engine::capabilities::inference::{self, InferenceConfig, ModelInferenceAction},
     models::RunStatus,
 };
 
@@ -17,16 +18,6 @@ pub struct CapabilityInvokeRequest {
     pub step_id: Option<String>,
     #[serde(default)]
     pub payload: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelInferenceAction {
-    Configure,
-    LaunchBrowser,
-    OpenUrl,
-    ProbeBrowser,
-    SendPrompt,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +188,7 @@ async fn invoke_model_inference(
             Ok(Json(result))
         }
         Err(err) => {
+            error!(run_id = %run_id, step_id = ?req.step_id, action = ?req.action, error = %format!("{:#}", err), "model inference request failed");
             update_run_status(&state.db, run_id, RunStatus::Error, req.step_id.as_deref())
                 .await
                 .map_err(internal)?;
@@ -221,6 +213,7 @@ async fn handle_model_inference(
     run_id: Uuid,
     req: &ModelInferenceRequest,
 ) -> anyhow::Result<Value> {
+    info!(run_id = %run_id, step_id = ?req.step_id, action = ?req.action, payload = %req.payload, "handling model inference request");
     let row = sqlx::query("SELECT context_json FROM workflow_runs WHERE id = ?")
         .bind(run_id.to_string())
         .fetch_one(&state.db)
@@ -233,91 +226,19 @@ async fn handle_model_inference(
 
     match req.action {
         ModelInferenceAction::Configure => {
-            if let Some(transport) = req.payload.get("transport").and_then(|v| v.as_str()) {
-                inference_cfg.transport = match transport {
-                    "browser" => InferenceTransport::Browser,
-                    _ => InferenceTransport::Api,
-                };
-            }
-
-            if let Some(model) = req.payload.get("model").and_then(|v| v.as_str()) {
-                inference_cfg.model = model.to_string();
-            }
-
-            if let Some(browser) = req.payload.get("browser") {
-                inference_cfg.browser = serde_json::from_value(browser.clone())?;
-            }
-
+            inference::apply_configuration(&mut inference_cfg, &req.payload)?;
             context["model_inference"] = serde_json::to_value(&inference_cfg)?;
             update_run_context(&state.db, run_id, &context).await?;
-
-            append_event(
-                &state.db,
-                run_id,
-                req.step_id.as_deref(),
-                "info",
-                "model_inference_configured",
-                "Model inference configuration saved",
-                json!({
-                    "transport": inference_cfg.transport,
-                    "model": inference_cfg.model,
-                    "browser_target_url": inference_cfg.browser.target_url,
-                }),
-            )
-            .await?;
 
             Ok(json!({ "ok": true, "config": inference_cfg }))
         }
 
-        ModelInferenceAction::LaunchBrowser => {
-            let session_id = browser_adapter::launch_and_attach(&mut inference_cfg.browser)?;
-
-            let target_url = inference_cfg.browser.target_url.trim().to_string();
-            let mut probe_payload = Value::Null;
-            let mut status = "attached";
-            let mut message = "Browser attached for inference".to_string();
-
-            if !target_url.is_empty() {
-                browser_adapter::open_url(&mut inference_cfg.browser, &target_url)?;
-                message = format!("Browser attached and opened {}", target_url);
-
-                if let Ok(probe) = browser_adapter::probe(&mut inference_cfg.browser) {
-                    probe_payload = serde_json::to_value(&probe)?;
-                    status = if probe.ready { "ready" } else { "attached" };
-                    message = if probe.ready {
-                        format!("Browser attached and target URL is ready: {}", target_url)
-                    } else {
-                        format!("Browser attached and target URL opened: {}", target_url)
-                    };
-                }
-            }
-
+        ModelInferenceAction::LaunchBrowser | ModelInferenceAction::ConnectBrowserSession => {
+            let result = inference::browser::connect_session(&mut inference_cfg)?;
             context["model_inference"] = serde_json::to_value(&inference_cfg)?;
             update_run_context(&state.db, run_id, &context).await?;
 
-            append_event(
-                &state.db,
-                run_id,
-                req.step_id.as_deref(),
-                "info",
-                "browser_attached",
-                &message,
-                json!({
-                    "session_id": session_id,
-                    "target_url": if target_url.is_empty() { Value::Null } else { Value::String(target_url.clone()) },
-                    "status": status,
-                    "probe": probe_payload,
-                }),
-            )
-            .await?;
-
-            Ok(json!({
-                "ok": true,
-                "session_id": session_id,
-                "target_url": if target_url.is_empty() { Value::Null } else { Value::String(target_url) },
-                "status": status,
-                "probe": probe_payload,
-            }))
+            Ok(result)
         }
 
         ModelInferenceAction::OpenUrl => {
@@ -326,29 +247,33 @@ async fn handle_model_inference(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("payload.url is required"))?;
 
-            browser_adapter::open_url(&mut inference_cfg.browser, url)?;
+            let result = inference::browser::open_session_url(&mut inference_cfg, url)?;
             context["model_inference"] = serde_json::to_value(&inference_cfg)?;
             update_run_context(&state.db, run_id, &context).await?;
 
-            append_event(
-                &state.db,
-                run_id,
-                req.step_id.as_deref(),
-                "info",
-                "browser_url_opened",
-                "Browser URL opened for inference",
-                json!({ "url": url }),
-            )
-            .await?;
-
-            Ok(json!({ "ok": true, "url": url }))
+            Ok(result)
         }
 
         ModelInferenceAction::ProbeBrowser => {
-            let probe: BrowserProbeResult = browser_adapter::probe(&mut inference_cfg.browser)?;
+            let result = inference::browser::probe_session(&mut inference_cfg)?;
             context["model_inference"] = serde_json::to_value(&inference_cfg)?;
             update_run_context(&state.db, run_id, &context).await?;
-            Ok(json!({ "ok": true, "probe": probe }))
+            Ok(result)
+        }
+
+        ModelInferenceAction::DisconnectBrowserSession => {
+            let result = inference::browser::disconnect_session(&mut inference_cfg)?;
+            context["model_inference"] = serde_json::to_value(&inference_cfg)?;
+            update_run_context(&state.db, run_id, &context).await?;
+
+            Ok(result)
+        }
+
+        ModelInferenceAction::GetConnectionStatus => {
+            let result = inference::browser::connection_status(&mut inference_cfg)?;
+            context["model_inference"] = serde_json::to_value(&inference_cfg)?;
+            update_run_context(&state.db, run_id, &context).await?;
+            Ok(result)
         }
 
         ModelInferenceAction::SendPrompt => {

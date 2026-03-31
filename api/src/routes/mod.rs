@@ -1,5 +1,5 @@
 mod capabilities;
-mod events;
+mod event_chains;
 mod health;
 mod repo_tree;
 mod runs;
@@ -14,5 +14,5 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(repo_tree::router())
         .merge(templates::router())
         .merge(runs::router())
-        .merge(events::router())
+        .merge(event_chains::router())
 }

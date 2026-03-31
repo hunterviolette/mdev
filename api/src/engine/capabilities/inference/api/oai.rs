@@ -53,12 +53,12 @@ impl OpenAIInferenceClient {
         &self,
         model: &str,
         conversation_id: Option<String>,
-        seed_items_if_new: Vec<(String, String)>,
+        prior_items: Vec<(String, String)>,
         turn_items: Vec<(String, String)>,
     ) -> Result<(String, String)> {
         let conv_id = match conversation_id {
-            Some(id) => id,
-            None => self.create_conversation(seed_items_if_new).await?,
+            Some(id) if !id.trim().is_empty() => id,
+            _ => self.create_conversation(prior_items).await?,
         };
 
         let url = format!("{}/v1/responses", self.base_url.trim_end_matches('/'));

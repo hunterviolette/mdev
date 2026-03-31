@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import {
   ActionIcon,
   Alert,
@@ -7,16 +7,19 @@ import {
   Box,
   Button,
   Card,
-  Checkbox,
   Code,
   Divider,
   Grid,
   Group,
+  JsonInput,
   Loader,
   Modal,
   ScrollArea,
+  SegmentedControl,
   Select,
+  SimpleGrid,
   Stack,
+  Switch,
   Table,
   Tabs,
   Text,
@@ -24,625 +27,1064 @@ import {
   Textarea,
   Title
 } from '@mantine/core';
-import { IconArrowLeft, IconBolt, IconPlus, IconRefresh } from '@tabler/icons-react';
+import { IconPlayerPause, IconPlayerPlay, IconRefresh, IconTrash } from '@tabler/icons-react';
 import {
   createRun,
   createTemplate,
   deleteRun,
-  invokeContextExport,
+  getPayloadGatewaySchema,
+  getRun,
+  getStageExecutionChain,
   invokeModelInference,
   listRepoTree,
   listRunEvents,
   listRuns,
   listTemplates,
   nextWorkflowStep,
+  openEventStream,
   patchWorkflowStageState,
+  pauseWorkflowRun,
   previousWorkflowStep,
+  resumeWorkflowRun,
   runCurrentWorkflowStep,
   selectWorkflowStep,
+  startWorkflowRun,
+  type AutomationMode,
+  type BrowserProbeResult,
+  type EventChainSummaryItem,
+  type EventChainSummaryResponse,
+  type InferenceTransport,
   type RepoTreeResponse,
+  type StageExecutionChain,
+  type StageExecutionEvent,
   type WorkflowEvent,
   type WorkflowRun,
+  type WorkflowRunStatus,
   type WorkflowStepDefinition,
   type WorkflowTemplate,
-  type WorkflowTemplateDefinition
+  type WorkflowTemplateDefinition,
+  type WorkflowTransition
 } from './api';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 
-type BuilderStepId = 'design' | 'code' | 'test' | 'review';
-type AutomationMode = 'manual' | 'assisted' | 'automatic';
-type CapabilityKey = 'context_export' | 'model_inference' | 'inject_user_context' | 'inject_changeset_schema';
-type InferenceProvider = 'api' | 'browser';
-
-type PausePolicy = {
-  pauseOnEnter: boolean;
-  pauseOnSuccess: boolean;
-  pauseOnError: boolean;
-  requireManualApproval: boolean;
-  notifyOnPause: boolean;
+type TransitionEditorValue = {
+  successTarget: string;
+  errorTarget: string;
+  pausedTarget: string;
 };
 
 type BuilderStep = {
-  id: BuilderStepId;
+  id: string;
   name: string;
+  stepType: string;
   automationMode: AutomationMode;
-  pause: PausePolicy;
-  enabled: boolean;
-  execution: {
-    changesetApply: boolean;
-    compileChecks: boolean;
-    cargoCheck: boolean;
-    npmBuild: boolean;
-    sapActivation: boolean;
-    retryOnApplyError: boolean;
-    retryOnValidationError: boolean;
-    maxConsecutiveApplyFailures: number;
-  };
+  includeRepoContext: boolean;
+  includeChangesetSchema: boolean;
+  pauseOnEnter: boolean;
+  requireManualApproval: boolean;
+  autoAdvanceOnSuccess: boolean;
+  compileCommands: string;
+  maxConsecutiveApplyFailures: number;
+  transitions: TransitionEditorValue;
 };
 
-type PromptFragmentKey =
-  | 'user_input'
-  | 'repo_context'
-  | 'changeset_schema'
-  | 'apply_error'
-  | 'compile_error';
+type BuilderMode = 'builder' | 'json';
+type ShellView = 'builder' | 'monitor';
+type MonitorView = 'workflow_list' | 'workflow_detail';
+type OperatorMode = 'auto' | 'manual';
 
-type PromptFragmentState = Record<PromptFragmentKey, boolean>;
-type PromptFragmentTextState = Record<PromptFragmentKey, string>;
+type EventTone = { color: string; label: string };
 
-function composeInferencePrompt(enabled: PromptFragmentState, values: PromptFragmentTextState) {
-  const ordered: Array<[PromptFragmentKey, string]> = [
-    ['repo_context', 'REPO CONTEXT'],
-    ['changeset_schema', 'CHANGESET SCHEMA'],
-    ['apply_error', 'APPLY ERROR'],
-    ['compile_error', 'COMPILE ERROR'],
-    ['user_input', 'USER INPUT']
-  ];
+type InferenceConnectionStatus = { color: string; label: string };
 
-  return ordered
-    .filter(([key]) => enabled[key] && values[key].trim())
-    .map(([key, label]) => `### ${label}\n${values[key].trim()}`)
-    .join('\n\n');
+
+type LiveCapabilityTrail = {
+  key: string;
+  capabilityId: string;
+  name: string;
+  statusColor: string;
+  statusLabel: string;
+  message: string;
+  startedAtText: string;
+  durationText: string;
+  durationMs: number | null;
+  latestCreatedAt: string;
+  isActive: boolean;
+  isNew: boolean;
+  eventCount: number;
+};
+
+type LiveStageTrail = {
+  key: string;
+  stepId: string;
+  label: string;
+  stageExecutionId: string;
+  latestCreatedAt: string;
+  durationMs: number | null;
+  isActive: boolean;
+  isCurrent: boolean;
+  capabilities: LiveCapabilityTrail[];
+};
+
+type LiveExecutionChainState = {
+  loading: boolean;
+  error: string | null;
+  chain: StageExecutionChain | null;
+};
+
+function collectLoadedFilePaths(parentPath: string, childrenByParent: Record<string, RepoTreeEntry[]>): string[] {
+  const children = childrenByParent[parentPath] ?? [];
+  const out: string[] = [];
+  for (const child of children) {
+    if (child.kind === 'file') {
+      out.push(child.path);
+    } else {
+      out.push(...collectLoadedFilePaths(child.path, childrenByParent));
+    }
+  }
+  return out;
+}
+
+function getLiveExecutionDefaultExpanded(trail: LiveStageTrail): boolean {
+  return trail.isActive || trail.isCurrent;
 }
 
 const DEFAULT_STEPS: BuilderStep[] = [
   {
     id: 'design',
     name: 'Design',
+    stepType: 'design',
     automationMode: 'manual',
-    enabled: true,
-    pause: {
-      pauseOnEnter: false,
-      pauseOnSuccess: true,
-      pauseOnError: true,
-      requireManualApproval: false,
-      notifyOnPause: true
-    },
-    execution: {
-      changesetApply: false,
-      compileChecks: false,
-      cargoCheck: false,
-      npmBuild: false,
-      sapActivation: false,
-      retryOnApplyError: false,
-      retryOnValidationError: false,
-      maxConsecutiveApplyFailures: 5
+    includeRepoContext: true,
+    includeChangesetSchema: false,
+    pauseOnEnter: false,
+    requireManualApproval: false,
+    autoAdvanceOnSuccess: false,
+    compileCommands: '',
+    maxConsecutiveApplyFailures: 1,
+    transitions: {
+      successTarget: 'code',
+      errorTarget: 'design',
+      pausedTarget: 'design'
     }
   },
   {
     id: 'code',
     name: 'Code',
+    stepType: 'code',
     automationMode: 'automatic',
-    enabled: true,
-    pause: {
-      pauseOnEnter: false,
-      pauseOnSuccess: false,
-      pauseOnError: true,
-      requireManualApproval: false,
-      notifyOnPause: true
-    },
-    execution: {
-      changesetApply: true,
-      compileChecks: true,
-      cargoCheck: true,
-      npmBuild: false,
-      sapActivation: false,
-      retryOnApplyError: true,
-      retryOnValidationError: true,
-      maxConsecutiveApplyFailures: 5
-    }
-  },
-  {
-    id: 'test',
-    name: 'Test',
-    automationMode: 'manual',
-    enabled: true,
-    pause: {
-      pauseOnEnter: true,
-      pauseOnSuccess: false,
-      pauseOnError: true,
-      requireManualApproval: false,
-      notifyOnPause: true
-    },
-    execution: {
-      changesetApply: false,
-      compileChecks: false,
-      cargoCheck: false,
-      npmBuild: false,
-      sapActivation: false,
-      retryOnApplyError: false,
-      retryOnValidationError: false,
-      maxConsecutiveApplyFailures: 5
+    includeRepoContext: true,
+    includeChangesetSchema: true,
+    pauseOnEnter: false,
+    requireManualApproval: false,
+    autoAdvanceOnSuccess: true,
+    compileCommands: 'cargo check',
+    maxConsecutiveApplyFailures: 3,
+    transitions: {
+      successTarget: 'review',
+      errorTarget: 'code',
+      pausedTarget: 'code'
     }
   },
   {
     id: 'review',
     name: 'Review',
+    stepType: 'review',
     automationMode: 'manual',
-    enabled: true,
-    pause: {
-      pauseOnEnter: true,
-      pauseOnSuccess: true,
-      pauseOnError: true,
-      requireManualApproval: true,
-      notifyOnPause: true
-    },
-    execution: {
-      changesetApply: false,
-      compileChecks: false,
-      cargoCheck: false,
-      npmBuild: false,
-      sapActivation: false,
-      retryOnApplyError: false,
-      retryOnValidationError: false,
-      maxConsecutiveApplyFailures: 5
+    includeRepoContext: false,
+    includeChangesetSchema: false,
+    pauseOnEnter: false,
+    requireManualApproval: true,
+    autoAdvanceOnSuccess: false,
+    compileCommands: '',
+    maxConsecutiveApplyFailures: 1,
+    transitions: {
+      successTarget: '',
+      errorTarget: 'design',
+      pausedTarget: 'review'
     }
   }
 ];
 
-function toTemplateDefinition(
-  steps: BuilderStep[],
-  inferenceProvider: InferenceProvider,
-  inferenceModel: string,
-  browserTargetUrl: string,
-  browserCdpUrl: string
-): WorkflowTemplateDefinition {
-  const enabledSteps = steps.filter((step) => step.enabled);
+function buildTransitions(step: BuilderStep): WorkflowTransition[] {
+  const transitions: WorkflowTransition[] = [];
+  if (step.transitions.successTarget) transitions.push({ when: { type: 'success' }, target_step_id: step.transitions.successTarget });
+  if (step.transitions.errorTarget) transitions.push({ when: { type: 'error' }, target_step_id: step.transitions.errorTarget });
+  if (step.transitions.pausedTarget) transitions.push({ when: { type: 'paused' }, target_step_id: step.transitions.pausedTarget });
+  return transitions;
+}
+
+function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
+  const compileCommands = step.compileCommands
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const executionLogic = step.id === 'code'
+    ? { kind: 'code_stage_policy', max_consecutive_apply_failures: step.maxConsecutiveApplyFailures }
+    : step.id === 'review'
+      ? { kind: 'review_stage_policy', require_manual_approval: step.requireManualApproval }
+      : { kind: 'design_stage_policy' };
+
+  const executionPlan = [
+    {
+      kind: 'capability' as const,
+      key: 'inference',
+      enabled: true,
+      config: {
+        mode: 'send_prompt',
+        allowed_invocations: step.id === 'design'
+          ? ['context_export']
+          : step.id === 'code'
+            ? ['context_export', 'changeset_schema', 'apply_changeset', 'compile_commands']
+            : []
+      },
+      input_mapping: {},
+      output_mapping: {},
+      run_after: [],
+      condition: null
+    }
+  ];
+
   return {
-    version: 1,
-    globals: {
-      inference: {
-        enabled: true,
-        transport: inferenceProvider,
-        model: inferenceModel,
-        browser: {
-          target_url: browserTargetUrl,
-          cdp_url: browserCdpUrl
-        }
-      },
-      prompt_fragments: {
-        context_export: {
-          enabled: true
-        },
-        inject_user_context: {
-          enabled: true
-        },
-        inject_changeset_schema: {
-          enabled: true
-        }
-      },
-      capabilities: [
-        {
-          capability: 'model_inference',
-          enabled: true,
-          config: {
-            transport: inferenceProvider,
-            model: inferenceModel,
-            browser: {
-              target_url: browserTargetUrl,
-              cdp_url: browserCdpUrl
-            }
-          },
-          input_mapping: {},
-          output_mapping: {}
-        },
-        {
-          capability: 'context_export',
-          enabled: true,
-          config: {},
-          input_mapping: {},
-          output_mapping: {}
-        },
-        {
-          capability: 'changeset_apply',
-          enabled: true,
-          config: {},
-          input_mapping: {},
-          output_mapping: {}
-        }
-      ]
+    id: step.id,
+    name: step.name,
+    step_type: step.stepType,
+    automation_mode: step.automationMode,
+    execution: {
+      changeset_apply: step.id === 'code' ? { enabled: true } : {},
+      compile_checks: step.id === 'code' ? { commands: compileCommands } : {}
     },
-
-    steps: enabledSteps.map((step, index) => {
-      const next = enabledSteps[index + 1];
-      const commands: string[] = [];
-      if (step.execution.cargoCheck) commands.push('cargo check');
-      if (step.execution.npmBuild) commands.push('npm run build');
-      if (step.execution.sapActivation) commands.push('sap_adt_activation');
-
-      const transitions: WorkflowStepDefinition['transitions'] = [];
-      if (next) {
-        transitions.push({ when: { type: 'success' }, target_step_id: next.id });
+    prompt: {
+      include_repo_context: step.includeRepoContext,
+      include_changeset_schema: step.includeChangesetSchema,
+      include_user_context: true
+    },
+    config: {
+      pause_policy: {
+        pause_on_enter: step.pauseOnEnter
       }
-      if (step.pause.pauseOnError) {
-        transitions.push({ when: { type: 'error' }, target_step_id: step.id });
-      }
-
-      return {
-        id: step.id,
-        name: step.name,
-        step_type: step.id,
-        automation_mode: step.automationMode,
-        execution: {
-          changeset_apply: {
-            enabled: step.id === 'code' && step.execution.changesetApply,
-            mode: step.id === 'code' && step.execution.changesetApply ? step.automationMode : 'manual',
-            retry_on_apply_error: step.id === 'code' && step.execution.changesetApply && step.automationMode === 'automatic',
-            retry_on_validation_error: step.id === 'code' && step.execution.changesetApply && step.automationMode === 'automatic',
-            max_consecutive_apply_failures: step.execution.maxConsecutiveApplyFailures
-          },
-          compile_checks: {
-            enabled: step.id === 'code' && step.execution.compileChecks,
-            commands
-          }
-        },
-        prompt: {
-          include_repo_context: step.id === 'design' || step.id === 'code',
-          include_changeset_schema: step.id === 'code',
-          include_user_context: false
-        },
+    },
+    capabilities: [
+      {
+        capability: 'inference',
+        enabled: true,
         config: {
-          pause_policy: {
-            pause_on_enter: step.pause.pauseOnEnter,
-            pause_on_success: step.pause.pauseOnSuccess,
-            pause_on_error: step.pause.pauseOnError,
-            require_manual_approval: step.pause.requireManualApproval,
-            notify_on_pause: step.pause.notifyOnPause
-          }
+          allowed_invocations: step.id === 'design'
+            ? ['context_export']
+            : step.id === 'code'
+              ? ['context_export', 'changeset_schema', 'apply_changeset', 'compile_commands']
+              : []
         },
-        capabilities: [
-          {
-            capability: 'context_export',
-            enabled: step.id === 'design' || step.id === 'code',
-            config: {
-              mode: 'artifact',
-              attach_to_inference: true
-            },
-            input_mapping: {},
-            output_mapping: {}
-          },
-          {
-            capability: 'model_inference',
-            enabled: step.id === 'design' || step.id === 'code' || step.id === 'review',
-            config: {
-              mode: 'send_prompt'
-            },
-            input_mapping: {},
-            output_mapping: {}
-          },
-          {
-            capability: 'changeset_apply',
-            enabled: step.id === 'code' && step.execution.changesetApply,
-            config: {
-              mode: step.automationMode
-            },
-            input_mapping: {},
-            output_mapping: {}
-          },
-          {
-            capability: 'compile_checks',
-            enabled: step.id === 'code' && step.execution.compileChecks,
-            config: {
-              commands
-            },
-            input_mapping: {},
-            output_mapping: {}
-          }
-        ],
-        execution_logic: step.id === 'code'
-          ? {
-              kind: 'code_stage_policy',
-              retry_on_apply_error: step.execution.retryOnApplyError,
-              retry_on_validation_error: step.execution.retryOnValidationError,
-              max_consecutive_apply_failures: step.execution.maxConsecutiveApplyFailures
-            }
-          : step.id === 'review'
-            ? {
-                kind: 'review_stage_policy',
-                require_manual_approval: step.pause.requireManualApproval
-              }
-            : null,
-        execution_plan: [
-          {
-            kind: 'capability',
-            key: 'context_export',
-            enabled: step.id === 'design' || step.id === 'code',
-            config: {
-              mode: 'artifact',
-              attach_to_inference: true
-            },
-            input_mapping: {},
-            output_mapping: {},
-            run_after: [],
-            condition: null
-          },
-          {
-            kind: 'capability',
-            key: 'model_inference',
-            enabled: step.id === 'design' || step.id === 'code' || step.id === 'review',
-            config: {
-              mode: 'send_prompt'
-            },
-            input_mapping: {},
-            output_mapping: {},
-            run_after: step.id === 'design' || step.id === 'code' ? ['context_export'] : [],
-            condition: null
-          },
-          {
-            kind: 'capability',
-            key: 'changeset_apply',
-            enabled: step.id === 'code' && step.execution.changesetApply,
-            config: {
-              mode: step.automationMode
-            },
-            input_mapping: {},
-            output_mapping: {},
-            run_after: ['model_inference'],
-            condition: null
-          },
-          {
-            kind: 'capability',
-            key: 'compile_checks',
-            enabled: step.id === 'code' && step.execution.compileChecks,
-            config: {
-              commands
-            },
-            input_mapping: {},
-            output_mapping: {},
-            run_after: ['changeset_apply'],
-            condition: null
-          },
-          {
-            kind: 'stage_logic',
-            key: 'stage_policy',
-            enabled: true,
-            config: step.id === 'code'
-              ? {
-                  kind: 'code_stage_policy',
-                  retry_on_apply_error: step.execution.retryOnApplyError,
-                  retry_on_validation_error: step.execution.retryOnValidationError,
-                  max_consecutive_apply_failures: step.execution.maxConsecutiveApplyFailures
-                }
-              : step.id === 'review'
-                ? {
-                    kind: 'review_stage_policy',
-                    require_manual_approval: step.pause.requireManualApproval
-                  }
-                : {
-                    kind: 'default_stage_policy'
-                  },
-            input_mapping: {},
-            output_mapping: {},
-            run_after: step.id === 'code'
-              ? ['compile_checks']
-              : step.id === 'design' || step.id === 'review'
-                ? ['model_inference']
-                : [],
-            condition: null
-          }
-        ],
-        transitions
-      };
-    })
+        input_mapping: {},
+        output_mapping: {}
+      }
+    ],
+    execution_logic: executionLogic,
+    execution_plan: executionPlan,
+    advancement: {
+      mode: step.automationMode,
+      auto_run_on_enter: step.automationMode === 'automatic',
+      auto_advance_on_success: step.autoAdvanceOnSuccess,
+      auto_advance_on_error: false,
+      auto_advance_on_paused: false
+    },
+    transitions: buildTransitions(step)
   };
 }
 
+function buildTemplateDefinition(steps: BuilderStep[]): WorkflowTemplateDefinition {
+  return {
+    version: 1,
+    globals: { inference: {}, prompt_fragments: {}, capabilities: [] },
+    steps: steps.map(buildStepDefinition)
+  };
+}
+
+function formatTimestamp(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function statusColor(status: WorkflowRunStatus) {
+  switch (status) {
+    case 'success': return 'green';
+    case 'error': return 'red';
+    case 'running': return 'blue';
+    case 'queued': return 'yellow';
+    case 'waiting': return 'grape';
+    case 'paused': return 'orange';
+    case 'cancelled': return 'gray';
+    default: return 'dark';
+  }
+}
+
+const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
+  inferenceConnectionStatus: InferenceConnectionStatus;
+  inferenceReady: boolean;
+  inferenceSummaryText: string;
+  inferenceTransport: InferenceTransport;
+  inferenceModel: string;
+  browserTargetUrl: string;
+  browserCdpUrl: string;
+  browserSessionId: string;
+  browserProbe: BrowserProbeResult | null;
+  inferenceBusy: boolean;
+  inferencePollBusy: boolean;
+  inferenceStatus: string | null;
+  inferenceConfigOpen: boolean;
+  onOpenConfig: () => void;
+  onCloseConfig: () => void;
+  onTransportChange: (value: InferenceTransport) => void;
+  onModelChange: (value: string) => void;
+  onBrowserTargetUrlChange: (value: string) => void;
+  onBrowserCdpUrlChange: (value: string) => void;
+  onSaveConfig: () => void;
+  onConnectBrowser: () => void;
+  onDisconnectBrowser: () => void;
+}) {
+  const {
+    inferenceConnectionStatus,
+    inferenceReady,
+    inferenceTransport,
+    inferenceModel,
+    browserTargetUrl,
+    browserCdpUrl,
+    browserSessionId,
+    browserProbe,
+    inferenceBusy,
+    inferencePollBusy,
+    inferenceStatus,
+    inferenceConfigOpen,
+    onOpenConfig,
+    onCloseConfig,
+    onTransportChange,
+    onModelChange,
+    onBrowserTargetUrlChange,
+    onBrowserCdpUrlChange,
+    onSaveConfig,
+    onConnectBrowser,
+    onDisconnectBrowser
+  } = props;
+
+  const showInlineConfig = !inferenceReady;
+
+  return (
+    <>
+      <Stack gap="md">
+        <Group justify="space-between" align="center" wrap="nowrap">
+          <Group gap="xs" wrap="nowrap">
+            <Text size="sm" fw={600}>Inference status</Text>
+            <Badge color={inferenceConnectionStatus.color} variant="light">
+              {inferenceConnectionStatus.label}
+            </Badge>
+          </Group>
+          {!showInlineConfig ? <Button size="xs" variant="subtle" onClick={onOpenConfig}>Connector</Button> : null}
+        </Group>
+
+        {showInlineConfig ? (
+          <Stack gap="md">
+            <SimpleGrid cols={{ base: 1, md: 2 }}>
+              <Select
+                label="Mode"
+                value={inferenceTransport}
+                onChange={(value) => onTransportChange((value as InferenceTransport) ?? 'api')}
+                data={[
+                  { value: 'api', label: 'API' },
+                  { value: 'browser', label: 'Browser' }
+                ]}
+                allowDeselect={false}
+              />
+              <TextInput
+                label="Model"
+                value={inferenceModel}
+                onChange={(e) => onModelChange(e.currentTarget.value)}
+                disabled={inferenceTransport !== 'api'}
+              />
+            </SimpleGrid>
+
+            {inferenceTransport === 'browser' ? (
+              <Stack gap="md">
+                <SimpleGrid cols={{ base: 1, md: 2 }}>
+                  <TextInput
+                    label="Browser URL"
+                    value={browserTargetUrl}
+                    onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
+                    placeholder="https://website.com/"
+                  />
+                  <TextInput
+                    label="CDP URL"
+                    value={browserCdpUrl}
+                    onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
+                    placeholder="http://127.0.0.1:9222"
+                  />
+                </SimpleGrid>
+                <TextInput label="Attached session" value={browserSessionId} readOnly />
+                <Group>
+                  <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
+                  <Button onClick={onConnectBrowser} loading={inferenceBusy}>Connect browser</Button>
+                  <Button variant="light" onClick={onDisconnectBrowser} loading={inferenceBusy} disabled={!browserSessionId.trim()}>Disconnect browser</Button>
+                </Group>
+                {browserProbe ? <JsonInput value={JSON.stringify(browserProbe, null, 2)} readOnly autosize minRows={8} /> : null}
+              </Stack>
+            ) : (
+              <Group>
+                <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
+              </Group>
+            )}
+
+            {inferencePollBusy && inferenceTransport === 'browser' && browserSessionId.trim() ? <Alert color="blue">Polling browser readiness…</Alert> : null}
+            {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
+          </Stack>
+        ) : null}
+      </Stack>
+
+      <Modal opened={inferenceConfigOpen} onClose={onCloseConfig} title="Inference connector" size="70%" centered>
+        <Stack gap="md">
+          <SimpleGrid cols={{ base: 1, md: 2 }}>
+            <Select
+              label="Mode"
+              value={inferenceTransport}
+              onChange={(value) => onTransportChange((value as InferenceTransport) ?? 'api')}
+              data={[
+                { value: 'api', label: 'API' },
+                { value: 'browser', label: 'Browser' }
+              ]}
+              allowDeselect={false}
+            />
+            <TextInput
+              label="Model"
+              value={inferenceModel}
+              onChange={(e) => onModelChange(e.currentTarget.value)}
+              disabled={inferenceTransport !== 'api'}
+            />
+          </SimpleGrid>
+
+          {inferenceTransport === 'browser' ? (
+            <Stack gap="md">
+              <SimpleGrid cols={{ base: 1, md: 2 }}>
+                <TextInput
+                  label="Browser URL"
+                  value={browserTargetUrl}
+                  onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
+                  placeholder="https://website.com/"
+                />
+                <TextInput
+                  label="CDP URL"
+                  value={browserCdpUrl}
+                  onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
+                  placeholder="http://127.0.0.1:9222"
+                />
+              </SimpleGrid>
+              <TextInput label="Attached session" value={browserSessionId} readOnly />
+              <Group>
+                <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
+                <Button onClick={onConnectBrowser} loading={inferenceBusy}>Connect browser</Button>
+                <Button variant="light" onClick={onDisconnectBrowser} loading={inferenceBusy} disabled={!browserSessionId.trim()}>Disconnect browser</Button>
+              </Group>
+              {browserProbe ? <JsonInput value={JSON.stringify(browserProbe, null, 2)} readOnly autosize minRows={8} /> : null}
+            </Stack>
+          ) : (
+            <Group>
+              <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
+            </Group>
+          )}
+
+          {inferencePollBusy && inferenceTransport === 'browser' && browserSessionId.trim() ? <Alert color="blue">Polling browser readiness…</Alert> : null}
+          {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
+        </Stack>
+      </Modal>
+    </>
+  );
+});
+
+const StageInputsPanel = memo(function StageInputsPanel(props: {
+  selectedWorkflowStep: WorkflowStepDefinition | null;
+  stageUserInput: string;
+  stageIncludeRepoContext: boolean;
+  stageIncludeChangesetSchema: boolean;
+  onStageUserInputChange: (value: string) => void;
+  onStageIncludeRepoContextChange: (checked: boolean) => void;
+  onStageIncludeChangesetSchemaChange: (checked: boolean) => void;
+  onOpenRepoConfig: () => void;
+  onOpenSchemaConfig: () => void;
+  onOpenApplyErrorConfig: () => void;
+  onOpenCompileErrorConfig: () => void;
+}) {
+  const {
+    selectedWorkflowStep,
+    stageUserInput,
+    stageIncludeRepoContext,
+    stageIncludeChangesetSchema,
+    onStageUserInputChange,
+    onStageIncludeRepoContextChange,
+    onStageIncludeChangesetSchemaChange,
+    onOpenRepoConfig,
+    onOpenSchemaConfig,
+    onOpenApplyErrorConfig,
+    onOpenCompileErrorConfig
+  } = props;
+
+  return (
+    <Stack>
+      <Title order={6}>Stage inputs</Title>
+      <Textarea label="User input" value={stageUserInput} onChange={(e) => onStageUserInputChange(e.currentTarget.value)} minRows={3} autosize />
+      <Group>
+        <Switch label="Include repo fragment" checked={stageIncludeRepoContext} onChange={(e) => onStageIncludeRepoContextChange(e.currentTarget.checked)} />
+        <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
+      </Group>
+      {selectedWorkflowStep?.id === 'code' ? (
+        <>
+          <Group>
+            <Switch label="Include changeset schema fragment" checked={stageIncludeChangesetSchema} onChange={(e) => onStageIncludeChangesetSchemaChange(e.currentTarget.checked)} />
+            <Button size="xs" variant="light" onClick={onOpenSchemaConfig}>Configure schema</Button>
+          </Group>
+          <Group>
+            <Switch label="Include apply error fragment" checked={false} onChange={() => {}} />
+            <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>Configure apply error</Button>
+          </Group>
+          <Group>
+            <Switch label="Include compile error fragment" checked={false} onChange={() => {}} />
+            <Button size="xs" variant="light" onClick={onOpenCompileErrorConfig}>Configure compile error</Button>
+          </Group>
+        </>
+      ) : null}
+    </Stack>
+  );
+});
+
+const StageStreamPanel = memo(function StageStreamPanel(props: {
+  renderStageStreamPanel: (emptyText: string) => JSX.Element;
+}) {
+  return (
+    <Box h="100%">
+      {props.renderStageStreamPanel('No stage stream yet.')}
+    </Box>
+  );
+});
+
 export function WorkflowShell() {
-  const [runs, setRuns] = useState<WorkflowRun[]>([]);
-  const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
-  const [events, setEvents] = useState<WorkflowEvent[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'home' | 'workflow'>('home');
+  const [view, setView] = useState<ShellView>('monitor');
+  const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
+  const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createMode, setCreateMode] = useState<'build' | 'copy' | 'save_template' | 'load'>('build');
+  const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
+  const [runs, setRuns] = useState<WorkflowRun[]>([]);
+  const [events, setEvents] = useState<WorkflowEvent[]>([]);
+  const [allWorkflowEvents, setAllWorkflowEvents] = useState<Record<string, WorkflowEvent[]>>({});
+  const [recentEventIds, setRecentEventIds] = useState<Set<string>>(new Set());
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+
   const [workflowName, setWorkflowName] = useState('Default workflow');
-  const [workflowDescription, setWorkflowDescription] = useState('Design, Code, Test, Review workflow');
+  const [workflowDescription, setWorkflowDescription] = useState('Design, code, and review workflow');
   const [runTitle, setRunTitle] = useState('New workflow run');
   const [repoRef, setRepoRef] = useState('');
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [builderSteps, setBuilderSteps] = useState<BuilderStep[]>(DEFAULT_STEPS);
-  const [builderRepoIsGit, setBuilderRepoIsGit] = useState(false);
+  const [jsonDraft, setJsonDraft] = useState('');
+  const [createRunAfterSave, setCreateRunAfterSave] = useState(true);
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
 
-  const [capabilityOpen, setCapabilityOpen] = useState(false);
-  const [activeCapability, setActiveCapability] = useState<CapabilityKey>('context_export');
+  const [operatorMode, setOperatorMode] = useState<OperatorMode>('auto');
+  const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  const [manualCapabilityStatus, setManualCapabilityStatus] = useState<string | null>(null);
+  const [manualCapabilityBusy, setManualCapabilityBusy] = useState(false);
+  const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
 
-  const [treeGitRef, setTreeGitRef] = useState('WORKTREE');
-  const [treeRootData, setTreeRootData] = useState<RepoTreeResponse | null>(null);
-  const [treeChildrenByParent, setTreeChildrenByParent] = useState<Record<string, RepoTreeEntry[]>>({});
-  const [loadedTreeDirs, setLoadedTreeDirs] = useState<Set<string>>(new Set());
-  const [loadingTreeDirs, setLoadingTreeDirs] = useState<Set<string>>(new Set());
-  const [treeBusy, setTreeBusy] = useState(false);
-  const [treeError, setTreeError] = useState<string | null>(null);
-  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [selectedDirPaths, setSelectedDirPaths] = useState<Set<string>>(new Set());
-
-  const [contextMode, setContextMode] = useState<'entire_repo' | 'tree_select'>('tree_select');
-  const [contextSavePath, setContextSavePath] = useState('/tmp/repo_context.txt');
-  const [skipBinary, setSkipBinary] = useState(true);
-  const [skipGitignore, setSkipGitignore] = useState(true);
-  const [includeStagedDiff, setIncludeStagedDiff] = useState(false);
-  const [includeUnstagedDiff, setIncludeUnstagedDiff] = useState(false);
-  const [contextStatus, setContextStatus] = useState<string | null>(null);
-  const [contextBusy, setContextBusy] = useState(false);
-
-  const [inferenceProvider, setInferenceProvider] = useState<InferenceProvider>('api');
-  const [inferenceModel, setInferenceModel] = useState('gpt-4.1');
-  const [browserTargetUrl, setBrowserTargetUrl] = useState('https://chatgpt.com/');
+  const [inferenceTransport, setInferenceTransport] = useState<InferenceTransport>('api');
+  const [inferenceModel, setInferenceModel] = useState('gpt-5');
+  const [browserTargetUrl, setBrowserTargetUrl] = useState('https://website.com/');
   const [browserCdpUrl, setBrowserCdpUrl] = useState('http://127.0.0.1:9222');
-  const [inferencePrompt, setInferencePrompt] = useState('');
+  const [browserSessionId, setBrowserSessionId] = useState('');
+  const [browserProbe, setBrowserProbe] = useState<BrowserProbeResult | null>(null);
   const [inferenceBusy, setInferenceBusy] = useState(false);
   const [inferenceStatus, setInferenceStatus] = useState<string | null>(null);
-  const [inferenceResponse, setInferenceResponse] = useState('');
-  const [browserProbe, setBrowserProbe] = useState<Record<string, unknown> | null>(null);
-  const [responseViewerOpen, setResponseViewerOpen] = useState(false);
-  const [previewViewerMode, setPreviewViewerMode] = useState<'response' | 'prompt'>('response');
+  const [inferencePollBusy, setInferencePollBusy] = useState(false);
+  const [inferenceConnected, setInferenceConnected] = useState(false);
+
+  const [stageUserInput, setStageUserInput] = useState('');
+  const [stageIncludeRepoContext, setStageIncludeRepoContext] = useState(false);
+  const [stageRepoContextGitRef, setStageRepoContextGitRef] = useState('WORKTREE');
+  const [stageRepoContextIncludeFilesText, setStageRepoContextIncludeFilesText] = useState('');
+  const [stageRepoContextExcludeRegexText, setStageRepoContextExcludeRegexText] = useState('');
+  const [stageRepoContextSavePath, setStageRepoContextSavePath] = useState('/tmp/repo_context.txt');
+  const [stageRepoContextSkipBinary, setStageRepoContextSkipBinary] = useState(true);
+  const [stageRepoContextSkipGitignore, setStageRepoContextSkipGitignore] = useState(true);
+  const [stageRepoContextIncludeStagedDiff, setStageRepoContextIncludeStagedDiff] = useState(false);
+  const [stageRepoContextIncludeUnstagedDiff, setStageRepoContextIncludeUnstagedDiff] = useState(false);
+  const [stageIncludeChangesetSchema, setStageIncludeChangesetSchema] = useState(true);
+  const [stageChangesetSchemaText, setStageChangesetSchemaText] = useState('Use ChangeSet JSON version 1. Return only the JSON payload.');
+  const [stageApplyError, setStageApplyError] = useState('');
+  const [stageCompileError, setStageCompileError] = useState('');
+  const [stageReviewNotes, setStageReviewNotes] = useState('');
+  const [stageApproved, setStageApproved] = useState(false);
+  const [stageRejected, setStageRejected] = useState(false);
+
+  const [repoContextConfigOpen, setRepoContextConfigOpen] = useState(false);
+  const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
-  const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
-  const [stepFragmentEnabled, setStepFragmentEnabled] = useState<PromptFragmentState>({
-    user_input: true,
-    repo_context: false,
-    changeset_schema: false,
-    apply_error: false,
-    compile_error: false
-  });
-  const [stepFragmentValues, setStepFragmentValues] = useState<PromptFragmentTextState>({
-    user_input: '',
-    repo_context: '',
-    changeset_schema: '',
-    apply_error: '',
-    compile_error: ''
-  });
-  const [expandedEventIds, setExpandedEventIds] = useState<Set<string>>(new Set());
-  const [expandedStageHistoryIds, setExpandedStageHistoryIds] = useState<Set<string>>(new Set());
+  const [responseViewerOpen, setResponseViewerOpen] = useState(false);
+  const [runContextOpen, setRunContextOpen] = useState(false);
+  const [inferenceConfigOpen, setInferenceConfigOpen] = useState(false);
+  const [previewViewerMode, setPreviewViewerMode] = useState<'prompt' | 'response' | 'stream'>('stream');
+
+  const [treeRootData, setTreeRootData] = useState<RepoTreeResponse | null>(null);
+  const [treeChildrenByParent, setTreeChildrenByParent] = useState<Record<string, RepoTreeEntry[]>>({});
+  const [loadingTreeDirs, setLoadingTreeDirs] = useState<Set<string>>(new Set());
+  const [treeBusy, setTreeBusy] = useState(false);
+  const [treeError, setTreeError] = useState<string | null>(null);
+  const [selectedRepoPaths, setSelectedRepoPaths] = useState<string[]>([]);
+  const [selectedRepoDirs, setSelectedRepoDirs] = useState<Set<string>>(new Set());
+
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(new Set());
   const [collapsedStageIds, setCollapsedStageIds] = useState<Set<string>>(new Set());
+  const [manuallyExpandedLiveExecutionIds, setManuallyExpandedLiveExecutionIds] = useState<Set<string>>(new Set());
+  const [manuallyCollapsedLiveExecutionIds, setManuallyCollapsedLiveExecutionIds] = useState<Set<string>>(new Set());
+  const [expandedLiveEventIds, setExpandedLiveEventIds] = useState<Set<string>>(new Set());
+  const [liveExecutionChains, setLiveExecutionChains] = useState<Record<string, LiveExecutionChainState>>({});
+  const [liveExecutionTrails, setLiveExecutionTrails] = useState<LiveStageTrail[]>([]);
+  const [stickyCompletedLiveExecutionId, setStickyCompletedLiveExecutionId] = useState<string | null>(null);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
-  const inferenceConnectionStatus = useMemo(() => {
-    if (browserProbe?.ready) {
-      return { color: 'green', label: 'URL ATTACHED' };
-    }
-    if (browserProbe?.session_id) {
-      return { color: 'yellow', label: 'BRIDGE ATTACHED' };
-    }
-    return { color: 'red', label: 'NO BRIDGE ATTACHED' };
-  }, [browserProbe]);
-  const selectedTemplate = useMemo(() => templates.find((template) => template.id === selectedRun?.template_id) ?? null, [templates, selectedRun?.template_id]);
+  const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
+  const selectedWorkflowStep = selectedRunTemplate?.definition.steps.find((step) => step.id === (selectedStepId ?? selectedRun?.current_step_id ?? '')) ?? null;
+  const selectedStageState = useMemo(() => {
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const stageState = (workflowEngine?.stage_state ?? {}) as Record<string, unknown>;
+    const stepId = selectedStepId ?? selectedRun?.current_step_id ?? '';
+    return (stageState[stepId] ?? null) as Record<string, unknown> | null;
+  }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId]);
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
-  const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
-  const currentStepDefinition = useMemo(
-    () => selectedTemplate?.definition.steps.find((step) => step.id === selectedRun?.current_step_id) ?? null,
-    [selectedTemplate, selectedRun?.current_step_id]
-  );
-  const isDesignStep = currentStepDefinition?.step_type === 'design';
-  const isCodeStep = currentStepDefinition?.step_type === 'code';
-  const composedInferencePrompt = useMemo(
-    () => composeInferencePrompt(stepFragmentEnabled, stepFragmentValues),
-    [stepFragmentEnabled, stepFragmentValues]
-  );
+  const selectedRepoPathSet = useMemo(() => new Set(selectedRepoPaths), [selectedRepoPaths]);
+  const definition = useMemo(() => buildTemplateDefinition(builderSteps), [builderSteps]);
 
-  function isStageWrapperEvent(event: WorkflowEvent): boolean {
-    return event.kind === 'stage_executed' || event.kind === 'run_action_completed';
-  }
-
-  const eventsByStage = useMemo(() => {
-    const order = selectedTemplate?.definition.steps.map((step) => step.id) ?? [];
-    const grouped = new Map<string, WorkflowEvent[]>();
-
-    for (const event of events) {
-      const key = event.step_id ?? '__ungrouped__';
-      const bucket = grouped.get(key);
-      if (bucket) bucket.push(event);
-      else grouped.set(key, [event]);
+  const inferenceConnectionStatus = useMemo<InferenceConnectionStatus>(() => {
+    if (inferenceTransport === 'api') {
+      return {
+        color: inferenceConnected ? 'blue' : 'gray',
+        label: inferenceConnected ? 'API CONNECTED' : 'API DISCONNECTED'
+      };
     }
 
-    const orderedKeys = [
-      ...order.filter((stepId) => grouped.has(stepId)),
-      ...Array.from(grouped.keys()).filter((key) => key !== '__ungrouped__' && !order.includes(key)),
-      ...(grouped.has('__ungrouped__') ? ['__ungrouped__'] : [])
-    ];
+    if (browserProbe?.ready) {
+      return { color: 'green', label: 'URL CONNECTED' };
+    }
 
-    const stageGroups = orderedKeys.flatMap((stepId) => {
-      const ascending = (grouped.get(stepId) ?? []).slice().sort((a, b) => {
-        return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    if (browserSessionId.trim()) {
+      return { color: 'yellow', label: 'BRIDGE CONNECTED' };
+    }
+
+    return { color: 'red', label: 'BRIDGE DISCONNECTED' };
+  }, [
+    browserProbe?.ready,
+    browserSessionId,
+    inferenceConnected,
+    inferenceTransport
+  ]);
+
+  const inferenceRequiresConnection = selectedWorkflowStep?.id === 'design' || selectedWorkflowStep?.id === 'code';
+  const inferenceReady = !inferenceRequiresConnection ? true : inferenceConnected && (inferenceTransport === 'api' || Boolean(browserProbe?.ready));
+  const showStageStream = !inferenceRequiresConnection || inferenceReady;
+
+  const shouldPollBrowserInference = inferenceRequiresConnection && Boolean(selectedRun) && (inferenceTransport === 'api' || Boolean(browserSessionId.trim()));
+
+  const inferenceSummaryText = inferenceConnectionStatus.label;
+
+  useEffect(() => {
+    setJsonDraft(JSON.stringify(definition, null, 2));
+  }, [definition]);
+
+  useEffect(() => {
+    void refreshRunsAndTemplates();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setEvents([]);
+      setLiveExecutionTrails([]);
+      return;
+    }
+    void refreshRunDetails(selectedRunId);
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+
+    const source = openEventStream(selectedRunId);
+    source.addEventListener('workflow_event', (event) => {
+      const incoming = JSON.parse((event as MessageEvent<string>).data) as WorkflowEvent;
+      setRecentEventIds((prev) => {
+        const next = new Set(prev);
+        next.add(incoming.id);
+        return next;
       });
-
-      if (stepId === '__ungrouped__') {
-        const visibleEvents = ascending.filter((event) => !isStageWrapperEvent(event));
-        const stageEvents = visibleEvents.slice().sort((a, b) => {
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      window.setTimeout(() => {
+        setRecentEventIds((prev) => {
+          const next = new Set(prev);
+          next.delete(incoming.id);
+          return next;
         });
-        const latest = stageEvents[0] ?? null;
-        return stageEvents.length === 0
-          ? []
-          : [{
-              stepId,
-              baseStepId: stepId,
-              attempt: 1,
-              label: 'Workflow events',
-              isCurrent: false,
-              events: stageEvents,
-              latest
-            }];
-      }
-
-      const attempts: WorkflowEvent[][] = [];
-      let currentAttempt: WorkflowEvent[] = [];
-
-      for (const event of ascending) {
-        currentAttempt.push(event);
-        if (event.kind === 'stage_executed') {
-          attempts.push(currentAttempt);
-          currentAttempt = [];
-        }
-      }
-
-      const trailingVisibleEvents = currentAttempt.filter((event) => !isStageWrapperEvent(event));
-      if (trailingVisibleEvents.length > 0) {
-        attempts.push(currentAttempt);
-      }
-
-      const stepDef = selectedTemplate?.definition.steps.find((step) => step.id === stepId) ?? null;
-      const latestAttemptIndex = attempts.length - 1;
-
-      return attempts.flatMap((attemptEvents, index) => {
-        const visibleEvents = attemptEvents.filter((event) => !isStageWrapperEvent(event));
-        if (visibleEvents.length === 0) {
-          return [];
-        }
-
-        const stageEvents = visibleEvents.slice().sort((a, b) => {
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-        });
-        const latest = stageEvents[0] ?? null;
-        const attempt = index + 1;
-        return [{
-          stepId: `${stepId}#${attempt}`,
-          baseStepId: stepId,
-          attempt,
-          label: `${stepDef?.name ?? stepId} · Run ${attempt}`,
-          isCurrent: selectedRun?.current_step_id === stepId && index === latestAttemptIndex,
-          events: stageEvents,
-          latest
-        }];
+      }, 3500);
+      setEvents((prev) => {
+        if (prev.some((item) => item.id === incoming.id)) return prev;
+        return [...prev, incoming].sort((a, b) => a.created_at.localeCompare(b.created_at));
       });
     });
+    source.addEventListener('monitor_snapshot', (event) => {
+      const summary = JSON.parse((event as MessageEvent<string>).data) as EventChainSummaryResponse;
+      setLiveExecutionTrails(mapLiveExecutionTrails(summary));
+    });
 
-    return stageGroups.reverse();
-  }, [events, selectedTemplate, selectedRun?.current_step_id]);
+    return () => {
+      source.close();
+    };
+  }, [selectedRunId]);
 
-  const currentStageGroup = useMemo(
-    () => eventsByStage.find((stageGroup) => stageGroup.isCurrent) ?? null,
-    [eventsByStage]
-  );
+  useEffect(() => {
+    setSelectedStepId(selectedRun?.current_step_id ?? null);
+    setManualCapabilityStatus(null);
+    setManualCapabilityResponse('');
+  }, [selectedRun?.id, selectedRun?.current_step_id]);
 
-  function toggleEventExpanded(eventId: string) {
-    setExpandedEventIds((prev) => {
+  useEffect(() => {
+    const modelInference = (selectedRun?.context as Record<string, unknown> | undefined)?.model_inference as Record<string, unknown> | undefined;
+    if (!modelInference) {
+      setInferenceTransport('api');
+      setInferenceModel('gpt-5');
+      setBrowserSessionId('');
+      setBrowserProbe(null);
+      return;
+    }
+
+    setInferenceTransport((modelInference.transport as InferenceTransport) ?? 'api');
+    setInferenceModel(typeof modelInference.model === 'string' && modelInference.model.trim() ? modelInference.model : 'gpt-5');
+
+    const browser = (modelInference.browser ?? {}) as Record<string, unknown>;
+    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
+    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : 'http://127.0.0.1:9222');
+    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
+  }, [selectedRun?.id]);
+
+  useEffect(() => {
+    const step = selectedWorkflowStep;
+    if (!step) return;
+
+    const promptFragments = (selectedStageState?.prompt_fragments ?? {}) as Record<string, unknown>;
+    const promptFragmentEnabled = (selectedStageState?.prompt_fragment_enabled ?? {}) as Record<string, unknown>;
+    const repoContext = (selectedStageState?.repo_context ?? {}) as Record<string, unknown>;
+    const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
+
+    setStageUserInput(typeof promptFragments.user_input === 'string' ? promptFragments.user_input : '');
+    setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
+    setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
+    setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
+    setStageApproved(Boolean(review.approved));
+    setStageRejected(Boolean(review.rejected));
+    setStageIncludeRepoContext(
+      typeof promptFragmentEnabled.repo_context === 'boolean'
+        ? promptFragmentEnabled.repo_context
+        : Boolean(step.prompt?.include_repo_context)
+    );
+    setStageIncludeChangesetSchema(
+      typeof promptFragmentEnabled.changeset_schema === 'boolean'
+        ? promptFragmentEnabled.changeset_schema
+        : (step.prompt?.include_changeset_schema ?? step.id === 'code')
+    );
+    setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
+    setStageRepoContextIncludeFilesText(
+      Array.isArray(repoContext.include_files)
+        ? repoContext.include_files.filter((value): value is string => typeof value === 'string').join('\n')
+        : ''
+    );
+    setStageRepoContextExcludeRegexText(
+      Array.isArray(repoContext.exclude_regex)
+        ? repoContext.exclude_regex.filter((value): value is string => typeof value === 'string').join('\n')
+        : ''
+    );
+    setStageRepoContextSavePath(
+      typeof repoContext.save_path === 'string' && repoContext.save_path.trim()
+        ? repoContext.save_path
+        : '/tmp/repo_context.txt'
+    );
+    setStageRepoContextSkipBinary(typeof repoContext.skip_binary === 'boolean' ? repoContext.skip_binary : true);
+    setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
+    setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
+    setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
+  }, [selectedWorkflowStep?.id, selectedStageState]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    const active = selectedRun?.status === 'queued' || selectedRun?.status === 'running';
+    if (!active) return;
+    const timer = window.setInterval(() => {
+      void getRun(selectedRunId).then((run) => {
+        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+      });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedRunId, selectedRun?.status]);
+
+  useEffect(() => {
+    if (!repoContextConfigOpen || !selectedRun) return;
+    if (treeRootData) return;
+    void loadTreeDir(selectedRun, '', true);
+  }, [repoContextConfigOpen, selectedRun?.id, stageRepoContextGitRef, stageRepoContextSkipBinary, stageRepoContextSkipGitignore]);
+
+  useEffect(() => {
+    const next = selectedRepoPaths.join('\n');
+    if (next !== stageRepoContextIncludeFilesText) {
+      setStageRepoContextIncludeFilesText(next);
+    }
+  }, [selectedRepoPaths]);
+
+  useEffect(() => {
+    if (!shouldPollBrowserInference || !selectedRun) return;
+
+    let cancelled = false;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        setInferencePollBusy(true);
+        const json = await invokeModelInference(selectedRun.id, {
+          step_id: selectedStepId ?? selectedRun.current_step_id,
+          action: 'get_connection_status',
+          payload: {}
+        });
+        if (cancelled) return;
+
+        const nextConnected = Boolean(json.connected);
+        const nextSessionId = typeof json.session_id === 'string' ? json.session_id : '';
+        const nextProbe = (json.probe ?? null) as BrowserProbeResult | null;
+
+        setInferenceConnected((prev) => (prev === nextConnected ? prev : nextConnected));
+
+        if (json.transport === 'browser') {
+          setBrowserSessionId((prev) => (prev === nextSessionId ? prev : nextSessionId));
+          setBrowserProbe((prev) => {
+            const prevJson = prev ? JSON.stringify(prev) : '';
+            const nextJson = nextProbe ? JSON.stringify(nextProbe) : '';
+            return prevJson === nextJson ? prev : nextProbe;
+          });
+          if (!nextConnected) {
+            setInferenceStatus('Browser session lost. Reconnect required.');
+          }
+        } else {
+          setBrowserProbe(null);
+          if (!nextConnected) {
+            setInferenceStatus('Inference connection unavailable.');
+          }
+        }
+      } catch {
+        if (cancelled) return;
+        setInferenceConnected(false);
+        setBrowserSessionId('');
+        setBrowserProbe(null);
+        setInferenceStatus('Inference connection unavailable.');
+      } finally {
+        if (!cancelled) {
+          setInferencePollBusy(false);
+        }
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [shouldPollBrowserInference, selectedRun?.id, selectedRun?.current_step_id, selectedStepId, browserSessionId, inferenceTransport]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshAllWorkflowSummaries();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [runs]);
+
+  useEffect(() => {
+    const validTrailKeys = new Set(liveExecutionTrails.map((trail) => trail.key));
+
+    setManuallyExpandedLiveExecutionIds((prev) => {
+      const next = new Set(Array.from(prev).filter((key) => validTrailKeys.has(key)));
+      return next.size === prev.size ? prev : next;
+    });
+
+    setManuallyCollapsedLiveExecutionIds((prev) => {
+      const next = new Set(Array.from(prev).filter((key) => validTrailKeys.has(key)));
+      return next.size === prev.size ? prev : next;
+    });
+
+    setLiveExecutionChains((prev) => {
+      const nextEntries = Object.entries(prev).filter(([key]) => validTrailKeys.has(key));
+      if (nextEntries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(nextEntries);
+    });
+  }, [liveExecutionTrails]);
+
+  useEffect(() => {
+    const validEventIds = new Set(
+      Object.values(liveExecutionChains)
+        .flatMap((state) => state.chain?.items ?? [])
+        .map((item) => item.id)
+    );
+
+    setExpandedLiveEventIds((prev) => {
+      const next = new Set(Array.from(prev).filter((id) => validEventIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [liveExecutionChains]);
+
+  useEffect(() => {
+    const activeTrail = liveExecutionTrails.find((trail) => trail.isActive || trail.isCurrent);
+    if (activeTrail) {
+      setStickyCompletedLiveExecutionId(null);
+      return;
+    }
+
+    const mostRecentCompletedTrail = liveExecutionTrails[0] ?? null;
+    setStickyCompletedLiveExecutionId((prev) => {
+      if (!mostRecentCompletedTrail) return null;
+      if (manuallyCollapsedLiveExecutionIds.has(mostRecentCompletedTrail.key)) return prev;
+      return mostRecentCompletedTrail.key;
+    });
+  }, [liveExecutionTrails, manuallyCollapsedLiveExecutionIds]);
+
+  useEffect(() => {
+    for (const trail of liveExecutionTrails) {
+      if (isLiveExecutionExpanded(trail)) {
+        void ensureLiveExecutionChainLoaded(trail, trail.isActive || trail.isCurrent);
+      }
+    }
+  }, [liveExecutionTrails, selectedRunId, stickyCompletedLiveExecutionId]);
+
+
+  async function refreshRunsAndTemplates(nextSelectedRunId?: string | null) {
+    const [runsRes, templatesRes] = await Promise.all([listRuns(), listTemplates()]);
+    setRuns(runsRes);
+    setTemplates(templatesRes);
+    const resolvedRunId = nextSelectedRunId ?? selectedRunId ?? runsRes[0]?.id ?? null;
+    setSelectedRunId(resolvedRunId);
+    if (!selectedTemplateId && templatesRes[0]) setSelectedTemplateId(templatesRes[0].id);
+  }
+
+  function mapLiveExecutionTrails(summary: EventChainSummaryResponse): LiveStageTrail[] {
+    return summary.stages.map((stage: EventChainSummaryItem) => ({
+      key: stage.key,
+      stepId: stage.step_id,
+      label: stage.label,
+      stageExecutionId: stage.stage_execution_id,
+      latestCreatedAt: stage.latest_created_at,
+      durationMs: stage.duration_ms,
+      isActive: stage.is_active,
+      isCurrent: stage.is_current,
+      capabilities: stage.capabilities.map((capability) => ({
+        key: capability.key,
+        capabilityId: capability.capability_id,
+        name: capability.name,
+        statusColor: capability.status_color,
+        statusLabel: capability.status_label,
+        message: capability.message,
+        startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
+        durationText: formatDurationMs(capability.duration_ms, capability.started_at, capability.is_active ? null : capability.latest_created_at),
+        durationMs: capability.duration_ms,
+        latestCreatedAt: capability.latest_created_at,
+        isActive: capability.is_active,
+        isNew: false,
+        eventCount: capability.event_count
+      }))
+    }));
+  }
+
+  function isLiveExecutionExpanded(trail: LiveStageTrail): boolean {
+    if (manuallyExpandedLiveExecutionIds.has(trail.key)) return true;
+    if (manuallyCollapsedLiveExecutionIds.has(trail.key)) return false;
+    if (stickyCompletedLiveExecutionId === trail.key) return true;
+    return getLiveExecutionDefaultExpanded(trail);
+  }
+
+  function toggleLiveExecutionExpanded(trail: LiveStageTrail) {
+    const defaultExpanded = getLiveExecutionDefaultExpanded(trail);
+    const currentlyExpanded = isLiveExecutionExpanded(trail);
+
+    if (currentlyExpanded) {
+      setManuallyExpandedLiveExecutionIds((prev) => {
+        const next = new Set(prev);
+        next.delete(trail.key);
+        return next;
+      });
+      setManuallyCollapsedLiveExecutionIds((prev) => {
+        const next = new Set(prev);
+        if (defaultExpanded) next.add(trail.key);
+        else next.delete(trail.key);
+        return next;
+      });
+      return;
+    }
+
+    setManuallyCollapsedLiveExecutionIds((prev) => {
+      const next = new Set(prev);
+      next.delete(trail.key);
+      return next;
+    });
+    setManuallyExpandedLiveExecutionIds((prev) => {
+      const next = new Set(prev);
+      if (!defaultExpanded) next.add(trail.key);
+      else next.delete(trail.key);
+      return next;
+    });
+  }
+
+  async function ensureLiveExecutionChainLoaded(trail: LiveStageTrail, force = false) {
+    if (!selectedRunId) return;
+
+    const shouldRefreshLiveTrail = trail.isActive || trail.isCurrent;
+    const existing = liveExecutionChains[trail.key];
+    if (existing?.loading) return;
+    if (!force && existing?.chain && !shouldRefreshLiveTrail) return;
+
+    setLiveExecutionChains((prev) => ({
+      ...prev,
+      [trail.key]: {
+        loading: true,
+        error: null,
+        chain: prev[trail.key]?.chain ?? null
+      }
+    }));
+
+    try {
+      const chain = await getStageExecutionChain(selectedRunId, trail.stepId, trail.stageExecutionId);
+      setLiveExecutionChains((prev) => ({
+        ...prev,
+        [trail.key]: {
+          loading: false,
+          error: null,
+          chain
+        }
+      }));
+    } catch (err) {
+      setLiveExecutionChains((prev) => ({
+        ...prev,
+        [trail.key]: {
+          loading: false,
+          error: err instanceof Error ? err.message : String(err),
+          chain: prev[trail.key]?.chain ?? null
+        }
+      }));
+    }
+  }
+
+  function toggleLiveEventExpanded(eventId: string) {
+    setExpandedLiveEventIds((prev) => {
       const next = new Set(prev);
       if (next.has(eventId)) next.delete(eventId);
       else next.add(eventId);
@@ -650,313 +1092,203 @@ export function WorkflowShell() {
     });
   }
 
-  function toggleStageHistoryExpanded(stepId: string) {
-    setExpandedStageHistoryIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(stepId)) next.delete(stepId);
-      else next.add(stepId);
-      return next;
-    });
+  async function refreshRunDetails(runId: string) {
+    const [run, runEvents] = await Promise.all([getRun(runId), listRunEvents(runId)]);
+    setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+    setEvents(runEvents);
+    setSelectedRunId(run.id);
   }
 
-  function toggleStageExpanded(stepId: string, isCurrent: boolean) {
-    if (isCurrent) {
-      setCollapsedStageIds((prev) => {
-        const next = new Set(prev);
-        if (next.has(stepId)) next.delete(stepId);
-        else next.add(stepId);
-        return next;
-      });
+  async function refreshAllWorkflowSummaries() {
+    const activeRuns = runs.filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting');
+    if (activeRuns.length === 0) {
+      setAllWorkflowEvents({});
       return;
     }
+    const results = await Promise.all(activeRuns.map(async (run) => [run.id, await listRunEvents(run.id)] as const));
+    const next: Record<string, WorkflowEvent[]> = {};
+    for (const [runId, runEvents] of results) next[runId] = runEvents;
+    setAllWorkflowEvents(next);
+  }
 
-    setExpandedStageIds((prev) => {
+  async function openWorkflow(runId: string) {
+    await refreshRunDetails(runId);
+    setView('monitor');
+    setMonitorView('workflow_detail');
+  }
+
+  function backToWorkflowList() {
+    setMonitorView('workflow_list');
+  }
+
+  function updateStep(stepId: string, patch: Partial<BuilderStep>) {
+    setBuilderSteps((prev) => prev.map((step) => (step.id === stepId ? { ...step, ...patch } : step)));
+  }
+
+  function updateStepTransitions(stepId: string, patch: Partial<TransitionEditorValue>) {
+    setBuilderSteps((prev) => prev.map((step) => step.id !== stepId ? step : { ...step, transitions: { ...step.transitions, ...patch } }));
+  }
+
+  async function handleSaveTemplate() {
+    try {
+      setBusy(true);
+      setError(null);
+      const parsed = builderMode === 'json' ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition) : definition;
+      const template = await createTemplate({ name: workflowName, description: workflowDescription, definition: parsed });
+      await refreshRunsAndTemplates();
+      setSelectedTemplateId(template.id);
+      setTemplateModalOpen(false);
+      if (createRunAfterSave) {
+        const run = await createRun({ template_id: template.id, title: runTitle, repo_ref: repoRef, context: {} });
+        await refreshRunsAndTemplates(run.id);
+        setView('monitor');
+        setMonitorView('workflow_detail');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateRunFromTemplate(templateId?: string | null) {
+    if (!templateId) {
+      setError('Select a template first.');
+      return;
+    }
+    try {
+      setBusy(true);
+      setError(null);
+      const run = await createRun({ template_id: templateId, title: runTitle, repo_ref: repoRef, context: {} });
+      await refreshRunsAndTemplates(run.id);
+      setView('monitor');
+      setMonitorView('workflow_detail');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStartRun() {
+    if (!selectedRunId) return;
+    try {
+      setBusy(true);
+      setError(null);
+      await startWorkflowRun(selectedRunId);
+      await refreshRunDetails(selectedRunId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResumeRun() {
+    if (!selectedRunId) return;
+    try {
+      setBusy(true);
+      setError(null);
+      await resumeWorkflowRun(selectedRunId);
+      await refreshRunDetails(selectedRunId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handlePauseRun() {
+    if (!selectedRunId) return;
+    try {
+      setBusy(true);
+      setError(null);
+      await pauseWorkflowRun(selectedRunId);
+      await refreshRunDetails(selectedRunId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteRun(runId: string) {
+    try {
+      setBusy(true);
+      setError(null);
+      await deleteRun(runId);
+      const nextId = selectedRunId === runId ? null : selectedRunId;
+      await refreshRunsAndTemplates(nextId);
+      if (selectedRunId === runId) {
+        setEvents([]);
+        setMonitorView('workflow_list');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshSelectedRunArtifacts() {
+    if (!selectedRunId) return;
+    await refreshRunDetails(selectedRunId);
+  }
+
+  async function loadCanonicalChangesetSchema() {
+    try {
+      setChangesetSchemaBusy(true);
+      const json = await getPayloadGatewaySchema();
+      setStageChangesetSchemaText(typeof json.example === 'string' ? json.example : '');
+    } finally {
+      setChangesetSchemaBusy(false);
+    }
+  }
+
+  function setPaths(paths: string[], checked: boolean) {
+    setSelectedRepoPaths((prev) => {
       const next = new Set(prev);
-      if (next.has(stepId)) next.delete(stepId);
-      else next.add(stepId);
-      return next;
+      for (const path of paths) {
+        if (checked) next.add(path); else next.delete(path);
+      }
+      return Array.from(next).sort();
     });
   }
 
-  function eventTone(event: WorkflowEvent): { color: string; label: string } {
-    const payload = (event.payload ?? {}) as Record<string, unknown>;
-    const ok = payload.ok;
-
-    if (event.level === 'error' || ok === false) {
-      return { color: 'red', label: 'ERROR' };
-    }
-
-    if (event.level === 'warning') {
-      return { color: 'yellow', label: 'WARNING' };
-    }
-
-    if (event.kind.includes('completed') || event.kind.includes('executed') || ok === true) {
-      return { color: 'green', label: 'SUCCESS' };
-    }
-
-    return { color: 'blue', label: 'INFO' };
+  function toggleFile(path: string) {
+    setPaths([path], !selectedRepoPathSet.has(path));
   }
 
-  function summarizeEvent(event: WorkflowEvent): string {
-    const payload = (event.payload ?? {}) as Record<string, unknown>;
-
-    if (event.kind === 'terminal_completed' || event.kind === 'terminal_failed') {
-      const outputs = Array.isArray(payload.outputs) ? payload.outputs as Array<Record<string, unknown>> : [];
-      const commandCount = outputs.length;
-      const failedCount = outputs.filter((row) => row.ok === false).length;
-      if (failedCount > 0) {
-        return `Ran ${commandCount} terminal command${commandCount === 1 ? '' : 's'} with ${failedCount} failure${failedCount === 1 ? '' : 's'}.`;
-      }
-      return `Ran ${commandCount} terminal command${commandCount === 1 ? '' : 's'} successfully.`;
-    }
-
-    if (event.kind === 'payload_gateway_completed' || event.kind === 'payload_gateway_failed') {
-      const stats = payload.stats as Record<string, unknown> | undefined;
-      const successCount = typeof stats?.successful_operations === 'number' ? stats.successful_operations : null;
-      const failedCount = typeof stats?.failed_operations === 'number' ? stats.failed_operations : null;
-      const totalCount = typeof stats?.total_operations === 'number' ? stats.total_operations : null;
-      if (successCount !== null && failedCount !== null && totalCount !== null) {
-        if (failedCount > 0) {
-          return `Applied ${successCount}/${totalCount} operations successfully with ${failedCount} failure${failedCount === 1 ? '' : 's'}.`;
-        }
-        return `Applied ${successCount}/${totalCount} operations successfully.`;
-      }
-      const summary = typeof payload.summary === 'string' ? payload.summary : null;
-      if (summary) return summary;
-    }
-
-    if (event.kind === 'context_export_completed') {
-      const bytesWritten = payload.bytes_written;
-      const outputPath = payload.output_path;
-      if (typeof bytesWritten === 'number' && typeof outputPath === 'string') {
-        return `Exported ${bytesWritten.toLocaleString()} bytes to ${outputPath}.`;
-      }
-    }
-
-    if (event.kind === 'model_inference_completed') {
-      const transport = payload.transport;
-      const repoContextMode = payload.repo_context_mode;
-      if (typeof transport === 'string' && typeof repoContextMode === 'string' && repoContextMode) {
-        return `Inference completed via ${transport} with repo context ${repoContextMode}.`;
-      }
-      if (typeof transport === 'string') {
-        return `Inference completed via ${transport}.`;
-      }
-    }
-
-    if (event.kind === 'stage_executed' || event.kind === 'run_action_completed') {
-      const result = payload.result as Record<string, unknown> | undefined;
-      const status = (result?.status ?? payload.status) as string | undefined;
-      const stepId = (result?.step_id ?? payload.step_id) as string | undefined;
-      if (status || stepId) {
-        return `Stage ${stepId ?? 'unknown'} resolved with status ${status ?? 'unknown'}.`;
-      }
-    }
-
-    return event.message;
-  }
-
-  function capabilityLifecycleKey(kind: string): string | null {
-    if (kind.endsWith('_started')) return kind.slice(0, -'_started'.length);
-    if (kind.endsWith('_completed')) return kind.slice(0, -'_completed'.length);
-    if (kind.endsWith('_failed')) return kind.slice(0, -'_failed'.length);
-    return null;
-  }
-
-  function formatDurationMs(startedAt: string, endedAt: string): string {
-    const delta = Math.max(new Date(endedAt).getTime() - new Date(startedAt).getTime(), 0);
-    if (delta < 1000) return `${delta} ms`;
-    const seconds = delta / 1000;
-    if (seconds < 60) return `${seconds.toFixed(1)} s`;
-    const minutes = Math.floor(seconds / 60);
-    const rem = Math.round(seconds % 60);
-    return `${minutes}m ${rem}s`;
-  }
-
-  type StageEventItem =
-    | { type: 'single'; key: string; event: WorkflowEvent }
-    | { type: 'capability'; key: string; capabilityKey: string; summaryEvent: WorkflowEvent; childEvents: WorkflowEvent[]; runtimeLabel: string | null };
-
-  function buildStageEventItems(stageEvents: WorkflowEvent[]): StageEventItem[] {
-    const ascending = stageEvents
-      .filter((event) => !isStageWrapperEvent(event))
-      .slice()
-      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-    const items: StageEventItem[] = [];
-    const openByCapability = new Map<string, { index: number; startedAt: string }>();
-
-    for (const event of ascending) {
-      const capabilityKey = capabilityLifecycleKey(event.kind);
-      if (!capabilityKey) {
-        items.push({ type: 'single', key: event.id, event });
-        continue;
-      }
-
-      if (event.kind.endsWith('_started')) {
-        items.push({
-          type: 'capability',
-          key: `${capabilityKey}:${event.id}`,
-          capabilityKey,
-          summaryEvent: event,
-          childEvents: [event],
-          runtimeLabel: null
-        });
-        openByCapability.set(capabilityKey, { index: items.length - 1, startedAt: event.created_at });
-        continue;
-      }
-
-      const open = openByCapability.get(capabilityKey);
-      if (open && items[open.index]?.type === 'capability') {
-        const item = items[open.index] as Extract<StageEventItem, { type: 'capability' }>;
-        item.summaryEvent = event;
-        item.childEvents.push(event);
-        item.runtimeLabel = formatDurationMs(open.startedAt, event.created_at);
-        openByCapability.delete(capabilityKey);
-      } else {
-        items.push({
-          type: 'capability',
-          key: `${capabilityKey}:${event.id}`,
-          capabilityKey,
-          summaryEvent: event,
-          childEvents: [event],
-          runtimeLabel: null
-        });
-      }
-    }
-
-    return items.reverse();
-  }
-
-  function renderPreviewPanel(
-    title: string,
-    content: string,
-    emptyText: string,
-    mode: 'response' | 'prompt'
-  ) {
-    const hasContent = Boolean(content.trim());
-
-    return (
-      <Stack gap="xs">
-        <Group justify="space-between" align="center">
-          <Text fw={600} size="sm">{title}</Text>
-          <Group gap="xs">
-            <Badge variant="light">{hasContent ? `${content.length.toLocaleString()} chars` : 'empty'}</Badge>
-            <Button
-              size="xs"
-              variant="light"
-              onClick={() => {
-                setPreviewViewerMode(mode);
-                setResponseViewerOpen(true);
-              }}
-              disabled={!hasContent}
-            >
-              Full screen
-            </Button>
-          </Group>
-        </Group>
-
-        <Box
-          p="md"
-          style={{
-            border: '1px solid var(--mantine-color-dark-4)',
-            borderRadius: 12,
-            background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))',
-            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)'
-          }}
-        >
-          <ScrollArea h={220} offsetScrollbars>
-            <Box maw={960} mx="auto">
-              <Text
-                size="sm"
-                style={{
-                  whiteSpace: 'pre-wrap',
-                  overflowWrap: 'anywhere',
-                  wordBreak: 'break-word',
-                  lineHeight: 1.75,
-                  letterSpacing: '0.01em',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace'
-                }}
-              >
-                {hasContent ? content : emptyText}
-              </Text>
-            </Box>
-          </ScrollArea>
-        </Box>
-      </Stack>
-    );
-  }
-
-  function renderInferenceResponsePanel(emptyText: string) {
-    return renderPreviewPanel('Inference response', inferenceResponse, emptyText, 'response');
-  }
-
-  function renderComposedPromptPreviewPanel(emptyText: string) {
-    return renderPreviewPanel('Composed prompt preview', composedInferencePrompt, emptyText, 'prompt');
-  }
-
-  async function refresh() {
-    setError(null);
-    try {
-      const [templateData, runData] = await Promise.all([listTemplates(), listRuns()]);
-      setTemplates(templateData);
-      setRuns(runData);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  async function refreshEvents(runId: string) {
-    setEvents(await listRunEvents(runId));
-  }
-
-  async function refreshTree(run: WorkflowRun) {
-    await loadTreeDir(run, '', true);
-  }
-
-  async function loadTreeSubtree(run: WorkflowRun, basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[]; loadedDirs: string[] }> {
-    const data = await listRepoTree(run.repo_ref, treeGitRef, {
+  async function loadTreeSubtree(run: WorkflowRun, basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[] }> {
+    const data = await listRepoTree(run.repo_ref, stageRepoContextGitRef, {
       basePath,
-      skipBinary,
-      skipGitignore
+      skipBinary: stageRepoContextSkipBinary,
+      skipGitignore: stageRepoContextSkipGitignore
     });
 
     const children: Record<string, RepoTreeEntry[]> = {
       [basePath]: data.entries
     };
-    const files = data.entries.filter((entry) => entry.kind === 'file').map((entry) => entry.path);
-    const loadedDirs: string[] = [basePath];
+    const files: string[] = [];
 
     for (const entry of data.entries) {
-      if (entry.kind === 'dir' && !entry.has_children) {
-        children[entry.path] = [];
-        loadedDirs.push(entry.path);
+      if (entry.kind === 'file') {
+        files.push(entry.path);
+      } else if (entry.has_children) {
+        const nested = await loadTreeSubtree(run, entry.path);
+        Object.assign(children, nested.children);
+        files.push(...nested.files);
       }
     }
 
-    const nestedResults = await Promise.all(
-      data.entries
-        .filter((entry) => entry.kind === 'dir' && entry.has_children)
-        .map((entry) => loadTreeSubtree(run, entry.path))
-    );
-
-    for (const nested of nestedResults) {
-      Object.assign(children, nested.children);
-      files.push(...nested.files);
-      loadedDirs.push(...nested.loadedDirs);
-    }
-
-    return { children, files, loadedDirs };
+    return { children, files };
   }
 
   async function loadTreeDir(run: WorkflowRun, basePath: string, replaceRoot = false) {
-    if (loadingTreeDirs.has(basePath)) {
-      return;
-    }
+    if (loadingTreeDirs.has(basePath)) return;
 
     setTreeError(null);
-    if (replaceRoot) {
-      setTreeBusy(true);
-    }
+    if (replaceRoot) setTreeBusy(true);
     setLoadingTreeDirs((prev) => {
       const next = new Set(prev);
       next.add(basePath);
@@ -964,38 +1296,21 @@ export function WorkflowShell() {
     });
 
     try {
-      const data = await listRepoTree(run.repo_ref, treeGitRef, {
+      const data = await listRepoTree(run.repo_ref, stageRepoContextGitRef, {
         basePath,
-        skipBinary,
-        skipGitignore
+        skipBinary: stageRepoContextSkipBinary,
+        skipGitignore: stageRepoContextSkipGitignore
       });
 
       if (replaceRoot) {
         setTreeRootData(data);
         setTreeChildrenByParent({ '': data.entries });
-        setLoadedTreeDirs(new Set(['']));
+        const visiblePaths = new Set<string>(data.entries.filter((entry) => entry.kind === 'file').map((entry) => entry.path));
+        setSelectedRepoPaths((prev) => prev.filter((path) => visiblePaths.has(path)));
+        setSelectedRepoDirs(new Set());
       } else {
-        setTreeChildrenByParent((prev) => ({
-          ...prev,
-          [basePath]: data.entries
-        }));
-        setLoadedTreeDirs((prev) => {
-          const next = new Set(prev);
-          next.add(basePath);
-          return next;
-        });
+        setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
       }
-
-      const nextChildren = replaceRoot
-        ? { '': data.entries }
-        : { ...treeChildrenByParent, [basePath]: data.entries };
-      const visiblePaths = new Set<string>();
-      for (const entries of Object.values(nextChildren)) {
-        for (const entry of entries) {
-          visiblePaths.add(entry.path);
-        }
-      }
-      setSelectedPaths((prev) => prev.filter((path) => visiblePaths.has(path)));
     } catch (err) {
       setTreeError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1004,463 +1319,221 @@ export function WorkflowShell() {
         next.delete(basePath);
         return next;
       });
-      if (replaceRoot) {
-        setTreeBusy(false);
-      }
+      if (replaceRoot) setTreeBusy(false);
     }
-  }
-
-  useEffect(() => {
-    void refresh();
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function probeBuilderRepo() {
-      if (!createOpen || !repoRef.trim()) {
-        if (!cancelled) {
-          setBuilderRepoIsGit(false);
-          setBuilderSteps((prev) => prev.map((step) => (
-            step.id === 'code'
-              ? {
-                  ...step,
-                  automationMode: 'manual',
-                  execution: {
-                    ...step.execution,
-                    changesetApply: false
-                  }
-                }
-              : step
-          )));
-        }
-        return;
-      }
-
-      try {
-        await listRepoTree(repoRef, 'WORKTREE');
-        if (cancelled) return;
-        setBuilderRepoIsGit(true);
-        setBuilderSteps((prev) => prev.map((step) => (
-          step.id === 'code'
-            ? {
-                ...step,
-                automationMode: step.execution.changesetApply ? step.automationMode : 'automatic',
-                execution: {
-                  ...step.execution,
-                  changesetApply: true,
-                  maxConsecutiveApplyFailures: step.execution.maxConsecutiveApplyFailures || 5
-                }
-              }
-            : step
-        )));
-      } catch {
-        if (cancelled) return;
-        setBuilderRepoIsGit(false);
-        setBuilderSteps((prev) => prev.map((step) => (
-          step.id === 'code'
-            ? {
-                ...step,
-                automationMode: 'manual',
-                execution: {
-                  ...step.execution,
-                  changesetApply: false
-                }
-              }
-            : step
-        )));
-      }
-    }
-
-    void probeBuilderRepo();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [createOpen, repoRef]);
-
-  useEffect(() => {
-    if (!currentStepDefinition) {
-      return;
-    }
-
-    const currentStageType = currentStepDefinition.step_type;
-    const isChangesetStage = currentStageType === 'code';
-
-    setStepFragmentEnabled({
-      user_input: true,
-      repo_context: currentStepDefinition.prompt.include_repo_context,
-      changeset_schema: isChangesetStage && currentStepDefinition.prompt.include_changeset_schema,
-      apply_error: isChangesetStage,
-      compile_error: isChangesetStage
-    });
-  }, [currentStepDefinition?.id, currentStepDefinition?.step_type]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void refresh();
-      if (selectedRunId) {
-        void refreshEvents(selectedRunId);
-      }
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [selectedRunId]);
-
-  useEffect(() => {
-    if (selectedRunId) {
-      void refreshEvents(selectedRunId);
-    } else {
-      setEvents([]);
-    }
-  }, [selectedRunId]);
-
-  useEffect(() => {
-    if (!currentStageGroup) {
-      return;
-    }
-
-    setExpandedStageIds(new Set());
-    setExpandedStageHistoryIds(new Set());
-    setCollapsedStageIds(new Set());
-  }, [currentStageGroup?.stepId]);
-
-  useEffect(() => {
-    if (!selectedRun || !capabilityOpen || activeCapability !== 'context_export') {
-      return;
-    }
-    void refreshTree(selectedRun);
-  }, [selectedRun?.id, selectedRun?.repo_ref, capabilityOpen, activeCapability, treeGitRef, skipBinary, skipGitignore]);
-
-  function openWorkflow(runId: string) {
-    setSelectedRunId(runId);
-    setViewMode('workflow');
-  }
-
-  function toggleFile(path: string) {
-    setSelectedPaths((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return Array.from(next).sort();
-    });
-  }
-
-  function setPaths(paths: string[], checked: boolean) {
-    setSelectedPaths((prev) => {
-      const next = new Set(prev);
-      for (const path of paths) {
-        if (checked) next.add(path);
-        else next.delete(path);
-      }
-      return Array.from(next).sort();
-    });
-  }
-
-  function setDirectorySelected(path: string, checked: boolean) {
-    setSelectedDirPaths((prev) => {
-      const next = new Set(prev);
-      if (checked) next.add(path);
-      else next.delete(path);
-      return next;
-    });
   }
 
   async function toggleDirectory(entry: RepoTreeEntry, checked: boolean) {
-    if (!selectedRun) {
+    if (!selectedRun) return;
+
+    if (checked) {
+      const nested = await loadTreeSubtree(selectedRun, entry.path);
+      setTreeChildrenByParent((prev) => ({ ...prev, ...nested.children }));
+      setSelectedRepoDirs((prev) => {
+        const next = new Set(prev);
+        next.add(entry.path);
+        return next;
+      });
+      setPaths(nested.files, true);
       return;
     }
 
-    setDirectorySelected(entry.path, checked);
-
-    const collectLoadedPaths = (dirPath: string): string[] => {
-      const entries = treeChildrenByParent[dirPath] ?? [];
-      const files: string[] = [];
-      for (const child of entries) {
-        if (child.kind === 'file') {
-          files.push(child.path);
-        } else {
-          files.push(...collectLoadedPaths(child.path));
-        }
-      }
-      return files;
-    };
-
-    const loadedFiles = collectLoadedPaths(entry.path);
-    if (loadedFiles.length > 0) {
-      setPaths(loadedFiles, checked);
-    }
-
-    setTreeError(null);
-    setLoadingTreeDirs((prev) => {
+    const descendantFiles = collectLoadedFilePaths(entry.path, treeChildrenByParent);
+    setSelectedRepoDirs((prev) => {
       const next = new Set(prev);
-      next.add(entry.path);
+      next.delete(entry.path);
       return next;
     });
+    setPaths(descendantFiles, false);
+  }
 
-    try {
-      const { children, files, loadedDirs } = await loadTreeSubtree(selectedRun, entry.path);
-
-      setTreeChildrenByParent((prev) => ({
-        ...prev,
-        ...children
-      }));
-
-      setLoadedTreeDirs((prev) => {
-        const next = new Set(prev);
-        for (const dir of loadedDirs) {
-          next.add(dir);
-        }
-        return next;
-      });
-
-      setSelectedPaths((prev) => {
-        const next = new Set(prev);
-        for (const path of files) {
-          if (checked) next.add(path);
-          else next.delete(path);
-        }
-        return Array.from(next).sort();
-      });
-    } catch (err) {
-      setDirectorySelected(entry.path, !checked);
-      setTreeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingTreeDirs((prev) => {
-        const next = new Set(prev);
-        next.delete(entry.path);
-        return next;
-      });
+  const composedInferencePrompt = useMemo(() => {
+    const parts: string[] = [];
+    if (stageIncludeRepoContext) parts.push('### REPO CONTEXT\nAttached repo context from backend export');
+    if (selectedWorkflowStep?.id === 'code' && stageIncludeChangesetSchema) {
+      parts.push(`### CHANGESET SCHEMA\n${stageChangesetSchemaText.trim() || 'Use ChangeSet JSON version 1.'}`);
     }
-  }
+    if (stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
+    if (stageCompileError.trim()) parts.push(`### COMPILE ERROR\n${stageCompileError.trim()}`);
+    if (stageReviewNotes.trim() && selectedWorkflowStep?.id === 'review') parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
+    if (stageUserInput.trim()) parts.push(`### USER INPUT\n${stageUserInput.trim()}`);
+    return parts.join('\n\n');
+  }, [selectedWorkflowStep?.id, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageApplyError, stageCompileError, stageReviewNotes, stageUserInput]);
 
-  function patchStep(stepId: BuilderStepId, patch: Partial<BuilderStep>) {
-    setBuilderSteps((prev) => prev.map((step) => (step.id === stepId ? { ...step, ...patch } : step)));
-  }
+  const inferenceResponse = useMemo(() => {
+    const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
+    for (let i = stageEvents.length - 1; i >= 0; i -= 1) {
+      const payload = stageEvents[i].payload as Record<string, unknown> | undefined;
+      const result = payload?.result as Record<string, unknown> | undefined;
+      const nestedResult = result?.result as Record<string, unknown> | undefined;
+      const directText = typeof nestedResult?.text === 'string' ? nestedResult.text : undefined;
+      if (directText && directText.trim()) return directText;
 
-  function patchStepExecution(stepId: BuilderStepId, patch: Partial<BuilderStep['execution']>) {
-    setBuilderSteps((prev) => prev.map((step) => (
-      step.id === stepId
-        ? { ...step, execution: { ...step.execution, ...patch } }
-        : step
-    )));
-  }
-
-  function patchStepPause(stepId: BuilderStepId, patch: Partial<PausePolicy>) {
-    setBuilderSteps((prev) => prev.map((step) => (
-      step.id === stepId
-        ? { ...step, pause: { ...step.pause, ...patch } }
-        : step
-    )));
-  }
-
-  function patchStepFragmentEnabled(key: PromptFragmentKey, enabled: boolean) {
-    setStepFragmentEnabled((prev) => ({ ...prev, [key]: enabled }));
-  }
-
-  function patchStepFragmentValue(key: PromptFragmentKey, value: string) {
-    setStepFragmentValues((prev) => ({ ...prev, [key]: value }));
-  }
-
-  function openContextExporter() {
-    setActiveCapability('context_export');
-    setCapabilityOpen(true);
-  }
-
-  function openChangesetSchemaConfigurator() {
-    setChangesetSchemaConfigOpen(true);
-    patchStepFragmentEnabled('changeset_schema', true);
-  }
-
-  function openApplyErrorConfigurator() {
-    patchStepFragmentEnabled('apply_error', true);
-    setApplyErrorConfigOpen(true);
-  }
-
-  function openCompileErrorConfigurator() {
-    patchStepFragmentEnabled('compile_error', true);
-    setCompileErrorConfigOpen(true);
-  }
-
-  function clearStageFragmentSelections() {
-    setStepFragmentEnabled((prev) => ({
-      ...prev,
-      repo_context: false,
-      changeset_schema: false,
-      apply_error: false,
-      compile_error: false
-    }));
-  }
-
-  async function submitCreateWorkflow() {
-    setBusy(true);
-    setError(null);
-    try {
-      if (createMode === 'load') {
-        const template = templates.find((t) => t.id === selectedTemplateId);
-        if (!template) throw new Error('Choose a template to load.');
-        setWorkflowName(template.name);
-        setWorkflowDescription(template.description);
-        setCreateMode('build');
-        return;
+      const capabilityResults = Array.isArray(payload?.capability_results) ? (payload?.capability_results as Array<Record<string, unknown>>) : [];
+      for (let j = capabilityResults.length - 1; j >= 0; j -= 1) {
+        const entry = capabilityResults[j];
+        const entryResult = entry?.result as Record<string, unknown> | undefined;
+        const entryNestedResult = entryResult?.result as Record<string, unknown> | undefined;
+        const text = typeof entryNestedResult?.text === 'string' ? entryNestedResult.text : undefined;
+        if (text && text.trim()) return text;
       }
-
-      let templateIdToUse = selectedTemplateId;
-
-      if (createMode === 'build' || createMode === 'save_template') {
-        const created = await createTemplate({
-          name: workflowName,
-          description: workflowDescription,
-          definition: toTemplateDefinition(builderSteps, inferenceProvider, inferenceModel, browserTargetUrl, browserCdpUrl)
-        });
-        templateIdToUse = created.id;
-      }
-
-      if (createMode === 'copy') {
-        const source = templates.find((t) => t.id === selectedTemplateId);
-        if (!source) throw new Error('Choose a template to copy.');
-        const copied = await createTemplate({
-          name: workflowName,
-          description: workflowDescription,
-          definition: source.definition
-        });
-        templateIdToUse = copied.id;
-      }
-
-      const run = await createRun({
-        template_id: templateIdToUse,
-        title: runTitle,
-        repo_ref: repoRef,
-        context: {
-          model_inference: {
-            transport: inferenceProvider,
-            model: inferenceModel,
-            browser: {
-              profile: 'auto',
-              bridge_dir: 'bridge',
-              cdp_url: browserCdpUrl,
-              page_url_contains: browserTargetUrl,
-              target_url: browserTargetUrl,
-              edge_executable: '',
-              user_data_dir: '',
-              session_id: null,
-              auto_launch_edge: true,
-              response_timeout_ms: 120000,
-              response_poll_ms: 1000,
-              dom_poll_ms: 1000
-            }
-          }
-        }
-      });
-
-      await refresh();
-      setSelectedRunId(run.id);
-      setViewMode('workflow');
-      setCreateOpen(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
     }
+    return '';
+  }, [events, selectedStepId]);
+
+  const stageStreamContent = useMemo(() => {
+    const parts: string[] = [];
+    if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+    if (inferenceResponse.trim()) parts.push(`### OUTPUT\n${inferenceResponse}`);
+    return parts.join('\n\n');
+  }, [composedInferencePrompt, inferenceResponse]);
+
+  function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
+    return (
+      <Stack gap="xs" h="100%">
+        <Group justify="space-between" align="center">
+          <Text fw={600}>{title}</Text>
+          <Group gap="xs">
+            <Badge variant="light">{content ? `${content.length.toLocaleString()} chars` : 'empty'}</Badge>
+            <Button size="xs" variant="light" onClick={() => { setPreviewViewerMode(mode); setResponseViewerOpen(true); }}>
+              Full screen
+            </Button>
+          </Group>
+        </Group>
+        <Box p="md" h="100%" style={{ flex: 1, border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, minHeight: 220, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
+          <Text size="sm" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', lineHeight: 1.7, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace' }}>
+            {content || emptyText}
+          </Text>
+        </Box>
+      </Stack>
+    );
   }
 
-  async function runStage(stepId?: string) {
-    if (!selectedRun) return;
+  function renderStageStreamPanel(emptyText: string) {
+    return renderPreviewPanel('Stage stream', stageStreamContent, emptyText, 'stream');
+  }
 
-    const effectiveStepId = stepId ?? selectedRun.current_step_id ?? undefined;
-    if (!effectiveStepId) return;
-
-    setInferenceBusy(true);
-    setInferenceStatus(null);
-
-    try {
-      await patchWorkflowStageState(selectedRun.id, effectiveStepId, {
-        prompt_fragments: stepFragmentValues,
-        prompt_fragment_enabled: stepFragmentEnabled,
-        composed_prompt: composedInferencePrompt,
+  function buildInteractiveStagePayload() {
+    const step = selectedWorkflowStep;
+    const promptFragments: Record<string, unknown> = { user_input: stageUserInput };
+    const promptFragmentEnabled: Record<string, unknown> = { user_input: true, repo_context: stageIncludeRepoContext };
+    if (step?.id === 'code') {
+      promptFragmentEnabled.changeset_schema = stageIncludeChangesetSchema;
+      promptFragmentEnabled.apply_error = Boolean(stageApplyError.trim());
+      promptFragmentEnabled.compile_error = Boolean(stageCompileError.trim());
+      promptFragments.changeset_schema = stageChangesetSchemaText;
+      promptFragments.apply_error = stageApplyError;
+      promptFragments.compile_error = stageCompileError;
+    }
+    if (step?.id === 'review') {
+      promptFragments.review_notes = stageReviewNotes;
+      promptFragmentEnabled.review_notes = Boolean(stageReviewNotes.trim());
+    }
+    const includeFiles = stageRepoContextIncludeFilesText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const excludeRegex = stageRepoContextExcludeRegexText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    return {
+      ...(stageIncludeRepoContext ? {
         repo_context: {
-          mode: contextMode,
-          git_ref: treeGitRef,
-          skip_binary: skipBinary,
-          skip_gitignore: skipGitignore,
-          include_staged_diff: includeStagedDiff,
-          include_unstaged_diff: includeUnstagedDiff,
-          include_files: contextMode === 'tree_select' ? selectedPaths : null,
-          save_path: contextSavePath
+          git_ref: stageRepoContextGitRef || 'WORKTREE',
+          include_files: includeFiles.length > 0 ? includeFiles : null,
+          exclude_regex: excludeRegex,
+          save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
+          skip_binary: stageRepoContextSkipBinary,
+          skip_gitignore: stageRepoContextSkipGitignore,
+          include_staged_diff: stageRepoContextIncludeStagedDiff,
+          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
         }
-      });
-
-      const result = await runCurrentWorkflowStep(selectedRun.id, effectiveStepId);
-      const capabilityResults = (result.capability_results ?? []) as Array<Record<string, unknown>>;
-      const inferenceResult = capabilityResults
-        .find((row) => typeof row?.result === 'object' && row.result !== null)
-        ?.result as Record<string, unknown> | undefined;
-
-      if (inferenceResult?.text) {
-        setInferenceResponse(String(inferenceResult.text));
-      }
-
-      if (stepFragmentEnabled.repo_context) {
-        setSelectedPaths([]);
-        setSelectedDirPaths(new Set());
-      }
-
-      setInferenceStatus(String(result.message ?? 'Stage executed through backend workflow engine.'));
-      await refresh();
-      await refreshEvents(selectedRun.id);
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      clearStageFragmentSelections();
-      setInferenceBusy(false);
-    }
+      } : {}),
+      prompt_fragments: promptFragments,
+      prompt_fragment_enabled: promptFragmentEnabled,
+      review: step?.id === 'review' ? { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes } : undefined
+    } as Record<string, unknown>;
   }
 
-  async function moveToStage(stepId: string) {
-    if (!selectedRun) return;
-    await selectWorkflowStep(selectedRun.id, stepId);
-    await refresh();
-    await refreshEvents(selectedRun.id);
-  }
-
-  async function runContextExport() {
-    if (!selectedRun) return;
-    setContextBusy(true);
-    setContextStatus(null);
+  async function runManualCapability(action: () => Promise<Record<string, unknown>>, successMessage: string) {
     try {
-      const response = await invokeContextExport(selectedRun.id, {
-        step_id: 'context_export',
-        payload: {
-          repo_ref: selectedRun.repo_ref,
-          git_ref: treeGitRef,
-          exclude_regex: [],
-          skip_binary: skipBinary,
-          skip_gitignore: skipGitignore,
-          include_staged_diff: includeStagedDiff,
-          include_unstaged_diff: includeUnstagedDiff,
-          include_files: contextMode === 'tree_select' ? selectedPaths : null,
-          save_path: contextSavePath
-        }
-      });
-      setContextStatus(`Context export completed: ${String(response.output_path ?? '')}`);
-      await refreshEvents(selectedRun.id);
-      await refresh();
+      setManualCapabilityBusy(true);
+      setManualCapabilityStatus(null);
+      const json = await action();
+      setManualCapabilityResponse(JSON.stringify(json, null, 2));
+      setManualCapabilityStatus(successMessage);
+      await refreshSelectedRunArtifacts();
     } catch (err) {
-      setContextStatus(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setManualCapabilityStatus(message);
+      setManualCapabilityResponse('');
     } finally {
-      setContextBusy(false);
+      setManualCapabilityBusy(false);
     }
+  }
+
+  async function handleManualSelectStep(stepId: string | null) {
+    if (!selectedRun || !stepId) return;
+    await runManualCapability(async () => {
+      const json = await selectWorkflowStep(selectedRun.id, stepId);
+      return json as Record<string, unknown>;
+    }, `Selected step ${stepId}.`);
+    setSelectedStepId(stepId);
+  }
+
+  async function handleManualRunCurrentStep() {
+    if (!selectedRun) return;
+    await runManualCapability(async () => {
+      const json = await runCurrentWorkflowStep(selectedRun.id, selectedStepId ?? selectedRun.current_step_id);
+      return json as Record<string, unknown>;
+    }, 'Executed current workflow step.');
+  }
+
+  async function handleManualPreviousStep() {
+    if (!selectedRun) return;
+    await runManualCapability(async () => {
+      const json = await previousWorkflowStep(selectedRun.id);
+      return json as Record<string, unknown>;
+    }, 'Moved to previous workflow step.');
+  }
+
+  async function handleManualNextStep() {
+    if (!selectedRun) return;
+    await runManualCapability(async () => {
+      const json = await nextWorkflowStep(selectedRun.id);
+      return json as Record<string, unknown>;
+    }, 'Moved to next workflow step.');
+  }
+
+  async function handleManualPatchStageState() {
+    if (!selectedRun || !selectedStepId) return;
+    await runManualCapability(async () => {
+      const payload = buildInteractiveStagePayload();
+      const json = await patchWorkflowStageState(selectedRun.id, selectedStepId, payload);
+      return json as Record<string, unknown>;
+    }, 'Patched stage state.');
+  }
+
+  async function handleManualRunWithPatchedState() {
+    if (!selectedRun || !selectedStepId) return;
+    await runManualCapability(async () => {
+      const payload = buildInteractiveStagePayload();
+      const json = await runCurrentWorkflowStep(selectedRun.id, selectedStepId, payload);
+      return json as Record<string, unknown>;
+    }, 'Executed current stage with interactive local state through backend workflow engine.');
   }
 
   async function configureInference() {
     if (!selectedRun) return;
-    setInferenceBusy(true);
-    setInferenceStatus(null);
     try {
-      await invokeModelInference(selectedRun.id, {
-        step_id: selectedRun.current_step_id,
+      setInferenceBusy(true);
+      setInferenceStatus(null);
+      const json = await invokeModelInference(selectedRun.id, {
+        step_id: selectedStepId ?? selectedRun.current_step_id,
         action: 'configure',
         payload: {
-          transport: inferenceProvider,
+          transport: inferenceTransport,
           model: inferenceModel,
           browser: {
             profile: 'auto',
@@ -1470,7 +1543,7 @@ export function WorkflowShell() {
             target_url: browserTargetUrl,
             edge_executable: '',
             user_data_dir: '',
-            session_id: null,
+            session_id: browserSessionId || null,
             auto_launch_edge: true,
             response_timeout_ms: 120000,
             response_poll_ms: 1000,
@@ -1478,9 +1551,11 @@ export function WorkflowShell() {
           }
         }
       });
-      await refresh();
-      await refreshEvents(selectedRun.id);
+      const config = (json.config ?? {}) as Record<string, unknown>;
+      const browser = (config.browser ?? {}) as Record<string, unknown>;
+      setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
       setInferenceStatus('Inference configuration saved.');
+      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1490,17 +1565,18 @@ export function WorkflowShell() {
 
   async function launchBrowserInference() {
     if (!selectedRun) return;
-    setInferenceBusy(true);
-    setInferenceStatus(null);
     try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
       const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedRun.current_step_id,
+        step_id: selectedStepId ?? selectedRun.current_step_id,
         action: 'launch_browser',
         payload: {}
       });
-      await refresh();
-      await refreshEvents(selectedRun.id);
-      setInferenceStatus(`Browser attached: ${String(json.session_id ?? '')}`);
+      setBrowserSessionId(typeof json.session_id === 'string' ? json.session_id : '');
+      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
+      setInferenceStatus(typeof json.status === 'string' ? `Browser ${json.status}.` : 'Browser attached.');
+      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1509,18 +1585,17 @@ export function WorkflowShell() {
   }
 
   async function openBrowserInferenceUrl() {
-    if (!selectedRun) return;
-    setInferenceBusy(true);
-    setInferenceStatus(null);
+    if (!selectedRun || !browserTargetUrl.trim()) return;
     try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
       await invokeModelInference(selectedRun.id, {
-        step_id: selectedRun.current_step_id,
+        step_id: selectedStepId ?? selectedRun.current_step_id,
         action: 'open_url',
         payload: { url: browserTargetUrl }
       });
-      await refresh();
-      await refreshEvents(selectedRun.id);
       setInferenceStatus(`Opened URL: ${browserTargetUrl}`);
+      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1530,17 +1605,17 @@ export function WorkflowShell() {
 
   async function probeBrowserInference() {
     if (!selectedRun) return;
-    setInferenceBusy(true);
-    setInferenceStatus(null);
     try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
       const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedRun.current_step_id,
+        step_id: selectedStepId ?? selectedRun.current_step_id,
         action: 'probe_browser',
         payload: {}
       });
-      setBrowserProbe((json.probe ?? null) as Record<string, unknown> | null);
-      await refreshEvents(selectedRun.id);
+      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
       setInferenceStatus('Browser probe completed.');
+      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1548,475 +1623,597 @@ export function WorkflowShell() {
     }
   }
 
-
-  async function removeRun(runId: string) {
-    await deleteRun(runId);
-    if (selectedRunId === runId) {
-      setSelectedRunId(null);
-      setViewMode('home');
-      setCapabilityOpen(false);
+  async function connectBrowserInferenceSession() {
+    if (!selectedRun) return;
+    try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
+      const json = await invokeModelInference(selectedRun.id, {
+        step_id: selectedStepId ?? selectedRun.current_step_id,
+        action: 'connect_browser_session',
+        payload: {}
+      });
+      setInferenceConnected(Boolean(json.connected ?? true));
+      setBrowserSessionId(typeof json.session_id === 'string' ? json.session_id : '');
+      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
+      setInferenceStatus(typeof json.ready === 'boolean' && json.ready ? 'Browser session connected and ready.' : 'Browser session connected. Waiting for readiness heartbeat.');
+      await refreshSelectedRunArtifacts();
+    } catch (err) {
+      setInferenceConnected(false);
+      setInferenceStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInferenceBusy(false);
     }
-    await refresh();
   }
+
+  async function disconnectBrowserInferenceSession() {
+    if (!selectedRun) return;
+    try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
+      await invokeModelInference(selectedRun.id, {
+        step_id: selectedStepId ?? selectedRun.current_step_id,
+        action: 'disconnect_browser_session',
+        payload: {}
+      });
+      setInferenceConnected(false);
+      setBrowserSessionId('');
+      setBrowserProbe(null);
+      setInferenceStatus('Browser session disconnected.');
+      await refreshSelectedRunArtifacts();
+    } catch (err) {
+      setInferenceStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInferenceBusy(false);
+      setInferencePollBusy(false);
+    }
+  }
+
+  function eventTone(event: WorkflowEvent): EventTone {
+    if (event.level === 'error') return { color: 'red', label: 'ERROR' };
+    if (event.level === 'warn') return { color: 'yellow', label: 'WARN' };
+    if (event.kind.includes('success') || event.kind.includes('completed')) return { color: 'green', label: 'SUCCESS' };
+    if (event.kind.includes('running') || event.kind.includes('executed')) return { color: 'blue', label: 'RUNNING' };
+    return { color: 'gray', label: 'INFO' };
+  }
+
+  function summarizeEvent(event: WorkflowEvent): string {
+    if (event.kind === 'stage_executed') {
+      const disposition = typeof event.payload?.disposition === 'string' ? event.payload.disposition : null;
+      return disposition ? `Stage executed: ${disposition}` : 'Stage executed';
+    }
+    if (event.kind === 'capability_executed') {
+      const node = typeof event.payload?.node === 'string' ? event.payload.node : null;
+      return node ? `Capability ${node} executed` : 'Capability executed';
+    }
+    if (event.kind === 'run_paused') return 'Run paused';
+    if (event.kind === 'run_created') return 'Run created';
+    return event.message;
+  }
+
+  function capabilityNameFromKind(kind: string): string {
+    return kind.replace(/_(started|completed|failed)$/u, '');
+  }
+
+  function formatCapabilityLabel(name: string): string {
+    return name
+      .split('_')
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(' ');
+  }
+
+  function formatDuration(startedAt?: string | null, completedAt?: string | null): string {
+    if (!startedAt) return 'duration —';
+    if (!completedAt) return 'running';
+    const startMs = new Date(startedAt).getTime();
+    const endMs = new Date(completedAt).getTime();
+    const deltaMs = Math.max(0, endMs - startMs);
+    if (deltaMs < 1000) return `${deltaMs} ms`;
+    const seconds = deltaMs / 1000;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.round(seconds % 60);
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+
+  function formatDurationMs(durationMs: number | null, fallbackStartedAt?: string | null, fallbackCompletedAt?: string | null): string {
+    if (typeof durationMs === 'number') {
+      if (durationMs < 1000) return `${durationMs} ms`;
+      const seconds = durationMs / 1000;
+      if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = Math.round(seconds % 60);
+      return `${minutes}m ${remainingSeconds}s`;
+    }
+    return formatDuration(fallbackStartedAt, fallbackCompletedAt);
+  }
+
+  function toggleExpandedSet(setter: React.Dispatch<React.SetStateAction<Set<string>>>, key: string) {
+    setter((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleStageExpanded(stepId: string, isCurrent: boolean) {
+    if (isCurrent) {
+      toggleExpandedSet(setCollapsedStageIds, stepId);
+      return;
+    }
+    toggleExpandedSet(setExpandedStageIds, stepId);
+  }
+
+  const stepOptions = builderSteps.map((step) => ({ value: step.id, label: `${step.name} (${step.id})` }));
 
   return (
     <AppShell padding="md">
       <AppShell.Main>
         <Stack>
           <Group justify="space-between">
+            <div>
+              <Title order={2}>Workflow Shell</Title>
+              <Text c="dimmed">Build templates declaratively and monitor background workflow runs.</Text>
+            </div>
             <Group>
-              {viewMode === 'workflow' ? (
-                <ActionIcon variant="light" onClick={() => setViewMode('home')}>
-                  <IconArrowLeft size={16} />
-                </ActionIcon>
-              ) : null}
-              <Title order={2}>{viewMode === 'home' ? 'Workflows' : selectedRun?.title ?? 'Workflow'}</Title>
-            </Group>
-
-            <Group>
-              <Button variant="light" leftSection={<IconRefresh size={16} />} onClick={() => void refresh()}>
-                Refresh
-              </Button>
-              {viewMode === 'home' ? (
-                <Button leftSection={<IconPlus size={16} />} onClick={() => setCreateOpen(true)}>
-                  Create workflow
-                </Button>
-              ) : (
-                <Button leftSection={<IconBolt size={16} />} onClick={() => setCapabilityOpen(true)} disabled={!selectedRun}>
-                  Global capability
-                </Button>
-              )}
+              <Button onClick={() => setView('builder')}>New workflow</Button>
+              <Button variant="light" onClick={() => setTemplateModalOpen(true)} disabled={view !== 'builder'}>Save template</Button>
+              <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => void refreshRunsAndTemplates()}>Refresh</Button>
             </Group>
           </Group>
 
           {error ? <Alert color="red">{error}</Alert> : null}
 
-          {viewMode === 'home' ? (
-            <Card withBorder>
+          {view === 'builder' ? (
+            <Modal opened={view === 'builder'} onClose={() => setView('monitor')} title="Create workflow" size="min(1400px, 96vw)" centered>
               <Stack>
-                <Group justify="space-between">
-                  <Title order={4}>Workflow list</Title>
-                  <Text c="dimmed" size="sm">Live status refreshes every 5 seconds</Text>
-                </Group>
-                <Table striped highlightOnHover>
-                  <Table.Thead>
-                    <Table.Tr>
-                      <Table.Th>Workflow</Table.Th>
-                      <Table.Th>Status</Table.Th>
-                      <Table.Th>Current step</Table.Th>
-                      <Table.Th>Repo</Table.Th>
-                      <Table.Th>Updated</Table.Th>
-                      <Table.Th>Actions</Table.Th>
-                    </Table.Tr>
-                  </Table.Thead>
-                  <Table.Tbody>
-                    {runs.map((run) => (
-                      <Table.Tr key={run.id} onClick={() => openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
-                        <Table.Td>{run.title}</Table.Td>
-                        <Table.Td><Badge>{run.status}</Badge></Table.Td>
-                        <Table.Td>{run.current_step_id ?? '—'}</Table.Td>
-                        <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
-                        <Table.Td>{new Date(run.updated_at).toLocaleString()}</Table.Td>
-                        <Table.Td>
-                          <Button
-                            color="red"
-                            variant="light"
-                            size="xs"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void removeRun(run.id);
-                            }}
-                          >
-                            Delete
-                          </Button>
-                        </Table.Td>
-                      </Table.Tr>
-                    ))}
-                  </Table.Tbody>
-                </Table>
-              </Stack>
-            </Card>
-          ) : selectedRun ? (
-            <Grid gutter="md" align="stretch">
-              <Grid.Col span={{ base: 12, xl: 8 }}>
+                <SimpleGrid cols={{ base: 1, xl: 2 }}>
                 <Card withBorder>
+                  <Stack>
+                    <Title order={4}>Workflow metadata</Title>
+                    <TextInput label="Workflow name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
+                    <Textarea label="Description" minRows={2} value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
+                    <TextInput label="Run title" value={runTitle} onChange={(e) => setRunTitle(e.currentTarget.value)} />
+                    <TextInput label="Repo path" placeholder="C:/repo or /home/user/repo" value={repoRef} onChange={(e) => setRepoRef(e.currentTarget.value)} />
+                    <Group>
+                      <Button onClick={() => void handleCreateRunFromTemplate(selectedTemplateId)} loading={busy} variant="default">Create run from selected template</Button>
+                      <Select style={{ flex: 1 }} label="Existing template" placeholder="Select saved template" data={templates.map((template) => ({ value: template.id, label: template.name }))} value={selectedTemplateId} onChange={setSelectedTemplateId} searchable clearable />
+                    </Group>
+                  </Stack>
+                </Card>
+
+                <Card withBorder>
+                  <Stack>
+                    <Group justify="space-between">
+                      <Title order={4}>Builder mode</Title>
+                      <SegmentedControl value={builderMode} onChange={(value) => setBuilderMode(value as BuilderMode)} data={[{ label: 'Visual', value: 'builder' }, { label: 'JSON', value: 'json' }]} />
+                    </Group>
+                    <Text c="dimmed" size="sm">Visual mode edits stages and transitions directly. JSON mode lets you inspect or override the template definition sent to the backend.</Text>
+                    {builderMode === 'json' ? (
+                      <JsonInput autosize minRows={20} value={jsonDraft} onChange={setJsonDraft} formatOnBlur />
+                    ) : (
+                      <Stack gap="md">
+                        {builderSteps.map((step, index) => (
+                          <Card withBorder key={step.id}>
+                            <Stack>
+                              <Group justify="space-between">
+                                <Group>
+                                  <Badge variant="light">{index + 1}</Badge>
+                                  <Text fw={600}>{step.name}</Text>
+                                  <Code>{step.id}</Code>
+                                </Group>
+                                <Badge color={step.automationMode === 'automatic' ? 'blue' : 'gray'}>{step.automationMode}</Badge>
+                              </Group>
+                              <Grid>
+                                <Grid.Col span={{ base: 12, md: 6 }}>
+                                  <TextInput label="Name" value={step.name} onChange={(e) => updateStep(step.id, { name: e.currentTarget.value })} />
+                                </Grid.Col>
+                                <Grid.Col span={{ base: 12, md: 6 }}>
+                                  <Select label="Automation" value={step.automationMode} onChange={(value) => value && updateStep(step.id, { automationMode: value as AutomationMode })} data={[{ value: 'manual', label: 'manual' }, { value: 'assisted', label: 'assisted' }, { value: 'automatic', label: 'automatic' }]} />
+                                </Grid.Col>
+                              </Grid>
+                              <SimpleGrid cols={{ base: 1, md: 2 }}>
+                                <Switch label="Include repo context" checked={step.includeRepoContext} onChange={(e) => updateStep(step.id, { includeRepoContext: e.currentTarget.checked })} />
+                                <Switch label="Include ChangeSet schema" checked={step.includeChangesetSchema} onChange={(e) => updateStep(step.id, { includeChangesetSchema: e.currentTarget.checked })} />
+                                <Switch label="Pause on enter" checked={step.pauseOnEnter} onChange={(e) => updateStep(step.id, { pauseOnEnter: e.currentTarget.checked })} />
+                                <Switch label="Auto-advance on success" checked={step.autoAdvanceOnSuccess} onChange={(e) => updateStep(step.id, { autoAdvanceOnSuccess: e.currentTarget.checked })} />
+                                <Switch label="Require manual approval" checked={step.requireManualApproval} onChange={(e) => updateStep(step.id, { requireManualApproval: e.currentTarget.checked })} disabled={step.id !== 'review'} />
+                              </SimpleGrid>
+                              {step.id === 'code' ? (
+                                <SimpleGrid cols={{ base: 1, md: 2 }}>
+                                  <Textarea label="Compile commands" minRows={3} value={step.compileCommands} onChange={(e) => updateStep(step.id, { compileCommands: e.currentTarget.value })} />
+                                  <TextInput label="Max apply failures" value={String(step.maxConsecutiveApplyFailures)} onChange={(e) => updateStep(step.id, { maxConsecutiveApplyFailures: Number(e.currentTarget.value || '1') })} />
+                                </SimpleGrid>
+                              ) : null}
+                              <Divider label="Transitions" />
+                              <SimpleGrid cols={{ base: 1, md: 3 }}>
+                                <Select label="On success →" value={step.transitions.successTarget} data={[{ value: '', label: 'End workflow' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { successTarget: value ?? '' })} />
+                                <Select label="On error →" value={step.transitions.errorTarget} data={[{ value: '', label: 'Stop on error' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { errorTarget: value ?? '' })} />
+                                <Select label="On paused →" value={step.transitions.pausedTarget} data={[{ value: '', label: 'Wait on current step' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { pausedTarget: value ?? '' })} />
+                              </SimpleGrid>
+                            </Stack>
+                          </Card>
+                        ))}
+                      </Stack>
+                    )}
+                  </Stack>
+                </Card>
+                </SimpleGrid>
+                <Group justify="flex-end">
+                  <Button variant="default" onClick={() => setView('monitor')}>Close</Button>
+                  <Button variant="light" onClick={() => setTemplateModalOpen(true)}>Save template</Button>
+                </Group>
+              </Stack>
+            </Modal>
+          ) : monitorView === 'workflow_list' ? (
+            <Stack>
+              <Card withBorder>
                 <Stack>
                   <Group justify="space-between">
-                    <Title order={4}>Workflow detail</Title>
-                    <Badge>{selectedRun.status}</Badge>
+                    <Title order={4}>Workflow list</Title>
+                    <Text c="dimmed" size="sm">Open a workflow to inspect logs and control execution.</Text>
                   </Group>
-                  <Text fw={600}>{selectedRun.title}</Text>
-                  <Code>{selectedRun.repo_ref}</Code>
-                  <Text size="sm" c="dimmed">Current step: {selectedRun.current_step_id ?? '—'}</Text>
-
-                  <Divider />
-                  <Title order={5}>Workflow stages</Title>
-                  {selectedTemplate && selectedTemplate.definition.steps.length ? (
-                    <Group justify="space-between">
-                      <Group>
-                        <Button size="xs" variant="light" onClick={() => void previousWorkflowStep(selectedRun.id)}>
-                          Previous stage
-                        </Button>
-                        <Button size="xs" onClick={() => void runStage(selectedRun.current_step_id ?? undefined)}>
-                          Run stage
-                        </Button>
-                        <Button size="xs" variant="light" onClick={() => void nextWorkflowStep(selectedRun.id)}>
-                          Next stage
-                        </Button>
-                      </Group>
-                    </Group>
-                  ) : null}
-                  {selectedTemplate ? (
-                    <Stack gap="xs">
-                      {selectedTemplate.definition.steps.map((step, index) => {
-                        const isCurrent = selectedRun.current_step_id === step.id;
-                        return (
-                          <Box
-                            key={step.id}
-                            p="sm"
-                            style={{
-                              border: isCurrent ? '1px solid var(--mantine-color-blue-4)' : '1px solid var(--mantine-color-dark-4)',
-                              background: isCurrent ? 'rgba(34, 139, 230, 0.12)' : 'transparent',
-                              borderRadius: 8
-                            }}
-                          >
-                            <Group justify="space-between" align="start">
-                              <div>
-                                <Group gap="xs">
-                                  <Badge variant={isCurrent ? 'filled' : 'light'} color={isCurrent ? 'blue' : 'gray'}>
-                                    {index + 1}
-                                  </Badge>
-                                  <Text fw={700}>{step.name}</Text>
-                                  <Badge variant="light">{step.automation_mode}</Badge>
-                                  {isCurrent ? <Badge color="blue">CURRENT</Badge> : null}
-                                </Group>
-                                <Text size="sm" c="dimmed" mt={4}>{step.id}</Text>
-                              </div>
-                              <Group>
-                                <Button size="xs" variant="light" onClick={() => void moveToStage(step.id)}>
-                                  Select stage
-                                </Button>
-                              </Group>
+                  <Table striped highlightOnHover>
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>Workflow</Table.Th>
+                        <Table.Th>Status</Table.Th>
+                        <Table.Th>Current step</Table.Th>
+                        <Table.Th>Repo</Table.Th>
+                        <Table.Th>Updated</Table.Th>
+                        <Table.Th>Actions</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {runs.map((run) => (
+                        <Table.Tr key={run.id} onClick={() => void openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
+                          <Table.Td>{run.title}</Table.Td>
+                          <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
+                          <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
+                          <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
+                          <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
+                          <Table.Td>
+                            <Group gap="xs">
+                              <Button size="xs" variant="light" onClick={(e) => { e.stopPropagation(); void openWorkflow(run.id); }}>Open</Button>
+                              <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
                             </Group>
-                            {isCurrent && currentStepDefinition ? (
-                              <Stack gap="sm" mt="md">
-                                <Textarea
-                                  label="User input"
-                                  minRows={4}
-                                  value={stepFragmentValues.user_input}
-                                  onChange={(e) => patchStepFragmentValue('user_input', e.currentTarget.value)}
-                                  placeholder="Enter the message for the current step"
-                                />
+                          </Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                </Stack>
+              </Card>
 
-                                <Group align="end" gap="sm">
-                                  <Checkbox
-                                    checked={stepFragmentEnabled.repo_context}
-                                    onChange={(e) => patchStepFragmentEnabled('repo_context', e.currentTarget.checked)}
-                                    label="Include repo fragment"
-                                  />
-                                  <Button
-                                    size="xs"
-                                    variant="light"
-                                    onClick={() => openContextExporter()}
-                                    disabled={!selectedRun}
-                                  >
-                                    Context exporter
-                                  </Button>
+              <Card withBorder>
+                <Stack>
+                  <Group justify="space-between">
+                    <Title order={4}>Global summary</Title>
+                    <Button variant="light" size="xs" onClick={() => void refreshAllWorkflowSummaries()}>Refresh summary</Button>
+                  </Group>
+                  {Object.keys(allWorkflowEvents).length === 0 ? (
+                    <Text c="dimmed">No active workflow summaries yet.</Text>
+                  ) : (
+                    <Stack>
+                      {runs.filter((run) => allWorkflowEvents[run.id]?.length).map((run) => {
+                        const latestEvent = allWorkflowEvents[run.id][allWorkflowEvents[run.id].length - 1] ?? null;
+                        return (
+                          <Card key={run.id} withBorder>
+                            <Group justify="space-between" align="flex-start">
+                              <Stack gap={4}>
+                                <Text fw={600}>{run.title}</Text>
+                                <Text size="sm" c="dimmed">{run.repo_ref}</Text>
+                                <Group gap="xs">
+                                  <Badge color={statusColor(run.status)}>{run.status}</Badge>
+                                  <Code>{run.current_step_id ?? '-'}</Code>
                                 </Group>
-
-                                {isCodeStep ? (
-                                  <>
-                                    <Group align="end" gap="sm">
-                                      <Checkbox
-                                        checked={stepFragmentEnabled.changeset_schema}
-                                        onChange={(e) => patchStepFragmentEnabled('changeset_schema', e.currentTarget.checked)}
-                                        label="Include changeset schema fragment"
-                                      />
-                                      <Button
-                                        size="xs"
-                                        variant="light"
-                                        onClick={() => void openChangesetSchemaConfigurator()}
-                                      >
-                                        Configure schema
-                                      </Button>
-                                    </Group>
-                                    {stepFragmentEnabled.changeset_schema ? (
-                                      <Text size="sm" c="dimmed">
-                                        {stepFragmentValues.changeset_schema.trim()
-                                          ? `Schema configured (${stepFragmentValues.changeset_schema.length} chars)`
-                                          : 'No schema configured yet.'}
-                                      </Text>
-                                    ) : null}
-
-                                    <Group align="end" gap="sm">
-                                      <Checkbox
-                                        checked={stepFragmentEnabled.apply_error}
-                                        onChange={(e) => patchStepFragmentEnabled('apply_error', e.currentTarget.checked)}
-                                        label="Include apply error fragment"
-                                      />
-                                      <Button
-                                        size="xs"
-                                        variant="light"
-                                        onClick={() => openApplyErrorConfigurator()}
-                                      >
-                                        Configure apply error
-                                      </Button>
-                                    </Group>
-                                    {stepFragmentEnabled.apply_error ? (
-                                      <Text size="sm" c="dimmed">
-                                        {stepFragmentValues.apply_error.trim()
-                                          ? `Apply error configured (${stepFragmentValues.apply_error.length} chars)`
-                                          : 'No apply error configured yet.'}
-                                      </Text>
-                                    ) : null}
-
-                                    <Group align="end" gap="sm">
-                                      <Checkbox
-                                        checked={stepFragmentEnabled.compile_error}
-                                        onChange={(e) => patchStepFragmentEnabled('compile_error', e.currentTarget.checked)}
-                                        label="Include compile error fragment"
-                                      />
-                                      <Button
-                                        size="xs"
-                                        variant="light"
-                                        onClick={() => openCompileErrorConfigurator()}
-                                      >
-                                        Configure compile error
-                                      </Button>
-                                    </Group>
-                                    {stepFragmentEnabled.compile_error ? (
-                                      <Text size="sm" c="dimmed">
-                                        {stepFragmentValues.compile_error.trim()
-                                          ? `Compile error configured (${stepFragmentValues.compile_error.length} chars)`
-                                          : 'No compile error configured yet.'}
-                                      </Text>
-                                    ) : null}
-                                  </>
-                                ) : null}
-
-                                {renderComposedPromptPreviewPanel('No prompt fragments enabled yet.')}
-
-                                {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-                                {renderInferenceResponsePanel('No inference response yet.')}
                               </Stack>
-                            ) : null}
-                          </Box>
+                              <Stack gap={4} align="flex-end">
+                                <Text size="xs" c="dimmed">{latestEvent ? formatTimestamp(latestEvent.created_at) : '-'}</Text>
+                                <Text size="sm">{latestEvent ? summarizeEvent(latestEvent) : 'No events'}</Text>
+                              </Stack>
+                            </Group>
+                          </Card>
                         );
                       })}
                     </Stack>
-                  ) : (
-                    <Alert color="gray">This run has no template definition attached, so stage structure cannot be shown.</Alert>
                   )}
-
-                  <Divider />
-                  <Title order={5}>Inference connection</Title>
-                  <Stack gap="xs">
-                    <Group>
-                      {inferenceProvider === 'api' ? <Badge variant="light">Model: {inferenceModel}</Badge> : null}
-                      <Badge color={inferenceConnectionStatus.color}>{inferenceConnectionStatus.label}</Badge>
-                    </Group>
-                    <TextInput label="Target URL" value={browserTargetUrl} onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)} />
-                    <TextInput label="CDP URL" value={browserCdpUrl} onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)} />
-                    <Group>
-                      <Button size="xs" onClick={() => void configureInference()} loading={inferenceBusy}>Save config</Button>
-                      <Button size="xs" onClick={() => void launchBrowserInference()} loading={inferenceBusy}>Launch + attach</Button>
-                      <Button size="xs" variant="light" onClick={() => void openBrowserInferenceUrl()} loading={inferenceBusy}>Open URL</Button>
-                      <Button size="xs" variant="light" onClick={() => void probeBrowserInference()} loading={inferenceBusy}>Probe</Button>
-                    </Group>
-                    {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-                    {browserProbe ? <Code block>{JSON.stringify(browserProbe, null, 2)}</Code> : null}
-                  </Stack>
-
-                  <Divider />
-                  <Title order={5}>Global capabilities</Title>
-                  <Group>
-                    <Button variant="light" onClick={() => { setActiveCapability('context_export'); setCapabilityOpen(true); }}>Context exporter</Button>
-                    <Button variant="light" onClick={() => { setActiveCapability('model_inference'); setCapabilityOpen(true); }}>Model inference</Button>
-                    <Button variant="light" onClick={() => { setActiveCapability('inject_user_context'); setCapabilityOpen(true); }}>Inject user context</Button>
-                    <Button variant="light" onClick={() => { setActiveCapability('inject_changeset_schema'); setCapabilityOpen(true); }}>Inject changeset schema</Button>
-                  </Group>
                 </Stack>
-                </Card>
-              </Grid.Col>
+              </Card>
+            </Stack>
+          ) : (
+            <Grid align="start">
+              <Grid.Col span={{ base: 12, xl: 7 }}>
+                <Stack>
+                  <Card withBorder>
+                    {selectedRun ? (
+                      <Stack>
+                        <Group justify="space-between">
+                          <Group>
+                            <Button variant="light" onClick={backToWorkflowList}>Back to workflows</Button>
+                            <div>
+                              <Title order={4}>{selectedRun.title}</Title>
+                              <Text c="dimmed">{selectedRun.repo_ref}</Text>
+                            </div>
+                          </Group>
+                          <Badge color={statusColor(selectedRun.status)}>{selectedRun.status}</Badge>
+                        </Group>
+                        <Stack gap="md">
+                          <Group>
+                            <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy}>Start</Button>
+                            <Button variant="light" leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleResumeRun()} loading={busy}>Resume</Button>
+                            <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy}>Pause</Button>
+                            <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
+                          </Group>
+                          <Card withBorder>
+                            <Stack gap="md">
+                              <Group justify="space-between" align="center">
+                                <Title order={6}>Workflow controls</Title>
+                                <SegmentedControl value={operatorMode} onChange={(value) => setOperatorMode(value as OperatorMode)} data={[{ label: 'Auto', value: 'auto' }, { label: 'Manual', value: 'manual' }]} />
+                              </Group>
+                              <SimpleGrid cols={{ base: 1, md: 3 }}>
+                                <Select label="Selected step" data={selectedRunTemplate?.definition.steps.map((step) => ({ value: step.id, label: `${step.name} (${step.id})` })) ?? []} value={selectedStepId} onChange={(value) => setSelectedStepId(value)} clearable={false} />
+                                <Stack gap="xs">
+                                  <Text size="sm">Current template step</Text>
+                                  <Code>{selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? '-'}</Code>
+                                </Stack>
+                                <Stack gap="xs">
+                                  <Text size="sm">Automation</Text>
+                                  <Badge>{selectedWorkflowStep?.automation_mode ?? '-'}</Badge>
+                                </Stack>
+                              </SimpleGrid>
+                              <Group>
+                                <Button variant="default" onClick={() => void handleManualPreviousStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy}>Previous step</Button>
+                                <Button variant="default" onClick={() => selectedStepId && void handleManualSelectStep(selectedStepId)} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Select step</Button>
+                                <Button variant="default" onClick={() => void handleManualNextStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy}>Next step</Button>
+                                <Button onClick={() => void handleManualRunCurrentStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy} loading={manualCapabilityBusy}>Run current step</Button>
+                              </Group>
+                            </Stack>
+                          </Card>
+                        </Stack>
+                        <Card withBorder>
+                          <Stack gap="md">
+                            <Group justify="space-between" align="flex-start">
+                              <Stack gap="xs">
+                                <Text fw={600}>Run overview</Text>
+                                <Group gap="xs" wrap="wrap">
+                                  <Badge color={statusColor(selectedRun.status)}>{selectedRun.status}</Badge>
+                                  <Badge variant="light">Current: {selectedRun.current_step_id ?? '-'}</Badge>
+                                  <Badge variant="light">Polling: {(selectedRun.status === 'queued' || selectedRun.status === 'running') ? 'active' : 'idle'}</Badge>
+                                </Group>
+                              </Stack>
+                              <Code>{selectedRun.id}</Code>
+                            </Group>
+                            <SimpleGrid cols={{ base: 1, md: 3 }}>
+                              <Box>
+                                <Text size="xs" c="dimmed">Template</Text>
+                                <Text size="sm"><Code>{selectedRun.template_id ?? '-'}</Code></Text>
+                              </Box>
+                              <Box>
+                                <Text size="xs" c="dimmed">Created</Text>
+                                <Text size="sm">{formatTimestamp(selectedRun.created_at)}</Text>
+                              </Box>
+                              <Box>
+                                <Text size="xs" c="dimmed">Updated</Text>
+                                <Text size="sm">{formatTimestamp(selectedRun.updated_at)}</Text>
+                              </Box>
+                            </SimpleGrid>
+                            <Divider />
+                            <Stack gap="md">
+                              <Text fw={600}>Workflow progress</Text>
+                              {selectedRunTemplate ? (
+                                <Group gap="sm" wrap="wrap" align="stretch">
+                                  {selectedRunTemplate.definition.steps.map((step, index) => {
+                                    const isCurrent = selectedRun?.current_step_id === step.id;
+                                    const currentIndex = selectedRunTemplate.definition.steps.findIndex((item) => item.id === selectedRun?.current_step_id);
+                                    const isCompleted = currentIndex >= 0 && index < currentIndex;
+                                    const color = isCurrent ? 'blue' : isCompleted ? 'green' : 'gray';
+                                    return (
+                                      <Group key={step.id} gap="sm" wrap="nowrap" align="center">
+                                        <Box
+                                          p="md"
+                                          style={{
+                                            minWidth: 180,
+                                            borderRadius: 12,
+                                            border: `1px solid var(--mantine-color-${color}-6)`,
+                                            background: isCurrent
+                                              ? 'rgba(34, 139, 230, 0.14)'
+                                              : isCompleted
+                                                ? 'rgba(64, 192, 87, 0.12)'
+                                                : 'rgba(255,255,255,0.02)'
+                                          }}
+                                        >
+                                          <Stack gap={6}>
+                                            <Badge color={color} variant={isCurrent ? 'filled' : 'light'} style={{ alignSelf: 'flex-start' }}>
+                                              {index + 1}
+                                            </Badge>
+                                            <Text fw={600}>{step.name}</Text>
+                                            <Text size="xs" c="dimmed">{step.automation_mode}</Text>
+                                            <Badge color={color} variant={isCurrent ? 'filled' : 'light'} style={{ alignSelf: 'flex-start' }}>
+                                              {isCurrent ? 'ACTIVE' : isCompleted ? 'DONE' : 'UP NEXT'}
+                                            </Badge>
+                                          </Stack>
+                                        </Box>
+                                        {index < selectedRunTemplate.definition.steps.length - 1 ? <Text c="dimmed" fw={700}>→</Text> : null}
+                                      </Group>
+                                    );
+                                  })}
+                                </Group>
+                              ) : (
+                                <Text c="dimmed">The selected run is not linked to a loaded template.</Text>
+                              )}
+                            </Stack>
+                          </Stack>
+                        </Card>
+                      </Stack>
+                    ) : (
+                      <Text c="dimmed">No workflow selected.</Text>
+                    )}
+                  </Card>
 
-              <Grid.Col span={{ base: 12, xl: 4 }}>
-                <Card withBorder style={{ height: 'calc(100vh - 140px)' }}>
-                <Stack h="100%">
-                  <Title order={4}>Live workflow events</Title>
-                  <ScrollArea style={{ flex: 1 }} offsetScrollbars>
-                    <Stack gap="xs">
-                      {events.length === 0 ? (
-                        <Text c="dimmed">No events yet.</Text>
-                      ) : (
-                        <Stack gap="sm">
-                          {eventsByStage.map((stageGroup) => {
-                            const stageKey = stageGroup.stepId;
-                            const stageHistoryExpanded = stageGroup.isCurrent && expandedStageHistoryIds.has(stageKey);
-                            const visibleStageEvents = stageGroup.isCurrent && !stageHistoryExpanded
-                              ? stageGroup.events.slice(0, 4)
-                              : stageGroup.events;
-                            const hiddenEventCount = Math.max(stageGroup.events.length - visibleStageEvents.length, 0);
-                            const stageExpanded = stageGroup.isCurrent
-                              ? !collapsedStageIds.has(stageKey)
-                              : expandedStageIds.has(stageKey);
-                            const latestTone = stageGroup.latest ? eventTone(stageGroup.latest) : { color: 'gray', label: 'IDLE' };
+                  <Card withBorder>
+                    <Stack>
+                      <Grid align="stretch">
+                        <Grid.Col span={{ base: 12, xl: 4 }}>
+                          <Stack>
+                            <Card withBorder>
+                              <InferenceConnectionCard
+                                inferenceConnectionStatus={inferenceConnectionStatus}
+                                inferenceReady={inferenceReady}
+                                inferenceSummaryText={inferenceSummaryText}
+                                inferenceTransport={inferenceTransport}
+                                inferenceModel={inferenceModel}
+                                browserTargetUrl={browserTargetUrl}
+                                browserCdpUrl={browserCdpUrl}
+                                browserSessionId={browserSessionId}
+                                browserProbe={browserProbe}
+                                inferenceBusy={inferenceBusy}
+                                inferencePollBusy={inferencePollBusy}
+                                inferenceStatus={inferenceStatus}
+                                inferenceConfigOpen={inferenceConfigOpen}
+                                onOpenConfig={() => setInferenceConfigOpen(true)}
+                                onCloseConfig={() => setInferenceConfigOpen(false)}
+                                onTransportChange={(value) => setInferenceTransport(value)}
+                                onModelChange={setInferenceModel}
+                                onBrowserTargetUrlChange={setBrowserTargetUrl}
+                                onBrowserCdpUrlChange={setBrowserCdpUrl}
+                                onSaveConfig={() => void configureInference()}
+                                onConnectBrowser={() => void connectBrowserInferenceSession()}
+                                onDisconnectBrowser={() => void disconnectBrowserInferenceSession()}
+                              />
+                            </Card>
 
+                            {!inferenceRequiresConnection || inferenceReady ? (
+                              <>
+                                <StageInputsPanel
+                                  selectedWorkflowStep={selectedWorkflowStep}
+                                  stageUserInput={stageUserInput}
+                                  stageIncludeRepoContext={stageIncludeRepoContext}
+                                  stageIncludeChangesetSchema={stageIncludeChangesetSchema}
+                                  onStageUserInputChange={setStageUserInput}
+                                  onStageIncludeRepoContextChange={setStageIncludeRepoContext}
+                                  onStageIncludeChangesetSchemaChange={setStageIncludeChangesetSchema}
+                                  onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
+                                  onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
+                                  onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
+                                  onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
+                                />
+
+                                <Group>
+                                  <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
+                                  <Button size="md" onClick={() => void handleManualRunWithPatchedState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy} loading={manualCapabilityBusy}>Run stage</Button>
+                                  <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
+                                </Group>
+                              </>
+                            ) : null}
+                          </Stack>
+                        </Grid.Col>
+                        <Grid.Col span={{ base: 12, xl: 8 }} style={{ display: 'flex' }}>
+                          <Box style={{ flex: 1 }}>
+                            {showStageStream ? <StageStreamPanel renderStageStreamPanel={renderStageStreamPanel} /> : null}
+                          </Box>
+                        </Grid.Col>
+                      </Grid>
+
+                      {!inferenceRequiresConnection || inferenceReady ? null : (
+                        <Alert color="yellow">Inference connection required before stage inputs are available for this step.</Alert>
+                      )}
+
+                      {manualCapabilityStatus ? <Alert color={manualCapabilityStatus.toLowerCase().includes('error') ? 'red' : 'blue'}>{manualCapabilityStatus}</Alert> : null}
+                    </Stack>
+                  </Card>
+                  </Stack>
+                </Grid.Col>
+
+                <Grid.Col span={{ base: 12, xl: 5 }}>
+                  <Card withBorder style={{ height: '100%' }}>
+                    <Stack h="100%">
+                      <Group justify="space-between">
+                        <Title order={5}>Live workflow events</Title>
+                        <Button variant="light" size="xs" onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh events</Button>
+                      </Group>
+                      {liveExecutionTrails.length > 0 ? (
+                        <Stack gap="xs">
+                          {liveExecutionTrails.map((trail, index) => {
+                            const trailExpanded = isLiveExecutionExpanded(trail);
+                            const executionState = liveExecutionChains[trail.key] ?? { loading: false, error: null, chain: null };
+                            const rawEvents = (executionState.chain?.items ?? []).slice().sort((a, b) => b.sequence_no - a.sequence_no);
                             return (
                               <Box
-                                key={stageKey}
+                                key={trail.key}
                                 p="sm"
                                 style={{
-                                  border: stageGroup.isCurrent ? '1px solid var(--mantine-color-blue-4)' : '1px solid var(--mantine-color-dark-4)',
+                                  border: trail.isCurrent ? '1px solid var(--mantine-color-blue-4)' : '1px solid var(--mantine-color-dark-4)',
                                   borderRadius: 10,
-                                  background: stageGroup.isCurrent ? 'rgba(34, 139, 230, 0.08)' : 'rgba(255,255,255,0.02)'
+                                  background: trail.isCurrent ? 'rgba(34, 139, 230, 0.08)' : 'rgba(255,255,255,0.02)'
                                 }}
                               >
                                 <Group justify="space-between" align="flex-start" wrap="nowrap">
                                   <Stack gap={4} style={{ flex: 1 }}>
                                     <Group gap="xs" wrap="wrap">
-                                      <Badge color={stageGroup.isCurrent ? 'blue' : latestTone.color}>
-                                        {stageGroup.isCurrent ? 'CURRENT STAGE' : latestTone.label}
-                                      </Badge>
-                                      <Badge variant="light">{stageGroup.label}</Badge>
+                                      <Badge color={trail.isCurrent ? 'blue' : trail.isActive ? 'blue' : 'gray'}>{trail.isCurrent ? 'CURRENT' : trail.isActive ? 'ACTIVE' : 'COMPLETE'}</Badge>
+                                      <Badge variant="light">{trail.label}</Badge>
+                                      {trail.stepId !== '__ungrouped__' ? <Code>{trail.stepId}</Code> : null}
+                                      <Code>{trail.stageExecutionId}</Code>
                                     </Group>
-                                    <Text size="xs" c="dimmed">
-                                      {visibleStageEvents.length} of {stageGroup.events.length} event{stageGroup.events.length === 1 ? '' : 's'} shown
-                                    </Text>
+                                    <Text size="xs" c="dimmed">position {index + 1} • latest {formatTimestamp(trail.latestCreatedAt)} • elapsed {formatDurationMs(trail.durationMs, null, null)}</Text>
                                   </Stack>
-
-                                  <Group gap="xs">
-                                    {stageGroup.isCurrent && stageGroup.events.length > 4 ? (
-                                      <Button
-                                        size="xs"
-                                        variant="subtle"
-                                        onClick={() => toggleStageHistoryExpanded(stageKey)}
-                                      >
-                                        {stageHistoryExpanded ? 'Show recent only' : `Show ${hiddenEventCount} earlier`}
-                                      </Button>
-                                    ) : null}
-                                    <Button
-                                      size="xs"
-                                      variant="subtle"
-                                      onClick={() => toggleStageExpanded(stageKey, stageGroup.isCurrent)}
-                                    >
-                                      {stageExpanded ? 'Collapse stage' : 'Expand stage'}
-                                    </Button>
-                                  </Group>
-                                </Group>
-
-                                {stageExpanded ? (
-                                  <Stack gap="xs" mt="sm">
-                                    {buildStageEventItems(visibleStageEvents).map((item) => {
-                                      if (item.type === 'single') {
-                                        const event = item.event;
-                                        const tone = eventTone(event);
-                                        const expanded = expandedEventIds.has(event.id);
-                                        const summary = summarizeEvent(event);
-
-                                        return (
-                                          <Box
-                                            key={item.key}
-                                            p="sm"
-                                            ml="md"
-                                            style={{
-                                              borderLeft: `3px solid var(--mantine-color-${tone.color}-6)`,
-                                              borderRadius: 8,
-                                              background: 'rgba(255,255,255,0.015)'
-                                            }}
-                                          >
-                                            <Group justify="space-between" align="flex-start" wrap="nowrap">
-                                              <Stack gap={4} style={{ flex: 1 }}>
-                                                <Group gap="xs" wrap="wrap">
-                                                  <Badge color={tone.color}>{tone.label}</Badge>
-                                                  <Badge variant="light">{event.kind}</Badge>
-                                                  <Text fw={600} size="sm">{summary}</Text>
-                                                </Group>
-                                                {summary !== event.message ? (
-                                                  <Text size="xs" c="dimmed">{event.message}</Text>
-                                                ) : null}
-                                              </Stack>
-
-                                              <Stack gap={6} align="flex-end">
-                                                <Text size="xs" c="dimmed">{new Date(event.created_at).toLocaleString()}</Text>
-                                                <Button
-                                                  size="xs"
-                                                  variant="subtle"
-                                                  onClick={() => toggleEventExpanded(event.id)}
-                                                >
-                                                  {expanded ? 'Hide raw JSON' : 'Show raw JSON'}
-                                                </Button>
-                                              </Stack>
-                                            </Group>
-
-                                            {expanded ? (
-                                              <Box mt="sm">
-                                                <Code block>{JSON.stringify(event.payload, null, 2)}</Code>
-                                              </Box>
-                                            ) : null}
-                                          </Box>
-                                        );
+                                  <Button
+                                    size="xs"
+                                    variant="subtle"
+                                    onClick={() => {
+                                      toggleLiveExecutionExpanded(trail);
+                                      if (!trailExpanded) {
+                                        void ensureLiveExecutionChainLoaded(trail);
                                       }
+                                    }}
+                                  >
+                                    {trailExpanded ? 'Collapse execution' : 'Expand execution'}
+                                  </Button>
+                                </Group>
+                                {trailExpanded ? (
+                                  <Stack gap="xs" mt="sm">
 
-                                      const summaryEvent = item.summaryEvent;
-                                      const tone = eventTone(summaryEvent);
-                                      const expanded = expandedEventIds.has(item.key);
-                                      const summary = summarizeEvent(summaryEvent);
+                                    <Divider label="Events" labelPosition="left" />
 
+                                    {executionState.loading ? <Loader size="sm" /> : null}
+                                    {executionState.error ? <Alert color="red">{executionState.error}</Alert> : null}
+                                    {!executionState.loading && !executionState.error && rawEvents.length === 0 ? (
+                                      <Text size="sm" c="dimmed">No execution events loaded.</Text>
+                                    ) : null}
+
+                                    {rawEvents.map((event) => {
+                                      const eventExpanded = expandedLiveEventIds.has(event.id);
                                       return (
                                         <Box
-                                          key={item.key}
+                                          key={event.id}
                                           p="sm"
-                                          ml="md"
                                           style={{
-                                            borderLeft: `3px solid var(--mantine-color-${tone.color}-6)`,
+                                            border: '1px solid var(--mantine-color-dark-4)',
                                             borderRadius: 8,
-                                            background: 'rgba(255,255,255,0.015)'
+                                            background: 'rgba(255,255,255,0.02)'
                                           }}
                                         >
                                           <Group justify="space-between" align="flex-start" wrap="nowrap">
                                             <Stack gap={4} style={{ flex: 1 }}>
                                               <Group gap="xs" wrap="wrap">
-                                                <Badge color={tone.color}>{tone.label}</Badge>
-                                                <Badge variant="light">{item.capabilityKey}</Badge>
-                                                <Text fw={600} size="sm">{summary}</Text>
-                                                {item.runtimeLabel ? <Badge variant="outline">{item.runtimeLabel}</Badge> : null}
+                                                <Badge variant="light">{event.kind}</Badge>
+                                                <Badge color={event.level === 'error' ? 'red' : event.level === 'warn' ? 'yellow' : 'gray'}>{event.level.toUpperCase()}</Badge>
+                                                <Text size="xs" c="dimmed">#{event.sequence_no}</Text>
+                                                {event.capability_invocation_id ? <Code>{event.capability_invocation_id}</Code> : null}
                                               </Group>
-                                              <Text size="xs" c="dimmed">
-                                                {item.childEvents.length} lifecycle event{item.childEvents.length === 1 ? '' : 's'}
-                                              </Text>
+                                              <Text size="sm">{event.message}</Text>
+                                              <Text size="xs" c="dimmed">{formatTimestamp(event.created_at)}</Text>
                                             </Stack>
-
-                                            <Stack gap={6} align="flex-end">
-                                              <Text size="xs" c="dimmed">{new Date(summaryEvent.created_at).toLocaleString()}</Text>
-                                              <Button
-                                                size="xs"
-                                                variant="subtle"
-                                                onClick={() => toggleEventExpanded(item.key)}
-                                              >
-                                                {expanded ? 'Hide capability logs' : 'Show capability logs'}
-                                              </Button>
-                                            </Stack>
+                                            <Button size="xs" variant="subtle" onClick={() => toggleLiveEventExpanded(event.id)}>
+                                              {eventExpanded ? 'Hide raw JSON' : 'Show raw JSON'}
+                                            </Button>
                                           </Group>
-
-                                          {expanded ? (
-                                            <Stack gap="xs" mt="sm">
-                                              {item.childEvents.slice().reverse().map((event) => (
-                                                <Box key={event.id} p="xs" style={{ borderRadius: 8, background: 'rgba(255,255,255,0.02)' }}>
-                                                  <Group justify="space-between" align="flex-start" wrap="nowrap">
-                                                    <Stack gap={4} style={{ flex: 1 }}>
-                                                      <Group gap="xs" wrap="wrap">
-                                                        <Badge variant="light">{event.kind}</Badge>
-                                                        <Text size="sm" fw={500}>{event.message}</Text>
-                                                      </Group>
-                                                    </Stack>
-                                                    <Text size="xs" c="dimmed">{new Date(event.created_at).toLocaleString()}</Text>
-                                                  </Group>
-                                                  <Box mt="xs">
-                                                    <Code block>{JSON.stringify(event.payload, null, 2)}</Code>
-                                                  </Box>
-                                                </Box>
-                                              ))}
-                                            </Stack>
+                                          {eventExpanded ? (
+                                            <ScrollArea mt="sm" offsetScrollbars>
+                                              <Code block>{JSON.stringify(event.payload ?? {}, null, 2)}</Code>
+                                            </ScrollArea>
                                           ) : null}
                                         </Box>
                                       );
@@ -2027,161 +2224,122 @@ export function WorkflowShell() {
                             );
                           })}
                         </Stack>
-                      )}
+                      ) : null}
+                      {liveExecutionTrails.length === 0 ? (
+                        <Text c="dimmed">No live executions yet.</Text>
+                      ) : null}
                     </Stack>
-                    </ScrollArea>
-                  </Stack>
-                </Card>
-              </Grid.Col>
-            </Grid>
-          ) : (
-            <Alert color="gray">Select a workflow run from the home page.</Alert>
+                  </Card>
+                </Grid.Col>
+              </Grid>
           )}
         </Stack>
 
-        <Modal
-          opened={changesetSchemaConfigOpen}
-          onClose={() => setChangesetSchemaConfigOpen(false)}
-          title="Changeset schema fragment"
-          size="80%"
-          centered
-        >
+        <Modal opened={repoContextConfigOpen} onClose={() => setRepoContextConfigOpen(false)} title="Repo fragment" size="80%" centered>
+          <Stack>
+            <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(e) => setStageRepoContextGitRef(e.currentTarget.value)} placeholder="WORKTREE" />
+            <TextInput label="Save path" value={stageRepoContextSavePath} onChange={(e) => setStageRepoContextSavePath(e.currentTarget.value)} placeholder="/tmp/repo_context.txt" />
+            <SimpleGrid cols={{ base: 1, md: 2 }}>
+              <Switch label="Skip binary" checked={stageRepoContextSkipBinary} onChange={(e) => setStageRepoContextSkipBinary(e.currentTarget.checked)} />
+              <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(e) => setStageRepoContextSkipGitignore(e.currentTarget.checked)} />
+              <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(e) => setStageRepoContextIncludeStagedDiff(e.currentTarget.checked)} />
+              <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(e) => setStageRepoContextIncludeUnstagedDiff(e.currentTarget.checked)} />
+            </SimpleGrid>
+            <Group justify="space-between">
+              <Group>
+                <Button size="xs" variant="light" onClick={() => { if (selectedRun) void loadTreeDir(selectedRun, '', true); }} disabled={!selectedRun}>
+                  Refresh tree
+                </Button>
+                <Button size="xs" variant="light" onClick={() => { setSelectedRepoPaths([]); setSelectedRepoDirs(new Set()); }}>
+                  Clear selection
+                </Button>
+                <Button size="xs" variant="light" onClick={() => {
+                  const allVisibleFiles = collectLoadedFilePaths('', treeChildrenByParent);
+                  setSelectedRepoDirs(new Set(rootTreeEntries.filter((entry) => entry.kind === 'dir').map((entry) => entry.path)));
+                  setPaths(allVisibleFiles, true);
+                }}>
+                  Select loaded files
+                </Button>
+              </Group>
+              <Text size="sm">Selected files: <Code>{selectedRepoPaths.length}</Code></Text>
+            </Group>
+            {treeError ? <Alert color="red">{treeError}</Alert> : null}
+            {treeRootData ? <Text size="sm" c="dimmed">Refreshed {treeRootData.refreshed_at}</Text> : null}
+            {treeBusy && !treeRootData ? (
+              <Group><Loader size="sm" /><Text size="sm">Scanning repository…</Text></Group>
+            ) : (
+              <RepoTree
+                rootEntries={rootTreeEntries}
+                childrenByParent={treeChildrenByParent}
+                loadingDirs={loadingTreeDirs}
+                selected={selectedRepoPathSet}
+                selectedDirs={selectedRepoDirs}
+                onLoadDir={(path) => {
+                  if (selectedRun) {
+                    void loadTreeDir(selectedRun, path, false);
+                  }
+                }}
+                onToggleFile={toggleFile}
+                onToggleDir={(entry, checked) => {
+                  void toggleDirectory(entry, checked);
+                }}
+                onSetPaths={setPaths}
+                height={360}
+              />
+            )}
+            <Textarea label="Include files" minRows={8} value={stageRepoContextIncludeFilesText} onChange={(e) => {
+              const value = e.currentTarget.value;
+              setStageRepoContextIncludeFilesText(value);
+              setSelectedRepoPaths(value.split('\n').map((item) => item.trim()).filter(Boolean));
+            }} placeholder={"src/main.rs\nsrc/lib.rs"} />
+            <Textarea label="Exclude regex" minRows={6} value={stageRepoContextExcludeRegexText} onChange={(e) => setStageRepoContextExcludeRegexText(e.currentTarget.value)} placeholder={"target/.*\nnode_modules/.*"} />
+            <Group justify="flex-end"><Button size="xs" onClick={() => setRepoContextConfigOpen(false)}>Done</Button></Group>
+          </Stack>
+        </Modal>
+
+        <Modal opened={changesetSchemaConfigOpen} onClose={() => setChangesetSchemaConfigOpen(false)} title="Changeset schema fragment" size="70%" centered>
           <Stack>
             <Group justify="space-between">
               <Text size="sm" c="dimmed">Use the canonical payload-gateway schema example or paste custom guidance.</Text>
-              <Button
-                size="xs"
-                variant="light"
-                loading={changesetSchemaBusy}
-                onClick={() => void openChangesetSchemaConfigurator()}
-              >
+              <Button size="xs" variant="light" loading={changesetSchemaBusy} onClick={() => void loadCanonicalChangesetSchema()}>
                 Reload from API
               </Button>
             </Group>
-            <Textarea
-              label="Changeset schema"
-              minRows={18}
-              value={stepFragmentValues.changeset_schema}
-              onChange={(e) => patchStepFragmentValue('changeset_schema', e.currentTarget.value)}
-              placeholder="Paste the changeset schema or guidance for code generation"
-            />
-            <Group justify="space-between">
-              <Checkbox
-                checked={stepFragmentEnabled.changeset_schema}
-                onChange={(e) => patchStepFragmentEnabled('changeset_schema', e.currentTarget.checked)}
-                label="Include changeset schema fragment"
-              />
-              <Button size="xs" onClick={() => setChangesetSchemaConfigOpen(false)}>Done</Button>
-            </Group>
+            <Textarea label="Changeset schema guidance" minRows={18} value={stageChangesetSchemaText} onChange={(e) => setStageChangesetSchemaText(e.currentTarget.value)} placeholder="Paste the schema or guidance used for code generation" />
+            <Group justify="flex-end"><Button size="xs" onClick={() => setChangesetSchemaConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
 
-        <Modal
-          opened={applyErrorConfigOpen}
-          onClose={() => setApplyErrorConfigOpen(false)}
-          title="Apply error fragment"
-          size="70%"
-          centered
-        >
+        <Modal opened={applyErrorConfigOpen} onClose={() => setApplyErrorConfigOpen(false)} title="Apply error fragment" size="70%" centered>
           <Stack>
-            <Textarea
-              label="Apply error"
-              minRows={12}
-              value={stepFragmentValues.apply_error}
-              onChange={(e) => patchStepFragmentValue('apply_error', e.currentTarget.value)}
-              placeholder="Paste apply failures for the next retry prompt"
-            />
-            <Group justify="space-between">
-              <Checkbox
-                checked={stepFragmentEnabled.apply_error}
-                onChange={(e) => patchStepFragmentEnabled('apply_error', e.currentTarget.checked)}
-                label="Include apply error fragment"
-              />
-              <Button size="xs" onClick={() => setApplyErrorConfigOpen(false)}>Done</Button>
-            </Group>
+            <Textarea label="Apply error" minRows={12} value={stageApplyError} onChange={(e) => setStageApplyError(e.currentTarget.value)} placeholder="Paste apply failures for the next retry prompt" />
+            <Group justify="flex-end"><Button size="xs" onClick={() => setApplyErrorConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
 
-        <Modal
-          opened={compileErrorConfigOpen}
-          onClose={() => setCompileErrorConfigOpen(false)}
-          title="Compile error fragment"
-          size="70%"
-          centered
-        >
+        <Modal opened={compileErrorConfigOpen} onClose={() => setCompileErrorConfigOpen(false)} title="Compile error fragment" size="70%" centered>
           <Stack>
-            <Textarea
-              label="Compile error"
-              minRows={12}
-              value={stepFragmentValues.compile_error}
-              onChange={(e) => patchStepFragmentValue('compile_error', e.currentTarget.value)}
-              placeholder="Paste compile or test failures for the next retry prompt"
-            />
-            <Group justify="space-between">
-              <Checkbox
-                checked={stepFragmentEnabled.compile_error}
-                onChange={(e) => patchStepFragmentEnabled('compile_error', e.currentTarget.checked)}
-                label="Include compile error fragment"
-              />
-              <Button size="xs" onClick={() => setCompileErrorConfigOpen(false)}>Done</Button>
-            </Group>
+            <Textarea label="Compile error" minRows={12} value={stageCompileError} onChange={(e) => setStageCompileError(e.currentTarget.value)} placeholder="Paste compile or test failures for the next retry prompt" />
+            <Group justify="flex-end"><Button size="xs" onClick={() => setCompileErrorConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
 
-        <Modal
-          opened={responseViewerOpen}
-          onClose={() => setResponseViewerOpen(false)}
-          title={previewViewerMode === 'prompt' ? 'Composed prompt preview' : 'Inference response'}
-          size="min(1200px, 96vw)"
-          centered
-        >
+        <Modal opened={responseViewerOpen} onClose={() => setResponseViewerOpen(false)} title={previewViewerMode === 'stream' ? 'Stage stream' : previewViewerMode === 'prompt' ? 'Composed prompt preview' : 'Inference response'} size="min(1200px, 96vw)" centered>
           <Stack gap="md">
             <Group justify="space-between" align="center">
               <Group gap="xs">
-                <Badge variant="light">
-                  {(previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse)
-                    ? `${(previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).length.toLocaleString()} chars`
-                    : 'empty'}
-                </Badge>
+                <Badge variant="light">{(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse) ? `${(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).length.toLocaleString()} chars` : 'empty'}</Badge>
                 <Text size="sm" c="dimmed">Wrapped and formatted for review</Text>
               </Group>
-              <Button
-                size="xs"
-                variant="light"
-                onClick={() => {
-                  void navigator.clipboard.writeText(previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse);
-                }}
-                disabled={!(previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).trim()}
-              >
-                {previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
+              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse); }} disabled={!(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).trim()}>
+                {previewViewerMode === 'stream' ? 'Copy stream' : previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
               </Button>
             </Group>
-
-            <Box
-              p="lg"
-              style={{
-                border: '1px solid var(--mantine-color-dark-4)',
-                borderRadius: 12,
-                background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))',
-                boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)'
-              }}
-            >
+            <Box p="lg" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
               <ScrollArea h="82vh" offsetScrollbars>
                 <Box maw={920} mx="auto">
-                  <Text
-                    size="sm"
-                    style={{
-                      whiteSpace: 'pre-wrap',
-                      overflowWrap: 'anywhere',
-                      wordBreak: 'break-word',
-                      lineHeight: 1.8,
-                      letterSpacing: '0.01em',
-                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace'
-                    }}
-                  >
-                    {previewViewerMode === 'prompt'
-                      ? (composedInferencePrompt || 'No prompt fragments enabled yet.')
-                      : (inferenceResponse || 'No inference response yet.')}
+                  <Text size="sm" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', lineHeight: 1.8, letterSpacing: '0.01em', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace' }}>
+                    {previewViewerMode === 'stream' ? (stageStreamContent || 'No stage stream yet.') : previewViewerMode === 'prompt' ? (composedInferencePrompt || 'No prompt fragments enabled yet.') : (inferenceResponse || 'No inference response yet.')}
                   </Text>
                 </Box>
               </ScrollArea>
@@ -2189,349 +2347,23 @@ export function WorkflowShell() {
           </Stack>
         </Modal>
 
-        <Modal opened={createOpen} onClose={() => setCreateOpen(false)} title="Create workflow" size="90%">
+        <Modal opened={runContextOpen} onClose={() => setRunContextOpen(false)} title="Run context" size="min(1100px, 96vw)" centered>
           <Stack>
-            <Select
-              label="Creation mode"
-              value={createMode}
-              onChange={(value) => setCreateMode((value as 'build' | 'copy' | 'save_template' | 'load') ?? 'build')}
-              data={[
-                { value: 'build', label: 'Build workflow' },
-                { value: 'copy', label: 'Copy from template' },
-                { value: 'save_template', label: 'Save template and create run' },
-                { value: 'load', label: 'Load template metadata' }
-              ]}
-            />
-
-            <TextInput label="Workflow name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
-            <TextInput label="Workflow description" value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
-            <TextInput label="Run title" value={runTitle} onChange={(e) => setRunTitle(e.currentTarget.value)} />
-            <TextInput label="Repo path" value={repoRef} onChange={(e) => setRepoRef(e.currentTarget.value)} />
-
-            {(createMode === 'copy' || createMode === 'load') ? (
-              <Select
-                label="Template"
-                data={templates.map((t) => ({ value: t.id, label: t.name }))}
-                value={selectedTemplateId}
-                onChange={setSelectedTemplateId}
-                searchable
-                clearable
-              />
-            ) : null}
-
-            <Divider label="Inference transport" labelPosition="center" />
-
-            <Select
-              label="Inference provider"
-              value={inferenceProvider}
-              onChange={(value) => setInferenceProvider((value as InferenceProvider) ?? 'api')}
-              data={[
-                { value: 'api', label: 'OpenAI API workflow' },
-                { value: 'browser', label: 'Browser workflow' }
-              ]}
-            />
-
-            <TextInput
-              label="Model"
-              value={inferenceModel}
-              onChange={(e) => setInferenceModel(e.currentTarget.value)}
-            />
-
-            {inferenceProvider === 'browser' ? (
-              <>
-                <TextInput
-                  label="Browser target URL"
-                  value={browserTargetUrl}
-                  onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)}
-                />
-                <TextInput
-                  label="CDP URL"
-                  value={browserCdpUrl}
-                  onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
-                />
-              </>
-            ) : null}
-
-            <Divider label="Starter workflow builder" labelPosition="center" />
-
-            <Stack>
-              {builderSteps.map((step) => (
-                <Card key={step.id} withBorder>
-                  <Stack>
-                    <Group justify="space-between">
-                      <Group>
-                        <Checkbox checked={step.enabled} onChange={(e) => patchStep(step.id, { enabled: e.currentTarget.checked })} />
-                        <Title order={5}>{step.name}</Title>
-                      </Group>
-                      <Select
-                        w={180}
-                        label="Automation"
-                        value={step.automationMode}
-                        onChange={(value) => {
-                          const nextMode = (value as AutomationMode) ?? 'manual';
-                          if (step.id === 'code') {
-                            patchStep(step.id, { automationMode: nextMode });
-                            patchStepExecution(step.id, { changesetApply: nextMode !== 'manual' });
-                            return;
-                          }
-                          patchStep(step.id, { automationMode: nextMode });
-                        }}
-                        data={step.id === 'design'
-                          ? [{ value: 'manual', label: 'Manual' }]
-                          : step.id === 'code'
-                            ? step.execution.changesetApply && builderRepoIsGit
-                              ? [
-                                  { value: 'manual', label: 'Manual' },
-                                  { value: 'assisted', label: 'Assisted' },
-                                  { value: 'automatic', label: 'Automatic' }
-                                ]
-                              : [{ value: 'manual', label: 'Manual' }]
-                            : [{ value: 'manual', label: 'Manual' }]}
-                      />
-                    </Group>
-
-                    {step.id === 'code' ? (
-                      <Box>
-                        <Text fw={600} mb="xs">Capabilities</Text>
-                        <Stack gap={6}>
-                          <Checkbox
-                            checked={step.execution.changesetApply}
-                            disabled={!builderRepoIsGit}
-                            onChange={(e) => {
-                              const checked = e.currentTarget.checked;
-                              patchStepExecution(step.id, { changesetApply: checked });
-                              patchStep(step.id, { automationMode: checked ? 'automatic' : 'manual' });
-                            }}
-                            label="Apply changesets"
-                          />
-                          {!builderRepoIsGit ? (
-                            <Text c="dimmed" size="sm">Apply Changesets is only available for git repositories.</Text>
-                          ) : null}
-                          {step.execution.changesetApply ? (
-                            <Box pl="md">
-                              <Text fw={600} size="sm" mb="xs">Apply changesets config</Text>
-                              <TextInput
-                                label="Max consecutive changeset failures before pause"
-                                value={String(step.execution.maxConsecutiveApplyFailures)}
-                                onChange={(e) => patchStepExecution(step.id, {
-                                  maxConsecutiveApplyFailures: Math.max(1, Number.parseInt(e.currentTarget.value || '5', 10) || 5)
-                                })}
-                              />
-                            </Box>
-                          ) : null}
-                        </Stack>
-                      </Box>
-                    ) : null}
-                  </Stack>
-                </Card>
-              ))}
-            </Stack>
-
-            <Group justify="flex-end">
-              <Button variant="light" onClick={() => setCreateOpen(false)}>Cancel</Button>
-              <Button loading={busy} onClick={() => void submitCreateWorkflow()}>Create workflow</Button>
-            </Group>
+            <JsonInput value={JSON.stringify(selectedRun?.context ?? {}, null, 2)} readOnly autosize minRows={20} />
           </Stack>
         </Modal>
 
-        <Modal opened={capabilityOpen} onClose={() => setCapabilityOpen(false)} title="Global capabilities" size="90%">
-          <Tabs value={activeCapability} onChange={(value) => setActiveCapability((value as CapabilityKey) ?? 'context_export')}>
-            <Tabs.List>
-              <Tabs.Tab value="context_export">Context exporter</Tabs.Tab>
-              <Tabs.Tab value="model_inference">Model inference</Tabs.Tab>
-              <Tabs.Tab value="inject_user_context">Inject user context</Tabs.Tab>
-              <Tabs.Tab value="inject_changeset_schema">Inject changeset schema</Tabs.Tab>
-            </Tabs.List>
-
-            <Tabs.Panel value="context_export" pt="md">
-              {!selectedRun ? (
-                <Alert color="gray">Select a workflow first.</Alert>
-              ) : (
-                <Stack>
-                  <Group align="end">
-                    <TextInput label="Repo" value={selectedRun.repo_ref} readOnly style={{ flex: 1 }} />
-                    <TextInput label="Git ref" value={treeGitRef} onChange={(e) => setTreeGitRef(e.currentTarget.value)} />
-                    <ActionIcon size="lg" variant="light" onClick={() => void refreshTree(selectedRun)}>
-                      <IconRefresh size={18} />
-                    </ActionIcon>
-                  </Group>
-
-                  <Group align="end">
-                    <Select
-                      label="Mode"
-                      value={contextMode}
-                      onChange={(value) => setContextMode((value as 'entire_repo' | 'tree_select') ?? 'tree_select')}
-                      data={[
-                        { value: 'entire_repo', label: 'ENTIRE REPO' },
-                        { value: 'tree_select', label: 'TREE SELECT' }
-                      ]}
-                    />
-                    <TextInput label="Save path" value={contextSavePath} onChange={(e) => setContextSavePath(e.currentTarget.value)} style={{ flex: 1 }} />
-                    <Button loading={contextBusy} onClick={() => void runContextExport()} disabled={!contextSavePath || (contextMode === 'tree_select' && selectedPaths.length === 0)}>
-                      Generate context file
-                    </Button>
-                  </Group>
-
-                  <Group>
-                    <Button color={skipBinary ? 'blue' : 'gray'} variant={skipBinary ? 'filled' : 'outline'} onClick={() => setSkipBinary((v) => !v)}>
-                      {skipBinary ? 'Skip binary: ON' : 'Skip binary: OFF'}
-                    </Button>
-                    <Button color={skipGitignore ? 'blue' : 'gray'} variant={skipGitignore ? 'filled' : 'outline'} onClick={() => setSkipGitignore((v) => !v)}>
-                      {skipGitignore ? 'Skip .gitignore: ON' : 'Skip .gitignore: OFF'}
-                    </Button>
-                    <Button color={includeStagedDiff ? 'blue' : 'gray'} variant={includeStagedDiff ? 'filled' : 'outline'} onClick={() => setIncludeStagedDiff((v) => !v)}>
-                      {includeStagedDiff ? 'Staged diff: ON' : 'Staged diff: OFF'}
-                    </Button>
-                    <Button color={includeUnstagedDiff ? 'blue' : 'gray'} variant={includeUnstagedDiff ? 'filled' : 'outline'} onClick={() => setIncludeUnstagedDiff((v) => !v)}>
-                      {includeUnstagedDiff ? 'Unstaged diff: ON' : 'Unstaged diff: OFF'}
-                    </Button>
-                  </Group>
-
-                  {contextStatus ? <Alert color="blue">{contextStatus}</Alert> : null}
-                  {treeError ? <Alert color="red">{treeError}</Alert> : null}
-
-                  <Group justify="space-between">
-                    <Text size="sm" c="dimmed">{treeRootData ? `Refreshed ${treeRootData.refreshed_at}` : 'No tree data loaded yet.'}</Text>
-                    <Text size="sm">Selected files: <Code>{selectedPaths.length}</Code></Text>
-                  </Group>
-
-                  {treeBusy && !treeRootData ? (
-                    <Group><Loader size="sm" /><Text size="sm">Scanning repository…</Text></Group>
-                  ) : (
-                    <RepoTree
-                      rootEntries={rootTreeEntries}
-                      childrenByParent={treeChildrenByParent}
-                      loadingDirs={loadingTreeDirs}
-                      selected={selectedSet}
-                      selectedDirs={selectedDirPaths}
-                      onLoadDir={(path) => {
-                        if (selectedRun) {
-                          void loadTreeDir(selectedRun, path, false);
-                        }
-                      }}
-                      onToggleFile={toggleFile}
-                      onToggleDir={(entry, checked) => {
-                        void toggleDirectory(entry, checked);
-                      }}
-                      onSetPaths={setPaths}
-                      height={420}
-                    />
-                  )}
-                </Stack>
-              )}
-            </Tabs.Panel>
-
-            <Tabs.Panel value="model_inference" pt="md">
-              {!selectedRun ? (
-                <Alert color="gray">Select a workflow first.</Alert>
-              ) : (
-                <Stack>
-                  <Group grow>
-                    <Select
-                      label="Transport"
-                      value={inferenceProvider}
-                      onChange={(value) => setInferenceProvider((value as InferenceProvider) ?? 'api')}
-                      data={[
-                        { value: 'api', label: 'OpenAI API' },
-                        { value: 'browser', label: 'Browser workflow' }
-                      ]}
-                    />
-                    {inferenceProvider === 'api' ? (
-                      <TextInput
-                        label="Model"
-                        value={inferenceModel}
-                        onChange={(e) => setInferenceModel(e.currentTarget.value)}
-                      />
-                    ) : null}
-                    <Button loading={inferenceBusy} onClick={() => void configureInference()}>
-                      Save config
-                    </Button>
-                  </Group>
-
-                  {inferenceProvider === 'browser' ? (
-                    <>
-                      <Group grow>
-                        <TextInput
-                          label="CDP URL"
-                          value={browserCdpUrl}
-                          onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
-                        />
-                        <TextInput
-                          label="Chat URL"
-                          value={browserTargetUrl}
-                          onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)}
-                        />
-                      </Group>
-                      <Group>
-                        <Button loading={inferenceBusy} onClick={() => void launchBrowserInference()}>
-                          Launch + attach browser
-                        </Button>
-                        <Button variant="light" loading={inferenceBusy} onClick={() => void openBrowserInferenceUrl()}>
-                          Open URL
-                        </Button>
-                        <Button variant="light" loading={inferenceBusy} onClick={() => void probeBrowserInference()}>
-                          Probe
-                        </Button>
-                      </Group>
-                      {browserProbe ? <Code block>{JSON.stringify(browserProbe, null, 2)}</Code> : null}
-                    </>
-                  ) : (
-                    <Alert color="blue">This workflow is configured for API inference. Use the prompt box below to send API-backed turns.</Alert>
-                  )}
-
-                  <TextInput
-                    label="Prompt"
-                    value={inferencePrompt}
-                    onChange={(e) => setInferencePrompt(e.currentTarget.value)}
-                    placeholder="Send a design/code/test prompt"
-                  />
-
-                  <Group justify="flex-end">
-                    <Button
-                      loading={inferenceBusy}
-                      onClick={() => void (async () => {
-                        if (!selectedRun || !inferencePrompt.trim()) return;
-                        setInferenceBusy(true);
-                        setInferenceStatus(null);
-                        try {
-                          const json = await invokeModelInference(selectedRun.id, {
-                            step_id: selectedRun.current_step_id,
-                            action: 'send_prompt',
-                            payload: {
-                              prompt: inferencePrompt
-                            }
-                          });
-                          const result = (json.result ?? {}) as Record<string, unknown>;
-                          setInferenceResponse(String(result.text ?? ''));
-                          setInferenceStatus(`Inference completed via ${String(result.transport ?? inferenceProvider)}.`);
-                          await refresh();
-                          await refreshEvents(selectedRun.id);
-                        } catch (err) {
-                          setInferenceStatus(err instanceof Error ? err.message : String(err));
-                        } finally {
-                          setInferenceBusy(false);
-                        }
-                      })()}
-                      disabled={!inferencePrompt.trim()}
-                    >
-                      Send inference
-                    </Button>
-                  </Group>
-
-                  {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-                  {renderInferenceResponsePanel('No inference response yet.')}
-                </Stack>
-              )}
-            </Tabs.Panel>
-
-            <Tabs.Panel value="inject_user_context" pt="md">
-              <Alert color="blue">User context injection shell is present. Persist into run context next.</Alert>
-            </Tabs.Panel>
-
-            <Tabs.Panel value="inject_changeset_schema" pt="md">
-              <Alert color="blue">Changeset schema injection shell is present. Feed it into prompt/context assembly next.</Alert>
-            </Tabs.Panel>
-          </Tabs>
+        <Modal opened={templateModalOpen} onClose={() => setTemplateModalOpen(false)} title="Save workflow template" size="lg">
+          <Stack>
+            <TextInput label="Name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
+            <Textarea label="Description" minRows={2} value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
+            <Switch label="Create a run immediately after saving" checked={createRunAfterSave} onChange={(e) => setCreateRunAfterSave(e.currentTarget.checked)} />
+            <JsonInput value={builderMode === 'json' ? jsonDraft : JSON.stringify(definition, null, 2)} readOnly autosize minRows={12} />
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setTemplateModalOpen(false)}>Cancel</Button>
+              <Button onClick={() => void handleSaveTemplate()} loading={busy}>Save template</Button>
+            </Group>
+          </Stack>
         </Modal>
       </AppShell.Main>
     </AppShell>

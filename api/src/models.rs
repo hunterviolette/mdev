@@ -7,10 +7,13 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Draft,
+    Queued,
     Running,
+    Waiting,
     Paused,
     Success,
     Error,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +90,20 @@ pub struct WorkflowStepPromptConfig {
     pub include_user_context: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStepAdvancementConfig {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub auto_run_on_enter: bool,
+    #[serde(default)]
+    pub auto_advance_on_success: bool,
+    #[serde(default)]
+    pub auto_advance_on_error: bool,
+    #[serde(default)]
+    pub auto_advance_on_paused: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowTransition {
     pub when: TransitionWhen,
@@ -98,7 +115,10 @@ pub struct WorkflowTransition {
 pub enum TransitionWhen {
     Success,
     Error,
+    Paused,
+    RetryStage,
     ErrorCode(String),
+    Outcome(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +141,8 @@ pub struct WorkflowStepDefinition {
     pub execution_plan: Vec<StageExecutionNode>,
     #[serde(default)]
     pub transitions: Vec<WorkflowTransition>,
+    #[serde(default)]
+    pub advancement: WorkflowStepAdvancementConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +171,7 @@ pub struct WorkflowRun {
     pub current_step_id: Option<String>,
     pub title: String,
     pub repo_ref: String,
+    #[serde(default)]
     pub context: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -162,11 +185,12 @@ pub struct WorkflowEvent {
     pub level: String,
     pub kind: String,
     pub message: String,
+    #[serde(default)]
     pub payload: Value,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTemplateRequest {
     pub name: String,
     #[serde(default)]
@@ -174,20 +198,18 @@ pub struct CreateTemplateRequest {
     pub definition: WorkflowTemplateDefinition,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateRunRequest {
     pub template_id: Option<Uuid>,
     pub title: String,
-    #[serde(default)]
     pub repo_ref: String,
     #[serde(default)]
     pub context: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RunActionRequest {
     pub action: String,
-    #[serde(default)]
     pub step_id: Option<String>,
     #[serde(default)]
     pub payload: Value,

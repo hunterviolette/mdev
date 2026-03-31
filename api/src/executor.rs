@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{app_state::AppState, models::RunStatus};
-use crate::inference::{api::oai::OpenAIInferenceClient, browser::adapter as browser_adapter, InferenceConfig, InferenceResult, InferenceTransport};
+use crate::engine::capabilities::inference::{api::oai::OpenAIInferenceClient, browser::adapter as browser_adapter, InferenceConfig, InferenceResult, InferenceTransport};
 
 #[derive(Debug, serde::Serialize, Deserialize)]
 pub struct ContextExportPayload {
@@ -118,22 +118,6 @@ pub async fn execute_model_inference_send_prompt(
         context.get("model_inference").cloned().unwrap_or_else(|| json!({}))
     ).unwrap_or_default();
 
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "model_inference_started",
-        "Model inference started",
-        json!({
-            "transport": inference_cfg.transport,
-            "include_repo_context": req.include_repo_context,
-            "repo_context_present": req.repo_context.is_some(),
-            "prompt_chars": req.prompt.chars().count(),
-        }),
-    )
-    .await?;
-
     let mut repo_context_mode = Value::Null;
     let mut repo_context_output_path = Value::Null;
     let mut final_prompt = req.prompt.clone();
@@ -211,24 +195,6 @@ pub async fn execute_model_inference_send_prompt(
         });
     }
     update_run_context(&state.db, run_id, &context).await?;
-
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "model_inference_completed",
-        "Model inference completed",
-        json!({
-            "transport": result.transport,
-            "conversation_id": result.conversation_id,
-            "browser_session_id": result.browser_session_id,
-            "repo_context_mode": repo_context_mode,
-            "repo_context_output_path": repo_context_output_path,
-            "response_preview": result.text.chars().take(300).collect::<String>(),
-        }),
-    )
-    .await?;
 
     Ok(json!({ "ok": true, "result": result }))
 }
@@ -332,25 +298,66 @@ pub async fn append_event(
     message: &str,
     payload: Value,
 ) -> anyhow::Result<()> {
+    let stage_execution_id = payload.get("event_meta")
+        .and_then(|v| v.get("stage_execution_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let capability_invocation_id = payload.get("event_meta")
+        .and_then(|v| v.get("capability_invocation_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let parent_invocation_id = payload.get("event_meta")
+        .and_then(|v| v.get("parent_invocation_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let is_header_event = payload.get("event_meta")
+        .and_then(|v| v.get("is_header_event"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sequence_no: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM workflow_events WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_one(db)
+        .await?;
+    let now = Utc::now().to_rfc3339();
+
     sqlx::query(
         r#"
-        INSERT INTO workflow_events (id, run_id, step_id, level, kind, message, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO workflow_events (
+            id,
+            run_id,
+            step_id,
+            stage_execution_id,
+            capability_invocation_id,
+            parent_invocation_id,
+            sequence_no,
+            is_header_event,
+            level,
+            kind,
+            message,
+            payload_json,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(Uuid::new_v4().to_string())
     .bind(run_id.to_string())
     .bind(step_id)
+    .bind(stage_execution_id)
+    .bind(capability_invocation_id)
+    .bind(parent_invocation_id)
+    .bind(sequence_no)
+    .bind(if is_header_event { 1 } else { 0 })
     .bind(level)
     .bind(kind)
     .bind(message)
     .bind(payload.to_string())
-    .bind(Utc::now().to_rfc3339())
+    .bind(&now)
     .execute(db)
     .await?;
 
     sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
         .bind(run_id.to_string())
         .execute(db)
         .await?;
@@ -398,23 +405,12 @@ pub async fn update_run_context(
 }
 
 pub async fn execute_context_export(
-    state: &AppState,
+    _state: &AppState,
     run_id: Uuid,
-    step_id: Option<String>,
+    _step_id: Option<String>,
     payload: Value,
 ) -> anyhow::Result<Value> {
     let req = parse_context_export_payload(payload.clone())?;
-
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "context_export_started",
-        "Context export started",
-        payload,
-    )
-    .await?;
 
     tracing::info!(%run_id, repo = %req.repo_ref, git_ref = %req.git_ref, save_path = %req.save_path, "context export started");
 
@@ -434,40 +430,18 @@ pub async fn execute_context_export(
         "bytes_written": export_text.len(),
     });
 
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "context_export_completed",
-        "Context export completed",
-        result.clone(),
-    )
-    .await?;
-
     tracing::info!(%run_id, output_path = %out_path.display(), bytes_written = export_text.len(), "context export completed");
     Ok(result)
 }
 
 pub async fn execute_payload_gateway(
-    state: &AppState,
+    _state: &AppState,
     run_id: Uuid,
-    step_id: Option<String>,
+    _step_id: Option<String>,
     payload: Value,
 ) -> anyhow::Result<Value> {
     let req: PayloadGatewayPayload = serde_json::from_value(payload.clone())
         .context("invalid payload gateway payload")?;
-
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "payload_gateway_started",
-        "Payload gateway started",
-        payload,
-    )
-    .await?;
 
     let repo = PathBuf::from(&req.repo_ref);
     let result = match req.mode.as_str() {
@@ -505,17 +479,6 @@ pub async fn execute_payload_gateway(
     };
 
     let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        if ok { "info" } else { "error" },
-        if ok { "payload_gateway_completed" } else { "payload_gateway_failed" },
-        if ok { "Payload gateway completed" } else { "Payload gateway completed with errors" },
-        result.clone(),
-    )
-    .await?;
-
     tracing::info!(%run_id, mode = %req.mode, ok, "payload gateway completed");
     Ok(result)
 }
@@ -528,24 +491,13 @@ struct TerminalCommandPayload {
 }
 
 pub async fn execute_terminal_command(
-    state: &AppState,
-    run_id: Uuid,
-    step_id: Option<String>,
+    _state: &AppState,
+    _run_id: Uuid,
+    _step_id: Option<String>,
     payload: Value,
 ) -> anyhow::Result<Value> {
     let req: TerminalCommandPayload = serde_json::from_value(payload.clone())
         .context("invalid terminal capability payload")?;
-
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        "info",
-        "terminal_started",
-        "Terminal capability started",
-        payload,
-    )
-    .await?;
 
     let repo = PathBuf::from(&req.repo_ref);
     let mut outputs = Vec::new();
@@ -565,27 +517,10 @@ pub async fn execute_terminal_command(
         }
     }
 
-    let summary = if ok {
-        "Terminal capability completed successfully"
-    } else {
-        "Terminal capability completed with errors"
-    };
-
     let result = json!({
         "ok": ok,
         "outputs": outputs,
     });
-
-    append_event(
-        &state.db,
-        run_id,
-        step_id.as_deref(),
-        if ok { "info" } else { "error" },
-        if ok { "terminal_completed" } else { "terminal_failed" },
-        summary,
-        result.clone(),
-    )
-    .await?;
 
     Ok(result)
 }

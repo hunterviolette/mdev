@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine,
-    executor::append_event,
+    executor,
     models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun},
 };
 
@@ -15,6 +15,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-runs", get(list_runs).post(create_run))
         .route("/api/workflow-runs/:run_id", get(get_run).delete(delete_run))
+        .route("/api/workflow-runs/:run_id/events", get(list_run_events))
         .route("/api/workflow-runs/:run_id/actions", post(run_action))
 }
 
@@ -26,11 +27,7 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun
     .await
     .map_err(internal)?;
 
-    let runs = rows
-        .into_iter()
-        .map(row_to_run)
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let runs = rows.into_iter().map(row_to_run).collect::<Result<Vec<_>, _>>()?;
     Ok(Json(runs))
 }
 
@@ -47,6 +44,22 @@ async fn get_run(
     .map_err(internal)?;
 
     Ok(Json(row_to_run(row)?))
+}
+
+async fn list_run_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<WorkflowEvent>>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query(
+        "SELECT id, run_id, step_id, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? ORDER BY sequence_no ASC, created_at ASC"
+    )
+    .bind(run_id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+
+    let events = rows.into_iter().map(row_to_event).collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(events))
 }
 
 async fn delete_run(
@@ -83,7 +96,24 @@ async fn run_action(
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
         }
+        "start_run" => {
+            engine::start_run(&state, run_id).await.map_err(internal)?
+        }
+        "resume_run" => {
+            engine::resume_run(&state, run_id).await.map_err(internal)?
+        }
+        "pause_run" => {
+            engine::pause_run(&state, run_id).await.map_err(internal)?
+        }
         "run_step" | "run_current_step" => {
+            if !req.payload.is_null() {
+                let step_id = req.step_id.as_deref().ok_or_else(|| {
+                    (axum::http::StatusCode::BAD_REQUEST, "step_id required when payload is provided".to_string())
+                })?;
+                engine::patch_stage_state(&state, run_id, step_id, req.payload.clone())
+                    .await
+                    .map_err(internal)?;
+            }
             engine::run_step(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
         "next_step" => {
@@ -127,8 +157,7 @@ async fn create_run(
 
         if let Some(template_row) = template_row {
             let definition_json: String = template_row.get("definition_json");
-            let definition: crate::models::WorkflowTemplateDefinition =
-                serde_json::from_str(&definition_json).map_err(internal)?;
+            let definition: crate::models::WorkflowTemplateDefinition = serde_json::from_str(&definition_json).map_err(internal)?;
             definition.steps.first().map(|step| step.id.clone())
         } else {
             None
@@ -153,16 +182,17 @@ async fn create_run(
     .await
     .map_err(internal)?;
 
-    insert_event(&state, WorkflowEvent {
-        id: Uuid::new_v4(),
-        run_id: id,
-        step_id: None,
-        level: "info".to_string(),
-        kind: "run_created".to_string(),
-        message: "Workflow run created".to_string(),
-        payload: json!({}),
-        created_at: now,
-    }).await?;
+    executor::append_event(
+        &state.db,
+        id,
+        None,
+        "info",
+        "run_created",
+        "Workflow run created",
+        json!({}),
+    )
+    .await
+    .map_err(internal)?;
 
     Ok(Json(WorkflowRun {
         id,
@@ -177,23 +207,17 @@ async fn create_run(
     }))
 }
 
-
-pub(crate) async fn insert_event(state: &AppState, event: WorkflowEvent) -> Result<(), (axum::http::StatusCode, String)> {
-    sqlx::query(
-        "INSERT INTO workflow_events (id, run_id, step_id, level, kind, message, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(event.id.to_string())
-    .bind(event.run_id.to_string())
-    .bind(event.step_id)
-    .bind(event.level)
-    .bind(event.kind)
-    .bind(event.message)
-    .bind(serde_json::to_string(&event.payload).map_err(internal)?)
-    .bind(event.created_at.to_rfc3339())
-    .execute(&state.db)
-    .await
-    .map_err(internal)?;
-    Ok(())
+fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowEvent, (axum::http::StatusCode, String)> {
+    Ok(WorkflowEvent {
+        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
+        run_id: Uuid::parse_str(row.get::<String, _>("run_id").as_str()).map_err(internal)?,
+        step_id: row.get("step_id"),
+        level: row.get("level"),
+        kind: row.get("kind"),
+        message: row.get("message"),
+        payload: serde_json::from_str(row.get::<String, _>("payload_json").as_str()).map_err(internal)?,
+        created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
+    })
 }
 
 fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::StatusCode, String)> {
@@ -202,9 +226,12 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
         template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose().map_err(internal)?,
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Draft,
+            "queued" => RunStatus::Queued,
             "running" => RunStatus::Running,
+            "waiting" => RunStatus::Waiting,
             "paused" => RunStatus::Paused,
             "success" => RunStatus::Success,
+            "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Error,
         },
         current_step_id: row.get("current_step_id"),

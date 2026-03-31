@@ -47,12 +47,21 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query("DROP TABLE IF EXISTS workflow_events")
+    .execute(db)
+    .await?;
+
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS workflow_events (
+        CREATE TABLE workflow_events (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
             step_id TEXT,
+            stage_execution_id TEXT,
+            capability_invocation_id TEXT,
+            parent_invocation_id TEXT,
+            sequence_no INTEGER NOT NULL,
+            is_header_event INTEGER NOT NULL,
             level TEXT NOT NULL,
             kind TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -61,6 +70,18 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         )
         "#,
     )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_workflow_events_run_seq ON workflow_events (run_id, sequence_no)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_workflow_events_stage_exec_seq ON workflow_events (run_id, step_id, stage_execution_id, sequence_no)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_workflow_events_header_seq ON workflow_events (run_id, is_header_event, sequence_no)")
     .execute(db)
     .await?;
 

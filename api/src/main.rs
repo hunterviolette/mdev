@@ -2,8 +2,6 @@ mod app_state;
 mod db;
 mod engine;
 mod executor;
-mod inference;
-mod migration;
 mod models;
 mod routes;
 
@@ -67,9 +65,7 @@ fn build_router(state: AppState, web_dist: &Path) -> Router {
 
     if web_dist.exists() {
         let index_html = web_dist.join("index.html");
-        api.fallback_service(
-            ServeDir::new(web_dist).fallback(ServeFile::new(index_html))
-        )
+        api.fallback_service(ServeDir::new(web_dist).fallback(ServeFile::new(index_html)))
     } else {
         tracing::warn!(path = %web_dist.display(), "web/dist not found; serving backend routes only");
         api
