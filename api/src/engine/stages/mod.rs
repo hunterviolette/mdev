@@ -40,37 +40,63 @@ pub struct StageOutcome {
     pub local_state: Value,
 }
 
+pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
+    let mut run = crate::engine::load_run(state, run_id).await?;
+    let root = ensure_engine_root(&mut run.context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = stage_state
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("stage_state must be object"))?;
+    let code_state = stage_state_obj.entry("code".to_string()).or_insert_with(|| json!({}));
+    let code_state_obj = code_state
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("code stage state must be object"))?;
+
+    {
+        let enabled = code_state_obj
+            .entry("prompt_fragment_enabled".to_string())
+            .or_insert_with(|| json!({}));
+        if !enabled.is_object() {
+            *enabled = json!({});
+        }
+        let enabled_obj = enabled
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("prompt_fragment_enabled must be object"))?;
+        enabled_obj.insert("apply_error".to_string(), Value::Bool(false));
+        enabled_obj.insert("compile_error".to_string(), Value::Bool(false));
+    }
+
+    {
+        let fragments = code_state_obj
+            .entry("prompt_fragments".to_string())
+            .or_insert_with(|| json!({}));
+        if !fragments.is_object() {
+            *fragments = json!({});
+        }
+        let fragments_obj = fragments
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("prompt_fragments must be object"))?;
+        fragments_obj.remove("apply_error");
+        fragments_obj.remove("compile_error");
+    }
+
+    let prompt = compose_prompt_from_state(
+        code_state_obj.get("prompt_fragment_enabled").unwrap_or(&Value::Null),
+        code_state_obj.get("prompt_fragments").unwrap_or(&Value::Null),
+    );
+    code_state_obj.insert("composed_prompt".to_string(), Value::String(prompt));
+
+    persist_context(state, run_id, &run.context).await?;
+    Ok(())
+}
+
 pub async fn execute_stage(
     state: &AppState,
     run_id: Uuid,
     run: &mut WorkflowRun,
     step: &WorkflowStepDefinition,
 ) -> Result<StageOutcome> {
-    let global_inference = run.context.get("model_inference").cloned();
-    let root = ensure_engine_root(&mut run.context);
-    let global_repo_context = root
-        .get("global_state")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("repo_context"))
-        .cloned();
-
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = stage_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("stage_state must be object"))?;
-    let local_state = stage_state_obj
-        .entry(step.id.clone())
-        .or_insert_with(|| json!({}))
-        .clone();
-
-    let effective_local_state = merge_stage_with_global_state(local_state, global_repo_context, global_inference);
-    let mut hydrated_local_state = hydrate_stage_local_state(&run.repo_ref, step, effective_local_state);
     let stage_execution_id = Uuid::new_v4().to_string();
-    if let Some(obj) = hydrated_local_state.as_object_mut() {
-        obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone()));
-    }
-    stage_state_obj.insert(step.id.clone(), hydrated_local_state.clone());
-    persist_context(state, run_id, &run.context).await?;
 
     append_engine_event(
         state,
@@ -86,6 +112,39 @@ pub async fn execute_stage(
         }),
     )
     .await?;
+
+    clear_auto_prompt_fragments(state, run_id).await?;
+
+    let refreshed_run = crate::engine::load_run(state, run_id).await?;
+    run.context = refreshed_run.context.clone();
+    run.updated_at = refreshed_run.updated_at;
+    run.current_step_id = refreshed_run.current_step_id.clone();
+    run.status = refreshed_run.status.clone();
+
+    let global_inference = run.context.get("model_inference").cloned();
+    let root = ensure_engine_root(&mut run.context);
+    let global_repo_context = root
+        .get("global_state")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("repo_context"))
+        .cloned();
+
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = stage_state
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("stage_state must be object"))?;
+    let local_state = stage_state_obj
+        .get(step.id.as_str())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let effective_local_state = merge_stage_with_global_state(local_state, global_repo_context, global_inference);
+    let mut hydrated_local_state = hydrate_stage_local_state(&run.repo_ref, step, effective_local_state);
+    if let Some(obj) = hydrated_local_state.as_object_mut() {
+        obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone()));
+    }
+    stage_state_obj.insert(step.id.clone(), hydrated_local_state.clone());
+    persist_context(state, run_id, &run.context).await?;
 
     let stage_started_at = Instant::now();
 

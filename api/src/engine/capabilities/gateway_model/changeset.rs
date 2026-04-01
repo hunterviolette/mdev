@@ -89,6 +89,30 @@ struct LiteralMatch {
     text: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct EditActionFailure {
+    index: usize,
+    action: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EditActionResult {
+    index: usize,
+    action: String,
+    status: String,
+    descriptor: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EditSequenceReport {
+    lines: Vec<String>,
+    successful_actions: usize,
+    failed: Vec<EditActionFailure>,
+    action_results: Vec<EditActionResult>,
+}
+
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],
@@ -136,11 +160,23 @@ pub async fn execute(
             "stats": {
                 "successful_operations": 0,
                 "failed_operations": 1,
-                "total_operations": 0
+                "total_operations": 0,
+                "successful_actions": 0,
+                "failed_actions": 1,
+                "total_actions": 1
             },
             "attempted": [],
             "failed": ["changeset_decode"],
-            "operation_results": []
+            "operation_results": [
+                {
+                    "index": 1,
+                    "status": "failed",
+                    "kind": "changeset_decode",
+                    "label": "changeset_decode",
+                    "error": format!("{:#}", err),
+                    "action_results": []
+                }
+            ]
         }),
     };
 
@@ -165,55 +201,118 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
     let payload: ChangeSetPayload = serde_json::from_str(&normalized)
         .context("failed to decode normalized changeset")?;
 
+    let total_operations = payload.operations.len();
+    let total_actions: usize = payload
+        .operations
+        .iter()
+        .map(|op| match op {
+            Operation::Edit { changes, .. } => changes.len(),
+            _ => 1,
+        })
+        .sum();
+
     let mut lines = Vec::new();
     let mut attempted = Vec::new();
     let mut failed = Vec::new();
     let mut successful_operations = 0usize;
+    let mut successful_actions = 0usize;
     let mut operation_results = Vec::new();
+    let mut first_error = None::<String>;
 
     for (idx, op) in payload.operations.iter().enumerate() {
+        let index = idx + 1;
+        let label = operation_label_with_index(index, op);
+        lines.push(label.clone());
+
+        if let Some(path) = operation_primary_path(op) {
+            attempted.push(path);
+        }
+
         match apply_operation(repo, op) {
-            Ok(label) => {
-                attempted.push(label.clone());
-                lines.push(format!("[{}] ok {}", idx + 1, label));
+            Ok(report) => {
                 successful_operations += 1;
+                successful_actions += report.successful_actions;
+                lines.extend(report.lines.clone());
+                lines.push(format!("[{}] ok", index));
                 operation_results.push(json!({
-                    "index": idx + 1,
+                    "index": index,
                     "status": "ok",
-                    "label": label,
+                    "kind": operation_kind(op),
+                    "label": operation_label(op),
                     "error": Value::Null,
+                    "action_results": report.action_results,
                 }));
             }
             Err(err) => {
-                let label = operation_label(op);
-                attempted.push(label.clone());
-                failed.push(label.clone());
-                lines.push(format!("[{}] fail {} :: {:#}", idx + 1, label, err));
+                let err_text = format!("{:#}", err);
+                if first_error.is_none() {
+                    first_error = Some(err_text.clone());
+                }
+                if let Some(path) = operation_primary_path(op) {
+                    failed.push(path);
+                } else {
+                    failed.push(operation_label(op));
+                }
+                lines.push(format!("[{}] FAILED: {}", index, err_text));
                 operation_results.push(json!({
-                    "index": idx + 1,
+                    "index": index,
                     "status": "failed",
-                    "label": label,
-                    "error": format!("{:#}", err),
+                    "kind": operation_kind(op),
+                    "label": operation_label(op),
+                    "error": err_text,
+                    "action_results": [],
                 }));
             }
         }
     }
 
-    let total_operations = payload.operations.len();
-    let summary = format!("Applied {}/{} operations successfully.", successful_operations, total_operations);
+    let failed_operations = total_operations.saturating_sub(successful_operations);
+    let failed_actions = total_actions.saturating_sub(successful_actions);
+    let summary = format_apply_summary(
+        successful_operations,
+        total_operations,
+        successful_actions,
+        total_actions,
+    );
+    let status = if failed_operations == 0 {
+        "ChangeSet applied successfully.".to_string()
+    } else if failed_operations == total_operations {
+        match first_error {
+            Some(err) => format!("All {} operations failed. First error: {}", total_operations, err),
+            None => format!("All {} operations failed.", total_operations),
+        }
+    } else {
+        match first_error {
+            Some(err) => format!(
+                "Partially applied ChangeSet: {} succeeded, {} failed. First error: {}",
+                successful_operations,
+                failed_operations,
+                err
+            ),
+            None => format!(
+                "Partially applied ChangeSet: {} succeeded, {} failed.",
+                successful_operations,
+                failed_operations
+            ),
+        }
+    };
 
     Ok(json!({
-        "ok": failed.is_empty(),
+        "ok": failed_operations == 0,
         "mode": "changeset_apply",
         "summary": summary,
+        "status": status,
         "target": {
             "repo_ref": repo.to_string_lossy(),
             "git_ref": git_ref,
         },
         "stats": {
             "successful_operations": successful_operations,
-            "failed_operations": failed.len(),
+            "failed_operations": failed_operations,
             "total_operations": total_operations,
+            "successful_actions": successful_actions,
+            "failed_actions": failed_actions,
+            "total_actions": total_actions
         },
         "attempted": attempted,
         "failed": failed,
@@ -305,7 +404,7 @@ fn normalize_changeset_payload_text(payload_text: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn apply_operation(repo: &Path, op: &Operation) -> Result<String> {
+fn apply_operation(repo: &Path, op: &Operation) -> Result<EditSequenceReport> {
     match op {
         Operation::Write { path, contents } => {
             let full = repo.join(path);
@@ -313,14 +412,36 @@ fn apply_operation(repo: &Path, op: &Operation) -> Result<String> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&full, contents)?;
-            Ok(format!("write {}", path))
+            Ok(EditSequenceReport {
+                lines: vec!["  - PASS write[1] write".to_string()],
+                successful_actions: 1,
+                failed: Vec::new(),
+                action_results: vec![EditActionResult {
+                    index: 1,
+                    action: "write".to_string(),
+                    status: "ok".to_string(),
+                    descriptor: "write[1] write".to_string(),
+                    error: None,
+                }],
+            })
         }
         Operation::Delete { path } => {
             let full = repo.join(path);
             if full.exists() {
                 fs::remove_file(&full).or_else(|_| fs::remove_dir_all(&full))?;
             }
-            Ok(format!("delete {}", path))
+            Ok(EditSequenceReport {
+                lines: vec!["  - PASS delete[1] delete".to_string()],
+                successful_actions: 1,
+                failed: Vec::new(),
+                action_results: vec![EditActionResult {
+                    index: 1,
+                    action: "delete".to_string(),
+                    status: "ok".to_string(),
+                    descriptor: "delete[1] delete".to_string(),
+                    error: None,
+                }],
+            })
         }
         Operation::Move { from, to } => {
             let src = repo.join(from);
@@ -329,78 +450,188 @@ fn apply_operation(repo: &Path, op: &Operation) -> Result<String> {
                 fs::create_dir_all(parent)?;
             }
             fs::rename(&src, &dst)?;
-            Ok(format!("move {} -> {}", from, to))
+            Ok(EditSequenceReport {
+                lines: vec!["  - PASS move[1] move".to_string()],
+                successful_actions: 1,
+                failed: Vec::new(),
+                action_results: vec![EditActionResult {
+                    index: 1,
+                    action: "move".to_string(),
+                    status: "ok".to_string(),
+                    descriptor: "move[1] move".to_string(),
+                    error: None,
+                }],
+            })
         }
-        Operation::Edit { path, changes } => {
-            let full = repo.join(path);
-            let mut text = fs::read_to_string(&full)
-                .with_context(|| format!("failed to read {}", path))?;
-            for change in changes {
-                text = apply_edit_change(&text, change)?;
-            }
-            fs::write(&full, text)?;
-            Ok(format!("edit {}", path))
-        }
+        Operation::Edit { path, changes } => apply_edit_sequence(repo, path, changes),
     }
 }
 
 fn apply_edit_change(input: &str, change: &EditAction) -> Result<String> {
-    let match_text = &change.match_spec.text;
+    if change.match_spec.match_type != "literal" {
+        bail!("unsupported match.type {}", change.match_spec.match_type);
+    }
+
+    let needle = if change.match_spec.mode == "normalized_newlines" {
+        change.match_spec.text.replace("\r\n", "\n")
+    } else {
+        change.match_spec.text.clone()
+    };
+
+    let haystack = if change.match_spec.mode == "normalized_newlines" {
+        input.replace("\r\n", "\n")
+    } else {
+        input.to_string()
+    };
+
+    let mut matches = Vec::new();
+    let mut start = 0usize;
+    while let Some(idx) = haystack[start..].find(&needle) {
+        let abs = start + idx;
+        matches.push(abs);
+        start = abs + needle.len();
+    }
+
+    match change.match_spec.must_match.as_str() {
+        "exactly_one" if matches.len() != 1 => {
+            bail!("Expected exactly one match, found {}", matches.len());
+        }
+        "at_least_one" if matches.is_empty() => {
+            bail!("Expected at least one match, found none");
+        }
+        "exactly_one" | "at_least_one" => {}
+        other => bail!("Unsupported must_match '{}'", other),
+    }
+
     let occurrence = change.match_spec.occurrence.max(1);
-    let start = nth_match_start(input, match_text, occurrence)
-        .ok_or_else(|| anyhow!("literal match not found for occurrence {}", occurrence))?;
-    let end = start + match_text.len();
+    let target = matches
+        .get(occurrence.saturating_sub(1))
+        .copied()
+        .context("Requested occurrence not found")?;
+    let end = target + needle.len();
 
     match change.action.as_str() {
         "replace_block" => {
             let replacement = change.replacement.clone().ok_or_else(|| anyhow!("replacement is required"))?;
-            let mut out = String::new();
-            out.push_str(&input[..start]);
-            out.push_str(&replacement);
-            out.push_str(&input[end..]);
-            Ok(out)
+            Ok(format!("{}{}{}", &haystack[..target], replacement, &haystack[end..]))
         }
         "insert_before" => {
             let text = change.text.clone().ok_or_else(|| anyhow!("text is required"))?;
-            let mut out = String::new();
-            out.push_str(&input[..start]);
-            out.push_str(&text);
-            out.push_str(&input[start..]);
-            Ok(out)
+            Ok(format!("{}{}{}", &haystack[..target], text, &haystack[target..]))
         }
         "insert_after" => {
             let text = change.text.clone().ok_or_else(|| anyhow!("text is required"))?;
-            let mut out = String::new();
-            out.push_str(&input[..end]);
-            out.push_str(&text);
-            out.push_str(&input[end..]);
-            Ok(out)
+            Ok(format!("{}{}{}", &haystack[..end], text, &haystack[end..]))
         }
-        "delete_block" => {
-            let mut out = String::new();
-            out.push_str(&input[..start]);
-            out.push_str(&input[end..]);
-            Ok(out)
-        }
+        "delete_block" => Ok(format!("{}{}", &haystack[..target], &haystack[end..])),
         other => bail!("unsupported edit action {}", other),
     }
 }
 
-fn nth_match_start(haystack: &str, needle: &str, occurrence: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
+fn operation_primary_path(op: &Operation) -> Option<String> {
+    match op {
+        Operation::Write { path, .. } => Some(path.clone()),
+        Operation::Delete { path } => Some(path.clone()),
+        Operation::Move { to, .. } => Some(to.clone()),
+        Operation::Edit { path, .. } => Some(path.clone()),
     }
-    let mut from = 0usize;
-    let mut seen = 0usize;
-    while let Some(idx) = haystack[from..].find(needle) {
-        let absolute = from + idx;
-        seen += 1;
-        if seen == occurrence {
-            return Some(absolute);
+}
+
+fn describe_edit_change(index: usize, change: &EditAction) -> String {
+    format!(
+        "edit[{}] {} (occurrence={}, must_match={}, mode={})",
+        index,
+        change.action,
+        change.match_spec.occurrence.max(1),
+        change.match_spec.must_match,
+        change.match_spec.mode
+    )
+}
+
+fn apply_edit_sequence(repo: &Path, path: &str, changes: &[EditAction]) -> Result<EditSequenceReport> {
+    let full = repo.join(path);
+    let mut report = EditSequenceReport::default();
+
+    let mut text = fs::read_to_string(&full)
+        .with_context(|| format!("Failed to read {path} for edit"))?;
+
+    for (idx, change) in changes.iter().enumerate() {
+        let descriptor = describe_edit_change(idx + 1, change);
+        let pass_descriptor = descriptor.replacen("edit[", "PASS edit[", 1);
+
+        match apply_edit_change(&text, change) {
+            Ok(next_text) => {
+                text = next_text;
+                report.successful_actions += 1;
+                report.lines.push(format!("  - {}", pass_descriptor));
+                report.action_results.push(EditActionResult {
+                    index: idx + 1,
+                    action: change.action.clone(),
+                    status: "ok".to_string(),
+                    descriptor,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                let err_text = format!("{e:#}");
+                let fail_descriptor = descriptor.replacen("edit[", "FAIL edit[", 1);
+                report.lines.push(format!("  - {}", fail_descriptor));
+                report.lines.push(format!("      {}", err_text));
+                report.failed.push(EditActionFailure {
+                    index: idx + 1,
+                    action: change.action.clone(),
+                    error: err_text.clone(),
+                });
+                report.action_results.push(EditActionResult {
+                    index: idx + 1,
+                    action: change.action.clone(),
+                    status: "failed".to_string(),
+                    descriptor,
+                    error: Some(err_text),
+                });
+            }
         }
-        from = absolute + needle.len();
     }
-    None
+
+    if report.successful_actions > 0 {
+        fs::write(&full, text.as_bytes())
+            .with_context(|| format!("Failed to write edited file {path}"))?;
+    }
+
+    if !report.failed.is_empty() {
+        let first = report
+            .failed
+            .first()
+            .map(|item| format!("edit[{}] {}: {}", item.index, item.action, item.error))
+            .unwrap_or_else(|| "edit sequence failed".to_string());
+        bail!(first);
+    }
+
+    Ok(report)
+}
+
+fn format_apply_summary(
+    successful_operations: usize,
+    total_operations: usize,
+    successful_actions: usize,
+    total_actions: usize,
+) -> String {
+    format!(
+        "Applied {}/{} operations successfully. Applied {}/{} actions successfully.",
+        successful_operations,
+        total_operations,
+        successful_actions,
+        total_actions
+    )
+}
+
+fn operation_kind(op: &Operation) -> &'static str {
+    match op {
+        Operation::Write { .. } => "write",
+        Operation::Delete { .. } => "delete",
+        Operation::Move { .. } => "move",
+        Operation::Edit { .. } => "edit",
+    }
 }
 
 fn operation_label(op: &Operation) -> String {
@@ -409,5 +640,14 @@ fn operation_label(op: &Operation) -> String {
         Operation::Delete { path } => format!("delete {}", path),
         Operation::Move { from, to } => format!("move {} -> {}", from, to),
         Operation::Edit { path, .. } => format!("edit {}", path),
+    }
+}
+
+fn operation_label_with_index(index: usize, op: &Operation) -> String {
+    match op {
+        Operation::Write { path, .. } => format!("[{}] write {}", index, path),
+        Operation::Delete { path } => format!("[{}] delete {}", index, path),
+        Operation::Move { from, to } => format!("[{}] move {} -> {}", index, from, to),
+        Operation::Edit { path, .. } => format!("[{}] edit {}", index, path),
     }
 }

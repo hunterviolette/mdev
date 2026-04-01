@@ -172,6 +172,55 @@ function extractInferenceTextFromPayload(payload: unknown): string {
   return '';
 }
 
+function extractCompileResultsFromPayload(payload: unknown): Array<Record<string, unknown>> {
+  const objectPayload = (payload ?? {}) as Record<string, unknown>;
+  const directResult = objectPayload.result as Record<string, unknown> | undefined;
+  const directRows = Array.isArray(directResult?.results)
+    ? (directResult?.results as Array<Record<string, unknown>>)
+    : null;
+  if (directRows && directRows.length > 0) return directRows;
+
+  const capabilityResults = Array.isArray(objectPayload.capability_results)
+    ? (objectPayload.capability_results as Array<Record<string, unknown>>)
+    : [];
+
+  for (let i = capabilityResults.length - 1; i >= 0; i -= 1) {
+    const entry = capabilityResults[i];
+    const entryKey = typeof entry?.key === 'string' ? entry.key : '';
+    const entryResult = entry?.result as Record<string, unknown> | undefined;
+    const rows = Array.isArray(entryResult?.results)
+      ? (entryResult?.results as Array<Record<string, unknown>>)
+      : [];
+    if (entryKey === 'compile_commands' && rows.length > 0) {
+      return rows;
+    }
+  }
+
+  return [];
+}
+
+function formatCompileStageStream(commandResults: Array<Record<string, unknown>>): string {
+  const parts: string[] = ['### COMPILE RESULTS'];
+
+  for (const row of commandResults) {
+    const label = typeof row.label === 'string' && row.label.trim()
+      ? row.label.trim()
+      : (typeof row.command === 'string' ? row.command.trim() : 'compile command');
+    const command = typeof row.command === 'string' ? row.command : '';
+    const status = typeof row.status === 'number' ? row.status : Number(row.status ?? -1);
+    const stdout = typeof row.stdout === 'string' ? row.stdout.trim() : '';
+    const stderr = typeof row.stderr === 'string' ? row.stderr.trim() : '';
+
+    parts.push(`#### ${label}`);
+    if (command) parts.push(`COMMAND: ${command}`);
+    parts.push(`STATUS: ${Number.isFinite(status) ? status : -1}`);
+    parts.push(`STDOUT:\n${stdout || '(empty)'}`);
+    parts.push(`STDERR:\n${stderr || '(empty)'}`);
+  }
+
+  return parts.join('\n\n');
+}
+
 const DEFAULT_STEPS: BuilderStep[] = [
   {
     id: 'design',
@@ -259,7 +308,8 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
   const compileCommands = step.compileCommands
     .split('\n')
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((command) => ({ command, label: command }));
 
   const executionLogic = step.id === 'code'
     ? { kind: 'code_stage_policy' }
@@ -547,37 +597,21 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   );
 });
 
-const StageInputsPanel = memo(function StageInputsPanel(props: {
-  selectedWorkflowStep: WorkflowStepDefinition | null;
+const DesignStageInputsPanel = memo(function DesignStageInputsPanel(props: {
   stageUserInput: string;
   stageIncludeRepoContext: boolean;
-  stageIncludeChangesetSchema: boolean;
-  stageIncludeApplyError: boolean;
-  stageApplyError: string;
   repoFragmentSummary: string | null;
   onStageUserInputChange: (value: string) => void;
   onStageIncludeRepoContextChange: (checked: boolean) => void;
-  onStageIncludeChangesetSchemaChange: (checked: boolean) => void;
-  onStageIncludeApplyErrorChange: (checked: boolean) => void;
   onOpenRepoConfig: () => void;
-  onOpenSchemaConfig: () => void;
-  onOpenApplyErrorConfig: () => void;
 }) {
   const {
-    selectedWorkflowStep,
     stageUserInput,
     stageIncludeRepoContext,
-    stageIncludeChangesetSchema,
-    stageIncludeApplyError,
-    stageApplyError,
     repoFragmentSummary,
     onStageUserInputChange,
     onStageIncludeRepoContextChange,
-    onStageIncludeChangesetSchemaChange,
-    onStageIncludeApplyErrorChange,
-    onOpenRepoConfig,
-    onOpenSchemaConfig,
-    onOpenApplyErrorConfig
+    onOpenRepoConfig
   } = props;
 
   return (
@@ -589,21 +623,125 @@ const StageInputsPanel = memo(function StageInputsPanel(props: {
         <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
         {stageIncludeRepoContext && repoFragmentSummary ? <Badge variant="light">{repoFragmentSummary}</Badge> : null}
       </Group>
-      {selectedWorkflowStep?.id === 'code' ? (
-        <>
-          <Group>
-            <Switch label="Include changeset schema fragment" checked={stageIncludeChangesetSchema} onChange={(e) => onStageIncludeChangesetSchemaChange(e.currentTarget.checked)} />
-            <Button size="xs" variant="light" onClick={onOpenSchemaConfig}>Configure schema</Button>
-          </Group>
-          {stageApplyError.trim() ? (
-            <Group>
-              <Switch label="Include apply error fragment" checked={stageIncludeApplyError} onChange={(e) => onStageIncludeApplyErrorChange(e.currentTarget.checked)} />
-              <Badge variant="light" color="orange">Apply error available</Badge>
-              <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>View apply error</Button>
-            </Group>
-          ) : null}
-        </>
+    </Stack>
+  );
+});
+
+const CodeStageInputsPanel = memo(function CodeStageInputsPanel(props: {
+  stageUserInput: string;
+  stageIncludeRepoContext: boolean;
+  stageIncludeChangesetSchema: boolean;
+  stageAutoApplyChangeset: boolean;
+  stageIncludeApplyError: boolean;
+  stageApplyError: string;
+  stageIncludeCompileError: boolean;
+  stageCompileError: string;
+  repoFragmentSummary: string | null;
+  onStageUserInputChange: (value: string) => void;
+  onStageIncludeRepoContextChange: (checked: boolean) => void;
+  onStageIncludeChangesetSchemaChange: (checked: boolean) => void;
+  onStageAutoApplyChangesetChange: (checked: boolean) => void;
+  onStageIncludeApplyErrorChange: (checked: boolean) => void;
+  onStageIncludeCompileErrorChange: (checked: boolean) => void;
+  onOpenRepoConfig: () => void;
+  onOpenSchemaConfig: () => void;
+  onOpenApplyErrorConfig: () => void;
+  onOpenCompileErrorConfig: () => void;
+}) {
+  const {
+    stageUserInput,
+    stageIncludeRepoContext,
+    stageIncludeChangesetSchema,
+    stageAutoApplyChangeset,
+    stageIncludeApplyError,
+    stageApplyError,
+    stageIncludeCompileError,
+    stageCompileError,
+    repoFragmentSummary,
+    onStageUserInputChange,
+    onStageIncludeRepoContextChange,
+    onStageIncludeChangesetSchemaChange,
+    onStageAutoApplyChangesetChange,
+    onStageIncludeApplyErrorChange,
+    onStageIncludeCompileErrorChange,
+    onOpenRepoConfig,
+    onOpenSchemaConfig,
+    onOpenApplyErrorConfig,
+    onOpenCompileErrorConfig
+  } = props;
+
+  return (
+    <Stack>
+      <Title order={6}>Stage inputs</Title>
+      <Textarea label="User input" value={stageUserInput} onChange={(e) => onStageUserInputChange(e.currentTarget.value)} minRows={3} autosize />
+      <Group>
+        <Switch label="Include repo fragment" checked={stageIncludeRepoContext} onChange={(e) => onStageIncludeRepoContextChange(e.currentTarget.checked)} />
+        <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
+        {stageIncludeRepoContext && repoFragmentSummary ? <Badge variant="light">{repoFragmentSummary}</Badge> : null}
+      </Group>
+      <Group>
+        <Switch label="Include changeset schema fragment" checked={stageIncludeChangesetSchema} onChange={(e) => onStageIncludeChangesetSchemaChange(e.currentTarget.checked)} />
+        <Button size="xs" variant="light" onClick={onOpenSchemaConfig}>Configure schema</Button>
+      </Group>
+      <Group>
+        <Switch label="Auto apply changeset" checked={stageAutoApplyChangeset} onChange={(e) => onStageAutoApplyChangesetChange(e.currentTarget.checked)} />
+      </Group>
+      {stageApplyError.trim() ? (
+        <Group>
+          <Switch label="Include apply error fragment" checked={stageIncludeApplyError} onChange={(e) => onStageIncludeApplyErrorChange(e.currentTarget.checked)} />
+          <Badge variant="light" color="orange">Apply error available</Badge>
+          <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>View apply error</Button>
+        </Group>
       ) : null}
+      {stageCompileError.trim() ? (
+        <Group>
+          <Switch label="Include compile error fragment" checked={stageIncludeCompileError} onChange={(e) => onStageIncludeCompileErrorChange(e.currentTarget.checked)} />
+          <Badge variant="light" color="yellow">Compile error available</Badge>
+          <Button size="xs" variant="light" onClick={onOpenCompileErrorConfig}>View compile error</Button>
+        </Group>
+      ) : null}
+    </Stack>
+  );
+});
+
+const CompileStageInputsPanel = memo(function CompileStageInputsPanel(props: {
+  stageCompileCommandsText: string;
+  onStageCompileCommandsTextChange: (value: string) => void;
+}) {
+  const {
+    stageCompileCommandsText,
+    onStageCompileCommandsTextChange
+  } = props;
+
+  return (
+    <Stack>
+      <Title order={6}>Stage inputs</Title>
+      <Textarea
+        label="Compile commands"
+        description="One command per line. The compile stage should only patch backend compile checks."
+        value={stageCompileCommandsText}
+        onChange={(e) => onStageCompileCommandsTextChange(e.currentTarget.value)}
+        minRows={6}
+        autosize
+        placeholder={"cargo check\nnpm run build"}
+      />
+    </Stack>
+  );
+});
+
+const ReviewStageInputsPanel = memo(function ReviewStageInputsPanel(props: {
+  stageReviewNotes: string;
+  onStageReviewNotesChange: (value: string) => void;
+}) {
+  const {
+    stageReviewNotes,
+    onStageReviewNotesChange
+  } = props;
+
+  return (
+    <Stack>
+      <Title order={6}>Stage inputs</Title>
+      <Textarea label="Review notes" value={stageReviewNotes} onChange={(e) => onStageReviewNotesChange(e.currentTarget.value)} minRows={4} autosize />
     </Stack>
   );
 });
@@ -674,6 +812,10 @@ export function WorkflowShell() {
   const [stageApplyError, setStageApplyError] = useState('');
   const [stageIncludeApplyError, setStageIncludeApplyError] = useState(true);
   const [stageReviewNotes, setStageReviewNotes] = useState('');
+  const [stageCompileError, setStageCompileError] = useState('');
+  const [stageIncludeCompileError, setStageIncludeCompileError] = useState(true);
+  const [stageAutoApplyChangeset, setStageAutoApplyChangeset] = useState(true);
+  const [stageCompileCommandsText, setStageCompileCommandsText] = useState('');
   const [stageApproved, setStageApproved] = useState(false);
   const [stageRejected, setStageRejected] = useState(false);
 
@@ -682,6 +824,7 @@ export function WorkflowShell() {
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
+  const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
   const [runContextOpen, setRunContextOpen] = useState(false);
   const [inferenceConfigOpen, setInferenceConfigOpen] = useState(false);
   const [previewViewerMode, setPreviewViewerMode] = useState<'prompt' | 'response' | 'stream'>('stream');
@@ -859,6 +1002,14 @@ export function WorkflowShell() {
     setStageChangesetSchemaText(typeof promptFragments.changeset_schema === 'string' ? promptFragments.changeset_schema : '');
     setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
     setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
+    setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
+    setStageCompileCommandsText(
+      Array.isArray((selectedWorkflowStep?.execution?.compile_checks as Record<string, unknown> | undefined)?.commands)
+        ? (((selectedWorkflowStep?.execution?.compile_checks as Record<string, unknown> | undefined)?.commands as unknown[]) ?? [])
+            .filter((value): value is string => typeof value === 'string')
+            .join('\n')
+        : ''
+    );
     setStageApproved(Boolean(review.approved));
     setStageRejected(Boolean(review.rejected));
     setStageIncludeRepoContext(
@@ -875,6 +1026,16 @@ export function WorkflowShell() {
       typeof promptFragmentEnabled.apply_error === 'boolean'
         ? promptFragmentEnabled.apply_error
         : false
+    );
+    setStageIncludeCompileError(
+      typeof promptFragmentEnabled.compile_error === 'boolean'
+        ? promptFragmentEnabled.compile_error
+        : false
+    );
+    setStageAutoApplyChangeset(
+      typeof ((selectedStageState?.changeset_apply as Record<string, unknown> | undefined)?.enabled) === 'boolean'
+        ? Boolean((selectedStageState?.changeset_apply as Record<string, unknown>).enabled)
+        : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.id === 'code')
     );
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
@@ -1379,16 +1540,23 @@ export function WorkflowShell() {
   }
 
   const composedInferencePrompt = useMemo(() => {
+    if (selectedWorkflowStep?.id === 'compile') {
+      return stageCompileCommandsText.trim()
+        ? `### COMPILE COMMANDS\n${stageCompileCommandsText.trim()}`
+        : '';
+    }
+
     const parts: string[] = [];
     if (stageIncludeRepoContext) parts.push('### REPO CONTEXT\nAttached repo context from backend export');
     if (selectedWorkflowStep?.id === 'code' && stageIncludeChangesetSchema) {
       parts.push(`### CHANGESET SCHEMA\n${stageChangesetSchemaText.trim() || 'Use ChangeSet JSON version 1. Return only the JSON payload.'}`);
     }
     if (selectedWorkflowStep?.id === 'code' && stageIncludeApplyError && stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
+    if (selectedWorkflowStep?.id === 'code' && stageIncludeCompileError && stageCompileError.trim()) parts.push(`### COMPILE ERROR\n${stageCompileError.trim()}`);
     if (selectedWorkflowStep?.id === 'review' && stageReviewNotes.trim()) parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
     if (stageUserInput.trim()) parts.push(`### USER INPUT\n${stageUserInput.trim()}`);
     return parts.join('\n\n');
-  }, [selectedWorkflowStep?.id, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageIncludeApplyError, stageApplyError, stageReviewNotes, stageUserInput]);
+  }, [selectedWorkflowStep?.id, stageCompileCommandsText, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageIncludeApplyError, stageApplyError, stageIncludeCompileError, stageCompileError, stageReviewNotes, stageUserInput]);
 
   const selectedLiveStageTrail = useMemo(() => {
     const scopedTrails = selectedStepId
@@ -1440,9 +1608,44 @@ export function WorkflowShell() {
   const stageStreamContent = useMemo(() => {
     const parts: string[] = [];
     if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+
+    if (selectedWorkflowStep?.id === 'compile') {
+      const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+      let compileResults: Array<Record<string, unknown>> = [];
+
+      for (let i = executionItems.length - 1; i >= 0; i -= 1) {
+        const rows = extractCompileResultsFromPayload(executionItems[i].payload);
+        if (rows.length > 0) {
+          compileResults = rows;
+          break;
+        }
+      }
+
+      if (compileResults.length === 0) {
+        const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
+        for (let i = stageEvents.length - 1; i >= 0; i -= 1) {
+          const rows = extractCompileResultsFromPayload(stageEvents[i].payload);
+          if (rows.length > 0) {
+            compileResults = rows;
+            break;
+          }
+        }
+      }
+
+      if (compileResults.length > 0) {
+        parts.push(formatCompileStageStream(compileResults));
+      } else if (selectedLiveExecutionState?.loading) {
+        parts.push('### COMPILE RESULTS\nLoading current execution output…');
+      } else if (selectedLiveExecutionState?.error) {
+        parts.push(`### COMPILE RESULTS\nUnable to load current execution chain: ${selectedLiveExecutionState.error}`);
+      }
+
+      return parts.join('\n\n');
+    }
+
     if (inferenceResponse.trim()) parts.push(`### OUTPUT\n${inferenceResponse}`);
     return parts.join('\n\n');
-  }, [composedInferencePrompt, inferenceResponse]);
+  }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.id]);
 
   function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
     return (
@@ -1471,18 +1674,7 @@ export function WorkflowShell() {
 
   function buildInteractiveStagePayload() {
     const step = selectedWorkflowStep;
-    const promptFragments: Record<string, unknown> = { user_input: stageUserInput };
-    const promptFragmentEnabled: Record<string, unknown> = { user_input: true, repo_context: stageIncludeRepoContext };
-    if (step?.id === 'code') {
-      promptFragmentEnabled.changeset_schema = stageIncludeChangesetSchema;
-      promptFragmentEnabled.apply_error = Boolean(stageApplyError.trim());
-      promptFragments.changeset_schema = stageChangesetSchemaText;
-      promptFragments.apply_error = stageApplyError;
-    }
-    if (step?.id === 'review') {
-      promptFragments.review_notes = stageReviewNotes;
-      promptFragmentEnabled.review_notes = Boolean(stageReviewNotes.trim());
-    }
+    const stepId = step?.id ?? null;
     const includeFiles = Array.from(
       new Set(
         selectedRepoPaths
@@ -1494,25 +1686,77 @@ export function WorkflowShell() {
       .split('\n')
       .map((value) => value.trim())
       .filter(Boolean);
+
+    if (stepId === 'compile') {
+      const commands = stageCompileCommandsText
+        .split('\n')
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((command) => ({ command, label: command }));
+
+      return {
+        execution: {
+          compile_checks: {
+            commands
+          }
+        },
+        execution_logic: {
+          compile_checks: {
+            commands
+          }
+        },
+        execution_plan_override: buildInteractiveExecutionPlan(stepId)
+      } as Record<string, unknown>;
+    }
+
+    if (stepId === 'review') {
+      return {
+        prompt_fragments: {
+          user_input: stageUserInput,
+          review_notes: stageReviewNotes
+        },
+        prompt_fragment_enabled: {
+          user_input: true,
+          review_notes: Boolean(stageReviewNotes.trim())
+        },
+        review: { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes },
+        execution_plan_override: buildInteractiveExecutionPlan(stepId)
+      } as Record<string, unknown>;
+    }
+
+    const promptFragments: Record<string, unknown> = { user_input: stageUserInput };
+    const promptFragmentEnabled: Record<string, unknown> = { user_input: true, repo_context: stageIncludeRepoContext };
+
+    if (stepId === 'code') {
+      promptFragmentEnabled.changeset_schema = stageIncludeChangesetSchema;
+      promptFragmentEnabled.apply_error = stageIncludeApplyError && Boolean(stageApplyError.trim());
+      promptFragmentEnabled.compile_error = stageIncludeCompileError && Boolean(stageCompileError.trim());
+      promptFragments.changeset_schema = stageChangesetSchemaText;
+      promptFragments.apply_error = stageApplyError;
+      promptFragments.compile_error = stageCompileError;
+    }
+
     const payload = {
-      inference: {
-        transport: inferenceTransport,
-        model: inferenceModel,
-        browser: {
-          profile: 'default',
-          bridge_dir: 'bridge',
-          cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
-          page_url_contains: browserTargetUrl,
-          target_url: browserTargetUrl,
-          edge_executable: '',
-          user_data_dir: '',
-          session_id: null,
-          auto_launch_edge: true,
-          response_timeout_ms: 120000,
-          response_poll_ms: 1000,
-          dom_poll_ms: 1000
+      ...(stepId === 'design' || stepId === 'code' ? {
+        inference: {
+          transport: inferenceTransport,
+          model: inferenceModel,
+          browser: {
+            profile: 'default',
+            bridge_dir: 'bridge',
+            cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
+            page_url_contains: browserTargetUrl,
+            target_url: browserTargetUrl,
+            edge_executable: '',
+            user_data_dir: '',
+            session_id: null,
+            auto_launch_edge: true,
+            response_timeout_ms: 120000,
+            response_poll_ms: 1000,
+            dom_poll_ms: 1000
+          }
         }
-      },
+      } : {}),
       ...(stageIncludeRepoContext ? {
         repo_context: {
           git_ref: stageRepoContextGitRef || 'WORKTREE',
@@ -1525,10 +1769,14 @@ export function WorkflowShell() {
           include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
         }
       } : {}),
+      ...(stepId === 'code' ? {
+        changeset_apply: {
+          enabled: stageAutoApplyChangeset
+        }
+      } : {}),
       prompt_fragments: promptFragments,
       prompt_fragment_enabled: promptFragmentEnabled,
-      review: step?.id === 'review' ? { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes } : undefined,
-      execution_plan_override: buildInteractiveExecutionPlan(step?.id ?? null)
+      execution_plan_override: buildInteractiveExecutionPlan(stepId)
     } as Record<string, unknown>;
     return payload;
   }
@@ -1574,7 +1822,7 @@ export function WorkflowShell() {
         condition: null
       });
 
-      if (stepId === 'code') {
+      if (stepId === 'code' && stageAutoApplyChangeset) {
         plan.push({
           kind: 'capability',
           key: 'gateway_model/changeset',
@@ -2088,46 +2336,74 @@ export function WorkflowShell() {
                       <Grid align="stretch">
                         <Grid.Col span={{ base: 12, xl: 4 }}>
                           <Stack>
-                            <Card withBorder>
-                              <InferenceConnectionCard
-                                inferenceConnectionStatus={inferenceConnectionStatus}
-                                inferenceReady={inferenceReady}
-                                inferenceSummaryText={inferenceSummaryText}
-                                inferenceTransport={inferenceTransport}
-                                inferenceModel={inferenceModel}
-                                browserTargetUrl={browserTargetUrl}
-                                browserCdpUrl={browserCdpUrl}
-                                inferenceBusy={inferenceBusy}
-                                inferenceStatus={inferenceStatus}
-                                inferenceConfigOpen={inferenceConfigOpen}
-                                onOpenConfig={() => setInferenceConfigOpen(true)}
-                                onCloseConfig={() => setInferenceConfigOpen(false)}
-                                onTransportChange={(value) => setInferenceTransport(value)}
-                                onModelChange={setInferenceModel}
-                                onBrowserTargetUrlChange={setBrowserTargetUrl}
-                                onBrowserCdpUrlChange={setBrowserCdpUrl}
-                                onSaveConfig={() => void configureInference()}
-                              />
-                            </Card>
-
-                            {!inferenceRequiresConnection || inferenceReady ? (
-                              <>
-                                <StageInputsPanel
-                                  selectedWorkflowStep={selectedWorkflowStep}
-                                  stageUserInput={stageUserInput}
-                                  stageIncludeRepoContext={stageIncludeRepoContext}
-                                  stageIncludeChangesetSchema={stageIncludeChangesetSchema}
-                                  stageIncludeApplyError={stageIncludeApplyError}
-                                  stageApplyError={stageApplyError}
-                                  repoFragmentSummary={repoFragmentSummary}
-                                  onStageUserInputChange={setStageUserInput}
-                                  onStageIncludeRepoContextChange={setStageIncludeRepoContext}
-                                  onStageIncludeChangesetSchemaChange={setStageIncludeChangesetSchema}
-                                  onStageIncludeApplyErrorChange={setStageIncludeApplyError}
-                                  onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
-                                  onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
-                                  onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
+                            {selectedWorkflowStep?.id === 'design' || selectedWorkflowStep?.id === 'code' ? (
+                              <Card withBorder>
+                                <InferenceConnectionCard
+                                  inferenceConnectionStatus={inferenceConnectionStatus}
+                                  inferenceReady={inferenceReady}
+                                  inferenceSummaryText={inferenceSummaryText}
+                                  inferenceTransport={inferenceTransport}
+                                  inferenceModel={inferenceModel}
+                                  browserTargetUrl={browserTargetUrl}
+                                  browserCdpUrl={browserCdpUrl}
+                                  inferenceBusy={inferenceBusy}
+                                  inferenceStatus={inferenceStatus}
+                                  inferenceConfigOpen={inferenceConfigOpen}
+                                  onOpenConfig={() => setInferenceConfigOpen(true)}
+                                  onCloseConfig={() => setInferenceConfigOpen(false)}
+                                  onTransportChange={(value) => setInferenceTransport(value)}
+                                  onModelChange={setInferenceModel}
+                                  onBrowserTargetUrlChange={setBrowserTargetUrl}
+                                  onBrowserCdpUrlChange={setBrowserCdpUrl}
+                                  onSaveConfig={() => void configureInference()}
                                 />
+                              </Card>
+                            ) : null}
+
+                            {selectedWorkflowStep?.id === 'compile' || !inferenceRequiresConnection || inferenceReady ? (
+                              <>
+                                {selectedWorkflowStep?.id === 'design' ? (
+                                  <DesignStageInputsPanel
+                                    stageUserInput={stageUserInput}
+                                    stageIncludeRepoContext={stageIncludeRepoContext}
+                                    repoFragmentSummary={repoFragmentSummary}
+                                    onStageUserInputChange={setStageUserInput}
+                                    onStageIncludeRepoContextChange={setStageIncludeRepoContext}
+                                    onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
+                                  />
+                                ) : selectedWorkflowStep?.id === 'code' ? (
+                                  <CodeStageInputsPanel
+                                    stageUserInput={stageUserInput}
+                                    stageIncludeRepoContext={stageIncludeRepoContext}
+                                    stageIncludeChangesetSchema={stageIncludeChangesetSchema}
+                                    stageAutoApplyChangeset={stageAutoApplyChangeset}
+                                    stageIncludeApplyError={stageIncludeApplyError}
+                                    stageApplyError={stageApplyError}
+                                    stageIncludeCompileError={stageIncludeCompileError}
+                                    stageCompileError={stageCompileError}
+                                    repoFragmentSummary={repoFragmentSummary}
+                                    onStageUserInputChange={setStageUserInput}
+                                    onStageIncludeRepoContextChange={setStageIncludeRepoContext}
+                                    onStageIncludeChangesetSchemaChange={setStageIncludeChangesetSchema}
+                                    onStageAutoApplyChangesetChange={setStageAutoApplyChangeset}
+                                    onStageIncludeApplyErrorChange={setStageIncludeApplyError}
+                                    onStageIncludeCompileErrorChange={setStageIncludeCompileError}
+                                    onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
+                                    onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
+                                    onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
+                                    onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
+                                  />
+                                ) : selectedWorkflowStep?.id === 'compile' ? (
+                                  <CompileStageInputsPanel
+                                    stageCompileCommandsText={stageCompileCommandsText}
+                                    onStageCompileCommandsTextChange={setStageCompileCommandsText}
+                                  />
+                                ) : (
+                                  <ReviewStageInputsPanel
+                                    stageReviewNotes={stageReviewNotes}
+                                    onStageReviewNotesChange={setStageReviewNotes}
+                                  />
+                                )}
 
                                 <Group>
                                   <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
@@ -2340,6 +2616,13 @@ export function WorkflowShell() {
           <Stack>
             <Textarea label="Apply error" minRows={12} value={stageApplyError} onChange={(e) => setStageApplyError(e.currentTarget.value)} placeholder="Paste apply failures for the next retry prompt" />
             <Group justify="flex-end"><Button size="xs" onClick={() => setApplyErrorConfigOpen(false)}>Done</Button></Group>
+          </Stack>
+        </Modal>
+
+        <Modal opened={compileErrorConfigOpen} onClose={() => setCompileErrorConfigOpen(false)} title="Compile error fragment" size="70%" centered>
+          <Stack>
+            <Textarea label="Compile error" minRows={12} value={stageCompileError} onChange={(e) => setStageCompileError(e.currentTarget.value)} placeholder="Compile failures persisted by the backend for the next code retry prompt" />
+            <Group justify="flex-end"><Button size="xs" onClick={() => setCompileErrorConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
 

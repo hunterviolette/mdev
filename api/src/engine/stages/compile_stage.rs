@@ -49,6 +49,53 @@ async fn persist_compile_error_for_code_stage(
     run_id: Uuid,
     capability_results: &[Value],
 ) -> Result<()> {
+async fn clear_compile_error_for_code_stage(
+    state: &AppState,
+    run_id: Uuid,
+) -> Result<()> {
+    let mut run = load_run(state, run_id).await?;
+    let root = super::ensure_engine_root(&mut run.context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = stage_state.as_object_mut().expect("stage_state must be object");
+    let code_state = stage_state_obj.entry("code".to_string()).or_insert_with(|| json!({}));
+    let code_state_obj = code_state.as_object_mut().expect("code stage state must be object");
+
+    {
+        let enabled = code_state_obj
+            .entry("prompt_fragment_enabled".to_string())
+            .or_insert_with(|| json!({}));
+        if !enabled.is_object() {
+            *enabled = json!({});
+        }
+        enabled
+            .as_object_mut()
+            .expect("prompt_fragment_enabled must be object")
+            .insert("compile_error".to_string(), Value::Bool(false));
+    }
+
+    {
+        let fragments = code_state_obj
+            .entry("prompt_fragments".to_string())
+            .or_insert_with(|| json!({}));
+        if !fragments.is_object() {
+            *fragments = json!({});
+        }
+        fragments
+            .as_object_mut()
+            .expect("prompt_fragments must be object")
+            .remove("compile_error");
+    }
+
+    let prompt = super::compose_prompt_from_state(
+        code_state_obj.get("prompt_fragment_enabled").unwrap_or(&Value::Null),
+        code_state_obj.get("prompt_fragments").unwrap_or(&Value::Null),
+    );
+    code_state_obj.insert("composed_prompt".to_string(), Value::String(prompt));
+
+    persist_context(state, run_id, &run.context).await?;
+    Ok(())
+}
+
     let compile_result = capability_results
         .iter()
         .find(|item| item.get("key").and_then(Value::as_str) == Some("compile_commands"))

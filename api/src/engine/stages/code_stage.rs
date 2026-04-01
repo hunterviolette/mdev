@@ -185,6 +185,55 @@ async fn persist_stage_fragment(
     fragment_key: &str,
     fragment_value: Value,
 ) -> Result<()> {
+async fn clear_stage_fragment(
+    state: &AppState,
+    run_id: Uuid,
+    step_id: &str,
+    fragment_key: &str,
+) -> Result<()> {
+    let mut run = load_run(state, run_id).await?;
+    let root = super::ensure_engine_root(&mut run.context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = stage_state.as_object_mut().expect("stage_state must be object");
+    let existing = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
+    let obj = existing.as_object_mut().expect("stage state must be object");
+
+    {
+        let enabled = obj
+            .entry("prompt_fragment_enabled".to_string())
+            .or_insert_with(|| json!({}));
+        if !enabled.is_object() {
+            *enabled = json!({});
+        }
+        enabled
+            .as_object_mut()
+            .expect("prompt_fragment_enabled must be object")
+            .insert(fragment_key.to_string(), Value::Bool(false));
+    }
+
+    {
+        let fragments = obj
+            .entry("prompt_fragments".to_string())
+            .or_insert_with(|| json!({}));
+        if !fragments.is_object() {
+            *fragments = json!({});
+        }
+        fragments
+            .as_object_mut()
+            .expect("prompt_fragments must be object")
+            .remove(fragment_key);
+    }
+
+    let prompt = compose_prompt_from_state(
+        obj.get("prompt_fragment_enabled").unwrap_or(&Value::Null),
+        obj.get("prompt_fragments").unwrap_or(&Value::Null),
+    );
+    obj.insert("composed_prompt".to_string(), Value::String(prompt));
+
+    persist_context(state, run_id, &run.context).await?;
+    Ok(())
+}
+
     let mut run = load_run(state, run_id).await?;
     let root = super::ensure_engine_root(&mut run.context);
     let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));

@@ -10,13 +10,7 @@ pub async fn execute(
     _prior_results: &[CapabilityResult],
     _config: Value,
 ) -> Result<CapabilityResult> {
-    let commands = ctx
-        .step
-        .execution_logic
-        .get("compile_checks")
-        .and_then(|v| v.get("commands"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let commands = resolve_compile_commands(ctx.local_state, ctx.step.execution_logic.clone());
 
     let result = execute_terminal_command(
         PathBuf::from(ctx.repo_ref).as_path(),
@@ -31,14 +25,47 @@ pub async fn execute(
     })
 }
 
+fn resolve_compile_commands(local_state: &Value, execution_logic: Value) -> Value {
+    local_state
+        .get("execution")
+        .and_then(|v| v.get("compile_checks"))
+        .and_then(|v| v.get("commands"))
+        .cloned()
+        .or_else(|| {
+            local_state
+                .get("execution_logic")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .or_else(|| {
+            execution_logic
+                .get("compile_checks")
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!([]))
+}
+
 fn execute_terminal_command(repo: &Path, commands: Value) -> Result<Value> {
     let rows = commands.as_array().cloned().unwrap_or_default();
     let mut results = Vec::new();
     let mut ok = true;
 
     for item in rows {
-        let command = item.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let label = item.get("label").and_then(Value::as_str).unwrap_or(command.as_str()).to_string();
+        let (command, label) = match item {
+            Value::String(command) => {
+                let trimmed = command.trim().to_string();
+                (trimmed.clone(), trimmed)
+            }
+            Value::Object(obj) => {
+                let command = obj.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let label = obj.get("label").and_then(Value::as_str).unwrap_or(command.as_str()).trim().to_string();
+                (command, label)
+            }
+            _ => (String::new(), String::new())
+        };
+
         if command.is_empty() {
             continue;
         }
