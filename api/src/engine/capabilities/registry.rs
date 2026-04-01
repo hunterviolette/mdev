@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta}, models::WorkflowStepDefinition};
 
-use super::{apply_changeset, changeset_schema, compile_commands, context_export, inference};
+use super::{changeset_schema, compile_commands, context_export, gateway_model, inference};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -55,9 +55,12 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
             allowed_invocations: &[
                 "context_export",
                 "changeset_schema",
-                "apply_changeset",
-                "compile_commands",
+                "gateway_model/changeset",
             ],
+        }),
+        "compile" => Ok(StageCapabilityPolicy {
+            entrypoint: "compile_commands",
+            allowed_invocations: &[],
         }),
         "review" => Ok(StageCapabilityPolicy {
             entrypoint: "inference",
@@ -87,6 +90,14 @@ pub async fn execute_root_capability(ctx: CapabilityContext<'_>) -> Result<Vec<C
     execute_capability_chain(ctx, &policy, vec![root]).await
 }
 
+pub async fn execute_capability_invocations(
+    ctx: CapabilityContext<'_>,
+    queue: Vec<CapabilityInvocation>,
+) -> Result<Vec<CapabilityResult>> {
+    let policy = stage_capability_policy(ctx.step)?;
+    execute_capability_chain(ctx, &policy, queue).await
+}
+
 async fn execute_capability_chain(
     ctx: CapabilityContext<'_>,
     policy: &StageCapabilityPolicy,
@@ -106,6 +117,14 @@ async fn execute_capability_chain(
         let capability_invocation_id = Uuid::new_v4().to_string();
         let capability_started_at = Instant::now();
 
+        tracing::info!(
+            run_id = %ctx.run_id,
+            step_id = %ctx.step.id,
+            capability = %invocation.capability,
+            capability_invocation_id = %capability_invocation_id,
+            "capability dispatch starting"
+        );
+
         append_engine_event(
             ctx.state,
             ctx.run_id,
@@ -122,8 +141,29 @@ async fn execute_capability_chain(
         .await?;
 
         let result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
-            Ok(result) => result,
+            Ok(result) => {
+                tracing::info!(
+                    run_id = %ctx.run_id,
+                    step_id = %ctx.step.id,
+                    capability = %invocation.capability,
+                    capability_invocation_id = %capability_invocation_id,
+                    ok = result.ok,
+                    duration_ms = i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    "capability dispatch returned"
+                );
+                result
+            }
             Err(err) => {
+                tracing::error!(
+                    run_id = %ctx.run_id,
+                    step_id = %ctx.step.id,
+                    capability = %invocation.capability,
+                    capability_invocation_id = %capability_invocation_id,
+                    duration_ms = i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    error = %err,
+                    "capability dispatch returned error"
+                );
+
                 append_engine_event(
                     ctx.state,
                     ctx.run_id,
@@ -140,7 +180,18 @@ async fn execute_capability_chain(
                     }),
                 )
                 .await?;
-                return Err(err);
+
+                CapabilityResult {
+                    ok: false,
+                    capability: invocation.capability.clone(),
+                    payload: json!({
+                        "ok": false,
+                        "summary": format!("Capability '{}' failed during execution.", invocation.capability),
+                        "error": err.to_string(),
+                        "config": invocation.config,
+                    }),
+                    follow_ups: CapabilityInvocationRequest::None,
+                }
             }
         };
 
@@ -161,7 +212,28 @@ async fn execute_capability_chain(
         )
         .await?;
 
-        queue.extend(follow_up_vec(&result.follow_ups));
+        tracing::info!(
+            run_id = %ctx.run_id,
+            step_id = %ctx.step.id,
+            capability = %result.capability,
+            capability_invocation_id = %capability_invocation_id,
+            ok = result.ok,
+            follow_up_count = follow_up_vec(&result.follow_ups).len(),
+            "capability result recorded"
+        );
+
+        let existing_capabilities: std::collections::HashSet<String> = queue
+            .iter()
+            .map(|item| item.capability.clone())
+            .chain(results.iter().map(|item| item.capability.clone()))
+            .collect();
+
+        let follow_ups = follow_up_vec(&result.follow_ups)
+            .into_iter()
+            .filter(|item| !existing_capabilities.contains(&item.capability))
+            .collect::<Vec<_>>();
+
+        queue.extend(follow_ups);
         results.push(result);
     }
 
@@ -178,15 +250,15 @@ fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation>
 
 async fn dispatch(
     ctx: &CapabilityContext<'_>,
-    policy: &StageCapabilityPolicy,
+    _policy: &StageCapabilityPolicy,
     prior_results: &[CapabilityResult],
     invocation: CapabilityInvocation,
 ) -> Result<CapabilityResult> {
     match invocation.capability.as_str() {
-        "inference" => inference::execute(ctx, policy, invocation.config).await,
+        "inference" => inference::execute(ctx, prior_results, invocation.config).await,
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset_schema::execute(ctx, prior_results, invocation.config).await,
-        "apply_changeset" => apply_changeset::execute(ctx, prior_results, invocation.config).await,
+        "gateway_model/changeset" => gateway_model::changeset::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),
     }

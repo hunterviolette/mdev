@@ -1,10 +1,15 @@
 pub mod adapter;
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use super::{BrowserConfig, BrowserProbeResult, InferenceConfig};
-use super::super::registry::CapabilityContext;
+use super::{persist_inference_config, BrowserConfig, BrowserProbeResult, InferenceConfig};
+use super::super::{
+    context_export,
+    registry::{find_result, CapabilityContext, CapabilityResult},
+};
 
 fn is_stale_session_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err).to_ascii_lowercase();
@@ -28,7 +33,34 @@ fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
     Ok(session_id)
 }
 
-pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
+fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityResult]) -> Result<Vec<PathBuf>> {
+    let mut uploads = Vec::new();
+
+    if let Some(result) = find_result(prior_results, "context_export") {
+        if result.ok {
+            if let Some(path) = result.payload.get("output_path").and_then(Value::as_str) {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    uploads.push(PathBuf::from(trimmed));
+                }
+            }
+        }
+    }
+
+    if uploads.is_empty() {
+        if let Some(repo_context) = ctx.local_state.get("repo_context").cloned() {
+            let rendered = context_export::render_context_export_text(repo_context)?;
+            let mut temp_path = std::env::temp_dir();
+            temp_path.push(format!("repo_context_{}.txt", ctx.run_id));
+            std::fs::write(&temp_path, rendered.as_bytes())?;
+            uploads.push(temp_path);
+        }
+    }
+
+    Ok(uploads)
+}
+
+pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityResult]) -> Result<serde_json::Value> {
     let prompt = ctx
         .local_state
         .get("composed_prompt")
@@ -46,16 +78,10 @@ pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
             ..InferenceConfig::default()
         });
 
-    ensure_live_browser_session(&mut inference_cfg.browser)?;
-    let result = adapter::send_chat_and_wait(&mut inference_cfg.browser, &prompt)?;
-    Ok(json!(result))
-}
+    let target_url = inference_cfg.browser.target_url.trim().to_string();
+    let session_id = ensure_live_browser_session(&mut inference_cfg.browser)?;
 
-pub fn connect_session(cfg: &mut InferenceConfig) -> Result<Value> {
-    let target_url = cfg.browser.target_url.trim().to_string();
-    let session_id = ensure_live_browser_session(&mut cfg.browser)?;
-
-    let current_probe = adapter::probe(&mut cfg.browser).ok();
+    let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
     let should_open_target = if target_url.is_empty() {
         false
     } else {
@@ -66,17 +92,51 @@ pub fn connect_session(cfg: &mut InferenceConfig) -> Result<Value> {
     };
 
     if should_open_target {
-        adapter::open_url(&mut cfg.browser, &target_url)?;
+        adapter::open_url(&mut inference_cfg.browser, &target_url)?;
     }
 
-    let probe = match adapter::probe(&mut cfg.browser) {
+    let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
+    if let Some(probe) = current_probe.as_ref() {
+        if !probe.ready {
+            persist_inference_config(ctx, &inference_cfg).await?;
+            return Ok(json!({
+                "transport": "browser",
+                "text": "",
+                "conversation_id": Value::Null,
+                "browser_session_id": inference_cfg.browser.session_id,
+                "probe": probe,
+                "ok": false,
+                "message": format!(
+                    "Browser page is not chat-ready; send was skipped (page_open={}, chat_input_found={}, chat_input_visible={}, url={})",
+                    probe.page_open,
+                    probe.chat_input_found,
+                    probe.chat_input_visible,
+                    probe.url
+                )
+            }));
+        }
+    }
+
+    let upload_paths = dependency_upload_paths(ctx, prior_results)?;
+    let mut uploaded_files = Vec::new();
+    for upload_path in upload_paths.iter() {
+        if upload_path.exists() {
+            adapter::upload_file(&mut inference_cfg.browser, upload_path.as_path())?;
+            uploaded_files.push(upload_path.to_string_lossy().to_string());
+        }
+    }
+
+    let result = adapter::send_chat_and_wait(&mut inference_cfg.browser, &prompt)?;
+    persist_inference_config(ctx, &inference_cfg).await?;
+
+    let probe = match adapter::probe(&mut inference_cfg.browser) {
         Ok(probe) => probe,
         Err(_) => BrowserProbeResult {
-            session_id: session_id.clone(),
+            session_id,
             browser_connected: true,
             page_open: !target_url.is_empty(),
-            url: target_url.clone(),
-            profile: cfg.browser.profile.clone(),
+            url: target_url,
+            profile: inference_cfg.browser.profile.clone(),
             chat_input_found: false,
             chat_input_visible: false,
             chat_submit_found: false,
@@ -84,84 +144,30 @@ pub fn connect_session(cfg: &mut InferenceConfig) -> Result<Value> {
         },
     };
 
-    Ok(json!({
+    let bridge_result = serde_json::from_str::<Value>(&result.text).unwrap_or_else(|_| json!({
         "ok": true,
-        "connected": probe.browser_connected && probe.page_open,
-        "session_id": session_id,
-        "target_url": if target_url.is_empty() { Value::Null } else { Value::String(target_url) },
-        "ready": probe.ready,
-        "probe": probe,
-    }))
-}
-
-pub fn disconnect_session(cfg: &mut InferenceConfig) -> Result<Value> {
-    cfg.browser.session_id = None;
-    Ok(json!({ "ok": true }))
-}
-
-pub fn open_session_url(cfg: &mut InferenceConfig, url: &str) -> Result<Value> {
-    ensure_live_browser_session(&mut cfg.browser)?;
-    adapter::open_url(&mut cfg.browser, url)?;
-    Ok(json!({ "ok": true, "url": url }))
-}
-
-pub fn probe_session(cfg: &mut InferenceConfig) -> Result<Value> {
-    ensure_live_browser_session(&mut cfg.browser)?;
-    let probe = adapter::probe(&mut cfg.browser)?;
-    Ok(json!({ "ok": true, "probe": probe }))
-}
-
-pub fn connection_status(cfg: &mut InferenceConfig) -> Result<Value> {
-    match cfg.transport {
-        super::InferenceTransport::Api => Ok(json!({
-            "ok": true,
-            "transport": "api",
-            "connected": !cfg.model.trim().is_empty(),
-            "ready": !cfg.model.trim().is_empty(),
-            "model": cfg.model,
-        })),
-        super::InferenceTransport::Browser => {
-            let session_id = cfg.browser.session_id.clone().unwrap_or_default();
-            if session_id.trim().is_empty() {
-                return Ok(json!({
-                    "ok": true,
-                    "transport": "browser",
-                    "connected": false,
-                    "ready": false,
-                    "session_id": Value::Null,
-                    "probe": Value::Null,
-                }));
-            }
-
-            match adapter::probe(&mut cfg.browser) {
-                Ok(probe) => Ok(json!({
-                    "ok": true,
-                    "transport": "browser",
-                    "connected": probe.browser_connected && probe.page_open,
-                    "ready": probe.ready,
-                    "session_id": session_id,
-                    "probe": probe,
-                })),
-                Err(err) if is_stale_session_error(&err) => {
-                    cfg.browser.session_id = None;
-                    Ok(json!({
-                        "ok": true,
-                        "transport": "browser",
-                        "connected": false,
-                        "ready": false,
-                        "session_id": Value::Null,
-                        "probe": Value::Null,
-                    }))
-                }
-                Err(err) => Ok(json!({
-                    "ok": false,
-                    "transport": "browser",
-                    "connected": false,
-                    "ready": false,
-                    "session_id": session_id,
-                    "error": format!("{:#}", err),
-                }))
-            }
-        }
+        "text": result.text,
+        "send": Value::Null,
+        "read": Value::Null,
+    }));
+    let send_sent = bridge_result
+        .get("send")
+        .and_then(|v| v.get("sent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !send_sent {
+        return Err(anyhow!("Browser bridge did not send chat successfully"));
     }
+
+    Ok(json!({
+        "ok": bridge_result.get("ok").and_then(Value::as_bool).unwrap_or(true),
+        "transport": result.transport,
+        "text": bridge_result.get("text").and_then(Value::as_str).unwrap_or(""),
+        "conversation_id": result.conversation_id,
+        "browser_session_id": result.browser_session_id,
+        "probe": probe,
+        "uploaded_files": uploaded_files,
+        "send": bridge_result.get("send").cloned().unwrap_or(Value::Null),
+        "read": bridge_result.get("read").cloned().unwrap_or(Value::Null)
+    }))
 }

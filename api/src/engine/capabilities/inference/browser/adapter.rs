@@ -159,6 +159,7 @@ struct BridgeClient {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
+    launched_browser: Option<Child>,
 }
 
 impl BridgeClient {
@@ -167,6 +168,7 @@ impl BridgeClient {
             child: None,
             stdin: None,
             stdout: None,
+            launched_browser: None,
         }
     }
 
@@ -226,6 +228,73 @@ impl BridgeClient {
         }
         Ok(response)
     }
+
+    fn shutdown(&mut self) {
+        self.stdin.take();
+        self.stdout.take();
+
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        if let Some(mut browser) = self.launched_browser.take() {
+            let _ = browser.kill();
+            let _ = browser.wait();
+        }
+    }
+}
+
+impl Drop for BridgeClient {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+pub fn shutdown_browser_bridge() {
+    if let Ok(mut client) = bridge_client().lock() {
+        client.shutdown();
+    }
+}
+
+fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
+    let executable = resolve_edge_executable(cfg);
+
+    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
+    let cdp_url = if cfg.cdp_url.trim().is_empty() {
+        "http://127.0.0.1:9222".to_string()
+    } else {
+        cfg.cdp_url.clone()
+    };
+    let host_port = cdp_url
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| cdp_url.trim().strip_prefix("https://"))
+        .unwrap_or(cdp_url.trim())
+        .split('/')
+        .next()
+        .unwrap_or("127.0.0.1:9222")
+        .to_string();
+    let port = host_port
+        .split(':')
+        .nth(1)
+        .unwrap_or("9222")
+        .parse::<u16>()
+        .unwrap_or(9222);
+    let launch_url = normalize_browser_url_for_launch(&cfg.target_url);
+
+    info!(executable = %executable, user_data_dir = %user_data_dir.display(), port, launch_url = %launch_url, "launching Edge with remote debugging");
+
+    let child = Command::new(&executable)
+        .arg(format!("--remote-debugging-port={}", port))
+        .arg(format!("--user-data-dir={}", user_data_dir.to_string_lossy()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg(launch_url)
+        .spawn()
+        .with_context(|| format!("failed to launch Edge via {}", executable))?;
+
+    Ok(child)
 }
 
 fn bridge_client() -> &'static Mutex<BridgeClient> {
@@ -290,45 +359,6 @@ fn normalize_browser_url_for_launch(url: &str) -> String {
     format!("https://{}", trimmed.trim_start_matches('/'))
 }
 
-fn launch_edge(cfg: &BrowserConfig) -> Result<()> {
-    let executable = resolve_edge_executable(cfg);
-
-    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
-    let cdp_url = if cfg.cdp_url.trim().is_empty() {
-        "http://127.0.0.1:9222".to_string()
-    } else {
-        cfg.cdp_url.clone()
-    };
-    let host_port = cdp_url
-        .trim()
-        .strip_prefix("http://")
-        .or_else(|| cdp_url.trim().strip_prefix("https://"))
-        .unwrap_or(cdp_url.trim())
-        .split('/')
-        .next()
-        .unwrap_or("127.0.0.1:9222")
-        .to_string();
-    let port = host_port
-        .split(':')
-        .nth(1)
-        .unwrap_or("9222")
-        .parse::<u16>()
-        .unwrap_or(9222);
-    let launch_url = normalize_browser_url_for_launch(&cfg.target_url);
-
-    info!(executable = %executable, user_data_dir = %user_data_dir.display(), port, launch_url = %launch_url, "launching Edge with remote debugging");
-
-    Command::new(&executable)
-        .arg(format!("--remote-debugging-port={}", port))
-        .arg(format!("--user-data-dir={}", user_data_dir.to_string_lossy()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg(launch_url)
-        .spawn()
-        .with_context(|| format!("failed to launch Edge via {}", executable))?;
-
-    Ok(())
-}
 
 pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
     info!(cdp_url = %cfg.cdp_url, bridge_dir = %cfg.bridge_dir, target_url = %cfg.target_url, page_url_contains = %cfg.page_url_contains, auto_launch_edge = cfg.auto_launch_edge, "launch_and_attach starting");
@@ -336,7 +366,10 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         warn!(cdp_url = %cfg.cdp_url, "cdp endpoint not reachable before attach");
         if cfg.auto_launch_edge {
             info!(cdp_url = %cfg.cdp_url, "attempting to launch edge with remote debugging");
-            launch_edge(cfg)?;
+            let child = launch_edge(cfg)?;
+            if let Ok(mut client) = bridge_client().lock() {
+                client.launched_browser = Some(child);
+            }
         }
     }
 
@@ -447,27 +480,60 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
     payload["session_id"] = Value::String(session_id);
     payload["file_path"] = Value::String(file_path.to_string_lossy().to_string());
     payload["timeout_ms"] = Value::Number(timeout_ms(cfg).into());
-    client.send_json(payload)?;
+    let value = client.send_json(payload)?;
+    let data = value.get("data").cloned().unwrap_or(value);
+    let ready = data.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ready {
+        let upload_name = data
+            .get("upload_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| file_path.file_name().and_then(|v| v.to_str()))
+            .unwrap_or("unknown");
+        return Err(anyhow!("Browser bridge upload did not become ready ({})", upload_name));
+    }
 
     Ok(())
 }
 
 pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<InferenceResult> {
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-    client.ensure_started(&cfg.bridge_dir)?;
+    let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before send_chat"))?;
 
-    if cfg.session_id.is_none() {
-        let session_id = launch_and_attach(cfg)?;
-        cfg.session_id = Some(session_id);
+    let probe = probe(cfg)?;
+    if !probe.ready {
+        return Err(anyhow!(
+            "Browser page is not chat-ready before send_chat (page_open={}, chat_input_found={}, chat_input_visible={}, url={})",
+            probe.page_open,
+            probe.chat_input_found,
+            probe.chat_input_visible,
+            probe.url
+        ));
     }
 
-    let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
+    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    client.ensure_started(&cfg.bridge_dir)?;
 
     let mut send_payload = bridge_cmd("send_chat");
     send_payload["session_id"] = Value::String(session_id.clone());
     send_payload["text"] = Value::String(text.to_string());
     send_payload["timeout_ms"] = Value::Number(timeout_ms(cfg).into());
-    client.send_json(send_payload)?;
+    let send_value = client.send_json(send_payload)?;
+
+    let send_data = send_value.get("data").cloned().unwrap_or(send_value);
+    let sent = send_data
+        .get("sent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !sent {
+        let method = send_data
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        return Err(anyhow!(
+            "Browser bridge did not send chat successfully (method={})",
+            method
+        ));
+    }
 
     let mut read_payload = bridge_cmd("read_response");
     read_payload["session_id"] = Value::String(session_id);
@@ -475,22 +541,22 @@ pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<Inferen
     read_payload["timeout_ms"] = Value::Number(cfg.response_timeout_ms.into());
     let read_value = client.send_json(read_payload)?;
 
-    let data = read_value.get("data").cloned().unwrap_or(read_value);
-    let text = data
+    let read_data = read_value.get("data").cloned().unwrap_or(read_value);
+    let text = read_data
         .get("response")
         .and_then(|v| v.as_str())
-        .or_else(|| data.get("text").and_then(|v| v.as_str()))
-        .or_else(|| data.get("content").and_then(|v| v.as_str()))
-        .or_else(|| data.get("message").and_then(|v| v.as_str()))
-        .or_else(|| data.get("output_text").and_then(|v| v.as_str()))
+        .or_else(|| read_data.get("text").and_then(|v| v.as_str()))
+        .or_else(|| read_data.get("content").and_then(|v| v.as_str()))
+        .or_else(|| read_data.get("message").and_then(|v| v.as_str()))
+        .or_else(|| read_data.get("output_text").and_then(|v| v.as_str()))
         .or_else(|| {
-            data.get("response")
+            read_data.get("response")
                 .and_then(|v| v.as_object())
                 .and_then(|obj| obj.get("text"))
                 .and_then(|v| v.as_str())
         })
         .or_else(|| {
-            data.get("message")
+            read_data.get("message")
                 .and_then(|v| v.as_object())
                 .and_then(|obj| obj.get("content"))
                 .and_then(|v| v.as_str())
@@ -500,7 +566,12 @@ pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<Inferen
 
     Ok(InferenceResult {
         transport: InferenceTransport::Browser,
-        text,
+        text: json!({
+            "ok": true,
+            "text": text,
+            "send": send_data,
+            "read": read_data,
+        }).to_string(),
         conversation_id: None,
         browser_session_id: cfg.session_id.clone(),
     })

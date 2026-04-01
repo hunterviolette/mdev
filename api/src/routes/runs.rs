@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine,
-    executor,
     models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun},
 };
 
@@ -87,6 +86,16 @@ async fn run_action(
     Json(req): Json<RunActionRequest>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let action = req.action.as_str();
+    let requested_step_id = req.step_id.clone();
+
+    tracing::info!(
+        run_id = %run_id,
+        action = %action,
+        step_id = ?requested_step_id,
+        payload = %req.payload,
+        "workflow run action requested"
+    );
+
     let response = match action {
         "select_step" => {
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
@@ -137,6 +146,13 @@ async fn run_action(
         }
     };
 
+    tracing::info!(
+        run_id = %run_id,
+        action = %action,
+        step_id = ?requested_step_id,
+        "workflow run action completed"
+    );
+
     Ok(Json(response))
 }
 
@@ -182,7 +198,7 @@ async fn create_run(
     .await
     .map_err(internal)?;
 
-    executor::append_event(
+    engine::append_event(
         &state.db,
         id,
         None,

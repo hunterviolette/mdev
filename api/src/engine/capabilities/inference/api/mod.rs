@@ -3,7 +3,7 @@ pub mod oai;
 use anyhow::Result;
 use serde_json::json;
 
-use super::{InferenceConfig, InferenceResult, InferenceTransport};
+use super::{persist_inference_config, InferenceConfig, InferenceResult, InferenceTransport};
 use super::super::registry::CapabilityContext;
 
 pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
@@ -14,7 +14,7 @@ pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
         .unwrap_or("")
         .to_string();
 
-    let inference_cfg: InferenceConfig = ctx
+    let mut inference_cfg: InferenceConfig = ctx
         .local_state
         .get("inference")
         .cloned()
@@ -30,6 +30,9 @@ pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
             vec![("user".to_string(), prompt)],
         )
         .await?;
+
+    inference_cfg.conversation_id = Some(conversation_id.clone());
+    persist_inference_config(ctx, &inference_cfg).await?;
 
     let result = InferenceResult {
         transport: InferenceTransport::Api,

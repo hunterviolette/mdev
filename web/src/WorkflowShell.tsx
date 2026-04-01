@@ -32,10 +32,10 @@ import {
   createRun,
   createTemplate,
   deleteRun,
-  getPayloadGatewaySchema,
+  getEventChainSummary,
+  getChangesetSchema,
   getRun,
   getStageExecutionChain,
-  invokeModelInference,
   listRepoTree,
   listRunEvents,
   listRuns,
@@ -130,6 +130,7 @@ type LiveExecutionChainState = {
   loading: boolean;
   error: string | null;
   chain: StageExecutionChain | null;
+  latestCreatedAt: string | null;
 };
 
 function collectLoadedFilePaths(parentPath: string, childrenByParent: Record<string, RepoTreeEntry[]>): string[] {
@@ -147,6 +148,28 @@ function collectLoadedFilePaths(parentPath: string, childrenByParent: Record<str
 
 function getLiveExecutionDefaultExpanded(trail: LiveStageTrail): boolean {
   return trail.isActive || trail.isCurrent;
+}
+
+function extractInferenceTextFromPayload(payload: unknown): string {
+  const objectPayload = (payload ?? {}) as Record<string, unknown>;
+  const result = objectPayload.result as Record<string, unknown> | undefined;
+  const nestedResult = result?.result as Record<string, unknown> | undefined;
+  const directText = typeof nestedResult?.text === 'string' ? nestedResult.text : undefined;
+  if (directText && directText.trim()) return directText;
+
+  const capabilityResults = Array.isArray(objectPayload.capability_results)
+    ? (objectPayload.capability_results as Array<Record<string, unknown>>)
+    : [];
+
+  for (let i = capabilityResults.length - 1; i >= 0; i -= 1) {
+    const entry = capabilityResults[i];
+    const entryResult = entry?.result as Record<string, unknown> | undefined;
+    const entryNestedResult = entryResult?.result as Record<string, unknown> | undefined;
+    const text = typeof entryNestedResult?.text === 'string' ? entryNestedResult.text : undefined;
+    if (text && text.trim()) return text;
+  }
+
+  return '';
 }
 
 const DEFAULT_STEPS: BuilderStep[] = [
@@ -178,12 +201,30 @@ const DEFAULT_STEPS: BuilderStep[] = [
     pauseOnEnter: false,
     requireManualApproval: false,
     autoAdvanceOnSuccess: true,
+    compileCommands: '',
+    maxConsecutiveApplyFailures: 1,
+    transitions: {
+      successTarget: 'compile',
+      errorTarget: 'code',
+      pausedTarget: 'code'
+    }
+  },
+  {
+    id: 'compile',
+    name: 'Compile',
+    stepType: 'compile',
+    automationMode: 'automatic',
+    includeRepoContext: false,
+    includeChangesetSchema: false,
+    pauseOnEnter: false,
+    requireManualApproval: false,
+    autoAdvanceOnSuccess: true,
     compileCommands: 'cargo check',
-    maxConsecutiveApplyFailures: 3,
+    maxConsecutiveApplyFailures: 1,
     transitions: {
       successTarget: 'review',
       errorTarget: 'code',
-      pausedTarget: 'code'
+      pausedTarget: 'compile'
     }
   },
   {
@@ -221,30 +262,45 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
     .filter(Boolean);
 
   const executionLogic = step.id === 'code'
-    ? { kind: 'code_stage_policy', max_consecutive_apply_failures: step.maxConsecutiveApplyFailures }
-    : step.id === 'review'
-      ? { kind: 'review_stage_policy', require_manual_approval: step.requireManualApproval }
-      : { kind: 'design_stage_policy' };
+    ? { kind: 'code_stage_policy' }
+    : step.id === 'compile'
+      ? { kind: 'compile_stage_policy' }
+      : step.id === 'review'
+        ? { kind: 'review_stage_policy', require_manual_approval: step.requireManualApproval }
+        : { kind: 'design_stage_policy' };
 
-  const executionPlan = [
-    {
-      kind: 'capability' as const,
-      key: 'inference',
-      enabled: true,
-      config: {
-        mode: 'send_prompt',
-        allowed_invocations: step.id === 'design'
-          ? ['context_export']
-          : step.id === 'code'
-            ? ['context_export', 'changeset_schema', 'apply_changeset', 'compile_commands']
-            : []
-      },
-      input_mapping: {},
-      output_mapping: {},
-      run_after: [],
-      condition: null
-    }
-  ];
+  const executionPlan = step.id === 'compile'
+    ? [
+        {
+          kind: 'capability' as const,
+          key: 'compile_commands',
+          enabled: true,
+          config: {},
+          input_mapping: {},
+          output_mapping: {},
+          run_after: [],
+          condition: null
+        }
+      ]
+    : [
+        {
+          kind: 'capability' as const,
+          key: 'inference',
+          enabled: true,
+          config: {
+            mode: 'send_prompt',
+            allowed_invocations: step.id === 'design'
+              ? ['context_export']
+              : step.id === 'code'
+                ? ['context_export', 'changeset_schema', 'apply_changeset']
+                : []
+          },
+          input_mapping: {},
+          output_mapping: {},
+          run_after: [],
+          condition: null
+        }
+      ];
 
   return {
     id: step.id,
@@ -253,7 +309,7 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
     automation_mode: step.automationMode,
     execution: {
       changeset_apply: step.id === 'code' ? { enabled: true } : {},
-      compile_checks: step.id === 'code' ? { commands: compileCommands } : {}
+      compile_checks: step.id === 'compile' ? { commands: compileCommands } : {}
     },
     prompt: {
       include_repo_context: step.includeRepoContext,
@@ -265,21 +321,31 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
         pause_on_enter: step.pauseOnEnter
       }
     },
-    capabilities: [
-      {
-        capability: 'inference',
-        enabled: true,
-        config: {
-          allowed_invocations: step.id === 'design'
-            ? ['context_export']
-            : step.id === 'code'
-              ? ['context_export', 'changeset_schema', 'apply_changeset', 'compile_commands']
-              : []
-        },
-        input_mapping: {},
-        output_mapping: {}
-      }
-    ],
+    capabilities: step.id === 'compile'
+      ? [
+          {
+            capability: 'compile_commands',
+            enabled: true,
+            config: {},
+            input_mapping: {},
+            output_mapping: {}
+          }
+        ]
+      : [
+          {
+            capability: 'inference',
+            enabled: true,
+            config: {
+              allowed_invocations: step.id === 'design'
+                ? ['context_export']
+                : step.id === 'code'
+                  ? ['context_export', 'changeset_schema', 'apply_changeset']
+                  : []
+            },
+            input_mapping: {},
+            output_mapping: {}
+          }
+        ],
     execution_logic: executionLogic,
     execution_plan: executionPlan,
     advancement: {
@@ -328,10 +394,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   inferenceModel: string;
   browserTargetUrl: string;
   browserCdpUrl: string;
-  browserSessionId: string;
-  browserProbe: BrowserProbeResult | null;
   inferenceBusy: boolean;
-  inferencePollBusy: boolean;
   inferenceStatus: string | null;
   inferenceConfigOpen: boolean;
   onOpenConfig: () => void;
@@ -341,8 +404,6 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   onBrowserTargetUrlChange: (value: string) => void;
   onBrowserCdpUrlChange: (value: string) => void;
   onSaveConfig: () => void;
-  onConnectBrowser: () => void;
-  onDisconnectBrowser: () => void;
 }) {
   const {
     inferenceConnectionStatus,
@@ -351,10 +412,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
     inferenceModel,
     browserTargetUrl,
     browserCdpUrl,
-    browserSessionId,
-    browserProbe,
     inferenceBusy,
-    inferencePollBusy,
     inferenceStatus,
     inferenceConfigOpen,
     onOpenConfig,
@@ -363,9 +421,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
     onModelChange,
     onBrowserTargetUrlChange,
     onBrowserCdpUrlChange,
-    onSaveConfig,
-    onConnectBrowser,
-    onDisconnectBrowser
+    onSaveConfig
   } = props;
 
   const showInlineConfig = !inferenceReady;
@@ -420,13 +476,10 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
                     placeholder="http://127.0.0.1:9222"
                   />
                 </SimpleGrid>
-                <TextInput label="Attached session" value={browserSessionId} readOnly />
+                <Alert color="blue">Browser lifecycle is managed automatically by the backend when this stage runs.</Alert>
                 <Group>
                   <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-                  <Button onClick={onConnectBrowser} loading={inferenceBusy}>Connect browser</Button>
-                  <Button variant="light" onClick={onDisconnectBrowser} loading={inferenceBusy} disabled={!browserSessionId.trim()}>Disconnect browser</Button>
                 </Group>
-                {browserProbe ? <JsonInput value={JSON.stringify(browserProbe, null, 2)} readOnly autosize minRows={8} /> : null}
               </Stack>
             ) : (
               <Group>
@@ -434,7 +487,6 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
               </Group>
             )}
 
-            {inferencePollBusy && inferenceTransport === 'browser' && browserSessionId.trim() ? <Alert color="blue">Polling browser readiness…</Alert> : null}
             {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
           </Stack>
         ) : null}
@@ -477,13 +529,10 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
                   placeholder="http://127.0.0.1:9222"
                 />
               </SimpleGrid>
-              <TextInput label="Attached session" value={browserSessionId} readOnly />
+              <Alert color="blue">Browser lifecycle is managed automatically by the backend when this stage runs.</Alert>
               <Group>
                 <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-                <Button onClick={onConnectBrowser} loading={inferenceBusy}>Connect browser</Button>
-                <Button variant="light" onClick={onDisconnectBrowser} loading={inferenceBusy} disabled={!browserSessionId.trim()}>Disconnect browser</Button>
               </Group>
-              {browserProbe ? <JsonInput value={JSON.stringify(browserProbe, null, 2)} readOnly autosize minRows={8} /> : null}
             </Stack>
           ) : (
             <Group>
@@ -491,7 +540,6 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
             </Group>
           )}
 
-          {inferencePollBusy && inferenceTransport === 'browser' && browserSessionId.trim() ? <Alert color="blue">Polling browser readiness…</Alert> : null}
           {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
         </Stack>
       </Modal>
@@ -504,26 +552,32 @@ const StageInputsPanel = memo(function StageInputsPanel(props: {
   stageUserInput: string;
   stageIncludeRepoContext: boolean;
   stageIncludeChangesetSchema: boolean;
+  stageIncludeApplyError: boolean;
+  stageApplyError: string;
+  repoFragmentSummary: string | null;
   onStageUserInputChange: (value: string) => void;
   onStageIncludeRepoContextChange: (checked: boolean) => void;
   onStageIncludeChangesetSchemaChange: (checked: boolean) => void;
+  onStageIncludeApplyErrorChange: (checked: boolean) => void;
   onOpenRepoConfig: () => void;
   onOpenSchemaConfig: () => void;
   onOpenApplyErrorConfig: () => void;
-  onOpenCompileErrorConfig: () => void;
 }) {
   const {
     selectedWorkflowStep,
     stageUserInput,
     stageIncludeRepoContext,
     stageIncludeChangesetSchema,
+    stageIncludeApplyError,
+    stageApplyError,
+    repoFragmentSummary,
     onStageUserInputChange,
     onStageIncludeRepoContextChange,
     onStageIncludeChangesetSchemaChange,
+    onStageIncludeApplyErrorChange,
     onOpenRepoConfig,
     onOpenSchemaConfig,
-    onOpenApplyErrorConfig,
-    onOpenCompileErrorConfig
+    onOpenApplyErrorConfig
   } = props;
 
   return (
@@ -533,6 +587,7 @@ const StageInputsPanel = memo(function StageInputsPanel(props: {
       <Group>
         <Switch label="Include repo fragment" checked={stageIncludeRepoContext} onChange={(e) => onStageIncludeRepoContextChange(e.currentTarget.checked)} />
         <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
+        {stageIncludeRepoContext && repoFragmentSummary ? <Badge variant="light">{repoFragmentSummary}</Badge> : null}
       </Group>
       {selectedWorkflowStep?.id === 'code' ? (
         <>
@@ -540,14 +595,13 @@ const StageInputsPanel = memo(function StageInputsPanel(props: {
             <Switch label="Include changeset schema fragment" checked={stageIncludeChangesetSchema} onChange={(e) => onStageIncludeChangesetSchemaChange(e.currentTarget.checked)} />
             <Button size="xs" variant="light" onClick={onOpenSchemaConfig}>Configure schema</Button>
           </Group>
-          <Group>
-            <Switch label="Include apply error fragment" checked={false} onChange={() => {}} />
-            <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>Configure apply error</Button>
-          </Group>
-          <Group>
-            <Switch label="Include compile error fragment" checked={false} onChange={() => {}} />
-            <Button size="xs" variant="light" onClick={onOpenCompileErrorConfig}>Configure compile error</Button>
-          </Group>
+          {stageApplyError.trim() ? (
+            <Group>
+              <Switch label="Include apply error fragment" checked={stageIncludeApplyError} onChange={(e) => onStageIncludeApplyErrorChange(e.currentTarget.checked)} />
+              <Badge variant="light" color="orange">Apply error available</Badge>
+              <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>View apply error</Button>
+            </Group>
+          ) : null}
         </>
       ) : null}
     </Stack>
@@ -616,9 +670,9 @@ export function WorkflowShell() {
   const [stageRepoContextIncludeStagedDiff, setStageRepoContextIncludeStagedDiff] = useState(false);
   const [stageRepoContextIncludeUnstagedDiff, setStageRepoContextIncludeUnstagedDiff] = useState(false);
   const [stageIncludeChangesetSchema, setStageIncludeChangesetSchema] = useState(true);
-  const [stageChangesetSchemaText, setStageChangesetSchemaText] = useState('Use ChangeSet JSON version 1. Return only the JSON payload.');
+  const [stageChangesetSchemaText, setStageChangesetSchemaText] = useState('');
   const [stageApplyError, setStageApplyError] = useState('');
-  const [stageCompileError, setStageCompileError] = useState('');
+  const [stageIncludeApplyError, setStageIncludeApplyError] = useState(true);
   const [stageReviewNotes, setStageReviewNotes] = useState('');
   const [stageApproved, setStageApproved] = useState(false);
   const [stageRejected, setStageRejected] = useState(false);
@@ -627,7 +681,6 @@ export function WorkflowShell() {
   const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
-  const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
   const [runContextOpen, setRunContextOpen] = useState(false);
   const [inferenceConfigOpen, setInferenceConfigOpen] = useState(false);
@@ -653,45 +706,58 @@ export function WorkflowShell() {
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
   const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
   const selectedWorkflowStep = selectedRunTemplate?.definition.steps.find((step) => step.id === (selectedStepId ?? selectedRun?.current_step_id ?? '')) ?? null;
+  const sharedInferenceState = useMemo(() => {
+    const context = (selectedRun?.context as Record<string, unknown> | undefined) ?? undefined;
+    const inference = (context?.model_inference ?? null) as Record<string, unknown> | null;
+    return inference;
+  }, [selectedRun?.context]);
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const stageState = (workflowEngine?.stage_state ?? {}) as Record<string, unknown>;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const globalRepoContext = (globalState.repo_context ?? null) as Record<string, unknown> | null;
     const stepId = selectedStepId ?? selectedRun?.current_step_id ?? '';
-    return (stageState[stepId] ?? null) as Record<string, unknown> | null;
-  }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId]);
+    const localStageState = (stageState[stepId] ?? null) as Record<string, unknown> | null;
+    if (!localStageState && !globalRepoContext && !sharedInferenceState) {
+      return null;
+    }
+    return {
+      ...(globalRepoContext ? { repo_context: globalRepoContext } : {}),
+      ...(sharedInferenceState ? { inference: sharedInferenceState } : {}),
+      ...(localStageState ?? {})
+    } as Record<string, unknown>;
+  }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
   const selectedRepoPathSet = useMemo(() => new Set(selectedRepoPaths), [selectedRepoPaths]);
+  const repoFragmentSummary = useMemo(() => {
+    const includeFiles = Array.from(new Set(selectedRepoPaths.map((value) => value.trim()).filter(Boolean)));
+    if (includeFiles.length === 0) {
+      return '0 files selected';
+    }
+    return `${includeFiles.length} file${includeFiles.length === 1 ? '' : 's'} selected`;
+  }, [selectedRepoPaths]);
+  const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
   const definition = useMemo(() => buildTemplateDefinition(builderSteps), [builderSteps]);
 
   const inferenceConnectionStatus = useMemo<InferenceConnectionStatus>(() => {
     if (inferenceTransport === 'api') {
       return {
-        color: inferenceConnected ? 'blue' : 'gray',
-        label: inferenceConnected ? 'API CONNECTED' : 'API DISCONNECTED'
+        color: 'blue',
+        label: 'API MODE'
       };
     }
 
-    if (browserProbe?.ready) {
-      return { color: 'green', label: 'URL CONNECTED' };
-    }
+    return {
+      color: 'violet',
+      label: 'BROWSER MODE'
+    };
+  }, [inferenceTransport]);
 
-    if (browserSessionId.trim()) {
-      return { color: 'yellow', label: 'BRIDGE CONNECTED' };
-    }
+  const inferenceRequiresConnection = false;
+  const inferenceReady = true;
+  const showStageStream = true;
 
-    return { color: 'red', label: 'BRIDGE DISCONNECTED' };
-  }, [
-    browserProbe?.ready,
-    browserSessionId,
-    inferenceConnected,
-    inferenceTransport
-  ]);
-
-  const inferenceRequiresConnection = selectedWorkflowStep?.id === 'design' || selectedWorkflowStep?.id === 'code';
-  const inferenceReady = !inferenceRequiresConnection ? true : inferenceConnected && (inferenceTransport === 'api' || Boolean(browserProbe?.ready));
-  const showStageStream = !inferenceRequiresConnection || inferenceReady;
-
-  const shouldPollBrowserInference = inferenceRequiresConnection && Boolean(selectedRun) && (inferenceTransport === 'api' || Boolean(browserSessionId.trim()));
+  const shouldPollBrowserInference = false;
 
   const inferenceSummaryText = inferenceConnectionStatus.label;
 
@@ -752,23 +818,26 @@ export function WorkflowShell() {
   }, [selectedRun?.id, selectedRun?.current_step_id]);
 
   useEffect(() => {
-    const modelInference = (selectedRun?.context as Record<string, unknown> | undefined)?.model_inference as Record<string, unknown> | undefined;
-    if (!modelInference) {
+    const inference = (sharedInferenceState ?? null) as Record<string, unknown> | null;
+    if (!inference) {
       setInferenceTransport('api');
       setInferenceModel('gpt-5');
+      setBrowserTargetUrl('https://website.com/');
+      setBrowserCdpUrl('http://127.0.0.1:9222');
       setBrowserSessionId('');
       setBrowserProbe(null);
       return;
     }
 
-    setInferenceTransport((modelInference.transport as InferenceTransport) ?? 'api');
-    setInferenceModel(typeof modelInference.model === 'string' && modelInference.model.trim() ? modelInference.model : 'gpt-5');
+    setInferenceTransport((inference.transport as InferenceTransport) ?? 'api');
+    setInferenceModel(typeof inference.model === 'string' && inference.model.trim() ? inference.model : 'gpt-5');
 
-    const browser = (modelInference.browser ?? {}) as Record<string, unknown>;
+    const browser = (inference.browser ?? {}) as Record<string, unknown>;
     setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
     setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : 'http://127.0.0.1:9222');
     setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
-  }, [selectedRun?.id]);
+    setBrowserProbe(null);
+  }, [sharedInferenceState, selectedRun?.id]);
 
   useEffect(() => {
     const step = selectedWorkflowStep;
@@ -778,10 +847,17 @@ export function WorkflowShell() {
     const promptFragmentEnabled = (selectedStageState?.prompt_fragment_enabled ?? {}) as Record<string, unknown>;
     const repoContext = (selectedStageState?.repo_context ?? {}) as Record<string, unknown>;
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
+    const includeFiles = Array.isArray(repoContext.include_files)
+      ? repoContext.include_files.filter((value): value is string => typeof value === 'string')
+      : [];
+
+    if (step.id === 'code' && typeof promptFragments.changeset_schema !== 'string') {
+      void loadCanonicalChangesetSchema(false);
+    }
 
     setStageUserInput(typeof promptFragments.user_input === 'string' ? promptFragments.user_input : '');
+    setStageChangesetSchemaText(typeof promptFragments.changeset_schema === 'string' ? promptFragments.changeset_schema : '');
     setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
-    setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
     setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
     setStageApproved(Boolean(review.approved));
     setStageRejected(Boolean(review.rejected));
@@ -795,12 +871,15 @@ export function WorkflowShell() {
         ? promptFragmentEnabled.changeset_schema
         : (step.prompt?.include_changeset_schema ?? step.id === 'code')
     );
-    setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
-    setStageRepoContextIncludeFilesText(
-      Array.isArray(repoContext.include_files)
-        ? repoContext.include_files.filter((value): value is string => typeof value === 'string').join('\n')
-        : ''
+    setStageIncludeApplyError(
+      typeof promptFragmentEnabled.apply_error === 'boolean'
+        ? promptFragmentEnabled.apply_error
+        : false
     );
+    setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
+    setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
+    setSelectedRepoPaths(includeFiles);
+    setSelectedRepoDirs(new Set());
     setStageRepoContextExcludeRegexText(
       Array.isArray(repoContext.exclude_regex)
         ? repoContext.exclude_regex.filter((value): value is string => typeof value === 'string').join('\n')
@@ -815,7 +894,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
-  }, [selectedWorkflowStep?.id, selectedStageState]);
+  }, [selectedStageHydrationKey]);
 
   useEffect(() => {
     if (!selectedRunId) return;
@@ -835,74 +914,7 @@ export function WorkflowShell() {
     void loadTreeDir(selectedRun, '', true);
   }, [repoContextConfigOpen, selectedRun?.id, stageRepoContextGitRef, stageRepoContextSkipBinary, stageRepoContextSkipGitignore]);
 
-  useEffect(() => {
-    const next = selectedRepoPaths.join('\n');
-    if (next !== stageRepoContextIncludeFilesText) {
-      setStageRepoContextIncludeFilesText(next);
-    }
-  }, [selectedRepoPaths]);
 
-  useEffect(() => {
-    if (!shouldPollBrowserInference || !selectedRun) return;
-
-    let cancelled = false;
-
-    const poll = async () => {
-      if (cancelled) return;
-      try {
-        setInferencePollBusy(true);
-        const json = await invokeModelInference(selectedRun.id, {
-          step_id: selectedStepId ?? selectedRun.current_step_id,
-          action: 'get_connection_status',
-          payload: {}
-        });
-        if (cancelled) return;
-
-        const nextConnected = Boolean(json.connected);
-        const nextSessionId = typeof json.session_id === 'string' ? json.session_id : '';
-        const nextProbe = (json.probe ?? null) as BrowserProbeResult | null;
-
-        setInferenceConnected((prev) => (prev === nextConnected ? prev : nextConnected));
-
-        if (json.transport === 'browser') {
-          setBrowserSessionId((prev) => (prev === nextSessionId ? prev : nextSessionId));
-          setBrowserProbe((prev) => {
-            const prevJson = prev ? JSON.stringify(prev) : '';
-            const nextJson = nextProbe ? JSON.stringify(nextProbe) : '';
-            return prevJson === nextJson ? prev : nextProbe;
-          });
-          if (!nextConnected) {
-            setInferenceStatus('Browser session lost. Reconnect required.');
-          }
-        } else {
-          setBrowserProbe(null);
-          if (!nextConnected) {
-            setInferenceStatus('Inference connection unavailable.');
-          }
-        }
-      } catch {
-        if (cancelled) return;
-        setInferenceConnected(false);
-        setBrowserSessionId('');
-        setBrowserProbe(null);
-        setInferenceStatus('Inference connection unavailable.');
-      } finally {
-        if (!cancelled) {
-          setInferencePollBusy(false);
-        }
-      }
-    };
-
-    void poll();
-    const timer = window.setInterval(() => {
-      void poll();
-    }, 2500);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [shouldPollBrowserInference, selectedRun?.id, selectedRun?.current_step_id, selectedStepId, browserSessionId, inferenceTransport]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -966,6 +978,14 @@ export function WorkflowShell() {
       }
     }
   }, [liveExecutionTrails, selectedRunId, stickyCompletedLiveExecutionId]);
+
+  useEffect(() => {
+    setLiveExecutionChains({});
+    setExpandedLiveEventIds(new Set());
+    setManuallyExpandedLiveExecutionIds(new Set());
+    setManuallyCollapsedLiveExecutionIds(new Set());
+    setStickyCompletedLiveExecutionId(null);
+  }, [selectedRunId]);
 
 
   async function refreshRunsAndTemplates(nextSelectedRunId?: string | null) {
@@ -1049,15 +1069,17 @@ export function WorkflowShell() {
 
     const shouldRefreshLiveTrail = trail.isActive || trail.isCurrent;
     const existing = liveExecutionChains[trail.key];
+    const summaryAdvanced = existing?.latestCreatedAt !== trail.latestCreatedAt;
     if (existing?.loading) return;
-    if (!force && existing?.chain && !shouldRefreshLiveTrail) return;
+    if (!force && existing?.chain && !shouldRefreshLiveTrail && !summaryAdvanced) return;
 
     setLiveExecutionChains((prev) => ({
       ...prev,
       [trail.key]: {
         loading: true,
         error: null,
-        chain: prev[trail.key]?.chain ?? null
+        chain: prev[trail.key]?.chain ?? null,
+        latestCreatedAt: prev[trail.key]?.latestCreatedAt ?? null
       }
     }));
 
@@ -1068,7 +1090,8 @@ export function WorkflowShell() {
         [trail.key]: {
           loading: false,
           error: null,
-          chain
+          chain,
+          latestCreatedAt: trail.latestCreatedAt
         }
       }));
     } catch (err) {
@@ -1077,7 +1100,8 @@ export function WorkflowShell() {
         [trail.key]: {
           loading: false,
           error: err instanceof Error ? err.message : String(err),
-          chain: prev[trail.key]?.chain ?? null
+          chain: prev[trail.key]?.chain ?? null,
+          latestCreatedAt: prev[trail.key]?.latestCreatedAt ?? null
         }
       }));
     }
@@ -1097,6 +1121,11 @@ export function WorkflowShell() {
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
     setEvents(runEvents);
     setSelectedRunId(run.id);
+  }
+
+  async function refreshLiveMonitor(runId: string) {
+    const summary = await getEventChainSummary(runId);
+    setLiveExecutionTrails(mapLiveExecutionTrails(summary));
   }
 
   async function refreshAllWorkflowSummaries() {
@@ -1235,11 +1264,13 @@ export function WorkflowShell() {
     await refreshRunDetails(selectedRunId);
   }
 
-  async function loadCanonicalChangesetSchema() {
+  async function loadCanonicalChangesetSchema(forceOverride = true) {
     try {
       setChangesetSchemaBusy(true);
-      const json = await getPayloadGatewaySchema();
-      setStageChangesetSchemaText(typeof json.example === 'string' ? json.example : '');
+      const json = await getChangesetSchema();
+      if (forceOverride || !stageChangesetSchemaText.trim()) {
+        setStageChangesetSchemaText(typeof json.schema === 'string' ? json.schema : '');
+      }
     } finally {
       setChangesetSchemaBusy(false);
     }
@@ -1351,35 +1382,60 @@ export function WorkflowShell() {
     const parts: string[] = [];
     if (stageIncludeRepoContext) parts.push('### REPO CONTEXT\nAttached repo context from backend export');
     if (selectedWorkflowStep?.id === 'code' && stageIncludeChangesetSchema) {
-      parts.push(`### CHANGESET SCHEMA\n${stageChangesetSchemaText.trim() || 'Use ChangeSet JSON version 1.'}`);
+      parts.push(`### CHANGESET SCHEMA\n${stageChangesetSchemaText.trim() || 'Use ChangeSet JSON version 1. Return only the JSON payload.'}`);
     }
-    if (stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
-    if (stageCompileError.trim()) parts.push(`### COMPILE ERROR\n${stageCompileError.trim()}`);
-    if (stageReviewNotes.trim() && selectedWorkflowStep?.id === 'review') parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
+    if (selectedWorkflowStep?.id === 'code' && stageIncludeApplyError && stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
+    if (selectedWorkflowStep?.id === 'review' && stageReviewNotes.trim()) parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
     if (stageUserInput.trim()) parts.push(`### USER INPUT\n${stageUserInput.trim()}`);
     return parts.join('\n\n');
-  }, [selectedWorkflowStep?.id, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageApplyError, stageCompileError, stageReviewNotes, stageUserInput]);
+  }, [selectedWorkflowStep?.id, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageIncludeApplyError, stageApplyError, stageReviewNotes, stageUserInput]);
+
+  const selectedLiveStageTrail = useMemo(() => {
+    const scopedTrails = selectedStepId
+      ? liveExecutionTrails.filter((trail) => trail.stepId === selectedStepId)
+      : liveExecutionTrails;
+
+    if (scopedTrails.length === 0) return null;
+    return scopedTrails.find((trail) => trail.isCurrent || trail.isActive) ?? scopedTrails[0];
+  }, [liveExecutionTrails, selectedStepId]);
+
+  const selectedLiveExecutionState = selectedLiveStageTrail ? (liveExecutionChains[selectedLiveStageTrail.key] ?? null) : null;
+
+  useEffect(() => {
+    if (!selectedLiveStageTrail) return;
+    void ensureLiveExecutionChainLoaded(selectedLiveStageTrail, true);
+  }, [
+    selectedLiveStageTrail?.key,
+    selectedLiveStageTrail?.isActive,
+    selectedLiveStageTrail?.isCurrent,
+    selectedLiveStageTrail?.latestCreatedAt,
+    selectedRunId
+  ]);
 
   const inferenceResponse = useMemo(() => {
+    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    for (let i = executionItems.length - 1; i >= 0; i -= 1) {
+      const text = extractInferenceTextFromPayload(executionItems[i].payload);
+      if (text.trim()) return text;
+    }
+
+    if (selectedLiveStageTrail) {
+      if (selectedLiveExecutionState?.loading) {
+        return 'Loading current execution output…';
+      }
+      if (selectedLiveExecutionState?.error) {
+        return `Unable to load current execution chain: ${selectedLiveExecutionState.error}`;
+      }
+      return '';
+    }
+
     const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
     for (let i = stageEvents.length - 1; i >= 0; i -= 1) {
-      const payload = stageEvents[i].payload as Record<string, unknown> | undefined;
-      const result = payload?.result as Record<string, unknown> | undefined;
-      const nestedResult = result?.result as Record<string, unknown> | undefined;
-      const directText = typeof nestedResult?.text === 'string' ? nestedResult.text : undefined;
-      if (directText && directText.trim()) return directText;
-
-      const capabilityResults = Array.isArray(payload?.capability_results) ? (payload?.capability_results as Array<Record<string, unknown>>) : [];
-      for (let j = capabilityResults.length - 1; j >= 0; j -= 1) {
-        const entry = capabilityResults[j];
-        const entryResult = entry?.result as Record<string, unknown> | undefined;
-        const entryNestedResult = entryResult?.result as Record<string, unknown> | undefined;
-        const text = typeof entryNestedResult?.text === 'string' ? entryNestedResult.text : undefined;
-        if (text && text.trim()) return text;
-      }
+      const text = extractInferenceTextFromPayload(stageEvents[i].payload);
+      if (text.trim()) return text;
     }
     return '';
-  }, [events, selectedStepId]);
+  }, [events, selectedStepId, selectedLiveExecutionState, selectedLiveStageTrail]);
 
   const stageStreamContent = useMemo(() => {
     const parts: string[] = [];
@@ -1420,28 +1476,47 @@ export function WorkflowShell() {
     if (step?.id === 'code') {
       promptFragmentEnabled.changeset_schema = stageIncludeChangesetSchema;
       promptFragmentEnabled.apply_error = Boolean(stageApplyError.trim());
-      promptFragmentEnabled.compile_error = Boolean(stageCompileError.trim());
       promptFragments.changeset_schema = stageChangesetSchemaText;
       promptFragments.apply_error = stageApplyError;
-      promptFragments.compile_error = stageCompileError;
     }
     if (step?.id === 'review') {
       promptFragments.review_notes = stageReviewNotes;
       promptFragmentEnabled.review_notes = Boolean(stageReviewNotes.trim());
     }
-    const includeFiles = stageRepoContextIncludeFilesText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
+    const includeFiles = Array.from(
+      new Set(
+        selectedRepoPaths
+          .map((value) => value.trim())
+          .filter(Boolean)
+      )
+    );
     const excludeRegex = stageRepoContextExcludeRegexText
       .split('\n')
       .map((value) => value.trim())
       .filter(Boolean);
-    return {
+    const payload = {
+      inference: {
+        transport: inferenceTransport,
+        model: inferenceModel,
+        browser: {
+          profile: 'default',
+          bridge_dir: 'bridge',
+          cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
+          page_url_contains: browserTargetUrl,
+          target_url: browserTargetUrl,
+          edge_executable: '',
+          user_data_dir: '',
+          session_id: null,
+          auto_launch_edge: true,
+          response_timeout_ms: 120000,
+          response_poll_ms: 1000,
+          dom_poll_ms: 1000
+        }
+      },
       ...(stageIncludeRepoContext ? {
         repo_context: {
           git_ref: stageRepoContextGitRef || 'WORKTREE',
-          include_files: includeFiles.length > 0 ? includeFiles : null,
+          include_files: includeFiles,
           exclude_regex: excludeRegex,
           save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
           skip_binary: stageRepoContextSkipBinary,
@@ -1452,8 +1527,84 @@ export function WorkflowShell() {
       } : {}),
       prompt_fragments: promptFragments,
       prompt_fragment_enabled: promptFragmentEnabled,
-      review: step?.id === 'review' ? { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes } : undefined
+      review: step?.id === 'review' ? { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes } : undefined,
+      execution_plan_override: buildInteractiveExecutionPlan(step?.id ?? null)
     } as Record<string, unknown>;
+    return payload;
+  }
+
+  function buildInteractiveExecutionPlan(stepId: string | null) {
+    const plan: Array<Record<string, unknown>> = [];
+
+    if (stepId === 'design' || stepId === 'code') {
+      if (stageIncludeRepoContext) {
+        plan.push({
+          kind: 'capability',
+          key: 'context_export',
+          enabled: true,
+          config: {},
+          input_mapping: {},
+          output_mapping: {},
+          run_after: [],
+          condition: null
+        });
+      }
+
+      if (stepId === 'code' && stageIncludeChangesetSchema) {
+        plan.push({
+          kind: 'capability',
+          key: 'changeset_schema',
+          enabled: true,
+          config: {},
+          input_mapping: {},
+          output_mapping: {},
+          run_after: [],
+          condition: null
+        });
+      }
+
+      plan.push({
+        kind: 'capability',
+        key: 'inference',
+        enabled: true,
+        config: {},
+        input_mapping: {},
+        output_mapping: {},
+        run_after: [],
+        condition: null
+      });
+
+      if (stepId === 'code') {
+        plan.push({
+          kind: 'capability',
+          key: 'gateway_model/changeset',
+          enabled: true,
+          config: {
+            repo_ref: selectedRun?.repo_ref ?? repoRef,
+            git_ref: stageRepoContextGitRef || 'WORKTREE'
+          },
+          input_mapping: {},
+          output_mapping: {},
+          run_after: [],
+          condition: null
+        });
+      }
+    }
+
+    if (stepId === 'compile') {
+      plan.push({
+        kind: 'capability',
+        key: 'compile_commands',
+        enabled: true,
+        config: {},
+        input_mapping: {},
+        output_mapping: {},
+        run_after: [],
+        condition: null
+      });
+    }
+
+    return plan;
   }
 
   async function runManualCapability(action: () => Promise<Record<string, unknown>>, successMessage: string) {
@@ -1525,35 +1676,12 @@ export function WorkflowShell() {
   }
 
   async function configureInference() {
-    if (!selectedRun) return;
+    if (!selectedRun || !selectedStepId) return;
     try {
       setInferenceBusy(true);
       setInferenceStatus(null);
-      const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'configure',
-        payload: {
-          transport: inferenceTransport,
-          model: inferenceModel,
-          browser: {
-            profile: 'auto',
-            bridge_dir: 'bridge',
-            cdp_url: browserCdpUrl,
-            page_url_contains: browserTargetUrl,
-            target_url: browserTargetUrl,
-            edge_executable: '',
-            user_data_dir: '',
-            session_id: browserSessionId || null,
-            auto_launch_edge: true,
-            response_timeout_ms: 120000,
-            response_poll_ms: 1000,
-            dom_poll_ms: 1000
-          }
-        }
-      });
-      const config = (json.config ?? {}) as Record<string, unknown>;
-      const browser = (config.browser ?? {}) as Record<string, unknown>;
-      setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
+      const payload = buildInteractiveStagePayload();
+      await patchWorkflowStageState(selectedRun.id, selectedStepId, payload);
       setInferenceStatus('Inference configuration saved.');
       await refreshSelectedRunArtifacts();
     } catch (err) {
@@ -1563,111 +1691,10 @@ export function WorkflowShell() {
     }
   }
 
-  async function launchBrowserInference() {
-    if (!selectedRun) return;
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'launch_browser',
-        payload: {}
-      });
-      setBrowserSessionId(typeof json.session_id === 'string' ? json.session_id : '');
-      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
-      setInferenceStatus(typeof json.status === 'string' ? `Browser ${json.status}.` : 'Browser attached.');
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-    }
-  }
 
-  async function openBrowserInferenceUrl() {
-    if (!selectedRun || !browserTargetUrl.trim()) return;
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'open_url',
-        payload: { url: browserTargetUrl }
-      });
-      setInferenceStatus(`Opened URL: ${browserTargetUrl}`);
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-    }
-  }
 
-  async function probeBrowserInference() {
-    if (!selectedRun) return;
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'probe_browser',
-        payload: {}
-      });
-      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
-      setInferenceStatus('Browser probe completed.');
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-    }
-  }
 
-  async function connectBrowserInferenceSession() {
-    if (!selectedRun) return;
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      const json = await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'connect_browser_session',
-        payload: {}
-      });
-      setInferenceConnected(Boolean(json.connected ?? true));
-      setBrowserSessionId(typeof json.session_id === 'string' ? json.session_id : '');
-      setBrowserProbe((json.probe ?? null) as BrowserProbeResult | null);
-      setInferenceStatus(typeof json.ready === 'boolean' && json.ready ? 'Browser session connected and ready.' : 'Browser session connected. Waiting for readiness heartbeat.');
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceConnected(false);
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-    }
-  }
 
-  async function disconnectBrowserInferenceSession() {
-    if (!selectedRun) return;
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      await invokeModelInference(selectedRun.id, {
-        step_id: selectedStepId ?? selectedRun.current_step_id,
-        action: 'disconnect_browser_session',
-        payload: {}
-      });
-      setInferenceConnected(false);
-      setBrowserSessionId('');
-      setBrowserProbe(null);
-      setInferenceStatus('Browser session disconnected.');
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-      setInferencePollBusy(false);
-    }
-  }
 
   function eventTone(event: WorkflowEvent): EventTone {
     if (event.level === 'error') return { color: 'red', label: 'ERROR' };
@@ -1822,8 +1849,12 @@ export function WorkflowShell() {
                               </SimpleGrid>
                               {step.id === 'code' ? (
                                 <SimpleGrid cols={{ base: 1, md: 2 }}>
-                                  <Textarea label="Compile commands" minRows={3} value={step.compileCommands} onChange={(e) => updateStep(step.id, { compileCommands: e.currentTarget.value })} />
                                   <TextInput label="Max apply failures" value={String(step.maxConsecutiveApplyFailures)} onChange={(e) => updateStep(step.id, { maxConsecutiveApplyFailures: Number(e.currentTarget.value || '1') })} />
+                                </SimpleGrid>
+                              ) : null}
+                              {step.id === 'compile' ? (
+                                <SimpleGrid cols={{ base: 1, md: 2 }}>
+                                  <Textarea label="Compile commands" minRows={3} value={step.compileCommands} onChange={(e) => updateStep(step.id, { compileCommands: e.currentTarget.value })} />
                                 </SimpleGrid>
                               ) : null}
                               <Divider label="Transitions" />
@@ -2066,10 +2097,7 @@ export function WorkflowShell() {
                                 inferenceModel={inferenceModel}
                                 browserTargetUrl={browserTargetUrl}
                                 browserCdpUrl={browserCdpUrl}
-                                browserSessionId={browserSessionId}
-                                browserProbe={browserProbe}
                                 inferenceBusy={inferenceBusy}
-                                inferencePollBusy={inferencePollBusy}
                                 inferenceStatus={inferenceStatus}
                                 inferenceConfigOpen={inferenceConfigOpen}
                                 onOpenConfig={() => setInferenceConfigOpen(true)}
@@ -2079,8 +2107,6 @@ export function WorkflowShell() {
                                 onBrowserTargetUrlChange={setBrowserTargetUrl}
                                 onBrowserCdpUrlChange={setBrowserCdpUrl}
                                 onSaveConfig={() => void configureInference()}
-                                onConnectBrowser={() => void connectBrowserInferenceSession()}
-                                onDisconnectBrowser={() => void disconnectBrowserInferenceSession()}
                               />
                             </Card>
 
@@ -2091,13 +2117,16 @@ export function WorkflowShell() {
                                   stageUserInput={stageUserInput}
                                   stageIncludeRepoContext={stageIncludeRepoContext}
                                   stageIncludeChangesetSchema={stageIncludeChangesetSchema}
+                                  stageIncludeApplyError={stageIncludeApplyError}
+                                  stageApplyError={stageApplyError}
+                                  repoFragmentSummary={repoFragmentSummary}
                                   onStageUserInputChange={setStageUserInput}
                                   onStageIncludeRepoContextChange={setStageIncludeRepoContext}
                                   onStageIncludeChangesetSchemaChange={setStageIncludeChangesetSchema}
+                                  onStageIncludeApplyErrorChange={setStageIncludeApplyError}
                                   onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
                                   onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
                                   onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
-                                  onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
                                 />
 
                                 <Group>
@@ -2116,9 +2145,6 @@ export function WorkflowShell() {
                         </Grid.Col>
                       </Grid>
 
-                      {!inferenceRequiresConnection || inferenceReady ? null : (
-                        <Alert color="yellow">Inference connection required before stage inputs are available for this step.</Alert>
-                      )}
 
                       {manualCapabilityStatus ? <Alert color={manualCapabilityStatus.toLowerCase().includes('error') ? 'red' : 'blue'}>{manualCapabilityStatus}</Alert> : null}
                     </Stack>
@@ -2131,13 +2157,13 @@ export function WorkflowShell() {
                     <Stack h="100%">
                       <Group justify="space-between">
                         <Title order={5}>Live workflow events</Title>
-                        <Button variant="light" size="xs" onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh events</Button>
+                        <Button variant="light" size="xs" onClick={() => selectedRunId && void refreshLiveMonitor(selectedRunId)}>Refresh events</Button>
                       </Group>
                       {liveExecutionTrails.length > 0 ? (
                         <Stack gap="xs">
                           {liveExecutionTrails.map((trail, index) => {
                             const trailExpanded = isLiveExecutionExpanded(trail);
-                            const executionState = liveExecutionChains[trail.key] ?? { loading: false, error: null, chain: null };
+                            const executionState = liveExecutionChains[trail.key] ?? { loading: false, error: null, chain: null, latestCreatedAt: null };
                             const rawEvents = (executionState.chain?.items ?? []).slice().sort((a, b) => b.sequence_no - a.sequence_no);
                             return (
                               <Box
@@ -2300,12 +2326,12 @@ export function WorkflowShell() {
         <Modal opened={changesetSchemaConfigOpen} onClose={() => setChangesetSchemaConfigOpen(false)} title="Changeset schema fragment" size="70%" centered>
           <Stack>
             <Group justify="space-between">
-              <Text size="sm" c="dimmed">Use the canonical payload-gateway schema example or paste custom guidance.</Text>
-              <Button size="xs" variant="light" loading={changesetSchemaBusy} onClick={() => void loadCanonicalChangesetSchema()}>
+              <Text size="sm" c="dimmed">Use the canonical changeset schema example from the backend capability or paste custom guidance.</Text>
+              <Button size="xs" variant="light" loading={changesetSchemaBusy} onClick={() => void loadCanonicalChangesetSchema(true)}>
                 Reload from API
               </Button>
             </Group>
-            <Textarea label="Changeset schema guidance" minRows={18} value={stageChangesetSchemaText} onChange={(e) => setStageChangesetSchemaText(e.currentTarget.value)} placeholder="Paste the schema or guidance used for code generation" />
+            <Textarea label="Changeset schema guidance" minRows={18} value={stageChangesetSchemaText} onChange={(e) => setStageChangesetSchemaText(e.currentTarget.value)} placeholder="Canonical backend changeset schema will populate here by default; you can override it." />
             <Group justify="flex-end"><Button size="xs" onClick={() => setChangesetSchemaConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
@@ -2317,12 +2343,6 @@ export function WorkflowShell() {
           </Stack>
         </Modal>
 
-        <Modal opened={compileErrorConfigOpen} onClose={() => setCompileErrorConfigOpen(false)} title="Compile error fragment" size="70%" centered>
-          <Stack>
-            <Textarea label="Compile error" minRows={12} value={stageCompileError} onChange={(e) => setStageCompileError(e.currentTarget.value)} placeholder="Paste compile or test failures for the next retry prompt" />
-            <Group justify="flex-end"><Button size="xs" onClick={() => setCompileErrorConfigOpen(false)}>Done</Button></Group>
-          </Stack>
-        </Modal>
 
         <Modal opened={responseViewerOpen} onClose={() => setResponseViewerOpen(false)} title={previewViewerMode === 'stream' ? 'Stage stream' : previewViewerMode === 'prompt' ? 'Composed prompt preview' : 'Inference response'} size="min(1200px, 96vw)" centered>
           <Stack gap="md">

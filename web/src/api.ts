@@ -339,17 +339,11 @@ export function getPayloadGatewaySchema() {
   }>(`/api/capabilities/payload-gateway/schema`);
 }
 
-export function invokeModelInference(
-  runId: string,
-  body: {
-    step_id?: string | null;
-    action: 'configure' | 'launch_browser' | 'open_url' | 'probe_browser' | 'connect_browser_session' | 'disconnect_browser_session' | 'get_connection_status' | 'send_prompt';
-    payload?: Record<string, unknown>;
-  }
-) {
-  return fetchJson<Record<string, unknown>>(`/api/workflow-runs/${runId}/capabilities/model-inference`, {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
+export function getChangesetSchema() {
+  return fetchJson<{
+    ok: boolean;
+    schema: string;
+  }>(`/api/capabilities/changeset-schema`);
 }
+
 

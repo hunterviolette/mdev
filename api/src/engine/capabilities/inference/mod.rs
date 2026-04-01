@@ -10,21 +10,7 @@ use super::registry::{
     CapabilityInvocation,
     CapabilityInvocationRequest,
     CapabilityResult,
-    StageCapabilityPolicy,
 };
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelInferenceAction {
-    Configure,
-    LaunchBrowser,
-    OpenUrl,
-    ProbeBrowser,
-    ConnectBrowserSession,
-    DisconnectBrowserSession,
-    GetConnectionStatus,
-    SendPrompt,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -102,25 +88,6 @@ impl Default for InferenceConfig {
     }
 }
 
-pub fn apply_configuration(cfg: &mut InferenceConfig, payload: &Value) -> Result<()> {
-    if let Some(transport) = payload.get("transport").and_then(|v| v.as_str()) {
-        cfg.transport = match transport {
-            "browser" => InferenceTransport::Browser,
-            _ => InferenceTransport::Api,
-        };
-    }
-
-    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
-        cfg.model = model.to_string();
-    }
-
-    if let Some(browser_cfg) = payload.get("browser") {
-        cfg.browser = serde_json::from_value(browser_cfg.clone())?;
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResult {
     pub transport: InferenceTransport,
@@ -145,66 +112,31 @@ pub struct BrowserProbeResult {
     pub ready: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_model() -> String { "gpt-4.1".to_string() }
-fn default_profile() -> String { "auto".to_string() }
-fn default_cdp_url() -> String { "http://127.0.0.1:9222".to_string() }
-fn default_response_timeout_ms() -> u64 { 120_000 }
-fn default_response_poll_ms() -> u64 { 1_000 }
-fn default_dom_poll_ms() -> u64 { 1_000 }
-
-fn default_bridge_dir() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        for dir in exe.ancestors() {
-            let candidate = dir.join("bridge");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        for dir in cwd.ancestors() {
-            let candidate = dir.join("bridge");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    "bridge".to_string()
+pub async fn persist_inference_config(ctx: &CapabilityContext<'_>, cfg: &InferenceConfig) -> Result<()> {
+    let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
+    let root = crate::engine::ensure_engine_root(&mut run.context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = stage_state.as_object_mut().expect("stage_state must be object");
+    let existing = stage_state_obj.entry(ctx.step.id.clone()).or_insert_with(|| json!({}));
+    let existing_obj = existing.as_object_mut().expect("stage state entry must be object");
+    existing_obj.insert("inference".to_string(), serde_json::to_value(cfg)?);
+    crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
 }
 
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
-    policy: &StageCapabilityPolicy,
+    prior_results: &[CapabilityResult],
     _config: Value,
 ) -> Result<CapabilityResult> {
-    let mut follow_ups: Vec<CapabilityInvocation> = Vec::new();
-
-    let include_repo_context = ctx
-        .local_state
-        .get("prompt_fragment_enabled")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("repo_context"))
-        .and_then(Value::as_bool)
-        .unwrap_or(ctx.step.prompt.include_repo_context);
-
+    let policy = super::registry::stage_capability_policy(ctx.step)?;
     let include_changeset_schema = ctx
         .local_state
         .get("prompt_fragment_enabled")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("changeset_schema"))
+        .and_then(|v| v.get("changeset_schema"))
         .and_then(Value::as_bool)
-        .unwrap_or(ctx.step.prompt.include_changeset_schema);
+        .unwrap_or(false);
 
-    if include_repo_context && policy.allowed_invocations.iter().any(|item| *item == "context_export") {
-        follow_ups.push(CapabilityInvocation {
-            capability: "context_export".to_string(),
-            config: json!({}),
-        });
-    }
-
+    let mut follow_ups = Vec::new();
     if include_changeset_schema && policy.allowed_invocations.iter().any(|item| *item == "changeset_schema") {
         follow_ups.push(CapabilityInvocation {
             capability: "changeset_schema".to_string(),
@@ -214,7 +146,7 @@ pub async fn execute(
 
     if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| *item == "apply_changeset") {
         follow_ups.push(CapabilityInvocation {
-            capability: "apply_changeset".to_string(),
+            capability: "gateway_model/changeset".to_string(),
             config: json!({}),
         });
     }
@@ -242,7 +174,7 @@ pub async fn execute(
         .unwrap_or(InferenceTransport::Api);
 
     let response = match selected_transport {
-        InferenceTransport::Browser => browser::execute(ctx).await?,
+        InferenceTransport::Browser => browser::execute(ctx, prior_results).await?,
         InferenceTransport::Api => api::execute(ctx).await?,
     };
 
@@ -253,18 +185,78 @@ pub async fn execute(
         .unwrap_or("")
         .to_string();
 
+    let response_ok = response
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let response_text = response
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let capability_ok = response_ok && (!sent_prompt.trim().is_empty() || response_text.trim().is_empty() || selected_transport != InferenceTransport::Browser);
+
+    let message = if capability_ok {
+        "Inference capability executed.".to_string()
+    } else {
+        response
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Inference capability failed.")
+            .to_string()
+    };
+
     Ok(CapabilityResult {
-        ok: true,
+        ok: capability_ok,
         capability: "inference".to_string(),
         payload: json!({
-            "message": "Inference capability executed.",
+            "message": message,
             "prompt": sent_prompt,
             "result": response,
         }),
-        follow_ups: if follow_ups.is_empty() {
-            CapabilityInvocationRequest::None
+        follow_ups: if capability_ok {
+            if follow_ups.is_empty() {
+                CapabilityInvocationRequest::None
+            } else {
+                CapabilityInvocationRequest::Many(follow_ups)
+            }
         } else {
-            CapabilityInvocationRequest::Many(follow_ups)
+            CapabilityInvocationRequest::None
         },
     })
+}
+
+fn default_profile() -> String {
+    "default".to_string()
+}
+
+fn default_bridge_dir() -> String {
+    "bridge".to_string()
+}
+
+fn default_cdp_url() -> String {
+    "http://127.0.0.1:9222".to_string()
+}
+
+fn default_model() -> String {
+    "gpt-4.1".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_response_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_response_poll_ms() -> u64 {
+    1_000
+}
+
+fn default_dom_poll_ms() -> u64 {
+    1_000
 }

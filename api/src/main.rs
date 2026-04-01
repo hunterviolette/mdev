@@ -1,7 +1,6 @@
 mod app_state;
 mod db;
 mod engine;
-mod executor;
 mod models;
 mod routes;
 
@@ -51,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
+            crate::engine::capabilities::inference::browser::adapter::shutdown_browser_bridge();
         })
         .await?;
     Ok(())

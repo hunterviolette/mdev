@@ -9,10 +9,10 @@ use axum::Router;
 
 pub fn router() -> Router<crate::app_state::AppState> {
     Router::new()
-        .merge(capabilities::router())
         .merge(health::router())
         .merge(repo_tree::router())
         .merge(templates::router())
         .merge(runs::router())
         .merge(event_chains::router())
+        .merge(capabilities::router())
 }

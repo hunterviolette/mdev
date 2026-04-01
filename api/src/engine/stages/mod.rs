@@ -1,4 +1,5 @@
 mod code_stage;
+mod compile_stage;
 mod design_stage;
 mod review_stage;
 
@@ -13,7 +14,7 @@ use crate::{
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
 };
 
-use super::capabilities::{execute_root_capability, CapabilityContext};
+use super::capabilities::{execute_capability_invocations, CapabilityContext, CapabilityInvocation};
 use super::{append_engine_event, ensure_engine_root, event_meta, persist_context};
 
 #[allow(dead_code)]
@@ -63,7 +64,7 @@ pub async fn execute_stage(
         .clone();
 
     let effective_local_state = merge_stage_with_global_state(local_state, global_repo_context, global_inference);
-    let mut hydrated_local_state = hydrate_stage_local_state(step, effective_local_state);
+    let mut hydrated_local_state = hydrate_stage_local_state(&run.repo_ref, step, effective_local_state);
     let stage_execution_id = Uuid::new_v4().to_string();
     if let Some(obj) = hydrated_local_state.as_object_mut() {
         obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone()));
@@ -88,11 +89,16 @@ pub async fn execute_stage(
 
     let stage_started_at = Instant::now();
 
-    let plan = if !step.execution_plan.is_empty() {
-        step.execution_plan.clone()
-    } else {
-        synthesize_execution_plan(step)
-    };
+    let plan = resolve_effective_execution_plan(&hydrated_local_state, step);
+
+    tracing::info!(
+        run_id = %run_id,
+        step_id = %step.id,
+        step_type = %step.step_type,
+        stage_execution_id = %stage_execution_id,
+        plan_len = plan.len(),
+        "stage execution plan resolved"
+    );
 
     let policy_kind = step
         .execution_logic
@@ -103,6 +109,9 @@ pub async fn execute_stage(
     let outcome = match policy_kind {
         "code_stage_policy" => {
             code_stage::execute_code_stage(state, run_id, &run.repo_ref, step, &hydrated_local_state, &plan).await?
+        }
+        "compile_stage_policy" => {
+            compile_stage::execute(state, run_id, &run.repo_ref, step, hydrated_local_state.clone(), &plan).await?
         }
         "review_stage_policy" => {
             review_stage::execute(state, run_id, &run.repo_ref, step, hydrated_local_state.clone(), &plan).await?
@@ -117,6 +126,17 @@ pub async fn execute_stage(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+
+    tracing::info!(
+        run_id = %run_id,
+        step_id = %step.id,
+        step_type = %step.step_type,
+        stage_execution_id = %stage_execution_id,
+        ok = outcome.ok,
+        disposition = ?outcome.disposition,
+        capability_result_count = outcome.capability_results.len(),
+        "stage execution outcome resolved"
+    );
 
     append_engine_event(
         state,
@@ -146,7 +166,7 @@ pub(crate) async fn run_capability_plan(
     repo_ref: &str,
     step: &WorkflowStepDefinition,
     local_state: &Value,
-    _plan: &[StageExecutionNode],
+    plan: &[StageExecutionNode],
 ) -> Result<Vec<Value>> {
     let ctx = CapabilityContext {
         state,
@@ -156,16 +176,69 @@ pub(crate) async fn run_capability_plan(
         local_state,
     };
 
-    Ok(execute_root_capability(ctx)
-        .await?
+    let queue = capability_invocations_from_plan(step, plan);
+    let results = execute_capability_invocations(ctx, queue).await?;
+
+    Ok(results
         .into_iter()
         .map(|item| {
             json!({
                 "key": item.capability,
+                "ok": item.ok,
                 "result": item.payload,
             })
         })
         .collect())
+}
+
+fn resolve_effective_execution_plan(local_state: &Value, step: &WorkflowStepDefinition) -> Vec<StageExecutionNode> {
+    let override_plan = local_state
+        .get("execution_plan_override")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<StageExecutionNode>>(value).ok())
+        .unwrap_or_default();
+
+    if !override_plan.is_empty() {
+        return override_plan;
+    }
+
+    if !step.execution_plan.is_empty() {
+        return step.execution_plan.clone();
+    }
+
+    synthesize_execution_plan(step)
+}
+
+fn capability_invocations_from_plan(
+    step: &WorkflowStepDefinition,
+    plan: &[StageExecutionNode],
+) -> Vec<CapabilityInvocation> {
+    let mut queue: Vec<CapabilityInvocation> = plan
+        .iter()
+        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
+        .map(|node| CapabilityInvocation {
+            capability: node.key.clone(),
+            config: node.config.clone(),
+        })
+        .collect();
+
+    if queue.is_empty() {
+        let fallback = if !step.execution_plan.is_empty() {
+            step.execution_plan.clone()
+        } else {
+            synthesize_execution_plan(step)
+        };
+        queue = fallback
+            .into_iter()
+            .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
+            .map(|node| CapabilityInvocation {
+                capability: node.key,
+                config: node.config,
+            })
+            .collect();
+    }
+
+    queue
 }
 
 fn merge_stage_with_global_state(
@@ -184,16 +257,14 @@ fn merge_stage_with_global_state(
         }
     }
 
-    if !state.contains_key("inference") {
-        if let Some(inference) = global_inference {
-            state.insert("inference".to_string(), inference);
-        }
+    if let Some(inference) = global_inference {
+        state.insert("inference".to_string(), inference);
     }
 
     Value::Object(state)
 }
 
-fn hydrate_stage_local_state(step: &WorkflowStepDefinition, local_state: Value) -> Value {
+fn hydrate_stage_local_state(repo_ref: &str, step: &WorkflowStepDefinition, local_state: Value) -> Value {
     let mut state = match local_state {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
@@ -244,9 +315,27 @@ fn hydrate_stage_local_state(step: &WorkflowStepDefinition, local_state: Value) 
                 .expect("prompt_fragments must be object");
             fragments.insert(
                 "changeset_schema".to_string(),
-                Value::String(crate::executor::CHANGESET_SCHEMA_EXAMPLE.to_string()),
+                Value::String(crate::engine::capabilities::changeset_schema::CHANGESET_SCHEMA_EXAMPLE.to_string()),
             );
         }
+    }
+
+    let include_repo_context = state
+        .get("prompt_fragment_enabled")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("repo_context"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if include_repo_context {
+        let repo_context = normalize_repo_context_payload(repo_ref, state.get("repo_context").cloned());
+        let obj = state.as_object_mut().expect("stage local state must be object");
+        obj.insert("repo_context".to_string(), repo_context);
+        let fragments = obj
+            .get_mut("prompt_fragments")
+            .and_then(Value::as_object_mut)
+            .expect("prompt_fragments must be object");
+        fragments.remove("repo_context");
     }
 
     let prompt = compose_prompt_from_state(

@@ -25,6 +25,7 @@ export type SessionState = {
   responseTimeoutMs?: number;
   responsePollMs: number;
   domPollMs: number;
+  pendingUploads: string[];
 };
 
 export class SessionManager {
@@ -73,7 +74,8 @@ export class SessionManager {
       attachedViaCdp: false,
       responseTimeoutMs: undefined,
       responsePollMs: 1000,
-      domPollMs: 1000
+      domPollMs: 1000,
+      pendingUploads: []
     };
 
     this.sessions.set(sessionId, state);
@@ -158,7 +160,8 @@ export class SessionManager {
       attachedViaCdp: true,
       responseTimeoutMs: undefined,
       responsePollMs: 1000,
-      domPollMs: 1000
+      domPollMs: 1000,
+      pendingUploads: []
     };
 
     this.sessions.set(sessionId, state);
@@ -238,9 +241,13 @@ export class SessionManager {
     const directChatInput = page.locator(chatInputSelector).first();
     const directInputCount = await directChatInput.count().catch(() => 0);
     const resolvedComposer = await this.findVisibleChatComposer(page, Math.min(timeout, 1000), chatInputSelector, state.domPollMs).catch(() => null);
+    const resolvedSubmit = resolvedComposer
+      ? await this.findActionableSubmitButton(page, resolvedComposer, state.chatSubmitSelector ?? profile.chatSubmitSelector).catch(() => null)
+      : null;
 
     const chatInputFound = directInputCount > 0 || resolvedComposer !== null;
     const chatInputVisible = resolvedComposer !== null;
+    const chatSubmitFound = resolvedSubmit !== null;
 
     return {
       session_id: state.sessionId,
@@ -250,9 +257,118 @@ export class SessionManager {
       profile: state.profile ?? 'auto',
       chat_input_found: chatInputFound,
       chat_input_visible: chatInputVisible,
-      chat_submit_found: chatInputVisible,
+      chat_submit_found: chatSubmitFound,
       ready: chatInputVisible
     };
+  }
+
+  private async waitForSendReady(page: Page, composer: Locator, submitSelector: string | undefined, timeoutMs: number): Promise<Locator | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const submit = await this.findActionableSubmitButton(page, composer, submitSelector).catch(() => null);
+      if (submit) {
+        return submit;
+      }
+      await page.waitForTimeout(250);
+    }
+    return null;
+  }
+
+  private async findActionableSubmitButton(page: Page, composer: Locator, preferredSelector?: string): Promise<Locator | null> {
+    const composerBox = await composer.boundingBox().catch(() => null);
+
+    const selectors = [
+      preferredSelector,
+      'button[data-testid="send-button"]',
+      'button[aria-label*="send" i]',
+      'button[type="submit"]',
+      'form button',
+      'button'
+    ].filter((selector): selector is string => Boolean(selector));
+
+    let best: { locator: Locator; score: number } | null = null;
+
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let i = 0; i < count; i += 1) {
+        const candidate = locator.nth(i);
+        const visible = await candidate.isVisible().catch(() => false);
+        if (!visible) {
+          continue;
+        }
+
+        const enabled = await candidate.isEnabled().catch(() => false);
+        if (!enabled) {
+          continue;
+        }
+
+        const meta = await candidate.evaluate((el) => {
+          const aria = (el.getAttribute('aria-label') ?? '').toLowerCase();
+          const title = (el.getAttribute('title') ?? '').toLowerCase();
+          const text = (el.textContent ?? '').trim().toLowerCase();
+          const hasVectorIcon = el.querySelector('svg, path, circle') !== null;
+          const disabled = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+          return { aria, title, text, hasVectorIcon, disabled };
+        }).catch(() => null);
+
+        if (!meta || meta.disabled) {
+          continue;
+        }
+
+        if (selector === 'button') {
+          const hasSendSemantics = meta.aria.includes('send')
+            || meta.title.includes('send')
+            || meta.text === 'send'
+            || meta.hasVectorIcon;
+          if (!hasSendSemantics) {
+            continue;
+          }
+        }
+
+        const box = await candidate.boundingBox().catch(() => null);
+        if (!box) {
+          continue;
+        }
+
+        let score = 0;
+        if (preferredSelector && selector === preferredSelector) {
+          score += 1000;
+        }
+        if (selector === 'button[data-testid="send-button"]') {
+          score += 500;
+        }
+        if (selector === 'button[aria-label*="send" i]') {
+          score += 400;
+        }
+        if (selector === 'button[type="submit"]') {
+          score += 300;
+        }
+        if (meta.aria.includes('send') || meta.title.includes('send') || meta.text === 'send') {
+          score += 200;
+        }
+
+        if (composerBox) {
+          const dx = Math.min(
+            Math.abs(box.x - (composerBox.x + composerBox.width)),
+            Math.abs((box.x + box.width) - (composerBox.x + composerBox.width)),
+            Math.abs(box.x - composerBox.x)
+          );
+          const dy = Math.min(
+            Math.abs(box.y - composerBox.y),
+            Math.abs(box.y - (composerBox.y + composerBox.height)),
+            Math.abs((box.y + box.height) - (composerBox.y + composerBox.height))
+          );
+          score -= Math.trunc(dx + dy);
+        }
+
+        if (!best || score > best.score) {
+          best = { locator: candidate, score };
+        }
+      }
+    }
+
+    return best?.locator ?? null;
   }
 
   async closePage(cmd: ClosePageCommand) {
@@ -355,76 +471,164 @@ export class SessionManager {
   async sendChat(cmd: SendChatCommand) {
     const state = this.getSession(cmd.session_id);
     state.responseTimeoutMs = undefined;
-    const timeout = cmd.timeout_ms ?? 60000;
+    const timeout = Math.max(cmd.timeout_ms ?? 60000, 60000);
     const inputSelector = cmd.input_selector ?? state.chatInputSelector;
     const submitSelector = cmd.submit_selector ?? state.chatSubmitSelector;
+
+    if (state.pendingUploads.length > 0) {
+      const uploadReady = await this.waitForPendingUploads(state, Math.min(timeout, 45000));
+      if (!uploadReady) {
+        throw new Error(`Upload did not finish before send_chat for session ${state.sessionId}: ${state.pendingUploads.join(', ')}`);
+      }
+    }
+
     const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
 
     await this.writeChatComposerText(state.page, composer, cmd.text);
 
-    if (submitSelector) {
-      const submit = state.page.locator(submitSelector).first();
-      if (await submit.count()) {
-        await submit.click({ timeout });
-        await this.waitForComposerToClear(composer, Math.min(timeout, 5000)).catch(() => {});
-        return { session_id: state.sessionId, sent: true, method: 'click', text: cmd.text };
-      }
+    const beforeSendText = await this.readComposerText(composer);
+    if (beforeSendText.length === 0) {
+      return {
+        session_id: state.sessionId,
+        sent: false,
+        method: 'none',
+        text: cmd.text
+      };
     }
 
-    const beforeSendText = await composer.evaluate((el) => {
-      if ((el as HTMLElement).isContentEditable) {
-        return (el.textContent ?? '').trim();
-      }
-      if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
-        return el.value.trim();
-      }
-      return (el.textContent ?? '').trim();
-    }).catch(() => '');
+    const sendResult = await this.trySendUntilDeadline(state.page, composer, submitSelector, timeout);
+    if (!sendResult.sent) {
+      throw new Error(`Chat submit did not clear composer within ${timeout}ms after ${sendResult.attempts} attempts for session ${state.sessionId}`);
+    }
 
-    await composer.press('Enter', { timeout });
-    await this.waitForComposerToClear(composer, Math.min(timeout, 5000)).catch(() => {});
-
-    const afterSendText = await composer.evaluate((el) => {
-      if ((el as HTMLElement).isContentEditable) {
-        return (el.textContent ?? '').trim();
-      }
-      if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
-        return el.value.trim();
-      }
-      return (el.textContent ?? '').trim();
-    }).catch(() => '');
-
+    state.pendingUploads = [];
     return {
       session_id: state.sessionId,
-      sent: beforeSendText.length > 0 && afterSendText.length === 0,
-      method: 'enter',
+      sent: true,
+      method: sendResult.method,
+      attempts: sendResult.attempts,
       text: cmd.text
     };
+  }
+
+  private async waitForComposerTextChange(composer: Locator, previousText: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const text = await this.readComposerText(composer).catch(() => '');
+      if (text !== previousText) {
+        return true;
+      }
+
+      await composer.page().waitForTimeout(100);
+    }
+
+    return false;
+  }
+
+  private async waitForPostClickSendResult(composer: Locator, beforeClickText: string, timeoutMs: number): Promise<'cleared' | 'changed' | 'unchanged'> {
+    const cleared = await this.waitForComposerToClear(composer, Math.min(timeoutMs, 2500)).catch(() => false);
+    if (cleared) {
+      return 'cleared';
+    }
+
+    const changed = await this.waitForComposerTextChange(composer, beforeClickText, Math.min(timeoutMs, 1500)).catch(() => false);
+    if (changed) {
+      return 'changed';
+    }
+
+    return 'unchanged';
+  }
+
+  private async trySendUntilDeadline(page: Page, composer: Locator, submitSelector: string | undefined, timeoutMs: number): Promise<{ sent: boolean; method: 'click'; attempts: number }> {
+    const deadline = Date.now() + timeoutMs;
+    let attempts = 0;
+    let lastText = await this.readComposerText(composer).catch(() => '');
+
+    while (Date.now() < deadline) {
+      const currentText = await this.readComposerText(composer).catch(() => '');
+      if (currentText.length === 0) {
+        return { sent: true, method: 'click', attempts };
+      }
+      lastText = currentText;
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+
+      const submit = await this.waitForSendReady(page, composer, submitSelector, Math.min(remainingMs, 5000));
+      if (!submit) {
+        await page.waitForTimeout(500).catch(() => {});
+        continue;
+      }
+
+      attempts += 1;
+      await submit.click({ timeout: Math.min(remainingMs, 5000) });
+
+      const postClick = await this.waitForPostClickSendResult(composer, lastText, Math.min(deadline - Date.now(), 5000));
+      if (postClick === 'cleared') {
+        return { sent: true, method: 'click', attempts };
+      }
+
+      const afterClickText = await this.readComposerText(composer).catch(() => '');
+      if (afterClickText.length === 0) {
+        return { sent: true, method: 'click', attempts };
+      }
+
+      await page.waitForTimeout(750).catch(() => {});
+    }
+
+    return { sent: false, method: 'click', attempts };
+  }
+
+  private getSessionPollMsHint(_page: Page): number {
+    return 1000;
+  }
+
+  private async readComposerText(composer: Locator): Promise<string> {
+    return await composer.evaluate((el) => {
+      if ((el as HTMLElement).isContentEditable) {
+        return (el.textContent ?? '').trim();
+      }
+      if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+        return el.value.trim();
+      }
+      return (el.textContent ?? '').trim();
+    }).catch(() => '');
   }
 
   async uploadFile(cmd: UploadFileCommand) {
     const state = this.getSession(cmd.session_id);
     const timeout = cmd.timeout_ms ?? 60000;
     const inputSelector = cmd.input_selector ?? state.uploadInputSelector ?? 'input[type="file"]';
+    const uploadName = this.basename(cmd.file_path);
+    let via = 'input';
 
     const input = state.page.locator(inputSelector).first();
     if (await input.count()) {
       await input.setInputFiles(cmd.file_path, { timeout });
-      return { session_id: state.sessionId, uploaded: cmd.file_path, via: 'input' };
+    } else {
+      const triggerSelector = cmd.button_selector ?? state.uploadButtonSelector;
+      if (!triggerSelector) {
+        throw new Error(`No file input found for session ${state.sessionId}`);
+      }
+
+      const trigger = state.page.locator(triggerSelector).first();
+      const chooserPromise = state.page.waitForEvent('filechooser', { timeout });
+      await trigger.click({ timeout });
+      const chooser = await chooserPromise;
+      await chooser.setFiles(cmd.file_path);
+      via = 'filechooser';
     }
 
-    const triggerSelector = cmd.button_selector ?? state.uploadButtonSelector;
-    if (!triggerSelector) {
-      throw new Error(`No file input found for session ${state.sessionId}`);
+    state.pendingUploads = Array.from(new Set([...state.pendingUploads, uploadName]));
+    const ready = await this.waitForPendingUploads(state, Math.min(timeout, 20000));
+    if (!ready) {
+      throw new Error(`Upload did not become ready for session ${state.sessionId}: ${uploadName}`);
     }
 
-    const trigger = state.page.locator(triggerSelector).first();
-    const chooserPromise = state.page.waitForEvent('filechooser', { timeout });
-    await trigger.click({ timeout });
-    const chooser = await chooserPromise;
-    await chooser.setFiles(cmd.file_path);
-
-    return { session_id: state.sessionId, uploaded: cmd.file_path, via: 'filechooser' };
+    return { session_id: state.sessionId, uploaded: cmd.file_path, upload_name: uploadName, ready: true, via };
   }
 
   private async readResponseSnapshot(page: Page, selector: string): Promise<ResponseSnapshot> {
@@ -620,6 +824,69 @@ export class SessionManager {
     return { session_id: sessionId, closed: true, detached_only: state.attachedViaCdp };
   }
 
+  async closeAllSessions() {
+    const sessionIds = [...this.sessions.keys()];
+    const results = [];
+
+    for (const sessionId of sessionIds) {
+      try {
+        const result = await this.closeSession(sessionId);
+        results.push(result);
+      } catch (err) {
+        results.push({
+          session_id: sessionId,
+          closed: false,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+
+    return {
+      closed_count: results.filter((item) => item.closed).length,
+      total_count: results.length,
+      results
+    };
+  }
+
+  private basename(filePath: string): string {
+    const normalized = filePath.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : filePath;
+  }
+
+  private async hasVisibleText(page: Page, text: string): Promise<boolean> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const escaped = trimmed.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const exact = page.getByText(trimmed, { exact: true }).first();
+    if (await exact.isVisible().catch(() => false)) {
+      return true;
+    }
+
+    const locator = page.locator(`text=${escaped}`).first();
+    return await locator.isVisible().catch(() => false);
+  }
+
+  private async waitForPendingUploads(state: SessionState, timeoutMs: number): Promise<boolean> {
+    if (state.pendingUploads.length === 0) {
+      return true;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const allVisible = await Promise.all(state.pendingUploads.map((name) => this.hasVisibleText(state.page, name)));
+      if (allVisible.every(Boolean)) {
+        return true;
+      }
+      await state.page.waitForTimeout(250);
+    }
+
+    return false;
+  }
+
   private getSession(sessionId: string): SessionState {
     const state = this.sessions.get(sessionId);
     if (!state) {
@@ -628,25 +895,18 @@ export class SessionManager {
     return state;
   }
 
-  private async waitForComposerToClear(composer: Locator, timeoutMs: number): Promise<void> {
+  private async waitForComposerToClear(composer: Locator, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-      const state = await composer.evaluate((el) => ({
-        text: (el.textContent ?? '').trim(),
-        ariaBusy: el.getAttribute('aria-busy'),
-        isContentEditable: (el as HTMLElement).isContentEditable
-      })).catch(() => null);
-
-      if (!state) {
-        return;
-      }
-
-      if (state.isContentEditable && state.text.length === 0) {
-        return;
+      const text = await this.readComposerText(composer).catch(() => '');
+      if (text.length === 0) {
+        return true;
       }
 
       await composer.page().waitForTimeout(100);
     }
+
+    return false;
   }
 }
