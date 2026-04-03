@@ -46,25 +46,52 @@ pub async fn execute(
     _prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
+    let repo_resource = ctx
+        .local_state
+        .get("resources")
+        .and_then(|v| v.get("repo"))
+        .cloned()
+        .unwrap_or_else(|| json!({
+            "repo_ref": ctx.repo_ref,
+            "git_ref": "WORKTREE"
+        }));
+
+    let capability_state = ctx
+        .local_state
+        .get("capabilities")
+        .and_then(|v| v.get("gateway_model/sync"))
+        .cloned()
+        .or_else(|| ctx.local_state.get("repo_context").cloned())
+        .unwrap_or_else(|| json!({}));
+
     let mut payload = if config.is_null() || config == json!({}) {
-        ctx.local_state
-            .get("repo_context")
-            .cloned()
-            .unwrap_or_else(|| json!({
-                "repo_ref": ctx.repo_ref,
-                "git_ref": "WORKTREE",
-                "mode": "entire"
-            }))
+        capability_state
     } else {
         config
     };
 
+    if !payload.is_object() {
+        payload = json!({});
+    }
+
     if let Some(obj) = payload.as_object_mut() {
         if !obj.contains_key("repo_ref") {
-            obj.insert("repo_ref".to_string(), Value::String(ctx.repo_ref.to_string()));
+            obj.insert(
+                "repo_ref".to_string(),
+                repo_resource
+                    .get("repo_ref")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(ctx.repo_ref.to_string())),
+            );
         }
         if !obj.contains_key("git_ref") {
-            obj.insert("git_ref".to_string(), Value::String("WORKTREE".to_string()));
+            obj.insert(
+                "git_ref".to_string(),
+                repo_resource
+                    .get("git_ref")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("WORKTREE".to_string())),
+            );
         }
         if !obj.contains_key("mode") {
             obj.insert("mode".to_string(), Value::String("entire".to_string()));

@@ -1,43 +1,58 @@
 use anyhow::Result;
-use serde_json::Value;
-use uuid::Uuid;
+use serde_json::{json, Value};
 
-use crate::{
-    app_state::AppState,
-    models::{StageExecutionNode, WorkflowStepDefinition},
-};
+use crate::models::WorkflowStepDefinition;
 
-use super::{run_capability_plan, StageDisposition, StageOutcome};
-
-pub async fn execute(
-    state: &AppState,
-    run_id: Uuid,
-    repo_ref: &str,
+pub fn prepare_stage_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
-    plan: &[StageExecutionNode],
-) -> Result<StageOutcome> {
-    let capability_results = run_capability_plan(state, run_id, repo_ref, step, &local_state, plan).await?;
-    let require_manual_approval = step.execution_logic
+) -> Result<Value> {
+    let mut state = ensure_object(local_state);
+    let require_manual_approval = step
+        .execution_logic
         .get("require_manual_approval")
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let disposition = if require_manual_approval {
-        StageDisposition::Paused
-    } else {
-        StageDisposition::Success
-    };
+    let obj = state.as_object_mut().expect("stage state must be object");
+    let execution_logic = obj
+        .entry("execution_logic".to_string())
+        .or_insert_with(|| step.execution_logic.clone());
+    if !execution_logic.is_object() {
+        *execution_logic = json!({});
+    }
+    let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
 
-    Ok(StageOutcome {
-        ok: true,
-        disposition,
-        capability_results,
-        local_state,
-        message: if require_manual_approval {
-            "Review stage completed and is waiting for manual approval.".to_string()
-        } else {
-            "Review stage completed successfully.".to_string()
-        },
-    })
+    if !exec_obj.contains_key("on_success") {
+        exec_obj.insert(
+            "on_success".to_string(),
+            json!({
+                "disposition": if require_manual_approval { "paused" } else { "success" },
+                "message": if require_manual_approval {
+                    "Review stage completed and is waiting for manual approval."
+                } else {
+                    "Review stage completed successfully."
+                }
+            }),
+        );
+    }
+
+    if !exec_obj.contains_key("on_error") {
+        exec_obj.insert(
+            "on_error".to_string(),
+            json!({
+                "disposition": "error",
+                "message": "Review stage failed during backend workflow execution."
+            }),
+        );
+    }
+
+    Ok(state)
+}
+
+fn ensure_object(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(map),
+        _ => json!({}),
+    }
 }

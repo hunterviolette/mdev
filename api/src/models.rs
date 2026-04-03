@@ -65,11 +65,9 @@ pub struct StageExecutionNode {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowGlobalConfig {
     #[serde(default)]
-    pub inference: Value,
+    pub resources: Value,
     #[serde(default)]
-    pub prompt_fragments: Value,
-    #[serde(default)]
-    pub capabilities: Vec<WorkflowCapabilityBinding>,
+    pub capabilities: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

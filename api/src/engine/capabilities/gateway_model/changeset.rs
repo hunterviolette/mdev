@@ -27,24 +27,51 @@ fn parse_apply_changeset_target(payload: Value) -> Result<ApplyChangesetTarget> 
 }
 
 fn resolve_apply_changeset_target(ctx: &CapabilityContext<'_>, config: Value) -> Result<ApplyChangesetTarget> {
+    let repo_resource = ctx
+        .local_state
+        .get("resources")
+        .and_then(|v| v.get("repo"))
+        .cloned()
+        .unwrap_or_else(|| json!({
+            "repo_ref": ctx.repo_ref,
+            "git_ref": "WORKTREE"
+        }));
+
+    let capability_state = ctx
+        .local_state
+        .get("capabilities")
+        .and_then(|v| v.get("gateway_model/changeset"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
     let mut payload = if config.is_null() || config == json!({}) {
-        ctx.local_state
-            .get("repo_context")
-            .cloned()
-            .unwrap_or_else(|| json!({
-                "repo_ref": ctx.repo_ref,
-                "git_ref": "WORKTREE"
-            }))
+        capability_state
     } else {
         config
     };
 
+    if !payload.is_object() {
+        payload = json!({});
+    }
+
     if let Some(obj) = payload.as_object_mut() {
         if !obj.contains_key("repo_ref") {
-            obj.insert("repo_ref".to_string(), Value::String(ctx.repo_ref.to_string()));
+            obj.insert(
+                "repo_ref".to_string(),
+                repo_resource
+                    .get("repo_ref")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(ctx.repo_ref.to_string())),
+            );
         }
         if !obj.contains_key("git_ref") {
-            obj.insert("git_ref".to_string(), Value::String("WORKTREE".to_string()));
+            obj.insert(
+                "git_ref".to_string(),
+                repo_resource
+                    .get("git_ref")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("WORKTREE".to_string())),
+            );
         }
     }
 
@@ -96,21 +123,11 @@ struct EditActionFailure {
     error: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct EditActionResult {
-    index: usize,
-    action: String,
-    status: String,
-    descriptor: String,
-    error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Default)]
 struct EditSequenceReport {
     lines: Vec<String>,
     successful_actions: usize,
     failed: Vec<EditActionFailure>,
-    action_results: Vec<EditActionResult>,
 }
 
 pub async fn execute(
@@ -164,19 +181,7 @@ pub async fn execute(
                 "successful_actions": 0,
                 "failed_actions": 1,
                 "total_actions": 1
-            },
-            "attempted": [],
-            "failed": ["changeset_decode"],
-            "operation_results": [
-                {
-                    "index": 1,
-                    "status": "failed",
-                    "kind": "changeset_decode",
-                    "label": "changeset_decode",
-                    "error": format!("{:#}", err),
-                    "action_results": []
-                }
-            ]
+            }
         }),
     };
 
@@ -212,11 +217,8 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
         .sum();
 
     let mut lines = Vec::new();
-    let mut attempted = Vec::new();
-    let mut failed = Vec::new();
     let mut successful_operations = 0usize;
     let mut successful_actions = 0usize;
-    let mut operation_results = Vec::new();
     let mut first_error = None::<String>;
 
     for (idx, op) in payload.operations.iter().enumerate() {
@@ -224,45 +226,50 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
         let label = operation_label_with_index(index, op);
         lines.push(label.clone());
 
-        if let Some(path) = operation_primary_path(op) {
-            attempted.push(path);
-        }
-
-        match apply_operation(repo, op) {
-            Ok(report) => {
-                successful_operations += 1;
+        match op {
+            Operation::Edit { path, changes } => {
+                let report = apply_edit_sequence(repo, path, changes)?;
                 successful_actions += report.successful_actions;
                 lines.extend(report.lines.clone());
-                lines.push(format!("[{}] ok", index));
-                operation_results.push(json!({
-                    "index": index,
-                    "status": "ok",
-                    "kind": operation_kind(op),
-                    "label": operation_label(op),
-                    "error": Value::Null,
-                    "action_results": report.action_results,
-                }));
-            }
-            Err(err) => {
-                let err_text = format!("{:#}", err);
-                if first_error.is_none() {
-                    first_error = Some(err_text.clone());
-                }
-                if let Some(path) = operation_primary_path(op) {
-                    failed.push(path);
+
+                if report.failed.is_empty() {
+                    successful_operations += 1;
+                    lines.push(format!("[{}] ok", index));
                 } else {
-                    failed.push(operation_label(op));
+                    if first_error.is_none() {
+                        first_error = report
+                            .failed
+                            .first()
+                            .map(|f| format!("edit[{}] {}: {}", f.index, f.action, f.error));
+                    }
+
+                    if report.successful_actions > 0 {
+                        lines.push(format!(
+                            "[{}] PARTIAL: {} passed, {} failed",
+                            index,
+                            report.successful_actions,
+                            report.failed.len()
+                        ));
+                    } else {
+                        lines.push(format!("[{}] FAILED: no edit actions applied successfully", index));
+                    }
                 }
-                lines.push(format!("[{}] FAILED: {}", index, err_text));
-                operation_results.push(json!({
-                    "index": index,
-                    "status": "failed",
-                    "kind": operation_kind(op),
-                    "label": operation_label(op),
-                    "error": err_text,
-                    "action_results": [],
-                }));
             }
+            _ => match apply_operation(repo, op) {
+                Ok(report) => {
+                    successful_operations += 1;
+                    successful_actions += report.successful_actions;
+                    lines.extend(report.lines.clone());
+                    lines.push(format!("[{}] ok", index));
+                }
+                Err(err) => {
+                    let err_text = format!("{:#}", err);
+                    if first_error.is_none() {
+                        first_error = Some(err_text.clone());
+                    }
+                    lines.push(format!("[{}] FAILED: {}", index, err_text));
+                }
+            },
         }
     }
 
@@ -314,9 +321,6 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
             "failed_actions": failed_actions,
             "total_actions": total_actions
         },
-        "attempted": attempted,
-        "failed": failed,
-        "operation_results": operation_results,
         "lines": lines,
         "normalized_payload": normalized,
     }))
@@ -416,13 +420,6 @@ fn apply_operation(repo: &Path, op: &Operation) -> Result<EditSequenceReport> {
                 lines: vec!["  - PASS write[1] write".to_string()],
                 successful_actions: 1,
                 failed: Vec::new(),
-                action_results: vec![EditActionResult {
-                    index: 1,
-                    action: "write".to_string(),
-                    status: "ok".to_string(),
-                    descriptor: "write[1] write".to_string(),
-                    error: None,
-                }],
             })
         }
         Operation::Delete { path } => {
@@ -434,13 +431,6 @@ fn apply_operation(repo: &Path, op: &Operation) -> Result<EditSequenceReport> {
                 lines: vec!["  - PASS delete[1] delete".to_string()],
                 successful_actions: 1,
                 failed: Vec::new(),
-                action_results: vec![EditActionResult {
-                    index: 1,
-                    action: "delete".to_string(),
-                    status: "ok".to_string(),
-                    descriptor: "delete[1] delete".to_string(),
-                    error: None,
-                }],
             })
         }
         Operation::Move { from, to } => {
@@ -454,13 +444,6 @@ fn apply_operation(repo: &Path, op: &Operation) -> Result<EditSequenceReport> {
                 lines: vec!["  - PASS move[1] move".to_string()],
                 successful_actions: 1,
                 failed: Vec::new(),
-                action_results: vec![EditActionResult {
-                    index: 1,
-                    action: "move".to_string(),
-                    status: "ok".to_string(),
-                    descriptor: "move[1] move".to_string(),
-                    error: None,
-                }],
             })
         }
         Operation::Edit { path, changes } => apply_edit_sequence(repo, path, changes),
@@ -564,13 +547,6 @@ fn apply_edit_sequence(repo: &Path, path: &str, changes: &[EditAction]) -> Resul
                 text = next_text;
                 report.successful_actions += 1;
                 report.lines.push(format!("  - {}", pass_descriptor));
-                report.action_results.push(EditActionResult {
-                    index: idx + 1,
-                    action: change.action.clone(),
-                    status: "ok".to_string(),
-                    descriptor,
-                    error: None,
-                });
             }
             Err(e) => {
                 let err_text = format!("{e:#}");
@@ -582,13 +558,6 @@ fn apply_edit_sequence(repo: &Path, path: &str, changes: &[EditAction]) -> Resul
                     action: change.action.clone(),
                     error: err_text.clone(),
                 });
-                report.action_results.push(EditActionResult {
-                    index: idx + 1,
-                    action: change.action.clone(),
-                    status: "failed".to_string(),
-                    descriptor,
-                    error: Some(err_text),
-                });
             }
         }
     }
@@ -596,15 +565,6 @@ fn apply_edit_sequence(repo: &Path, path: &str, changes: &[EditAction]) -> Resul
     if report.successful_actions > 0 {
         fs::write(&full, text.as_bytes())
             .with_context(|| format!("Failed to write edited file {path}"))?;
-    }
-
-    if !report.failed.is_empty() {
-        let first = report
-            .failed
-            .first()
-            .map(|item| format!("edit[{}] {}: {}", item.index, item.action, item.error))
-            .unwrap_or_else(|| "edit sequence failed".to_string());
-        bail!(first);
     }
 
     Ok(report)

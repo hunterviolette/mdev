@@ -70,9 +70,27 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
     Ok(json!({ "ok": true, "current_step_id": step_id }))
 }
 
+pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) -> Result<Value> {
+    let mut run = load_run(state, run_id).await?;
+
+    let global_payload = match payload {
+        Value::Object(map) => Value::Object(map),
+        _ => return Err(anyhow!("global payload must be object")),
+    };
+
+    let global_state_snapshot = {
+        let root = ensure_engine_root(&mut run.context);
+        let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+        merge_json_values(global_state, &global_payload);
+        global_state.clone()
+    };
+
+    update_run_context(&state.db, run_id, &run.context).await?;
+    Ok(json!({ "ok": true, "global_state": global_state_snapshot }))
+}
+
 pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, payload: Value) -> Result<Value> {
     let mut run = load_run(state, run_id).await?;
-    let definition = load_template_definition(state, &run).await?;
     let root = ensure_engine_root(&mut run.context);
 
     let mut stage_payload = match payload {
@@ -83,98 +101,22 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
     {
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
         let global_state_obj = global_state.as_object_mut().ok_or_else(|| anyhow!("global_state must be object"))?;
-        if let Some(repo_context) = stage_payload.remove("repo_context") {
-            global_state_obj.insert("repo_context".to_string(), repo_context);
-        } else {
-            global_state_obj.remove("repo_context");
+        if let Some(global_patch) = stage_payload.remove("global_state") {
+            let mut merged = Value::Object(global_state_obj.clone());
+            merge_json_values(&mut merged, &global_patch);
+            *global_state_obj = merged.as_object().cloned().unwrap_or_default();
         }
     }
 
-    let effective_plan = stage_payload
-        .get("execution_plan_override")
-        .cloned()
-        .unwrap_or_else(|| build_interactive_execution_plan_override(definition.as_ref(), step_id, &stage_payload));
-    stage_payload.insert("execution_plan_override".to_string(), effective_plan.clone());
-
     let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
     let stage_state_obj = stage_state.as_object_mut().ok_or_else(|| anyhow!("stage_state must be object"))?;
-    stage_state_obj.insert(step_id.to_string(), Value::Object(stage_payload.clone()));
+    let existing = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
+    let mut merged = existing.clone();
+    merge_json_values(&mut merged, &Value::Object(stage_payload.clone()));
+    *existing = merged.clone();
+
     update_run_context(&state.db, run_id, &run.context).await?;
-    Ok(json!({ "ok": true, "step_id": step_id, "state": Value::Object(stage_payload), "execution_plan_override": effective_plan }))
-}
-
-fn build_interactive_execution_plan_override(
-    definition: Option<&WorkflowTemplateDefinition>,
-    step_id: &str,
-    stage_payload: &Map<String, Value>,
-) -> Value {
-    let include_repo_context = stage_payload
-        .get("prompt_fragment_enabled")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get("repo_context"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let fallback_step = definition
-        .and_then(|def| def.steps.iter().find(|step| step.id == step_id));
-
-    let inference_config = fallback_step
-        .and_then(|step| {
-            step.execution_plan
-                .iter()
-                .find(|node| node.key == "inference")
-                .map(|node| node.config.clone())
-                .or_else(|| {
-                    step.capabilities
-                        .iter()
-                        .find(|binding| binding.capability == "inference" && binding.enabled)
-                        .map(|binding| binding.config.clone())
-                })
-        })
-        .unwrap_or_else(|| json!({}));
-
-    let context_export_config = fallback_step
-        .and_then(|step| {
-            step.execution_plan
-                .iter()
-                .find(|node| node.key == "context_export")
-                .map(|node| node.config.clone())
-                .or_else(|| {
-                    step.capabilities
-                        .iter()
-                        .find(|binding| binding.capability == "context_export" && binding.enabled)
-                        .map(|binding| binding.config.clone())
-                })
-        })
-        .unwrap_or_else(|| json!({}));
-
-    let mut plan = Vec::new();
-
-    if include_repo_context {
-        plan.push(json!({
-            "kind": "capability",
-            "key": "context_export",
-            "enabled": true,
-            "config": context_export_config,
-            "input_mapping": {},
-            "output_mapping": {},
-            "run_after": [],
-            "condition": null
-        }));
-    }
-
-    plan.push(json!({
-        "kind": "capability",
-        "key": "inference",
-        "enabled": true,
-        "config": inference_config,
-        "input_mapping": {},
-        "output_mapping": {},
-        "run_after": [],
-        "condition": null
-    }));
-
-    Value::Array(plan)
+    Ok(json!({ "ok": true, "step_id": step_id, "state": merged }))
 }
 
 pub(crate) async fn append_event(
@@ -275,7 +217,29 @@ pub(crate) async fn update_run_status(
     Ok(())
 }
 
-pub(crate) async fn update_run_context(
+pub(crate) fn merge_json_values(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(base_obj), Value::Object(patch_obj)) => {
+            for (key, patch_value) in patch_obj {
+                if patch_value.is_null() {
+                    base_obj.remove(key);
+                    continue;
+                }
+                match base_obj.get_mut(key) {
+                    Some(base_value) => merge_json_values(base_value, patch_value),
+                    None => {
+                        base_obj.insert(key.clone(), patch_value.clone());
+                    }
+                }
+            }
+        }
+        (base_slot, patch_value) => {
+            *base_slot = patch_value.clone();
+        }
+    }
+}
+
+async fn update_run_context(
     db: &SqlitePool,
     run_id: Uuid,
     context: &Value,

@@ -101,6 +101,9 @@ async fn run_action(
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::select_step(&state, run_id, step_id).await.map_err(internal)?
         }
+        "patch_global_state" => {
+            engine::patch_global_state(&state, run_id, req.payload).await.map_err(internal)?
+        }
         "patch_stage_state" => {
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
@@ -164,7 +167,10 @@ async fn create_run(
     let id = Uuid::new_v4();
     let status = RunStatus::Draft;
 
-    let current_step_id = if let Some(template_id) = req.template_id {
+    let mut run_context = req.context.clone();
+    let mut current_step_id = None;
+
+    if let Some(template_id) = req.template_id {
         let template_row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
             .bind(template_id.to_string())
             .fetch_optional(&state.db)
@@ -174,13 +180,34 @@ async fn create_run(
         if let Some(template_row) = template_row {
             let definition_json: String = template_row.get("definition_json");
             let definition: crate::models::WorkflowTemplateDefinition = serde_json::from_str(&definition_json).map_err(internal)?;
-            definition.steps.first().map(|step| step.id.clone())
-        } else {
-            None
+            current_step_id = definition.steps.first().map(|step| step.id.clone());
+
+            let root = engine::ensure_engine_root(&mut run_context);
+            let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+            let mut seeded_global_state = serde_json::to_value(definition.globals.clone()).map_err(internal)?;
+
+            if !seeded_global_state.is_object() {
+                seeded_global_state = json!({});
+            }
+
+            if let Some(global_obj) = seeded_global_state.as_object_mut() {
+                let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
+                if !resources.is_object() {
+                    *resources = json!({});
+                }
+                let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
+                let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
+                if !repo.is_object() {
+                    *repo = json!({});
+                }
+                let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
+                repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
+                repo_obj.entry("git_ref".to_string()).or_insert_with(|| json!("WORKTREE"));
+            }
+
+            engine::merge_json_values(global_state, &seeded_global_state);
         }
-    } else {
-        None
-    };
+    }
 
     sqlx::query(
         "INSERT INTO workflow_runs (id, template_id, status, current_step_id, title, repo_ref, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -191,7 +218,7 @@ async fn create_run(
     .bind(current_step_id.clone())
     .bind(&req.title)
     .bind(&req.repo_ref)
-    .bind(serde_json::to_string(&req.context).map_err(internal)?)
+    .bind(serde_json::to_string(&run_context).map_err(internal)?)
     .bind(now.to_rfc3339())
     .bind(now.to_rfc3339())
     .execute(&state.db)
@@ -217,7 +244,7 @@ async fn create_run(
         current_step_id: current_step_id.clone(),
         title: req.title,
         repo_ref: req.repo_ref,
-        context: req.context,
+        context: run_context,
         created_at: now,
         updated_at: now,
     }))

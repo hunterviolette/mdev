@@ -6,10 +6,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use super::{persist_inference_config, BrowserConfig, BrowserProbeResult, InferenceConfig};
-use super::super::{
-    context_export,
-    registry::{find_result, CapabilityContext, CapabilityResult},
-};
+use super::super::registry::{find_result, CapabilityContext, CapabilityResult};
+use crate::engine::capabilities::context_export;
 
 fn is_stale_session_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err).to_ascii_lowercase();
@@ -33,7 +31,27 @@ fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
     Ok(session_id)
 }
 
+fn repo_context_upload_enabled(ctx: &CapabilityContext<'_>) -> bool {
+    ctx.local_state
+        .get("capabilities")
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get("prompt_fragment_enabled"))
+        .and_then(|v| v.get("repo_context"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            ctx.local_state
+                .get("prompt_fragment_enabled")
+                .and_then(|v| v.get("repo_context"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityResult]) -> Result<Vec<PathBuf>> {
+    if !repo_context_upload_enabled(ctx) {
+        return Ok(Vec::new());
+    }
+
     let mut uploads = Vec::new();
 
     if let Some(result) = find_result(prior_results, "context_export") {
@@ -48,8 +66,21 @@ fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[Capabil
     }
 
     if uploads.is_empty() {
-        if let Some(repo_context) = ctx.local_state.get("repo_context").cloned() {
-            let rendered = context_export::render_context_export_text(repo_context)?;
+        let repo_context = ctx
+            .local_state
+            .get("capabilities")
+            .and_then(|v| v.get("context_export"))
+            .cloned();
+        if let Some(repo_context) = repo_context {
+            let normalized = context_export::normalize_context_export_payload(
+                repo_context,
+                ctx.local_state
+                    .get("resources")
+                    .and_then(|v| v.get("repo"))
+                    .cloned(),
+                ctx.repo_ref,
+            );
+            let rendered = context_export::render_context_export_text(normalized)?;
             let mut temp_path = std::env::temp_dir();
             temp_path.push(format!("repo_context_{}.txt", ctx.run_id));
             std::fs::write(&temp_path, rendered.as_bytes())?;
@@ -70,7 +101,8 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
 
     let mut inference_cfg: InferenceConfig = ctx
         .local_state
-        .get("inference")
+        .get("capabilities")
+        .and_then(|v| v.get("inference"))
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_else(|| InferenceConfig {

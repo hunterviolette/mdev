@@ -36,12 +36,14 @@ import {
   getChangesetSchema,
   getRun,
   getStageExecutionChain,
+  getWorkflowBuilderContract,
   listRepoTree,
   listRunEvents,
   listRuns,
   listTemplates,
   nextWorkflowStep,
   openEventStream,
+  patchWorkflowGlobalState,
   patchWorkflowStageState,
   pauseWorkflowRun,
   previousWorkflowStep,
@@ -57,6 +59,9 @@ import {
   type RepoTreeResponse,
   type StageExecutionChain,
   type StageExecutionEvent,
+  type WorkflowBuilderContract,
+  type WorkflowBuilderFieldContract,
+  type WorkflowBuilderStageContract,
   type WorkflowEvent,
   type WorkflowRun,
   type WorkflowRunStatus,
@@ -65,6 +70,7 @@ import {
   type WorkflowTemplateDefinition,
   type WorkflowTransition
 } from './api';
+import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 
 type TransitionEditorValue = {
@@ -78,13 +84,8 @@ type BuilderStep = {
   name: string;
   stepType: string;
   automationMode: AutomationMode;
-  includeRepoContext: boolean;
-  includeChangesetSchema: boolean;
-  pauseOnEnter: boolean;
-  requireManualApproval: boolean;
   autoAdvanceOnSuccess: boolean;
-  compileCommands: string;
-  maxConsecutiveApplyFailures: number;
+  fields: Record<string, boolean | number | string>;
   transitions: TransitionEditorValue;
 };
 
@@ -221,80 +222,36 @@ function formatCompileStageStream(commandResults: Array<Record<string, unknown>>
   return parts.join('\n\n');
 }
 
-const DEFAULT_STEPS: BuilderStep[] = [
-  {
-    id: 'design',
-    name: 'Design',
-    stepType: 'design',
-    automationMode: 'manual',
-    includeRepoContext: true,
-    includeChangesetSchema: false,
-    pauseOnEnter: false,
-    requireManualApproval: false,
-    autoAdvanceOnSuccess: false,
-    compileCommands: '',
-    maxConsecutiveApplyFailures: 1,
+function builderStepFromContract(stage: WorkflowBuilderStageContract): BuilderStep {
+  return {
+    id: stage.step_type,
+    name: stage.label,
+    stepType: stage.step_type,
+    automationMode: stage.automation_mode_default,
+    autoAdvanceOnSuccess: stage.automation_mode_default === 'automatic',
+    fields: Object.fromEntries(stage.fields.map((field) => [field.key, field.default])),
     transitions: {
-      successTarget: 'code',
-      errorTarget: 'design',
-      pausedTarget: 'design'
+      successTarget: stage.transition_defaults.on_success,
+      errorTarget: stage.transition_defaults.on_error,
+      pausedTarget: stage.transition_defaults.on_paused
     }
-  },
-  {
-    id: 'code',
-    name: 'Code',
-    stepType: 'code',
-    automationMode: 'automatic',
-    includeRepoContext: true,
-    includeChangesetSchema: true,
-    pauseOnEnter: false,
-    requireManualApproval: false,
-    autoAdvanceOnSuccess: true,
-    compileCommands: '',
-    maxConsecutiveApplyFailures: 1,
-    transitions: {
-      successTarget: 'compile',
-      errorTarget: 'code',
-      pausedTarget: 'code'
-    }
-  },
-  {
-    id: 'compile',
-    name: 'Compile',
-    stepType: 'compile',
-    automationMode: 'automatic',
-    includeRepoContext: false,
-    includeChangesetSchema: false,
-    pauseOnEnter: false,
-    requireManualApproval: false,
-    autoAdvanceOnSuccess: true,
-    compileCommands: 'cargo check',
-    maxConsecutiveApplyFailures: 1,
-    transitions: {
-      successTarget: 'review',
-      errorTarget: 'code',
-      pausedTarget: 'compile'
-    }
-  },
-  {
-    id: 'review',
-    name: 'Review',
-    stepType: 'review',
-    automationMode: 'manual',
-    includeRepoContext: false,
-    includeChangesetSchema: false,
-    pauseOnEnter: false,
-    requireManualApproval: true,
-    autoAdvanceOnSuccess: false,
-    compileCommands: '',
-    maxConsecutiveApplyFailures: 1,
-    transitions: {
-      successTarget: '',
-      errorTarget: 'design',
-      pausedTarget: 'review'
-    }
-  }
-];
+  };
+}
+
+function readBool(step: BuilderStep, key: string, fallback = false) {
+  const value = step.fields[key];
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function readNumber(step: BuilderStep, key: string, fallback = 0) {
+  const value = step.fields[key];
+  return typeof value === 'number' ? value : fallback;
+}
+
+function readString(step: BuilderStep, key: string, fallback = '') {
+  const value = step.fields[key];
+  return typeof value === 'string' ? value : fallback;
+}
 
 function buildTransitions(step: BuilderStep): WorkflowTransition[] {
   const transitions: WorkflowTransition[] = [];
@@ -304,20 +261,67 @@ function buildTransitions(step: BuilderStep): WorkflowTransition[] {
   return transitions;
 }
 
+function buildBranchDisposition(targetStepId: string, fallback: 'success' | 'error' | 'paused') {
+  if (!targetStepId) {
+    return fallback === 'paused' ? 'paused' : 'success';
+  }
+  return 'move_to_step';
+}
+
+function buildBranchConfig(targetStepId: string, fallback: 'success' | 'error' | 'paused') {
+  const disposition = buildBranchDisposition(targetStepId, fallback);
+  return targetStepId
+    ? { disposition, target_step_id: targetStepId }
+    : { disposition };
+}
+
 function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
-  const compileCommands = step.compileCommands
+  const compileCommands = readString(step, 'execution.compile_checks.commands_text', '')
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
     .map((command) => ({ command, label: command }));
 
-  const executionLogic = step.id === 'code'
-    ? { kind: 'code_stage_policy' }
+  const executionLogic: Record<string, unknown> = step.id === 'code'
+    ? {
+        kind: 'code_stage_policy',
+        automation: {
+          inject_context: readBool(step, 'automation.inject_context', true),
+          inject_changeset_schema: readBool(step, 'automation.inject_changeset_schema', true),
+          auto_apply_changeset: readBool(step, 'automation.auto_apply_changeset', true),
+          max_consecutive_apply_failures: readNumber(step, 'automation.max_consecutive_apply_failures', 1)
+        },
+        on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
+        on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
+        on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
+      }
     : step.id === 'compile'
-      ? { kind: 'compile_stage_policy' }
+      ? {
+          kind: 'compile_stage_policy',
+          automation: {
+            run_compile_checks: true
+          },
+          on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
+          on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
+          on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
+        }
       : step.id === 'review'
-        ? { kind: 'review_stage_policy', require_manual_approval: step.requireManualApproval }
-        : { kind: 'design_stage_policy' };
+        ? {
+            kind: 'review_stage_policy',
+            require_manual_approval: readBool(step, 'execution_logic.require_manual_approval', true),
+            on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
+            on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
+            on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
+          }
+        : {
+            kind: 'design_stage_policy',
+            automation: {
+              inject_context: readBool(step, 'automation.inject_context', true)
+            },
+            on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
+            on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
+            on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
+          };
 
   const executionPlan = step.id === 'compile'
     ? [
@@ -332,25 +336,41 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
           condition: null
         }
       ]
-    : [
-        {
-          kind: 'capability' as const,
-          key: 'inference',
-          enabled: true,
-          config: {
-            mode: 'send_prompt',
-            allowed_invocations: step.id === 'design'
-              ? ['context_export']
-              : step.id === 'code'
-                ? ['context_export', 'changeset_schema', 'apply_changeset']
-                : []
+    : step.id === 'design' || step.id === 'code'
+      ? [
+          {
+            kind: 'capability' as const,
+            key: 'context_export',
+            enabled: true,
+            config: {},
+            input_mapping: {},
+            output_mapping: {},
+            run_after: [],
+            condition: null
           },
-          input_mapping: {},
-          output_mapping: {},
-          run_after: [],
-          condition: null
-        }
-      ];
+          {
+            kind: 'capability' as const,
+            key: 'inference',
+            enabled: true,
+            config: {},
+            input_mapping: {},
+            output_mapping: {},
+            run_after: ['context_export'],
+            condition: null
+          }
+        ]
+      : [
+          {
+            kind: 'capability' as const,
+            key: 'inference',
+            enabled: true,
+            config: {},
+            input_mapping: {},
+            output_mapping: {},
+            run_after: [],
+            condition: null
+          }
+        ];
 
   return {
     id: step.id,
@@ -358,44 +378,25 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
     step_type: step.stepType,
     automation_mode: step.automationMode,
     execution: {
-      changeset_apply: step.id === 'code' ? { enabled: true } : {},
+      changeset_apply: step.id === 'code'
+        ? {
+            enabled: readBool(step, 'automation.auto_apply_changeset', true),
+            max_consecutive_failures: readNumber(step, 'automation.max_consecutive_apply_failures', 1)
+          }
+        : {},
       compile_checks: step.id === 'compile' ? { commands: compileCommands } : {}
     },
     prompt: {
-      include_repo_context: step.includeRepoContext,
-      include_changeset_schema: step.includeChangesetSchema,
+      include_repo_context: readBool(step, 'automation.inject_context', false),
+      include_changeset_schema: readBool(step, 'automation.inject_changeset_schema', false),
       include_user_context: true
     },
     config: {
       pause_policy: {
-        pause_on_enter: step.pauseOnEnter
+        pause_on_enter: readBool(step, 'config.pause_policy.pause_on_enter', false)
       }
     },
-    capabilities: step.id === 'compile'
-      ? [
-          {
-            capability: 'compile_commands',
-            enabled: true,
-            config: {},
-            input_mapping: {},
-            output_mapping: {}
-          }
-        ]
-      : [
-          {
-            capability: 'inference',
-            enabled: true,
-            config: {
-              allowed_invocations: step.id === 'design'
-                ? ['context_export']
-                : step.id === 'code'
-                  ? ['context_export', 'changeset_schema', 'apply_changeset']
-                  : []
-            },
-            input_mapping: {},
-            output_mapping: {}
-          }
-        ],
+    capabilities: [],
     execution_logic: executionLogic,
     execution_plan: executionPlan,
     advancement: {
@@ -412,7 +413,23 @@ function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
 function buildTemplateDefinition(steps: BuilderStep[]): WorkflowTemplateDefinition {
   return {
     version: 1,
-    globals: { inference: {}, prompt_fragments: {}, capabilities: [] },
+    globals: {
+      resources: {
+        repo: {
+          repo_ref: '',
+          git_ref: 'WORKTREE'
+        }
+      },
+      capabilities: {
+        inference: {},
+        context_export: {
+          save_path: '/tmp/repo_context.txt'
+        },
+        changeset_schema: {},
+        'gateway_model/changeset': {},
+        compile_commands: {}
+      }
+    },
     steps: steps.map(buildStepDefinition)
   };
 }
@@ -775,10 +792,23 @@ export function WorkflowShell() {
   const [workflowDescription, setWorkflowDescription] = useState('Design, code, and review workflow');
   const [runTitle, setRunTitle] = useState('New workflow run');
   const [repoRef, setRepoRef] = useState('');
-  const [builderSteps, setBuilderSteps] = useState<BuilderStep[]>(DEFAULT_STEPS);
+  const [builderContract, setBuilderContract] = useState<WorkflowBuilderContract | null>(null);
+  const [builderSteps, setBuilderSteps] = useState<BuilderStep[]>([]);
   const [jsonDraft, setJsonDraft] = useState('');
   const [createRunAfterSave, setCreateRunAfterSave] = useState(true);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [globalCapabilitiesOpen, setGlobalCapabilitiesOpen] = useState(false);
+
+  useEffect(() => {
+    void getWorkflowBuilderContract()
+      .then((contract) => {
+        setBuilderContract(contract);
+        setBuilderSteps(contract.stages.map(builderStepFromContract));
+      })
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+  }, []);
 
   const [operatorMode, setOperatorMode] = useState<OperatorMode>('auto');
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
@@ -986,9 +1016,13 @@ export function WorkflowShell() {
     const step = selectedWorkflowStep;
     if (!step) return;
 
-    const promptFragments = (selectedStageState?.prompt_fragments ?? {}) as Record<string, unknown>;
-    const promptFragmentEnabled = (selectedStageState?.prompt_fragment_enabled ?? {}) as Record<string, unknown>;
-    const repoContext = (selectedStageState?.repo_context ?? {}) as Record<string, unknown>;
+    const globalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state ?? {}) as Record<string, unknown>;
+    const globalCapabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    const inferenceConfig = (globalCapabilities.inference ?? {}) as Record<string, unknown>;
+    const promptFragments = ((inferenceConfig.prompt_fragments ?? {}) as Record<string, unknown>);
+    const promptFragmentEnabled = ((inferenceConfig.prompt_fragment_enabled ?? {}) as Record<string, unknown>);
+    const repoContext = (globalCapabilities.context_export ?? {}) as Record<string, unknown>;
+    const compileConfig = (globalCapabilities.compile_commands ?? {}) as Record<string, unknown>;
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const includeFiles = Array.isArray(repoContext.include_files)
       ? repoContext.include_files.filter((value): value is string => typeof value === 'string')
@@ -1003,10 +1037,18 @@ export function WorkflowShell() {
     setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
     setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
     setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
+    const compileCommands = compileConfig.commands;
     setStageCompileCommandsText(
-      Array.isArray((selectedWorkflowStep?.execution?.compile_checks as Record<string, unknown> | undefined)?.commands)
-        ? (((selectedWorkflowStep?.execution?.compile_checks as Record<string, unknown> | undefined)?.commands as unknown[]) ?? [])
-            .filter((value): value is string => typeof value === 'string')
+      Array.isArray(compileCommands)
+        ? compileCommands
+            .map((item) => {
+              if (typeof item === 'string') return item;
+              if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).command === 'string') {
+                return String((item as Record<string, unknown>).command);
+              }
+              return '';
+            })
+            .filter(Boolean)
             .join('\n')
         : ''
     );
@@ -1032,10 +1074,36 @@ export function WorkflowShell() {
         ? promptFragmentEnabled.compile_error
         : false
     );
+    const selectedExecutionLogic = (selectedStageState?.execution_logic ?? step.execution_logic ?? {}) as Record<string, unknown>;
+    const selectedAutomation = (selectedExecutionLogic.automation ?? {}) as Record<string, unknown>;
     setStageAutoApplyChangeset(
-      typeof ((selectedStageState?.changeset_apply as Record<string, unknown> | undefined)?.enabled) === 'boolean'
-        ? Boolean((selectedStageState?.changeset_apply as Record<string, unknown>).enabled)
+      typeof selectedAutomation.auto_apply_changeset === 'boolean'
+        ? Boolean(selectedAutomation.auto_apply_changeset)
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.id === 'code')
+    );
+    setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
+    setInferenceModel(typeof inferenceConfig.model === 'string' ? String(inferenceConfig.model) : 'gpt-5');
+    setBrowserTargetUrl(
+      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
+        ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
+        : 'https://chatgpt.com/?temporary-chat=true'
+    );
+    setBrowserCdpUrl(
+      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
+        ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
+        : 'http://127.0.0.1:9222'
+    );
+    setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
+    setInferenceModel(typeof inferenceConfig.model === 'string' ? String(inferenceConfig.model) : 'gpt-5');
+    setBrowserTargetUrl(
+      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
+        ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
+        : 'https://chatgpt.com/?temporary-chat=true'
+    );
+    setBrowserCdpUrl(
+      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
+        ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
+        : 'http://127.0.0.1:9222'
     );
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
@@ -1056,6 +1124,80 @@ export function WorkflowShell() {
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
   }, [selectedStageHydrationKey]);
+
+  function buildInteractiveGlobalStatePayload() {
+    const includeFiles = stageRepoContextIncludeFilesText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const excludeRegex = stageRepoContextExcludeRegexText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const compileCommands = stageCompileCommandsText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((command) => ({ command, label: command }));
+    const promptFragments: Record<string, unknown> = {
+      user_input: stageUserInput,
+      changeset_schema: stageChangesetSchemaText,
+      apply_error: stageApplyError,
+      compile_error: stageCompileError
+    };
+    const promptFragmentEnabled: Record<string, unknown> = {
+      user_input: true,
+      repo_context: stageIncludeRepoContext,
+      changeset_schema: stageIncludeChangesetSchema,
+      apply_error: stageIncludeApplyError && Boolean(stageApplyError.trim()),
+      compile_error: stageIncludeCompileError && Boolean(stageCompileError.trim())
+    };
+
+    return {
+      resources: {
+        repo: {
+          repo_ref: resolveRepoRefForRun(selectedRun),
+          git_ref: stageRepoContextGitRef || 'WORKTREE'
+        }
+      },
+      capabilities: {
+        inference: {
+          transport: inferenceTransport,
+          model: inferenceModel,
+          prompt_fragments: promptFragments,
+          prompt_fragment_enabled: promptFragmentEnabled,
+          browser: {
+            profile: 'default',
+            bridge_dir: 'bridge',
+            cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
+            page_url_contains: browserTargetUrl,
+            target_url: browserTargetUrl,
+            edge_executable: '',
+            user_data_dir: '',
+            session_id: null,
+            auto_launch_edge: true,
+            response_timeout_ms: 120000,
+            response_poll_ms: 1000,
+            dom_poll_ms: 1000
+          }
+        },
+        context_export: {
+          git_ref: stageRepoContextGitRef || 'WORKTREE',
+          include_files: includeFiles,
+          exclude_regex: excludeRegex,
+          save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
+          skip_binary: stageRepoContextSkipBinary,
+          skip_gitignore: stageRepoContextSkipGitignore,
+          include_staged_diff: stageRepoContextIncludeStagedDiff,
+          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
+        },
+        compile_commands: {
+          commands: compileCommands
+        }
+      }
+    } as Record<string, unknown>;
+  }
+
 
   useEffect(() => {
     if (!selectedRunId) return;
@@ -1437,14 +1579,33 @@ export function WorkflowShell() {
     }
   }
 
+  function syncRepoSelectionState(nextPaths: string[]) {
+    const normalized = Array.from(new Set(nextPaths.map((path) => path.trim()).filter(Boolean))).sort();
+    setSelectedRepoPaths(normalized);
+    setStageRepoContextIncludeFilesText(normalized.join('\n'));
+  }
+
+  function resolveRepoRefForRun(run: WorkflowRun | null): string {
+    const workflowEngine = (run?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const resources = (globalState.resources ?? {}) as Record<string, unknown>;
+    const repo = (resources.repo ?? {}) as Record<string, unknown>;
+    if (typeof repo.repo_ref === 'string' && repo.repo_ref.trim()) {
+      return String(repo.repo_ref);
+    }
+    if (typeof run?.repo_ref === 'string' && run.repo_ref.trim()) {
+      return run.repo_ref;
+    }
+    return repoRef;
+  }
+
   function setPaths(paths: string[], checked: boolean) {
-    setSelectedRepoPaths((prev) => {
-      const next = new Set(prev);
-      for (const path of paths) {
-        if (checked) next.add(path); else next.delete(path);
-      }
-      return Array.from(next).sort();
-    });
+    const next = new Set(selectedRepoPaths);
+    for (const path of paths) {
+      if (checked) next.add(path);
+      else next.delete(path);
+    }
+    syncRepoSelectionState(Array.from(next));
   }
 
   function toggleFile(path: string) {
@@ -1452,7 +1613,8 @@ export function WorkflowShell() {
   }
 
   async function loadTreeSubtree(run: WorkflowRun, basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[] }> {
-    const data = await listRepoTree(run.repo_ref, stageRepoContextGitRef, {
+    const repoRefForTree = resolveRepoRefForRun(run);
+    const data = await listRepoTree(repoRefForTree, stageRepoContextGitRef, {
       basePath,
       skipBinary: stageRepoContextSkipBinary,
       skipGitignore: stageRepoContextSkipGitignore
@@ -1488,7 +1650,8 @@ export function WorkflowShell() {
     });
 
     try {
-      const data = await listRepoTree(run.repo_ref, stageRepoContextGitRef, {
+      const repoRefForTree = resolveRepoRefForRun(run);
+      const data = await listRepoTree(repoRefForTree, stageRepoContextGitRef, {
         basePath,
         skipBinary: stageRepoContextSkipBinary,
         skipGitignore: stageRepoContextSkipGitignore
@@ -1498,7 +1661,7 @@ export function WorkflowShell() {
         setTreeRootData(data);
         setTreeChildrenByParent({ '': data.entries });
         const visiblePaths = new Set<string>(data.entries.filter((entry) => entry.kind === 'file').map((entry) => entry.path));
-        setSelectedRepoPaths((prev) => prev.filter((path) => visiblePaths.has(path)));
+        syncRepoSelectionState(selectedRepoPaths.filter((path) => visiblePaths.has(path)));
         setSelectedRepoDirs(new Set());
       } else {
         setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
@@ -1675,184 +1838,45 @@ export function WorkflowShell() {
   function buildInteractiveStagePayload() {
     const step = selectedWorkflowStep;
     const stepId = step?.id ?? null;
-    const includeFiles = Array.from(
-      new Set(
-        selectedRepoPaths
-          .map((value) => value.trim())
-          .filter(Boolean)
-      )
-    );
-    const excludeRegex = stageRepoContextExcludeRegexText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
 
     if (stepId === 'compile') {
-      const commands = stageCompileCommandsText
-        .split('\n')
-        .map((value) => value.trim())
-        .filter(Boolean)
-        .map((command) => ({ command, label: command }));
-
       return {
-        execution: {
-          compile_checks: {
-            commands
-          }
-        },
         execution_logic: {
-          compile_checks: {
-            commands
-          }
-        },
-        execution_plan_override: buildInteractiveExecutionPlan(stepId)
+          kind: 'compile_stage_policy'
+        }
       } as Record<string, unknown>;
     }
 
     if (stepId === 'review') {
       return {
-        prompt_fragments: {
-          user_input: stageUserInput,
-          review_notes: stageReviewNotes
-        },
-        prompt_fragment_enabled: {
-          user_input: true,
-          review_notes: Boolean(stageReviewNotes.trim())
-        },
-        review: { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes },
-        execution_plan_override: buildInteractiveExecutionPlan(stepId)
+        review: { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes }
       } as Record<string, unknown>;
     }
 
-    const promptFragments: Record<string, unknown> = { user_input: stageUserInput };
-    const promptFragmentEnabled: Record<string, unknown> = { user_input: true, repo_context: stageIncludeRepoContext };
+    const payload: Record<string, unknown> = {};
+
+    if (stepId === 'design') {
+      payload.execution_logic = {
+        kind: 'design_stage_policy',
+        automation: {
+          inject_context: stageIncludeRepoContext
+        }
+      };
+    }
 
     if (stepId === 'code') {
-      promptFragmentEnabled.changeset_schema = stageIncludeChangesetSchema;
-      promptFragmentEnabled.apply_error = stageIncludeApplyError && Boolean(stageApplyError.trim());
-      promptFragmentEnabled.compile_error = stageIncludeCompileError && Boolean(stageCompileError.trim());
-      promptFragments.changeset_schema = stageChangesetSchemaText;
-      promptFragments.apply_error = stageApplyError;
-      promptFragments.compile_error = stageCompileError;
+      payload.execution_logic = {
+        kind: 'code_stage_policy',
+        automation: {
+          inject_context: stageIncludeRepoContext,
+          inject_changeset_schema: stageIncludeChangesetSchema,
+          auto_apply_changeset: stageAutoApplyChangeset,
+          max_consecutive_apply_failures: 1
+        }
+      };
     }
 
-    const payload = {
-      ...(stepId === 'design' || stepId === 'code' ? {
-        inference: {
-          transport: inferenceTransport,
-          model: inferenceModel,
-          browser: {
-            profile: 'default',
-            bridge_dir: 'bridge',
-            cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
-            page_url_contains: browserTargetUrl,
-            target_url: browserTargetUrl,
-            edge_executable: '',
-            user_data_dir: '',
-            session_id: null,
-            auto_launch_edge: true,
-            response_timeout_ms: 120000,
-            response_poll_ms: 1000,
-            dom_poll_ms: 1000
-          }
-        }
-      } : {}),
-      ...(stageIncludeRepoContext ? {
-        repo_context: {
-          git_ref: stageRepoContextGitRef || 'WORKTREE',
-          include_files: includeFiles,
-          exclude_regex: excludeRegex,
-          save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
-          skip_binary: stageRepoContextSkipBinary,
-          skip_gitignore: stageRepoContextSkipGitignore,
-          include_staged_diff: stageRepoContextIncludeStagedDiff,
-          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
-        }
-      } : {}),
-      ...(stepId === 'code' ? {
-        changeset_apply: {
-          enabled: stageAutoApplyChangeset
-        }
-      } : {}),
-      prompt_fragments: promptFragments,
-      prompt_fragment_enabled: promptFragmentEnabled,
-      execution_plan_override: buildInteractiveExecutionPlan(stepId)
-    } as Record<string, unknown>;
     return payload;
-  }
-
-  function buildInteractiveExecutionPlan(stepId: string | null) {
-    const plan: Array<Record<string, unknown>> = [];
-
-    if (stepId === 'design' || stepId === 'code') {
-      if (stageIncludeRepoContext) {
-        plan.push({
-          kind: 'capability',
-          key: 'context_export',
-          enabled: true,
-          config: {},
-          input_mapping: {},
-          output_mapping: {},
-          run_after: [],
-          condition: null
-        });
-      }
-
-      if (stepId === 'code' && stageIncludeChangesetSchema) {
-        plan.push({
-          kind: 'capability',
-          key: 'changeset_schema',
-          enabled: true,
-          config: {},
-          input_mapping: {},
-          output_mapping: {},
-          run_after: [],
-          condition: null
-        });
-      }
-
-      plan.push({
-        kind: 'capability',
-        key: 'inference',
-        enabled: true,
-        config: {},
-        input_mapping: {},
-        output_mapping: {},
-        run_after: [],
-        condition: null
-      });
-
-      if (stepId === 'code' && stageAutoApplyChangeset) {
-        plan.push({
-          kind: 'capability',
-          key: 'gateway_model/changeset',
-          enabled: true,
-          config: {
-            repo_ref: selectedRun?.repo_ref ?? repoRef,
-            git_ref: stageRepoContextGitRef || 'WORKTREE'
-          },
-          input_mapping: {},
-          output_mapping: {},
-          run_after: [],
-          condition: null
-        });
-      }
-    }
-
-    if (stepId === 'compile') {
-      plan.push({
-        kind: 'capability',
-        key: 'compile_commands',
-        enabled: true,
-        config: {},
-        input_mapping: {},
-        output_mapping: {},
-        run_after: [],
-        condition: null
-      });
-    }
-
-    return plan;
   }
 
   async function runManualCapability(action: () => Promise<Record<string, unknown>>, successMessage: string) {
@@ -1905,9 +1929,16 @@ export function WorkflowShell() {
     }, 'Moved to next workflow step.');
   }
 
+  async function syncInteractiveGlobalState() {
+    if (!selectedRun) return;
+    const globalPayload = buildInteractiveGlobalStatePayload();
+    await patchWorkflowGlobalState(selectedRun.id, globalPayload);
+  }
+
   async function handleManualPatchStageState() {
     if (!selectedRun || !selectedStepId) return;
     await runManualCapability(async () => {
+      await syncInteractiveGlobalState();
       const payload = buildInteractiveStagePayload();
       const json = await patchWorkflowStageState(selectedRun.id, selectedStepId, payload);
       return json as Record<string, unknown>;
@@ -1917,6 +1948,7 @@ export function WorkflowShell() {
   async function handleManualRunWithPatchedState() {
     if (!selectedRun || !selectedStepId) return;
     await runManualCapability(async () => {
+      await syncInteractiveGlobalState();
       const payload = buildInteractiveStagePayload();
       const json = await runCurrentWorkflowStep(selectedRun.id, selectedStepId, payload);
       return json as Record<string, unknown>;
@@ -1924,13 +1956,12 @@ export function WorkflowShell() {
   }
 
   async function configureInference() {
-    if (!selectedRun || !selectedStepId) return;
+    if (!selectedRun) return;
     try {
       setInferenceBusy(true);
       setInferenceStatus(null);
-      const payload = buildInteractiveStagePayload();
-      await patchWorkflowStageState(selectedRun.id, selectedStepId, payload);
-      setInferenceStatus('Inference configuration saved.');
+      await syncInteractiveGlobalState();
+      setInferenceStatus('Global capability configuration saved.');
       await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
@@ -2021,6 +2052,51 @@ export function WorkflowShell() {
   }
 
   const stepOptions = builderSteps.map((step) => ({ value: step.id, label: `${step.name} (${step.id})` }));
+  const stageContractByType = new Map((builderContract?.stages ?? []).map((stage) => [stage.step_type, stage]));
+
+  function renderBuilderField(step: BuilderStep, field: WorkflowBuilderFieldContract) {
+    const value = step.fields[field.key];
+    if (field.type === 'boolean') {
+      return (
+        <Switch
+          key={field.key}
+          label={field.label}
+          checked={typeof value === 'boolean' ? value : false}
+          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.checked } })}
+        />
+      );
+    }
+    if (field.type === 'integer') {
+      return (
+        <TextInput
+          key={field.key}
+          label={field.label}
+          value={String(typeof value === 'number' ? value : 0)}
+          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: Number(e.currentTarget.value || '0') } })}
+        />
+      );
+    }
+    if (field.type === 'multiline_text') {
+      return (
+        <Textarea
+          key={field.key}
+          label={field.label}
+          minRows={4}
+          autosize
+          value={typeof value === 'string' ? value : ''}
+          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.value } })}
+        />
+      );
+    }
+    return (
+      <TextInput
+        key={field.key}
+        label={field.label}
+        value={typeof value === 'string' ? value : ''}
+        onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.value } })}
+      />
+    );
+  }
 
   return (
     <AppShell padding="md">
@@ -2089,22 +2165,9 @@ export function WorkflowShell() {
                                 </Grid.Col>
                               </Grid>
                               <SimpleGrid cols={{ base: 1, md: 2 }}>
-                                <Switch label="Include repo context" checked={step.includeRepoContext} onChange={(e) => updateStep(step.id, { includeRepoContext: e.currentTarget.checked })} />
-                                <Switch label="Include ChangeSet schema" checked={step.includeChangesetSchema} onChange={(e) => updateStep(step.id, { includeChangesetSchema: e.currentTarget.checked })} />
-                                <Switch label="Pause on enter" checked={step.pauseOnEnter} onChange={(e) => updateStep(step.id, { pauseOnEnter: e.currentTarget.checked })} />
+                                {(stageContractByType.get(step.stepType)?.fields ?? []).map((field) => renderBuilderField(step, field))}
                                 <Switch label="Auto-advance on success" checked={step.autoAdvanceOnSuccess} onChange={(e) => updateStep(step.id, { autoAdvanceOnSuccess: e.currentTarget.checked })} />
-                                <Switch label="Require manual approval" checked={step.requireManualApproval} onChange={(e) => updateStep(step.id, { requireManualApproval: e.currentTarget.checked })} disabled={step.id !== 'review'} />
                               </SimpleGrid>
-                              {step.id === 'code' ? (
-                                <SimpleGrid cols={{ base: 1, md: 2 }}>
-                                  <TextInput label="Max apply failures" value={String(step.maxConsecutiveApplyFailures)} onChange={(e) => updateStep(step.id, { maxConsecutiveApplyFailures: Number(e.currentTarget.value || '1') })} />
-                                </SimpleGrid>
-                              ) : null}
-                              {step.id === 'compile' ? (
-                                <SimpleGrid cols={{ base: 1, md: 2 }}>
-                                  <Textarea label="Compile commands" minRows={3} value={step.compileCommands} onChange={(e) => updateStep(step.id, { compileCommands: e.currentTarget.value })} />
-                                </SimpleGrid>
-                              ) : null}
                               <Divider label="Transitions" />
                               <SimpleGrid cols={{ base: 1, md: 3 }}>
                                 <Select label="On success →" value={step.transitions.successTarget} data={[{ value: '', label: 'End workflow' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { successTarget: value ?? '' })} />
@@ -2409,6 +2472,7 @@ export function WorkflowShell() {
                                   <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
                                   <Button size="md" onClick={() => void handleManualRunWithPatchedState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy} loading={manualCapabilityBusy}>Run stage</Button>
                                   <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
+                                  <Button variant="light" onClick={() => setGlobalCapabilitiesOpen(true)} disabled={!selectedRun}>Global capabilities</Button>
                                 </Group>
                               </>
                             ) : null}
@@ -2552,7 +2616,7 @@ export function WorkflowShell() {
                 <Button size="xs" variant="light" onClick={() => { if (selectedRun) void loadTreeDir(selectedRun, '', true); }} disabled={!selectedRun}>
                   Refresh tree
                 </Button>
-                <Button size="xs" variant="light" onClick={() => { setSelectedRepoPaths([]); setSelectedRepoDirs(new Set()); }}>
+                <Button size="xs" variant="light" onClick={() => { syncRepoSelectionState([]); setSelectedRepoDirs(new Set()); }}>
                   Clear selection
                 </Button>
                 <Button size="xs" variant="light" onClick={() => {
@@ -2591,8 +2655,7 @@ export function WorkflowShell() {
             )}
             <Textarea label="Include files" minRows={8} value={stageRepoContextIncludeFilesText} onChange={(e) => {
               const value = e.currentTarget.value;
-              setStageRepoContextIncludeFilesText(value);
-              setSelectedRepoPaths(value.split('\n').map((item) => item.trim()).filter(Boolean));
+              syncRepoSelectionState(value.split('\n').map((item) => item.trim()).filter(Boolean));
             }} placeholder={"src/main.rs\nsrc/lib.rs"} />
             <Textarea label="Exclude regex" minRows={6} value={stageRepoContextExcludeRegexText} onChange={(e) => setStageRepoContextExcludeRegexText(e.currentTarget.value)} placeholder={"target/.*\nnode_modules/.*"} />
             <Group justify="flex-end"><Button size="xs" onClick={() => setRepoContextConfigOpen(false)}>Done</Button></Group>
@@ -2648,6 +2711,18 @@ export function WorkflowShell() {
               </ScrollArea>
             </Box>
           </Stack>
+        </Modal>
+
+        <Modal opened={globalCapabilitiesOpen} onClose={() => setGlobalCapabilitiesOpen(false)} title="Global capabilities" size="min(1000px, 96vw)" centered>
+          <GlobalCapabilitiesPanel
+            value={((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {}}
+            busy={busy}
+            onSave={async (payload) => {
+              if (!selectedRun?.id) return;
+              await patchWorkflowGlobalState(selectedRun.id, payload);
+              await refreshRunDetails(selectedRun.id);
+            }}
+          />
         </Modal>
 
         <Modal opened={runContextOpen} onClose={() => setRunContextOpen(false)} title="Run context" size="min(1100px, 96vw)" centered>

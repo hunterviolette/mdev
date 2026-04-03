@@ -8,14 +8,19 @@ use super::registry::{CapabilityContext, CapabilityInvocationRequest, Capability
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     _prior_results: &[CapabilityResult],
-    _config: Value,
+    config: Value,
 ) -> Result<CapabilityResult> {
-    let commands = resolve_compile_commands(ctx.local_state, ctx.step.execution_logic.clone());
+    let commands = resolve_compile_commands(config, ctx.local_state, ctx.step.execution_logic.clone());
 
-    let result = execute_terminal_command(
-        PathBuf::from(ctx.repo_ref).as_path(),
-        commands,
-    )?;
+    let repo_ref = ctx
+        .local_state
+        .get("resources")
+        .and_then(|v| v.get("repo"))
+        .and_then(|v| v.get("repo_ref"))
+        .and_then(Value::as_str)
+        .unwrap_or(ctx.repo_ref);
+
+    let result = execute_terminal_command(PathBuf::from(repo_ref).as_path(), commands)?;
 
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
@@ -25,12 +30,24 @@ pub async fn execute(
     })
 }
 
-fn resolve_compile_commands(local_state: &Value, execution_logic: Value) -> Value {
-    local_state
-        .get("execution")
-        .and_then(|v| v.get("compile_checks"))
-        .and_then(|v| v.get("commands"))
+fn resolve_compile_commands(config: Value, local_state: &Value, execution_logic: Value) -> Value {
+    config
+        .get("commands")
         .cloned()
+        .or_else(|| {
+            local_state
+                .get("capabilities")
+                .and_then(|v| v.get("compile_commands"))
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .or_else(|| {
+            local_state
+                .get("execution")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
         .or_else(|| {
             local_state
                 .get("execution_logic")
@@ -59,11 +76,21 @@ fn execute_terminal_command(repo: &Path, commands: Value) -> Result<Value> {
                 (trimmed.clone(), trimmed)
             }
             Value::Object(obj) => {
-                let command = obj.get("command").and_then(Value::as_str).unwrap_or("").trim().to_string();
-                let label = obj.get("label").and_then(Value::as_str).unwrap_or(command.as_str()).trim().to_string();
+                let command = obj
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let label = obj
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or(command.as_str())
+                    .trim()
+                    .to_string();
                 (command, label)
             }
-            _ => (String::new(), String::new())
+            _ => (String::new(), String::new()),
         };
 
         if command.is_empty() {

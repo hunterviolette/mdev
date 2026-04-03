@@ -64,15 +64,38 @@ export type WorkflowStepDefinition = {
 };
 
 export type WorkflowGlobalConfig = {
-  inference: Record<string, unknown>;
-  prompt_fragments: Record<string, unknown>;
-  capabilities: WorkflowCapabilityBinding[];
+  resources: Record<string, unknown>;
+  capabilities: Record<string, unknown>;
 };
 
 export type WorkflowTemplateDefinition = {
   version: number;
   globals: WorkflowGlobalConfig;
   steps: WorkflowStepDefinition[];
+};
+
+export type WorkflowBuilderFieldContract = {
+  key: string;
+  label: string;
+  type: 'boolean' | 'integer' | 'text' | 'multiline_text';
+  default: boolean | number | string;
+};
+
+export type WorkflowBuilderStageContract = {
+  step_type: string;
+  label: string;
+  automation_mode_default: AutomationMode;
+  fields: WorkflowBuilderFieldContract[];
+  transition_defaults: {
+    on_success: string;
+    on_error: string;
+    on_paused: string;
+  };
+};
+
+export type WorkflowBuilderContract = {
+  version: number;
+  stages: WorkflowBuilderStageContract[];
 };
 
 export type WorkflowTemplate = {
@@ -222,6 +245,10 @@ export function listTemplates() {
   return fetchJson<WorkflowTemplate[]>('/api/workflow-templates');
 }
 
+export function getWorkflowBuilderContract() {
+  return fetchJson<WorkflowBuilderContract>('/api/workflow-builder-contract');
+}
+
 export function listRepoTree(
   repoRef: string,
   gitRef = 'WORKTREE',
@@ -328,6 +355,10 @@ export function previousWorkflowStep(runId: string) {
 
 export function patchWorkflowStageState(runId: string, stepId: string, payload: Record<string, unknown>) {
   return sendRunAction(runId, { action: 'patch_stage_state', step_id: stepId, payload });
+}
+
+export function patchWorkflowGlobalState(runId: string, payload: Record<string, unknown>) {
+  return sendRunAction(runId, { action: 'patch_global_state', payload });
 }
 
 export function getPayloadGatewaySchema() {

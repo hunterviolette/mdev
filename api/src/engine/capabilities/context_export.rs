@@ -37,25 +37,7 @@ pub async fn execute(
     _prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
-    let mut repo_context = if config.is_null() || config == json!({}) {
-        ctx.local_state
-            .get("repo_context")
-            .cloned()
-            .unwrap_or_else(|| json!({ "repo_ref": ctx.repo_ref, "git_ref": "WORKTREE" }))
-    } else {
-        config
-    };
-
-    if let Some(obj) = repo_context.as_object_mut() {
-        if !obj.contains_key("repo_ref") {
-            obj.insert("repo_ref".to_string(), Value::String(ctx.repo_ref.to_string()));
-        }
-        if !obj.contains_key("git_ref") {
-            obj.insert("git_ref".to_string(), Value::String("WORKTREE".to_string()));
-        }
-    }
-
-    let result = execute_context_export(ctx.run_id, repo_context)?;
+    let result = execute_context_export(ctx.run_id, resolve_context_export_payload(ctx, config)?)?;
 
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(true),
@@ -63,6 +45,63 @@ pub async fn execute(
         payload: result,
         follow_ups: CapabilityInvocationRequest::None,
     })
+}
+
+fn resolve_context_export_payload(ctx: &CapabilityContext<'_>, config: Value) -> Result<Value> {
+    let repo_resource = ctx
+        .local_state
+        .get("resources")
+        .and_then(|v| v.get("repo"))
+        .cloned();
+
+    let capability_state = ctx
+        .local_state
+        .get("capabilities")
+        .and_then(|v| v.get("context_export"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let payload = if config.is_null() || config == json!({}) {
+        capability_state
+    } else {
+        config
+    };
+
+    Ok(normalize_context_export_payload(payload, repo_resource, ctx.repo_ref))
+}
+
+pub fn normalize_context_export_payload(payload: Value, repo_resource: Option<Value>, fallback_repo_ref: &str) -> Value {
+    let repo_resource = repo_resource.unwrap_or_else(|| json!({
+        "repo_ref": fallback_repo_ref,
+        "git_ref": "WORKTREE"
+    }));
+
+    let mut normalized = match payload {
+        Value::Object(map) => Value::Object(map),
+        _ => json!({}),
+    };
+
+    let obj = normalized.as_object_mut().expect("context export payload must be object");
+    obj.entry("repo_ref".to_string()).or_insert_with(|| {
+        repo_resource
+            .get("repo_ref")
+            .cloned()
+            .unwrap_or_else(|| Value::String(fallback_repo_ref.to_string()))
+    });
+    obj.entry("git_ref".to_string()).or_insert_with(|| {
+        repo_resource
+            .get("git_ref")
+            .cloned()
+            .unwrap_or_else(|| Value::String("WORKTREE".to_string()))
+    });
+    obj.entry("exclude_regex".to_string()).or_insert_with(|| json!([]));
+    obj.entry("include_files".to_string()).or_insert_with(|| json!([]));
+    obj.entry("include_staged_diff".to_string()).or_insert_with(|| Value::Bool(false));
+    obj.entry("include_unstaged_diff".to_string()).or_insert_with(|| Value::Bool(false));
+    obj.entry("skip_binary".to_string()).or_insert_with(|| Value::Bool(true));
+    obj.entry("skip_gitignore".to_string()).or_insert_with(|| Value::Bool(true));
+    obj.entry("save_path".to_string()).or_insert_with(|| Value::String("/tmp/repo_context.txt".to_string()));
+    Value::Object(obj.clone())
 }
 
 pub fn parse_context_export_payload(payload: Value) -> Result<ContextExportPayload> {

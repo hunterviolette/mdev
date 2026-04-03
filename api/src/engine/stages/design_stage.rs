@@ -1,44 +1,62 @@
 use anyhow::Result;
-use serde_json::Value;
-use uuid::Uuid;
+use serde_json::{json, Value};
 
 use crate::{
-    app_state::AppState,
-    models::{StageExecutionNode, WorkflowStepDefinition},
+    engine::{
+        capabilities::inference::stage_support::{prepare_inference_stage_state, InferenceStageSettings},
+        stages::pause_on_enter,
+    },
+    models::WorkflowStepDefinition,
 };
 
-use super::{run_capability_plan, pause_on_enter, StageDisposition, StageOutcome};
-
-pub async fn execute(
-    state: &AppState,
-    run_id: Uuid,
+pub fn prepare_stage_state(
     repo_ref: &str,
+    global_state: &Value,
     step: &WorkflowStepDefinition,
     local_state: Value,
-    plan: &[StageExecutionNode],
-) -> Result<StageOutcome> {
-    let capability_results = run_capability_plan(state, run_id, repo_ref, step, &local_state, plan).await?;
-    let capability_failed = capability_results
-        .iter()
-        .any(|item| item.get("ok").and_then(Value::as_bool) == Some(false));
-
-    let disposition = if capability_failed {
-        StageDisposition::Error
-    } else if pause_on_enter(step) {
-        StageDisposition::Paused
-    } else {
-        StageDisposition::Success
-    };
-
-    Ok(StageOutcome {
-        ok: !capability_failed,
-        disposition,
-        capability_results,
+) -> Result<Value> {
+    let mut state = prepare_inference_stage_state(
+        repo_ref,
+        global_state,
+        step,
         local_state,
-        message: if capability_failed {
-            "Design stage failed during backend workflow execution.".to_string()
-        } else {
-            "Design stage executed by backend workflow engine.".to_string()
+        InferenceStageSettings {
+            include_changeset_schema: false,
         },
-    })
+    )?;
+
+    let obj = state.as_object_mut().expect("stage state must be object");
+    let execution_logic = obj
+        .entry("execution_logic".to_string())
+        .or_insert_with(|| step.execution_logic.clone());
+    if !execution_logic.is_object() {
+        *execution_logic = json!({});
+    }
+    let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
+
+    if !exec_obj.contains_key("on_success") {
+        exec_obj.insert(
+            "on_success".to_string(),
+            json!({
+                "disposition": if pause_on_enter(step) { "paused" } else { "success" },
+                "message": if pause_on_enter(step) {
+                    "Design stage completed and is paused."
+                } else {
+                    "Design stage completed successfully through backend workflow engine."
+                }
+            }),
+        );
+    }
+
+    if !exec_obj.contains_key("on_error") {
+        exec_obj.insert(
+            "on_error".to_string(),
+            json!({
+                "disposition": "error",
+                "message": "Design stage failed during backend workflow execution."
+            }),
+        );
+    }
+
+    Ok(state)
 }

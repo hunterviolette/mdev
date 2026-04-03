@@ -16,7 +16,8 @@ pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
 
     let mut inference_cfg: InferenceConfig = ctx
         .local_state
-        .get("inference")
+        .get("capabilities")
+        .and_then(|v| v.get("inference"))
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();

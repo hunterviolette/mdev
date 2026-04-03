@@ -1,5 +1,6 @@
 pub mod api;
 pub mod browser;
+pub mod stage_support;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,17 @@ use super::registry::{
     CapabilityInvocationRequest,
     CapabilityResult,
 };
+
+fn ensure_object_slot<'a>(parent: &'a mut serde_json::Map<String, Value>, key: &str) -> &'a mut serde_json::Map<String, Value> {
+    let slot = parent
+        .entry(key.to_string())
+        .or_insert_with(|| json!({}));
+    if !slot.is_object() {
+        *slot = json!({});
+    }
+    slot.as_object_mut().expect("object slot must be object")
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -115,11 +127,9 @@ pub struct BrowserProbeResult {
 pub async fn persist_inference_config(ctx: &CapabilityContext<'_>, cfg: &InferenceConfig) -> Result<()> {
     let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
     let root = crate::engine::ensure_engine_root(&mut run.context);
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = stage_state.as_object_mut().expect("stage_state must be object");
-    let existing = stage_state_obj.entry(ctx.step.id.clone()).or_insert_with(|| json!({}));
-    let existing_obj = existing.as_object_mut().expect("stage state entry must be object");
-    existing_obj.insert("inference".to_string(), serde_json::to_value(cfg)?);
+    let global_state = ensure_object_slot(root, "global_state");
+    let capabilities = ensure_object_slot(global_state, "capabilities");
+    capabilities.insert("inference".to_string(), serde_json::to_value(cfg)?);
     crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
 }
 
@@ -144,7 +154,7 @@ pub async fn execute(
         });
     }
 
-    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| *item == "apply_changeset") {
+    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| item == "gateway_model/changeset") {
         follow_ups.push(CapabilityInvocation {
             capability: "gateway_model/changeset".to_string(),
             config: json!({}),
@@ -153,8 +163,10 @@ pub async fn execute(
 
     let runtime_transport = ctx
         .local_state
-        .get("inference")
+        .get("capabilities")
+        .and_then(|v| v.get("inference"))
         .cloned()
+        .or_else(|| ctx.local_state.get("inference").cloned())
         .and_then(|v| serde_json::from_value::<InferenceConfig>(v).ok())
         .map(|cfg| cfg.transport);
 

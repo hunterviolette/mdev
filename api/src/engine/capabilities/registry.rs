@@ -4,14 +4,14 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{app_state::AppState, engine::{append_engine_event, event_meta}, models::WorkflowStepDefinition};
+use crate::{app_state::AppState, engine::{append_engine_event, event_meta}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
 use super::{changeset_schema, compile_commands, context_export, gateway_model, inference};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
-    pub entrypoint: &'static str,
-    pub allowed_invocations: &'static [&'static str],
+    pub entrypoint: String,
+    pub allowed_invocations: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -44,38 +44,57 @@ pub struct CapabilityResult {
     pub follow_ups: CapabilityInvocationRequest,
 }
 
+fn stage_capability_policy_from_queue(queue: &[CapabilityInvocation]) -> Result<StageCapabilityPolicy> {
+    let capabilities = queue
+        .iter()
+        .map(|invocation| invocation.capability.clone())
+        .collect::<Vec<_>>();
+
+    let entrypoint = capabilities
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("stage capability queue does not define any invocations"))?;
+
+    Ok(StageCapabilityPolicy {
+        entrypoint,
+        allowed_invocations: capabilities,
+    })
+}
+
 pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCapabilityPolicy> {
-    match step.step_type.as_str() {
-        "design" => Ok(StageCapabilityPolicy {
-            entrypoint: "inference",
-            allowed_invocations: &["context_export"],
-        }),
-        "code" => Ok(StageCapabilityPolicy {
-            entrypoint: "inference",
-            allowed_invocations: &[
-                "context_export",
-                "changeset_schema",
-                "gateway_model/changeset",
-            ],
-        }),
-        "compile" => Ok(StageCapabilityPolicy {
-            entrypoint: "compile_commands",
-            allowed_invocations: &[],
-        }),
-        "review" => Ok(StageCapabilityPolicy {
-            entrypoint: "inference",
-            allowed_invocations: &[],
-        }),
-        other => Err(anyhow!("unsupported step_type for capability policy: {}", other)),
+    let mut capabilities: Vec<String> = step
+        .execution_plan
+        .iter()
+        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
+        .map(|node| node.key.clone())
+        .collect();
+
+    if capabilities.is_empty() {
+        capabilities = step
+            .capabilities
+            .iter()
+            .filter(|binding| binding.enabled)
+            .map(|binding| binding.capability.clone())
+            .collect();
     }
+
+    let entrypoint = capabilities
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("stage '{}' does not define any enabled capabilities", step.id))?;
+
+    Ok(StageCapabilityPolicy {
+        entrypoint,
+        allowed_invocations: capabilities,
+    })
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
-    if capability == policy.entrypoint || policy.allowed_invocations.iter().any(|item| *item == capability) {
+    if capability == policy.entrypoint || policy.allowed_invocations.iter().any(|item| item == capability) {
         return Ok(());
     }
     Err(anyhow!(
-        "capability '{}' is not allowed for stage entrypoint '{}'",
+        "capability '{}' is not present in the stage capability plan rooted at '{}'",
         capability,
         policy.entrypoint
     ))
@@ -84,7 +103,7 @@ fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()
 pub async fn execute_root_capability(ctx: CapabilityContext<'_>) -> Result<Vec<CapabilityResult>> {
     let policy = stage_capability_policy(ctx.step)?;
     let root = CapabilityInvocation {
-        capability: policy.entrypoint.to_string(),
+        capability: policy.entrypoint.clone(),
         config: json!({}),
     };
     execute_capability_chain(ctx, &policy, vec![root]).await
@@ -94,11 +113,11 @@ pub async fn execute_capability_invocations(
     ctx: CapabilityContext<'_>,
     queue: Vec<CapabilityInvocation>,
 ) -> Result<Vec<CapabilityResult>> {
-    let policy = stage_capability_policy(ctx.step)?;
+    let policy = stage_capability_policy_from_queue(&queue)?;
     execute_capability_chain(ctx, &policy, queue).await
 }
 
-async fn execute_capability_chain(
+pub(crate) async fn execute_capability_chain(
     ctx: CapabilityContext<'_>,
     policy: &StageCapabilityPolicy,
     mut queue: Vec<CapabilityInvocation>,

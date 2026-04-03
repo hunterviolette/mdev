@@ -1,5 +1,6 @@
 use axum::{extract::State, routing::get, Json, Router};
 use chrono::Utc;
+use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -8,6 +9,7 @@ use crate::{app_state::AppState, models::{CreateTemplateRequest, WorkflowTemplat
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-templates", get(list_templates).post(create_template))
+        .route("/api/workflow-builder-contract", get(get_workflow_builder_contract))
 }
 
 async fn list_templates(State(state): State<AppState>) -> Result<Json<Vec<WorkflowTemplate>>, (axum::http::StatusCode, String)> {
@@ -63,6 +65,130 @@ async fn create_template(
         created_at: now,
         updated_at: now,
     }))
+}
+
+async fn get_workflow_builder_contract(
+    State(_state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    Ok(Json(json!({
+        "version": 1,
+        "stages": [
+            {
+                "step_type": "design",
+                "label": "Design",
+                "automation_mode_default": "manual",
+                "fields": [
+                    {
+                        "key": "automation.inject_context",
+                        "label": "Inject context",
+                        "type": "boolean",
+                        "default": true
+                    },
+                    {
+                        "key": "config.pause_policy.pause_on_enter",
+                        "label": "Pause on enter",
+                        "type": "boolean",
+                        "default": false
+                    }
+                ],
+                "transition_defaults": {
+                    "on_success": "code",
+                    "on_error": "design",
+                    "on_paused": "design"
+                }
+            },
+            {
+                "step_type": "code",
+                "label": "Code",
+                "automation_mode_default": "automatic",
+                "fields": [
+                    {
+                        "key": "automation.inject_context",
+                        "label": "Inject context",
+                        "type": "boolean",
+                        "default": true
+                    },
+                    {
+                        "key": "automation.inject_changeset_schema",
+                        "label": "Inject ChangeSet schema",
+                        "type": "boolean",
+                        "default": true
+                    },
+                    {
+                        "key": "automation.auto_apply_changeset",
+                        "label": "Auto apply ChangeSet",
+                        "type": "boolean",
+                        "default": true
+                    },
+                    {
+                        "key": "automation.max_consecutive_apply_failures",
+                        "label": "Max apply failures",
+                        "type": "integer",
+                        "default": 1
+                    },
+                    {
+                        "key": "config.pause_policy.pause_on_enter",
+                        "label": "Pause on enter",
+                        "type": "boolean",
+                        "default": false
+                    }
+                ],
+                "transition_defaults": {
+                    "on_success": "compile",
+                    "on_error": "code",
+                    "on_paused": "code"
+                }
+            },
+            {
+                "step_type": "compile",
+                "label": "Compile",
+                "automation_mode_default": "automatic",
+                "fields": [
+                    {
+                        "key": "execution.compile_checks.commands_text",
+                        "label": "Compile commands",
+                        "type": "multiline_text",
+                        "default": "cargo check"
+                    },
+                    {
+                        "key": "config.pause_policy.pause_on_enter",
+                        "label": "Pause on enter",
+                        "type": "boolean",
+                        "default": false
+                    }
+                ],
+                "transition_defaults": {
+                    "on_success": "review",
+                    "on_error": "code",
+                    "on_paused": "compile"
+                }
+            },
+            {
+                "step_type": "review",
+                "label": "Review",
+                "automation_mode_default": "manual",
+                "fields": [
+                    {
+                        "key": "execution_logic.require_manual_approval",
+                        "label": "Require manual approval",
+                        "type": "boolean",
+                        "default": true
+                    },
+                    {
+                        "key": "config.pause_policy.pause_on_enter",
+                        "label": "Pause on enter",
+                        "type": "boolean",
+                        "default": false
+                    }
+                ],
+                "transition_defaults": {
+                    "on_success": "",
+                    "on_error": "design",
+                    "on_paused": "review"
+                }
+            }
+        ]
+    })))
 }
 
 fn parse_uuid(value: String) -> Result<Uuid, (axum::http::StatusCode, String)> {
