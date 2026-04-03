@@ -15,41 +15,8 @@ pub fn context_exporter(
         return actions;
     };
 
-    if ex.export_pending {
-        let mut finished: Option<Result<u128, String>> = None;
-        if let Some(rx) = ex.export_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(r) => finished = Some(r),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    finished = Some(Err("Export channel disconnected.".to_string()));
-                }
-            }
-        }
-
-        if let Some(done) = finished {
-            ex.export_pending = false;
-            ex.export_rx = None;
-            ex.status = match done {
-                Ok(now_ms) => {
-                    use time::format_description::well_known::Rfc3339;
-                    use time::OffsetDateTime;
-
-                    let nanos = (now_ms as i128) * 1_000_000;
-                    let ts = OffsetDateTime::from_unix_timestamp_nanos(nanos)
-                        .ok()
-                        .and_then(|dt| dt.format(&Rfc3339).ok())
-                        .unwrap_or_else(|| now_ms.to_string());
-
-                    Some(format!("generated at {}", ts))
-                }
-
-                Err(e) => Some(e),
-            };
-        } else {
-            ui.ctx().request_repaint();
-        }
-    }
+    ex.export_pending = false;
+    ex.export_rx = None;
 
     ui.add_space(6.0);
 

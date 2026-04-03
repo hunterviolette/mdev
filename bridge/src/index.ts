@@ -10,6 +10,22 @@ const rl = readline.createInterface({
 
 const manager = new SessionManager();
 
+let shuttingDown = false;
+
+async function shutdown(code = 0) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+
+  try {
+    await manager.closeAllSessions();
+  } finally {
+    process.exit(code);
+  }
+}
+
 function writeResponse(resp: BridgeResponse) {
   process.stdout.write(JSON.stringify(resp) + '\n');
 }
@@ -96,5 +112,13 @@ rl.on('line', async (line) => {
 });
 
 rl.on('close', async () => {
-  process.exit(0);
+  await shutdown(0);
+});
+
+process.on('SIGINT', async () => {
+  await shutdown(0);
+});
+
+process.on('SIGTERM', async () => {
+  await shutdown(0);
 });

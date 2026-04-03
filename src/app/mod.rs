@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod controllers;
 pub mod controller;
+pub mod workflow_api;
 pub mod state;
 pub mod theme;
 pub mod ui;
