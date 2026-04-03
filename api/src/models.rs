@@ -189,6 +189,23 @@ pub struct WorkflowEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowEventStreamItem {
+    pub id: String,
+    pub run_id: String,
+    pub step_id: Option<String>,
+    pub stage_execution_id: Option<String>,
+    pub capability_invocation_id: Option<String>,
+    pub parent_invocation_id: Option<String>,
+    pub sequence_no: i64,
+    pub level: String,
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTemplateRequest {
     pub name: String,
     #[serde(default)]

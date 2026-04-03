@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    models::{RunStatus, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
+    models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
 pub use runtime::{pause_run, resume_run, run_step, start_run};
@@ -127,7 +127,7 @@ pub(crate) async fn append_event(
     kind: &str,
     message: &str,
     payload: Value,
-) -> Result<()> {
+) -> Result<WorkflowEventStreamItem> {
     let stage_execution_id = payload.get("event_meta")
         .and_then(|v| v.get("stage_execution_id"))
         .and_then(Value::as_str)
@@ -149,6 +149,9 @@ pub(crate) async fn append_event(
         .fetch_one(db)
         .await?;
     let now = Utc::now().to_rfc3339();
+    let id = Uuid::new_v4().to_string();
+    let run_id_str = run_id.to_string();
+    let payload_json = payload.to_string();
 
     sqlx::query(
         r#"
@@ -170,29 +173,42 @@ pub(crate) async fn append_event(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
-    .bind(Uuid::new_v4().to_string())
-    .bind(run_id.to_string())
+    .bind(&id)
+    .bind(&run_id_str)
     .bind(step_id)
-    .bind(stage_execution_id)
-    .bind(capability_invocation_id)
-    .bind(parent_invocation_id)
+    .bind(&stage_execution_id)
+    .bind(&capability_invocation_id)
+    .bind(&parent_invocation_id)
     .bind(sequence_no)
     .bind(if is_header_event { 1 } else { 0 })
     .bind(level)
     .bind(kind)
     .bind(message)
-    .bind(payload.to_string())
+    .bind(&payload_json)
     .bind(&now)
     .execute(db)
     .await?;
 
     sqlx::query("UPDATE workflow_runs SET updated_at = ? WHERE id = ?")
         .bind(&now)
-        .bind(run_id.to_string())
+        .bind(&run_id_str)
         .execute(db)
         .await?;
 
-    Ok(())
+    Ok(WorkflowEventStreamItem {
+        id,
+        run_id: run_id_str,
+        step_id: step_id.map(ToString::to_string),
+        stage_execution_id,
+        capability_invocation_id,
+        parent_invocation_id,
+        sequence_no,
+        level: level.to_string(),
+        kind: kind.to_string(),
+        message: message.to_string(),
+        payload,
+        created_at: now,
+    })
 }
 
 pub(crate) async fn update_run_status(
@@ -265,7 +281,8 @@ pub(crate) async fn append_engine_event(
     message: &str,
     payload: Value,
 ) -> Result<()> {
-    append_event(&state.db, run_id, step_id, level, kind, message, payload).await?;
+    let event = append_event(&state.db, run_id, step_id, level, kind, message, payload).await?;
+    state.publish_workflow_event(event);
     Ok(())
 }
 

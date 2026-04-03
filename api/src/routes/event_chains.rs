@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use axum::{
     extract::{Path, Query, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -7,28 +9,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
-use tokio::time::{self, Duration};
-use futures_util::StreamExt;
-use tokio_stream::wrappers::IntervalStream;
+use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
-use crate::{app_state::AppState, engine::{load_run, load_template_definition}};
+use crate::{
+    app_state::AppState,
+    engine::{load_run, load_template_definition},
+    models::WorkflowEventStreamItem,
+};
 
-#[derive(Debug, Serialize)]
-struct StageChainEvent {
-    id: String,
-    run_id: String,
-    step_id: Option<String>,
-    stage_execution_id: Option<String>,
-    capability_invocation_id: Option<String>,
-    parent_invocation_id: Option<String>,
-    sequence_no: i64,
-    level: String,
-    kind: String,
-    message: String,
-    payload: Value,
-    created_at: String,
-}
+type StageChainEvent = WorkflowEventStreamItem;
 
 #[derive(Debug, Serialize)]
 struct StageExecutionChain {
@@ -285,51 +276,117 @@ async fn stream_events(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
     Query(query): Query<StreamQuery>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let state_for_task = state.clone();
+    let run_id_str = run_id.to_string();
+    let mut live_rx = state.subscribe_workflow_events();
     let mut last_sequence = query.after_sequence.unwrap_or(0);
-    let mut sent_initial_snapshot = false;
-    let stream = futures_util::StreamExt::then(IntervalStream::new(time::interval(Duration::from_millis(1000))), move |_| {
-        let state = state.clone();
-        let run_id = run_id;
-        async move {
-            let rows = sqlx::query(
-                "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
-            )
-            .bind(run_id.to_string())
-            .bind(last_sequence)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
 
-            let mut events = Vec::new();
-            let mut saw_new_rows = false;
-            for row in rows {
-                let sequence_no: i64 = row.get("sequence_no");
-                if sequence_no > last_sequence {
-                    last_sequence = sequence_no;
-                }
-                if let Ok(item) = row_to_stage_chain_event(row) {
-                    saw_new_rows = true;
-                    if let Ok(text) = serde_json::to_string(&item) {
-                        events.push(Ok(Event::default().event("workflow_event").data(text)));
+    tokio::spawn(async move {
+        let rows = sqlx::query(
+            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
+        )
+        .bind(&run_id_str)
+        .bind(last_sequence)
+        .fetch_all(&state_for_task.db)
+        .await
+        .unwrap_or_default();
+
+        let mut sent_snapshot = false;
+        for row in rows {
+            if let Ok(item) = row_to_stage_chain_event(row) {
+                last_sequence = last_sequence.max(item.sequence_no);
+                if let Some(event) = workflow_event_sse(&item) {
+                    if tx.send(Ok(event)).is_err() {
+                        return;
                     }
                 }
             }
-
-            if !sent_initial_snapshot || saw_new_rows {
-                if let Ok(summary) = build_event_chain_summary(&state, run_id).await {
-                    if let Ok(text) = serde_json::to_string(&summary) {
-                        events.push(Ok(Event::default().event("monitor_snapshot").data(text)));
-                    }
-                }
-                sent_initial_snapshot = true;
-            }
-
-            events
         }
-    }).flat_map(tokio_stream::iter);
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+        if let Ok(summary) = build_event_chain_summary(&state_for_task, run_id).await {
+            if let Some(event) = monitor_snapshot_sse(&summary) {
+                if tx.send(Ok(event)).is_err() {
+                    return;
+                }
+                sent_snapshot = true;
+            }
+        }
+
+        loop {
+            match live_rx.recv().await {
+                Ok(item) => {
+                    if item.run_id != run_id_str || item.sequence_no <= last_sequence {
+                        continue;
+                    }
+                    last_sequence = item.sequence_no;
+                    if let Some(event) = workflow_event_sse(&item) {
+                        if tx.send(Ok(event)).is_err() {
+                            return;
+                        }
+                    }
+                    if let Ok(summary) = build_event_chain_summary(&state_for_task, run_id).await {
+                        if let Some(event) = monitor_snapshot_sse(&summary) {
+                            if tx.send(Ok(event)).is_err() {
+                                return;
+                            }
+                            sent_snapshot = true;
+                        }
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let rows = sqlx::query(
+                        "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
+                    )
+                    .bind(&run_id_str)
+                    .bind(last_sequence)
+                    .fetch_all(&state_for_task.db)
+                    .await
+                    .unwrap_or_default();
+
+                    let mut saw_rows = false;
+                    for row in rows {
+                        if let Ok(item) = row_to_stage_chain_event(row) {
+                            saw_rows = true;
+                            last_sequence = last_sequence.max(item.sequence_no);
+                            if let Some(event) = workflow_event_sse(&item) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    if saw_rows || !sent_snapshot {
+                        if let Ok(summary) = build_event_chain_summary(&state_for_task, run_id).await {
+                            if let Some(event) = monitor_snapshot_sse(&summary) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                                sent_snapshot = true;
+                            }
+                        }
+                    }
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+}
+
+fn workflow_event_sse(item: &StageChainEvent) -> Option<Event> {
+    serde_json::to_string(item)
+        .ok()
+        .map(|text| Event::default().event("workflow_event").data(text))
+}
+
+fn monitor_snapshot_sse(summary: &EventChainSummaryResponse) -> Option<Event> {
+    serde_json::to_string(summary)
+        .ok()
+        .map(|text| Event::default().event("monitor_snapshot").data(text))
 }
 
 fn row_to_stage_chain_event(row: sqlx::sqlite::SqliteRow) -> Result<StageChainEvent, (axum::http::StatusCode, String)> {
