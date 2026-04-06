@@ -470,4 +470,76 @@ export function getChangesetSchema() {
   }>(`/api/capabilities/changeset-schema`);
 }
 
+export type SapConnectionInput = {
+  base_url: string;
+  auth_type?: string;
+  transport?: string;
+  username?: string;
+  password?: string;
+  authorization?: string;
+  cookie_header?: string;
+  client?: string;
+  bridge_dir?: string;
+};
+
+export type SapDiscoverResponse = {
+  ok: boolean;
+  message: string;
+};
+
+export type SapSearchObject = {
+  uri: string;
+  source_uri?: string | null;
+  name: string;
+  object_type: string;
+  package_name?: string | null;
+};
+
+export type SapSearchResponse = {
+  ok: boolean;
+  package_name: string;
+  objects: SapSearchObject[];
+  count: number;
+};
+
+export type SapExportScanItem = {
+  manifest_path: string;
+  object_name: string;
+  object_type: string;
+  package_name?: string | null;
+  candidate_count: number;
+  resource_paths: string[];
+};
+
+export type SapExportScanResponse = {
+  ok: boolean;
+  manifests: SapExportScanItem[];
+  count: number;
+};
+
+export function sapDiscover(connection: SapConnectionInput) {
+  return fetchJson<SapDiscoverResponse>('/api/sap/discover', {
+    method: 'POST',
+    body: JSON.stringify({ connection })
+  });
+}
+
+export function sapSearchObjects(connection: SapConnectionInput, packageName: string, includeSubpackages: boolean) {
+  return fetchJson<SapSearchResponse>('/api/sap/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      connection,
+      package_name: packageName,
+      include_subpackages: includeSubpackages
+    })
+  });
+}
+
+export function sapScanExportCandidates(repoRef: string) {
+  return fetchJson<SapExportScanResponse>('/api/sap/export-scan', {
+    method: 'POST',
+    body: JSON.stringify({ repo_ref: repoRef })
+  });
+}
+
 

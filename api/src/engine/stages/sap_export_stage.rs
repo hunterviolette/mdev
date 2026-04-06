@@ -22,8 +22,12 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "success",
-                "message": "SAP export stage completed successfully through backend workflow engine."
+                "disposition": "move_next",
+                "message": "SAP export stage completed successfully.",
+                "patch_from_capability": {
+                    "capability": "sap/export",
+                    "mode": "result_to_stage_review"
+                }
             }),
         );
     }

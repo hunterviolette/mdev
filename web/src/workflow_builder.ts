@@ -5,6 +5,7 @@ import type {
   WorkflowGlobalConfig,
   WorkflowStageDescriptor,
   WorkflowStageField,
+  WorkflowTemplateDefinition,
 } from './api';
 
 export type BuilderStep = {
@@ -68,4 +69,54 @@ export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlo
 
 export function descriptorMap(catalog: WorkflowBuilderCatalog): Record<string, WorkflowStageDescriptor> {
   return Object.fromEntries(catalog.stage_descriptors.map((descriptor) => [descriptor.step_type, descriptor]));
+}
+
+export function builderStepsFromDefinition(
+  definition: WorkflowTemplateDefinition | null | undefined,
+  catalog: WorkflowBuilderCatalog
+): BuilderStep[] {
+  if (!definition) {
+    return [];
+  }
+
+  const descriptors = descriptorMap(catalog);
+
+  return definition.steps.flatMap((step) => {
+    const descriptor = descriptors[step.step_type];
+    if (!descriptor) {
+      return [];
+    }
+
+    const defaults = Object.fromEntries(
+      flattenStageFields(descriptor).map((field) => [field.key, field.default])
+    );
+
+    const fieldValues = Object.fromEntries(
+      flattenStageFields(descriptor).map((field) => [field.key, readPath(step as Record<string, unknown>, field.bind_to, field.default)])
+    );
+
+    return [{
+      id: step.id,
+      name: step.name,
+      stepType: step.step_type,
+      fields: {
+        ...defaults,
+        ...fieldValues,
+      },
+    }];
+  });
+}
+
+function readPath(root: Record<string, unknown>, path: string, fallback: unknown): unknown {
+  const parts = path.split('.').filter(Boolean);
+  let current: unknown = root;
+
+  for (const part of parts) {
+    if (!current || typeof current !== 'object' || !(part in (current as Record<string, unknown>))) {
+      return fallback;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+
+  return current ?? fallback;
 }

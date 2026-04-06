@@ -3,6 +3,7 @@ mod event_chains;
 mod health;
 mod repo_tree;
 mod runs;
+mod sap;
 mod templates;
 mod workflow_builder;
 
@@ -15,6 +16,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(templates::router())
         .merge(workflow_builder::router())
         .merge(runs::router())
+        .merge(sap::router())
         .merge(event_chains::router())
         .merge(capabilities::router())
 }

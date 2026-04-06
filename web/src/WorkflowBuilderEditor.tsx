@@ -26,7 +26,7 @@ import {
   type WorkflowStageField,
   type WorkflowTemplateDefinition,
 } from './api';
-import { buildBuilderDocument, builderStepFromDescriptor, descriptorMap, type BuilderStep } from './workflow_builder';
+import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, descriptorMap, type BuilderStep } from './workflow_builder';
 
 type WorkflowBuilderEditorProps = {
   initialDefinition?: WorkflowTemplateDefinition | null;
@@ -114,7 +114,17 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
         const byType = descriptorMap(loadedCatalog);
         setCatalog(byType);
         setStageDescriptors(descriptors);
-        if (descriptors.length > 0) {
+
+        const hydratedSteps = builderStepsFromDefinition(initialDefinition, loadedCatalog);
+        if (hydratedSteps.length > 0) {
+          setSteps(hydratedSteps);
+          setSelectedStepId((prev) => {
+            if (prev && hydratedSteps.some((step) => step.id === prev)) {
+              return prev;
+            }
+            return hydratedSteps[0]?.id ?? null;
+          });
+        } else if (descriptors.length > 0) {
           const first = builderStepFromDescriptor(descriptors[0]);
           setSteps([first]);
           setSelectedStepId(first.id);
@@ -279,6 +289,13 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
       const result = await compileWorkflowBuilderDocument(
         buildBuilderDocument(steps)
       );
+      if (!result.ok) {
+        const message = result.errors.length > 0 ? result.errors.join('\n') : 'Workflow compilation failed.';
+        setCompileState('error');
+        setCompileMessage(message);
+        onError?.(message);
+        return;
+      }
       onCompiledDefinitionChange(result.definition);
       setCompileState('compiled');
       setCompileMessage(result.warnings.length > 0 ? result.warnings.join('\n') : 'Compiled successfully');

@@ -7,6 +7,7 @@ import {
   Box,
   Button,
   Card,
+  Checkbox,
   Code,
   Divider,
   Grid,
@@ -46,6 +47,9 @@ import {
   patchWorkflowStageState,
   pauseWorkflowRun,
   resumeWorkflowRun,
+  sapDiscover,
+  sapScanExportCandidates,
+  sapSearchObjects,
   runCurrentWorkflowStep,
   selectWorkflowStep,
   startWorkflowRun,
@@ -55,6 +59,9 @@ import {
   type EventChainSummaryResponse,
   type InferenceTransport,
   type RepoTreeResponse,
+  type SapConnectionInput,
+  type SapExportScanItem,
+  type SapSearchObject,
   type StageExecutionChain,
   type StageExecutionEvent,
   type WorkflowBuilderCatalog,
@@ -425,6 +432,41 @@ function stepUsesCapability(step: WorkflowStepDefinition | null | undefined, cap
   return (step.execution_plan ?? []).some((node) => node.kind === 'capability' && node.enabled !== false && node.key === capabilityKey);
 }
 
+function readNestedValue(root: unknown, path: string, fallback: unknown = ''): unknown {
+  const parts = path.split('.').filter(Boolean);
+  let current: unknown = root;
+  for (const part of parts) {
+    if (!current || typeof current !== 'object' || !(part in (current as Record<string, unknown>))) {
+      return fallback;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current ?? fallback;
+}
+
+function readStringValue(root: unknown, path: string, fallback = ''): string {
+  const value = readNestedValue(root, path, fallback);
+  return typeof value === 'string' ? value : String(value ?? fallback);
+}
+
+function readBooleanValue(root: unknown, path: string, fallback = false): boolean {
+  return Boolean(readNestedValue(root, path, fallback));
+}
+
+function readSapConnection(step: WorkflowStepDefinition | null, keyPrefix: 'sap_import' | 'sap_export'): SapConnectionInput {
+  const envBaseUrl = String((globalThis as { __MDEV_SAP_ADT_BASE_URL__?: string }).__MDEV_SAP_ADT_BASE_URL__ ?? '').trim();
+  return {
+    base_url: envBaseUrl,
+    client: readStringValue(step, `config.${keyPrefix}.connection.client`, ''),
+    auth_type: readStringValue(step, `config.${keyPrefix}.connection.auth_type`, 'basic'),
+    username: readStringValue(step, `config.${keyPrefix}.connection.username`, ''),
+    password: readStringValue(step, `config.${keyPrefix}.connection.password`, ''),
+    authorization: readStringValue(step, `config.${keyPrefix}.connection.authorization`, ''),
+    cookie_header: readStringValue(step, `config.${keyPrefix}.connection.cookie_header`, ''),
+    bridge_dir: readStringValue(step, `config.${keyPrefix}.connection.bridge_dir`, 'adt-bridge')
+  };
+}
+
 const StageModifierActions = memo(function StageModifierActions(props: {
   actions: StageModifierAction[];
 }) {
@@ -654,6 +696,378 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   );
 });
 
+const SapImportStageInputsPanel = memo(function SapImportStageInputsPanel(props: {
+  selectedWorkflowStep: WorkflowStepDefinition | null;
+  onPatchSelectedStepConfig: (key: string, value: unknown) => void;
+}) {
+  const { selectedWorkflowStep, onPatchSelectedStepConfig } = props;
+  const [packageName, setPackageName] = useState('');
+  const [includeSubpackages, setIncludeSubpackages] = useState(true);
+  const [includeXmlArtifacts, setIncludeXmlArtifacts] = useState(false);
+  const [selectedObjectUrisText, setSelectedObjectUrisText] = useState('');
+  const [connectionClient, setConnectionClient] = useState('');
+  const [connectionAuthType, setConnectionAuthType] = useState('basic');
+  const [connectionUsername, setConnectionUsername] = useState('');
+  const [connectionPassword, setConnectionPassword] = useState('');
+  const [connectionAuthorization, setConnectionAuthorization] = useState('');
+  const [connectionCookieHeader, setConnectionCookieHeader] = useState('');
+  const [connectionBridgeDir, setConnectionBridgeDir] = useState('adt-bridge');
+
+  const connection = useMemo(() => ({
+    ...readSapConnection(selectedWorkflowStep, 'sap_import'),
+    client: connectionClient,
+    auth_type: connectionAuthType,
+    username: connectionUsername,
+    password: connectionPassword,
+    authorization: connectionAuthorization,
+    cookie_header: connectionCookieHeader,
+    bridge_dir: connectionBridgeDir
+  }), [selectedWorkflowStep, connectionClient, connectionAuthType, connectionUsername, connectionPassword, connectionAuthorization, connectionCookieHeader, connectionBridgeDir]);
+
+  const selectedObjectUris = useMemo(() => new Set(selectedObjectUrisText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)), [selectedObjectUrisText]);
+
+  const [discoverBusy, setDiscoverBusy] = useState(false);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [objects, setObjects] = useState<SapSearchObject[]>([]);
+  const [checkedUris, setCheckedUris] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setPackageName(readStringValue(selectedWorkflowStep, 'config.sap_import.package_name', ''));
+    setIncludeSubpackages(readBooleanValue(selectedWorkflowStep, 'config.sap_import.include_subpackages', true));
+    setIncludeXmlArtifacts(readBooleanValue(selectedWorkflowStep, 'config.sap_import.include_xml_artifacts', false));
+    const nextUrisText = readStringValue(selectedWorkflowStep, 'config.sap_import.object_uris_text', '');
+    setSelectedObjectUrisText(nextUrisText);
+    setConnectionClient(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.client', ''));
+    setConnectionAuthType(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.auth_type', 'basic'));
+    setConnectionUsername(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.username', ''));
+    setConnectionPassword(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.password', ''));
+    setConnectionAuthorization(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.authorization', ''));
+    setConnectionCookieHeader(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.cookie_header', ''));
+    setConnectionBridgeDir(readStringValue(selectedWorkflowStep, 'config.sap_import.connection.bridge_dir', 'adt-bridge'));
+    setCheckedUris(new Set(nextUrisText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)));
+  }, [selectedWorkflowStep?.id]);
+
+  async function handleConnect() {
+    try {
+      setDiscoverBusy(true);
+      setStatus(null);
+      const result = await sapDiscover(connection);
+      setStatus(result.message);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDiscoverBusy(false);
+    }
+  }
+
+  async function handleSearch() {
+    try {
+      setSearchBusy(true);
+      setStatus(null);
+      const result = await sapSearchObjects(connection, packageName, includeSubpackages);
+      setObjects(result.objects);
+      const nextChecked = new Set<string>(selectedObjectUris);
+      for (const item of result.objects) {
+        if (selectedObjectUris.has(item.source_uri || item.uri)) {
+          nextChecked.add(item.source_uri || item.uri);
+        }
+      }
+      setCheckedUris(nextChecked);
+      setStatus(`Loaded ${result.count} SAP object(s).`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSearchBusy(false);
+    }
+  }
+
+  function toggleUri(uri: string, checked: boolean) {
+    setCheckedUris((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(uri); else next.delete(uri);
+      return next;
+    });
+  }
+
+  function applySelection() {
+    const next = Array.from(checkedUris).join('\n');
+    setSelectedObjectUrisText(next);
+    onPatchSelectedStepConfig('config.sap_import.object_uris_text', next);
+    setStatus(`Selected ${checkedUris.size} SAP object(s) for import.`);
+  }
+
+  return (
+    <Stack>
+      <Title order={6}>SAP Import inputs</Title>
+      <Group align="end" wrap="wrap">
+        <Button
+          size="xs"
+          variant="default"
+          onClick={() => void handleConnect()}
+          loading={discoverBusy}
+          disabled={!connection.base_url?.trim()}
+        >
+          Connect
+        </Button>
+      </Group>
+      {status ? <Alert color="blue">{status}</Alert> : null}
+      <Group align="end" wrap="wrap">
+        <TextInput
+          label="Package"
+          value={packageName}
+          onChange={(event) => {
+            const next = event.currentTarget.value;
+            setPackageName(next);
+            onPatchSelectedStepConfig('config.sap_import.package_name', next);
+          }}
+          style={{ flex: 1, minWidth: 260 }}
+        />
+        <Button
+          size="xs"
+          variant="default"
+          onClick={() => void handleSearch()}
+          loading={searchBusy}
+          disabled={!connection.base_url?.trim() || !packageName.trim()}
+        >
+          Load
+        </Button>
+        <Button size="xs" variant="light" onClick={applySelection} disabled={checkedUris.size === 0}>
+          Import selected
+        </Button>
+      </Group>
+      <Group>
+        <Switch
+          label="Include subpackages"
+          checked={includeSubpackages}
+          onChange={(event) => {
+            const next = event.currentTarget.checked;
+            setIncludeSubpackages(next);
+            onPatchSelectedStepConfig('config.sap_import.include_subpackages', next);
+          }}
+        />
+        <Switch
+          label="Include XML artifacts"
+          checked={includeXmlArtifacts}
+          onChange={(event) => {
+            const next = event.currentTarget.checked;
+            setIncludeXmlArtifacts(next);
+            onPatchSelectedStepConfig('config.sap_import.include_xml_artifacts', next);
+          }}
+        />
+      </Group>
+      <Divider label="Objects" />
+      {objects.length === 0 ? (
+        <Text c="dimmed" size="sm">No SAP objects loaded yet.</Text>
+      ) : (
+        <ScrollArea h={420} type="auto">
+          <Table striped highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th></Table.Th>
+                <Table.Th>Object</Table.Th>
+                <Table.Th>Type</Table.Th>
+                <Table.Th>Package</Table.Th>
+                <Table.Th>URI</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {objects.map((item) => {
+                const effectiveUri = item.source_uri || item.uri;
+                return (
+                  <Table.Tr key={effectiveUri}>
+                    <Table.Td>
+                      <Checkbox checked={checkedUris.has(effectiveUri)} onChange={(event) => toggleUri(effectiveUri, event.currentTarget.checked)} />
+                    </Table.Td>
+                    <Table.Td>{item.name}</Table.Td>
+                    <Table.Td><Code>{item.object_type}</Code></Table.Td>
+                    <Table.Td>{item.package_name ?? ''}</Table.Td>
+                    <Table.Td><Text size="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{effectiveUri}</Text></Table.Td>
+                  </Table.Tr>
+                );
+              })}
+            </Table.Tbody>
+          </Table>
+        </ScrollArea>
+      )}
+    </Stack>
+  );
+});
+
+const SapExportStageInputsPanel = memo(function SapExportStageInputsPanel(props: {
+  selectedWorkflowStep: WorkflowStepDefinition | null;
+  repoRef: string;
+  onPatchSelectedStepConfig: (key: string, value: unknown) => void;
+}) {
+  const { selectedWorkflowStep, repoRef, onPatchSelectedStepConfig } = props;
+  const [manifestPathsText, setManifestPathsText] = useState('');
+  const [autoActivate, setAutoActivate] = useState(true);
+  const [connectionClient, setConnectionClient] = useState('');
+  const [connectionAuthType, setConnectionAuthType] = useState('basic');
+  const [connectionUsername, setConnectionUsername] = useState('');
+  const [connectionPassword, setConnectionPassword] = useState('');
+  const [connectionAuthorization, setConnectionAuthorization] = useState('');
+  const [connectionCookieHeader, setConnectionCookieHeader] = useState('');
+  const [connectionBridgeDir, setConnectionBridgeDir] = useState('adt-bridge');
+
+  const connection = useMemo(() => ({
+    ...readSapConnection(selectedWorkflowStep, 'sap_export'),
+    client: connectionClient,
+    auth_type: connectionAuthType,
+    username: connectionUsername,
+    password: connectionPassword,
+    authorization: connectionAuthorization,
+    cookie_header: connectionCookieHeader,
+    bridge_dir: connectionBridgeDir
+  }), [selectedWorkflowStep, connectionClient, connectionAuthType, connectionUsername, connectionPassword, connectionAuthorization, connectionCookieHeader, connectionBridgeDir]);
+
+  const selectedManifestPaths = useMemo(() => new Set(manifestPathsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)), [manifestPathsText]);
+
+  const [discoverBusy, setDiscoverBusy] = useState(false);
+  const [scanBusy, setScanBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [manifests, setManifests] = useState<SapExportScanItem[]>([]);
+  const [checkedManifestPaths, setCheckedManifestPaths] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const nextManifestPathsText = readStringValue(selectedWorkflowStep, 'config.sap_export.manifest_paths_text', '');
+    setManifestPathsText(nextManifestPathsText);
+    setAutoActivate(readBooleanValue(selectedWorkflowStep, 'config.sap_export.auto_activate', true));
+    setConnectionClient(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.client', ''));
+    setConnectionAuthType(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.auth_type', 'basic'));
+    setConnectionUsername(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.username', ''));
+    setConnectionPassword(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.password', ''));
+    setConnectionAuthorization(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.authorization', ''));
+    setConnectionCookieHeader(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.cookie_header', ''));
+    setConnectionBridgeDir(readStringValue(selectedWorkflowStep, 'config.sap_export.connection.bridge_dir', 'adt-bridge'));
+    setCheckedManifestPaths(new Set(nextManifestPathsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)));
+  }, [selectedWorkflowStep?.id]);
+
+  async function handleConnect() {
+    try {
+      setDiscoverBusy(true);
+      setStatus(null);
+      const result = await sapDiscover(connection);
+      setStatus(result.message);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDiscoverBusy(false);
+    }
+  }
+
+  async function handleScan() {
+    try {
+      setScanBusy(true);
+      setStatus(null);
+      const result = await sapScanExportCandidates(repoRef);
+      setManifests(result.manifests);
+      const nextChecked = new Set<string>(selectedManifestPaths);
+      for (const item of result.manifests) {
+        if (selectedManifestPaths.has(item.manifest_path)) {
+          nextChecked.add(item.manifest_path);
+        }
+      }
+      setCheckedManifestPaths(nextChecked);
+      setStatus(`Found ${result.count} exportable SAP manifest(s).`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setScanBusy(false);
+    }
+  }
+
+  function toggleManifest(path: string, checked: boolean) {
+    setCheckedManifestPaths((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(path); else next.delete(path);
+      return next;
+    });
+  }
+
+  function applySelection() {
+    const next = Array.from(checkedManifestPaths).join('\n');
+    setManifestPathsText(next);
+    onPatchSelectedStepConfig('config.sap_export.manifest_paths_text', next);
+    setStatus(`Selected ${checkedManifestPaths.size} manifest(s) for export.`);
+  }
+
+  return (
+    <Stack>
+      <Title order={6}>SAP Export inputs</Title>
+      <Group align="end" wrap="wrap">
+        <Button
+          size="xs"
+          variant="default"
+          onClick={() => void handleConnect()}
+          loading={discoverBusy}
+          disabled={!connection.base_url?.trim()}
+        >
+          Connect
+        </Button>
+        <Button
+          size="xs"
+          variant="default"
+          onClick={() => void handleScan()}
+          loading={scanBusy}
+          disabled={!connection.base_url?.trim() || !repoRef.trim()}
+        >
+          Scan local SAP manifests
+        </Button>
+        <Button size="xs" variant="light" onClick={applySelection} disabled={checkedManifestPaths.size === 0}>
+          Export selected
+        </Button>
+      </Group>
+      {status ? <Alert color="blue">{status}</Alert> : null}
+      <Group>
+        <Switch
+          label="Auto activate"
+          checked={autoActivate}
+          onChange={(event) => {
+            const next = event.currentTarget.checked;
+            setAutoActivate(next);
+            onPatchSelectedStepConfig('config.sap_export.auto_activate', next);
+          }}
+        />
+      </Group>
+      <Divider label="Local export candidates" />
+      {manifests.length === 0 ? (
+        <Text c="dimmed" size="sm">No export candidates scanned yet.</Text>
+      ) : (
+        <ScrollArea h={420} type="auto">
+          <Table striped highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th></Table.Th>
+                <Table.Th>Object</Table.Th>
+                <Table.Th>Type</Table.Th>
+                <Table.Th>Package</Table.Th>
+                <Table.Th>Manifest</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {manifests.map((item) => (
+                <Table.Tr key={item.manifest_path}>
+                  <Table.Td>
+                    <Checkbox checked={checkedManifestPaths.has(item.manifest_path)} onChange={(event) => toggleManifest(item.manifest_path, event.currentTarget.checked)} />
+                  </Table.Td>
+                  <Table.Td>{item.object_name}</Table.Td>
+                  <Table.Td><Code>{item.object_type}</Code></Table.Td>
+                  <Table.Td>{item.package_name ?? ''}</Table.Td>
+                  <Table.Td>
+                    <Text size="xs">{item.manifest_path}</Text>
+                    <Text size="xs" c="dimmed">{item.candidate_count} resource(s)</Text>
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        </ScrollArea>
+      )}
+    </Stack>
+  );
+});
+
 const StageStreamPanel = memo(function StageStreamPanel(props: {
   renderStageStreamPanel: (emptyText: string) => JSX.Element;
 }) {
@@ -856,7 +1270,15 @@ export function WorkflowShell() {
   const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting';
   const isManualMode = isInteractiveMode;
   const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
-  const selectedWorkflowStep = selectedRunTemplate?.definition.steps.find((step) => step.id === (selectedStepId ?? selectedRun?.current_step_id ?? '')) ?? null;
+
+  const selectedRunDefinition = useMemo<WorkflowTemplateDefinition | null>(() => {
+    return selectedRun?.definition ?? null;
+  }, [selectedRun?.definition]);
+
+  const selectedWorkflowStep = useMemo(() => {
+    const stepId = selectedStepId ?? selectedRun?.current_step_id ?? '';
+    return selectedRunDefinition?.steps.find((step) => step.id === stepId) ?? null;
+  }, [selectedRunDefinition, selectedStepId, selectedRun?.current_step_id]);
 
   const workflowStageDescriptors = useMemo(
     () => workflowBuilderCatalog ? descriptorMap(workflowBuilderCatalog) : {},
@@ -872,10 +1294,6 @@ export function WorkflowShell() {
     () => stepUsesCapability(selectedWorkflowStep, 'inference'),
     [selectedWorkflowStep]
   );
-
-  const selectedRunDefinition = useMemo<WorkflowTemplateDefinition | null>(() => {
-    return selectedRun?.definition ?? null;
-  }, [selectedRun?.definition]);
 
   const pendingStageSelection = pendingStageSelectionId
     ? selectedRunDefinition?.steps.find((step) => step.id === pendingStageSelectionId) ?? null
@@ -2394,6 +2812,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
   }
 
   function renderStageStreamPanel(emptyText: string) {
+    if (selectedWorkflowStep?.step_type === 'sap_import' || selectedWorkflowStep?.step_type === 'sap_export') {
+      return <></>;
+    }
     return renderPreviewPanel('Stage stream', stageStreamContent, emptyText, 'stream');
   }
 
@@ -2852,21 +3273,34 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Stack>
                             {!inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
                               <>
-                                <BackendDrivenStageInputsPanel
-                                  descriptor={selectedStageDescriptor}
-                                  selectedWorkflowStep={selectedWorkflowStep ?? null}
-                                  repoFragmentSummary={repoFragmentSummary}
-                                  stageApplyError={stageApplyError}
-                                  stageCompileError={stageCompileError}
-                                  inferenceConnectionStatus={inferenceConnectionStatus}
-                                  inferenceTransport={inferenceTransport}
-                                  onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
-                                  onOpenInferenceConfig={() => setInferenceConfigOpen(true)}
-                                  onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
-                                  onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
-                                  onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
-                                  onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
-                                />
+                                {selectedWorkflowStep?.step_type === 'sap_import' ? (
+                                  <SapImportStageInputsPanel
+                                    selectedWorkflowStep={selectedWorkflowStep ?? null}
+                                    onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
+                                  />
+                                ) : selectedWorkflowStep?.step_type === 'sap_export' ? (
+                                  <SapExportStageInputsPanel
+                                    selectedWorkflowStep={selectedWorkflowStep ?? null}
+                                    repoRef={selectedRun?.repo_ref ?? ''}
+                                    onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
+                                  />
+                                ) : (
+                                  <BackendDrivenStageInputsPanel
+                                    descriptor={selectedStageDescriptor}
+                                    selectedWorkflowStep={selectedWorkflowStep ?? null}
+                                    repoFragmentSummary={repoFragmentSummary}
+                                    stageApplyError={stageApplyError}
+                                    stageCompileError={stageCompileError}
+                                    inferenceConnectionStatus={inferenceConnectionStatus}
+                                    inferenceTransport={inferenceTransport}
+                                    onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
+                                    onOpenInferenceConfig={() => setInferenceConfigOpen(true)}
+                                    onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
+                                    onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
+                                    onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
+                                    onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
+                                  />
+                                )}
                                 <InferenceConnectionCard
                                   inferenceConnectionStatus={inferenceConnectionStatus}
                                   inferenceReady={inferenceReady}
