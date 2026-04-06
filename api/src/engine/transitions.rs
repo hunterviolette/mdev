@@ -1,4 +1,4 @@
-use crate::models::{TransitionWhen, WorkflowStepDefinition, WorkflowTemplateDefinition};
+use crate::models::{WorkflowStepDefinition, WorkflowTemplateDefinition};
 
 use super::stages::{StageDisposition, StageOutcome};
 
@@ -20,22 +20,11 @@ pub fn resolve_next_target(
     outcome: &StageOutcome,
 ) -> Option<String> {
     match &outcome.disposition {
-        StageDisposition::MoveToStep(step_id) => Some(step_id.clone()),
+        StageDisposition::MoveNext => next_step_id(definition, Some(step.id.as_str())),
         StageDisposition::MoveBack => previous_step_id(definition, Some(step.id.as_str())),
         StageDisposition::RetryStage => Some(step.id.clone()),
         StageDisposition::Stay => Some(step.id.clone()),
-        other => {
-            let transition = step.transitions.iter().find(|transition| match (&transition.when, other) {
-                (TransitionWhen::Success, StageDisposition::Success) => true,
-                (TransitionWhen::Error, StageDisposition::Error) => true,
-                (TransitionWhen::Paused, StageDisposition::Paused) => true,
-                (TransitionWhen::RetryStage, StageDisposition::RetryStage) => true,
-                (TransitionWhen::Outcome(expected), StageDisposition::Outcome(actual)) => expected == actual,
-                (TransitionWhen::ErrorCode(expected), StageDisposition::ErrorCode(actual)) => expected == actual,
-                _ => false,
-            });
-            transition.map(|t| t.target_step_id.clone())
-        }
+        _ => None,
     }
 }
 
@@ -45,7 +34,7 @@ pub fn should_auto_advance(step: &WorkflowStepDefinition, outcome: &StageOutcome
         StageDisposition::Error | StageDisposition::ErrorCode(_) => step.advancement.auto_advance_on_error,
         StageDisposition::Paused => step.advancement.auto_advance_on_paused,
         StageDisposition::RetryStage => true,
-        StageDisposition::MoveToStep(_) | StageDisposition::MoveBack => true,
+        StageDisposition::MoveNext | StageDisposition::MoveBack => true,
         StageDisposition::Outcome(_) | StageDisposition::Stay => false,
     }
 }

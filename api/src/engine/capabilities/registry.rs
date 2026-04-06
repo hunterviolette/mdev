@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset_schema, compile_commands, context_export, gateway_model, inference};
+use super::{changeset_schema, compile_commands, context_export, gateway_model, inference, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -279,6 +279,8 @@ async fn dispatch(
         "changeset_schema" => changeset_schema::execute(ctx, prior_results, invocation.config).await,
         "gateway_model/changeset" => gateway_model::changeset::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
+        "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,
+        "sap/export" => sap::export::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),
     }
 }

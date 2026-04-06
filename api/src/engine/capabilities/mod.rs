@@ -4,6 +4,7 @@ pub mod changeset_schema;
 pub mod compile_commands;
 pub mod inference;
 pub mod gateway_model;
+pub mod sap;
 
 pub use registry::{
     CapabilityContext,

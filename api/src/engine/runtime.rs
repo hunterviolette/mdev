@@ -57,7 +57,7 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
         StageDisposition::Paused => RunStatus::Paused,
         StageDisposition::Success => RunStatus::Waiting,
         StageDisposition::RetryStage => RunStatus::Waiting,
-        StageDisposition::MoveToStep(_) | StageDisposition::MoveBack | StageDisposition::Outcome(_) | StageDisposition::Stay => RunStatus::Waiting,
+        StageDisposition::MoveNext | StageDisposition::MoveBack | StageDisposition::Outcome(_) | StageDisposition::Stay => RunStatus::Waiting,
         StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
     };
     let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
@@ -140,7 +140,7 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
                 requested = next_target;
                 continue;
             }
-            (StageDisposition::MoveToStep(_), Some(target), _) | (StageDisposition::MoveBack, Some(target), _) => {
+            (StageDisposition::MoveNext, Some(target), _) | (StageDisposition::MoveBack, Some(target), _) => {
                 set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
                 last_payload = json!({
                     "ok": outcome.ok,
@@ -151,6 +151,15 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
                 });
                 requested = next_target;
                 continue;
+            }
+            (StageDisposition::MoveNext, None, _) => {
+                set_run_status(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
+                return Ok(json!({
+                    "ok": outcome.ok,
+                    "status": "success",
+                    "step_id": step.id,
+                    "message": outcome.message,
+                }));
             }
             (StageDisposition::Success, Some(target), false) => {
                 set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
@@ -240,7 +249,7 @@ fn format_disposition(disposition: &StageDisposition) -> String {
         StageDisposition::ErrorCode(code) => format!("error_code:{}", code),
         StageDisposition::Paused => "paused".to_string(),
         StageDisposition::RetryStage => "retry_stage".to_string(),
-        StageDisposition::MoveToStep(step_id) => format!("move_to_step:{}", step_id),
+        StageDisposition::MoveNext => "move_next".to_string(),
         StageDisposition::MoveBack => "move_back".to_string(),
         StageDisposition::Outcome(name) => format!("outcome:{}", name),
         StageDisposition::Stay => "stay".to_string(),

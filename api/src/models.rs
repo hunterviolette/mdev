@@ -152,10 +152,127 @@ pub struct WorkflowTemplateDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowBuilderCatalog {
+    pub version: u32,
+    #[serde(default)]
+    pub stage_descriptors: Vec<WorkflowStageDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStageDescriptor {
+    pub step_type: String,
+    pub label: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub description: String,
+    pub definition_template: WorkflowStepDefinition,
+    #[serde(default)]
+    pub editable_fields: Vec<WorkflowStageFieldGroup>,
+    #[serde(default)]
+    pub routes: Vec<WorkflowStageRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldGroup {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub fields: Vec<WorkflowStageField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStageField {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    pub bind_to: String,
+    #[serde(default)]
+    pub default: Value,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub options: Vec<WorkflowStageFieldOption>,
+    #[serde(default)]
+    pub ui: WorkflowStageFieldUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldUi {
+    #[serde(default)]
+    pub control: String,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default)]
+    pub min_rows: u32,
+    #[serde(default)]
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageRoute {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub target_required: bool,
+    #[serde(default)]
+    pub allow_terminate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowBuilderDocument {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub globals: WorkflowGlobalConfig,
+    #[serde(default)]
+    pub stages: Vec<WorkflowBuilderStageDocument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowBuilderStageDocument {
+    pub id: String,
+    pub name: String,
+    pub step_type: String,
+    #[serde(default)]
+    pub field_values: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileWorkflowBuilderRequest {
+    pub document: WorkflowBuilderDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileWorkflowBuilderResponse {
+    pub ok: bool,
+    pub definition: WorkflowTemplateDefinition,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowTemplate {
     pub id: Uuid,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub repo_ref: String,
     pub definition: WorkflowTemplateDefinition,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -165,6 +282,7 @@ pub struct WorkflowTemplate {
 pub struct WorkflowRun {
     pub id: Uuid,
     pub template_id: Option<Uuid>,
+    pub definition: WorkflowTemplateDefinition,
     pub status: RunStatus,
     pub current_step_id: Option<String>,
     pub title: String,
@@ -210,6 +328,8 @@ pub struct CreateTemplateRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub repo_ref: String,
     pub definition: WorkflowTemplateDefinition,
 }
 
@@ -218,6 +338,8 @@ pub struct CreateRunRequest {
     pub template_id: Option<Uuid>,
     pub title: String,
     pub repo_ref: String,
+    #[serde(default)]
+    pub definition: Option<WorkflowTemplateDefinition>,
     #[serde(default)]
     pub context: Value,
 }

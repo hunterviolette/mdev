@@ -2,6 +2,8 @@ mod code_stage;
 mod compile_stage;
 mod design_stage;
 mod review_stage;
+mod sap_export_stage;
+mod sap_import_stage;
 
 use std::time::Instant;
 
@@ -29,7 +31,7 @@ pub enum StageDisposition {
     ErrorCode(String),
     Paused,
     RetryStage,
-    MoveToStep(String),
+    MoveNext,
     MoveBack,
     Outcome(String),
     Stay,
@@ -59,7 +61,7 @@ fn sanitize_persisted_stage_state(local_state: Value) -> Value {
     };
 
     let dst = sanitized.as_object_mut().expect("sanitized stage state must be object");
-    for key in ["_stage_execution_id", "review", "composed_prompt", "execution_logic", "repo_context", "prompt_fragment_enabled"] {
+    for key in ["_stage_execution_id", "review"] {
         if let Some(value) = src.get(key).cloned() {
             dst.insert(key.to_string(), value);
         }
@@ -132,12 +134,16 @@ pub async fn execute_stage(
 
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = stage_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("stage_state must be object"))?;
-    let existing_local_state = stage_state_obj
-        .get(step.id.as_str())
+    let existing_local_state = root
+        .get("stage_state")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(step.id.as_str()))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let stage_override_state = root
+        .get("stage_overrides")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(step.id.as_str()))
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -154,6 +160,7 @@ pub async fn execute_stage(
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
     };
+    merge_json_values(&mut local_state, &stage_override_state);
     let local_state_obj = local_state
         .as_object_mut()
         .ok_or_else(|| anyhow!("stage local state must be object"))?;
@@ -240,6 +247,8 @@ fn prepare_stage_local_state(
         "code" => code_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
         "compile" => compile_stage::prepare_stage_state(step, local_state),
         "review" => review_stage::prepare_stage_state(step, local_state),
+        "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
+        "sap_export" => sap_export_stage::prepare_stage_state(step, local_state),
         _ => design_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
     }
 }
@@ -320,8 +329,6 @@ fn parse_stage_disposition(
         .unwrap_or_else(|| {
             if capability_failed {
                 "error"
-            } else if pause_on_enter(step) && branch_key == "on_success" {
-                "paused"
             } else {
                 "success"
             }
@@ -333,12 +340,8 @@ fn parse_stage_disposition(
         "paused" => StageDisposition::Paused,
         "retry_stage" => StageDisposition::RetryStage,
         "stay" => StageDisposition::Stay,
+        "move_next" => StageDisposition::MoveNext,
         "move_back" => StageDisposition::MoveBack,
-        "move_to_step" => branch
-            .get("target_step_id")
-            .and_then(Value::as_str)
-            .map(|value| StageDisposition::MoveToStep(value.to_string()))
-            .unwrap_or(StageDisposition::Stay),
         "outcome" => branch
             .get("name")
             .and_then(Value::as_str)
@@ -367,8 +370,8 @@ fn default_branch_message(
     match disposition {
         StageDisposition::Paused => format!("{} stage completed and is paused.", step.name),
         StageDisposition::RetryStage => format!("{} stage requires a retry.", step.name),
+        StageDisposition::MoveNext => format!("{} stage requested move next.", step.name),
         StageDisposition::MoveBack => format!("{} stage requested move back.", step.name),
-        StageDisposition::MoveToStep(target) => format!("{} stage requested move to step '{}'.", step.name, target),
         StageDisposition::Outcome(name) => format!("{} stage completed with outcome '{}'.", step.name, name),
         StageDisposition::Stay => format!("{} stage completed and remains active.", step.name),
         StageDisposition::ErrorCode(code) => format!("{} stage failed with code '{}'.", step.name, code),
@@ -486,6 +489,7 @@ fn resolve_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: step.prompt.include_changeset_schema,
+                include_apply_error: false,
             },
         ),
         "design" => build_inference_execution_plan(
@@ -495,6 +499,7 @@ fn resolve_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: false,
+                include_apply_error: false,
             },
         ),
         "compile" => Ok(vec![StageExecutionNode {
@@ -538,8 +543,8 @@ pub(crate) fn compose_prompt_from_state(enabled: &Value, fragments: &Value) -> S
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
     let order = [
-        "repo_context",
         "user_input",
+        "repo_context",
         "changeset_schema",
         "apply_error",
         "compile_error",
@@ -559,14 +564,6 @@ pub(crate) fn compose_prompt_from_state(enabled: &Value, fragments: &Value) -> S
     parts.join("\n\n")
 }
 
-pub(crate) fn pause_on_enter(step: &WorkflowStepDefinition) -> bool {
-    step.config
-        .get("pause_policy")
-        .and_then(|v| v.get("pause_on_enter"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn format_disposition(disposition: &StageDisposition) -> String {
     match disposition {
         StageDisposition::Success => "success".to_string(),
@@ -574,7 +571,7 @@ fn format_disposition(disposition: &StageDisposition) -> String {
         StageDisposition::ErrorCode(code) => format!("error_code:{}", code),
         StageDisposition::Paused => "paused".to_string(),
         StageDisposition::RetryStage => "retry_stage".to_string(),
-        StageDisposition::MoveToStep(step_id) => format!("move_to_step:{}", step_id),
+        StageDisposition::MoveNext => "move_next".to_string(),
         StageDisposition::MoveBack => "move_back".to_string(),
         StageDisposition::Outcome(name) => format!("outcome:{}", name),
         StageDisposition::Stay => "stay".to_string(),

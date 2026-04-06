@@ -13,6 +13,7 @@ pub struct WorkflowApiClient {
 pub struct WorkflowRunDto {
     pub id: String,
     pub template_id: Option<String>,
+    pub definition: Value,
     pub status: String,
     pub current_step_id: Option<String>,
     pub title: String,
@@ -37,6 +38,7 @@ pub struct WorkflowEventDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateRunBody {
     pub template_id: Option<String>,
+    pub definition: Option<Value>,
     pub title: String,
     pub repo_ref: String,
     pub context: Value,

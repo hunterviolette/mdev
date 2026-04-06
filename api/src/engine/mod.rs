@@ -19,7 +19,7 @@ pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let row = sqlx::query(
-        "SELECT id, template_id, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
     .bind(run_id.to_string())
     .fetch_one(&state.db)
@@ -28,6 +28,7 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     Ok(WorkflowRun {
         id: Uuid::parse_str(row.get::<String, _>("id").as_str())?,
         template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose()?,
+        definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str())?,
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Draft,
             "queued" => RunStatus::Queued,
@@ -47,22 +48,8 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     })
 }
 
-pub async fn load_template_definition(state: &AppState, run: &WorkflowRun) -> Result<Option<WorkflowTemplateDefinition>> {
-    let Some(template_id) = run.template_id else {
-        return Ok(None);
-    };
-
-    let row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
-        .bind(template_id.to_string())
-        .fetch_optional(&state.db)
-        .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let definition = serde_json::from_str::<WorkflowTemplateDefinition>(row.get::<String, _>("definition_json").as_str())?;
-    Ok(Some(definition))
+pub async fn load_template_definition(_state: &AppState, run: &WorkflowRun) -> Result<Option<WorkflowTemplateDefinition>> {
+    Ok(Some(run.definition.clone()))
 }
 
 pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Result<Value> {
@@ -108,15 +95,15 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
         }
     }
 
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = stage_state.as_object_mut().ok_or_else(|| anyhow!("stage_state must be object"))?;
-    let existing = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
+    let stage_overrides = root.entry("stage_overrides".to_string()).or_insert_with(|| json!({}));
+    let stage_overrides_obj = stage_overrides.as_object_mut().ok_or_else(|| anyhow!("stage_overrides must be object"))?;
+    let existing = stage_overrides_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
     let mut merged = existing.clone();
     merge_json_values(&mut merged, &Value::Object(stage_payload.clone()));
     *existing = merged.clone();
 
     update_run_context(&state.db, run_id, &run.context).await?;
-    Ok(json!({ "ok": true, "step_id": step_id, "state": merged }))
+    Ok(json!({ "ok": true, "step_id": step_id, "override": merged }))
 }
 
 pub(crate) async fn append_event(

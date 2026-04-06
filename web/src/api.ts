@@ -74,6 +74,80 @@ export type WorkflowTemplateDefinition = {
   steps: WorkflowStepDefinition[];
 };
 
+export type WorkflowStageFieldOption = {
+  value: string;
+  label: string;
+};
+
+export type WorkflowStageFieldUi = {
+  control: 'text' | 'textarea' | 'switch' | 'number' | 'select';
+  placeholder?: string;
+  min_rows?: number;
+  format?: string;
+};
+
+export type WorkflowStageField = {
+  key: string;
+  label: string;
+  type: 'boolean' | 'integer' | 'text' | 'multiline_text';
+  bind_to: string;
+  default: unknown;
+  description?: string;
+  required?: boolean;
+  options?: WorkflowStageFieldOption[];
+  ui?: WorkflowStageFieldUi;
+};
+
+export type WorkflowStageFieldGroup = {
+  key: string;
+  label: string;
+  fields: WorkflowStageField[];
+};
+
+export type WorkflowStageRoute = {
+  key: string;
+  label: string;
+  description?: string;
+  target: string;
+  target_required?: boolean;
+  allow_terminate?: boolean;
+};
+
+export type WorkflowStageDescriptor = {
+  step_type: string;
+  label: string;
+  category: string;
+  description: string;
+  definition_template: WorkflowStepDefinition;
+  editable_fields: WorkflowStageFieldGroup[];
+  routes: WorkflowStageRoute[];
+};
+
+export type WorkflowBuilderCatalog = {
+  version: number;
+  stage_descriptors: WorkflowStageDescriptor[];
+};
+
+export type WorkflowBuilderStageDocument = {
+  id: string;
+  name: string;
+  step_type: string;
+  field_values: Record<string, unknown>;
+};
+
+export type WorkflowBuilderDocument = {
+  version: number;
+  globals: WorkflowGlobalConfig;
+  stages: WorkflowBuilderStageDocument[];
+};
+
+export type CompileWorkflowBuilderResponse = {
+  ok: boolean;
+  definition: WorkflowTemplateDefinition;
+  warnings: string[];
+  errors: string[];
+};
+
 export type WorkflowBuilderFieldContract = {
   key: string;
   label: string;
@@ -102,6 +176,7 @@ export type WorkflowTemplate = {
   id: string;
   name: string;
   description: string;
+  repo_ref: string;
   definition: WorkflowTemplateDefinition;
   created_at: string;
   updated_at: string;
@@ -126,6 +201,7 @@ export type BrowserProbeResult = {
 export type WorkflowRun = {
   id: string;
   template_id: string | null;
+  definition: WorkflowTemplateDefinition;
   status: WorkflowRunStatus;
   current_step_id: string | null;
   title: string;
@@ -249,6 +325,17 @@ export function getWorkflowBuilderContract() {
   return fetchJson<WorkflowBuilderContract>('/api/workflow-builder-contract');
 }
 
+export function getWorkflowBuilderCatalog() {
+  return fetchJson<WorkflowBuilderCatalog>('/api/workflow-builder-catalog');
+}
+
+export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument) {
+  return fetchJson<CompileWorkflowBuilderResponse>('/api/workflow-builder/compile', {
+    method: 'POST',
+    body: JSON.stringify({ document })
+  });
+}
+
 export function listRepoTree(
   repoRef: string,
   gitRef = 'WORKTREE',
@@ -264,10 +351,16 @@ export function listRepoTree(
   return fetchJson<RepoTreeResponse>(`/api/repo-tree?${params.toString()}`);
 }
 
-export function createTemplate(body: { name: string; description: string; definition: WorkflowTemplateDefinition }) {
+export function createTemplate(body: { name: string; description: string; repo_ref: string; definition: WorkflowTemplateDefinition }) {
   return fetchJson<WorkflowTemplate>('/api/workflow-templates', {
     method: 'POST',
     body: JSON.stringify(body)
+  });
+}
+
+export function deleteTemplate(templateId: string) {
+  return fetchJson<{ ok: boolean }>(`/api/workflow-templates/${templateId}`, {
+    method: 'DELETE'
   });
 }
 
@@ -279,7 +372,7 @@ export function getRun(runId: string) {
   return fetchJson<WorkflowRun>(`/api/workflow-runs/${runId}`);
 }
 
-export function createRun(body: { template_id?: string | null; title: string; repo_ref: string; context: Record<string, unknown> }) {
+export function createRun(body: { template_id?: string | null; title: string; repo_ref: string; definition?: WorkflowTemplateDefinition; context: Record<string, unknown> }) {
   return fetchJson<WorkflowRun>('/api/workflow-runs', {
     method: 'POST',
     body: JSON.stringify(body)

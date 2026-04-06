@@ -22,7 +22,7 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "success",
+                "disposition": "move_next",
                 "message": "Compile stage completed successfully through backend workflow engine.",
                 "patch": {
                     "global_state": {
@@ -46,8 +46,7 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "error_code",
-                "code": "compile_checks_failed",
+                "disposition": "move_back",
                 "message": "Compile stage failed during backend workflow execution.",
                 "patch_from_capability": {
                     "capability": "compile_commands",

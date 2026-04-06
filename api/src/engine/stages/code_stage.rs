@@ -24,6 +24,7 @@ pub fn prepare_stage_state(
         local_state,
         InferenceStageSettings {
             include_changeset_schema: step.prompt.include_changeset_schema,
+            include_apply_error: false,
         },
     )?;
 
@@ -40,7 +41,7 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "success",
+                "disposition": "move_next",
                 "message": "Code stage completed successfully through backend workflow engine.",
                 "patch": {
                     "global_state": {
@@ -52,6 +53,9 @@ pub fn prepare_stage_state(
                                 "prompt_fragments": {
                                     "apply_error": null
                                 }
+                            },
+                            "gateway_model/changeset": {
+                                "latest_apply_error": null
                             }
                         }
                     }
@@ -74,7 +78,7 @@ pub fn prepare_stage_state(
                 })
             } else {
                 json!({
-                    "disposition": "error",
+                    "disposition": "retry_stage",
                     "message": "Code stage failed during backend workflow execution."
                 })
             },
@@ -92,39 +96,33 @@ pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    let summary = apply_result
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("ChangeSet apply failed.")
+        .to_string();
+
     let lines = apply_result
         .get("lines")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            apply_result
-                .get("summary")
-                .and_then(Value::as_str)
-                .unwrap_or("ChangeSet apply failed.")
-                .to_string()
-        });
-
-    let apply_fragment = format!(
-        "ChangeSet apply failed.\n\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the apply errors.",
-        lines
-    );
+        .cloned()
+        .unwrap_or_default();
 
     json!({
         "global_state": {
             "capabilities": {
+                "gateway_model/changeset": {
+                    "latest_apply_error": {
+                        "summary": summary,
+                        "lines": lines
+                    }
+                },
                 "inference": {
                     "prompt_fragment_enabled": {
                         "apply_error": true
                     },
                     "prompt_fragments": {
-                        "apply_error": apply_fragment
+                        "apply_error": null
                     }
                 }
             }

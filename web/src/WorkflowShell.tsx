@@ -15,7 +15,6 @@ import {
   Loader,
   Modal,
   ScrollArea,
-  SegmentedControl,
   Select,
   SimpleGrid,
   Stack,
@@ -32,21 +31,20 @@ import {
   createRun,
   createTemplate,
   deleteRun,
+  deleteTemplate,
   getEventChainSummary,
   getChangesetSchema,
   getRun,
   getStageExecutionChain,
-  getWorkflowBuilderContract,
+  getWorkflowBuilderCatalog,
   listRepoTree,
   listRunEvents,
   listRuns,
   listTemplates,
-  nextWorkflowStep,
   openEventStream,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
   pauseWorkflowRun,
-  previousWorkflowStep,
   resumeWorkflowRun,
   runCurrentWorkflowStep,
   selectWorkflowStep,
@@ -59,12 +57,12 @@ import {
   type RepoTreeResponse,
   type StageExecutionChain,
   type StageExecutionEvent,
-  type WorkflowBuilderContract,
-  type WorkflowBuilderFieldContract,
-  type WorkflowBuilderStageContract,
+  type WorkflowBuilderCatalog,
   type WorkflowEvent,
   type WorkflowRun,
   type WorkflowRunStatus,
+  type WorkflowStageDescriptor,
+  type WorkflowStageField,
   type WorkflowStepDefinition,
   type WorkflowTemplate,
   type WorkflowTemplateDefinition,
@@ -72,33 +70,27 @@ import {
 } from './api';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
+import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
+import { descriptorMap, flattenStageFields } from './workflow_builder';
 
-type TransitionEditorValue = {
-  successTarget: string;
-  errorTarget: string;
-  pausedTarget: string;
-};
-
-type BuilderStep = {
-  id: string;
-  name: string;
-  stepType: string;
-  automationMode: AutomationMode;
-  autoAdvanceOnSuccess: boolean;
-  fields: Record<string, boolean | number | string>;
-  transitions: TransitionEditorValue;
-};
 
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type OperatorMode = 'auto' | 'manual';
-
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
 
 type EventStreamStatus = { color: string; label: string };
+
+type StageModifierAction = {
+  key: string;
+  label: string;
+  status: string;
+  color?: string;
+  buttonLabel: string;
+  onOpen: () => void;
+};
 
 
 type LiveCapabilityTrail = {
@@ -230,217 +222,6 @@ function formatCompileStageStream(commandResults: Array<Record<string, unknown>>
   return parts.join('\n\n');
 }
 
-function builderStepFromContract(stage: WorkflowBuilderStageContract): BuilderStep {
-  return {
-    id: stage.step_type,
-    name: stage.label,
-    stepType: stage.step_type,
-    automationMode: stage.automation_mode_default,
-    autoAdvanceOnSuccess: stage.automation_mode_default === 'automatic',
-    fields: Object.fromEntries(stage.fields.map((field) => [field.key, field.default])),
-    transitions: {
-      successTarget: stage.transition_defaults.on_success,
-      errorTarget: stage.transition_defaults.on_error,
-      pausedTarget: stage.transition_defaults.on_paused
-    }
-  };
-}
-
-function readBool(step: BuilderStep, key: string, fallback = false) {
-  const value = step.fields[key];
-  return typeof value === 'boolean' ? value : fallback;
-}
-
-function readNumber(step: BuilderStep, key: string, fallback = 0) {
-  const value = step.fields[key];
-  return typeof value === 'number' ? value : fallback;
-}
-
-function readString(step: BuilderStep, key: string, fallback = '') {
-  const value = step.fields[key];
-  return typeof value === 'string' ? value : fallback;
-}
-
-function buildTransitions(step: BuilderStep): WorkflowTransition[] {
-  const transitions: WorkflowTransition[] = [];
-  if (step.transitions.successTarget) transitions.push({ when: { type: 'success' }, target_step_id: step.transitions.successTarget });
-  if (step.transitions.errorTarget) transitions.push({ when: { type: 'error' }, target_step_id: step.transitions.errorTarget });
-  if (step.transitions.pausedTarget) transitions.push({ when: { type: 'paused' }, target_step_id: step.transitions.pausedTarget });
-  return transitions;
-}
-
-function buildBranchDisposition(targetStepId: string, fallback: 'success' | 'error' | 'paused') {
-  if (!targetStepId) {
-    return fallback === 'paused' ? 'paused' : 'success';
-  }
-  return 'move_to_step';
-}
-
-function buildBranchConfig(targetStepId: string, fallback: 'success' | 'error' | 'paused') {
-  const disposition = buildBranchDisposition(targetStepId, fallback);
-  return targetStepId
-    ? { disposition, target_step_id: targetStepId }
-    : { disposition };
-}
-
-function buildStepDefinition(step: BuilderStep): WorkflowStepDefinition {
-  const compileCommands = readString(step, 'execution.compile_checks.commands_text', '')
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((command) => ({ command, label: command }));
-
-  const executionLogic: Record<string, unknown> = step.id === 'code'
-    ? {
-        kind: 'code_stage_policy',
-        automation: {
-          inject_context: readBool(step, 'automation.inject_context', true),
-          inject_changeset_schema: readBool(step, 'automation.inject_changeset_schema', true),
-          auto_apply_changeset: readBool(step, 'automation.auto_apply_changeset', true),
-          max_consecutive_apply_failures: readNumber(step, 'automation.max_consecutive_apply_failures', 1)
-        },
-        on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
-        on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
-        on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
-      }
-    : step.id === 'compile'
-      ? {
-          kind: 'compile_stage_policy',
-          automation: {
-            run_compile_checks: true
-          },
-          on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
-          on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
-          on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
-        }
-      : step.id === 'review'
-        ? {
-            kind: 'review_stage_policy',
-            require_manual_approval: readBool(step, 'execution_logic.require_manual_approval', true),
-            on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
-            on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
-            on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
-          }
-        : {
-            kind: 'design_stage_policy',
-            automation: {
-              inject_context: readBool(step, 'automation.inject_context', true)
-            },
-            on_success: buildBranchConfig(step.transitions.successTarget, 'success'),
-            on_error: buildBranchConfig(step.transitions.errorTarget, 'error'),
-            on_paused: buildBranchConfig(step.transitions.pausedTarget, 'paused')
-          };
-
-  const executionPlan = step.id === 'compile'
-    ? [
-        {
-          kind: 'capability' as const,
-          key: 'compile_commands',
-          enabled: true,
-          config: {},
-          input_mapping: {},
-          output_mapping: {},
-          run_after: [],
-          condition: null
-        }
-      ]
-    : step.id === 'design' || step.id === 'code'
-      ? [
-          {
-            kind: 'capability' as const,
-            key: 'context_export',
-            enabled: true,
-            config: {},
-            input_mapping: {},
-            output_mapping: {},
-            run_after: [],
-            condition: null
-          },
-          {
-            kind: 'capability' as const,
-            key: 'inference',
-            enabled: true,
-            config: {},
-            input_mapping: {},
-            output_mapping: {},
-            run_after: ['context_export'],
-            condition: null
-          }
-        ]
-      : [
-          {
-            kind: 'capability' as const,
-            key: 'inference',
-            enabled: true,
-            config: {},
-            input_mapping: {},
-            output_mapping: {},
-            run_after: [],
-            condition: null
-          }
-        ];
-
-  return {
-    id: step.id,
-    name: step.name,
-    step_type: step.stepType,
-    automation_mode: step.automationMode,
-    execution: {
-      changeset_apply: step.id === 'code'
-        ? {
-            enabled: readBool(step, 'automation.auto_apply_changeset', true),
-            max_consecutive_failures: readNumber(step, 'automation.max_consecutive_apply_failures', 1)
-          }
-        : {},
-      compile_checks: step.id === 'compile' ? { commands: compileCommands } : {}
-    },
-    prompt: {
-      include_repo_context: readBool(step, 'automation.inject_context', false),
-      include_changeset_schema: readBool(step, 'automation.inject_changeset_schema', false),
-      include_user_context: true
-    },
-    config: {
-      pause_policy: {
-        pause_on_enter: readBool(step, 'config.pause_policy.pause_on_enter', false)
-      }
-    },
-    capabilities: [],
-    execution_logic: executionLogic,
-    execution_plan: executionPlan,
-    advancement: {
-      mode: step.automationMode,
-      auto_run_on_enter: step.automationMode === 'automatic',
-      auto_advance_on_success: step.autoAdvanceOnSuccess,
-      auto_advance_on_error: false,
-      auto_advance_on_paused: false
-    },
-    transitions: buildTransitions(step)
-  };
-}
-
-function buildTemplateDefinition(steps: BuilderStep[]): WorkflowTemplateDefinition {
-  return {
-    version: 1,
-    globals: {
-      resources: {
-        repo: {
-          repo_ref: '',
-          git_ref: 'WORKTREE'
-        }
-      },
-      capabilities: {
-        inference: {},
-        context_export: {
-          save_path: '/tmp/repo_context.txt'
-        },
-        changeset_schema: {},
-        'gateway_model/changeset': {},
-        compile_commands: {}
-      }
-    },
-    steps: steps.map(buildStepDefinition)
-  };
-}
 
 function formatTimestamp(value: string) {
   const date = new Date(value);
@@ -472,6 +253,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   inferenceBusy: boolean;
   inferenceStatus: string | null;
   inferenceConfigOpen: boolean;
+  hideInlineCard?: boolean;
   onOpenConfig: () => void;
   onCloseConfig: () => void;
   onTransportChange: (value: InferenceTransport) => void;
@@ -490,6 +272,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
     inferenceBusy,
     inferenceStatus,
     inferenceConfigOpen,
+    hideInlineCard = false,
     onOpenConfig,
     onCloseConfig,
     onTransportChange,
@@ -499,22 +282,23 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
     onSaveConfig
   } = props;
 
-  const showInlineConfig = !inferenceReady;
+  const showInlineConfig = !hideInlineCard && !inferenceReady;
 
   return (
     <>
-      <Stack gap="md">
-        <Group justify="space-between" align="center" wrap="nowrap">
-          <Group gap="xs" wrap="nowrap">
-            <Text size="sm" fw={600}>Inference status</Text>
-            <Badge color={inferenceConnectionStatus.color} variant="light">
-              {inferenceConnectionStatus.label}
-            </Badge>
+      {!hideInlineCard ? (
+        <Stack gap="md">
+          <Group justify="space-between" align="center" wrap="nowrap">
+            <Group gap="xs" wrap="nowrap">
+              <Text size="sm" fw={600}>Inference status</Text>
+              <Badge color={inferenceConnectionStatus.color} variant="light">
+                {inferenceTransport === 'browser' ? 'Browser' : 'API'}
+              </Badge>
+            </Group>
+            {!showInlineConfig ? <Button size="xs" variant="subtle" onClick={onOpenConfig}>Configure</Button> : null}
           </Group>
-          {!showInlineConfig ? <Button size="xs" variant="subtle" onClick={onOpenConfig}>Connector</Button> : null}
-        </Group>
 
-        {showInlineConfig ? (
+          {showInlineConfig ? (
           <Stack gap="md">
             <SimpleGrid cols={{ base: 1, md: 2 }}>
               <Select
@@ -564,10 +348,24 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
 
             {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
           </Stack>
-        ) : null}
-      </Stack>
+          ) : null}
+        </Stack>
+      ) : null}
 
-      <Modal opened={inferenceConfigOpen} onClose={onCloseConfig} title="Inference connector" size="70%" centered>
+      <Modal
+        opened={inferenceConfigOpen}
+        onClose={onCloseConfig}
+        title="Inference connector"
+        size="min(1600px, calc(100vw - 64px))"
+        centered
+        padding="md"
+        zIndex={300}
+        withCloseButton
+        styles={{
+          body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
+          content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+        }}
+      >
         <Stack gap="md">
           <SimpleGrid cols={{ base: 1, md: 2 }}>
             <Select
@@ -622,151 +420,236 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   );
 });
 
-const DesignStageInputsPanel = memo(function DesignStageInputsPanel(props: {
-  stageUserInput: string;
-  stageIncludeRepoContext: boolean;
-  repoFragmentSummary: string | null;
-  onStageUserInputChange: (value: string) => void;
-  onStageIncludeRepoContextChange: (checked: boolean) => void;
-  onOpenRepoConfig: () => void;
+function stepUsesCapability(step: WorkflowStepDefinition | null | undefined, capabilityKey: string): boolean {
+  if (!step) return false;
+  return (step.execution_plan ?? []).some((node) => node.kind === 'capability' && node.enabled !== false && node.key === capabilityKey);
+}
+
+const StageModifierActions = memo(function StageModifierActions(props: {
+  actions: StageModifierAction[];
 }) {
-  const {
-    stageUserInput,
-    stageIncludeRepoContext,
-    repoFragmentSummary,
-    onStageUserInputChange,
-    onStageIncludeRepoContextChange,
-    onOpenRepoConfig
-  } = props;
+  const { actions } = props;
+  if (actions.length === 0) return null;
 
   return (
-    <Stack>
-      <Title order={6}>Stage inputs</Title>
-      <Textarea label="User input" value={stageUserInput} onChange={(e) => onStageUserInputChange(e.currentTarget.value)} minRows={3} autosize />
-      <Group>
-        <Switch label="Include repo fragment" checked={stageIncludeRepoContext} onChange={(e) => onStageIncludeRepoContextChange(e.currentTarget.checked)} />
-        <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
-        {stageIncludeRepoContext && repoFragmentSummary ? <Badge variant="light">{repoFragmentSummary}</Badge> : null}
-      </Group>
+    <Stack gap="xs">
+      <Text fw={600} size="sm">Stage tools</Text>
+      {actions.map((action) => (
+        <Group key={action.key} justify="space-between" wrap="nowrap" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 8, padding: 10 }}>
+          <Group gap="xs" wrap="nowrap">
+            <Text size="sm" fw={500}>{action.label}</Text>
+            <Badge variant="light" color={action.color ?? 'blue'}>{action.status}</Badge>
+          </Group>
+          <Button size="xs" variant="light" onClick={action.onOpen}>{action.buttonLabel}</Button>
+        </Group>
+      ))}
     </Stack>
   );
 });
 
-const CodeStageInputsPanel = memo(function CodeStageInputsPanel(props: {
-  stageUserInput: string;
-  stageIncludeRepoContext: boolean;
-  stageIncludeChangesetSchema: boolean;
-  stageAutoApplyChangeset: boolean;
-  stageIncludeApplyError: boolean;
-  stageApplyError: string;
-  stageIncludeCompileError: boolean;
-  stageCompileError: string;
+const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPanel(props: {
+  descriptor: WorkflowStageDescriptor | null;
+  selectedWorkflowStep: WorkflowStepDefinition | null;
   repoFragmentSummary: string | null;
-  onStageUserInputChange: (value: string) => void;
-  onStageIncludeRepoContextChange: (checked: boolean) => void;
-  onStageIncludeChangesetSchemaChange: (checked: boolean) => void;
-  onStageAutoApplyChangesetChange: (checked: boolean) => void;
-  onStageIncludeApplyErrorChange: (checked: boolean) => void;
-  onStageIncludeCompileErrorChange: (checked: boolean) => void;
+  stageApplyError: string;
+  stageCompileError: string;
+  inferenceConnectionStatus: InferenceConnectionStatus;
+  inferenceTransport: InferenceTransport;
+  onPatchSelectedStepConfig: (key: string, value: unknown) => void;
+  onOpenInferenceConfig: () => void;
   onOpenRepoConfig: () => void;
   onOpenSchemaConfig: () => void;
   onOpenApplyErrorConfig: () => void;
   onOpenCompileErrorConfig: () => void;
 }) {
   const {
-    stageUserInput,
-    stageIncludeRepoContext,
-    stageIncludeChangesetSchema,
-    stageAutoApplyChangeset,
-    stageIncludeApplyError,
-    stageApplyError,
-    stageIncludeCompileError,
-    stageCompileError,
+    descriptor,
+    selectedWorkflowStep,
     repoFragmentSummary,
-    onStageUserInputChange,
-    onStageIncludeRepoContextChange,
-    onStageIncludeChangesetSchemaChange,
-    onStageAutoApplyChangesetChange,
-    onStageIncludeApplyErrorChange,
-    onStageIncludeCompileErrorChange,
+    stageApplyError,
+    stageCompileError,
+    inferenceConnectionStatus,
+    inferenceTransport,
+    onPatchSelectedStepConfig,
+    onOpenInferenceConfig,
     onOpenRepoConfig,
     onOpenSchemaConfig,
     onOpenApplyErrorConfig,
     onOpenCompileErrorConfig
   } = props;
 
-  return (
-    <Stack>
-      <Title order={6}>Stage inputs</Title>
-      <Textarea label="User input" value={stageUserInput} onChange={(e) => onStageUserInputChange(e.currentTarget.value)} minRows={3} autosize />
-      <Group>
-        <Switch label="Include repo fragment" checked={stageIncludeRepoContext} onChange={(e) => onStageIncludeRepoContextChange(e.currentTarget.checked)} />
-        <Button size="xs" variant="light" onClick={onOpenRepoConfig}>Configure repo fragment</Button>
-        {stageIncludeRepoContext && repoFragmentSummary ? <Badge variant="light">{repoFragmentSummary}</Badge> : null}
-      </Group>
-      <Group>
-        <Switch label="Include changeset schema fragment" checked={stageIncludeChangesetSchema} onChange={(e) => onStageIncludeChangesetSchemaChange(e.currentTarget.checked)} />
-        <Button size="xs" variant="light" onClick={onOpenSchemaConfig}>Configure schema</Button>
-      </Group>
-      <Group>
-        <Switch label="Auto apply changeset" checked={stageAutoApplyChangeset} onChange={(e) => onStageAutoApplyChangesetChange(e.currentTarget.checked)} />
-      </Group>
-      {stageApplyError.trim() ? (
-        <Group>
-          <Switch label="Include apply error fragment" checked={stageIncludeApplyError} onChange={(e) => onStageIncludeApplyErrorChange(e.currentTarget.checked)} />
-          <Badge variant="light" color="orange">Apply error available</Badge>
-          <Button size="xs" variant="light" onClick={onOpenApplyErrorConfig}>View apply error</Button>
-        </Group>
-      ) : null}
-      {stageCompileError.trim() ? (
-        <Group>
-          <Switch label="Include compile error fragment" checked={stageIncludeCompileError} onChange={(e) => onStageIncludeCompileErrorChange(e.currentTarget.checked)} />
-          <Badge variant="light" color="yellow">Compile error available</Badge>
-          <Button size="xs" variant="light" onClick={onOpenCompileErrorConfig}>View compile error</Button>
-        </Group>
-      ) : null}
-    </Stack>
-  );
-});
+  const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
+  const usesRepoContext = !!selectedWorkflowStep?.prompt?.include_repo_context;
+  const usesChangesetSchema = !!selectedWorkflowStep?.prompt?.include_changeset_schema;
+  const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
+  const usesCompileCommands = stepUsesCapability(selectedWorkflowStep, 'compile_commands');
 
-const CompileStageInputsPanel = memo(function CompileStageInputsPanel(props: {
-  stageCompileCommandsText: string;
-  onStageCompileCommandsTextChange: (value: string) => void;
-}) {
-  const {
-    stageCompileCommandsText,
-    onStageCompileCommandsTextChange
-  } = props;
+  const modifierActions = useMemo<StageModifierAction[]>(() => {
+    const actions: StageModifierAction[] = [];
 
-  return (
-    <Stack>
-      <Title order={6}>Stage inputs</Title>
-      <Textarea
-        label="Compile commands"
-        description="One command per line. The compile stage should only patch backend compile checks."
-        value={stageCompileCommandsText}
-        onChange={(e) => onStageCompileCommandsTextChange(e.currentTarget.value)}
-        minRows={6}
-        autosize
-        placeholder={"cargo check\nnpm run build"}
+    if (usesRepoContext) {
+      actions.push({
+        key: 'repo_fragment',
+        label: 'Repo fragment',
+        status: repoFragmentSummary ?? '0 files selected',
+        color: 'blue',
+        buttonLabel: 'Configure',
+        onOpen: onOpenRepoConfig
+      });
+    }
+
+    if (usesChangesetSchema) {
+      actions.push({
+        key: 'changeset_schema',
+        label: 'Schema',
+        status: 'Configured',
+        color: 'blue',
+        buttonLabel: 'Configure',
+        onOpen: onOpenSchemaConfig
+      });
+    }
+
+    if (usesInference) {
+      actions.push({
+        key: 'inference',
+        label: 'Inference',
+        status: inferenceTransport === 'browser' ? 'Browser' : 'API',
+        color: inferenceConnectionStatus.color,
+        buttonLabel: 'Configure',
+        onOpen: onOpenInferenceConfig
+      });
+    }
+
+    if (stageApplyError.trim()) {
+      actions.push({
+        key: 'apply_error',
+        label: 'Apply error',
+        status: 'Available',
+        color: 'orange',
+        buttonLabel: 'View',
+        onOpen: onOpenApplyErrorConfig
+      });
+    }
+
+    if (stageCompileError.trim()) {
+      actions.push({
+        key: 'compile_error',
+        label: 'Compile error',
+        status: 'Available',
+        color: 'yellow',
+        buttonLabel: 'View',
+        onOpen: onOpenCompileErrorConfig
+      });
+    }
+
+    return actions;
+  }, [
+    usesRepoContext,
+    repoFragmentSummary,
+    onOpenRepoConfig,
+    usesChangesetSchema,
+    onOpenSchemaConfig,
+    usesInference,
+    inferenceConnectionStatus,
+    inferenceTransport,
+    onOpenInferenceConfig,
+    stageApplyError,
+    onOpenApplyErrorConfig,
+    stageCompileError,
+    onOpenCompileErrorConfig
+  ]);
+
+  function valueForField(field: WorkflowStageField): unknown {
+    const parts = field.bind_to.split('.');
+    let current: unknown = selectedWorkflowStep ?? {};
+    for (const part of parts) {
+      if (!current || typeof current !== 'object' || !(part in (current as Record<string, unknown>))) {
+        return field.default;
+      }
+      current = (current as Record<string, unknown>)[part];
+    }
+    return current ?? field.default;
+  }
+
+  const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
+
+  useEffect(() => {
+    setFieldDrafts(
+      Object.fromEntries(
+        fields.map((field) => [field.key, valueForField(field)])
+      )
+    );
+  }, [fields, selectedWorkflowStep?.id]);
+
+  function updateField(field: WorkflowStageField, value: unknown) {
+    setFieldDrafts((prev) => ({
+      ...prev,
+      [field.key]: value
+    }));
+    onPatchSelectedStepConfig(field.bind_to, value);
+  }
+
+  function renderField(field: WorkflowStageField) {
+    const value = field.key in fieldDrafts ? fieldDrafts[field.key] : valueForField(field);
+
+    if (field.type === 'boolean') {
+      return (
+        <Switch
+          key={field.key}
+          label={field.label}
+          checked={typeof value === 'boolean' ? value : Boolean(field.default)}
+          onChange={(event) => updateField(field, event.currentTarget.checked)}
+        />
+      );
+    }
+
+    if (field.type === 'integer') {
+      return (
+        <TextInput
+          key={field.key}
+          label={field.label}
+          value={String(typeof value === 'number' ? value : Number(value ?? field.default ?? 0) || 0)}
+          onChange={(event) => updateField(field, Number(event.currentTarget.value || '0'))}
+        />
+      );
+    }
+
+    if (field.type === 'multiline_text') {
+      return (
+        <Textarea
+          key={field.key}
+          label={field.label}
+          description={field.description}
+          value={typeof value === 'string' ? value : String(value ?? field.default ?? '')}
+          onChange={(event) => updateField(field, event.currentTarget.value)}
+          minRows={4}
+          autosize
+        />
+      );
+    }
+
+    return (
+      <TextInput
+        key={field.key}
+        label={field.label}
+        description={field.description}
+        value={typeof value === 'string' ? value : String(value ?? field.default ?? '')}
+        onChange={(event) => updateField(field, event.currentTarget.value)}
       />
-    </Stack>
-  );
-});
-
-const ReviewStageInputsPanel = memo(function ReviewStageInputsPanel(props: {
-  stageReviewNotes: string;
-  onStageReviewNotesChange: (value: string) => void;
-}) {
-  const {
-    stageReviewNotes,
-    onStageReviewNotesChange
-  } = props;
+    );
+  }
 
   return (
     <Stack>
-      <Title order={6}>Stage inputs</Title>
-      <Textarea label="Review notes" value={stageReviewNotes} onChange={(e) => onStageReviewNotesChange(e.currentTarget.value)} minRows={4} autosize />
+      <Title order={6}>{descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs</Title>
+      {!descriptor ? <Text c="dimmed" size="sm">No backend descriptor found for this stage type.</Text> : null}
+      {descriptor?.editable_fields.map((group) => (
+        <Stack key={group.key} gap="xs">
+          {descriptor?.editable_fields.length > 1 ? <Text fw={600} size="sm">{group.label}</Text> : null}
+          {group.fields.map((field) => renderField(field))}
+        </Stack>
+      ))}
+      <StageModifierActions actions={modifierActions} />
     </Stack>
   );
 });
@@ -804,36 +687,92 @@ export function WorkflowShell() {
   const [eventStreamStatusText, setEventStreamStatusText] = useState('Disconnected');
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [workflowBuilderCatalog, setWorkflowBuilderCatalog] = useState<WorkflowBuilderCatalog | null>(null);
 
   const selectedRunIdRef = useRef<string | null>(null);
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
   const runEventStreamsRef = useRef<Record<string, EventSource>>({});
   const runRefreshTimersRef = useRef<Record<string, number>>({});
 
-  const [workflowName, setWorkflowName] = useState('Default workflow');
-  const [workflowDescription, setWorkflowDescription] = useState('Design, code, and review workflow');
-  const [runTitle, setRunTitle] = useState('New workflow run');
-  const [repoRef, setRepoRef] = useState('');
-  const [builderContract, setBuilderContract] = useState<WorkflowBuilderContract | null>(null);
-  const [builderSteps, setBuilderSteps] = useState<BuilderStep[]>([]);
-  const [jsonDraft, setJsonDraft] = useState('');
-  const [createRunAfterSave, setCreateRunAfterSave] = useState(true);
-  const [templateModalOpen, setTemplateModalOpen] = useState(false);
-  const [globalCapabilitiesOpen, setGlobalCapabilitiesOpen] = useState(false);
+
+  function patchSelectedStepDescriptorField(bindTo: string, value: unknown) {
+    if (!selectedRunId || !selectedWorkflowStep) return;
+
+    if (bindTo === 'prompt.user_input') {
+      setStageUserInput(typeof value === 'string' ? value : String(value ?? ''));
+    } else if (bindTo === 'execution.compile_checks.commands_text') {
+      setStageCompileCommandsText(typeof value === 'string' ? value : String(value ?? ''));
+    } else if (bindTo === 'execution_logic.automation.inject_context') {
+      setStageIncludeRepoContext(Boolean(value));
+    } else if (bindTo === 'execution_logic.automation.inject_changeset_schema') {
+      setStageIncludeChangesetSchema(Boolean(value));
+    } else if (bindTo === 'execution_logic.automation.include_apply_error') {
+      setStageIncludeApplyError(Boolean(value));
+    } else if (bindTo === 'execution_logic.automation.include_compile_error') {
+      setStageIncludeCompileError(Boolean(value));
+    } else if (bindTo === 'execution_logic.automation.auto_apply_changeset') {
+      setStageAutoApplyChangeset(Boolean(value));
+    } else if (bindTo === 'review.notes') {
+      setStageReviewNotes(typeof value === 'string' ? value : String(value ?? ''));
+    } else if (bindTo === 'review.approved') {
+      const checked = Boolean(value);
+      setStageApproved(checked);
+      if (checked) {
+        setStageRejected(false);
+      }
+    } else if (bindTo === 'review.rejected') {
+      const checked = Boolean(value);
+      setStageRejected(checked);
+      if (checked) {
+        setStageApproved(false);
+      }
+    }
+
+    const payload: Record<string, unknown> = {};
+    const parts = bindTo.split('.').filter(Boolean);
+    let cursor: Record<string, unknown> = payload;
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index]!;
+      if (index === parts.length - 1) {
+        cursor[part] = value;
+      } else {
+        const next: Record<string, unknown> = {};
+        cursor[part] = next;
+        cursor = next;
+      }
+    }
+    void patchWorkflowStageState(selectedRunId, selectedWorkflowStep.id, payload);
+  }
 
   useEffect(() => {
-    void getWorkflowBuilderContract()
-      .then((contract) => {
-        setBuilderContract(contract);
-        setBuilderSteps(contract.stages.map(builderStepFromContract));
-      })
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : String(err));
-      });
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await getWorkflowBuilderCatalog();
+        if (!cancelled) {
+          setWorkflowBuilderCatalog(next);
+        }
+      } catch {
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const [operatorMode, setOperatorMode] = useState<OperatorMode>('auto');
+  const [workflowName, setWorkflowName] = useState('Default workflow');
+  const [workflowDescription, setWorkflowDescription] = useState('Design, code, and review workflow');
+  const [repoRef, setRepoRef] = useState('');
+  const [jsonDraft, setJsonDraft] = useState('');
+  const [compiledBuilderDefinition, setCompiledBuilderDefinition] = useState<WorkflowTemplateDefinition | null>(null);
+  const [loadedTemplateDefinition, setLoadedTemplateDefinition] = useState<WorkflowTemplateDefinition | null>(null);
+  const [createRunAfterSave, setCreateRunAfterSave] = useState(true);
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [loadTemplateOpen, setLoadTemplateOpen] = useState(false);
+  const [globalCapabilitiesOpen, setGlobalCapabilitiesOpen] = useState(false);
+
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  const [pendingStageSelectionId, setPendingStageSelectionId] = useState<string | null>(null);
   const [manualCapabilityStatus, setManualCapabilityStatus] = useState<string | null>(null);
   const [manualCapabilityBusy, setManualCapabilityBusy] = useState(false);
   const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
@@ -875,6 +814,8 @@ export function WorkflowShell() {
   const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
+  const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
+  const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
   const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
   const [runContextOpen, setRunContextOpen] = useState(false);
@@ -912,27 +853,54 @@ export function WorkflowShell() {
   }, []);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
+  const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting';
+  const isManualMode = isInteractiveMode;
   const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
   const selectedWorkflowStep = selectedRunTemplate?.definition.steps.find((step) => step.id === (selectedStepId ?? selectedRun?.current_step_id ?? '')) ?? null;
+
+  const workflowStageDescriptors = useMemo(
+    () => workflowBuilderCatalog ? descriptorMap(workflowBuilderCatalog) : {},
+    [workflowBuilderCatalog]
+  );
+
+  const selectedStageDescriptor = useMemo(
+    () => selectedWorkflowStep ? workflowStageDescriptors[selectedWorkflowStep.step_type] ?? null : null,
+    [selectedWorkflowStep, workflowStageDescriptors]
+  );
+
+  const inferenceRequiredForSelectedStep = useMemo(
+    () => stepUsesCapability(selectedWorkflowStep, 'inference'),
+    [selectedWorkflowStep]
+  );
+
+  const selectedRunDefinition = useMemo<WorkflowTemplateDefinition | null>(() => {
+    return selectedRun?.definition ?? null;
+  }, [selectedRun?.definition]);
+
+  const pendingStageSelection = pendingStageSelectionId
+    ? selectedRunDefinition?.steps.find((step) => step.id === pendingStageSelectionId) ?? null
+    : null;
   const sharedInferenceState = useMemo(() => {
-    const context = (selectedRun?.context as Record<string, unknown> | undefined) ?? undefined;
-    const inference = (context?.model_inference ?? null) as Record<string, unknown> | null;
-    return inference;
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    return (capabilities.inference ?? null) as Record<string, unknown> | null;
   }, [selectedRun?.context]);
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
-    const stageState = (workflowEngine?.stage_state ?? {}) as Record<string, unknown>;
+    const stageOverrides = (workflowEngine?.stage_overrides ?? {}) as Record<string, unknown>;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
-    const globalRepoContext = (globalState.repo_context ?? null) as Record<string, unknown> | null;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    const globalRepoContext = (capabilities.context_export ?? null) as Record<string, unknown> | null;
     const stepId = selectedStepId ?? selectedRun?.current_step_id ?? '';
-    const localStageState = (stageState[stepId] ?? null) as Record<string, unknown> | null;
-    if (!localStageState && !globalRepoContext && !sharedInferenceState) {
+    const localStageOverride = (stageOverrides[stepId] ?? null) as Record<string, unknown> | null;
+    if (!localStageOverride && !globalRepoContext && !sharedInferenceState) {
       return null;
     }
     return {
       ...(globalRepoContext ? { repo_context: globalRepoContext } : {}),
       ...(sharedInferenceState ? { inference: sharedInferenceState } : {}),
-      ...(localStageState ?? {})
+      ...(localStageOverride ?? {})
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
@@ -945,7 +913,29 @@ export function WorkflowShell() {
     return `${includeFiles.length} file${includeFiles.length === 1 ? '' : 's'} selected`;
   }, [selectedRepoPaths]);
   const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
-  const definition = useMemo(() => buildTemplateDefinition(builderSteps), [builderSteps]);
+  const definition = useMemo<WorkflowTemplateDefinition>(() => compiledBuilderDefinition ?? ({
+    version: 1,
+    globals: {
+      resources: {
+        repo: {
+          repo_ref: '',
+          git_ref: 'WORKTREE'
+        }
+      },
+      capabilities: {
+        inference: {},
+        context_export: {
+          save_path: '/tmp/repo_context.txt'
+        },
+        changeset_schema: {},
+        'gateway_model/changeset': {},
+        compile_commands: {},
+        'sap/import': {},
+        'sap/export': {}
+      }
+    },
+    steps: []
+  }), [compiledBuilderDefinition]);
 
   const inferenceConnectionStatus = useMemo<InferenceConnectionStatus>(() => {
     if (inferenceTransport === 'api') {
@@ -1025,13 +1015,9 @@ export function WorkflowShell() {
   }, [selectedRunId]);
 
   useEffect(() => {
-    const desired = new Set(
-      runs
-        .filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting')
-        .map((run) => run.id)
-    );
+    const desired = new Set<string>();
 
-    if (selectedRunId) {
+    if (monitorView === 'workflow_detail' && selectedRunId) {
       desired.add(selectedRunId);
     }
 
@@ -1044,7 +1030,7 @@ export function WorkflowShell() {
     for (const runId of desired) {
       connectRunEventStream(runId);
     }
-  }, [runs, selectedRunId]);
+  }, [monitorView, selectedRunId]);
 
   useEffect(() => {
     setSelectedStepId(selectedRun?.current_step_id ?? null);
@@ -1075,6 +1061,20 @@ export function WorkflowShell() {
   }, [sharedInferenceState, selectedRun?.id]);
 
   useEffect(() => {
+    if (!changesetSchemaConfigOpen) return;
+    if (stageChangesetSchemaText.trim()) return;
+    void loadCanonicalChangesetSchema(false);
+  }, [changesetSchemaConfigOpen, stageChangesetSchemaText]);
+
+  useEffect(() => {
+    if (!globalApplyChangesetOpen) return;
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
+    setGlobalApplyChangesetText(typeof currentGatewayChangeset.draft === 'string' ? currentGatewayChangeset.draft : '');
+  }, [globalApplyChangesetOpen, selectedRun?.id, selectedRun?.context]);
+
+  useEffect(() => {
     const step = selectedWorkflowStep;
     if (!step) return;
 
@@ -1090,12 +1090,25 @@ export function WorkflowShell() {
       ? repoContext.include_files.filter((value): value is string => typeof value === 'string')
       : [];
 
-    if (step.id === 'code' && typeof promptFragments.changeset_schema !== 'string') {
+    if (step.step_type === 'code' && typeof promptFragments.changeset_schema !== 'string') {
       void loadCanonicalChangesetSchema(false);
     }
 
-    setStageUserInput(typeof promptFragments.user_input === 'string' ? promptFragments.user_input : '');
-    setStageChangesetSchemaText(typeof promptFragments.changeset_schema === 'string' ? promptFragments.changeset_schema : '');
+    const globalChangesetSchema = (globalCapabilities.changeset_schema ?? {}) as Record<string, unknown>;
+    const selectedPrompt = ((selectedStageState?.prompt ?? {}) as Record<string, unknown>);
+    const selectedExecutionLogic = (selectedStageState?.execution_logic ?? step.execution_logic ?? {}) as Record<string, unknown>;
+    const selectedAutomation = (selectedExecutionLogic.automation ?? {}) as Record<string, unknown>;
+    const hydratedUserInput = getString(selectedPrompt.user_input) ?? getString(promptFragments.user_input) ?? '';
+    const hydratedSchemaText = getString(globalChangesetSchema.schema) ?? '';
+    const hydratedInjectContext = getBoolean(selectedAutomation.inject_context) ?? Boolean(step.prompt?.include_repo_context);
+    const hydratedInjectChangesetSchema = getBoolean(selectedAutomation.inject_changeset_schema) ?? (step.prompt?.include_changeset_schema ?? step.step_type === 'code');
+
+    if (step.step_type === 'code' && !hydratedSchemaText.trim()) {
+      void loadCanonicalChangesetSchema(false);
+    }
+
+    setStageUserInput(hydratedUserInput);
+    setStageChangesetSchemaText(hydratedSchemaText);
     setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
     setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
     setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
@@ -1116,51 +1129,29 @@ export function WorkflowShell() {
     );
     setStageApproved(Boolean(review.approved));
     setStageRejected(Boolean(review.rejected));
-    setStageIncludeRepoContext(
-      typeof promptFragmentEnabled.repo_context === 'boolean'
-        ? promptFragmentEnabled.repo_context
-        : Boolean(step.prompt?.include_repo_context)
-    );
-    setStageIncludeChangesetSchema(
-      typeof promptFragmentEnabled.changeset_schema === 'boolean'
-        ? promptFragmentEnabled.changeset_schema
-        : (step.prompt?.include_changeset_schema ?? step.id === 'code')
-    );
+    setStageIncludeRepoContext(hydratedInjectContext);
+    setStageIncludeChangesetSchema(hydratedInjectChangesetSchema);
     setStageIncludeApplyError(
-      typeof promptFragmentEnabled.apply_error === 'boolean'
-        ? promptFragmentEnabled.apply_error
-        : false
+      typeof selectedAutomation.include_apply_error === 'boolean'
+        ? Boolean(selectedAutomation.include_apply_error)
+        : step.step_type === 'code'
     );
     setStageIncludeCompileError(
-      typeof promptFragmentEnabled.compile_error === 'boolean'
-        ? promptFragmentEnabled.compile_error
-        : false
+      typeof selectedAutomation.include_compile_error === 'boolean'
+        ? Boolean(selectedAutomation.include_compile_error)
+        : step.step_type === 'code'
     );
-    const selectedExecutionLogic = (selectedStageState?.execution_logic ?? step.execution_logic ?? {}) as Record<string, unknown>;
-    const selectedAutomation = (selectedExecutionLogic.automation ?? {}) as Record<string, unknown>;
     setStageAutoApplyChangeset(
       typeof selectedAutomation.auto_apply_changeset === 'boolean'
         ? Boolean(selectedAutomation.auto_apply_changeset)
-        : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.id === 'code')
+        : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
     setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
     setInferenceModel(typeof inferenceConfig.model === 'string' ? String(inferenceConfig.model) : 'gpt-5');
     setBrowserTargetUrl(
       typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
         ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
-        : 'https://chatgpt.com/?temporary-chat=true'
-    );
-    setBrowserCdpUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
-        : 'http://127.0.0.1:9222'
-    );
-    setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
-    setInferenceModel(typeof inferenceConfig.model === 'string' ? String(inferenceConfig.model) : 'gpt-5');
-    setBrowserTargetUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
-        : 'https://chatgpt.com/?temporary-chat=true'
+        : 'https://website.com'
     );
     setBrowserCdpUrl(
       typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
@@ -1185,7 +1176,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
-  }, [selectedStageHydrationKey]);
+  }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
 
   function buildInteractiveGlobalStatePayload() {
     const includeFiles = stageRepoContextIncludeFilesText
@@ -1202,33 +1193,49 @@ export function WorkflowShell() {
       .filter(Boolean)
       .map((command) => ({ command, label: command }));
     const promptFragments: Record<string, unknown> = {
-      user_input: stageUserInput,
-      changeset_schema: stageChangesetSchemaText,
       apply_error: stageApplyError,
       compile_error: stageCompileError
     };
     const promptFragmentEnabled: Record<string, unknown> = {
-      user_input: true,
-      repo_context: stageIncludeRepoContext,
-      changeset_schema: stageIncludeChangesetSchema,
       apply_error: stageIncludeApplyError && Boolean(stageApplyError.trim()),
       compile_error: stageIncludeCompileError && Boolean(stageCompileError.trim())
     };
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentResources = (currentGlobalState.resources as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentInference = (currentCapabilities.inference as Record<string, unknown> | undefined) ?? {};
+    const currentInferenceBrowser = (currentInference.browser as Record<string, unknown> | undefined) ?? {};
+    const currentContextExport = (currentCapabilities.context_export as Record<string, unknown> | undefined) ?? {};
+    const currentCompileCommands = (currentCapabilities.compile_commands as Record<string, unknown> | undefined) ?? {};
+    const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
 
     return {
+      ...currentGlobalState,
       resources: {
+        ...currentResources,
         repo: {
+          ...((currentResources.repo as Record<string, unknown> | undefined) ?? {}),
           repo_ref: resolveRepoRefForRun(selectedRun),
           git_ref: stageRepoContextGitRef || 'WORKTREE'
         }
       },
       capabilities: {
+        ...currentCapabilities,
         inference: {
+          ...currentInference,
           transport: inferenceTransport,
           model: inferenceModel,
-          prompt_fragments: promptFragments,
-          prompt_fragment_enabled: promptFragmentEnabled,
+          prompt_fragments: {
+            ...((currentInference.prompt_fragments as Record<string, unknown> | undefined) ?? {}),
+            ...promptFragments
+          },
+          prompt_fragment_enabled: {
+            ...((currentInference.prompt_fragment_enabled as Record<string, unknown> | undefined) ?? {}),
+            ...promptFragmentEnabled
+          },
           browser: {
+            ...currentInferenceBrowser,
             profile: 'default',
             bridge_dir: 'bridge',
             cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
@@ -1244,6 +1251,7 @@ export function WorkflowShell() {
           }
         },
         context_export: {
+          ...currentContextExport,
           git_ref: stageRepoContextGitRef || 'WORKTREE',
           include_files: includeFiles,
           exclude_regex: excludeRegex,
@@ -1253,7 +1261,15 @@ export function WorkflowShell() {
           include_staged_diff: stageRepoContextIncludeStagedDiff,
           include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
         },
+        changeset_schema: {
+          ...currentChangesetSchema,
+          schema: stageChangesetSchemaText
+        },
+        'gateway_model/changeset': {
+          ...currentGatewayChangeset
+        },
         compile_commands: {
+          ...currentCompileCommands,
           commands: compileCommands
         }
       }
@@ -1842,34 +1858,54 @@ export function WorkflowShell() {
 
 
   async function openWorkflow(runId: string) {
-    await refreshRunDetails(runId);
+    setSelectedRunId(runId);
     setView('monitor');
     setMonitorView('workflow_detail');
+    void refreshRunDetails(runId);
+    void refreshLiveMonitor(runId);
   }
 
   function backToWorkflowList() {
     setMonitorView('workflow_list');
   }
 
-  function updateStep(stepId: string, patch: Partial<BuilderStep>) {
-    setBuilderSteps((prev) => prev.map((step) => (step.id === stepId ? { ...step, ...patch } : step)));
-  }
-
-  function updateStepTransitions(stepId: string, patch: Partial<TransitionEditorValue>) {
-    setBuilderSteps((prev) => prev.map((step) => step.id !== stepId ? step : { ...step, transitions: { ...step.transitions, ...patch } }));
+  async function openBuilder() {
+    try {
+      setBusy(true);
+      setError(null);
+      await refreshRunsAndTemplates();
+      setView('builder');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleSaveTemplate() {
     try {
       setBusy(true);
       setError(null);
-      const parsed = builderMode === 'json' ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition) : definition;
-      const template = await createTemplate({ name: workflowName, description: workflowDescription, definition: parsed });
+      const parsed = builderMode === 'json'
+        ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
+        : compiledBuilderDefinition;
+      if (!parsed) {
+        throw new Error('Builder has not produced a compiled workflow definition yet.');
+      }
+      const template = await createTemplate({ name: workflowName, description: workflowDescription, repo_ref: repoRef, definition: parsed });
       await refreshRunsAndTemplates();
       setSelectedTemplateId(template.id);
       setTemplateModalOpen(false);
       if (createRunAfterSave) {
-        const run = await createRun({ template_id: template.id, title: runTitle, repo_ref: repoRef, context: {} });
+        const run = await createRun({
+          template_id: template.id,
+          title: workflowName,
+          repo_ref: repoRef,
+          definition: parsed,
+          context: {
+            workflow_engine: {}
+          }
+        });
         await refreshRunsAndTemplates(run.id);
         setView('monitor');
         setMonitorView('workflow_detail');
@@ -1889,10 +1925,89 @@ export function WorkflowShell() {
     try {
       setBusy(true);
       setError(null);
-      const run = await createRun({ template_id: templateId, title: runTitle, repo_ref: repoRef, context: {} });
+      const template = templates.find((item) => item.id === templateId);
+      const run = await createRun({
+        template_id: templateId,
+        title: workflowName,
+        repo_ref: repoRef,
+        definition: template?.definition,
+        context: {
+          workflow_engine: {}
+        }
+      });
       await refreshRunsAndTemplates(run.id);
       setView('monitor');
       setMonitorView('workflow_detail');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateWorkflow() {
+    try {
+      setBusy(true);
+      setError(null);
+      const parsed = builderMode === 'json'
+        ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
+        : compiledBuilderDefinition;
+      if (!parsed) {
+        throw new Error('Builder has not produced a compiled workflow definition yet.');
+      }
+      const template = await createTemplate({ name: workflowName, description: workflowDescription, repo_ref: repoRef, definition: parsed });
+      const run = await createRun({
+        template_id: template.id,
+        title: workflowName,
+        repo_ref: repoRef,
+        definition: parsed,
+        context: {
+          workflow_engine: {}
+        }
+      });
+      await refreshRunsAndTemplates(run.id);
+      setSelectedTemplateId(template.id);
+      setTemplateModalOpen(false);
+      setView('monitor');
+      setMonitorView('workflow_detail');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+
+  function handleLoadTemplateMetadata(templateId?: string | null) {
+    if (!templateId) {
+      setError('Select a template first.');
+      return;
+    }
+    const template = templates.find((item) => item.id === templateId);
+    if (!template) {
+      setError('Selected template was not found.');
+      return;
+    }
+    setError(null);
+    setSelectedTemplateId(template.id);
+    setWorkflowName(template.name);
+    setWorkflowDescription(template.description);
+    setRepoRef(template.repo_ref);
+    setCompiledBuilderDefinition(template.definition);
+    setLoadedTemplateDefinition(template.definition);
+    setJsonDraft(JSON.stringify(template.definition, null, 2));
+    setBuilderMode('builder');
+    setLoadTemplateOpen(false);
+  }
+
+  async function handleDeleteTemplate(templateId: string) {
+    try {
+      setBusy(true);
+      setError(null);
+      await deleteTemplate(templateId);
+      const nextTemplateId = selectedTemplateId === templateId ? null : selectedTemplateId;
+      await refreshRunsAndTemplates();
+      setSelectedTemplateId(nextTemplateId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1940,6 +2055,48 @@ export function WorkflowShell() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function patchGlobalCapabilityState(fragment: Record<string, unknown>) {
+    if (!selectedRun?.id) return;
+    const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    await patchWorkflowGlobalState(selectedRun.id, {
+      ...currentGlobalState,
+      ...fragment
+    });
+    await refreshRunDetails(selectedRun.id);
+  }
+
+  async function handleSaveGlobalChangesetSchema() {
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    await patchGlobalCapabilityState({
+      capabilities: {
+        ...currentCapabilities,
+        changeset_schema: {
+          ...currentChangesetSchema,
+          schema: stageChangesetSchemaText
+        }
+      }
+    });
+    setChangesetSchemaConfigOpen(false);
+  }
+
+  async function handleSaveGlobalApplyChangeset() {
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
+    await patchGlobalCapabilityState({
+      capabilities: {
+        ...currentCapabilities,
+        'gateway_model/changeset': {
+          ...currentGatewayChangeset,
+          draft: globalApplyChangesetText
+        }
+      }
+    });
+    setGlobalApplyChangesetOpen(false);
   }
 
   async function handleDeleteRun(runId: string) {
@@ -2058,8 +2215,7 @@ export function WorkflowShell() {
       if (replaceRoot) {
         setTreeRootData(data);
         setTreeChildrenByParent({ '': data.entries });
-        const visiblePaths = new Set<string>(data.entries.filter((entry) => entry.kind === 'file').map((entry) => entry.path));
-        syncRepoSelectionState(selectedRepoPaths.filter((path) => visiblePaths.has(path)));
+        syncRepoSelectionState(selectedRepoPaths);
         setSelectedRepoDirs(new Set());
       } else {
         setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
@@ -2109,15 +2265,15 @@ export function WorkflowShell() {
 
     const parts: string[] = [];
     if (stageIncludeRepoContext) parts.push('### REPO CONTEXT\nAttached repo context from backend export');
-    if (selectedWorkflowStep?.id === 'code' && stageIncludeChangesetSchema) {
+    if (selectedWorkflowStep?.step_type === 'code' && stageIncludeChangesetSchema) {
       parts.push(`### CHANGESET SCHEMA\n${stageChangesetSchemaText.trim() || 'Use ChangeSet JSON version 1. Return only the JSON payload.'}`);
     }
-    if (selectedWorkflowStep?.id === 'code' && stageIncludeApplyError && stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
-    if (selectedWorkflowStep?.id === 'code' && stageIncludeCompileError && stageCompileError.trim()) parts.push(`### COMPILE ERROR\n${stageCompileError.trim()}`);
-    if (selectedWorkflowStep?.id === 'review' && stageReviewNotes.trim()) parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
+    if (selectedWorkflowStep?.step_type === 'code' && stageIncludeApplyError && stageApplyError.trim()) parts.push(`### APPLY ERROR\n${stageApplyError.trim()}`);
+    if (selectedWorkflowStep?.step_type === 'code' && stageIncludeCompileError && stageCompileError.trim()) parts.push(`### COMPILE ERROR\n${stageCompileError.trim()}`);
+    if (selectedWorkflowStep?.step_type === 'review' && stageReviewNotes.trim()) parts.push(`### REVIEW NOTES\n${stageReviewNotes.trim()}`);
     if (stageUserInput.trim()) parts.push(`### USER INPUT\n${stageUserInput.trim()}`);
     return parts.join('\n\n');
-  }, [selectedWorkflowStep?.id, stageCompileCommandsText, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageIncludeApplyError, stageApplyError, stageIncludeCompileError, stageCompileError, stageReviewNotes, stageUserInput]);
+  }, [selectedWorkflowStep?.step_type, stageCompileCommandsText, stageIncludeRepoContext, stageIncludeChangesetSchema, stageChangesetSchemaText, stageIncludeApplyError, stageApplyError, stageIncludeCompileError, stageCompileError, stageReviewNotes, stageUserInput]);
 
   const selectedLiveStageTrail = useMemo(() => {
     const scopedTrails = selectedStepId
@@ -2208,7 +2364,15 @@ export function WorkflowShell() {
     return parts.join('\n\n');
   }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.id]);
 
-  function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
+  function getBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function getString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
     return (
       <Stack gap="xs" h="100%">
         <Group justify="space-between" align="center">
@@ -2235,9 +2399,9 @@ export function WorkflowShell() {
 
   function buildInteractiveStagePayload() {
     const step = selectedWorkflowStep;
-    const stepId = step?.id ?? null;
+    const stepType = step?.step_type ?? null;
 
-    if (stepId === 'compile') {
+    if (stepType === 'compile') {
       return {
         execution_logic: {
           kind: 'compile_stage_policy'
@@ -2245,15 +2409,19 @@ export function WorkflowShell() {
       } as Record<string, unknown>;
     }
 
-    if (stepId === 'review') {
+    if (stepType === 'review') {
       return {
         review: { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes }
       } as Record<string, unknown>;
     }
 
-    const payload: Record<string, unknown> = {};
+    const payload: Record<string, unknown> = {
+      prompt: {
+        user_input: stageUserInput
+      }
+    };
 
-    if (stepId === 'design') {
+    if (stepType === 'design') {
       payload.execution_logic = {
         kind: 'design_stage_policy',
         automation: {
@@ -2262,12 +2430,14 @@ export function WorkflowShell() {
       };
     }
 
-    if (stepId === 'code') {
+    if (stepType === 'code') {
       payload.execution_logic = {
         kind: 'code_stage_policy',
         automation: {
           inject_context: stageIncludeRepoContext,
           inject_changeset_schema: stageIncludeChangesetSchema,
+          include_apply_error: stageIncludeApplyError,
+          include_compile_error: stageIncludeCompileError,
           auto_apply_changeset: stageAutoApplyChangeset,
           max_consecutive_apply_failures: 1
         }
@@ -2299,32 +2469,25 @@ export function WorkflowShell() {
     await runManualCapability(async () => {
       const json = await selectWorkflowStep(selectedRun.id, stepId);
       return json as Record<string, unknown>;
-    }, `Selected step ${stepId}.`);
+    }, `Selected stage ${stepId}.`);
     setSelectedStepId(stepId);
   }
 
-  async function handleManualRunCurrentStep() {
-    if (!selectedRun) return;
-    await runManualCapability(async () => {
-      const json = await runCurrentWorkflowStep(selectedRun.id, selectedStepId ?? selectedRun.current_step_id);
-      return json as Record<string, unknown>;
-    }, 'Executed current workflow step.');
+  function handleStageCardClick(stepId: string) {
+    if (!selectedRun) {
+      return;
+    }
+    if (!isInteractiveMode || selectedRun.current_step_id === stepId) {
+      return;
+    }
+    setPendingStageSelectionId(stepId);
   }
 
-  async function handleManualPreviousStep() {
-    if (!selectedRun) return;
-    await runManualCapability(async () => {
-      const json = await previousWorkflowStep(selectedRun.id);
-      return json as Record<string, unknown>;
-    }, 'Moved to previous workflow step.');
-  }
-
-  async function handleManualNextStep() {
-    if (!selectedRun) return;
-    await runManualCapability(async () => {
-      const json = await nextWorkflowStep(selectedRun.id);
-      return json as Record<string, unknown>;
-    }, 'Moved to next workflow step.');
+  async function confirmStageSelection() {
+    if (!pendingStageSelectionId) return;
+    const stepId = pendingStageSelectionId;
+    await handleManualSelectStep(stepId);
+    setPendingStageSelectionId(null);
   }
 
   async function syncInteractiveGlobalState() {
@@ -2424,52 +2587,6 @@ export function WorkflowShell() {
     toggleExpandedSet(setExpandedStageIds, stepId);
   }
 
-  const stepOptions = builderSteps.map((step) => ({ value: step.id, label: `${step.name} (${step.id})` }));
-  const stageContractByType = new Map((builderContract?.stages ?? []).map((stage) => [stage.step_type, stage]));
-
-  function renderBuilderField(step: BuilderStep, field: WorkflowBuilderFieldContract) {
-    const value = step.fields[field.key];
-    if (field.type === 'boolean') {
-      return (
-        <Switch
-          key={field.key}
-          label={field.label}
-          checked={typeof value === 'boolean' ? value : false}
-          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.checked } })}
-        />
-      );
-    }
-    if (field.type === 'integer') {
-      return (
-        <TextInput
-          key={field.key}
-          label={field.label}
-          value={String(typeof value === 'number' ? value : 0)}
-          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: Number(e.currentTarget.value || '0') } })}
-        />
-      );
-    }
-    if (field.type === 'multiline_text') {
-      return (
-        <Textarea
-          key={field.key}
-          label={field.label}
-          minRows={4}
-          autosize
-          value={typeof value === 'string' ? value : ''}
-          onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.value } })}
-        />
-      );
-    }
-    return (
-      <TextInput
-        key={field.key}
-        label={field.label}
-        value={typeof value === 'string' ? value : ''}
-        onChange={(e) => updateStep(step.id, { fields: { ...step.fields, [field.key]: e.currentTarget.value } })}
-      />
-    );
-  }
 
   return (
     <AppShell padding="md">
@@ -2481,8 +2598,7 @@ export function WorkflowShell() {
               <Text c="dimmed">Build templates declaratively and monitor background workflow runs.</Text>
             </div>
             <Group>
-              <Button onClick={() => setView('builder')}>New workflow</Button>
-              <Button variant="light" onClick={() => setTemplateModalOpen(true)} disabled={view !== 'builder'}>Save template</Button>
+              <Button onClick={() => void openBuilder()} loading={busy}>New workflow</Button>
               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => void refreshRunsAndTemplates()}>Refresh</Button>
             </Group>
           </Group>
@@ -2490,75 +2606,64 @@ export function WorkflowShell() {
           {error ? <Alert color="red">{error}</Alert> : null}
 
           {view === 'builder' ? (
-            <Modal opened={view === 'builder'} onClose={() => setView('monitor')} title="Create workflow" size="min(1400px, 96vw)" centered>
-              <Stack>
-                <SimpleGrid cols={{ base: 1, xl: 2 }}>
-                <Card withBorder>
-                  <Stack>
-                    <Title order={4}>Workflow metadata</Title>
-                    <TextInput label="Workflow name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
-                    <Textarea label="Description" minRows={2} value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
-                    <TextInput label="Run title" value={runTitle} onChange={(e) => setRunTitle(e.currentTarget.value)} />
-                    <TextInput label="Repo path" placeholder="C:/repo or /home/user/repo" value={repoRef} onChange={(e) => setRepoRef(e.currentTarget.value)} />
-                    <Group>
-                      <Button onClick={() => void handleCreateRunFromTemplate(selectedTemplateId)} loading={busy} variant="default">Create run from selected template</Button>
-                      <Select style={{ flex: 1 }} label="Existing template" placeholder="Select saved template" data={templates.map((template) => ({ value: template.id, label: template.name }))} value={selectedTemplateId} onChange={setSelectedTemplateId} searchable clearable />
+            <Modal
+              opened={view === 'builder'}
+              onClose={() => setView('monitor')}
+              title="Workflow Builder"
+              size="calc(100vw - 32px)"
+              centered
+              fullScreen
+              padding="md"
+              zIndex={200}
+              styles={{
+                body: { paddingTop: 0, height: 'calc(100vh - 72px)' },
+                content: { background: 'var(--mantine-color-body)' }
+              }}
+            >
+              <Stack h="100%" gap="sm">
+                <Card withBorder p="sm">
+                  <Stack gap="sm">
+                    <Group justify="space-between" align="flex-start" wrap="wrap">
+                      <Stack gap={2}>
+                        <Title order={3}>Create workflow</Title>
+                        <Text c="dimmed" size="sm">Build the workflow on the canvas, then load or save templates from this panel.</Text>
+                      </Stack>
+                      <Group>
+                        <Button variant="default" onClick={() => setLoadTemplateOpen(true)} disabled={templates.length === 0}>Load template</Button>
+                        <Button variant="light" onClick={() => setTemplateModalOpen(true)}>Save template</Button>
+                        <Button variant="default" onClick={() => setView('monitor')}>Close</Button>
+                      </Group>
                     </Group>
+
+                    <Grid gutter="sm" align="end">
+                      <Grid.Col span={{ base: 12, md: 3 }}>
+                        <TextInput label="Workflow name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
+                      </Grid.Col>
+                      <Grid.Col span={{ base: 12, md: 3 }}>
+                        <TextInput label="Repo path" placeholder="C:/repo or /home/user/repo" value={repoRef} onChange={(e) => setRepoRef(e.currentTarget.value)} />
+                      </Grid.Col>
+                      <Grid.Col span={{ base: 12, md: 4 }}>
+                        <TextInput label="Description" value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
+                      </Grid.Col>
+                      <Grid.Col span={{ base: 12, md: 2 }}>
+                        <Button fullWidth onClick={() => void handleCreateWorkflow()} loading={busy}>
+                          Create workflow
+                        </Button>
+                      </Grid.Col>
+                    </Grid>
                   </Stack>
                 </Card>
 
-                <Card withBorder>
-                  <Stack>
-                    <Group justify="space-between">
-                      <Title order={4}>Builder mode</Title>
-                      <SegmentedControl value={builderMode} onChange={(value) => setBuilderMode(value as BuilderMode)} data={[{ label: 'Visual', value: 'builder' }, { label: 'JSON', value: 'json' }]} />
-                    </Group>
-                    <Text c="dimmed" size="sm">Visual mode edits stages and transitions directly. JSON mode lets you inspect or override the template definition sent to the backend.</Text>
-                    {builderMode === 'json' ? (
-                      <JsonInput autosize minRows={20} value={jsonDraft} onChange={setJsonDraft} formatOnBlur />
-                    ) : (
-                      <Stack gap="md">
-                        {builderSteps.map((step, index) => (
-                          <Card withBorder key={step.id}>
-                            <Stack>
-                              <Group justify="space-between">
-                                <Group>
-                                  <Badge variant="light">{index + 1}</Badge>
-                                  <Text fw={600}>{step.name}</Text>
-                                  <Code>{step.id}</Code>
-                                </Group>
-                                <Badge color={step.automationMode === 'automatic' ? 'blue' : 'gray'}>{step.automationMode}</Badge>
-                              </Group>
-                              <Grid>
-                                <Grid.Col span={{ base: 12, md: 6 }}>
-                                  <TextInput label="Name" value={step.name} onChange={(e) => updateStep(step.id, { name: e.currentTarget.value })} />
-                                </Grid.Col>
-                                <Grid.Col span={{ base: 12, md: 6 }}>
-                                  <Select label="Automation" value={step.automationMode} onChange={(value) => value && updateStep(step.id, { automationMode: value as AutomationMode })} data={[{ value: 'manual', label: 'manual' }, { value: 'assisted', label: 'assisted' }, { value: 'automatic', label: 'automatic' }]} />
-                                </Grid.Col>
-                              </Grid>
-                              <SimpleGrid cols={{ base: 1, md: 2 }}>
-                                {(stageContractByType.get(step.stepType)?.fields ?? []).map((field) => renderBuilderField(step, field))}
-                                <Switch label="Auto-advance on success" checked={step.autoAdvanceOnSuccess} onChange={(e) => updateStep(step.id, { autoAdvanceOnSuccess: e.currentTarget.checked })} />
-                              </SimpleGrid>
-                              <Divider label="Transitions" />
-                              <SimpleGrid cols={{ base: 1, md: 3 }}>
-                                <Select label="On success →" value={step.transitions.successTarget} data={[{ value: '', label: 'End workflow' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { successTarget: value ?? '' })} />
-                                <Select label="On error →" value={step.transitions.errorTarget} data={[{ value: '', label: 'Stop on error' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { errorTarget: value ?? '' })} />
-                                <Select label="On paused →" value={step.transitions.pausedTarget} data={[{ value: '', label: 'Wait on current step' }, ...stepOptions]} onChange={(value) => updateStepTransitions(step.id, { pausedTarget: value ?? '' })} />
-                              </SimpleGrid>
-                            </Stack>
-                          </Card>
-                        ))}
-                      </Stack>
-                    )}
-                  </Stack>
+                <Card withBorder p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
+                  <WorkflowBuilderEditor
+                    initialDefinition={loadedTemplateDefinition}
+                    onCompiledDefinitionChange={(next) => {
+                      setCompiledBuilderDefinition(next);
+                      setJsonDraft(JSON.stringify(next, null, 2));
+                    }}
+                    onError={setError}
+                  />
                 </Card>
-                </SimpleGrid>
-                <Group justify="flex-end">
-                  <Button variant="default" onClick={() => setView('monitor')}>Close</Button>
-                  <Button variant="light" onClick={() => setTemplateModalOpen(true)}>Save template</Button>
-                </Group>
               </Stack>
             </Modal>
           ) : monitorView === 'workflow_list' ? (
@@ -2655,79 +2760,47 @@ export function WorkflowShell() {
                           <Badge color={statusColor(selectedRun.status)}>{selectedRun.status}</Badge>
                         </Group>
                         <Stack gap="md">
-                          <Group>
-                            <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy}>Start</Button>
-                            <Button variant="light" leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleResumeRun()} loading={busy}>Resume</Button>
-                            <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy}>Pause</Button>
-                            <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
+                          <Group justify="space-between" align="flex-start" wrap="wrap">
+                            <Group>
+                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy}>Run autonomously</Button>
+                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy}>Pause</Button>
+                              <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
+                            </Group>
+                            <Stack gap={2} align="flex-end">
+                              <Text size="xs" c="dimmed">Created: {formatTimestamp(selectedRun.created_at)}</Text>
+                              <Text size="xs" c="dimmed">Updated: {formatTimestamp(selectedRun.updated_at)}</Text>
+                            </Stack>
                           </Group>
                           <Card withBorder>
                             <Stack gap="md">
                               <Group justify="space-between" align="center">
                                 <Title order={6}>Workflow controls</Title>
-                                <SegmentedControl value={operatorMode} onChange={(value) => setOperatorMode(value as OperatorMode)} data={[{ label: 'Auto', value: 'auto' }, { label: 'Manual', value: 'manual' }]} />
                               </Group>
-                              <SimpleGrid cols={{ base: 1, md: 3 }}>
-                                <Select label="Selected step" data={selectedRunTemplate?.definition.steps.map((step) => ({ value: step.id, label: `${step.name} (${step.id})` })) ?? []} value={selectedStepId} onChange={(value) => setSelectedStepId(value)} clearable={false} />
-                                <Stack gap="xs">
-                                  <Text size="sm">Current template step</Text>
-                                  <Code>{selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? '-'}</Code>
-                                </Stack>
-                                <Stack gap="xs">
-                                  <Text size="sm">Automation</Text>
-                                  <Badge>{selectedWorkflowStep?.automation_mode ?? '-'}</Badge>
-                                </Stack>
-                              </SimpleGrid>
                               <Group>
-                                <Button variant="default" onClick={() => void handleManualPreviousStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy}>Previous step</Button>
-                                <Button variant="default" onClick={() => selectedStepId && void handleManualSelectStep(selectedStepId)} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Select step</Button>
-                                <Button variant="default" onClick={() => void handleManualNextStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy}>Next step</Button>
-                                <Button onClick={() => void handleManualRunCurrentStep()} disabled={operatorMode !== 'manual' || manualCapabilityBusy} loading={manualCapabilityBusy}>Run current step</Button>
+                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
+                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedStepId || manualCapabilityBusy} loading={manualCapabilityBusy}>Run stage</Button>
+                                <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
+                                <Button variant="light" onClick={() => setGlobalCapabilitiesOpen(true)} disabled={!selectedRun}>Global capabilities</Button>
                               </Group>
                             </Stack>
                           </Card>
                         </Stack>
                         <Card withBorder>
                           <Stack gap="md">
-                            <Group justify="space-between" align="flex-start">
-                              <Stack gap="xs">
-                                <Text fw={600}>Run overview</Text>
-                                <Group gap="xs" wrap="wrap">
-                                  <Badge color={statusColor(selectedRun.status)}>{selectedRun.status}</Badge>
-                                  <Badge variant="light">Current: {selectedRun.current_step_id ?? '-'}</Badge>
-                                  <Badge variant="light">Polling: {(selectedRun.status === 'queued' || selectedRun.status === 'running') ? 'active' : 'idle'}</Badge>
-                                </Group>
-                              </Stack>
-                              <Code>{selectedRun.id}</Code>
-                            </Group>
-                            <SimpleGrid cols={{ base: 1, md: 3 }}>
-                              <Box>
-                                <Text size="xs" c="dimmed">Template</Text>
-                                <Text size="sm"><Code>{selectedRun.template_id ?? '-'}</Code></Text>
-                              </Box>
-                              <Box>
-                                <Text size="xs" c="dimmed">Created</Text>
-                                <Text size="sm">{formatTimestamp(selectedRun.created_at)}</Text>
-                              </Box>
-                              <Box>
-                                <Text size="xs" c="dimmed">Updated</Text>
-                                <Text size="sm">{formatTimestamp(selectedRun.updated_at)}</Text>
-                              </Box>
-                            </SimpleGrid>
-                            <Divider />
-                            <Stack gap="md">
-                              <Text fw={600}>Workflow progress</Text>
-                              {selectedRunTemplate ? (
-                                <Group gap="sm" wrap="wrap" align="stretch">
-                                  {selectedRunTemplate.definition.steps.map((step, index) => {
+                            <Text fw={600}>Workflow progress</Text>
+                            {selectedRunDefinition ? (
+                              <Group gap="sm" wrap="wrap" align="stretch">
+                                  {selectedRunDefinition.steps.map((step, index) => {
                                     const isCurrent = selectedRun?.current_step_id === step.id;
-                                    const currentIndex = selectedRunTemplate.definition.steps.findIndex((item) => item.id === selectedRun?.current_step_id);
+                                    const currentIndex = selectedRunDefinition.steps.findIndex((item) => item.id === selectedRun?.current_step_id);
                                     const isCompleted = currentIndex >= 0 && index < currentIndex;
+                                    const isUnknownCurrentStep = Boolean(selectedRun?.current_step_id) && currentIndex < 0;
                                     const color = isCurrent ? 'blue' : isCompleted ? 'green' : 'gray';
                                     return (
                                       <Group key={step.id} gap="sm" wrap="nowrap" align="center">
                                         <Box
                                           p="md"
+                                          onClick={() => handleStageCardClick(step.id)}
                                           style={{
                                             minWidth: 180,
                                             borderRadius: 12,
@@ -2736,7 +2809,8 @@ export function WorkflowShell() {
                                               ? 'rgba(34, 139, 230, 0.14)'
                                               : isCompleted
                                                 ? 'rgba(64, 192, 87, 0.12)'
-                                                : 'rgba(255,255,255,0.02)'
+                                                : 'rgba(255,255,255,0.02)',
+                                            cursor: 'pointer'
                                           }}
                                         >
                                           <Stack gap={6}>
@@ -2750,15 +2824,19 @@ export function WorkflowShell() {
                                             </Badge>
                                           </Stack>
                                         </Box>
-                                        {index < selectedRunTemplate.definition.steps.length - 1 ? <Text c="dimmed" fw={700}>→</Text> : null}
+                                        {index < selectedRunDefinition.steps.length - 1 ? <Text c="dimmed" fw={700}>→</Text> : null}
                                       </Group>
                                     );
                                   })}
+                                  {Boolean(selectedRun?.current_step_id) && selectedRunDefinition.steps.findIndex((item) => item.id === selectedRun.current_step_id) < 0 ? (
+                                    <Alert color="yellow" title="Current stage not in displayed definition">
+                                      Current step id: {selectedRun.current_step_id}
+                                    </Alert>
+                                  ) : null}
                                 </Group>
-                              ) : (
-                                <Text c="dimmed">The selected run is not linked to a loaded template.</Text>
-                              )}
-                            </Stack>
+                            ) : (
+                              <Text c="dimmed">The selected run is not linked to a loaded template.</Text>
+                            )}
                           </Stack>
                         </Card>
                       </Stack>
@@ -2772,8 +2850,23 @@ export function WorkflowShell() {
                       <Grid align="stretch">
                         <Grid.Col span={{ base: 12, xl: 4 }}>
                           <Stack>
-                            {selectedWorkflowStep?.id === 'design' || selectedWorkflowStep?.id === 'code' ? (
-                              <Card withBorder>
+                            {!inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
+                              <>
+                                <BackendDrivenStageInputsPanel
+                                  descriptor={selectedStageDescriptor}
+                                  selectedWorkflowStep={selectedWorkflowStep ?? null}
+                                  repoFragmentSummary={repoFragmentSummary}
+                                  stageApplyError={stageApplyError}
+                                  stageCompileError={stageCompileError}
+                                  inferenceConnectionStatus={inferenceConnectionStatus}
+                                  inferenceTransport={inferenceTransport}
+                                  onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
+                                  onOpenInferenceConfig={() => setInferenceConfigOpen(true)}
+                                  onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
+                                  onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
+                                  onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
+                                  onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
+                                />
                                 <InferenceConnectionCard
                                   inferenceConnectionStatus={inferenceConnectionStatus}
                                   inferenceReady={inferenceReady}
@@ -2785,6 +2878,7 @@ export function WorkflowShell() {
                                   inferenceBusy={inferenceBusy}
                                   inferenceStatus={inferenceStatus}
                                   inferenceConfigOpen={inferenceConfigOpen}
+                                  hideInlineCard
                                   onOpenConfig={() => setInferenceConfigOpen(true)}
                                   onCloseConfig={() => setInferenceConfigOpen(false)}
                                   onTransportChange={(value) => setInferenceTransport(value)}
@@ -2793,60 +2887,6 @@ export function WorkflowShell() {
                                   onBrowserCdpUrlChange={setBrowserCdpUrl}
                                   onSaveConfig={() => void configureInference()}
                                 />
-                              </Card>
-                            ) : null}
-
-                            {selectedWorkflowStep?.id === 'compile' || !inferenceRequiresConnection || inferenceReady ? (
-                              <>
-                                {selectedWorkflowStep?.id === 'design' ? (
-                                  <DesignStageInputsPanel
-                                    stageUserInput={stageUserInput}
-                                    stageIncludeRepoContext={stageIncludeRepoContext}
-                                    repoFragmentSummary={repoFragmentSummary}
-                                    onStageUserInputChange={setStageUserInput}
-                                    onStageIncludeRepoContextChange={setStageIncludeRepoContext}
-                                    onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
-                                  />
-                                ) : selectedWorkflowStep?.id === 'code' ? (
-                                  <CodeStageInputsPanel
-                                    stageUserInput={stageUserInput}
-                                    stageIncludeRepoContext={stageIncludeRepoContext}
-                                    stageIncludeChangesetSchema={stageIncludeChangesetSchema}
-                                    stageAutoApplyChangeset={stageAutoApplyChangeset}
-                                    stageIncludeApplyError={stageIncludeApplyError}
-                                    stageApplyError={stageApplyError}
-                                    stageIncludeCompileError={stageIncludeCompileError}
-                                    stageCompileError={stageCompileError}
-                                    repoFragmentSummary={repoFragmentSummary}
-                                    onStageUserInputChange={setStageUserInput}
-                                    onStageIncludeRepoContextChange={setStageIncludeRepoContext}
-                                    onStageIncludeChangesetSchemaChange={setStageIncludeChangesetSchema}
-                                    onStageAutoApplyChangesetChange={setStageAutoApplyChangeset}
-                                    onStageIncludeApplyErrorChange={setStageIncludeApplyError}
-                                    onStageIncludeCompileErrorChange={setStageIncludeCompileError}
-                                    onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
-                                    onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
-                                    onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
-                                    onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
-                                  />
-                                ) : selectedWorkflowStep?.id === 'compile' ? (
-                                  <CompileStageInputsPanel
-                                    stageCompileCommandsText={stageCompileCommandsText}
-                                    onStageCompileCommandsTextChange={setStageCompileCommandsText}
-                                  />
-                                ) : (
-                                  <ReviewStageInputsPanel
-                                    stageReviewNotes={stageReviewNotes}
-                                    onStageReviewNotesChange={setStageReviewNotes}
-                                  />
-                                )}
-
-                                <Group>
-                                  <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
-                                  <Button size="md" onClick={() => void handleManualRunWithPatchedState()} disabled={operatorMode !== 'manual' || !selectedStepId || manualCapabilityBusy} loading={manualCapabilityBusy}>Run stage</Button>
-                                  <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
-                                  <Button variant="light" onClick={() => setGlobalCapabilitiesOpen(true)} disabled={!selectedRun}>Global capabilities</Button>
-                                </Group>
                               </>
                             ) : null}
                           </Stack>
@@ -3006,11 +3046,24 @@ export function WorkflowShell() {
                   </Card>
                 </Grid.Col>
               </Grid>
-          )}
-        </Stack>
+            )}
+          </Stack>
 
-        <Modal opened={repoContextConfigOpen} onClose={() => setRepoContextConfigOpen(false)} title="Repo fragment" size="80%" centered>
-          <Stack>
+        <Modal
+          opened={repoContextConfigOpen}
+          onClose={() => setRepoContextConfigOpen(false)}
+          title="Repo fragment"
+          size="min(1600px, calc(100vw - 64px))"
+          centered
+          padding="md"
+          zIndex={300}
+          withCloseButton
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
             <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(e) => setStageRepoContextGitRef(e.currentTarget.value)} placeholder="WORKTREE" />
             <TextInput label="Save path" value={stageRepoContextSavePath} onChange={(e) => setStageRepoContextSavePath(e.currentTarget.value)} placeholder="/tmp/repo_context.txt" />
             <SimpleGrid cols={{ base: 1, md: 2 }}>
@@ -3070,28 +3123,108 @@ export function WorkflowShell() {
           </Stack>
         </Modal>
 
-        <Modal opened={changesetSchemaConfigOpen} onClose={() => setChangesetSchemaConfigOpen(false)} title="Changeset schema fragment" size="70%" centered>
-          <Stack>
+        <Modal
+          opened={changesetSchemaConfigOpen}
+          onClose={() => setChangesetSchemaConfigOpen(false)}
+          title="Workflow changeset schema"
+          size="min(1600px, calc(100vw - 64px))"
+          centered
+          padding="md"
+          zIndex={300}
+          withCloseButton
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
             <Group justify="space-between">
-              <Text size="sm" c="dimmed">Use the canonical changeset schema example from the backend capability or paste custom guidance.</Text>
+              <Text size="sm" c="dimmed">Patch the workflow-global changeset schema capability state.</Text>
               <Button size="xs" variant="light" loading={changesetSchemaBusy} onClick={() => void loadCanonicalChangesetSchema(true)}>
                 Reload from API
               </Button>
             </Group>
-            <Textarea label="Changeset schema guidance" minRows={18} value={stageChangesetSchemaText} onChange={(e) => setStageChangesetSchemaText(e.currentTarget.value)} placeholder="Canonical backend changeset schema will populate here by default; you can override it." />
-            <Group justify="flex-end"><Button size="xs" onClick={() => setChangesetSchemaConfigOpen(false)}>Done</Button></Group>
+            <Textarea
+              label="Changeset schema guidance"
+              value={stageChangesetSchemaText}
+              onChange={(e) => setStageChangesetSchemaText(e.currentTarget.value)}
+              placeholder="Canonical backend changeset schema will populate here by default; you can override it."
+              autosize={false}
+              styles={{ root: { flex: 1 }, wrapper: { flex: 1 }, input: { height: '100%', minHeight: 'calc(100vh - 280px)' } }}
+            />
+            <Group justify="flex-end">
+              <Button size="xs" variant="default" onClick={() => setChangesetSchemaConfigOpen(false)}>Cancel</Button>
+              <Button size="xs" onClick={() => void handleSaveGlobalChangesetSchema()} loading={busy}>Save</Button>
+            </Group>
           </Stack>
         </Modal>
 
-        <Modal opened={applyErrorConfigOpen} onClose={() => setApplyErrorConfigOpen(false)} title="Apply error fragment" size="70%" centered>
-          <Stack>
+        <Modal
+          opened={globalApplyChangesetOpen}
+          onClose={() => setGlobalApplyChangesetOpen(false)}
+          title="Manually apply changeset"
+          size="min(1600px, calc(100vw - 64px))"
+          centered
+          padding="md"
+          zIndex={300}
+          withCloseButton
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
+            <Text size="sm" c="dimmed">Patch the workflow-global gateway changeset capability state.</Text>
+            <Textarea
+              label="Changeset draft"
+              value={globalApplyChangesetText}
+              onChange={(e) => setGlobalApplyChangesetText(e.currentTarget.value)}
+              placeholder="Paste a changeset draft to apply or persist globally for the workflow."
+              autosize={false}
+              styles={{ root: { flex: 1 }, wrapper: { flex: 1 }, input: { height: '100%', minHeight: 'calc(100vh - 280px)' } }}
+            />
+            <Group justify="flex-end">
+              <Button size="xs" variant="default" onClick={() => setGlobalApplyChangesetOpen(false)}>Cancel</Button>
+              <Button size="xs" onClick={() => void handleSaveGlobalApplyChangeset()} loading={busy}>Save</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal
+          opened={applyErrorConfigOpen}
+          onClose={() => setApplyErrorConfigOpen(false)}
+          title="Apply error fragment"
+          size="calc(100vw - 32px)"
+          centered
+          fullScreen
+          padding="md"
+          zIndex={300}
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 72px)' },
+            content: { background: 'var(--mantine-color-body)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
             <Textarea label="Apply error" minRows={12} value={stageApplyError} onChange={(e) => setStageApplyError(e.currentTarget.value)} placeholder="Paste apply failures for the next retry prompt" />
             <Group justify="flex-end"><Button size="xs" onClick={() => setApplyErrorConfigOpen(false)}>Done</Button></Group>
           </Stack>
         </Modal>
 
-        <Modal opened={compileErrorConfigOpen} onClose={() => setCompileErrorConfigOpen(false)} title="Compile error fragment" size="70%" centered>
-          <Stack>
+        <Modal
+          opened={compileErrorConfigOpen}
+          onClose={() => setCompileErrorConfigOpen(false)}
+          title="Compile error fragment"
+          size="calc(100vw - 32px)"
+          centered
+          fullScreen
+          padding="md"
+          zIndex={300}
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 72px)' },
+            content: { background: 'var(--mantine-color-body)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
             <Textarea label="Compile error" minRows={12} value={stageCompileError} onChange={(e) => setStageCompileError(e.currentTarget.value)} placeholder="Compile failures persisted by the backend for the next code retry prompt" />
             <Group justify="flex-end"><Button size="xs" onClick={() => setCompileErrorConfigOpen(false)}>Done</Button></Group>
           </Stack>
@@ -3121,14 +3254,107 @@ export function WorkflowShell() {
           </Stack>
         </Modal>
 
-        <Modal opened={globalCapabilitiesOpen} onClose={() => setGlobalCapabilitiesOpen(false)} title="Global capabilities" size="min(1000px, 96vw)" centered>
+        <Modal opened={templateModalOpen} onClose={() => setTemplateModalOpen(false)} title="Save template" centered zIndex={300}>
+          <Stack>
+            <TextInput label="Template name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} placeholder="My workflow template" />
+            <Textarea label="Description" value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} minRows={3} autosize />
+            <Switch label="Create run after save" checked={createRunAfterSave} onChange={(e) => setCreateRunAfterSave(e.currentTarget.checked)} />
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setTemplateModalOpen(false)}>Cancel</Button>
+              <Button onClick={() => void handleSaveTemplate()} loading={busy}>Save template</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal opened={loadTemplateOpen} onClose={() => setLoadTemplateOpen(false)} title="Load template" size="lg" centered zIndex={300}>
+          <Stack>
+            {templates.length === 0 ? (
+              <Text c="dimmed" size="sm">No saved templates yet.</Text>
+            ) : (
+              <ScrollArea.Autosize mah={420} offsetScrollbars>
+                <Stack gap="sm" pr="xs">
+                  {templates.map((template) => {
+                    const selected = template.id === selectedTemplateId;
+                    return (
+                      <Card
+                        key={template.id}
+                        withBorder
+                        padding="sm"
+                        radius="md"
+                        style={{
+                          cursor: 'pointer',
+                          borderColor: selected ? 'var(--mantine-color-blue-6)' : undefined,
+                          background: selected ? 'rgba(34, 139, 230, 0.12)' : undefined,
+                          boxShadow: selected ? '0 0 0 1px var(--mantine-color-blue-6) inset' : undefined
+                        }}
+                        onClick={() => setSelectedTemplateId(template.id)}
+                      >
+                        <Box
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'minmax(0, 1fr) auto',
+                            gap: 12,
+                            alignItems: 'start'
+                          }}
+                        >
+                          <Stack gap={4} style={{ minWidth: 0 }}>
+                            <Text fw={600} c={selected ? 'blue.3' : undefined}>{template.name}</Text>
+                            <Text size="sm" c="dimmed">{template.description || 'No description provided.'}</Text>
+                          </Stack>
+                          <ActionIcon
+                            color="red"
+                            variant="subtle"
+                            aria-label={`Delete ${template.name}`}
+                            style={{ flexShrink: 0 }}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleDeleteTemplate(template.id);
+                            }}
+                          >
+                            <IconTrash size={16} />
+                          </ActionIcon>
+                        </Box>
+                      </Card>
+                    );
+                  })}
+                </Stack>
+              </ScrollArea.Autosize>
+            )}
+            {templates.length > 0 && !selectedTemplateId ? (
+              <Text c="dimmed" size="sm">Select a template to load it into the builder.</Text>
+            ) : null}
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setLoadTemplateOpen(false)}>Close</Button>
+              <Button variant="default" onClick={() => handleLoadTemplateMetadata(selectedTemplateId)} disabled={!selectedTemplateId}>Load template</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal opened={!!pendingStageSelectionId} onClose={() => setPendingStageSelectionId(null)} title="Move to stage" centered>
+          <Stack gap="md">
+            <Text>
+              Move this run to {pendingStageSelection?.name ?? pendingStageSelectionId ?? 'the selected stage'}?
+            </Text>
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setPendingStageSelectionId(null)}>Cancel</Button>
+              <Button onClick={() => void confirmStageSelection()} loading={manualCapabilityBusy}>Confirm</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal opened={globalCapabilitiesOpen} onClose={() => setGlobalCapabilitiesOpen(false)} title="Global capabilities" size="lg" centered>
           <GlobalCapabilitiesPanel
-            value={((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {}}
-            busy={busy}
-            onSave={async (payload) => {
-              if (!selectedRun?.id) return;
-              await patchWorkflowGlobalState(selectedRun.id, payload);
-              await refreshRunDetails(selectedRun.id);
+            onOpenRepoFragment={() => {
+              setGlobalCapabilitiesOpen(false);
+              setRepoContextConfigOpen(true);
+            }}
+            onOpenChangesetSchema={() => {
+              setGlobalCapabilitiesOpen(false);
+              setChangesetSchemaConfigOpen(true);
+            }}
+            onOpenApplyChangeset={() => {
+              setGlobalCapabilitiesOpen(false);
+              setGlobalApplyChangesetOpen(true);
             }}
           />
         </Modal>
@@ -3139,18 +3365,6 @@ export function WorkflowShell() {
           </Stack>
         </Modal>
 
-        <Modal opened={templateModalOpen} onClose={() => setTemplateModalOpen(false)} title="Save workflow template" size="lg">
-          <Stack>
-            <TextInput label="Name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} />
-            <Textarea label="Description" minRows={2} value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} />
-            <Switch label="Create a run immediately after saving" checked={createRunAfterSave} onChange={(e) => setCreateRunAfterSave(e.currentTarget.checked)} />
-            <JsonInput value={builderMode === 'json' ? jsonDraft : JSON.stringify(definition, null, 2)} readOnly autosize minRows={12} />
-            <Group justify="flex-end">
-              <Button variant="default" onClick={() => setTemplateModalOpen(false)}>Cancel</Button>
-              <Button onClick={() => void handleSaveTemplate()} loading={busy}>Save template</Button>
-            </Group>
-          </Stack>
-        </Modal>
       </AppShell.Main>
     </AppShell>
   );

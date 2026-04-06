@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT id, template_id, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
     )
     .fetch_all(&state.db)
     .await
@@ -35,7 +35,7 @@ async fn get_run(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let row = sqlx::query(
-        "SELECT id, template_id, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
     .bind(run_id.to_string())
     .fetch_one(&state.db)
@@ -167,53 +167,55 @@ async fn create_run(
     let id = Uuid::new_v4();
     let status = RunStatus::Draft;
 
-    let mut run_context = req.context.clone();
-    let mut current_step_id = None;
-
-    if let Some(template_id) = req.template_id {
+    let definition = if let Some(definition) = req.definition.clone() {
+        definition
+    } else if let Some(template_id) = req.template_id {
         let template_row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
             .bind(template_id.to_string())
             .fetch_optional(&state.db)
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "template not found".to_string()))?;
+        let definition_json: String = template_row.get("definition_json");
+        serde_json::from_str(&definition_json).map_err(internal)?
+    } else {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "definition or template_id is required".to_string()));
+    };
 
-        if let Some(template_row) = template_row {
-            let definition_json: String = template_row.get("definition_json");
-            let definition: crate::models::WorkflowTemplateDefinition = serde_json::from_str(&definition_json).map_err(internal)?;
-            current_step_id = definition.steps.first().map(|step| step.id.clone());
+    let mut run_context = req.context.clone();
+    let current_step_id = definition.steps.first().map(|step| step.id.clone());
 
-            let root = engine::ensure_engine_root(&mut run_context);
-            let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-            let mut seeded_global_state = serde_json::to_value(definition.globals.clone()).map_err(internal)?;
+    let root = engine::ensure_engine_root(&mut run_context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let mut seeded_global_state = serde_json::to_value(definition.globals.clone()).map_err(internal)?;
 
-            if !seeded_global_state.is_object() {
-                seeded_global_state = json!({});
-            }
-
-            if let Some(global_obj) = seeded_global_state.as_object_mut() {
-                let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
-                if !resources.is_object() {
-                    *resources = json!({});
-                }
-                let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
-                let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
-                if !repo.is_object() {
-                    *repo = json!({});
-                }
-                let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
-                repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
-                repo_obj.entry("git_ref".to_string()).or_insert_with(|| json!("WORKTREE"));
-            }
-
-            engine::merge_json_values(global_state, &seeded_global_state);
-        }
+    if !seeded_global_state.is_object() {
+        seeded_global_state = json!({});
     }
 
+    if let Some(global_obj) = seeded_global_state.as_object_mut() {
+        let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
+        if !resources.is_object() {
+            *resources = json!({});
+        }
+        let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
+        let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
+        if !repo.is_object() {
+            *repo = json!({});
+        }
+        let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
+        repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
+        repo_obj.entry("git_ref".to_string()).or_insert_with(|| json!("WORKTREE"));
+    }
+
+    engine::merge_json_values(global_state, &seeded_global_state);
+
     sqlx::query(
-        "INSERT INTO workflow_runs (id, template_id, status, current_step_id, title, repo_ref, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(id.to_string())
     .bind(req.template_id.map(|v| v.to_string()))
+    .bind(serde_json::to_string_pretty(&definition).map_err(internal)?)
     .bind("draft")
     .bind(current_step_id.clone())
     .bind(&req.title)
@@ -240,6 +242,7 @@ async fn create_run(
     Ok(Json(WorkflowRun {
         id,
         template_id: req.template_id,
+        definition,
         status,
         current_step_id: current_step_id.clone(),
         title: req.title,
@@ -267,6 +270,7 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
     Ok(WorkflowRun {
         id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
         template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose().map_err(internal)?,
+        definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str()).map_err(internal)?,
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Draft,
             "queued" => RunStatus::Queued,

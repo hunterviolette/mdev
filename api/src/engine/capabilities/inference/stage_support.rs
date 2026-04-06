@@ -11,6 +11,7 @@ use crate::{
 
 pub struct InferenceStageSettings {
     pub include_changeset_schema: bool,
+    pub include_apply_error: bool,
 }
 
 pub fn prepare_inference_stage_state(
@@ -60,6 +61,31 @@ pub fn prepare_inference_stage_state(
         .and_then(Value::as_bool)
         .unwrap_or(settings.include_changeset_schema);
 
+    let include_apply_error = automation
+        .get("include_apply_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(settings.include_apply_error);
+
+    let user_input = state
+        .get("prompt")
+        .and_then(|v| v.get("user_input"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if let Some(user_input_fragment) = user_input.clone() {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert("user_input".to_string(), Value::String(user_input_fragment));
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("user_input");
+    }
+
     let repo_context = if include_repo_context {
         let context_export_state = global_state
             .get("capabilities")
@@ -87,22 +113,28 @@ pub fn prepare_inference_stage_state(
         None
     };
 
-    if include_changeset_schema {
-        let schema_empty = fragments
-            .get("changeset_schema")
+    let changeset_schema_fragment = if include_changeset_schema {
+        global_state
+            .get("capabilities")
+            .and_then(|v| v.get("changeset_schema"))
+            .and_then(|v| v.get("schema"))
             .and_then(Value::as_str)
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(true);
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| changeset_schema::CHANGESET_SCHEMA_EXAMPLE.to_string())
+    } else {
+        String::new()
+    };
 
-        if schema_empty {
-            fragments
-                .as_object_mut()
-                .expect("prompt fragments must be object")
-                .insert(
-                    "changeset_schema".to_string(),
-                    Value::String(changeset_schema::CHANGESET_SCHEMA_EXAMPLE.to_string()),
-                );
-        }
+    if include_changeset_schema {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert(
+                "changeset_schema".to_string(),
+                Value::String(changeset_schema_fragment),
+            );
     } else {
         fragments
             .as_object_mut()
@@ -110,12 +142,47 @@ pub fn prepare_inference_stage_state(
             .remove("changeset_schema");
     }
 
+    if include_apply_error {
+        let apply_error_fragment = build_apply_error_prompt_fragment(global_state);
+        if let Some(fragment) = apply_error_fragment {
+            fragments
+                .as_object_mut()
+                .expect("prompt fragments must be object")
+                .insert("apply_error".to_string(), Value::String(fragment));
+        } else {
+            fragments
+                .as_object_mut()
+                .expect("prompt fragments must be object")
+                .remove("apply_error");
+        }
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("apply_error");
+    }
+
     let mut effective_enabled = enabled;
     let enabled_obj = effective_enabled
         .as_object_mut()
         .expect("prompt fragment enabled must be object");
     enabled_obj.insert("repo_context".to_string(), Value::Bool(include_repo_context));
+    enabled_obj.insert(
+        "user_input".to_string(),
+        Value::Bool(user_input.is_some()),
+    );
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
+    enabled_obj.insert(
+        "apply_error".to_string(),
+        Value::Bool(
+            include_apply_error
+                && fragments
+                    .get("apply_error")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false),
+        ),
+    );
 
     let prompt = compose_prompt_from_state(&effective_enabled, &fragments);
 
@@ -158,6 +225,60 @@ pub fn auto_apply_enabled(step: &WorkflowStepDefinition, state: &Value) -> bool 
                 .and_then(Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn build_apply_error_prompt_fragment(global_state: &Value) -> Option<String> {
+    let apply_state = global_state
+        .get("capabilities")
+        .and_then(|v| v.get("gateway_model/changeset"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let latest = apply_state
+        .get("latest_apply_error")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let summary = latest
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let lines = latest
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if summary.is_none() && lines.is_empty() {
+        return None;
+    }
+
+    let detail = if summary
+        .map(|value| value.contains("no JSON object found in changeset payload"))
+        .unwrap_or(false)
+    {
+        summary.unwrap().to_string()
+    } else {
+        match summary {
+            Some(summary) if !lines.is_empty() => format!("{}\n\n{}", summary, lines.join("\n")),
+            Some(summary) => summary.to_string(),
+            None => lines.join("\n"),
+        }
+    };
+
+    Some(format!(
+        "{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the apply errors.",
+        detail
+    ))
 }
 
 pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
@@ -261,25 +382,9 @@ fn build_execution_plan(
         });
     }
 
-    if include_changeset_schema {
-        nodes.push(StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "changeset_schema".to_string(),
-            enabled: true,
-            config: json!({}),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec![],
-            condition: Value::Null,
-        });
-    }
-
     let mut inference_after = Vec::new();
     if include_repo_context {
         inference_after.push("context_export".to_string());
-    }
-    if include_changeset_schema {
-        inference_after.push("changeset_schema".to_string());
     }
 
     nodes.push(StageExecutionNode {
