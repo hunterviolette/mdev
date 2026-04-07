@@ -7,6 +7,7 @@ mod routes;
 use std::{env, fs, net::SocketAddr, path::{Path, PathBuf}};
 
 use anyhow::Context;
+use dotenvy::from_path_override;
 use axum::Router;
 use tower_http::{
     cors::CorsLayer,
@@ -26,6 +27,30 @@ async fn main() -> anyhow::Result<()> {
 
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let repo_root = detect_repo_root(&cwd).context("failed to locate repo root containing web/ and api/")?;
+
+    let root_env = repo_root.join(".env");
+    let api_env = repo_root.join("api").join(".env");
+
+    if root_env.exists() {
+        match from_path_override(&root_env) {
+            Ok(_) => tracing::info!(path = %root_env.display(), "loaded workflow api env file"),
+            Err(err) => tracing::warn!(path = %root_env.display(), error = %err, "failed to load workflow api env file"),
+        }
+    }
+
+    if api_env.exists() {
+        match from_path_override(&api_env) {
+            Ok(_) => tracing::info!(path = %api_env.display(), "loaded workflow api env file"),
+            Err(err) => tracing::warn!(path = %api_env.display(), error = %err, "failed to load workflow api env file"),
+        }
+    }
+
+    tracing::info!(
+        adt_host_url_present = std::env::var("ADT_HOST_URL").ok().map(|v| !v.trim().is_empty()).unwrap_or(false),
+        mdev_sap_adt_base_url_present = std::env::var("MDEV_SAP_ADT_BASE_URL").ok().map(|v| !v.trim().is_empty()).unwrap_or(false),
+        sap_adt_base_url_present = std::env::var("SAP_ADT_BASE_URL").ok().map(|v| !v.trim().is_empty()).unwrap_or(false),
+        "workflow api sap env presence"
+    );
 
     let data_dir = repo_root.join(".data");
     fs::create_dir_all(&data_dir).context("failed to create .data directory")?;

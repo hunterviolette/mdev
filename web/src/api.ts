@@ -472,14 +472,6 @@ export function getChangesetSchema() {
 
 export type SapConnectionInput = {
   base_url: string;
-  auth_type?: string;
-  transport?: string;
-  username?: string;
-  password?: string;
-  authorization?: string;
-  cookie_header?: string;
-  client?: string;
-  bridge_dir?: string;
 };
 
 export type SapDiscoverResponse = {
@@ -502,6 +494,32 @@ export type SapSearchResponse = {
   count: number;
 };
 
+export type SapImportSelection = {
+  object_uri: string;
+  object_name: string;
+  object_type: string;
+  package_name?: string | null;
+  clone_target_path?: string | null;
+};
+
+export type SapImportItem = {
+  object_uri: string;
+  object_name: string;
+  object_type: string;
+  package_name?: string | null;
+  manifest_path: string;
+  manifest_dir: string;
+  resource_count: number;
+  document_count: number;
+};
+
+export type SapImportResponse = {
+  ok: boolean;
+  imported: SapImportItem[];
+  failures: string[];
+  count: number;
+};
+
 export type SapExportScanItem = {
   manifest_path: string;
   object_name: string;
@@ -517,20 +535,34 @@ export type SapExportScanResponse = {
   count: number;
 };
 
-export function sapDiscover(connection: SapConnectionInput) {
+export function sapDiscover() {
   return fetchJson<SapDiscoverResponse>('/api/sap/discover', {
     method: 'POST',
-    body: JSON.stringify({ connection })
+    body: JSON.stringify({})
   });
 }
 
-export function sapSearchObjects(connection: SapConnectionInput, packageName: string, includeSubpackages: boolean) {
+export function sapSearchObjects(packageName: string, includeSubpackages: boolean) {
   return fetchJson<SapSearchResponse>('/api/sap/search', {
     method: 'POST',
     body: JSON.stringify({
-      connection,
       package_name: packageName,
       include_subpackages: includeSubpackages
+    })
+  });
+}
+
+export function sapImportObjects(
+  repoRef: string,
+  selectedObjects: SapImportSelection[],
+  includeXmlArtifacts: boolean
+) {
+  return fetchJson<SapImportResponse>('/api/sap/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      repo_ref: repoRef,
+      selected_objects: selectedObjects,
+      include_xml_artifacts: includeXmlArtifacts
     })
   });
 }

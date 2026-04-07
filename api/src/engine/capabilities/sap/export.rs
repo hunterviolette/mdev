@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use super::common::{
     activation_details_have_errors,
     build_export_workflow,
+    ensure_adt_bridge_connected,
     export_candidates_from_manifest,
     join_manifest_relative_path,
     manifest_dir_from_manifest_path,
@@ -68,7 +69,7 @@ pub async fn execute(
     let connection = parse_connection(&payload)?;
     let bridge_dir = resolve_bridge_dir(&connection)?;
     let mut bridge = AdtBridgeProcess::start(&bridge_dir)?;
-    bridge.connect(&connection)?;
+    let _effective = ensure_adt_bridge_connected(&mut bridge, &connection).await?;
 
     let corr_nr = request.corr_nr.trim();
     let corr_nr = if corr_nr.is_empty() { None } else { Some(corr_nr) };

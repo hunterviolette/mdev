@@ -404,7 +404,8 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
             if !cfg.session_id.as_deref().unwrap_or("").is_empty() {
                 payload["session_id"] = Value::String(cfg.session_id.clone().unwrap_or_default());
             }
-            payload["timeout_ms"] = Value::Number(timeout_ms(cfg).into());
+            let attach_timeout_ms = timeout_ms(cfg).max(10_000);
+            payload["timeout_ms"] = Value::Number(attach_timeout_ms.into());
             let value = client.send_json(payload)?;
             let session_id = value
                 .get("session_id")
@@ -433,7 +434,56 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
     Err(err)
 }
 
-pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {
+pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<String> {
+    let session_id = cfg
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("Browser session missing before get_session_cookies"))?;
+
+    let normalized_urls = urls
+        .iter()
+        .map(|url| normalize_browser_url_for_launch(url))
+        .collect::<Vec<_>>();
+
+    info!(session_id = %session_id, url_count = normalized_urls.len(), "reading browser session cookies");
+
+    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    client.ensure_started(&cfg.bridge_dir)?;
+
+    let mut payload = bridge_cmd("get_cookies");
+    payload["session_id"] = Value::String(session_id);
+    payload["urls"] = Value::Array(normalized_urls.iter().cloned().map(Value::String).collect());
+
+    let value = client.send_json(payload)?;
+    let data = value.get("data").cloned().unwrap_or(value);
+
+    let cookie_header = data
+        .get("cookie_header")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            data.get("cookies")
+                .and_then(|v| v.as_array())
+                .map(|cookies| {
+                    cookies
+                        .iter()
+                        .filter_map(|cookie| {
+                            let name = cookie.get("name").and_then(|v| v.as_str())?;
+                            let value = cookie.get("value").and_then(|v| v.as_str())?;
+                            Some(format!("{}={}", name, value))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or_else(|| anyhow!("Browser bridge returned no cookies for current session"))?;
+
+    Ok(cookie_header)
+}
+
+
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before open_url"))?;
     let normalized_url = normalize_browser_url_for_launch(url);
     info!(session_id = %session_id, url = %normalized_url, "opening browser url");
@@ -575,4 +625,53 @@ pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<Inferen
         conversation_id: None,
         browser_session_id: cfg.session_id.clone(),
     })
+}
+
+pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<String> {
+    let session_id = cfg
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("Browser session missing before get_session_cookies"))?;
+
+    let normalized_urls = urls
+        .iter()
+        .map(|url| normalize_browser_url_for_launch(url))
+        .collect::<Vec<_>>();
+
+    info!(session_id = %session_id, url_count = normalized_urls.len(), "reading browser session cookies");
+
+    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    client.ensure_started(&cfg.bridge_dir)?;
+
+    let mut payload = bridge_cmd("get_cookies");
+    payload["session_id"] = Value::String(session_id);
+    payload["urls"] = Value::Array(normalized_urls.into_iter().map(Value::String).collect());
+
+    let value = client.send_json(payload)?;
+    let data = value.get("data").cloned().unwrap_or(value);
+
+    let cookie_header = data
+        .get("cookie_header")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            data.get("cookies")
+                .and_then(|v| v.as_array())
+                .map(|cookies| {
+                    cookies
+                        .iter()
+                        .filter_map(|cookie| {
+                            let name = cookie.get("name").and_then(|v| v.as_str())?;
+                            let value = cookie.get("value").and_then(|v| v.as_str())?;
+                            Some(format!("{}={}", name, value))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or_else(|| anyhow!("Browser bridge returned no cookies for current session"))?;
+
+    Ok(cookie_header)
 }

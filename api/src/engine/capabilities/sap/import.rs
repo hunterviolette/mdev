@@ -3,14 +3,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::common::{
-    crawl_object_manifest,
-    manifest_directory_name,
+    ensure_adt_bridge_connected,
+    import_object_to_worktree,
     parse_connection,
     resolve_bridge_dir,
+    resolve_package_objects,
     resolve_repo_path,
-    should_persist_sap_adt_resource,
     split_multiline_items,
-    write_manifest_tree,
     AdtBridgeProcess,
     SapImportObjectResult,
 };
@@ -30,9 +29,22 @@ struct SapImportRequest {
     #[serde(default)]
     pub object_uris_text: String,
     #[serde(default)]
+    pub selected_objects: Vec<SapImportSelection>,
+    #[serde(default)]
     pub mode: String,
     #[serde(default)]
     pub connection: Value,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SapImportSelection {
+    pub object_uri: String,
+    #[serde(default)]
+    pub object_name: String,
+    #[serde(default)]
+    pub object_type: String,
+    #[serde(default)]
+    pub package_name: Option<String>,
 }
 
 fn default_git_ref() -> String {
@@ -56,54 +68,76 @@ pub async fn execute(
     let bridge_dir = resolve_bridge_dir(&connection)?;
 
     let mut bridge = AdtBridgeProcess::start(&bridge_dir)?;
-    bridge.connect(&connection)?;
+    let effective = ensure_adt_bridge_connected(&mut bridge, &connection).await?;
 
-    let mut object_uris = split_multiline_items(&request.object_uris_text);
-    if object_uris.is_empty() {
-        if request.package_name.trim().is_empty() {
-            bail!("sap/import requires package_name or object_uris_text")
+    let mut selected_objects = request.selected_objects.clone();
+    if selected_objects.is_empty() {
+        let object_uris = split_multiline_items(&request.object_uris_text);
+        if !object_uris.is_empty() {
+            selected_objects = object_uris
+                .into_iter()
+                .map(|object_uri| SapImportSelection {
+                    object_uri,
+                    object_name: String::new(),
+                    object_type: String::new(),
+                    package_name: None,
+                })
+                .collect();
         }
-        let objects = bridge.list_package_objects(&request.package_name, request.include_subpackages)?;
-        object_uris = objects
-            .into_iter()
-            .filter(|object| object.object_type != "DEVC/K" && !object.uri.contains("/packages/"))
-            .map(|object| object.source_uri.unwrap_or(object.uri))
-            .collect();
     }
 
-    if object_uris.is_empty() {
-        bail!("sap/import resolved zero importable object URIs")
+    let needs_package_resolution = selected_objects.is_empty() && !request.package_name.trim().is_empty();
+
+    if needs_package_resolution {
+        let objects = resolve_package_objects(&mut bridge, &effective, &request.package_name, request.include_subpackages).await?;
+        if !selected_objects.is_empty() {
+            let requested = selected_objects;
+            selected_objects = objects
+                .into_iter()
+                .filter(|object| object.object_type != "DEVC/K" && !object.uri.contains("/packages/"))
+                .filter(|object| {
+                    requested.iter().any(|item| {
+                        item.object_uri == object.uri
+                            || object.source_uri.as_deref() == Some(item.object_uri.as_str())
+                    })
+                })
+                .map(|object| SapImportSelection {
+                    object_uri: object.uri.clone(),
+                    object_name: object.name.clone(),
+                    object_type: object.object_type.clone(),
+                    package_name: object.package_name.clone(),
+                })
+                .collect();
+        } else {
+            selected_objects = objects
+                .into_iter()
+                .filter(|object| object.object_type != "DEVC/K" && !object.uri.contains("/packages/"))
+                .map(|object| SapImportSelection {
+                    object_uri: object.uri.clone(),
+                    object_name: object.name.clone(),
+                    object_type: object.object_type.clone(),
+                    package_name: object.package_name.clone(),
+                })
+                .collect();
+        }
+    }
+
+    if selected_objects.is_empty() {
+        bail!("sap/import resolved zero importable object selections")
     }
 
     let mut imported: Vec<SapImportObjectResult> = Vec::new();
-    for object_uri in object_uris {
-        let mut manifest = crawl_object_manifest(&mut bridge, &object_uri, None, None, None)
-            .with_context(|| format!("failed to import {}", object_uri))?;
-
-        if !request.include_xml_artifacts {
-            manifest.metadata_xml.clear();
-            manifest.documents.clear();
-            manifest.resources.retain(|resource| should_persist_sap_adt_resource(resource, false));
-        }
-
-        let manifest_dir = manifest_directory_name(
-            manifest.object_name.as_deref(),
-            manifest.object_type.as_deref(),
-            manifest.package_name.as_deref(),
-        );
-        write_manifest_tree(&repo, &manifest_dir, &manifest)
-            .with_context(|| format!("failed to persist imported manifest for {}", object_uri))?;
-
-        imported.push(SapImportObjectResult {
-            object_uri: object_uri.clone(),
-            object_name: manifest.object_name.clone().unwrap_or_default(),
-            object_type: manifest.object_type.clone().unwrap_or_default(),
-            package_name: manifest.package_name.clone(),
-            manifest_path: format!("{}/manifest.adt.json", manifest_dir),
-            manifest_dir,
-            resource_count: manifest.resources.len(),
-            document_count: manifest.documents.len(),
-        });
+    for item in selected_objects {
+        imported.push(import_object_to_worktree(
+            &mut bridge,
+            &repo,
+            &item.object_uri,
+            if item.object_name.trim().is_empty() { None } else { Some(item.object_name.as_str()) },
+            if item.object_type.trim().is_empty() { None } else { Some(item.object_type.as_str()) },
+            item.package_name.as_deref(),
+            None,
+            request.include_xml_artifacts,
+        )?);
     }
 
     Ok(CapabilityResult {
@@ -160,6 +194,8 @@ fn resolve_payload(ctx: &CapabilityContext<'_>, config: Value) -> Value {
         .or_insert_with(|| Value::Bool(false));
     obj.entry("object_uris_text".to_string())
         .or_insert_with(|| Value::String(String::new()));
+    obj.entry("selected_objects".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
 
     payload
 }

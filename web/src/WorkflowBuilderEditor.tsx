@@ -331,7 +331,7 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
       <Box
         style={{
           display: 'grid',
-          gridTemplateColumns: 'minmax(0, 1fr) 360px',
+          gridTemplateColumns: 'minmax(0, 1fr) minmax(640px, 40%)',
           gap: 16,
           height: '100%',
           minHeight: 0,
