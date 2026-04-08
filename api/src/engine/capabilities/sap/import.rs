@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 

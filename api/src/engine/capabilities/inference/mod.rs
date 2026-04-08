@@ -35,8 +35,6 @@ pub enum InferenceTransport {
 pub struct BrowserConfig {
     #[serde(default = "default_profile")]
     pub profile: String,
-    #[serde(default = "default_bridge_dir")]
-    pub bridge_dir: String,
     #[serde(default = "default_cdp_url")]
     pub cdp_url: String,
     #[serde(default)]
@@ -63,7 +61,6 @@ impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             profile: default_profile(),
-            bridge_dir: default_bridge_dir(),
             cdp_url: default_cdp_url(),
             page_url_contains: String::new(),
             target_url: String::new(),
@@ -243,10 +240,6 @@ pub async fn execute(
 
 fn default_profile() -> String {
     "default".to_string()
-}
-
-fn default_bridge_dir() -> String {
-    "bridge".to_string()
 }
 
 fn default_cdp_url() -> String {

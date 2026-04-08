@@ -11,7 +11,8 @@ use reqwest::header::{ACCEPT, COOKIE, USER_AGENT};
 use reqwest::{StatusCode, Url};
 use serde_json::{json, Value};
 
-use super::browser_bridge::{self, BrowserTurnConfig};
+use crate::engine::capabilities::inference::BrowserConfig as BrowserTurnConfig;
+use crate::engine::capabilities::inference::browser::adapter as browser_bridge;
 use super::sap_adt_manifest::{
     SapAdtManifestDocument,
     SapAdtManifestResource,
@@ -1081,12 +1082,9 @@ fn transport_bridge_dir(sap: &SapAdtState) -> String {
         }
     }
 
-    let browser_dir = std::path::Path::new(&sap.browser_bridge_dir);
-    if let Some(parent) = browser_dir.parent() {
-        let candidate = parent.join("adt-bridge");
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
+    let configured = sap.bridge_dir.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -1118,35 +1116,43 @@ fn browser_profile_for_adt(sap: &SapAdtState) -> String {
 }
 
 fn browser_executable_for_adt() -> String {
-    browser_bridge::resolve_browser_executable("").0
+    String::new()
 }
 
-fn normalize_bridge_dir(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let unquoted = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(trimmed);
-    unquoted.replace('/', std::path::MAIN_SEPARATOR_STR)
-}
+fn browser_page_match_url(url: &str) -> String {
+    if let Ok(parsed) = Url::parse(url) {
+        return format!(
+            "{}://{}{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default(),
+            parsed.port().map(|p| format!(":{}", p)).unwrap_or_default()
+        );
+    }
 
-fn resolve_browser_bridge_dir(sap: &SapAdtState) -> String {
-    let normalized = normalize_bridge_dir(&sap.browser_bridge_dir);
-    browser_bridge::resolve_browser_bridge_dir_with_override(&normalized)
+    url.trim().to_string()
 }
 
 fn browser_cfg_from_state(sap: &SapAdtState) -> BrowserTurnConfig {
+    let discovery_url = sap
+        .discovery_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("https://website.com/")
+        .to_string();
+    let target_url = explicit_flp_url(&discovery_url).unwrap_or_else(|| discovery_url.clone());
+    let page_url_contains = browser_page_match_url(&target_url);
+
     BrowserTurnConfig {
-        bridge_dir: resolve_browser_bridge_dir(sap),
         edge_executable: browser_executable_for_adt(),
-        user_data_dir: sap.browser_user_data_dir.clone(),
+        user_data_dir: String::new(),
         cdp_url: "http://127.0.0.1:9222".to_string(),
-        page_url_contains: String::new(),
+        page_url_contains,
         profile: browser_profile_for_adt(sap),
         session_id: sap.browser_session_id.clone(),
         auto_launch_edge: true,
-        runtime_key: "sap_adt".to_string(),
-        response_timeout_ms: 60_000,
+        target_url,
+        response_timeout_ms: 45_000,
         response_poll_ms: 1_000,
         dom_poll_ms: 1_000,
     }
@@ -1160,17 +1166,7 @@ fn require_discovery_url(sap: &SapAdtState) -> Result<String> {
         .ok_or_else(|| anyhow!("SAP ADT discovery URL is not set"))
 }
 
-fn validate_bridge_settings(sap: &SapAdtState) -> Result<()> {
-    let resolved_bridge_dir = resolve_browser_bridge_dir(sap);
-    if resolved_bridge_dir.trim().is_empty() {
-        return Err(anyhow!("SAP ADT browser bridge directory is not set"));
-    }
-    if !std::path::Path::new(&resolved_bridge_dir).is_dir() {
-        return Err(anyhow!(format!("SAP ADT browser bridge directory does not exist: {}", resolved_bridge_dir)));
-    }
-    if sap.browser_user_data_dir.trim().is_empty() {
-        return Err(anyhow!("SAP ADT browser user data dir is not set"));
-    }
+fn validate_bridge_settings(_sap: &SapAdtState) -> Result<()> {
     Ok(())
 }
 
@@ -1190,24 +1186,305 @@ fn cookie_urls_for_discovery(discovery_url: &str) -> Vec<String> {
     urls
 }
 
-fn refresh_cookie_header(sap: &mut SapAdtState, discovery_url: &str) -> Result<String> {
-    validate_bridge_settings(sap)?;
+fn explicit_flp_url(discovery_url: &str) -> Option<String> {
+    let parsed = Url::parse(discovery_url).ok()?;
+    let mut flp = parsed;
+    flp.set_path("/sap/bc/ui5_ui5/ui2/ushell/shells/abap/FioriLaunchpad.html");
+    flp.set_fragment(Some("Shell-home"));
 
-    let mut cfg = browser_cfg_from_state(sap);
-    if cfg.session_id.is_none() {
-        browser_bridge::launch_and_attach(&mut cfg)
-            .context("Failed to attach browser bridge session for SAP ADT")?;
-        browser_bridge::open_url_in_session(&mut cfg, discovery_url)
-            .context("Failed to open SAP ADT discovery URL in browser bridge session")?;
+    let mut sap_client = None::<String>;
+    let mut sap_language = None::<String>;
+    for (key, value) in flp.query_pairs() {
+        if key.eq_ignore_ascii_case("sap-client") {
+            sap_client = Some(value.into_owned());
+        } else if key.eq_ignore_ascii_case("sap-language") {
+            sap_language = Some(value.into_owned());
+        }
     }
 
-    let urls = cookie_urls_for_discovery(discovery_url);
-    let cookie_header = browser_bridge::get_session_cookies(&mut cfg, &urls)
-        .context("Failed to harvest SAP ADT cookies from browser bridge")?;
+    let sap_client = sap_client.unwrap_or_else(|| "010".to_string());
+    flp.query_pairs_mut().clear().append_pair("sap-client", &sap_client);
+    if let Some(language) = sap_language {
+        flp.query_pairs_mut().append_pair("sap-language", &language);
+    }
 
-    sap.browser_session_id = cfg.session_id.clone();
-    sap.cookie_header = Some(cookie_header.clone());
-    Ok(cookie_header)
+    Some(flp.to_string())
+}
+
+fn cookie_harvest_navigation_urls(discovery_url: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    if let Some(flp_url) = explicit_flp_url(discovery_url) {
+        if !urls.iter().any(|u| u == &flp_url) {
+            urls.push(flp_url);
+        }
+    }
+
+    let trimmed = discovery_url.trim();
+    if !trimmed.is_empty() {
+        let raw = trimmed.to_string();
+        if !urls.iter().any(|u| u == &raw) {
+            urls.push(raw);
+        }
+    }
+
+    urls
+}
+
+fn cookie_harvest_lookup_urls(discovery_url: &str) -> Vec<String> {
+    let mut urls = cookie_urls_for_discovery(discovery_url);
+
+    if let Some(flp_url) = explicit_flp_url(discovery_url) {
+        if !urls.iter().any(|u| u == &flp_url) {
+            urls.push(flp_url.clone());
+        }
+        if let Ok(url) = Url::parse(&flp_url) {
+            let origin = format!(
+                "{}://{}{}",
+                url.scheme(),
+                url.host_str().unwrap_or_default(),
+                url.port().map(|p| format!(":{}", p)).unwrap_or_default()
+            );
+            if !urls.iter().any(|u| u == &origin) {
+                urls.push(origin);
+            }
+        }
+    }
+
+    urls
+}
+
+fn merge_cookie_lookup_urls(base: &[String], extra_url: &str) -> Vec<String> {
+    let mut urls = base.to_vec();
+    let trimmed = extra_url.trim();
+    if trimmed.is_empty() {
+        return urls;
+    }
+
+    if !urls.iter().any(|u| u == trimmed) {
+        urls.push(trimmed.to_string());
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        let origin = format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.port().map(|p| format!(":{}", p)).unwrap_or_default()
+        );
+        if !urls.iter().any(|u| u == &origin) {
+            urls.push(origin);
+        }
+    }
+
+    urls
+}
+
+fn apply_browser_runtime_url(cfg: &mut BrowserTurnConfig, current_url: &str) {
+    let trimmed = current_url.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    cfg.target_url = trimmed.to_string();
+    cfg.page_url_contains = browser_page_match_url(trimmed);
+}
+
+fn has_cookie_harvest_signal(cookie_header: &str) -> bool {
+    let names: Vec<String> = cookie_header
+        .split(';')
+        .filter_map(|part| part.split('=').next())
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let has_mysapsso2 = names.iter().any(|name| name == "mysapsso2");
+    let has_session = names.iter().any(|name| name.starts_with("sap_sessionid"));
+    let has_usercontext = names.iter().any(|name| name == "sap-usercontext");
+
+    !cookie_header.trim().is_empty() && ((has_mysapsso2 && has_session) || has_usercontext)
+}
+
+fn reset_browser_session(cfg: &mut BrowserTurnConfig) {
+    cfg.session_id = None;
+}
+
+fn attach_browser_session(cfg: &mut BrowserTurnConfig) -> Result<()> {
+    browser_bridge::launch_and_attach(cfg)?;
+    Ok(())
+}
+
+const MAX_COOKIE_HARVEST_OPEN_ATTEMPTS: usize = 3;
+
+fn wait_for_stable_browser_url(cfg: &mut BrowserTurnConfig, expected_prefix: &str) -> Result<String> {
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(90);
+    let stable_for = Duration::from_secs(3);
+    let poll = Duration::from_millis(500);
+    let expected_prefix = expected_prefix.trim().to_ascii_lowercase();
+    let mut last_url = String::new();
+    let mut last_seen = String::new();
+    let mut stable_since: Option<std::time::Instant> = None;
+    let mut saw_expected_host = expected_prefix.is_empty();
+
+    loop {
+        if started.elapsed() >= timeout {
+            return Err(anyhow!(format!("Timed out waiting for browser URL to stabilize after SSO redirects (last_url={})", last_seen)));
+        }
+
+        let probe = browser_bridge::probe(cfg)?;
+        let current_url = probe.url.trim().to_string();
+        if current_url.is_empty() {
+            stable_since = None;
+            std::thread::sleep(poll);
+            continue;
+        }
+
+        last_seen = current_url.clone();
+        let matches_expected = expected_prefix.is_empty() || current_url.to_ascii_lowercase().starts_with(&expected_prefix);
+        if matches_expected {
+            saw_expected_host = true;
+        }
+
+        if !saw_expected_host {
+            last_url = current_url;
+            stable_since = None;
+            std::thread::sleep(poll);
+            continue;
+        }
+
+        if current_url == last_url {
+            if let Some(since) = stable_since {
+                if since.elapsed() >= stable_for && probe.page_open {
+                    return Ok(current_url);
+                }
+            } else {
+                stable_since = Some(std::time::Instant::now());
+            }
+        } else {
+            last_url = current_url;
+            stable_since = Some(std::time::Instant::now());
+        }
+
+        std::thread::sleep(poll);
+    }
+}
+
+fn cached_cookie_header(sap: &SapAdtState) -> Option<String> {
+    sap.cookie_header
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| has_cookie_harvest_signal(value))
+}
+
+pub(crate) fn refresh_cookie_header(sap: &mut SapAdtState, discovery_url: &str) -> Result<String> {
+    validate_bridge_settings(sap)?;
+
+    let navigation_urls = cookie_harvest_navigation_urls(discovery_url);
+    let lookup_urls = cookie_harvest_lookup_urls(discovery_url);
+    if let Some(cookie_header) = cached_cookie_header(sap) {
+        sap.browser_session_id = None;
+        return Ok(cookie_header);
+    }
+
+    let mut last_err = None::<anyhow::Error>;
+    let mut last_cookie_header = String::new();
+    let mut open_attempts = 0usize;
+
+    for (index, url) in navigation_urls.iter().enumerate() {
+        let mut cfg = browser_cfg_from_state(sap);
+        let expected_prefix = cfg.page_url_contains.clone();
+        let had_existing_session = cfg
+            .session_id
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+
+        if !had_existing_session {
+            reset_browser_session(&mut cfg);
+        }
+
+        if let Err(err) = attach_browser_session(&mut cfg) {
+            last_err = Some(err.context(format!("Failed to attach browser bridge session for SAP ADT target {}: {}", index + 1, url)));
+            continue;
+        }
+
+        if had_existing_session {
+            match browser_bridge::get_session_cookies(&mut cfg, &lookup_urls) {
+                Ok(cookie_header) => {
+                    if has_cookie_harvest_signal(&cookie_header) {
+                        sap.browser_session_id = None;
+                        sap.cookie_header = Some(cookie_header.clone());
+                        return Ok(cookie_header);
+                    }
+                    last_cookie_header = cookie_header;
+                }
+                Err(err) => {
+                    last_err = Some(err.context("Failed to harvest SAP ADT cookies from existing browser session"));
+                }
+            }
+        }
+
+        if open_attempts >= MAX_COOKIE_HARVEST_OPEN_ATTEMPTS {
+            last_err = Some(anyhow!(format!(
+                "Exceeded maximum SAP browser open attempts ({}) before harvesting cookies",
+                MAX_COOKIE_HARVEST_OPEN_ATTEMPTS
+            )));
+            break;
+        }
+
+        open_attempts += 1;
+        if let Err(err) = browser_bridge::open_url(&mut cfg, url) {
+            last_err = Some(err.context(format!(
+                "Failed to open SAP ADT browser URL attempt {} of {}: {}",
+                open_attempts,
+                MAX_COOKIE_HARVEST_OPEN_ATTEMPTS,
+                url
+            )));
+            continue;
+        }
+
+        if let Err(err) = wait_for_stable_browser_url(&mut cfg, &expected_prefix) {
+            last_err = Some(err.context(format!(
+                "Failed waiting for stable SAP browser URL after open attempt {} of {}: {}",
+                open_attempts,
+                MAX_COOKIE_HARVEST_OPEN_ATTEMPTS,
+                url
+            )));
+            continue;
+        }
+
+        match browser_bridge::get_session_cookies(&mut cfg, &lookup_urls) {
+            Ok(cookie_header) => {
+                if has_cookie_harvest_signal(&cookie_header) {
+                    sap.browser_session_id = None;
+                    sap.cookie_header = Some(cookie_header.clone());
+                    return Ok(cookie_header);
+                }
+                last_cookie_header = cookie_header;
+            }
+            Err(err) => {
+                last_err = Some(err.context(format!(
+                    "Failed to harvest SAP ADT cookies after open attempt {} of {}: {}",
+                    open_attempts,
+                    MAX_COOKIE_HARVEST_OPEN_ATTEMPTS,
+                    url
+                )));
+            }
+        }
+    }
+
+    sap.browser_session_id = None;
+    if !last_cookie_header.trim().is_empty() {
+        sap.cookie_header = Some(last_cookie_header.clone());
+        return Ok(last_cookie_header);
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+
+    Err(anyhow!("Failed to harvest SAP ADT cookies from browser bridge after all URL attempts"))
 }
 
 fn build_http_client() -> Result<Client> {

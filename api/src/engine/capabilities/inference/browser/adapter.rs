@@ -15,13 +15,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::engine::capabilities::inference::{BrowserConfig, BrowserProbeResult, InferenceResult, InferenceTransport};
 
-fn resolve_bridge_dir(raw: &str) -> PathBuf {
-    let input = raw.trim();
-    let candidate = PathBuf::from(if input.is_empty() { "bridge" } else { input });
-
-    if candidate.is_absolute() && candidate.exists() {
-        return candidate;
-    }
+fn resolve_bridge_dir(_raw: &str) -> PathBuf {
+    let candidate = PathBuf::from("bridge");
 
     if let Ok(cwd) = std::env::current_dir() {
         let joined = cwd.join(&candidate);
@@ -152,7 +147,7 @@ fn bridge_cmd(cmd: &str) -> Value {
 }
 
 fn timeout_ms(cfg: &BrowserConfig) -> u64 {
-    if cfg.dom_poll_ms == 0 { 1_000 } else { cfg.dom_poll_ms }
+    cfg.response_timeout_ms.max(1_000)
 }
 
 struct BridgeClient {
@@ -172,16 +167,16 @@ impl BridgeClient {
         }
     }
 
-    fn ensure_started(&mut self, bridge_dir: &str) -> Result<()> {
+    fn ensure_started(&mut self) -> Result<()> {
         if self.child.is_some() {
-            debug!(bridge_dir, "browser bridge already running");
+            debug!("browser bridge already running");
             return Ok(());
         }
 
-        let bridge_root = resolve_bridge_dir(bridge_dir);
+        let bridge_root = resolve_bridge_dir("");
         ensure_bridge_built(&bridge_root)?;
         let (program, args) = bridge_entrypoint(&bridge_root)?;
-        info!(bridge_dir, bridge_root = %bridge_root.display(), program = %program, args = ?args, "starting browser bridge process");
+        info!(bridge_root = %bridge_root.display(), program = %program, args = ?args, "starting browser bridge process");
 
         let mut child = Command::new(&program)
             .args(&args)
@@ -198,7 +193,7 @@ impl BridgeClient {
         self.stdin = Some(stdin);
         self.stdout = Some(BufReader::new(stdout));
         self.child = Some(child);
-        info!(bridge_dir, "browser bridge process started");
+        info!("browser bridge process started");
         Ok(())
     }
 
@@ -361,7 +356,8 @@ fn normalize_browser_url_for_launch(url: &str) -> String {
 
 
 pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
-    info!(cdp_url = %cfg.cdp_url, bridge_dir = %cfg.bridge_dir, target_url = %cfg.target_url, page_url_contains = %cfg.page_url_contains, auto_launch_edge = cfg.auto_launch_edge, "launch_and_attach starting");
+    let resolved_bridge_dir = resolve_bridge_dir("");
+    info!(cdp_url = %cfg.cdp_url, bridge_dir = %resolved_bridge_dir.display(), target_url = %cfg.target_url, page_url_contains = %cfg.page_url_contains, auto_launch_edge = cfg.auto_launch_edge, "launch_and_attach starting");
     if !cdp_reachable(&cfg.cdp_url) {
         warn!(cdp_url = %cfg.cdp_url, "cdp endpoint not reachable before attach");
         if cfg.auto_launch_edge {
@@ -373,7 +369,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if cdp_reachable(&cfg.cdp_url) {
             info!(cdp_url = %cfg.cdp_url, "cdp endpoint became reachable");
@@ -387,14 +383,12 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         let attempt = (|| -> Result<String> {
             debug!(attempt = attempt_index + 1, cdp_url = %cfg.cdp_url, "attempting browser bridge connect_over_cdp");
             let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-            client.ensure_started(&cfg.bridge_dir)?;
+            client.ensure_started()?;
             let mut payload = bridge_cmd("connect_over_cdp");
             payload["cdp_url"] = Value::String(cfg.cdp_url.clone());
             payload["profile"] = Value::String(if cfg.profile.is_empty() { "auto".to_string() } else { cfg.profile.clone() });
             let page_url_contains = if !cfg.page_url_contains.trim().is_empty() {
                 cfg.page_url_contains.trim().to_string()
-            } else if !cfg.target_url.trim().is_empty() {
-                normalize_browser_url_for_launch(&cfg.target_url)
             } else {
                 String::new()
             };
@@ -438,7 +432,7 @@ pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {
     let normalized_url = normalize_browser_url_for_launch(url);
     info!(session_id = %session_id, url = %normalized_url, "opening browser url");
     let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-    client.ensure_started(&cfg.bridge_dir)?;
+    client.ensure_started()?;
     let mut payload = bridge_cmd("open_page");
     payload["session_id"] = Value::String(session_id);
     payload["url"] = Value::String(normalized_url.clone());
@@ -453,7 +447,7 @@ pub fn probe(cfg: &mut BrowserConfig) -> Result<BrowserProbeResult> {
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before probe"))?;
     debug!(session_id = %session_id, "probing browser session");
     let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-    client.ensure_started(&cfg.bridge_dir)?;
+    client.ensure_started()?;
     let mut payload = bridge_cmd("probe_page");
     payload["session_id"] = Value::String(session_id.clone());
     payload["profile"] = Value::String(if cfg.profile.is_empty() { "auto".to_string() } else { cfg.profile.clone() });
@@ -467,7 +461,7 @@ pub fn probe(cfg: &mut BrowserConfig) -> Result<BrowserProbeResult> {
 
 pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Result<()> {
     let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-    client.ensure_started(&cfg.bridge_dir)?;
+    client.ensure_started()?;
 
     if cfg.session_id.is_none() {
         let session_id = launch_and_attach(cfg)?;
@@ -495,6 +489,104 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
     Ok(())
 }
 
+pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<String> {
+    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    client.ensure_started()?;
+
+    if cfg.session_id.is_none() {
+        let session_id = launch_and_attach(cfg)?;
+        cfg.session_id = Some(session_id);
+    }
+
+    let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis((timeout_ms(cfg) as u64).max(5_000));
+    let poll = Duration::from_millis(1_000);
+    let url_list = urls.join(", ");
+    let mut attempt: u32 = 0;
+    let mut last_header: Option<String> = None;
+
+    loop {
+        attempt += 1;
+
+        let mut payload = bridge_cmd("get_cookies");
+        payload["session_id"] = Value::String(session_id.clone());
+        payload["urls"] = serde_json::to_value(urls)?;
+        let value = client.send_json(payload)?;
+        let data = value.get("data").cloned().unwrap_or(value);
+
+        let cookie_header = data
+            .get("cookie_header")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                data.get("cookies")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| {
+                                let name = c.get("name").and_then(|v| v.as_str())?;
+                                let value = c.get("value").and_then(|v| v.as_str())?;
+                                Some(format!("{}={}", name, value))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_default();
+
+        let cookie_name_list = data
+            .get("cookie_names")
+            .and_then(|v| v.as_array())
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                data.get("cookies")
+                    .and_then(|v| v.as_array())
+                    .map(|cookies| {
+                        cookies
+                            .iter()
+                            .filter_map(|c| c.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
+
+        let cookie_names = cookie_name_list.join(",");
+        let has_mysapsso2 = cookie_name_list.iter().any(|name| name.eq_ignore_ascii_case("MYSAPSSO2"));
+        let has_session = cookie_name_list.iter().any(|name| name.to_ascii_uppercase().starts_with("SAP_SESSIONID_"));
+        let has_usercontext = cookie_name_list.iter().any(|name| name.eq_ignore_ascii_case("sap-usercontext"));
+        let has_required_cookies = has_mysapsso2 && has_session && has_usercontext;
+
+        eprintln!(
+            "[sap_adt] cookie harvest attempt={} session_id={} urls=[{}] cookie_names=[{}] cookie_header={}",
+            attempt,
+            session_id,
+            url_list,
+            cookie_names,
+            cookie_header
+        );
+
+        if has_required_cookies && !cookie_header.trim().is_empty() {
+            return Ok(cookie_header);
+        }
+
+        last_header = Some(cookie_header);
+
+        if started.elapsed() >= timeout {
+            return Ok(last_header.unwrap_or_default());
+        }
+
+        std::thread::sleep(poll);
+    }
+}
+
 pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<InferenceResult> {
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before send_chat"))?;
 
@@ -510,7 +602,7 @@ pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<Inferen
     }
 
     let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
-    client.ensure_started(&cfg.bridge_dir)?;
+    client.ensure_started()?;
 
     let mut send_payload = bridge_cmd("send_chat");
     send_payload["session_id"] = Value::String(session_id.clone());
