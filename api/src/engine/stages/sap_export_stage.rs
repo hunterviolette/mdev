@@ -1,53 +1,11 @@
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::models::WorkflowStepDefinition;
 
 pub fn prepare_stage_state(
-    step: &WorkflowStepDefinition,
+    _step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
-    let mut state = ensure_object(local_state);
-    let obj = state.as_object_mut().expect("stage state must be object");
-
-    let execution_logic = obj
-        .entry("execution_logic".to_string())
-        .or_insert_with(|| step.execution_logic.clone());
-    if !execution_logic.is_object() {
-        *execution_logic = json!({});
-    }
-    let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
-
-    if !exec_obj.contains_key("on_success") {
-        exec_obj.insert(
-            "on_success".to_string(),
-            json!({
-                "disposition": "move_next",
-                "message": "SAP export stage completed successfully.",
-                "patch_from_capability": {
-                    "capability": "sap/export",
-                    "mode": "result_to_stage_review"
-                }
-            }),
-        );
-    }
-
-    if !exec_obj.contains_key("on_error") {
-        exec_obj.insert(
-            "on_error".to_string(),
-            json!({
-                "disposition": "error",
-                "message": "SAP export stage failed during backend workflow execution."
-            }),
-        );
-    }
-
-    Ok(state)
-}
-
-fn ensure_object(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(map),
-        _ => json!({}),
-    }
+    Ok(local_state)
 }

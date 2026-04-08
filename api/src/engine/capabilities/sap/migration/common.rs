@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -11,13 +11,13 @@ use std::{
         OnceLock,
     },
 };
+ use std::collections::HashSet;
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::engine::capabilities::inference::{BrowserConfig as SharedBrowserConfig};
-use crate::engine::capabilities::inference::browser::adapter as shared_browser_adapter;
+use super::browser_bridge;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SapAdtObjectManifest {
@@ -178,6 +178,36 @@ fn store_cached_cookie_header(config: &SapConnectionConfig, cookie_header: &str)
     if let Ok(mut cache) = sap_cookie_cache().lock() {
         cache.insert(sap_cookie_cache_key(config), trimmed.to_string());
     }
+}
+
+fn clear_cached_cookie_header(config: &SapConnectionConfig) {
+    if let Ok(mut cache) = sap_cookie_cache().lock() {
+        cache.remove(&sap_cookie_cache_key(config));
+    }
+}
+
+pub fn harvest_cookie_header_for_runtime(base_url: &str, client: Option<String>) -> Result<String> {
+    let config = SapConnectionConfig {
+        base_url: base_url.trim().trim_end_matches('/').to_string(),
+        auth_type: Some("cookie".to_string()),
+        transport: Some("fetch".to_string()),
+        username: None,
+        password: None,
+        authorization: None,
+        cookie_header: None,
+        negotiate_command: None,
+        client,
+        timeout_ms: Some(60_000),
+        bridge_dir: None,
+    };
+
+    if let Some(cookie_header) = load_cached_cookie_header(&config) {
+        return Ok(cookie_header);
+    }
+
+    let cookie_header = harvest_cookie_header_via_browser(&config)?;
+    store_cached_cookie_header(&config, &cookie_header);
+    Ok(cookie_header)
 }
 
 
@@ -967,26 +997,25 @@ fn cookie_urls_for_discovery(discovery_url: &str) -> Vec<String> {
     urls
 }
 
-fn shared_browser_cfg_for_sap(config: &SapConnectionConfig) -> Result<SharedBrowserConfig> {
+fn shared_browser_cfg_for_sap(config: &SapConnectionConfig) -> Result<browser_bridge::BrowserTurnConfig> {
     let bridge_dir = resolve_browser_bridge_dir_for_api()?;
     let user_data_dir = resolve_browser_user_data_dir_for_api()?;
-    let browser_launch_url = browser_launch_url_for_connection(config)?;
     let browser_profile = resolve_browser_profile_for_api();
     let cdp_url = env_var("MDEV_BROWSER_CDP_URL")
         .or_else(|| env_var("SAP_ADT_BROWSER_CDP_URL"))
         .or_else(|| env_var("BROWSER_CDP_URL"))
         .unwrap_or_else(|| "http://127.0.0.1:9222".to_string());
 
-    Ok(SharedBrowserConfig {
-        profile: browser_profile,
+    Ok(browser_bridge::BrowserTurnConfig {
         bridge_dir: bridge_dir.to_string_lossy().to_string(),
-        cdp_url,
-        page_url_contains: "/sap/bc/ui5_ui5/ui2/ushell/shells/abap/FioriLaunchpad.html".to_string(),
-        target_url: browser_launch_url,
         edge_executable: resolve_edge_executable_for_api(),
         user_data_dir: user_data_dir.to_string_lossy().to_string(),
+        cdp_url,
+        page_url_contains: String::new(),
+        profile: browser_profile,
         session_id: None,
         auto_launch_edge: true,
+        runtime_key: "sap_cookie_harvest".to_string(),
         response_timeout_ms: config.timeout_ms.unwrap_or(60_000).max(10_000),
         response_poll_ms: 1_000,
         dom_poll_ms: 1_000,
@@ -1007,30 +1036,21 @@ fn harvest_cookie_header_via_browser(config: &SapConnectionConfig) -> Result<Str
         user_data_dir = %browser.user_data_dir,
         browser_profile = %browser.profile,
         cdp_url = %browser.cdp_url,
-        "using shared browser attach path for SAP cookie harvest"
+        "using browser bridge attach path for SAP cookie harvest"
     );
 
-    shared_browser_adapter::launch_and_attach(&mut browser)
-        .context("Failed to attach shared browser bridge session for SAP ADT")?;
-    shared_browser_adapter::open_url(&mut browser, &browser_launch_url)
-        .context("Failed to open SAP browser bootstrap URL in shared browser session")?;
+    browser_bridge::launch_and_attach(&mut browser)
+        .context("Failed to attach browser bridge session for SAP ADT")?;
+    browser_bridge::open_url_in_session(&mut browser, &browser_launch_url)
+        .context("Failed to open SAP browser bootstrap URL in browser bridge session")?;
 
-    let cookie_header = shared_browser_adapter::get_session_cookies(&mut browser, &cookie_urls)
-        .context("Failed to harvest SAP ADT cookies from shared browser bridge")?;
+    let cookie_header = browser_bridge::get_session_cookies(&mut browser, &cookie_urls)
+        .context("Failed to harvest SAP ADT cookies from browser bridge")?;
 
     Ok(cookie_header)
 }
 
 async fn direct_http_get_with_cookies(config: &SapConnectionConfig, url_or_path: &str, accept: &str) -> Result<BridgeReadResult> {
-    let cookie_header = config
-        .cookie_header
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .or_else(|| load_cached_cookie_header(config))
-        .ok_or_else(|| anyhow!("SAP direct HTTP request requires a non-empty cookie header"))?;
-
     let timeout = std::time::Duration::from_millis(config.timeout_ms.unwrap_or(60_000).max(1_000));
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -1048,7 +1068,18 @@ async fn direct_http_get_with_cookies(config: &SapConnectionConfig, url_or_path:
         )
     };
 
-    let resp = client
+    let mut cookie_header = load_cached_cookie_header(config)
+        .or_else(|| {
+            config
+                .cookie_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+        })
+        .ok_or_else(|| anyhow!("SAP direct HTTP request requires a non-empty cookie header"))?;
+
+    let mut resp = client
         .get(&url)
         .header(ACCEPT, accept)
         .header(COOKIE, cookie_header.as_str())
@@ -1056,18 +1087,48 @@ async fn direct_http_get_with_cookies(config: &SapConnectionConfig, url_or_path:
         .await
         .with_context(|| format!("failed direct SAP HTTP GET to {}", url))?;
 
-    let status = resp.status();
-    let content_type = resp
+    let mut status = resp.status();
+    let mut content_type = resp
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
-    let headers = resp
+    let mut headers = resp
         .headers()
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|vv| (k.as_str().to_string(), vv.to_string())))
         .collect::<Vec<_>>();
-    let body = resp.text().await.context("failed to read SAP direct HTTP response body")?;
+    let mut body = resp.text().await.context("failed to read SAP direct HTTP response body")?;
+
+    let unauthorized = status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN;
+    let html_login = looks_like_non_adt_html(&body);
+
+    if unauthorized || html_login {
+        clear_cached_cookie_header(config);
+        cookie_header = harvest_cookie_header_for_runtime(&config.base_url, config.client.clone())?;
+        store_cached_cookie_header(config, &cookie_header);
+
+        resp = client
+            .get(&url)
+            .header(ACCEPT, accept)
+            .header(COOKIE, cookie_header.as_str())
+            .send()
+            .await
+            .with_context(|| format!("failed direct SAP HTTP GET retry to {}", url))?;
+
+        status = resp.status();
+        content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vv| (k.as_str().to_string(), vv.to_string())))
+            .collect::<Vec<_>>();
+        body = resp.text().await.context("failed to read SAP direct HTTP retry response body")?;
+    }
 
     tracing::info!(
         target: "workflow_api::sap",
@@ -1215,13 +1276,15 @@ async fn load_package_metadata_summary_direct(config: &SapConnectionConfig, pack
 }
 
 async fn fetch_csrf_token_direct(config: &SapConnectionConfig) -> Result<String> {
-    let cookie_header = config
-        .cookie_header
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .or_else(|| load_cached_cookie_header(config))
+    let cookie_header = load_cached_cookie_header(config)
+        .or_else(|| {
+            config
+                .cookie_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+        })
         .ok_or_else(|| anyhow!("SAP direct HTTP request requires a non-empty cookie header"))?;
 
     let timeout = std::time::Duration::from_millis(config.timeout_ms.unwrap_or(60_000).max(1_000));
@@ -2322,7 +2385,74 @@ pub fn manifest_directory_name(object_name: Option<&str>, object_type: Option<&s
     format!("sap_adt/{}__{}__{}", package, kind, object)
 }
 
-pub fn should_persist_sap_adt_resource(resource: &SapAdtManifestResource, include_xml_artifacts: bool) -> bool {
+fn manifest_body_looks_like_non_adt_html(body: &str) -> bool {
+    let lower = body.trim().to_ascii_lowercase();
+    lower.starts_with("<html")
+        || lower.contains("<head")
+        || lower.contains("<body")
+        || lower.contains("login.microsoftonline.com")
+        || lower.contains("samlrequest")
+        || lower.contains("relaystate")
+}
+
+fn manifest_contains_usable_adt_content(manifest: &crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtObjectManifest) -> bool {
+    let metadata = manifest.metadata_xml.trim();
+    if metadata.is_empty() {
+        return !manifest.resources.is_empty() || !manifest.documents.is_empty();
+    }
+
+    if manifest_body_looks_like_non_adt_html(metadata) {
+        return false;
+    }
+
+    metadata.contains("adtcore:")
+        || metadata.contains("abapsource:")
+        || metadata.contains("http://www.sap.com/adt/")
+        || metadata.contains("<atom:link")
+        || !manifest.resources.is_empty()
+        || !manifest.documents.is_empty()
+}
+
+pub fn validate_imported_manifest(object_uri: &str, manifest: &crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtObjectManifest) -> Result<()> {
+    if manifest_body_looks_like_non_adt_html(&manifest.metadata_xml) {
+        bail!(
+            "SAP import for {} returned HTML/login content instead of ADT metadata",
+            object_uri
+        );
+    }
+
+    if !manifest_contains_usable_adt_content(manifest) {
+        bail!(
+            "SAP import for {} returned no usable ADT metadata/resources",
+            object_uri
+        );
+    }
+
+    Ok(())
+}
+
+fn fallback_name_is_placeholder(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+
+    value == "==============================CP"
+        || value == "OBJECT"
+        || value == "unnamed"
+        || value.chars().all(|ch| ch == '=')
+}
+
+fn fallback_package_is_placeholder(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim) else {
+        return true;
+    };
+    value.is_empty() || value.eq_ignore_ascii_case("UNKNOWNPKG") || value.eq_ignore_ascii_case("package")
+}
+
+pub fn should_persist_sap_adt_resource(resource: &crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtManifestResource, include_xml_artifacts: bool) -> bool {
     if include_xml_artifacts {
         return true;
     }
@@ -2332,59 +2462,36 @@ pub fn should_persist_sap_adt_resource(resource: &SapAdtManifestResource, includ
     !content_type.contains("xml") && !path.ends_with(".xml")
 }
 
-pub fn import_object_to_worktree(
-    bridge: &mut AdtBridgeProcess,
-    repo: &Path,
-    object_uri: &str,
-    object_name: Option<&str>,
-    object_type: Option<&str>,
-    package_name: Option<&str>,
-    clone_target_path: Option<&str>,
-    include_xml_artifacts: bool,
-) -> Result<SapImportObjectResult> {
-    let mut manifest = crawl_object_manifest(
-        bridge,
-        object_uri,
-        object_name,
-        object_type,
-        package_name,
-    )
-    .with_context(|| format!("failed to import {}", object_uri))?;
-
-    if !include_xml_artifacts {
-        manifest.metadata_xml.clear();
-        manifest.documents.clear();
-        manifest.resources.retain(|resource| should_persist_sap_adt_resource(resource, false));
+pub fn should_persist_sap_adt_document(document: &crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtManifestDocument, include_xml_artifacts: bool) -> bool {
+    if include_xml_artifacts {
+        return true;
     }
 
-    let manifest_dir = manifest_directory_name(
-        manifest.object_name.as_deref().or(object_name),
-        manifest.object_type.as_deref().or(object_type),
-        manifest.package_name.as_deref().or(package_name),
-    );
-
-    write_manifest_tree(repo, &manifest_dir, &manifest)
-        .with_context(|| format!("failed to persist imported manifest for {}", object_uri))?;
-
-    Ok(SapImportObjectResult {
-        object_uri: object_uri.to_string(),
-        object_name: manifest.object_name.clone().unwrap_or_else(|| object_name.unwrap_or_default().to_string()),
-        object_type: manifest.object_type.clone().unwrap_or_else(|| object_type.unwrap_or_default().to_string()),
-        package_name: manifest.package_name.clone().or_else(|| package_name.map(|s| s.to_string())),
-        manifest_path: format!("{}/manifest.adt.json", manifest_dir),
-        manifest_dir,
-        resource_count: manifest.resources.len(),
-        document_count: manifest.documents.len(),
-    })
+    let content_type = document.content_type.clone().unwrap_or_default().to_ascii_lowercase();
+    let path = document.path.to_ascii_lowercase();
+    !content_type.contains("xml") && !path.ends_with(".xml")
 }
 
-pub fn read_manifest(repo: &Path, manifest_path: &str) -> Result<SapAdtObjectManifest> {
+pub fn import_object_to_worktree(
+    _bridge: &mut AdtBridgeProcess,
+    _repo: &Path,
+    object_uri: &str,
+    _object_name: Option<&str>,
+    _object_type: Option<&str>,
+    _package_name: Option<&str>,
+    _clone_target_path: Option<&str>,
+    _include_xml_artifacts: bool,
+) -> Result<SapImportObjectResult> {
+    bail!("manifest crawl import has been removed from common.rs for {}", object_uri)
+}
+
+pub fn read_manifest(repo: &Path, manifest_path: &str) -> Result<crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtObjectManifest> {
     let full_path = repo.join(manifest_path);
     let bytes = fs::read(&full_path).with_context(|| format!("failed to read {}", manifest_path))?;
     serde_json::from_slice(&bytes).with_context(|| format!("invalid manifest JSON in {}", manifest_path))
 }
 
-pub fn write_manifest_tree(repo: &Path, manifest_dir: &str, manifest: &SapAdtObjectManifest) -> Result<()> {
+pub fn write_manifest_tree(repo: &Path, manifest_dir: &str, manifest: &crate::engine::capabilities::sap::migration::sap_adt_manifest::SapAdtObjectManifest) -> Result<()> {
     fs::create_dir_all(repo.join("sap_adt")).context("failed to ensure sap_adt directory")?;
 
     for doc in &manifest.documents {
@@ -2550,6 +2657,43 @@ fn xml_attr_any(attrs: &str, names: &[&str]) -> Option<String> {
     None
 }
 
+fn package_object_name_is_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed == "==============================CP"
+        || trimmed == "OBJECT"
+        || trimmed == "unnamed"
+        || trimmed.chars().all(|ch| ch == '=')
+}
+
+fn canonical_name_from_object_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let last = trimmed.rsplit('/').next()?.trim();
+    if last.is_empty() {
+        return None;
+    }
+
+    Some(last.to_ascii_uppercase())
+}
+
+fn normalize_package_object_summary(mut item: SapPackageObjectSummary) -> SapPackageObjectSummary {
+    if package_object_name_is_placeholder(&item.name) {
+        if let Some(name) = canonical_name_from_object_uri(&item.uri) {
+            item.name = name;
+        }
+    }
+
+    if item.package_name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        item.package_name = None;
+    }
+
+    item
+}
+
 pub fn parse_package_tree_xml(xml: &str) -> Result<Vec<SapPackageObjectSummary>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -2603,6 +2747,8 @@ pub fn parse_package_tree_xml(xml: &str) -> Result<Vec<SapPackageObjectSummary>>
             });
         }
     }
+
+    out = out.into_iter().map(normalize_package_object_summary).collect();
 
     out.sort_by(|a, b| {
         a.object_type
@@ -2711,125 +2857,6 @@ fn extract_lock_handle(body: &str) -> Option<String> {
                 rest.find('"').map(|end| rest[..end].to_string())
             })
         })
-}
-
-pub fn crawl_object_manifest(
-    bridge: &mut AdtBridgeProcess,
-    object_uri: &str,
-    object_name: Option<&str>,
-    object_type: Option<&str>,
-    package_name: Option<&str>,
-) -> Result<SapAdtObjectManifest> {
-    let metadata_result = bridge.read_object(object_uri, Some("application/xml, text/xml, */*"))?;
-    let metadata_uri = if metadata_result.object_uri.trim().is_empty() {
-        object_uri.to_string()
-    } else {
-        metadata_result.object_uri.clone()
-    };
-    let metadata_xml = metadata_result.body.clone();
-
-    let mut resources: Vec<SapAdtManifestResource> = Vec::new();
-    let mut documents: Vec<SapAdtManifestDocument> = Vec::new();
-
-    let links = collect_links(&metadata_xml);
-    let mut seen_resource_uris = HashSet::new();
-
-    for (index, link) in links.iter().enumerate() {
-        let resolved_uri = resolve_relative_uri(&metadata_uri, &link.uri);
-        let title = link.title.clone().or_else(|| Some(format!("resource_{}", index + 1)));
-        let rel = link.rel.clone().unwrap_or_default();
-        let role = link.title.clone().unwrap_or_else(|| rel.clone());
-
-        let looks_like_source = rel.contains("relations/source") || role.eq_ignore_ascii_case("source");
-        let looks_like_doc = rel.contains("documentation") || rel.contains("relations/doc") || role.contains("doc");
-
-        let read = match bridge.read_object(&resolved_uri, Some("text/plain, application/xml, text/xml, */*")) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        if looks_like_doc {
-            let path = link
-                .title
-                .clone()
-                .map(|t| sanitize_rel_path(&format!("docs/{}.txt", t)))
-                .unwrap_or_else(|| format!("docs/document_{}.txt", index + 1));
-            documents.push(SapAdtManifestDocument {
-                id: format!("document_{}", index + 1),
-                uri: resolved_uri,
-                title,
-                content_type: read.content_type.clone(),
-                headers: read.headers.clone(),
-                path,
-                body: read.body,
-            });
-            continue;
-        }
-
-        if !seen_resource_uris.insert(resolved_uri.clone()) {
-            continue;
-        }
-
-        let path = if looks_like_source {
-            source_resource_path(object_name, object_type, read.content_type.as_deref())
-        } else {
-            sanitize_rel_path(&format!("resources/{}_{}", index + 1, title.clone().unwrap_or_else(|| "resource".to_string())))
-        };
-
-        resources.push(SapAdtManifestResource {
-            id: format!("resource_{}", resources.len() + 1),
-            uri: resolved_uri,
-            rel: rel.clone(),
-            title,
-            content_type: read.content_type.clone(),
-            etag: header_lookup(&read.headers, "etag"),
-            lock_handle: None,
-            headers: read.headers.clone(),
-            path,
-            readable: true,
-            editable: looks_like_source,
-            activatable: looks_like_source,
-            role,
-            body: read.body,
-        });
-    }
-
-    if resources.is_empty() {
-        let source_read = bridge.read_object(object_uri, Some("text/plain, application/xml, text/xml, */*"))?;
-        resources.push(SapAdtManifestResource {
-            id: "resource_1".to_string(),
-            uri: object_uri.to_string(),
-            rel: "http://www.sap.com/adt/relations/source".to_string(),
-            title: Some("source".to_string()),
-            content_type: source_read.content_type.clone(),
-            etag: header_lookup(&source_read.headers, "etag"),
-            lock_handle: None,
-            headers: source_read.headers.clone(),
-            path: source_resource_path(object_name, object_type, source_read.content_type.as_deref()),
-            readable: true,
-            editable: true,
-            activatable: true,
-            role: "source".to_string(),
-            body: source_read.body,
-        });
-    }
-
-    let root_object_name = object_name.map(|v| v.to_string()).or_else(|| extract_xml_attr(&metadata_xml, &["adtcore:name", "name", "objName", "objectName"]));
-    let root_object_type = object_type.map(|v| v.to_string()).or_else(|| extract_xml_attr(&metadata_xml, &["adtcore:type", "type", "objType", "objectType"]));
-    let root_package_name = package_name.map(|v| v.to_string()).or_else(|| extract_xml_attr(&metadata_xml, &["adtcore:packageName", "packageName", "devclass"]));
-
-    Ok(SapAdtObjectManifest {
-        schema_version: 1,
-        metadata_uri,
-        object_uri: resources.first().map(|resource| resource.uri.clone()),
-        object_name: root_object_name,
-        object_type: root_object_type,
-        package_name: root_package_name,
-        etag: header_lookup(&metadata_result.headers, "etag").or_else(|| resources.iter().find_map(|r| r.etag.clone())),
-        metadata_xml,
-        resources,
-        documents,
-    })
 }
 
 #[derive(Clone, Debug)]

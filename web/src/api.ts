@@ -470,15 +470,6 @@ export function getChangesetSchema() {
   }>(`/api/capabilities/changeset-schema`);
 }
 
-export type SapConnectionInput = {
-  base_url: string;
-};
-
-export type SapDiscoverResponse = {
-  ok: boolean;
-  message: string;
-};
-
 export type SapSearchObject = {
   uri: string;
   source_uri?: string | null;
@@ -494,30 +485,30 @@ export type SapSearchResponse = {
   count: number;
 };
 
-export type SapImportSelection = {
-  object_uri: string;
-  object_name: string;
-  object_type: string;
-  package_name?: string | null;
-  clone_target_path?: string | null;
+export type SapManifestResource = {
+  id: string;
+  path?: string | null;
+  uri?: string | null;
+  source_uri?: string | null;
+  content_type?: string | null;
 };
 
-export type SapImportItem = {
-  object_uri: string;
-  object_name: string;
-  object_type: string;
-  package_name?: string | null;
-  manifest_path: string;
-  manifest_dir: string;
-  resource_count: number;
-  document_count: number;
+export type SapManifestDocument = {
+  path: string;
+  contents: string;
+  content_type?: string | null;
+  resource_id?: string | null;
 };
 
-export type SapImportResponse = {
-  ok: boolean;
-  imported: SapImportItem[];
-  failures: string[];
-  count: number;
+export type SapObjectManifest = {
+  schema_version?: number;
+  metadata_uri?: string | null;
+  object_uri?: string | null;
+  object_name?: string | null;
+  object_type?: string | null;
+  package_name?: string | null;
+  resources?: SapManifestResource[];
+  documents?: SapManifestDocument[];
 };
 
 export type SapExportScanItem = {
@@ -535,34 +526,12 @@ export type SapExportScanResponse = {
   count: number;
 };
 
-export function sapDiscover() {
-  return fetchJson<SapDiscoverResponse>('/api/sap/discover', {
-    method: 'POST',
-    body: JSON.stringify({})
-  });
-}
-
 export function sapSearchObjects(packageName: string, includeSubpackages: boolean) {
   return fetchJson<SapSearchResponse>('/api/sap/search', {
     method: 'POST',
     body: JSON.stringify({
       package_name: packageName,
       include_subpackages: includeSubpackages
-    })
-  });
-}
-
-export function sapImportObjects(
-  repoRef: string,
-  selectedObjects: SapImportSelection[],
-  includeXmlArtifacts: boolean
-) {
-  return fetchJson<SapImportResponse>('/api/sap/import', {
-    method: 'POST',
-    body: JSON.stringify({
-      repo_ref: repoRef,
-      selected_objects: selectedObjects,
-      include_xml_artifacts: includeXmlArtifacts
     })
   });
 }

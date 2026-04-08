@@ -47,8 +47,6 @@ import {
   patchWorkflowStageState,
   pauseWorkflowRun,
   resumeWorkflowRun,
-  sapDiscover,
-  sapImportObjects as runSapImportObjects,
   sapScanExportCandidates,
   sapSearchObjects,
   runCurrentWorkflowStep,
@@ -60,7 +58,6 @@ import {
   type EventChainSummaryResponse,
   type InferenceTransport,
   type RepoTreeResponse,
-  type SapConnectionInput,
   type SapExportScanItem,
   type SapSearchObject,
   type StageExecutionChain,
@@ -454,18 +451,6 @@ function readBooleanValue(root: unknown, path: string, fallback = false): boolea
   return Boolean(readNestedValue(root, path, fallback));
 }
 
-function readSapConnection(): SapConnectionInput {
-  const globalConfig = globalThis as {
-    __MDEV_SAP_ADT_BASE_URL__?: string;
-    __ADT_HOST_URL__?: string;
-  };
-  const envBaseUrl = String(
-    globalConfig.__MDEV_SAP_ADT_BASE_URL__ ?? globalConfig.__ADT_HOST_URL__ ?? ''
-  ).trim();
-  return {
-    base_url: envBaseUrl,
-  };
-}
 
 const StageModifierActions = memo(function StageModifierActions(props: {
   actions: StageModifierAction[];
@@ -701,10 +686,8 @@ const SapImportStageControlsPanel = memo(function SapImportStageControlsPanel(pr
   packageName: string;
   includeSubpackages: boolean;
   includeXmlArtifacts: boolean;
-  discoverBusy: boolean;
   searchBusy: boolean;
   checkedCount: number;
-  onConnect: () => void;
   onLoad: () => void;
   onApplySelection: () => void;
   onPackageNameChange: (value: string) => void;
@@ -716,10 +699,8 @@ const SapImportStageControlsPanel = memo(function SapImportStageControlsPanel(pr
     packageName,
     includeSubpackages,
     includeXmlArtifacts,
-    discoverBusy,
     searchBusy,
     checkedCount,
-    onConnect,
     onLoad,
     onApplySelection,
     onPackageNameChange,
@@ -733,9 +714,6 @@ const SapImportStageControlsPanel = memo(function SapImportStageControlsPanel(pr
       {status ? <Alert color="blue">{status}</Alert> : null}
       <Stack gap="md" style={{ minWidth: 0 }}>
         <Group align="end" wrap="wrap">
-          <Button size="xs" variant="default" onClick={onConnect} loading={discoverBusy}>
-            Connect
-          </Button>
           <Button size="xs" variant="default" onClick={onLoad} loading={searchBusy}>
             Load
           </Button>
@@ -913,9 +891,11 @@ const SapExportStageInputsPanel = memo(function SapExportStageInputsPanel(props:
   const [manifestPathsText, setManifestPathsText] = useState('');
   const [autoActivate, setAutoActivate] = useState(true);
 
-  const selectedManifestPaths = useMemo(() => new Set(manifestPathsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)), [manifestPathsText]);
+  const selectedManifestPaths = useMemo(
+    () => new Set(manifestPathsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)),
+    [manifestPathsText]
+  );
 
-  const [discoverBusy, setDiscoverBusy] = useState(false);
   const [scanBusy, setScanBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [manifests, setManifests] = useState<SapExportScanItem[]>([]);
@@ -927,19 +907,6 @@ const SapExportStageInputsPanel = memo(function SapExportStageInputsPanel(props:
     setAutoActivate(readBooleanValue(selectedWorkflowStep, 'config.sap_export.auto_activate', true));
     setCheckedManifestPaths(new Set(nextManifestPathsText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)));
   }, [selectedWorkflowStep?.id]);
-
-  async function handleConnect() {
-    try {
-      setDiscoverBusy(true);
-      setStatus(null);
-      const result = await sapDiscover();
-      setStatus(result.message);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDiscoverBusy(false);
-    }
-  }
 
   async function handleScan() {
     try {
@@ -984,14 +951,6 @@ const SapExportStageInputsPanel = memo(function SapExportStageInputsPanel(props:
         <Button
           size="xs"
           variant="default"
-          onClick={() => void handleConnect()}
-          loading={discoverBusy}
-        >
-          Connect
-        </Button>
-        <Button
-          size="xs"
-          variant="default"
           onClick={() => void handleScan()}
           loading={scanBusy}
           disabled={!repoRef.trim()}
@@ -1033,7 +992,10 @@ const SapExportStageInputsPanel = memo(function SapExportStageInputsPanel(props:
               {manifests.map((item) => (
                 <Table.Tr key={item.manifest_path}>
                   <Table.Td>
-                    <Checkbox checked={checkedManifestPaths.has(item.manifest_path)} onChange={(event) => toggleManifest(item.manifest_path, event.currentTarget.checked)} />
+                    <Checkbox
+                      checked={checkedManifestPaths.has(item.manifest_path)}
+                      onChange={(event) => toggleManifest(item.manifest_path, event.currentTarget.checked)}
+                    />
                   </Table.Td>
                   <Table.Td>{item.object_name}</Table.Td>
                   <Table.Td><Code>{item.object_type}</Code></Table.Td>
@@ -1268,7 +1230,6 @@ export function WorkflowShell() {
   const [sapImportIncludeSubpackages, setSapImportIncludeSubpackages] = useState(true);
   const [sapImportIncludeXmlArtifacts, setSapImportIncludeXmlArtifacts] = useState(false);
   const [sapImportSelectedObjectUrisText, setSapImportSelectedObjectUrisText] = useState('');
-  const [sapImportDiscoverBusy, setSapImportDiscoverBusy] = useState(false);
   const [sapImportSearchBusy, setSapImportSearchBusy] = useState(false);
   const [sapImportApplyBusy, setSapImportApplyBusy] = useState(false);
   const [sapImportStatus, setSapImportStatus] = useState<string | null>(null);
@@ -1330,19 +1291,6 @@ export function WorkflowShell() {
     setSapImportObjectFilter('');
     setSapImportStatus(null);
   }, [selectedWorkflowStep?.id, selectedWorkflowStep?.step_type]);
-
-  async function handleSapImportConnect() {
-    try {
-      setSapImportDiscoverBusy(true);
-      setSapImportStatus(null);
-      const result = await sapDiscover();
-      setSapImportStatus(result.message);
-    } catch (error) {
-      setSapImportStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setSapImportDiscoverBusy(false);
-    }
-  }
 
   async function handleSapImportSearch() {
     const packageName = sapImportPackageName.trim();
@@ -1406,7 +1354,7 @@ export function WorkflowShell() {
         object_name: item.name,
         object_type: item.object_type,
         package_name: item.package_name ?? null,
-        clone_target_path: null
+        source_uri: item.source_uri ?? null
       }));
     const next = selectedObjects.map((item) => item.object_uri).join('\n');
 
@@ -1414,11 +1362,7 @@ export function WorkflowShell() {
     patchSelectedStepDescriptorField('config.sap_import.object_uris_text', next);
     patchSelectedStepDescriptorField('config.sap_import.selected_objects', selectedObjects);
     patchSelectedStepDescriptorField('config.sap_import.package_name', sapImportPackageName);
-
-    if (!selectedRun?.repo_ref?.trim()) {
-      setSapImportStatus('Run repo_ref is not set.');
-      return;
-    }
+    patchSelectedStepDescriptorField('config.sap_import.include_xml_artifacts', sapImportIncludeXmlArtifacts);
 
     if (selectedObjects.length === 0) {
       setSapImportStatus('Select at least one SAP object to import.');
@@ -1428,17 +1372,7 @@ export function WorkflowShell() {
     try {
       setSapImportApplyBusy(true);
       setSapImportStatus(null);
-      setSapImportStatus(`Importing ${selectedObjects.length} SAP object(s)...`);
-      const result = await runSapImportObjects(
-        selectedRun.repo_ref,
-        selectedObjects,
-        sapImportIncludeXmlArtifacts
-      );
-      if (result.failures.length > 0) {
-        setSapImportStatus(`Imported ${result.imported.length} SAP object(s). ${result.failures.length} failed.`);
-      } else {
-        setSapImportStatus(`Imported ${result.imported.length} SAP object(s) into the worktree.`);
-      }
+      setSapImportStatus(`Prepared ${selectedObjects.length} SAP object(s) for workflow import.`);
     } catch (error) {
       setSapImportStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3460,10 +3394,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     packageName={sapImportPackageName}
                                     includeSubpackages={sapImportIncludeSubpackages}
                                     includeXmlArtifacts={sapImportIncludeXmlArtifacts}
-                                    discoverBusy={sapImportDiscoverBusy}
                                     searchBusy={sapImportSearchBusy || sapImportApplyBusy}
                                     checkedCount={sapImportCheckedUris.size}
-                                    onConnect={() => void handleSapImportConnect()}
                                     onLoad={() => void handleSapImportSearch()}
                                     onApplySelection={() => void applySapImportSelection()}
                                     onPackageNameChange={(value) => {
