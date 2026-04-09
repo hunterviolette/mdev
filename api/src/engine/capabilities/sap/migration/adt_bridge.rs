@@ -3008,18 +3008,109 @@ fn extract_status_from_error_text(error_text: &str) -> Option<u16> {
         .and_then(|m| m.as_str().parse::<u16>().ok())
 }
 
-pub fn syntax_check(_sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckResult> {
+pub fn syntax_check(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckResult> {
     let object_uri = object_uri.trim();
     if object_uri.is_empty() {
         return Err(anyhow!("Object URI is required"));
     }
 
-    Ok(AdtCheckResult {
-        status: Some(204),
-        body: String::new(),
-        problems: Vec::new(),
-        ok: true,
-    })
+    let session_id = ensure_transport_session(sap)?;
+    let discovery_url = require_discovery_url(sap)?;
+    let base_url = bridge_base_url(&discovery_url)?;
+    let bridge_dir = transport_bridge_dir(sap);
+
+    let mutex = bridge_client();
+    let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.ensure_started(&bridge_dir, &base_url)?;
+
+    let resp = client.send_json(json!({
+        "cmd": "syntax_check",
+        "session_id": session_id,
+        "object_uri": object_uri
+    }));
+
+    match resp {
+        Ok(resp) => {
+            let data = resp.get("data").unwrap_or(&resp);
+            let body = data
+                .get("xml")
+                .and_then(|v| v.as_str())
+                .or_else(|| data.get("body").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string();
+            let status = data
+                .get("status")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16)
+                .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
+
+            let mut problems = problem_messages_from_json(data.get("problems"));
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&body);
+            }
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body) {
+                    problems.push(message);
+                }
+            }
+
+            let status_ok = status.map(|s| (200..300).contains(&s)).unwrap_or(false);
+            let bridge_ok = data.get("ok").and_then(|v| v.as_bool()).unwrap_or(status_ok);
+            let ok = bridge_ok && problems.is_empty();
+
+            log_adt_http(
+                "syntax_check",
+                "POST",
+                object_uri,
+                status,
+                if ok { None } else { Some(&body) },
+            );
+
+            Ok(AdtCheckResult {
+                status,
+                body,
+                problems,
+                ok,
+            })
+        }
+        Err(err) => {
+            let error_text = format!("{:#}", err);
+            let status = extract_status_from_error_text(&error_text);
+            let body = extract_xml_payload_from_error_text(&error_text);
+            let mut problems = extract_adt_problem_messages(&body);
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&body) {
+                    problems.push(message);
+                }
+            }
+            if problems.is_empty() {
+                problems = extract_adt_problem_messages(&error_text);
+            }
+            if problems.is_empty() {
+                if let Some(message) = extract_adt_exception_message(&error_text) {
+                    problems.push(message);
+                }
+            }
+            if problems.is_empty() {
+                problems.push(body.clone());
+            }
+
+            log_adt_http(
+                "syntax_check",
+                "POST",
+                object_uri,
+                status,
+                Some(&body),
+            );
+
+            Ok(AdtCheckResult {
+                status,
+                body,
+                problems,
+                ok: false,
+            })
+        }
+    }
 }
 
 pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtActivateResult> {

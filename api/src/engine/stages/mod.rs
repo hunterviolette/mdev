@@ -4,6 +4,7 @@ mod design_stage;
 mod review_stage;
 mod sap_export_stage;
 mod sap_import_stage;
+mod sap_syntax_stage;
 
 use std::time::Instant;
 
@@ -248,6 +249,7 @@ fn prepare_stage_local_state(
         "compile" => compile_stage::prepare_stage_state(step, local_state),
         "review" => review_stage::prepare_stage_state(step, local_state),
         "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
+        "sap_syntax" => sap_syntax_stage::prepare_stage_state(step, local_state),
         "sap_export" => sap_export_stage::prepare_stage_state(step, local_state),
         _ => design_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
     }
@@ -277,11 +279,7 @@ fn resolve_stage_branch(
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
 
-    let patch = if capability_failed {
-        build_branch_patch(step, &branch, capability_results)
-    } else {
-        branch.get("patch").cloned()
-    };
+    let patch = build_branch_patch(step, &branch, capability_results);
 
     let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
 
@@ -312,6 +310,15 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
         }
         ("code", "gateway_model/changeset", "apply_error_to_code_prompt") => {
             Some(code_stage::build_apply_error_patch(capability_results))
+        }
+        ("sap_syntax", "sap/export", "sap_syntax_success_state") => {
+            Some(sap_syntax_stage::build_sap_syntax_success_patch(capability_results))
+        }
+        ("sap_syntax", "sap/export", "sap_syntax_error_to_code_prompt") => {
+            Some(sap_syntax_stage::build_sap_syntax_error_patch(capability_results))
+        }
+        ("sap_export", "sap/export", "sap_execution_state") => {
+            Some(sap_export_stage::build_sap_execution_patch(capability_results))
         }
         _ => None,
     }

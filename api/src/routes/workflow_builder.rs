@@ -121,6 +121,7 @@ fn default_builder_catalog() -> WorkflowBuilderCatalog {
             compile_descriptor(),
             review_descriptor(),
             sap_import_descriptor(),
+            sap_syntax_descriptor(),
             sap_export_descriptor(),
         ],
     }
@@ -361,18 +362,51 @@ fn sap_import_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
+fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
+    let mut template = base_stage_template("sap_syntax", "SAP Syntax", AutomationMode::Automatic);
+    template.execution_logic = json!({
+        "kind": "sap_syntax_stage_policy"
+    });
+    template.execution_plan = vec![capability_node_with_config("sap/export", json!({ "mode": "syntax" }))];
+
+    WorkflowStageDescriptor {
+        step_type: "sap_syntax".to_string(),
+        label: "SAP Syntax".to_string(),
+        category: "sap".to_string(),
+        description: "Push inactive SAP artifacts and run backend-owned syntax validation against unstaged worktree changes.".to_string(),
+        definition_template: template,
+        editable_fields: vec![WorkflowStageFieldGroup {
+            key: "sap_syntax".to_string(),
+            label: "SAP Syntax".to_string(),
+            fields: vec![
+                text_field("manifest_paths_text", "Manifest paths", "config.sap_syntax.manifest_paths_text", ""),
+                text_field("corr_nr", "Transport request", "config.sap_syntax.corr_nr", ""),
+                text_field("connection.base_url", "ADT base URL", "config.sap_syntax.connection.base_url", ""),
+                text_field("connection.client", "SAP client", "config.sap_syntax.connection.client", ""),
+                text_field("connection.auth_type", "Auth type", "config.sap_syntax.connection.auth_type", "basic"),
+                text_field("connection.username", "Username", "config.sap_syntax.connection.username", ""),
+                text_field("connection.password", "Password", "config.sap_syntax.connection.password", ""),
+                text_field("connection.authorization", "Authorization header", "config.sap_syntax.connection.authorization", ""),
+                text_field("connection.cookie_header", "Cookie header", "config.sap_syntax.connection.cookie_header", ""),
+                text_field("connection.bridge_dir", "ADT bridge dir", "config.sap_syntax.connection.bridge_dir", "adt-bridge"),
+            ],
+        }],
+        routes: default_routes("review", "sap_syntax", "sap_syntax"),
+    }
+}
+
 fn sap_export_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_export", "SAP Export", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_export_stage_policy"
     });
-    template.execution_plan = vec![capability_node("sap/export")];
+    template.execution_plan = vec![capability_node_with_config("sap/export", json!({ "mode": "export" }))];
 
     WorkflowStageDescriptor {
         step_type: "sap_export".to_string(),
         label: "SAP Export".to_string(),
         category: "sap".to_string(),
-        description: "Export SAP artifacts through backend-owned stage descriptors and compile flow.".to_string(),
+        description: "Activate SAP artifacts through backend-owned stage descriptors using unstaged worktree changes.".to_string(),
         definition_template: template,
         editable_fields: vec![WorkflowStageFieldGroup {
             key: "sap_export".to_string(),
@@ -391,7 +425,7 @@ fn sap_export_descriptor() -> WorkflowStageDescriptor {
                 text_field("connection.bridge_dir", "ADT bridge dir", "config.sap_export.connection.bridge_dir", "adt-bridge"),
             ],
         }],
-        routes: default_routes("review", "sap_export", "sap_export"),
+        routes: default_routes("", "sap_export", "sap_export"),
     }
 }
 
@@ -401,6 +435,19 @@ fn capability_node(key: &str) -> StageExecutionNode {
         key: key.to_string(),
         enabled: true,
         config: json!({}),
+        input_mapping: json!({}),
+        output_mapping: json!({}),
+        run_after: Vec::new(),
+        condition: Value::Null,
+    }
+}
+
+fn capability_node_with_config(key: &str, config: Value) -> StageExecutionNode {
+    StageExecutionNode {
+        kind: StageExecutionNodeKind::Capability,
+        key: key.to_string(),
+        enabled: true,
+        config,
         input_mapping: json!({}),
         output_mapping: json!({}),
         run_after: Vec::new(),
