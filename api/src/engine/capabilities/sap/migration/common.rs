@@ -208,13 +208,6 @@ pub fn harvest_cookie_header_for_runtime(base_url: &str, client: Option<String>)
         None => format!("{}/sap/bc/adt/discovery", normalized_base),
     };
 
-    let bridge_dir = resolve_bridge_dir(&SapConnectionConfig {
-        base_url: normalized_base.clone(),
-        client: client_trimmed.clone(),
-        ..SapConnectionConfig::default()
-    })?;
-
-    let bridge_dir_string = bridge_dir.to_string_lossy().into_owned();
     let mut sap = SapAdtState {
         base_url: normalized_base.clone(),
         auth_type: "cookie".to_string(),
@@ -222,7 +215,6 @@ pub fn harvest_cookie_header_for_runtime(base_url: &str, client: Option<String>)
         authorization: String::new(),
         cookie_header: None,
         client: client_trimmed.clone().unwrap_or_default(),
-        bridge_dir: bridge_dir_string,
         discovery_url: Some(discovery_url.clone()),
         ..SapAdtState::default()
     };

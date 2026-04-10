@@ -100,14 +100,6 @@ fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()
     ))
 }
 
-pub async fn execute_root_capability(ctx: CapabilityContext<'_>) -> Result<Vec<CapabilityResult>> {
-    let policy = stage_capability_policy(ctx.step)?;
-    let root = CapabilityInvocation {
-        capability: policy.entrypoint.clone(),
-        config: json!({}),
-    };
-    execute_capability_chain(ctx, &policy, vec![root]).await
-}
 
 pub async fn execute_capability_invocations(
     ctx: CapabilityContext<'_>,

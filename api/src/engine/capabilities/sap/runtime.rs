@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -90,42 +88,9 @@ fn default_browser_user_data_dir() -> String {
     dir.to_string_lossy().replace('\\', "/")
 }
 
-fn first_existing_candidate(candidates: &[PathBuf]) -> Option<String> {
-    candidates
-        .iter()
-        .find(|path| path.is_dir())
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-fn resolve_transport_bridge_dir() -> Result<String> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let parent = cwd.parent().map(PathBuf::from).unwrap_or_else(|| cwd.clone());
-
-    let candidates = vec![
-        parent.join("adt-bridge"),
-        parent.join("bridge"),
-        cwd.join("adt-bridge"),
-        cwd.join("bridge"),
-    ];
-
-    if let Some(found) = first_existing_candidate(&candidates) {
-        return Ok(found);
-    }
-
-    Err(anyhow!(format!(
-        "Could not resolve SAP transport bridge dir. Checked: {}",
-        candidates
-            .iter()
-            .map(|path| path.to_string_lossy().replace('\\', "/"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
-}
-
 fn build_state() -> Result<SapAdtState> {
     let base_url = read_required_env("ADT_HOST_URL")?;
     let discovery_url = default_discovery_url(&base_url, None);
-    let bridge_dir = resolve_transport_bridge_dir()?;
     let cookie_header = common::harvest_cookie_header_for_runtime(&base_url, None)?;
 
     Ok(SapAdtState {
@@ -135,8 +100,6 @@ fn build_state() -> Result<SapAdtState> {
         authorization: String::new(),
         cookie_header: Some(cookie_header),
         client: String::new(),
-        bridge_dir: bridge_dir.clone(),
-        browser_bridge_dir: bridge_dir,
         browser_user_data_dir: default_browser_user_data_dir(),
         discovery_url: Some(discovery_url),
         ..SapAdtState::default()

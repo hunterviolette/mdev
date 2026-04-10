@@ -133,6 +133,7 @@ pub fn ensure_run_for_repo(
 ) -> Result<String> {
     let run = api.create_run(CreateRunBody {
         template_id: None,
+        definition: None,
         title: title.to_string(),
         repo_ref: repo_ref_from_repo_path(repo),
         context: json!({

@@ -1,73 +1,38 @@
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
-use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, COOKIE, USER_AGENT};
-use reqwest::{StatusCode, Url};
+use reqwest::Url;
 use serde_json::{json, Value};
 
 use crate::engine::capabilities::inference::BrowserConfig as BrowserTurnConfig;
 use crate::engine::capabilities::inference::browser::adapter as browser_bridge;
+use crate::engine::capabilities::sap::adt::client::AdtClient;
 use super::sap_adt_manifest::{
     SapAdtManifestDocument,
     SapAdtManifestResource,
     SapAdtObjectManifest,
 };
 use crate::engine::capabilities::sap::state::{
-    SapAdtDiscoveryCollection,
-    SapAdtDiscoveryState,
     SapAdtObjectSummary,
     SapAdtState,
-    SapAdtTemplateLink,
 };
 
 #[derive(Clone, Debug)]
 pub struct AdtReadObjectResult {
     pub object_uri: String,
     pub content_type: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub body: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct AdtLockObjectResult {
-    pub object_uri: String,
-    pub lock_handle: String,
-    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct AdtUpdateObjectResult {
     pub status: Option<u16>,
-    pub headers: Vec<(String, String)>,
     pub body: String,
     pub problems: Vec<String>,
     pub ok: bool,
-}
-
-fn should_persist_manifest_header(name: &str) -> bool {
-    !matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "x-final-url"
-            | "x-redirected"
-            | "x-request-auth-type"
-            | "x-request-auth-attached"
-            | "x-request-authorization-scheme"
-    )
-}
-
-fn sanitize_manifest_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| should_persist_manifest_header(name))
-        .cloned()
-        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -194,10 +159,10 @@ pub fn extract_object_source_uri(metadata_uri: &str, metadata_xml: &str) -> Resu
 
         if rel.as_deref() == Some("http://www.sap.com/adt/relations/source") {
             if let Some(href) = href {
-                if !href.trim().is_empty() {
-                    if content_type.as_deref() == Some("text/plain") || content_type.is_none() {
-                        return Ok(Some(resolve_relative_object_uri(metadata_uri, &href)?));
-                    }
+                if !href.trim().is_empty()
+                    && (content_type.as_deref() == Some("text/plain") || content_type.is_none())
+                {
+                    return Ok(Some(resolve_relative_object_uri(metadata_uri, &href)?));
                 }
             }
         }
@@ -244,13 +209,6 @@ fn manifest_slug(value: &str, fallback: &str) -> String {
     } else {
         collapsed
     }
-}
-
-fn manifest_header_value(headers: &[(String, String)], key: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.clone())
 }
 
 fn manifest_extension_for(content_type: Option<&str>) -> &'static str {
@@ -425,23 +383,6 @@ fn manifest_resource_path_for_link(
     format!("{}.{}", stem, manifest_extension_for(content_type))
 }
 
-fn manifest_resource_path(index: usize, role: &str, title: Option<&str>, content_type: Option<&str>) -> String {
-    let stem = if let Some(title) = title {
-        let slug = manifest_slug(title, "resource");
-        if slug == role {
-            role.to_string()
-        } else {
-            format!("{}_{}", role, slug)
-        }
-    } else if index == 0 {
-        role.to_string()
-    } else {
-        format!("{}_{}", role, index + 1)
-    };
-
-    format!("{}.{}", stem, manifest_extension_for(content_type))
-}
-
 fn manifest_document_path(index: usize, title: Option<&str>, content_type: Option<&str>) -> String {
     let stem = title
         .map(|title| manifest_slug(title, "document"))
@@ -528,15 +469,14 @@ fn should_skip_manifest_artifact(
         return true;
     }
 
-    if rel_lc.contains("source") || title_lc.contains("source") || uri_lc.contains("source") {
-        if title_lc.contains("unicode")
+    if (rel_lc.contains("source") || title_lc.contains("source") || uri_lc.contains("source"))
+        && (title_lc.contains("unicode")
             || uri_lc.contains("source_standard_abap_unicode")
             || uri_lc.contains("standard_abap_unicode")
             || rel_lc.contains("standardabapunicode")
-            || ct_lc.contains("abap") && body.len() > 200000
-        {
-            return true;
-        }
+            || ct_lc.contains("abap") && body.len() > 200000)
+    {
+        return true;
     }
 
     false
@@ -757,7 +697,7 @@ pub fn crawl_object_manifest(
             .content_type
             .clone()
             .or_else(|| Some("application/xml".to_string())),
-        headers: sanitize_manifest_headers(&metadata_result.headers),
+        headers: Vec::new(),
         path: "metadata.xml".to_string(),
         body: metadata_xml.clone(),
     }];
@@ -836,12 +776,9 @@ pub fn crawl_object_manifest(
                     rel: rel.clone(),
                     title: title.clone(),
                     content_type: read_result.content_type.clone().or(content_type.clone()),
-                    etag: manifest_header_value(&read_result.headers, "etag"),
-                    lock_handle: manifest_header_value(&read_result.headers, "lock_handle")
-                        .or_else(|| manifest_header_value(&read_result.headers, "lock-handle"))
-                        .or_else(|| manifest_header_value(&read_result.headers, "x-lock-handle"))
-                        .or_else(|| manifest_header_value(&read_result.headers, "x-lockhandle")),
-                    headers: sanitize_manifest_headers(&read_result.headers),
+                    etag: None,
+                    lock_handle: None,
+                    headers: Vec::new(),
                     path,
                     readable,
                     editable,
@@ -856,7 +793,7 @@ pub fn crawl_object_manifest(
                     uri: resolved_uri,
                     title: title.clone(),
                     content_type: read_result.content_type.clone().or(content_type.clone()),
-                    headers: sanitize_manifest_headers(&read_result.headers),
+                    headers: Vec::new(),
                     path,
                     body: read_result.body,
                 });
@@ -884,41 +821,38 @@ pub fn crawl_object_manifest(
         if let Some(source_uri) = extract_object_source_uri(metadata_uri, &metadata_xml)? {
             let read_result = read_link_target_with_resolution_fallbacks(sap, metadata_uri, &source_uri, Some("text/plain, text/*, */*"))?;
             let resolved_uri = read_result.object_uri.clone();
-            if seen_uris.insert(resolved_uri.clone()) {
-                if !should_skip_manifest_artifact(
+            if seen_uris.insert(resolved_uri.clone())
+                && !should_skip_manifest_artifact(
                     "http://www.sap.com/adt/relations/source",
                     Some("source"),
                     read_result.content_type.as_deref(),
                     &resolved_uri,
                     &read_result.body,
-                ) {
-                    resources.push(SapAdtManifestResource {
-                        id: "resource_1".to_string(),
-                        uri: resolved_uri.clone(),
-                        rel: "http://www.sap.com/adt/relations/source".to_string(),
-                        title: Some("source".to_string()),
-                        content_type: read_result.content_type.clone(),
-                        etag: manifest_header_value(&read_result.headers, "etag"),
-                        lock_handle: manifest_header_value(&read_result.headers, "lock_handle")
-                            .or_else(|| manifest_header_value(&read_result.headers, "lock-handle"))
-                            .or_else(|| manifest_header_value(&read_result.headers, "x-lock-handle"))
-                            .or_else(|| manifest_header_value(&read_result.headers, "x-lockhandle")),
-                        headers: sanitize_manifest_headers(&read_result.headers),
-                        path: manifest_resource_path_for_link(
-                            &metadata_xml,
-                            0,
-                            "source",
-                            Some("source"),
-                            &resolved_uri,
-                            read_result.content_type.as_deref(),
-                        ),
-                        readable: true,
-                        editable: true,
-                        activatable: true,
-                        role: "source".to_string(),
-                        body: read_result.body,
-                    });
-                }
+                )
+            {
+                resources.push(SapAdtManifestResource {
+                    id: "resource_1".to_string(),
+                    uri: resolved_uri.clone(),
+                    rel: "http://www.sap.com/adt/relations/source".to_string(),
+                    title: Some("source".to_string()),
+                    content_type: read_result.content_type.clone(),
+                    etag: None,
+                    lock_handle: None,
+                    headers: Vec::new(),
+                    path: manifest_resource_path_for_link(
+                        &metadata_xml,
+                        0,
+                        "source",
+                        Some("source"),
+                        &resolved_uri,
+                        read_result.content_type.as_deref(),
+                    ),
+                    readable: true,
+                    editable: true,
+                    activatable: true,
+                    role: "source".to_string(),
+                    body: read_result.body,
+                });
             }
         }
     }
@@ -946,9 +880,6 @@ pub fn crawl_object_manifest(
         .and_then(|source_uri| resolve_relative_object_uri_candidates(metadata_uri, &source_uri).ok())
         .and_then(|candidates| candidates.into_iter().find(|candidate| seen_uris.contains(candidate)))
         .or_else(|| resources.first().map(|resource| resource.uri.clone()));
-    let manifest_etag = manifest_header_value(&metadata_result.headers, "etag")
-        .or_else(|| resources.iter().find_map(|resource| resource.etag.clone()));
-
     let manifest = SapAdtObjectManifest {
         schema_version: 1,
         metadata_uri: metadata_uri.to_string(),
@@ -956,7 +887,7 @@ pub fn crawl_object_manifest(
         object_name: object_name.map(|v| v.to_string()).or(root_object_name),
         object_type: object_type.map(|v| v.to_string()).or(root_object_type),
         package_name: package_name.map(|v| v.to_string()).or(root_package_name),
-        etag: manifest_etag,
+        etag: None,
         metadata_xml,
         resources,
         documents,
@@ -965,60 +896,52 @@ pub fn crawl_object_manifest(
     Ok(manifest)
 }
 
+struct SharedAdtSession {
+    cache_key: String,
+    session_id: String,
+}
+
 struct AdtBridgeClient {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    stdout: Option<BufReader<ChildStdout>>,
+    session: Option<SharedAdtSession>,
+    pending_state: Option<SapAdtState>,
     next_id: u64,
-    bridge_dir: Option<String>,
-    base_url: Option<String>,
 }
 
 impl AdtBridgeClient {
     fn new() -> Self {
         Self {
-            child: None,
-            stdin: None,
-            stdout: None,
+            session: None,
+            pending_state: None,
             next_id: 1,
-            bridge_dir: None,
-            base_url: None,
         }
     }
 
-    fn ensure_started(&mut self, bridge_dir: &str, base_url: &str) -> Result<()> {
-        if self.child.is_some()
-            && self.bridge_dir.as_deref() == Some(bridge_dir)
-            && self.base_url.as_deref() == Some(base_url)
-        {
+    fn set_state(&mut self, sap: &SapAdtState) {
+        self.pending_state = Some(sap.clone());
+    }
+
+    fn ensure_started(&mut self, _bridge_dir: &str, _base_url: &str) -> Result<()> {
+        let state = self
+            .pending_state
+            .clone()
+            .ok_or_else(|| anyhow!("ADT native client state unavailable"))?;
+        let cache_key = native_session_cache_key(&state);
+
+        let reuse_existing = self
+            .session
+            .as_ref()
+            .map(|session| session.cache_key == cache_key)
+            .unwrap_or(false);
+
+        if reuse_existing {
             return Ok(());
         }
 
-        self.child = None;
-        self.stdin = None;
-        self.stdout = None;
-
-        let npm = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
-        let mut child = Command::new(npm)
-            .arg("start")
-            .current_dir(bridge_dir)
-            .env("ADT_HOST_URL", base_url)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("Failed to start ADT bridge from {}", bridge_dir))?;
-
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("ADT bridge stdin unavailable"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("ADT bridge stdout unavailable"))?;
-
-        self.stdin = Some(stdin);
-        self.stdout = Some(BufReader::new(stdout));
-        self.child = Some(child);
-        self.bridge_dir = Some(bridge_dir.to_string());
-        self.base_url = Some(base_url.to_string());
-
-        std::thread::sleep(Duration::from_millis(1200));
+        let session_id = format!("adt-native-{}", self.command_id());
+        self.session = Some(SharedAdtSession {
+            cache_key,
+            session_id,
+        });
         Ok(())
     }
 
@@ -1028,43 +951,361 @@ impl AdtBridgeClient {
         format!("adt-{}", id)
     }
 
+    fn session_ref(&self) -> Result<&SharedAdtSession> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| anyhow!("ADT native client session not connected"))
+    }
+
+    fn run_with_native_client<T, F>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&mut AdtClient) -> Result<T>,
+    {
+        let state = self
+            .pending_state
+            .clone()
+            .ok_or_else(|| anyhow!("ADT native client state unavailable"))?;
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| {
+                let mut client = AdtClient::new(&state)?;
+                op(&mut client)
+            })
+        } else {
+            let mut client = AdtClient::new(&state)?;
+            op(&mut client)
+        }
+    }
+
     fn send_json(&mut self, mut payload: Value) -> Result<Value> {
         let id = self.command_id();
         payload["id"] = Value::String(id.clone());
 
-        let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("ADT bridge stdin not connected"))?;
-        writeln!(stdin, "{}", payload).context("Failed writing ADT bridge command")?;
-        stdin.flush().context("Failed flushing ADT bridge stdin")?;
+        let cmd = payload
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("ADT command missing cmd"))?
+            .to_string();
 
-        let stdout = self.stdout.as_mut().ok_or_else(|| anyhow!("ADT bridge stdout not connected"))?;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = stdout.read_line(&mut line).context("Failed reading ADT bridge response")?;
-            if n == 0 {
-                return Err(anyhow!("ADT bridge exited before sending a response"));
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let parsed: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if parsed.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
-                continue;
-            }
-            if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return Ok(parsed);
-            }
-            let msg = parsed
-                .get("error")
+        if cmd == "connect" {
+            if let Some(cookie_header) = payload
+                .get("cookie_header")
                 .and_then(|v| v.as_str())
-                .unwrap_or("ADT bridge command failed");
-            return Err(anyhow!(msg.to_string()));
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                if let Some(state) = self.pending_state.as_mut() {
+                    state.cookie_header = Some(cookie_header.to_string());
+                }
+            }
+            self.ensure_started("", "")?;
+            let session = self.session_ref()?;
+            return Ok(json!({
+                "id": id,
+                "ok": true,
+                "cmd": cmd,
+                "session_id": session.session_id,
+                "data": {
+                    "session_id": session.session_id,
+                    "connected": true,
+                    "cookie_header": self.pending_state.as_ref().and_then(|state| state.cookie_header.clone())
+                }
+            }));
         }
+
+        let session_id = self.session_ref()?.session_id.clone();
+        let data = match cmd.as_str() {
+            "call_endpoint" => {
+                let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+                let uri = payload
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("call_endpoint missing uri"))?
+                    .to_string();
+                let body = payload.get("body").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let content_type = payload.get("content_type").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let accept = payload.get("accept").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let headers = json_headers_to_pairs(payload.get("headers"));
+                self.run_with_native_client(|client| {
+                    let resp = client.call_endpoint(
+                        &method,
+                        &uri,
+                        body.as_deref(),
+                        content_type.as_deref(),
+                        accept.as_deref(),
+                        Some(headers),
+                    )?;
+                    if !(200..300).contains(&resp.status) {
+                        let message = if resp.body.trim().is_empty() {
+                            format!("ADT call_endpoint failed ({}) {} {}", resp.status, method, uri)
+                        } else {
+                            format!("ADT call_endpoint failed ({}) {} {}: {}", resp.status, method, uri, resp.body)
+                        };
+                        return Err(anyhow!(message));
+                    }
+                    Ok(json!({
+                        "status": resp.status,
+                        "headers": resp.headers,
+                        "body": resp.body,
+                        "xml": resp.body
+                    }))
+                })?
+            }
+            "read_object" => {
+                let object_uri = payload
+                    .get("object_uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("read_object missing object_uri"))?
+                    .to_string();
+                let accept = payload.get("accept").and_then(|v| v.as_str()).map(|v| v.to_string());
+                self.run_with_native_client(|client| {
+                    let resp = client.call_endpoint(
+                        "GET",
+                        &object_uri,
+                        None,
+                        None,
+                        accept.as_deref(),
+                        None,
+                    )?;
+                    if !(200..300).contains(&resp.status) {
+                        let message = if resp.body.trim().is_empty() {
+                            format!("ADT read_object failed ({}) {}", resp.status, object_uri)
+                        } else {
+                            format!("ADT read_object failed ({}) {}: {}", resp.status, object_uri, resp.body)
+                        };
+                        return Err(anyhow!(message));
+                    }
+                    Ok(json!({
+                        "object_uri": object_uri,
+                        "content_type": header_value(&resp.headers, "content-type"),
+                        "body": resp.body,
+                        "status": resp.status,
+                        "headers": resp.headers
+                    }))
+                })?
+            }
+            "lock_object" => {
+                let object_uri = payload
+                    .get("object_uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("lock_object missing object_uri"))?
+                    .to_string();
+                self.run_with_native_client(|client| {
+                    let lock_resp = if object_uri.contains("/ddic/ddl/sources/") {
+                        client.lock_ddl_source(&object_uri)?
+                    } else {
+                        client.lock_object(&object_uri)?
+                    };
+
+                    let lock_handle = extract_tag_value(&lock_resp.body, "LOCK_HANDLE")
+                        .or_else(|| extract_tag_value(&lock_resp.body, "lockHandle"))
+                        .ok_or_else(|| anyhow!(format!("lock_object did not return LOCK_HANDLE for {}", object_uri)))?;
+
+                    Ok(json!({
+                        "status": 200,
+                        "headers": [],
+                        "body": lock_resp.body,
+                        "lock_handle": lock_handle
+                    }))
+                })?
+            }
+            "update_object" => {
+                let object_uri = payload
+                    .get("object_uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("update_object missing object_uri"))?
+                    .to_string();
+                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let content_type = payload.get("content_type").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let lock_handle = payload.get("lock_handle").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let corr_nr = payload.get("corr_nr").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let headers = json_headers_to_pairs(payload.get("headers"));
+                self.run_with_native_client(|client| {
+                    let route = resolve_adt_route(&object_uri);
+                    let is_ddl_source = matches!(route.route_family, AdtResolvedRouteFamily::RootToSourceMain)
+                        && route.lock_uri.contains("/ddic/ddl/sources/");
+                    let mut derived_lock_handle = lock_handle.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+                    let mut derived_corr_nr = corr_nr.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+
+                    if derived_lock_handle.is_none() {
+                        let lock_resp = if is_ddl_source {
+                            client.lock_ddl_source(&route.lock_uri)
+                        } else {
+                            client.lock_object(&route.lock_uri)
+                        };
+
+                        let lock_resp = match lock_resp {
+                            Ok(resp) => resp,
+                            Err(err) => {
+                                let error_text = format!("{:#}", err);
+                                let body = extract_xml_payload_from_error_text(&error_text);
+                                let message = extract_adt_exception_message(&body)
+                                    .or_else(|| extract_adt_exception_message(&error_text))
+                                    .unwrap_or_else(|| error_text.clone());
+                                return Err(anyhow!(format!(
+                                    "update_object lock failed for {}: {}",
+                                    route.lock_uri,
+                                    message
+                                )));
+                            }
+                        };
+
+                        derived_lock_handle = extract_tag_value(&lock_resp.body, "LOCK_HANDLE")
+                            .or_else(|| extract_tag_value(&lock_resp.body, "lockHandle"));
+                        derived_corr_nr = extract_tag_value(&lock_resp.body, "CORRNR")
+                            .or_else(|| extract_tag_value(&lock_resp.body, "corrNr"))
+                            .or(derived_corr_nr);
+                        if derived_lock_handle.is_none() {
+                            let body_message = extract_adt_exception_message(&lock_resp.body)
+                                .unwrap_or_else(|| lock_resp.body.chars().take(500).collect::<String>());
+                            return Err(anyhow!(format!(
+                                "update_object lock failed for {}: {}",
+                                route.lock_uri,
+                                body_message
+                            )));
+                        }
+                    }
+
+                    let mut final_uri = route.write_uri.clone();
+                    let mut query_parts = Vec::new();
+                    if let Some(lock_handle) = derived_lock_handle.as_deref() {
+                        query_parts.push(format!("lockHandle={}", urlencoding::encode(lock_handle)));
+                    }
+                    if let Some(corr_nr) = derived_corr_nr.as_deref() {
+                        query_parts.push(format!("corrNr={}", urlencoding::encode(corr_nr)));
+                    }
+                    if !query_parts.is_empty() {
+                        final_uri.push(if final_uri.contains('?') { '&' } else { '?' });
+                        final_uri.push_str(&query_parts.join("&"));
+                    }
+
+                    let source_to_write = if is_ddl_source {
+                        let fmt_resp = client.format_ddl_identifiers(&source)?;
+                        if !fmt_resp.body.trim().is_empty() {
+                            fmt_resp.body
+                        } else {
+                            source.clone()
+                        }
+                    } else {
+                        source.clone()
+                    };
+
+                    let result = client.call_endpoint(
+                        "PUT",
+                        &final_uri,
+                        Some(&source_to_write),
+                        content_type.as_deref(),
+                        None,
+                        Some(headers),
+                    );
+
+                    if let Some(lock_handle) = derived_lock_handle.as_deref() {
+                        let _ = client.unlock_object(&route.lock_uri, lock_handle);
+                    }
+
+                    let resp = result?;
+                    let ok = (200..300).contains(&resp.status);
+                    Ok(json!({
+                        "status": resp.status,
+                        "body": resp.body,
+                        "problems": [],
+                        "ok": ok,
+                        "headers": {
+                            "x-adt-lock-uri": route.lock_uri,
+                            "x-adt-write-uri": route.write_uri
+                        }
+                    }))
+                })?
+            }
+            "syntax_check" => {
+                let object_uri = payload
+                    .get("object_uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("syntax_check missing object_uri"))?
+                    .to_string();
+                self.run_with_native_client(|client| {
+                    let body = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><chkrun:checkObjectList xmlns:chkrun=\"http://www.sap.com/adt/checkrun\" xmlns:adtcore=\"http://www.sap.com/adt/core\"><chkrun:checkObject adtcore:uri=\"{}\" chkrun:version=\"inactive\"/></chkrun:checkObjectList>",
+                        object_uri
+                            .replace('&', "&amp;")
+                            .replace('"', "&quot;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    );
+                    let resp = client.call_endpoint(
+                        "POST",
+                        "/sap/bc/adt/checkruns?reporters=abapCheckRun",
+                        Some(&body),
+                        Some("application/vnd.sap.adt.checkobjects+xml"),
+                        Some("application/vnd.sap.adt.checkmessages+xml"),
+                        None,
+                    )?;
+                    Ok(json!({
+                        "status": resp.status,
+                        "body": resp.body
+                    }))
+                })?
+            }
+            "activate_object" => {
+                let object_uri = payload
+                    .get("object_uri")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("activate_object missing object_uri"))?
+                    .to_string();
+                self.run_with_native_client(|client| {
+                    let body = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><adtcore:objectReferences xmlns:adtcore=\"http://www.sap.com/adt/core\"><adtcore:objectReference adtcore:uri=\"{}\" /></adtcore:objectReferences>",
+                        object_uri
+                            .replace('&', "&amp;")
+                            .replace('"', "&quot;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    );
+                    let resp = client.call_endpoint(
+                        "POST",
+                        "/sap/bc/adt/activation?method=activate&preauditRequested=true",
+                        Some(&body),
+                        Some("application/xml, text/xml, */*"),
+                        None,
+                        Some(vec![("Content-Type".to_string(), "application/xml; charset=utf-8".to_string())]),
+                    )?;
+                    Ok(json!({
+                        "status": resp.status,
+                        "body": resp.body
+                    }))
+                })?
+            }
+            other => {
+                return Err(anyhow!(format!("Unhandled ADT native command {}", other)));
+            }
+        };
+
+        Ok(json!({
+            "id": id,
+            "ok": true,
+            "cmd": cmd,
+            "session_id": session_id,
+            "data": data
+        }))
     }
+}
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+fn native_session_cache_key(sap: &SapAdtState) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        sap.base_url.trim().trim_end_matches('/').to_ascii_lowercase(),
+        sap.client.trim().to_ascii_lowercase(),
+        sap.auth_type.trim().to_ascii_lowercase(),
+        sap.authorization.trim(),
+        sap.cookie_header.as_deref().unwrap_or("").trim()
+    )
 }
 
 fn bridge_client() -> &'static Mutex<AdtBridgeClient> {
@@ -1252,42 +1493,6 @@ fn cookie_harvest_lookup_urls(discovery_url: &str) -> Vec<String> {
     }
 
     urls
-}
-
-fn merge_cookie_lookup_urls(base: &[String], extra_url: &str) -> Vec<String> {
-    let mut urls = base.to_vec();
-    let trimmed = extra_url.trim();
-    if trimmed.is_empty() {
-        return urls;
-    }
-
-    if !urls.iter().any(|u| u == trimmed) {
-        urls.push(trimmed.to_string());
-    }
-
-    if let Ok(url) = Url::parse(trimmed) {
-        let origin = format!(
-            "{}://{}{}",
-            url.scheme(),
-            url.host_str().unwrap_or_default(),
-            url.port().map(|p| format!(":{}", p)).unwrap_or_default()
-        );
-        if !urls.iter().any(|u| u == &origin) {
-            urls.push(origin);
-        }
-    }
-
-    urls
-}
-
-fn apply_browser_runtime_url(cfg: &mut BrowserTurnConfig, current_url: &str) {
-    let trimmed = current_url.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    cfg.target_url = trimmed.to_string();
-    cfg.page_url_contains = browser_page_match_url(trimmed);
 }
 
 fn has_cookie_harvest_signal(cookie_header: &str) -> bool {
@@ -1487,28 +1692,6 @@ pub(crate) fn refresh_cookie_header(sap: &mut SapAdtState, discovery_url: &str) 
     Err(anyhow!("Failed to harvest SAP ADT cookies from browser bridge after all URL attempts"))
 }
 
-fn build_http_client() -> Result<Client> {
-    Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to build SAP ADT HTTP client")
-}
-
-fn send_discovery_request(client: &Client, discovery_url: &str, cookie_header: &str) -> Result<(StatusCode, String)> {
-    let response = client
-        .get(discovery_url)
-        .header(COOKIE, cookie_header)
-        .header(ACCEPT, "application/xml, text/xml, */*")
-        .header(USER_AGENT, "mdev-sap-adt/1.0")
-        .send()
-        .with_context(|| format!("Failed to send SAP ADT discovery request to {}", discovery_url))?;
-
-    let status = response.status();
-    let body = response.text().unwrap_or_default();
-    Ok((status, body))
-}
-
 fn xml_decode(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -1523,25 +1706,6 @@ fn xml_attr(attrs: &str, name: &str) -> Option<String> {
     let rest = &attrs[start..];
     let end = rest.find('"')?;
     Some(xml_decode(&rest[..end]))
-}
-
-fn first_tag_text(block: &str, tag: &str) -> Option<String> {
-    let pattern = format!(r"(?s)<{}\b[^>]*>(.*?)</{}>", regex::escape(tag), regex::escape(tag));
-    let re = Regex::new(&pattern).ok()?;
-    let caps = re.captures(block)?;
-    Some(xml_decode(caps.get(1)?.as_str().trim()))
-}
-
-fn collect_tag_texts(block: &str, tag: &str) -> Vec<String> {
-    let pattern = format!(r"(?s)<{}\b[^>]*>(.*?)</{}>", regex::escape(tag), regex::escape(tag));
-    let Ok(re) = Regex::new(&pattern) else {
-        return vec![];
-    };
-
-    re.captures_iter(block)
-        .filter_map(|caps| caps.get(1).map(|m| xml_decode(m.as_str().trim())))
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 fn extract_adt_exception_message(xml: &str) -> Option<String> {
@@ -1590,116 +1754,6 @@ fn build_package_search_queries(package_name: &str) -> Vec<String> {
     queries
 }
 
-fn parse_discovery(xml: &str) -> Result<SapAdtDiscoveryState> {
-    let workspace_re = Regex::new(r"(?s)<app:workspace\b[^>]*>(.*?)</app:workspace>")?;
-    let collection_re = Regex::new(r"(?s)<app:collection\b([^>]*)>(.*?)</app:collection>")?;
-    let category_re = Regex::new(r#"<atom:category\b([^>]*)/?>"#)?;
-    let template_link_re = Regex::new(r#"<adtcomp:templateLink\b([^>]*)/?>"#)?;
-
-    let mut workspaces = Vec::new();
-    for caps in workspace_re.captures_iter(xml) {
-        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(title) = first_tag_text(body, "atom:title") {
-            if !title.is_empty() {
-                workspaces.push(title);
-            }
-        }
-    }
-
-    let mut collections = Vec::new();
-    for caps in collection_re.captures_iter(xml) {
-        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let body = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let href = xml_attr(attrs, "href").unwrap_or_default();
-        if href.is_empty() {
-            continue;
-        }
-
-        let title = first_tag_text(body, "atom:title").unwrap_or_else(|| href.clone());
-        let accepts = collect_tag_texts(body, "app:accept");
-
-        let category_caps = category_re.captures(body);
-        let (category_term, category_scheme) = if let Some(cat_caps) = category_caps {
-            let cat_attrs = cat_caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            (xml_attr(cat_attrs, "term"), xml_attr(cat_attrs, "scheme"))
-        } else {
-            (None, None)
-        };
-
-        let template_links = template_link_re
-            .captures_iter(body)
-            .map(|tpl_caps| {
-                let tpl_attrs = tpl_caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                SapAdtTemplateLink {
-                    rel: xml_attr(tpl_attrs, "rel").unwrap_or_default(),
-                    href: xml_attr(tpl_attrs, "href").unwrap_or_default(),
-                    title: xml_attr(tpl_attrs, "title"),
-                    content_type: xml_attr(tpl_attrs, "type"),
-                    template: xml_attr(tpl_attrs, "template").unwrap_or_default(),
-                }
-            })
-            .filter(|tpl| !tpl.template.is_empty() || !tpl.rel.is_empty())
-            .collect::<Vec<_>>();
-
-        collections.push(SapAdtDiscoveryCollection {
-            title,
-            href,
-            category_term,
-            category_scheme,
-            accepts,
-            template_links,
-        });
-    }
-
-    if collections.is_empty() {
-        return Err(anyhow!("SAP ADT discovery XML contained no collections"));
-    }
-
-    let package_collection_href = collections
-        .iter()
-        .find(|c| c.href == "/sap/bc/adt/packages")
-        .map(|c| c.href.clone());
-
-    let package_tree_href = package_collection_href
-        .as_ref()
-        .map(|href| format!("{}/$tree", href.trim_end_matches('/')));
-
-    let repository_search_collection = collections
-        .iter()
-        .find(|c| c.href == "/sap/bc/adt/repository/informationsystem/search");
-
-    let repository_search_href = repository_search_collection.map(|c| c.href.clone());
-    let repository_search_template = repository_search_collection
-        .and_then(|c| {
-            c.template_links
-                .iter()
-                .find(|tpl| tpl.template.contains("/sap/bc/adt/repository/informationsystem/search"))
-                .map(|tpl| tpl.template.clone())
-        })
-        .or_else(|| repository_search_href.clone());
-
-    let object_types_href = collections
-        .iter()
-        .find(|c| c.href == "/sap/bc/adt/repository/informationsystem/objecttypes")
-        .map(|c| c.href.clone());
-
-    let enabled = package_tree_href.is_some() && repository_search_template.is_some();
-
-    Ok(SapAdtDiscoveryState {
-        title: String::new(),
-        collections,
-        links: Vec::new(),
-        xml: String::new(),
-        workspaces,
-        package_collection_href,
-        package_tree_href,
-        repository_search_href,
-        repository_search_template,
-        object_types_href,
-        enabled,
-    })
-}
-
 fn bridge_base_url(discovery_url: &str) -> Result<String> {
     let url = Url::parse(discovery_url)
         .with_context(|| format!("Invalid SAP ADT discovery URL: {}", discovery_url))?;
@@ -1719,6 +1773,7 @@ fn connect_transport_session(sap: &mut SapAdtState, cookie_header: &str) -> Resu
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let resp = client.send_json(json!({
@@ -1839,50 +1894,6 @@ fn choose_asxml_node_name(object_type: &str, uri: &str, object_name: &str, tech_
     }
 
     uri_leaf.to_string()
-}
-
-fn looks_like_generated_oo_name(name: &str) -> bool {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let eq_count = trimmed.chars().filter(|c| *c == '=').count();
-    eq_count >= 8 || trimmed.ends_with("CP") || trimmed.ends_with("CM") || trimmed.ends_with("CU") || trimmed.ends_with("CCAU")
-}
-
-fn choose_asxml_display_name(object_type: &str, uri: &str, object_name: &str, tech_name: &str, description: &str) -> String {
-    let object_name = object_name.trim();
-    let tech_name = tech_name.trim();
-    let description = description.trim();
-
-    let is_oo_object = object_type.starts_with("CLAS/")
-        || object_type.starts_with("INTF/")
-        || uri.starts_with("/sap/bc/adt/oo/classes/")
-        || uri.starts_with("/sap/bc/adt/oo/interfaces/");
-
-    if is_oo_object {
-        if !tech_name.is_empty() && !looks_like_generated_oo_name(tech_name) {
-            return tech_name.to_string();
-        }
-        if !object_name.is_empty() && !looks_like_generated_oo_name(object_name) {
-            return object_name.to_string();
-        }
-        if !description.is_empty() {
-            return description.to_string();
-        }
-    }
-
-    if !tech_name.is_empty() {
-        return tech_name.to_string();
-    }
-    if !object_name.is_empty() {
-        return object_name.to_string();
-    }
-    if !description.is_empty() {
-        return description.to_string();
-    }
-
-    uri.rsplit('/').next().unwrap_or(uri).to_string()
 }
 
 fn parse_asxml_repository_nodes(xml: &str) -> Vec<SapAdtObjectSummary> {
@@ -2051,63 +2062,6 @@ pub fn parse_package_tree_xml(xml: &str) -> Result<Vec<SapAdtObjectSummary>> {
     Ok(out)
 }
 
-pub fn connect(sap: &mut SapAdtState) -> Result<()> {
-    let discovery_url = require_discovery_url(sap)?;
-
-    sap.connected = false;
-    sap.last_error = None;
-    sap.last_status = Some("Refreshing SAP ADT authentication".to_string());
-
-    let mut cookie_header = sap.cookie_header.clone().unwrap_or_default();
-    if cookie_header.trim().is_empty() {
-        cookie_header = refresh_cookie_header(sap, &discovery_url)?;
-    }
-
-    let client = build_http_client()?;
-    let (status, body) = send_discovery_request(&client, &discovery_url, &cookie_header)?;
-
-    let final_body = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        cookie_header = refresh_cookie_header(sap, &discovery_url)?;
-        let (retry_status, retry_body) = send_discovery_request(&client, &discovery_url, &cookie_header)?;
-        if !retry_status.is_success() {
-            return Err(anyhow!(
-                "SAP ADT discovery returned {} after cookie refresh: {}",
-                retry_status,
-                retry_body
-            ));
-        }
-        retry_body
-    } else if !status.is_success() {
-        return Err(anyhow!("SAP ADT discovery returned {}: {}", status, body));
-    } else {
-        body
-    };
-
-    let discovery = parse_discovery(&final_body)?;
-    if !discovery.enabled {
-        return Err(anyhow!(
-            "SAP ADT discovery was retrieved but did not expose the package tree and repository search metadata needed by mdev"
-        ));
-    }
-
-    let session_id = connect_transport_session(sap, &cookie_header)?;
-    let workspace_count = discovery.workspaces.len();
-    let collection_count = discovery.collections.len();
-
-    sap.connected = true;
-    sap.discovery_xml = final_body;
-    sap.discovery = Some(discovery);
-    sap.adt_session_id = Some(session_id);
-    sap.last_error = None;
-    sap.last_status = Some(format!(
-        "Connected: discovery ingested ({} workspaces, {} collections)",
-        workspace_count,
-        collection_count
-    ));
-
-    Ok(())
-}
-
 fn encode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
@@ -2123,10 +2077,6 @@ fn encode_component(input: &str) -> String {
     out
 }
 
-fn package_tree_attempts(_include_subpackages: bool) -> Vec<Vec<(&'static str, &'static str)>> {
-    vec![vec![]]
-}
-
 fn looks_like_empty_package_tree(xml: &str) -> bool {
     let trimmed = xml.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -2134,60 +2084,6 @@ fn looks_like_empty_package_tree(xml: &str) -> bool {
     let has_object_reference = lower.contains("<objectreference") || lower.contains(":objectreference");
     let has_uri_attr = lower.contains(" uri=") || lower.contains(" adtcore:uri=") || lower.contains("\nuri=") || lower.contains("\nadtcore:uri=");
     has_package_tree && !has_object_reference && !has_uri_attr
-}
-
-fn load_package_tree_xml(
-
-
-    client: &mut AdtBridgeClient,
-    session_id: &str,
-    package_name: &str,
-    include_subpackages: bool,
-) -> Result<String> {
-    let mut last_xml = String::new();
-
-    for attempt in package_tree_attempts(include_subpackages) {
-        let mut query = format!("packagename={}", encode_component(package_name));
-        for (key, value) in attempt {
-            query.push('&');
-            query.push_str(key);
-            query.push('=');
-            query.push_str(&encode_component(value));
-        }
-        let uri = format!("/sap/bc/adt/packages/$tree?{}", query);
-
-        let resp = client.send_json(json!({
-            "cmd": "call_endpoint",
-            "session_id": session_id,
-            "method": "GET",
-            "uri": uri,
-            "accept": "application/xml, text/xml, */*"
-        }))?;
-
-        let xml = resp
-            .get("data")
-            .and_then(|v| v.get("body").or_else(|| v.get("xml")))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("ADT package tree response missing body"))?
-            .to_string();
-
-        if let Some(message) = extract_adt_exception_message(&xml) {
-            eprintln!(
-                "[sap_adt] package tree exception package={} include_subpackages={} message={}",
-                package_name,
-                include_subpackages,
-                message
-            );
-        }
-
-        last_xml = xml.clone();
-
-        if !looks_like_empty_package_tree(&xml) {
-            return Ok(xml);
-        }
-    }
-
-    Ok(last_xml)
 }
 
 fn extract_xml_attr_value(xml: &str, attr_name: &str) -> Option<String> {
@@ -2226,10 +2122,6 @@ fn load_package_metadata_summary(
         .ok_or_else(|| anyhow!("ADT package metadata did not expose a package type"))?;
 
     Ok((package_uri, package_type))
-}
-
-fn repository_parent_type(object_type: &str) -> &str {
-    object_type.split('/').next().unwrap_or(object_type)
 }
 
 fn load_nodestructure_xml(
@@ -2390,7 +2282,7 @@ fn looks_like_global_package_catalog(
     all_package_nodes && has_foreign_package_nodes && !has_non_package_nodes
 }
 
-pub fn list_package_objects(sap: &mut SapAdtState, package_name: &str, include_subpackages: bool) -> Result<String> {
+pub fn list_package_objects(sap: &mut SapAdtState, package_name: &str, _include_subpackages: bool) -> Result<String> {
     let package_name = package_name.trim();
     if package_name.is_empty() {
         return Err(anyhow!("Package name is required"));
@@ -2406,6 +2298,7 @@ pub fn list_package_objects(sap: &mut SapAdtState, package_name: &str, include_s
     client.ensure_started(&bridge_dir, &base_url)?;
 
     if let Ok((package_uri, package_type)) = load_package_metadata_summary(&mut client, &session_id, package_name) {
+    client.set_state(sap);
         match load_nodestructure_xml(&mut client, &session_id, package_name, &package_uri, &package_type) {
             Ok(xml) if xml.trim().is_empty() || looks_like_empty_package_tree(&xml) => {
                 eprintln!("[sap_adt] nodestructure returned empty tree for {}", package_name);
@@ -2498,6 +2391,7 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let accept_value = accept.unwrap_or("application/vnd.sap.adt.basic.object.properties+xml, text/plain, text/*, application/xml, text/xml, */*");
@@ -2516,7 +2410,6 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("ADT read_object response missing body"))?
                 .to_string();
-            let headers = json_headers_to_pairs(data.get("headers"));
             let status = data
                 .get("status")
                 .and_then(|v| v.as_u64())
@@ -2534,7 +2427,6 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
             Ok(AdtReadObjectResult {
                 object_uri: object_uri.to_string(),
                 content_type: data.get("content_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                headers,
                 body,
             })
         }
@@ -2559,6 +2451,118 @@ pub fn read_object(sap: &mut SapAdtState, object_uri: &str, accept: Option<&str>
     }
 }
 
+fn extract_server_etag_from_adt_error(body: &str) -> Option<String> {
+    let marker = "object ETag ";
+    let start = body.find(marker)? + marker.len();
+    let rest = &body[start..];
+    let end = rest
+        .find(' ')
+        .or_else(|| rest.find('<'))
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim().trim_matches('"');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn normalize_if_match_value(value: &str) -> String {
+    value.trim().trim_matches('"').to_string()
+}
+
+#[derive(Clone, Debug)]
+pub struct AdtLockObjectResult {
+    pub object_uri: String,
+    pub lock_handle: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+fn extract_tag_value(body: &str, tag_name: &str) -> Option<String> {
+    let open = format!("<{}>", tag_name);
+    let close = format!("</{}>", tag_name);
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    let value = body[start..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum AdtResolvedRouteFamily {
+    SourceMainAtRoot,
+    DirectResource,
+    RootToSourceMain,
+}
+
+#[derive(Clone, Debug)]
+struct AdtResolvedRoute {
+    route_family: AdtResolvedRouteFamily,
+    lock_uri: String,
+    write_uri: String,
+}
+
+fn split_uri_suffix(uri: &str) -> (String, String) {
+    match uri.find(['?', '#']) {
+        Some(index) => (uri[..index].to_string(), uri[index..].to_string()),
+        None => (uri.to_string(), String::new()),
+    }
+}
+
+fn resolve_adt_route(object_uri: &str) -> AdtResolvedRoute {
+    let trimmed = object_uri.trim();
+    if trimmed.is_empty() {
+        return AdtResolvedRoute {
+            route_family: AdtResolvedRouteFamily::DirectResource,
+            lock_uri: String::new(),
+            write_uri: String::new(),
+        };
+    }
+
+    let (base, suffix) = split_uri_suffix(trimmed);
+    let normalized_base = base.trim_end_matches('/').to_string();
+    let lower = normalized_base.to_ascii_lowercase();
+
+    if lower.ends_with("/source/main") {
+        let lock_uri = normalized_base[..normalized_base.len() - "/source/main".len()].to_string();
+        return AdtResolvedRoute {
+            route_family: AdtResolvedRouteFamily::SourceMainAtRoot,
+            lock_uri,
+            write_uri: format!("{}{}", normalized_base, suffix),
+        };
+    }
+
+    if let Some(index) = lower.find("/includes/") {
+        return AdtResolvedRoute {
+            route_family: AdtResolvedRouteFamily::DirectResource,
+            lock_uri: normalized_base[..index].to_string(),
+            write_uri: format!("{}{}", normalized_base, suffix),
+        };
+    }
+
+    let is_root_to_source_main = lower.contains("/programs/programs/")
+        || lower.contains("/ddic/ddl/sources/")
+        || lower.contains("/oo/classes/");
+
+    if is_root_to_source_main {
+        return AdtResolvedRoute {
+            route_family: AdtResolvedRouteFamily::RootToSourceMain,
+            lock_uri: normalized_base.clone(),
+            write_uri: format!("{}/source/main{}", normalized_base, suffix),
+        };
+    }
+
+    AdtResolvedRoute {
+        route_family: AdtResolvedRouteFamily::DirectResource,
+        lock_uri: normalized_base.clone(),
+        write_uri: format!("{}{}", normalized_base, suffix),
+    }
+}
+
 pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObjectResult> {
     let object_uri = object_uri.trim();
     if object_uri.is_empty() {
@@ -2572,6 +2576,7 @@ pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObj
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let resp = client.send_json(json!({
@@ -2636,25 +2641,6 @@ pub fn lock_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtLockObj
     }
 }
 
-fn extract_server_etag_from_adt_error(body: &str) -> Option<String> {
-    let marker = "object ETag ";
-    let start = body.find(marker)? + marker.len();
-    let rest = &body[start..];
-    let end = rest
-        .find(' ')
-        .or_else(|| rest.find('<'))
-        .unwrap_or(rest.len());
-    let value = rest[..end].trim().trim_matches('"');
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn normalize_if_match_value(value: &str) -> String {
-    value.trim().trim_matches('"').to_string()
-}
 
 pub fn update_object(
     sap: &mut SapAdtState,
@@ -2677,6 +2663,7 @@ pub fn update_object(
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let mut headers = serde_json::Map::new();
@@ -2726,7 +2713,6 @@ pub fn update_object(
     match resp {
         Ok(resp) => {
             let data = resp.get("data").unwrap_or(&resp);
-            let headers = json_headers_to_pairs(data.get("headers").or_else(|| resp.get("headers")));
             let body_text = data
                 .get("body")
                 .and_then(|v| v.as_str())
@@ -2761,7 +2747,6 @@ pub fn update_object(
 
             Ok(AdtUpdateObjectResult {
                 status,
-                headers,
                 body: body_text,
                 problems,
                 ok,
@@ -2794,7 +2779,6 @@ pub fn update_object(
 
             Ok(AdtUpdateObjectResult {
                 status,
-                headers: Vec::new(),
                 body,
                 problems,
                 ok: false,
@@ -3021,6 +3005,7 @@ pub fn syntax_check(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtCheckR
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let resp = client.send_json(json!({
@@ -3126,6 +3111,7 @@ pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtAct
 
     let mutex = bridge_client();
     let mut client = mutex.lock().map_err(|_| anyhow!("ADT bridge mutex poisoned"))?;
+    client.set_state(sap);
     client.ensure_started(&bridge_dir, &base_url)?;
 
     let resp = client.send_json(json!({
@@ -3148,12 +3134,7 @@ pub fn activate_object(sap: &mut SapAdtState, object_uri: &str) -> Result<AdtAct
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u16)
                 .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
-            let status = data
-                .get("status")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u16)
-                .or_else(|| resp.get("status").and_then(|v| v.as_u64()).map(|v| v as u16));
-            let activation_http_failed = status.map(|s| s < 200 || s >= 300).unwrap_or(false);
+            let activation_http_failed = status.map(|s| !(200..300).contains(&s)).unwrap_or(false);
 
             let mut problems = problem_messages_from_json(data.get("problems"));
             let checkruns_xml_problems: Vec<String> = data

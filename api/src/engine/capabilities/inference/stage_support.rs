@@ -363,7 +363,7 @@ pub fn build_inference_execution_plan(
 
 fn build_execution_plan(
     include_repo_context: bool,
-    include_changeset_schema: bool,
+    _include_changeset_schema: bool,
     auto_apply_changeset: bool,
     repo_context: Option<Value>,
 ) -> Result<Vec<StageExecutionNode>> {

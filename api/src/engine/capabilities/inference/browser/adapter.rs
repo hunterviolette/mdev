@@ -504,7 +504,6 @@ pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<S
     let poll = Duration::from_millis(1_000);
     let url_list = urls.join(", ");
     let mut attempt: u32 = 0;
-    let mut last_header: Option<String> = None;
 
     loop {
         attempt += 1;
@@ -577,10 +576,9 @@ pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<S
             return Ok(cookie_header);
         }
 
-        last_header = Some(cookie_header);
 
         if started.elapsed() >= timeout {
-            return Ok(last_header.unwrap_or_default());
+            return Ok(std::string::String::new());
         }
 
         std::thread::sleep(poll);

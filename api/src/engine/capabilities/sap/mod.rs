@@ -1,3 +1,4 @@
+pub mod adt;
 pub mod export;
 pub mod import;
 pub mod migration;

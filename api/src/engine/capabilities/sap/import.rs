@@ -9,7 +9,6 @@ use super::{
             harvest_cookie_header_for_runtime,
             manifest_directory_name,
             parse_connection,
-            resolve_bridge_dir,
             resolve_repo_path,
             should_persist_sap_adt_resource,
             split_multiline_items,
@@ -50,10 +49,6 @@ struct SapImportRequest {
     pub object_uris_text: String,
     #[serde(default)]
     pub selected_objects: Vec<SapImportSelectedObject>,
-    #[serde(default)]
-    pub mode: String,
-    #[serde(default)]
-    pub connection: Value,
 }
 
 fn default_git_ref() -> String {
@@ -103,9 +98,6 @@ fn find_selected_object<'a>(
 }
 
 fn build_sap_state(connection: &super::migration::common::SapConnectionConfig) -> Result<SapAdtState> {
-    let bridge_dir = resolve_bridge_dir(connection)?;
-    let bridge_dir = bridge_dir.to_string_lossy().replace('\\', "/");
-
     let cookie_header = connection
         .cookie_header
         .clone()
@@ -119,8 +111,6 @@ fn build_sap_state(connection: &super::migration::common::SapConnectionConfig) -
         authorization: String::new(),
         cookie_header: Some(cookie_header),
         client: connection.client.clone().unwrap_or_default(),
-        bridge_dir: bridge_dir.clone(),
-        browser_bridge_dir: bridge_dir,
         browser_user_data_dir: default_browser_user_data_dir(),
         discovery_url: Some(default_discovery_url(&connection.base_url, connection.client.as_deref())),
         ..SapAdtState::default()
@@ -146,7 +136,7 @@ pub async fn execute(
     let mut object_uris = request
         .selected_objects
         .iter()
-        .map(|item| item.source_uri.clone().unwrap_or_else(|| item.object_uri.clone()))
+        .map(|item| item.object_uri.clone())
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect::<Vec<_>>();

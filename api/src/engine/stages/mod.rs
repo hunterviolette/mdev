@@ -71,43 +71,6 @@ fn sanitize_persisted_stage_state(local_state: Value) -> Value {
     sanitized
 }
 
-pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
-    let mut run = crate::engine::load_run(state, run_id).await?;
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = global_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("global_state must be object"))?;
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = ensure_value_object(inference);
-
-    {
-        let enabled = inference_obj
-            .entry("prompt_fragment_enabled".to_string())
-            .or_insert_with(|| json!({}));
-        let enabled_obj = ensure_value_object(enabled);
-        enabled_obj.insert("apply_error".to_string(), Value::Bool(false));
-        enabled_obj.insert("compile_error".to_string(), Value::Bool(false));
-    }
-
-    {
-        let fragments = inference_obj
-            .entry("prompt_fragments".to_string())
-            .or_insert_with(|| json!({}));
-        let fragments_obj = ensure_value_object(fragments);
-        fragments_obj.remove("apply_error");
-        fragments_obj.remove("compile_error");
-    }
-
-    persist_context(state, run_id, &run.context).await?;
-    Ok(())
-}
 
 pub async fn execute_stage(
     state: &AppState,
@@ -281,7 +244,7 @@ fn resolve_stage_branch(
 
     let patch = build_branch_patch(step, &branch, capability_results);
 
-    let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
+    let disposition = parse_stage_disposition(&branch, capability_failed);
 
     StageBranch {
         disposition: disposition.clone(),
@@ -325,20 +288,16 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
 }
 
 fn parse_stage_disposition(
-    step: &WorkflowStepDefinition,
-    branch_key: &str,
     branch: &Value,
     capability_failed: bool,
 ) -> StageDisposition {
     let disposition = branch
         .get("disposition")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if capability_failed {
-                "error"
-            } else {
-                "success"
-            }
+        .unwrap_or(if capability_failed {
+            "error"
+        } else {
+            "success"
         });
 
     match disposition {

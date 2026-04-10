@@ -4,27 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use super::migration::sap_adt_manifest::SapAdtObjectManifest;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ExecuteLoopTurnResult {
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub conversation_id: Option<String>,
-    #[serde(default)]
-    pub browser_session_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct BrowserProbeResult {
-    #[serde(default)]
-    pub ok: bool,
-    #[serde(default)]
-    pub message: String,
-    #[serde(default)]
-    pub browser_session_id: Option<String>,
-    #[serde(default)]
-    pub conversation_id: Option<String>,
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SapAdtTemplateLink {

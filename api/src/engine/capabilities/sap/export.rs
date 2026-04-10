@@ -14,7 +14,6 @@ use super::{
         common::{
             harvest_cookie_header_for_runtime,
             parse_connection,
-            resolve_bridge_dir,
             resolve_repo_path,
         },
         sap_adt_manifest::{SapAdtManifestResource, SapAdtObjectManifest},
@@ -39,8 +38,6 @@ struct SapExportRequest {
     pub corr_nr: String,
     #[serde(default = "default_mode")]
     pub mode: String,
-    #[serde(default)]
-    pub connection: Value,
 }
 
 fn default_git_ref() -> String {
@@ -82,9 +79,6 @@ fn default_browser_user_data_dir() -> String {
 }
 
 fn build_sap_state(connection: &super::migration::common::SapConnectionConfig) -> Result<SapAdtState> {
-    let bridge_dir = resolve_bridge_dir(connection)?;
-    let bridge_dir = bridge_dir.to_string_lossy().replace('\\', "/");
-
     let cookie_header = connection
         .cookie_header
         .clone()
@@ -98,8 +92,6 @@ fn build_sap_state(connection: &super::migration::common::SapConnectionConfig) -
         authorization: String::new(),
         cookie_header: Some(cookie_header),
         client: connection.client.clone().unwrap_or_default(),
-        bridge_dir: bridge_dir.clone(),
-        browser_bridge_dir: bridge_dir,
         browser_user_data_dir: default_browser_user_data_dir(),
         discovery_url: Some(default_discovery_url(&connection.base_url, connection.client.as_deref())),
         ..SapAdtState::default()
@@ -370,6 +362,15 @@ pub async fn execute(
                 .unwrap_or_default()
         };
 
+        let check_uri = if !manifest.metadata_uri.trim().is_empty() {
+            manifest.metadata_uri.trim().to_string()
+        } else {
+            changed_resources
+                .first()
+                .map(|(resource, _)| resource.uri.clone())
+                .unwrap_or_default()
+        };
+
         let mut resource_results = Vec::new();
         let mut pushed_count = 0usize;
         let mut syntax_ok = true;
@@ -387,10 +388,19 @@ pub async fn execute(
                 resource.content_type.as_deref(),
                 None,
                 Some(request.corr_nr.as_str()).filter(|value| !value.trim().is_empty()),
-                resource.etag.as_deref(),
+                None,
             )?;
 
-            let check_result = adt_bridge::syntax_check(&mut sap, &resource.uri)?;
+            let check_result = if update_result.ok {
+                adt_bridge::syntax_check(&mut sap, if check_uri.is_empty() { &resource.uri } else { &check_uri })?
+            } else {
+                adt_bridge::AdtCheckResult {
+                    status: update_result.status,
+                    body: update_result.body.clone(),
+                    problems: vec!["Syntax check skipped because inactive update failed.".to_string()],
+                    ok: false,
+                }
+            };
 
             if update_result.ok {
                 pushed_count += 1;

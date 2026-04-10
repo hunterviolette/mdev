@@ -200,11 +200,6 @@ fn build_sap_execution_state(export_result: &Value, stage: &str) -> Value {
 }
 
 fn build_sap_syntax_error_fragment(export_result: &Value) -> String {
-    let summary = export_result
-        .get("summary")
-        .and_then(Value::as_str)
-        .unwrap_or("SAP syntax validation failed.");
-
     let rows = export_result
         .get("objects")
         .and_then(Value::as_array)
