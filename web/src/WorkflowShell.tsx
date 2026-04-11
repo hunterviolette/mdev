@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionIcon,
   Alert,
@@ -75,8 +75,14 @@ import {
 } from './api';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
+import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { descriptorMap, flattenStageFields } from './workflow_builder';
+
+const ReviewDiffViewerPanel = lazy(async () => {
+  const mod = await import('./ReviewDiffViewerPanel');
+  return { default: mod.ReviewDiffViewerPanel };
+});
 
 
 type BuilderMode = 'builder' | 'json';
@@ -1421,6 +1427,22 @@ export function WorkflowShell() {
       ...(localStageOverride ?? {})
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
+
+  const reviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
+    const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
+    const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
+    return {
+      selected_scope: sourceControl.selected_scope === 'staged' ? 'staged' : 'unstaged',
+      selected_path: typeof sourceControl.selected_path === 'string' && sourceControl.selected_path.trim()
+        ? sourceControl.selected_path
+        : null,
+      diff_style: sourceControl.diff_style === 'split' ? 'split' : 'unified',
+      only_changes: sourceControl.only_changes !== false,
+      context_lines: typeof sourceControl.context_lines === 'number' ? sourceControl.context_lines : 10,
+      whole_file: Boolean(sourceControl.whole_file)
+    };
+  }, [selectedStageState]);
+
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
   const selectedRepoPathSet = useMemo(() => new Set(selectedRepoPaths), [selectedRepoPaths]);
   const repoFragmentSummary = useMemo(() => {
@@ -2927,6 +2949,24 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         />
       );
     }
+    if (selectedWorkflowStep?.step_type === 'review') {
+      return (
+        <Suspense fallback={
+          <Stack gap="sm" p="md">
+            <Group gap="xs">
+              <Loader size="sm" />
+              <Text size="sm" c="dimmed">Loading diff viewer…</Text>
+            </Group>
+          </Stack>
+        }>
+          <ReviewDiffViewerPanel
+            repoRef={resolveRepoRefForRun(selectedRun)}
+            state={reviewSourceControlState}
+            onPersistState={persistReviewSourceControlState}
+          />
+        </Suspense>
+      );
+    }
     if (selectedWorkflowStep?.step_type === 'sap_export') {
       return <></>;
     }
@@ -2947,7 +2987,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
     if (stepType === 'review') {
       return {
-        review: { approved: stageApproved, rejected: stageRejected, notes: stageReviewNotes }
+        review: {
+          approved: stageApproved,
+          rejected: stageRejected,
+          notes: stageReviewNotes,
+          source_control: reviewSourceControlState
+        }
       } as Record<string, unknown>;
     }
 
@@ -3030,6 +3075,20 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     if (!selectedRun) return;
     const globalPayload = buildInteractiveGlobalStatePayload();
     await patchWorkflowGlobalState(selectedRun.id, globalPayload);
+  }
+
+  async function persistReviewSourceControlState(next: ReviewSourceControlState) {
+    if (!selectedRun || !selectedWorkflowStep) return;
+    const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
+    await patchWorkflowStageState(selectedRun.id, selectedWorkflowStep.id, {
+      review: {
+        approved: Boolean(review.approved),
+        rejected: Boolean(review.rejected),
+        notes: typeof review.notes === 'string' ? review.notes : '',
+        source_control: next
+      }
+    });
+    await refreshSelectedRunArtifacts();
   }
 
   async function handleManualPatchStageState() {

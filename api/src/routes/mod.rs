@@ -4,6 +4,7 @@ mod health;
 mod repo_tree;
 mod runs;
 mod sap;
+mod review;
 mod templates;
 mod workflow_builder;
 
@@ -14,6 +15,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(health::router())
         .merge(repo_tree::router())
         .merge(templates::router())
+        .merge(review::router())
         .merge(workflow_builder::router())
         .merge(runs::router())
         .merge(sap::router())

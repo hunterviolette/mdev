@@ -470,6 +470,127 @@ export function getChangesetSchema() {
   }>(`/api/capabilities/changeset-schema`);
 }
 
+export type ReviewDiffScope = 'staged' | 'unstaged';
+
+export type ReviewStatusFileEntry = {
+  path: string;
+  additions: number;
+  deletions: number;
+  index_status: string;
+  worktree_status: string;
+  untracked: boolean;
+};
+
+export type ReviewStatusResponse = {
+  ok: boolean;
+  branch: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  staged: ReviewStatusFileEntry[];
+  unstaged: ReviewStatusFileEntry[];
+};
+
+export type ReviewDiffResponse = {
+  ok: boolean;
+  scope: ReviewDiffScope;
+  path?: string | null;
+  from_ref: string;
+  to_ref: string;
+  patch: string;
+};
+
+export function getReviewStatus(repoRef: string) {
+  return fetchJson<ReviewStatusResponse>('/api/review/status', {
+    method: 'POST',
+    body: JSON.stringify({ repo_ref: repoRef })
+  });
+}
+
+export function getReviewDiff(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  path?: string | null;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewDiffResponse>('/api/review/diff', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export type ReviewDiffManifestFileEntry = {
+  path: string;
+  additions: number;
+  deletions: number;
+  index_status: string;
+  worktree_status: string;
+  untracked: boolean;
+};
+
+export type ReviewDiffManifestResponse = {
+  ok: boolean;
+  scope: ReviewDiffScope;
+  from_ref: string;
+  to_ref: string;
+  files: ReviewDiffManifestFileEntry[];
+};
+
+export type ReviewFilePatchResponse = {
+  ok: boolean;
+  scope: ReviewDiffScope;
+  path: string;
+  from_ref: string;
+  to_ref: string;
+  patch: string;
+};
+
+export function getReviewDiffManifest(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+}) {
+  return fetchJson<ReviewDiffManifestResponse>('/api/review/diff/manifest', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewFilePatch(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  path: string;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewFilePatchResponse>('/api/review/diff/file', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function stageReviewDiff(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  path?: string | null;
+}) {
+  return fetchJson<{ ok: boolean }>('/api/review/stage', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function unstageReviewDiff(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  path?: string | null;
+}) {
+  return fetchJson<{ ok: boolean }>('/api/review/unstage', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
 export type SapSearchObject = {
   uri: string;
   source_uri?: string | null;

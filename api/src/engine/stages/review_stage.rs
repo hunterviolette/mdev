@@ -15,6 +15,22 @@ pub fn prepare_stage_state(
         .unwrap_or(true);
 
     let obj = state.as_object_mut().expect("stage state must be object");
+    obj.entry("review".to_string()).or_insert_with(|| {
+        json!({
+            "approved": false,
+            "rejected": false,
+            "notes": "",
+            "source_control": {
+                "selected_scope": "unstaged",
+                "selected_path": null,
+                "diff_style": "unified",
+                "only_changes": true,
+                "context_lines": 10,
+                "whole_file": false
+            }
+        })
+    });
+
     let execution_logic = obj
         .entry("execution_logic".to_string())
         .or_insert_with(|| step.execution_logic.clone());
