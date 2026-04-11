@@ -36,12 +36,22 @@ pub struct RepoTreeResponse {
     pub refreshed_at: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RepoFilesResponse {
+    pub repo_ref: String,
+    pub git_ref: String,
+    pub files: Vec<String>,
+    pub refreshed_at: String,
+}
+
 fn default_git_ref() -> String {
     "WORKTREE".to_string()
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/repo-tree", get(get_repo_tree))
+    Router::new()
+        .route("/api/repo-tree", get(get_repo_tree))
+        .route("/api/repo-files", get(get_repo_files))
 }
 
 async fn get_repo_tree(
@@ -68,6 +78,28 @@ async fn get_repo_tree(
         git_ref: query.git_ref,
         base_path,
         entries,
+        refreshed_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+async fn get_repo_files(
+    Query(query): Query<RepoTreeQuery>,
+) -> Result<Json<RepoFilesResponse>, (axum::http::StatusCode, String)> {
+    let repo = PathBuf::from(&query.repo_ref);
+
+    let mut files = if effective_ref(&query.git_ref) == "WORKTREE" {
+        collect_worktree_tracked_files_flat(&repo, query.skip_binary).map_err(internal)?
+    } else {
+        collect_git_files_flat(&repo, effective_ref(&query.git_ref), query.skip_binary).map_err(internal)?
+    };
+
+    files.sort();
+    files.dedup();
+
+    Ok(Json(RepoFilesResponse {
+        repo_ref: query.repo_ref,
+        git_ref: query.git_ref,
+        files,
         refreshed_at: chrono::Utc::now().to_rfc3339(),
     }))
 }
@@ -174,6 +206,28 @@ fn dir_has_visible_children(
     Ok(false)
 }
 
+fn collect_worktree_tracked_files_flat(
+    repo: &Path,
+    skip_binary: bool,
+) -> anyhow::Result<Vec<String>> {
+    let stdout = run_git_capture_string(repo, &["ls-files"])?;
+    let mut out = Vec::new();
+
+    for rel in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if skip_binary {
+            let bytes = fs::read(repo.join(rel))
+                .with_context(|| format!("failed to read {}", rel))?;
+            if is_probably_binary(&bytes) {
+                continue;
+            }
+        }
+
+        out.push(rel.to_string());
+    }
+
+    Ok(out)
+}
+
 fn collect_git_entries(
     repo: &Path,
     git_ref: &str,
@@ -225,6 +279,27 @@ fn collect_git_entries(
     }
 
     Ok(grouped.into_values().collect())
+}
+
+fn collect_git_files_flat(
+    repo: &Path,
+    git_ref: &str,
+    skip_binary: bool,
+) -> anyhow::Result<Vec<String>> {
+    let stdout = run_git_capture_string(repo, &["ls-tree", "-r", "--name-only", git_ref])?;
+    let mut out = Vec::new();
+
+    for rel in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if skip_binary {
+            let bytes = read_git_file_bytes(repo, git_ref, rel)?;
+            if is_probably_binary(&bytes) {
+                continue;
+            }
+        }
+        out.push(rel.to_string());
+    }
+
+    Ok(out)
 }
 
 fn normalize_rel_path(path: &str) -> String {

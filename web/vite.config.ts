@@ -8,6 +8,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           diffviewer: ['@pierre/diffs', 'shiki'],
+          fileeditor: ['modern-monaco'],
         },
       },
     },

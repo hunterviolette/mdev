@@ -84,10 +84,16 @@ const ReviewDiffViewerPanel = lazy(async () => {
   return { default: mod.ReviewDiffViewerPanel };
 });
 
+const RepoMonacoFileEditorPanel = lazy(async () => {
+  const mod = await import('./RepoMonacoFileEditorPanel');
+  return { default: mod.RepoMonacoFileEditorPanel };
+});
+
 
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'files';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -1041,6 +1047,7 @@ export function WorkflowShell() {
   const [view, setView] = useState<ShellView>('monitor');
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -3200,6 +3207,16 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
           {error ? <Alert color="red">{error}</Alert> : null}
 
+          {view !== 'builder' ? (
+            <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
+              <Tabs.List>
+                <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
+                <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Diff editor</Tabs.Tab>
+                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>File editor</Tabs.Tab>
+              </Tabs.List>
+            </Tabs>
+          ) : null}
+
           {view === 'builder' ? (
             <Modal
               opened={view === 'builder'}
@@ -3261,6 +3278,18 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 </Card>
               </Stack>
             </Modal>
+          ) : activeWorkspaceTab === 'diff' ? (
+            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading diff viewer…</Text></Group></Card>}>
+              <ReviewDiffViewerPanel
+                repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+                state={reviewSourceControlState}
+                onPersistState={persistReviewSourceControlState}
+              />
+            </Suspense>
+          ) : activeWorkspaceTab === 'files' ? (
+            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading file editor…</Text></Group></Card>}>
+              <RepoMonacoFileEditorPanel repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()} />
+            </Suspense>
           ) : monitorView === 'workflow_list' ? (
             <Stack>
               <Card withBorder>

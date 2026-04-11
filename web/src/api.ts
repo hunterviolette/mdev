@@ -306,6 +306,13 @@ export type RepoTreeResponse = {
   refreshed_at: string;
 };
 
+export type RepoFilesResponse = {
+  repo_ref: string;
+  git_ref: string;
+  files: string[];
+  refreshed_at: string;
+};
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
@@ -349,6 +356,74 @@ export function listRepoTree(
     skip_gitignore: String(Boolean(options?.skipGitignore))
   });
   return fetchJson<RepoTreeResponse>(`/api/repo-tree?${params.toString()}`);
+}
+
+export function listRepoFiles(
+  repoRef: string,
+  gitRef = 'WORKTREE',
+  options?: { skipBinary?: boolean; skipGitignore?: boolean }
+) {
+  const params = new URLSearchParams({
+    repo_ref: repoRef,
+    git_ref: gitRef,
+    skip_binary: String(Boolean(options?.skipBinary)),
+    skip_gitignore: String(Boolean(options?.skipGitignore))
+  });
+  return fetchJson<RepoFilesResponse>(`/api/repo-files?${params.toString()}`);
+}
+
+export type FileContentsResponse = {
+  ok: boolean;
+  repo_ref: string;
+  path: string;
+  contents: string;
+};
+
+export type MutatePathResponse = {
+  ok: boolean;
+  repo_ref: string;
+  path: string;
+  kind: string;
+  bytes: number;
+};
+
+export function readWorkspaceFile(repoRef: string, path: string) {
+  const params = new URLSearchParams({
+    repo_ref: repoRef,
+    path,
+  });
+  return fetchJson<FileContentsResponse>(`/api/file?${params.toString()}`);
+}
+
+export function writeWorkspaceFile(body: { repo_ref: string; path: string; contents: string }) {
+  return fetchJson<MutatePathResponse>('/api/file', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+export function createWorkspaceFile(body: { repo_ref: string; path: string; contents?: string }) {
+  return fetchJson<MutatePathResponse>('/api/file', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function createWorkspaceFolder(body: { repo_ref: string; path: string }) {
+  return fetchJson<MutatePathResponse>('/api/folder', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteWorkspacePath(repoRef: string, path: string) {
+  const params = new URLSearchParams({
+    repo_ref: repoRef,
+    path,
+  });
+  return fetchJson<{ ok: boolean; repo_ref: string; path: string }>(`/api/file?${params.toString()}`, {
+    method: 'DELETE',
+  });
 }
 
 export function createTemplate(body: { name: string; description: string; repo_ref: string; definition: WorkflowTemplateDefinition }) {

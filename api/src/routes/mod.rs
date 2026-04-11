@@ -1,5 +1,6 @@
 mod capabilities;
 mod event_chains;
+mod filesystem;
 mod health;
 mod repo_tree;
 mod runs;
@@ -19,6 +20,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(workflow_builder::router())
         .merge(runs::router())
         .merge(sap::router())
+        .merge(filesystem::router())
         .merge(event_chains::router())
         .merge(capabilities::router())
 }
