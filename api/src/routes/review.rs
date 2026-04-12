@@ -11,6 +11,7 @@ use crate::{
         git_status,
         git_untracked_line_stats,
         run_git,
+        run_git_allow_fail,
     },
 };
 
@@ -46,6 +47,14 @@ pub struct ReviewFilePatchRequest {
     pub context_lines: Option<u32>,
     #[serde(default)]
     pub whole_file: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewMultiFileContentsRequest {
+    pub repo_ref: String,
+    pub scope: String,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,12 +125,34 @@ pub struct ReviewFilePatchResponse {
     pub patch: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct ReviewMultiFileContentsEntry {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub untracked: bool,
+    pub old_contents: String,
+    pub new_contents: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewMultiFileContentsResponse {
+    pub ok: bool,
+    pub scope: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub files: Vec<ReviewMultiFileContentsEntry>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/review/status", post(review_status))
         .route("/api/review/diff", post(review_diff))
         .route("/api/review/diff/manifest", post(review_diff_manifest))
         .route("/api/review/diff/file", post(review_file_patch))
+        .route("/api/review/diff/multifile", post(review_multifile_contents))
         .route("/api/review/stage", post(review_stage))
         .route("/api/review/unstage", post(review_unstage))
 }
@@ -199,6 +230,92 @@ fn refs_for_scope(scope: &str) -> Result<(String, String, bool), (axum::http::St
             format!("unsupported review diff scope {other}"),
         )),
     }
+}
+
+fn read_text_for_review_ref(repo: &std::path::Path, git_ref: &str, path: &str) -> Result<String, (axum::http::StatusCode, String)> {
+    let bytes = match git_ref {
+        "WORKTREE" => match std::fs::read(repo.join(path)) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(err) => return Err(internal(err)),
+        },
+        "INDEX" => {
+            let spec = format!(":{path}");
+            let (code, stdout, _stderr) = run_git_allow_fail(repo, &["show", &spec]).map_err(internal)?;
+            if code != 0 {
+                return Ok(String::new());
+            }
+            stdout
+        }
+        other => {
+            let spec = format!("{other}:{path}");
+            let (code, stdout, _stderr) = run_git_allow_fail(repo, &["show", &spec]).map_err(internal)?;
+            if code != 0 {
+                return Ok(String::new());
+            }
+            stdout
+        }
+    };
+
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn review_scope_entries(
+    repo: &std::path::Path,
+    scope: &str,
+) -> Result<(String, String, Vec<ReviewDiffManifestFileEntry>), (axum::http::StatusCode, String)> {
+    let (from_ref, to_ref, _use_cached) = refs_for_scope(scope)?;
+    let status = git_status(repo).map_err(internal)?;
+
+    let staged_stats = git_diff_stats(repo, true).unwrap_or_else(|_| HashMap::new());
+    let unstaged_stats = git_diff_stats(repo, false).unwrap_or_else(|_| HashMap::new());
+    let untracked_paths: Vec<String> = status
+        .files
+        .iter()
+        .filter(|item| item.untracked)
+        .map(|item| item.path.clone())
+        .collect();
+    let untracked_stats = git_untracked_line_stats(repo, &untracked_paths);
+
+    let mut files = Vec::new();
+    for file in status.files {
+        let staged_counts = staged_stats.get(&file.path).copied().unwrap_or((0, 0));
+        let unstaged_counts = if file.untracked {
+            untracked_stats.get(&file.path).copied().unwrap_or((0, 0))
+        } else {
+            unstaged_stats.get(&file.path).copied().unwrap_or((0, 0))
+        };
+
+        let include = match scope {
+            "staged" => file.staged,
+            "unstaged" => file.untracked || file.worktree_status != ".",
+            _ => false,
+        };
+        if !include {
+            continue;
+        }
+
+        let (additions, deletions) = match scope {
+            "staged" => staged_counts,
+            "unstaged" => unstaged_counts,
+            _ => (0, 0),
+        };
+
+        files.push(ReviewDiffManifestFileEntry {
+            path: file.path.clone(),
+            additions,
+            deletions,
+            index_status: file.index_status.clone(),
+            worktree_status: file.worktree_status.clone(),
+            untracked: file.untracked,
+        });
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((from_ref, to_ref, files))
 }
 
 async fn review_diff_manifest(
@@ -341,6 +458,42 @@ async fn review_diff(
         from_ref,
         to_ref,
         patch,
+    }))
+}
+
+async fn review_multifile_contents(
+    Json(req): Json<ReviewMultiFileContentsRequest>,
+) -> Result<Json<ReviewMultiFileContentsResponse>, (axum::http::StatusCode, String)> {
+    let repo = PathBuf::from(&req.repo_ref);
+    let (from_ref, to_ref, mut files) = review_scope_entries(&repo, &req.scope)?;
+
+    if let Some(paths) = req.paths.as_ref().filter(|paths| !paths.is_empty()) {
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        files.retain(|file| wanted.contains(file.path.as_str()));
+    }
+
+    let mut response_files = Vec::with_capacity(files.len());
+    for file in files {
+        let old_contents = read_text_for_review_ref(&repo, &from_ref, &file.path)?;
+        let new_contents = read_text_for_review_ref(&repo, &to_ref, &file.path)?;
+        response_files.push(ReviewMultiFileContentsEntry {
+            path: file.path,
+            additions: file.additions,
+            deletions: file.deletions,
+            index_status: file.index_status,
+            worktree_status: file.worktree_status,
+            untracked: file.untracked,
+            old_contents,
+            new_contents,
+        });
+    }
+
+    Ok(Json(ReviewMultiFileContentsResponse {
+        ok: true,
+        scope: req.scope,
+        from_ref,
+        to_ref,
+        files: response_files,
     }))
 }
 

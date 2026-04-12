@@ -475,18 +475,30 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
     payload["file_path"] = Value::String(file_path.to_string_lossy().to_string());
     payload["timeout_ms"] = Value::Number(timeout_ms(cfg).into());
     let value = client.send_json(payload)?;
-    let data = value.get("data").cloned().unwrap_or(value);
+    let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
+
+    let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let ready = data.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !ready {
-        let upload_name = data
-            .get("upload_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| file_path.file_name().and_then(|v| v.to_str()))
-            .unwrap_or("unknown");
-        return Err(anyhow!("Browser bridge upload did not become ready ({})", upload_name));
+    let uploaded = data
+        .get("uploaded")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if ok && (ready || uploaded.is_some()) {
+        return Ok(());
     }
 
-    Ok(())
+    let upload_name = data
+        .get("upload_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| uploaded)
+        .or_else(|| file_path.file_name().and_then(|v| v.to_str()))
+        .unwrap_or("unknown");
+    return Err(anyhow!(
+        "Browser bridge upload failed or did not become ready ({})",
+        upload_name
+    ));
 }
 
 pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<String> {

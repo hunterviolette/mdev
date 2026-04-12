@@ -93,7 +93,7 @@ const RepoMonacoFileEditorPanel = lazy(async () => {
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type WorkspaceTabKey = 'workflows' | 'diff' | 'files';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -500,6 +500,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   onOpenSchemaConfig: () => void;
   onOpenApplyErrorConfig: () => void;
   onOpenCompileErrorConfig: () => void;
+  onOpenChanges: () => void;
 }) {
   const {
     descriptor,
@@ -514,7 +515,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     onOpenRepoConfig,
     onOpenSchemaConfig,
     onOpenApplyErrorConfig,
-    onOpenCompileErrorConfig
+    onOpenCompileErrorConfig,
+    onOpenChanges
   } = props;
 
   const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
@@ -688,6 +690,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           {group.fields.map((field) => renderField(field))}
         </Stack>
       ))}
+      {selectedWorkflowStep?.step_type === 'review' ? (
+        <Group>
+          <Button variant="light" onClick={onOpenChanges}>
+            Open changes
+          </Button>
+        </Group>
+      ) : null}
       <StageModifierActions actions={modifierActions} />
     </Stack>
   );
@@ -3189,30 +3198,67 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     toggleExpandedSet(setExpandedStageIds, stepId);
   }
 
+  useEffect(() => {
+    if (view === 'builder' || monitorView !== 'workflow_detail') {
+      return;
+    }
+
+    const hasRepoRef = Boolean((selectedRun?.repo_ref ?? repoRef ?? '').trim());
+
+    const handler = (event: KeyboardEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+        return;
+      }
+
+      const key = event.key;
+      if (!/^[1-9]$/.test(key)) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (key === '1') {
+        setActiveWorkspaceTab('workflows');
+        return;
+      }
+
+      if (key === '2') {
+        if (hasRepoRef) {
+          setActiveWorkspaceTab('diff');
+        }
+        return;
+      }
+
+      if (key === '3') {
+        if (hasRepoRef) {
+          setActiveWorkspaceTab('files');
+        }
+        return;
+      }
+
+      if (key === '4') {
+        setActiveWorkspaceTab('capabilities');
+      }
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [view, monitorView, selectedRun?.repo_ref, repoRef]);
+
 
   return (
     <AppShell padding="md">
       <AppShell.Main>
         <Stack>
-          <Group justify="space-between">
-            <div>
-              <Title order={2}>Workflow Shell</Title>
-              <Text c="dimmed">Build templates declaratively and monitor background workflow runs.</Text>
-            </div>
-            <Group>
-              <Button onClick={() => void openBuilder()} loading={busy}>New workflow</Button>
-              <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => void refreshRunsAndTemplates()}>Refresh</Button>
-            </Group>
-          </Group>
-
           {error ? <Alert color="red">{error}</Alert> : null}
 
-          {view !== 'builder' ? (
+          {view !== 'builder' && monitorView === 'workflow_detail' ? (
             <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
               <Tabs.List>
-                <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
-                <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Diff editor</Tabs.Tab>
-                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>File editor</Tabs.Tab>
+                <Tabs.Tab value="workflows">Workflow (Alt+1)</Tabs.Tab>
+                <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
+                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+3)</Tabs.Tab>
+                <Tabs.Tab value="capabilities">Capabilities (Alt+4)</Tabs.Tab>
               </Tabs.List>
             </Tabs>
           ) : null}
@@ -3279,24 +3325,51 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               </Stack>
             </Modal>
           ) : activeWorkspaceTab === 'diff' ? (
-            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading diff viewer…</Text></Group></Card>}>
+            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading changes view…</Text></Group></Card>}>
               <ReviewDiffViewerPanel
                 repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
                 state={reviewSourceControlState}
                 onPersistState={persistReviewSourceControlState}
+                forceViewerOpen
               />
             </Suspense>
           ) : activeWorkspaceTab === 'files' ? (
-            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading file editor…</Text></Group></Card>}>
+            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
               <RepoMonacoFileEditorPanel repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()} />
             </Suspense>
+          ) : activeWorkspaceTab === 'capabilities' ? (
+            <Card withBorder>
+              <GlobalCapabilitiesPanel
+                onOpenRepoFragment={() => {
+                  setRepoContextConfigOpen(true);
+                }}
+                onOpenChangesetSchema={() => {
+                  setChangesetSchemaConfigOpen(true);
+                }}
+                onOpenApplyChangeset={() => {
+                  setGlobalApplyChangesetOpen(true);
+                }}
+              />
+            </Card>
           ) : monitorView === 'workflow_list' ? (
             <Stack>
               <Card withBorder>
                 <Stack>
-                  <Group justify="space-between">
+                  <Group justify="space-between" align="center" wrap="wrap">
                     <Title order={4}>Workflow list</Title>
-                    <Text c="dimmed" size="sm">Open a workflow to inspect logs and control execution.</Text>
+                    <Group>
+                      <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
+                        New workflow
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="default"
+                        leftSection={<IconRefresh size={16} />}
+                        onClick={() => void refreshRunsAndTemplates()}
+                      >
+                        Refresh
+                      </Button>
+                    </Group>
                   </Group>
                   <Table striped highlightOnHover>
                     <Table.Thead>
@@ -3404,7 +3477,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedStepId || manualCapabilityBusy}>Save stage inputs</Button>
                                 <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedStepId || manualCapabilityBusy} loading={manualCapabilityBusy}>Run stage</Button>
                                 <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
-                                <Button variant="light" onClick={() => setGlobalCapabilitiesOpen(true)} disabled={!selectedRun}>Global capabilities</Button>
                               </Group>
                             </Stack>
                           </Card>
@@ -3520,6 +3592,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
                                     onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
                                     onOpenCompileErrorConfig={() => setCompileErrorConfigOpen(true)}
+                                    onOpenChanges={() => setActiveWorkspaceTab('diff')}
                                   />
                                 )}
                                 <InferenceConnectionCard
@@ -3997,22 +4070,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Stack>
         </Modal>
 
-        <Modal opened={globalCapabilitiesOpen} onClose={() => setGlobalCapabilitiesOpen(false)} title="Global capabilities" size="lg" centered>
-          <GlobalCapabilitiesPanel
-            onOpenRepoFragment={() => {
-              setGlobalCapabilitiesOpen(false);
-              setRepoContextConfigOpen(true);
-            }}
-            onOpenChangesetSchema={() => {
-              setGlobalCapabilitiesOpen(false);
-              setChangesetSchemaConfigOpen(true);
-            }}
-            onOpenApplyChangeset={() => {
-              setGlobalCapabilitiesOpen(false);
-              setGlobalApplyChangesetOpen(true);
-            }}
-          />
-        </Modal>
 
         <Modal opened={runContextOpen} onClose={() => setRunContextOpen(false)} title="Run context" size="min(1100px, 96vw)" centered>
           <Stack>
