@@ -86,6 +86,14 @@ struct ChangeSetPayload {
     operations: Vec<Operation>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FailingFileReport {
+    path: String,
+    operation_index: usize,
+    operation_kind: String,
+    failed_actions: Vec<EditActionFailure>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Operation {
@@ -304,6 +312,71 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
         }
     };
 
+    let touched_files = payload
+        .operations
+        .iter()
+        .filter_map(operation_primary_path)
+        .collect::<Vec<_>>();
+
+    let failing_files = payload
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| {
+            let path = operation_primary_path(op)?;
+            let op_label = operation_label_with_index(idx + 1, op);
+            let failed_lines = lines
+                .iter()
+                .filter(|line| line.starts_with("  - FAIL ") || line.starts_with("      "))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let failed_actions = match op {
+                Operation::Edit { changes, .. } => {
+                    let mut failures = Vec::new();
+                    for (change_idx, change) in changes.iter().enumerate() {
+                        let descriptor = describe_edit_change(change_idx + 1, change);
+                        let fail_prefix = format!("  - FAIL {}", descriptor);
+                        if let Some(pos) = lines.iter().position(|line| line == &fail_prefix) {
+                            let error = lines
+                                .get(pos + 1)
+                                .map(|line| line.trim().to_string())
+                                .unwrap_or_else(|| "unknown edit failure".to_string());
+                            failures.push(EditActionFailure {
+                                index: change_idx + 1,
+                                action: change.action.clone(),
+                                error,
+                            });
+                        }
+                    }
+                    failures
+                }
+                _ => {
+                    if lines.iter().any(|line| line == &format!("[{}] FAILED: {}", idx + 1, op_label.trim_start_matches(&format!("[{}] ", idx + 1)))) {
+                        vec![EditActionFailure {
+                            index: 1,
+                            action: operation_kind(op),
+                            error: "operation failed".to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+
+            if failed_actions.is_empty() {
+                None
+            } else {
+                Some(FailingFileReport {
+                    path,
+                    operation_index: idx + 1,
+                    operation_kind: operation_kind(op),
+                    failed_actions,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
     Ok(json!({
         "ok": failed_operations == 0,
         "mode": "changeset_apply",
@@ -319,9 +392,12 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
             "total_operations": total_operations,
             "successful_actions": successful_actions,
             "failed_actions": failed_actions,
-            "total_actions": total_actions
+            "total_actions": total_actions,
+            "failed_files": failing_files.len()
         },
         "lines": lines,
+        "touched_files": touched_files,
+        "failing_files": failing_files,
         "normalized_payload": normalized,
     }))
 }
@@ -585,13 +661,14 @@ fn format_apply_summary(
     )
 }
 
-fn operation_kind(op: &Operation) -> &'static str {
+fn operation_kind(op: &Operation) -> String {
     match op {
         Operation::Write { .. } => "write",
         Operation::Delete { .. } => "delete",
         Operation::Move { .. } => "move",
         Operation::Edit { .. } => "edit",
     }
+    .to_string()
 }
 
 fn operation_label(op: &Operation) -> String {

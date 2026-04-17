@@ -1,4 +1,5 @@
 pub(crate) mod capabilities;
+pub(crate) mod governance;
 mod runtime;
 mod stages;
 mod transitions;

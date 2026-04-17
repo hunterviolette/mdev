@@ -44,6 +44,21 @@ pub struct RepoFilesResponse {
     pub refreshed_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RepoValidateQuery {
+    pub repo_ref: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoValidateResponse {
+    pub ok: bool,
+    pub repo_ref: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    pub git_repo: bool,
+    pub message: String,
+}
+
 fn default_git_ref() -> String {
     "WORKTREE".to_string()
 }
@@ -52,6 +67,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/repo-tree", get(get_repo_tree))
         .route("/api/repo-files", get(get_repo_files))
+        .route("/api/repo/validate", get(validate_repo_ref))
 }
 
 async fn get_repo_tree(
@@ -101,6 +117,56 @@ async fn get_repo_files(
         git_ref: query.git_ref,
         files,
         refreshed_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+async fn validate_repo_ref(
+    Query(query): Query<RepoValidateQuery>,
+) -> Result<Json<RepoValidateResponse>, (axum::http::StatusCode, String)> {
+    let repo_ref = query.repo_ref.trim().to_string();
+    if repo_ref.is_empty() {
+        return Ok(Json(RepoValidateResponse {
+            ok: false,
+            repo_ref,
+            exists: false,
+            is_dir: false,
+            git_repo: false,
+            message: "Repository path is required.".to_string(),
+        }));
+    }
+
+    let repo = PathBuf::from(&repo_ref);
+    let exists = repo.exists();
+    let is_dir = exists && repo.is_dir();
+    let git_repo = if is_dir {
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let message = if !exists {
+        format!("Repository path does not exist: {}", repo_ref)
+    } else if !is_dir {
+        format!("Repository path is not a directory: {}", repo_ref)
+    } else if !git_repo {
+        format!("Repository path is not a git repository: {}", repo_ref)
+    } else {
+        format!("Repository path is valid: {}", repo_ref)
+    };
+
+    Ok(Json(RepoValidateResponse {
+        ok: exists && is_dir && git_repo,
+        repo_ref,
+        exists,
+        is_dir,
+        git_repo,
+        message,
     }))
 }
 

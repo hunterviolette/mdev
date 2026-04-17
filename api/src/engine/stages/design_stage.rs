@@ -37,7 +37,24 @@ pub fn prepare_stage_state(
             "on_success".to_string(),
             json!({
                 "disposition": "stay",
-                "message": "Design stage completed successfully through backend workflow engine."
+                "message": "Design stage completed successfully through backend workflow engine.",
+                "patch": {
+                    "global_state": {
+                        "capabilities": {
+                            "inference": {
+                                "connection_runtime": {
+                                    "shared_stage_family:design_code": {
+                                        "repo_context": {
+                                            "has_fired": true,
+                                            "active": true,
+                                            "last_trigger": "design_success"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }),
         );
     }

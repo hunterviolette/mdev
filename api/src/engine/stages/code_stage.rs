@@ -46,12 +46,18 @@ pub fn prepare_stage_state(
                 "patch": {
                     "global_state": {
                         "capabilities": {
+                            "context_export": null,
                             "inference": {
+                                "connection_runtime": {
+                                    "shared_stage_family:design_code": null
+                                },
                                 "prompt_fragment_enabled": {
-                                    "apply_error": false
+                                    "apply_error": false,
+                                    "repo_context": false
                                 },
                                 "prompt_fragments": {
-                                    "apply_error": null
+                                    "apply_error": null,
+                                    "repo_context": null
                                 }
                             },
                             "gateway_model/changeset": {

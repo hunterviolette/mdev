@@ -48,6 +48,16 @@ export type WorkflowExecutionNode = {
   condition: unknown;
 };
 
+export type WorkflowStageGovernancePolicy = {
+  key: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+};
+
+export type WorkflowStepGovernanceConfig = {
+  policies: WorkflowStageGovernancePolicy[];
+};
+
 export type WorkflowStepDefinition = {
   id: string;
   name: string;
@@ -59,6 +69,7 @@ export type WorkflowStepDefinition = {
   capabilities: WorkflowCapabilityBinding[];
   execution_logic?: Record<string, unknown>;
   execution_plan?: WorkflowExecutionNode[];
+  governance?: WorkflowStepGovernanceConfig;
   transitions: WorkflowTransition[];
   advancement?: WorkflowStepAdvancementConfig;
 };
@@ -66,6 +77,7 @@ export type WorkflowStepDefinition = {
 export type WorkflowGlobalConfig = {
   resources: Record<string, unknown>;
   capabilities: Record<string, unknown>;
+  automation: Record<string, unknown>;
 };
 
 export type WorkflowTemplateDefinition = {
@@ -104,6 +116,15 @@ export type WorkflowStageFieldGroup = {
   fields: WorkflowStageField[];
 };
 
+export type WorkflowGovernancePolicyDescriptor = {
+  key: string;
+  label: string;
+  description: string;
+  capability: string;
+  required_capabilities: string[];
+  fields: WorkflowStageField[];
+};
+
 export type WorkflowStageRoute = {
   key: string;
   label: string;
@@ -120,6 +141,7 @@ export type WorkflowStageDescriptor = {
   description: string;
   definition_template: WorkflowStepDefinition;
   editable_fields: WorkflowStageFieldGroup[];
+  available_governance_policies?: WorkflowGovernancePolicyDescriptor[];
   routes: WorkflowStageRoute[];
 };
 
@@ -133,6 +155,7 @@ export type WorkflowBuilderStageDocument = {
   name: string;
   step_type: string;
   field_values: Record<string, unknown>;
+  governance_policies?: WorkflowStageGovernancePolicy[];
 };
 
 export type WorkflowBuilderDocument = {
@@ -141,9 +164,16 @@ export type WorkflowBuilderDocument = {
   stages: WorkflowBuilderStageDocument[];
 };
 
+export type WorkflowCapabilitySummaryItem = {
+  key: string;
+  stage_ids: string[];
+  stage_types: string[];
+};
+
 export type CompileWorkflowBuilderResponse = {
   ok: boolean;
   definition: WorkflowTemplateDefinition;
+  capability_summary: WorkflowCapabilitySummaryItem[];
   warnings: string[];
   errors: string[];
 };
@@ -313,6 +343,15 @@ export type RepoFilesResponse = {
   refreshed_at: string;
 };
 
+export type RepoValidateResponse = {
+  ok: boolean;
+  repo_ref: string;
+  exists: boolean;
+  is_dir: boolean;
+  git_repo: boolean;
+  message: string;
+};
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
@@ -370,6 +409,13 @@ export function listRepoFiles(
     skip_gitignore: String(Boolean(options?.skipGitignore))
   });
   return fetchJson<RepoFilesResponse>(`/api/repo-files?${params.toString()}`);
+}
+
+export function validateRepoRef(repoRef: string) {
+  const params = new URLSearchParams({
+    repo_ref: repoRef,
+  });
+  return fetchJson<RepoValidateResponse>(`/api/repo/validate?${params.toString()}`);
 }
 
 export type FileContentsResponse = {

@@ -40,6 +40,7 @@ import {
   getWorkflowBuilderCatalog,
   listRepoTree,
   listRunEvents,
+  validateRepoRef,
   listRuns,
   listTemplates,
   openEventStream,
@@ -77,7 +78,7 @@ import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
-import { descriptorMap, flattenStageFields } from './workflow_builder';
+import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 
 const ReviewDiffViewerPanel = lazy(async () => {
   const mod = await import('./ReviewDiffViewerPanel');
@@ -88,6 +89,39 @@ const RepoMonacoFileEditorPanel = lazy(async () => {
   const mod = await import('./RepoMonacoFileEditorPanel');
   return { default: mod.RepoMonacoFileEditorPanel };
 });
+
+function openBuilderCapabilityConfig(
+  capabilityKey: string,
+  handlers: {
+    openRepo: () => void;
+    openInference: () => void;
+    openSchema: () => void;
+    openApplyChangeset: () => void;
+  }
+) {
+  const normalized = capabilityKey.trim().toLowerCase();
+
+  switch (normalized) {
+    case 'context_export':
+      handlers.openRepo();
+      return;
+    case 'inference':
+      handlers.openInference();
+      return;
+    case 'changeset_schema':
+      handlers.openSchema();
+      return;
+    case 'gateway_model/changeset':
+    case 'changeset_apply':
+    case 'changeset apply':
+      handlers.openApplyChangeset();
+      return;
+    case 'compile_commands':
+      return;
+    default:
+      return;
+  }
+}
 
 
 type BuilderMode = 'builder' | 'json';
@@ -264,17 +298,13 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
   inferenceReady: boolean;
   inferenceSummaryText: string;
   inferenceTransport: InferenceTransport;
-  inferenceModel: string;
   browserTargetUrl: string;
   browserCdpUrl: string;
   inferenceBusy: boolean;
   inferenceStatus: string | null;
-  inferenceConfigOpen: boolean;
   hideInlineCard?: boolean;
   onOpenConfig: () => void;
-  onCloseConfig: () => void;
   onTransportChange: (value: InferenceTransport) => void;
-  onModelChange: (value: string) => void;
   onBrowserTargetUrlChange: (value: string) => void;
   onBrowserCdpUrlChange: (value: string) => void;
   onSaveConfig: () => void;
@@ -283,17 +313,13 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
     inferenceConnectionStatus,
     inferenceReady,
     inferenceTransport,
-    inferenceModel,
     browserTargetUrl,
     browserCdpUrl,
     inferenceBusy,
     inferenceStatus,
-    inferenceConfigOpen,
     hideInlineCard = false,
     onOpenConfig,
-    onCloseConfig,
     onTransportChange,
-    onModelChange,
     onBrowserTargetUrlChange,
     onBrowserCdpUrlChange,
     onSaveConfig
@@ -329,30 +355,23 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
                 allowDeselect={false}
               />
               <TextInput
-                label="Model"
-                value={inferenceModel}
-                onChange={(e) => onModelChange(e.currentTarget.value)}
-                disabled={inferenceTransport !== 'api'}
+                label="CDP URL"
+                value={browserCdpUrl}
+                onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
+                placeholder="http://127.0.0.1:9222"
+                disabled={inferenceTransport !== 'browser'}
               />
             </SimpleGrid>
 
             {inferenceTransport === 'browser' ? (
               <Stack gap="md">
-                <SimpleGrid cols={{ base: 1, md: 2 }}>
-                  <TextInput
-                    label="Browser URL"
-                    value={browserTargetUrl}
-                    onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
-                    placeholder="https://website.com/"
-                  />
-                  <TextInput
-                    label="CDP URL"
-                    value={browserCdpUrl}
-                    onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
-                    placeholder="http://127.0.0.1:9222"
-                  />
-                </SimpleGrid>
-                <Alert color="blue">Browser lifecycle is managed automatically by the backend when this stage runs.</Alert>
+                <TextInput
+                  label="Browser URL"
+                  value={browserTargetUrl}
+                  onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
+                  placeholder="https://website.com/"
+                />
+                <Alert color="blue">Only transport and browser connection details are configured here.</Alert>
                 <Group>
                   <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
                 </Group>
@@ -369,70 +388,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
         </Stack>
       ) : null}
 
-      <Modal
-        opened={inferenceConfigOpen}
-        onClose={onCloseConfig}
-        title="Inference connector"
-        size="min(1600px, calc(100vw - 64px))"
-        centered
-        padding="md"
-        zIndex={300}
-        withCloseButton
-        styles={{
-          body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
-          content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
-        }}
-      >
-        <Stack gap="md">
-          <SimpleGrid cols={{ base: 1, md: 2 }}>
-            <Select
-              label="Mode"
-              value={inferenceTransport}
-              onChange={(value) => onTransportChange((value as InferenceTransport) ?? 'api')}
-              data={[
-                { value: 'api', label: 'API' },
-                { value: 'browser', label: 'Browser' }
-              ]}
-              allowDeselect={false}
-            />
-            <TextInput
-              label="Model"
-              value={inferenceModel}
-              onChange={(e) => onModelChange(e.currentTarget.value)}
-              disabled={inferenceTransport !== 'api'}
-            />
-          </SimpleGrid>
 
-          {inferenceTransport === 'browser' ? (
-            <Stack gap="md">
-              <SimpleGrid cols={{ base: 1, md: 2 }}>
-                <TextInput
-                  label="Browser URL"
-                  value={browserTargetUrl}
-                  onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
-                  placeholder="https://website.com/"
-                />
-                <TextInput
-                  label="CDP URL"
-                  value={browserCdpUrl}
-                  onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
-                  placeholder="http://127.0.0.1:9222"
-                />
-              </SimpleGrid>
-              <Alert color="blue">Browser lifecycle is managed automatically by the backend when this stage runs.</Alert>
-              <Group>
-                <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-              </Group>
-            </Stack>
-          ) : (
-            <Group>
-              <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-            </Group>
-          )}
-
-          {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-        </Stack>
-      </Modal>
     </>
   );
 });
@@ -1148,6 +1104,7 @@ export function WorkflowShell() {
   const [jsonDraft, setJsonDraft] = useState('');
   const [compiledBuilderDefinition, setCompiledBuilderDefinition] = useState<WorkflowTemplateDefinition | null>(null);
   const [loadedTemplateDefinition, setLoadedTemplateDefinition] = useState<WorkflowTemplateDefinition | null>(null);
+  const [builderGlobals, setBuilderGlobals] = useState<WorkflowTemplateDefinition['globals'] | null>(null);
   const [createRunAfterSave, setCreateRunAfterSave] = useState(true);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [loadTemplateOpen, setLoadTemplateOpen] = useState(false);
@@ -1160,7 +1117,6 @@ export function WorkflowShell() {
   const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
 
   const [inferenceTransport, setInferenceTransport] = useState<InferenceTransport>('api');
-  const [inferenceModel, setInferenceModel] = useState('gpt-5');
   const [browserTargetUrl, setBrowserTargetUrl] = useState('https://website.com/');
   const [browserCdpUrl, setBrowserCdpUrl] = useState('http://127.0.0.1:9222');
   const [browserSessionId, setBrowserSessionId] = useState('');
@@ -1193,6 +1149,7 @@ export function WorkflowShell() {
   const [stageRejected, setStageRejected] = useState(false);
 
   const [repoContextConfigOpen, setRepoContextConfigOpen] = useState(false);
+  const [globalInferenceConfigOpen, setGlobalInferenceConfigOpen] = useState(false);
   const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
@@ -1201,7 +1158,6 @@ export function WorkflowShell() {
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
   const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
   const [runContextOpen, setRunContextOpen] = useState(false);
-  const [inferenceConfigOpen, setInferenceConfigOpen] = useState(false);
   const [previewViewerMode, setPreviewViewerMode] = useState<'prompt' | 'response' | 'stream'>('stream');
 
   const [treeRootData, setTreeRootData] = useState<RepoTreeResponse | null>(null);
@@ -1488,10 +1444,19 @@ export function WorkflowShell() {
         compile_commands: {},
         'sap/import': {},
         'sap/export': {}
+      },
+      automation: {
+        guardrails: {
+          changeset_context_inject_after_failures: 3,
+          changeset_pause_after_failures: 6,
+          compile_pause_after_failures: 5
+        }
       }
     },
     steps: []
   }), [compiledBuilderDefinition]);
+
+
 
   const inferenceConnectionStatus = useMemo<InferenceConnectionStatus>(() => {
     if (inferenceTransport === 'api') {
@@ -1598,7 +1563,6 @@ export function WorkflowShell() {
     const inference = (sharedInferenceState ?? null) as Record<string, unknown> | null;
     if (!inference) {
       setInferenceTransport('api');
-      setInferenceModel('gpt-5');
       setBrowserTargetUrl('https://website.com/');
       setBrowserCdpUrl('http://127.0.0.1:9222');
       setBrowserSessionId('');
@@ -1607,7 +1571,6 @@ export function WorkflowShell() {
     }
 
     setInferenceTransport((inference.transport as InferenceTransport) ?? 'api');
-    setInferenceModel(typeof inference.model === 'string' && inference.model.trim() ? inference.model : 'gpt-5');
 
     const browser = (inference.browser ?? {}) as Record<string, unknown>;
     setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
@@ -1703,7 +1666,6 @@ export function WorkflowShell() {
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
     setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
-    setInferenceModel(typeof inferenceConfig.model === 'string' ? String(inferenceConfig.model) : 'gpt-5');
     setBrowserTargetUrl(
       typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
         ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
@@ -1781,7 +1743,6 @@ export function WorkflowShell() {
         inference: {
           ...currentInference,
           transport: inferenceTransport,
-          model: inferenceModel,
           prompt_fragments: {
             ...((currentInference.prompt_fragments as Record<string, unknown> | undefined) ?? {}),
             ...promptFragments
@@ -1792,18 +1753,9 @@ export function WorkflowShell() {
           },
           browser: {
             ...currentInferenceBrowser,
-            profile: 'default',
-            bridge_dir: 'bridge',
             cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
-            page_url_contains: browserTargetUrl,
             target_url: browserTargetUrl,
-            edge_executable: '',
-            user_data_dir: '',
-            session_id: null,
-            auto_launch_edge: true,
-            response_timeout_ms: 120000,
-            response_poll_ms: 1000,
-            dom_poll_ms: 1000
+            session_id: browserSessionId.trim() || null
           }
         },
         context_export: {
@@ -1836,10 +1788,10 @@ export function WorkflowShell() {
 
 
   useEffect(() => {
-    if (!repoContextConfigOpen || !selectedRun) return;
+    if (!repoContextConfigOpen) return;
     if (treeRootData) return;
-    void loadTreeDir(selectedRun, '', true);
-  }, [repoContextConfigOpen, selectedRun?.id, stageRepoContextGitRef, stageRepoContextSkipBinary, stageRepoContextSkipGitignore]);
+    void loadRepoTreeForActiveRef('', true);
+  }, [repoContextConfigOpen, view, repoRef, selectedRun?.id, stageRepoContextGitRef, stageRepoContextSkipBinary, stageRepoContextSkipGitignore]);
 
 
 
@@ -2444,7 +2396,7 @@ export function WorkflowShell() {
       setError(null);
       const parsed = builderMode === 'json'
         ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
-        : compiledBuilderDefinition;
+        : applyBuilderGlobalsToDefinition(compiledBuilderDefinition, builderGlobals);
       if (!parsed) {
         throw new Error('Builder has not produced a compiled workflow definition yet.');
       }
@@ -2507,7 +2459,7 @@ export function WorkflowShell() {
       setError(null);
       const parsed = builderMode === 'json'
         ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
-        : compiledBuilderDefinition;
+        : applyBuilderGlobalsToDefinition(compiledBuilderDefinition, builderGlobals);
       if (!parsed) {
         throw new Error('Builder has not produced a compiled workflow definition yet.');
       }
@@ -2551,6 +2503,7 @@ export function WorkflowShell() {
     setRepoRef(template.repo_ref);
     setCompiledBuilderDefinition(template.definition);
     setLoadedTemplateDefinition(template.definition);
+    setBuilderGlobals(normalizeBuilderGlobals(template.definition?.globals ?? null));
     setJsonDraft(JSON.stringify(template.definition, null, 2));
     setBuilderMode('builder');
     setLoadTemplateOpen(false);
@@ -2584,6 +2537,15 @@ export function WorkflowShell() {
       setBusy(false);
     }
   }
+
+  const currentAutonomousStep = selectedRunDefinition?.steps.find((step) => step.id === selectedRun?.current_step_id)
+    ?? selectedRunDefinition?.steps[0]
+    ?? null;
+  const canRunCurrentStageAutomatically = Boolean(
+    currentAutonomousStep
+      && ((((currentAutonomousStep.advancement as Record<string, unknown> | undefined)?.auto_run_on_enter) === true)
+        || currentAutonomousStep.automation_mode === 'automatic')
+  );
 
   async function handleResumeRun() {
     if (!selectedRunId) return;
@@ -2623,7 +2585,59 @@ export function WorkflowShell() {
     await refreshRunDetails(selectedRun.id);
   }
 
+  function loadBuilderRepoContextConfig() {
+    const globals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const contextExport = ((capabilities.context_export as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+
+    const includeFiles = Array.isArray(contextExport.include_files)
+      ? contextExport.include_files.filter((value): value is string => typeof value === 'string')
+      : [];
+    const excludeRegex = Array.isArray(contextExport.exclude_regex)
+      ? contextExport.exclude_regex.filter((value): value is string => typeof value === 'string')
+      : [];
+
+    setStageRepoContextGitRef(
+      typeof contextExport.git_ref === 'string' && contextExport.git_ref.trim()
+        ? contextExport.git_ref
+        : 'WORKTREE'
+    );
+    syncRepoSelectionState(includeFiles);
+    setStageRepoContextExcludeRegexText(excludeRegex.join('\n'));
+    setStageRepoContextSavePath(
+      typeof contextExport.save_path === 'string' && contextExport.save_path.trim()
+        ? contextExport.save_path
+        : '/tmp/repo_context.txt'
+    );
+    setStageRepoContextSkipBinary(typeof contextExport.skip_binary === 'boolean' ? contextExport.skip_binary : true);
+    setStageRepoContextSkipGitignore(typeof contextExport.skip_gitignore === 'boolean' ? contextExport.skip_gitignore : true);
+    setStageRepoContextIncludeStagedDiff(Boolean(contextExport.include_staged_diff));
+    setStageRepoContextIncludeUnstagedDiff(Boolean(contextExport.include_unstaged_diff));
+  }
+
+  function loadBuilderChangesetSchemaConfig() {
+    const globals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const changesetSchema = ((capabilities.changeset_schema as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    setStageChangesetSchemaText(typeof changesetSchema.schema === 'string' ? changesetSchema.schema : '');
+  }
+
+  function loadBuilderApplyChangesetConfig() {
+    const globals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const gatewayChangeset = ((capabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    setGlobalApplyChangesetText(typeof gatewayChangeset.draft === 'string' ? gatewayChangeset.draft : '');
+  }
+
   async function handleSaveGlobalChangesetSchema() {
+    if (view === 'builder') {
+      saveBuilderCapability('changeset_schema', {
+        schema: stageChangesetSchemaText
+      });
+      setChangesetSchemaConfigOpen(false);
+      return;
+    }
+
     const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
     const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
     const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
@@ -2640,6 +2654,14 @@ export function WorkflowShell() {
   }
 
   async function handleSaveGlobalApplyChangeset() {
+    if (view === 'builder') {
+      saveBuilderCapability('gateway_model/changeset', {
+        draft: globalApplyChangesetText
+      });
+      setGlobalApplyChangesetOpen(false);
+      return;
+    }
+
     const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
     const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
     const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
@@ -2708,6 +2730,57 @@ export function WorkflowShell() {
       return run.repo_ref;
     }
     return repoRef;
+  }
+
+  function resolveActiveRepoRef(): string {
+    if (view === 'builder') {
+      return repoRef.trim();
+    }
+    return resolveRepoRefForRun(selectedRun).trim();
+  }
+
+  async function loadRepoTreeForActiveRef(basePath: string, replaceRoot = false) {
+    const activeRepoRef = resolveActiveRepoRef();
+    if (!activeRepoRef) {
+      setTreeError('Set a repo path to browse files.');
+      return;
+    }
+
+    if (loadingTreeDirs.has(basePath)) return;
+
+    setTreeError(null);
+    if (replaceRoot) setTreeBusy(true);
+    setLoadingTreeDirs((prev) => {
+      const next = new Set(prev);
+      next.add(basePath);
+      return next;
+    });
+
+    try {
+      const data = await listRepoTree(activeRepoRef, stageRepoContextGitRef, {
+        basePath,
+        skipBinary: stageRepoContextSkipBinary,
+        skipGitignore: stageRepoContextSkipGitignore
+      });
+
+      if (replaceRoot) {
+        setTreeRootData(data);
+        setTreeChildrenByParent({ '': data.entries });
+        syncRepoSelectionState(selectedRepoPaths);
+        setSelectedRepoDirs(new Set());
+      } else {
+        setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
+      }
+    } catch (err) {
+      setTreeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingTreeDirs((prev) => {
+        const next = new Set(prev);
+        next.delete(basePath);
+        return next;
+      });
+      if (replaceRoot) setTreeBusy(false);
+    }
   }
 
   function setPaths(paths: string[], checked: boolean) {
@@ -2788,11 +2861,53 @@ export function WorkflowShell() {
     }
   }
 
+  async function loadRepoTreeForRef(repoRefForTree: string, basePath: string, replaceRoot = false) {
+    if (loadingTreeDirs.has(basePath)) return;
+
+    const normalizedRepoRef = repoRefForTree.trim();
+    if (!normalizedRepoRef) return;
+
+    setTreeError(null);
+    if (replaceRoot) setTreeBusy(true);
+    setLoadingTreeDirs((prev) => {
+      const next = new Set(prev);
+      next.add(basePath);
+      return next;
+    });
+
+    try {
+      const data = await listRepoTree(normalizedRepoRef, stageRepoContextGitRef, {
+        basePath,
+        skipBinary: stageRepoContextSkipBinary,
+        skipGitignore: stageRepoContextSkipGitignore
+      });
+
+      if (replaceRoot) {
+        setTreeRootData(data);
+        setTreeChildrenByParent({ '': data.entries });
+        syncRepoSelectionState(selectedRepoPaths);
+        setSelectedRepoDirs(new Set());
+      } else {
+        setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
+      }
+    } catch (err) {
+      setTreeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingTreeDirs((prev) => {
+        const next = new Set(prev);
+        next.delete(basePath);
+        return next;
+      });
+      if (replaceRoot) setTreeBusy(false);
+    }
+  }
+
   async function toggleDirectory(entry: RepoTreeEntry, checked: boolean) {
-    if (!selectedRun) return;
+    const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
+    if (!activeRepoRef) return;
 
     if (checked) {
-      const nested = await loadTreeSubtree(selectedRun, entry.path);
+      const nested = await loadTreeSubtree({ repo_ref: activeRepoRef } as WorkflowRun, entry.path);
       setTreeChildrenByParent((prev) => ({ ...prev, ...nested.children }));
       setSelectedRepoDirs((prev) => {
         const next = new Set(prev);
@@ -3021,6 +3136,14 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     if (stepType === 'design') {
       payload.execution_logic = {
         kind: 'design_stage_policy',
+        connection_bundles: ['design_code_inference_default'],
+        connections: {
+          inference: {
+            repo_context: {
+              enabled: stageIncludeRepoContext
+            }
+          }
+        },
         automation: {
           inject_context: stageIncludeRepoContext
         }
@@ -3030,6 +3153,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     if (stepType === 'code') {
       payload.execution_logic = {
         kind: 'code_stage_policy',
+        connection_bundles: ['design_code_inference_default'],
+        connections: {
+          inference: {
+            repo_context: {
+              enabled: stageIncludeRepoContext
+            },
+            changeset_schema: {
+              enabled: stageIncludeChangesetSchema
+            }
+          }
+        },
         automation: {
           inject_context: stageIncludeRepoContext,
           inject_changeset_schema: stageIncludeChangesetSchema,
@@ -3134,6 +3268,196 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
       setInferenceStatus(null);
       await syncInteractiveGlobalState();
       setInferenceStatus('Global capability configuration saved.');
+      await refreshSelectedRunArtifacts();
+    } catch (err) {
+      setInferenceStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInferenceBusy(false);
+    }
+  }
+
+  function loadGlobalInferenceConfigFromGlobals(globals?: Record<string, unknown> | null) {
+    const capabilities = ((globals?.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const inference = ((capabilities.inference as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const browser = ((inference.browser as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    setInferenceTransport(((typeof inference.transport === 'string' ? inference.transport : 'api') as InferenceTransport) ?? 'api');
+    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : '');
+    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : 'http://127.0.0.1:9222');
+    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
+  }
+
+  function openGlobalInferenceConfig() {
+    loadGlobalInferenceConfigFromGlobals((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? null);
+    setInferenceStatus(null);
+    setGlobalInferenceConfigOpen(true);
+  }
+
+  function normalizeBuilderDefinition(definition?: WorkflowTemplateDefinition | null): WorkflowTemplateDefinition | null {
+    if (!definition) {
+      return null;
+    }
+    const globals = (definition.globals ?? {}) as Record<string, unknown>;
+    const existingResources = ((globals.resources as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const existingCapabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const existingAutomation = ((globals.automation as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    return {
+      ...definition,
+      globals: {
+        resources: existingResources,
+        capabilities: existingCapabilities,
+        automation: existingAutomation,
+      },
+    };
+  }
+
+  function normalizeBuilderGlobals(globals?: WorkflowTemplateDefinition['globals'] | null): WorkflowTemplateDefinition['globals'] {
+    const fallback = defaultGlobals();
+    if (!globals) {
+      return fallback;
+    }
+
+    const value = globals as Record<string, unknown>;
+    return {
+      resources: {
+        ...(fallback.resources ?? {}),
+        ...(((value.resources as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
+      },
+      capabilities: {
+        ...(fallback.capabilities ?? {}),
+        ...(((value.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
+      },
+      automation: {
+        ...(fallback.automation ?? {}),
+        ...(((value.automation as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>),
+      },
+    } as WorkflowTemplateDefinition['globals'];
+  }
+
+  function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  function deepMergeRecords(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+    const next: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(patch)) {
+      const current = next[key];
+      if (isPlainObject(current) && isPlainObject(value)) {
+        next[key] = deepMergeRecords(current, value);
+      } else {
+        next[key] = value;
+      }
+    }
+    return next;
+  }
+
+  function applyBuilderGlobalsToDefinition(
+    definition: WorkflowTemplateDefinition | null | undefined,
+    globals: WorkflowTemplateDefinition['globals'] | null | undefined
+  ): WorkflowTemplateDefinition | null {
+    const base = normalizeBuilderDefinition(definition);
+    if (!base) {
+      return null;
+    }
+    return {
+      ...base,
+      globals: normalizeBuilderGlobals(globals ?? base.globals ?? null),
+    };
+  }
+
+  function patchBuilderGlobals(patch: Record<string, unknown>) {
+    setBuilderGlobals((prev) => {
+      const base = normalizeBuilderGlobals(prev ?? compiledBuilderDefinition?.globals ?? loadedTemplateDefinition?.globals ?? null);
+      const next = deepMergeRecords(base as Record<string, unknown>, patch) as WorkflowTemplateDefinition['globals'];
+
+      setCompiledBuilderDefinition((current) => applyBuilderGlobalsToDefinition(current, next));
+      setLoadedTemplateDefinition((current) => applyBuilderGlobalsToDefinition(current, next));
+      setJsonDraft((currentDraft) => {
+        try {
+          if (!currentDraft.trim()) {
+            return currentDraft;
+          }
+          const parsed = JSON.parse(currentDraft) as WorkflowTemplateDefinition;
+          const withGlobals = applyBuilderGlobalsToDefinition(parsed, next);
+          return withGlobals ? JSON.stringify(withGlobals, null, 2) : currentDraft;
+        } catch {
+          return currentDraft;
+        }
+      });
+
+      return next;
+    });
+  }
+
+  function patchBuilderCapability(capabilityKey: string, patch: Record<string, unknown>) {
+    patchBuilderGlobals({
+      capabilities: {
+        [capabilityKey]: patch,
+      },
+    });
+  }
+
+  function syncBuilderRepoResource() {
+    const trimmed = repoRef.trim();
+    if (!trimmed) {
+      return '';
+    }
+    patchBuilderGlobals({
+      resources: {
+        repo: {
+          repo_ref: trimmed,
+          git_ref: 'WORKTREE',
+        },
+      },
+    });
+    return trimmed;
+  }
+
+  function saveBuilderCapability(capabilityKey: string, patch: Record<string, unknown>) {
+    syncBuilderRepoResource();
+    patchBuilderCapability(capabilityKey, patch);
+  }
+
+  function handleSaveBuilderRepoContext() {
+    saveBuilderCapability('context_export', {
+      git_ref: stageRepoContextGitRef.trim() || 'WORKTREE',
+      include_files: selectedRepoPaths,
+      exclude_regex: stageRepoContextExcludeRegexText
+        .split('\n')
+        .map((item) => item.trim())
+        .filter(Boolean),
+      save_path: stageRepoContextSavePath.trim() || '/tmp/repo_context.txt',
+      skip_binary: stageRepoContextSkipBinary,
+      skip_gitignore: stageRepoContextSkipGitignore,
+      include_staged_diff: stageRepoContextIncludeStagedDiff,
+      include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+    });
+    setRepoContextConfigOpen(false);
+  }
+
+  async function handleSaveGlobalInference() {
+    try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
+      const inferencePatch = {
+        transport: inferenceTransport,
+        browser: {
+          target_url: browserTargetUrl.trim(),
+          cdp_url: browserCdpUrl.trim(),
+          session_id: browserSessionId.trim(),
+        },
+      };
+      if (view === 'builder') {
+        saveBuilderCapability('inference', inferencePatch);
+        setInferenceStatus('Global inference defaults saved.');
+        return;
+      }
+      if (!selectedRun) return;
+      await patchWorkflowGlobalState(selectedRun.id, {
+        capabilities: {
+          inference: inferencePatch,
+        },
+      });
+      setInferenceStatus('Global inference defaults saved.');
       await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
@@ -3315,11 +3639,44 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 <Card withBorder p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
                   <WorkflowBuilderEditor
                     initialDefinition={loadedTemplateDefinition}
+                    builderGlobals={builderGlobals}
                     onCompiledDefinitionChange={(next) => {
-                      setCompiledBuilderDefinition(next);
-                      setJsonDraft(JSON.stringify(next, null, 2));
+                      const withGlobals = applyBuilderGlobalsToDefinition(next, builderGlobals);
+                      if (!withGlobals) {
+                        return;
+                      }
+                      setCompiledBuilderDefinition(withGlobals);
+                      setLoadedTemplateDefinition(withGlobals);
+                      setJsonDraft(JSON.stringify(withGlobals, null, 2));
                     }}
                     onError={setError}
+                    onOpenCapabilityConfig={(capabilityKey) => {
+                      openBuilderCapabilityConfig(capabilityKey, {
+                        openRepo: () => {
+                          setError(null);
+                          syncBuilderRepoResource();
+                          loadBuilderRepoContextConfig();
+                          setRepoContextConfigOpen(true);
+                        },
+                        openInference: () => {
+                          setError(null);
+                          syncBuilderRepoResource();
+                          openGlobalInferenceConfig();
+                        },
+                        openSchema: () => {
+                          setError(null);
+                          syncBuilderRepoResource();
+                          loadBuilderChangesetSchemaConfig();
+                          setChangesetSchemaConfigOpen(true);
+                        },
+                        openApplyChangeset: () => {
+                          setError(null);
+                          syncBuilderRepoResource();
+                          loadBuilderApplyChangesetConfig();
+                          setGlobalApplyChangesetOpen(true);
+                        },
+                      });
+                    }}
                   />
                 </Card>
               </Stack>
@@ -3340,6 +3697,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : activeWorkspaceTab === 'capabilities' ? (
             <Card withBorder>
               <GlobalCapabilitiesPanel
+                onOpenInference={() => {
+                  openGlobalInferenceConfig();
+                }}
                 onOpenRepoFragment={() => {
                   setRepoContextConfigOpen(true);
                 }}
@@ -3459,7 +3819,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Stack gap="md">
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
-                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy}>Run autonomously</Button>
+                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !canRunCurrentStageAutomatically}>Run autonomously</Button>
                               <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy}>Pause</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
                             </Group>
@@ -3587,7 +3947,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
                                     onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
-                                    onOpenInferenceConfig={() => setInferenceConfigOpen(true)}
+                                    onOpenInferenceConfig={openGlobalInferenceConfig}
                                     onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
                                     onOpenSchemaConfig={() => setChangesetSchemaConfigOpen(true)}
                                     onOpenApplyErrorConfig={() => setApplyErrorConfigOpen(true)}
@@ -3600,20 +3960,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                   inferenceReady={inferenceReady}
                                   inferenceSummaryText={inferenceSummaryText}
                                   inferenceTransport={inferenceTransport}
-                                  inferenceModel={inferenceModel}
                                   browserTargetUrl={browserTargetUrl}
                                   browserCdpUrl={browserCdpUrl}
                                   inferenceBusy={inferenceBusy}
                                   inferenceStatus={inferenceStatus}
-                                  inferenceConfigOpen={inferenceConfigOpen}
+
                                   hideInlineCard
-                                  onOpenConfig={() => setInferenceConfigOpen(true)}
-                                  onCloseConfig={() => setInferenceConfigOpen(false)}
+                                  onOpenConfig={openGlobalInferenceConfig}
                                   onTransportChange={(value) => setInferenceTransport(value)}
-                                  onModelChange={setInferenceModel}
                                   onBrowserTargetUrlChange={setBrowserTargetUrl}
                                   onBrowserCdpUrlChange={setBrowserCdpUrl}
-                                  onSaveConfig={() => void configureInference()}
+                                  onSaveConfig={() => void handleSaveGlobalInference()}
                                 />
                               </>
                             ) : null}
@@ -3802,7 +4159,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </SimpleGrid>
             <Group justify="space-between">
               <Group>
-                <Button size="xs" variant="light" onClick={() => { if (selectedRun) void loadTreeDir(selectedRun, '', true); }} disabled={!selectedRun}>
+                <Button
+                  size="xs"
+                  variant="light"
+                  onClick={() => {
+                    const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
+                    if (activeRepoRef) {
+                      void loadRepoTreeForRef(activeRepoRef, '', true);
+                    }
+                  }}
+                  disabled={!(view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim()}
+                >
                   Refresh tree
                 </Button>
                 <Button size="xs" variant="light" onClick={() => { syncRepoSelectionState([]); setSelectedRepoDirs(new Set()); }}>
@@ -3830,8 +4197,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 selected={selectedRepoPathSet}
                 selectedDirs={selectedRepoDirs}
                 onLoadDir={(path) => {
-                  if (selectedRun) {
-                    void loadTreeDir(selectedRun, path, false);
+                  const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
+                  if (activeRepoRef) {
+                    void loadRepoTreeForRef(activeRepoRef, path, false);
                   }
                 }}
                 onToggleFile={toggleFile}
@@ -3847,7 +4215,76 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               syncRepoSelectionState(value.split('\n').map((item) => item.trim()).filter(Boolean));
             }} placeholder={"src/main.rs\nsrc/lib.rs"} />
             <Textarea label="Exclude regex" minRows={6} value={stageRepoContextExcludeRegexText} onChange={(e) => setStageRepoContextExcludeRegexText(e.currentTarget.value)} placeholder={"target/.*\nnode_modules/.*"} />
-            <Group justify="flex-end"><Button size="xs" onClick={() => setRepoContextConfigOpen(false)}>Done</Button></Group>
+            <Group justify="flex-end">
+              <Button size="xs" variant="default" onClick={() => setRepoContextConfigOpen(false)}>Cancel</Button>
+              <Button size="xs" onClick={handleSaveBuilderRepoContext}>Save</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal
+          opened={globalInferenceConfigOpen}
+          onClose={() => setGlobalInferenceConfigOpen(false)}
+          title="Inference connector"
+          size="min(1600px, calc(100vw - 64px))"
+          centered
+          padding="md"
+          zIndex={300}
+          withCloseButton
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+          }}
+        >
+          <Stack gap="md">
+            <SimpleGrid cols={{ base: 1, md: 2 }}>
+              <Select
+                label="Mode"
+                value={inferenceTransport}
+                onChange={(value) => setInferenceTransport((value as InferenceTransport) ?? 'api')}
+                data={[
+                  { value: 'api', label: 'API' },
+                  { value: 'browser', label: 'Browser' }
+                ]}
+                allowDeselect={false}
+              />
+              <TextInput
+                label="Session ID"
+                value={browserSessionId}
+                onChange={(e) => setBrowserSessionId(e.currentTarget.value)}
+                disabled={inferenceTransport !== 'browser'}
+                placeholder="Optional existing browser session"
+              />
+            </SimpleGrid>
+
+            {inferenceTransport === 'browser' ? (
+              <Stack gap="md">
+                <SimpleGrid cols={{ base: 1, md: 2 }}>
+                  <TextInput
+                    label="Browser URL"
+                    value={browserTargetUrl}
+                    onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)}
+                    placeholder="https://website.com/"
+                  />
+                  <TextInput
+                    label="CDP URL"
+                    value={browserCdpUrl}
+                    onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
+                    placeholder="http://127.0.0.1:9222"
+                  />
+                </SimpleGrid>
+                <Alert color="blue">Only backend-owned inference fields are persisted here. Browser defaults and runtime session behavior stay on the backend.</Alert>
+              </Stack>
+            ) : (
+              <Alert color="blue">API mode only persists the transport choice. Model, max tokens, temperature, provider, and system prompt are not stored in workflow global state.</Alert>
+            )}
+
+            {inferenceStatus ? <Alert color={inferenceStatus.toLowerCase().includes('saved') ? 'green' : 'red'}>{inferenceStatus}</Alert> : null}
+
+            <Group justify="flex-end">
+              <Button size="xs" variant="default" onClick={() => setGlobalInferenceConfigOpen(false)}>Cancel</Button>
+              <Button size="xs" onClick={() => void handleSaveGlobalInference()} loading={inferenceBusy}>Save</Button>
+            </Group>
           </Stack>
         </Modal>
 

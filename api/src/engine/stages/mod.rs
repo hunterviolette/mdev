@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::capabilities::{execute_capability_invocations, CapabilityContext, CapabilityInvocation};
+use super::governance;
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
 #[allow(dead_code)]
@@ -133,6 +134,19 @@ pub async fn execute_stage(
     )
     .await?;
 
+    let before_decisions = governance::before_stage(state, run_id, run, step).await?;
+    governance::apply_context_mutations(run, &before_decisions, Some(step.id.as_str()), None)?;
+    if let Some(message) = governance::pause_message(&before_decisions) {
+        persist_context(state, run_id, &run.context).await?;
+        return Ok(StageOutcome {
+            ok: false,
+            disposition: StageDisposition::Paused,
+            message,
+            capability_results: Vec::new(),
+            local_state: json!({}),
+        });
+    }
+
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
     let existing_local_state = root
@@ -172,13 +186,39 @@ pub async fn execute_stage(
 
     let prepared_local_state = prepare_stage_local_state(repo_ref.as_str(), &global_state, step, local_state)?;
     let plan = resolve_effective_execution_plan(&global_state, repo_ref.as_str(), step, &prepared_local_state)?;
+    let prepared_local_state_obj = prepared_local_state
+        .as_object()
+        .ok_or_else(|| anyhow!("prepared stage local state must be object"))?;
+
     let execution_local_state = materialize_capability_runtime_state(prepared_local_state.clone(), &global_state, repo_ref.as_str());
     let capability_results = run_capability_plan(state, run_id, repo_ref.as_str(), step, &execution_local_state, &plan).await?;
     let capability_failed = capability_results
         .iter()
         .any(|item| item.get("ok").and_then(Value::as_bool) == Some(false));
 
+    let after_decisions = governance::after_stage(
+        state,
+        run_id,
+        run,
+        step,
+        stage_execution_id.as_str(),
+        &capability_results,
+    )
+    .await?;
+    governance::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
+
     let branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
+
+    if let Some(message) = governance::pause_message(&after_decisions) {
+        persist_context(state, run_id, &run.context).await?;
+        return Ok(StageOutcome {
+            ok: false,
+            disposition: StageDisposition::Paused,
+            message,
+            capability_results,
+            local_state: Value::Object(prepared_local_state_obj.clone()),
+        });
+    }
 
     {
         let root = ensure_engine_root(&mut run.context);

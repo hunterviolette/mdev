@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{app_state::AppState, engine::{append_engine_event, event_meta}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
+use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
 use super::{changeset_schema, compile_commands, context_export, gateway_model, inference, sap};
 
@@ -133,6 +133,32 @@ pub(crate) async fn execute_capability_chain(
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
 
+        let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
+        let before_decisions = governance::before_capability(
+            ctx.state,
+            ctx.run_id,
+            &governance_run,
+            ctx.step,
+            stage_execution_id.as_deref(),
+            &invocation,
+            &results,
+        )
+        .await?;
+        governance::apply_context_mutations(
+            &mut governance_run,
+            &before_decisions,
+            Some(ctx.step.id.as_str()),
+            Some(invocation.capability.as_str()),
+        )?;
+        if !before_decisions.is_empty() {
+            persist_context(ctx.state, ctx.run_id, &governance_run.context).await?;
+        }
+        for injected in governance::injected_capabilities(&before_decisions).into_iter().rev() {
+            if injected.capability != invocation.capability && !queue.iter().any(|item| item.capability == injected.capability) {
+                queue.insert(0, injected);
+            }
+        }
+
         let capability_invocation_id = Uuid::new_v4().to_string();
         let capability_started_at = Instant::now();
 
@@ -152,6 +178,8 @@ pub(crate) async fn execute_capability_chain(
             &format!("{}_started", invocation.capability),
             &format!("{} started", invocation.capability.replace('_', " ")),
             json!({
+        // governor hooks can be added here later for before_capability / after_capability if needed.
+
                 "capability": invocation.capability,
                 "config": invocation.config,
                 "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
@@ -214,6 +242,33 @@ pub(crate) async fn execute_capability_chain(
             }
         };
 
+        let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
+        let after_decisions = governance::after_capability(
+            ctx.state,
+            ctx.run_id,
+            &governance_run,
+            ctx.step,
+            stage_execution_id.as_deref(),
+            &result,
+            &results,
+        )
+        .await?;
+        governance::apply_context_mutations(
+            &mut governance_run,
+            &after_decisions,
+            Some(ctx.step.id.as_str()),
+            Some(result.capability.as_str()),
+        )?;
+        if !after_decisions.is_empty() {
+            persist_context(ctx.state, ctx.run_id, &governance_run.context).await?;
+        }
+        let governance_pause_requested = governance::pause_message(&after_decisions).is_some();
+        let governance_follow_ups = if governance_pause_requested {
+            Vec::new()
+        } else {
+            governance::injected_capabilities(&after_decisions)
+        };
+
         append_engine_event(
             ctx.state,
             ctx.run_id,
@@ -249,11 +304,15 @@ pub(crate) async fn execute_capability_chain(
 
         let follow_ups = follow_up_vec(&result.follow_ups)
             .into_iter()
+            .chain(governance_follow_ups.into_iter())
             .filter(|item| !existing_capabilities.contains(&item.capability))
             .collect::<Vec<_>>();
 
         queue.extend(follow_ups);
         results.push(result);
+        if governance_pause_requested {
+            break;
+        }
     }
 
     Ok(results)

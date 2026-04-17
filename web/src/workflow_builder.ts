@@ -3,8 +3,10 @@ import type {
   WorkflowBuilderDocument,
   WorkflowBuilderStageDocument,
   WorkflowGlobalConfig,
+  WorkflowGovernancePolicyDescriptor,
   WorkflowStageDescriptor,
   WorkflowStageField,
+  WorkflowStageGovernancePolicy,
   WorkflowTemplateDefinition,
 } from './api';
 
@@ -13,10 +15,51 @@ export type BuilderStep = {
   name: string;
   stepType: string;
   fields: Record<string, unknown>;
+  governancePolicies?: WorkflowStageGovernancePolicy[];
 };
+
+export function capabilityDisplayLabel(capabilityKey: string): string {
+  switch (capabilityKey) {
+    case 'context_export':
+      return 'Context export';
+    case 'inference':
+      return 'Inference';
+    case 'gateway_model/changeset':
+      return 'ChangeSet apply';
+    case 'compile_commands':
+      return 'Compile commands';
+    case 'sap/import':
+      return 'SAP import';
+    case 'sap/export':
+      return 'SAP export';
+    default:
+      return capabilityKey;
+  }
+}
 
 export function flattenStageFields(descriptor: WorkflowStageDescriptor): WorkflowStageField[] {
   return descriptor.editable_fields.flatMap((group) => group.fields);
+}
+
+export function governancePolicyMap(descriptor: WorkflowStageDescriptor): Record<string, WorkflowGovernancePolicyDescriptor> {
+  return Object.fromEntries((descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy]));
+}
+
+export function ensureStageGovernancePolicies(
+  descriptor: WorkflowStageDescriptor,
+  selected: WorkflowStageGovernancePolicy[] | undefined,
+): WorkflowStageGovernancePolicy[] {
+  const byKey = new Map((selected ?? []).map((item) => [item.key, item]));
+  return (descriptor.available_governance_policies ?? []).map((policy) => ({
+    key: policy.key,
+    enabled: byKey.get(policy.key)?.enabled ?? false,
+    config: Object.fromEntries(
+      policy.fields.map((field) => [
+        field.key,
+        (byKey.get(policy.key)?.config as Record<string, unknown> | undefined)?.[field.key] ?? field.default,
+      ])
+    ),
+  }));
 }
 
 export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, id?: string): BuilderStep {
@@ -25,6 +68,7 @@ export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, i
     name: descriptor.label,
     stepType: descriptor.step_type,
     fields: Object.fromEntries(flattenStageFields(descriptor).map((field) => [field.key, field.default])),
+    governancePolicies: ensureStageGovernancePolicies(descriptor, []),
   };
 }
 
@@ -34,6 +78,7 @@ export function buildStageDocument(step: BuilderStep): WorkflowBuilderStageDocum
     name: step.name,
     step_type: step.stepType,
     field_values: step.fields,
+    governance_policies: step.governancePolicies ?? [],
   };
 }
 
@@ -46,15 +91,30 @@ export function defaultGlobals(): WorkflowGlobalConfig {
       },
     },
     capabilities: {
-      inference: {},
+      inference: {
+        provider: 'openai',
+        model: 'gpt-5.4',
+        temperature: 0.2,
+        max_tokens: 8000,
+        system_prompt: '',
+      },
       context_export: {
         save_path: '/tmp/repo_context.txt',
       },
       changeset_schema: {},
       'gateway_model/changeset': {},
-      compile_commands: {},
+      compile_commands: {
+        commands: [],
+      },
       'sap/import': {},
       'sap/export': {},
+    },
+    automation: {
+      guardrails: {
+        changeset_context_inject_after_failures: 3,
+        changeset_pause_after_failures: 6,
+        compile_pause_after_failures: 5,
+      },
     },
   };
 }
@@ -103,6 +163,7 @@ export function builderStepsFromDefinition(
         ...defaults,
         ...fieldValues,
       },
+      governancePolicies: ensureStageGovernancePolicies(descriptor, step.governance?.policies),
     }];
   });
 }

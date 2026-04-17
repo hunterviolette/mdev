@@ -46,20 +46,22 @@ pub fn prepare_inference_stage_state(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let include_repo_context = automation
-        .get("inject_context")
+    let include_repo_context = inference_connection_enabled(
+        &state,
+        step,
+        "repo_context",
+        step.prompt.include_repo_context,
+    ) || enabled
+        .get("repo_context")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| {
-            enabled
-                .get("repo_context")
-                .and_then(Value::as_bool)
-                .unwrap_or(step.prompt.include_repo_context)
-        });
+        .unwrap_or(false);
 
-    let include_changeset_schema = automation
-        .get("inject_changeset_schema")
-        .and_then(Value::as_bool)
-        .unwrap_or(settings.include_changeset_schema);
+    let include_changeset_schema = inference_connection_enabled(
+        &state,
+        step,
+        "changeset_schema",
+        settings.include_changeset_schema,
+    );
 
     let include_apply_error = automation
         .get("include_apply_error")
@@ -294,6 +296,30 @@ pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
     )
 }
 
+fn inference_connection_enabled(
+    state: &Value,
+    step: &WorkflowStepDefinition,
+    key: &str,
+    default_enabled: bool,
+) -> bool {
+    state
+        .get("execution_logic")
+        .and_then(|v| v.get("connections"))
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            step.execution_logic
+                .get("connections")
+                .and_then(|v| v.get("inference"))
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(default_enabled)
+}
+
 pub fn build_inference_execution_plan(
     repo_ref: &str,
     global_state: &Value,
@@ -318,20 +344,22 @@ pub fn build_inference_execution_plan(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let include_repo_context = automation
-        .get("inject_context")
+    let include_repo_context = inference_connection_enabled(
+        local_state,
+        step,
+        "repo_context",
+        step.prompt.include_repo_context,
+    ) || enabled
+        .get("repo_context")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| {
-            enabled
-                .get("repo_context")
-                .and_then(Value::as_bool)
-                .unwrap_or(step.prompt.include_repo_context)
-        });
+        .unwrap_or(false);
 
-    let include_changeset_schema = automation
-        .get("inject_changeset_schema")
-        .and_then(Value::as_bool)
-        .unwrap_or(settings.include_changeset_schema);
+    let include_changeset_schema = inference_connection_enabled(
+        local_state,
+        step,
+        "changeset_schema",
+        settings.include_changeset_schema,
+    );
 
     let auto_apply_changeset = automation
         .get("auto_apply_changeset")
@@ -404,7 +432,11 @@ fn build_execution_plan(
             key: "gateway_model/changeset".to_string(),
             enabled: true,
             config: json!({}),
-            input_mapping: json!({}),
+            input_mapping: json!({
+                "changeset": {
+                    "from": "inference.payload"
+                }
+            }),
             output_mapping: json!({}),
             run_after: vec!["inference".to_string()],
             condition: Value::Null,

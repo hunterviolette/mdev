@@ -22,16 +22,21 @@ import {
 import {
   compileWorkflowBuilderDocument,
   getWorkflowBuilderCatalog,
+  type CompileWorkflowBuilderResponse,
+  type WorkflowCapabilitySummaryItem,
   type WorkflowStageDescriptor,
   type WorkflowStageField,
+  type WorkflowStageGovernancePolicy,
   type WorkflowTemplateDefinition,
 } from './api';
-import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, descriptorMap, type BuilderStep } from './workflow_builder';
+import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, ensureStageGovernancePolicies, type BuilderStep } from './workflow_builder';
 
 type WorkflowBuilderEditorProps = {
   initialDefinition?: WorkflowTemplateDefinition | null;
+  builderGlobals?: WorkflowTemplateDefinition['globals'] | null;
   onCompiledDefinitionChange: (definition: WorkflowTemplateDefinition) => void;
   onError?: (message: string | null) => void;
+  onOpenCapabilityConfig?: (capabilityKey: string) => void;
 };
 
 type CompileState = 'idle' | 'dirty' | 'compiling' | 'compiled' | 'error';
@@ -80,16 +85,38 @@ function fieldControl(field: WorkflowStageField) {
   return 'text';
 }
 
+function capabilitySummaryDetail(item: WorkflowCapabilitySummaryItem) {
+  if (item.stage_types.length === 0) {
+    return 'Used by workflow';
+  }
+  return `Used by ${item.stage_types.join(', ')}`;
+}
 
-export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionChange, onError }: WorkflowBuilderEditorProps) {
+function isGlobalEditableCapability(capabilityKey: string) {
+  const normalized = capabilityKey.trim().toLowerCase();
+  return [
+    'context_export',
+    'inference',
+    'gateway_model/changeset',
+    'changeset_apply',
+    'changeset apply',
+    'changeset_schema',
+    'browser',
+  ].includes(normalized);
+}
+
+
+export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCompiledDefinitionChange, onError, onOpenCapabilityConfig }: WorkflowBuilderEditorProps) {
   const [catalog, setCatalog] = useState<Record<string, WorkflowStageDescriptor>>({});
   const [stageDescriptors, setStageDescriptors] = useState<WorkflowStageDescriptor[]>([]);
   const [steps, setSteps] = useState<BuilderStep[]>([]);
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
+  const [globalsRevision, setGlobalsRevision] = useState(0);
   const [loading, setLoading] = useState(true);
   const [compileState, setCompileState] = useState<CompileState>('idle');
   const [compileMessage, setCompileMessage] = useState('');
   const [compileRevision, setCompileRevision] = useState(0);
+  const [compiledCapabilitySummary, setCompiledCapabilitySummary] = useState<WorkflowCapabilitySummaryItem[]>([]);
 
   const selectedStep = useMemo(
     () => steps.find((step) => step.id === selectedStepId) ?? null,
@@ -98,6 +125,18 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
   const selectedDescriptor = useMemo(
     () => (selectedStep ? catalog[selectedStep.stepType] ?? null : null),
     [catalog, selectedStep]
+  );
+
+  const selectedGovernancePolicies = useMemo(
+    () => (selectedStep && selectedDescriptor
+      ? ensureStageGovernancePolicies(selectedDescriptor, selectedStep.governancePolicies)
+      : []),
+    [selectedDescriptor, selectedStep]
+  );
+
+  const selectedStageCapabilitySummary = useMemo(
+    () => compiledCapabilitySummary.find((item) => item.stage_ids.includes(selectedStep?.id ?? '')) ?? null,
+    [compiledCapabilitySummary, selectedStep?.id]
   );
 
   useEffect(() => {
@@ -116,6 +155,7 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
         setStageDescriptors(descriptors);
 
         const hydratedSteps = builderStepsFromDefinition(initialDefinition, loadedCatalog);
+        setGlobalsRevision((prev) => prev + 1);
         if (hydratedSteps.length > 0) {
           setSteps(hydratedSteps);
           setSelectedStepId((prev) => {
@@ -147,7 +187,7 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
     return () => {
       cancelled = true;
     };
-  }, [initialDefinition, onError]);
+  }, [onError]);
 
   function markDirty(message = 'Unsaved visual changes') {
     setCompileState('dirty');
@@ -205,6 +245,21 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
                 ...step.fields,
                 [key]: value,
               },
+            }
+          : step
+      )
+    );
+    markDirty();
+  }
+
+
+  function updateStepGovernancePolicies(stepId: string, governancePolicies: WorkflowStageGovernancePolicy[]) {
+    setSteps((prev) =>
+      prev.map((step) =>
+        step.id === stepId
+          ? {
+              ...step,
+              governancePolicies,
             }
           : step
       )
@@ -286,22 +341,25 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
     try {
       setCompileState('compiling');
       setCompileMessage('Compiling backend-defined workflow');
-      const result = await compileWorkflowBuilderDocument(
-        buildBuilderDocument(steps)
+      const result: CompileWorkflowBuilderResponse = await compileWorkflowBuilderDocument(
+        buildBuilderDocument(steps, (builderGlobals ?? initialDefinition?.globals ?? defaultGlobals()))
       );
       if (!result.ok) {
         const message = result.errors.length > 0 ? result.errors.join('\n') : 'Workflow compilation failed.';
+        setCompiledCapabilitySummary([]);
         setCompileState('error');
         setCompileMessage(message);
         onError?.(message);
         return;
       }
+      setCompiledCapabilitySummary(result.capability_summary ?? []);
       onCompiledDefinitionChange(result.definition);
       setCompileState('compiled');
       setCompileMessage(result.warnings.length > 0 ? result.warnings.join('\n') : 'Compiled successfully');
       onError?.(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      setCompiledCapabilitySummary([]);
       setCompileState('error');
       setCompileMessage(message);
       onError?.(message);
@@ -313,7 +371,7 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
       return;
     }
     void compileDocument();
-  }, [compileRevision]);
+  }, [compileRevision, globalsRevision, builderGlobals]);
 
   if (loading) {
     return (
@@ -361,6 +419,37 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
             </Group>
 
             {compileMessage ? <Alert color={compileState === 'error' ? 'red' : 'blue'}>{compileMessage}</Alert> : null}
+
+            {compiledCapabilitySummary.length > 0 ? (
+              <Card withBorder p="sm">
+                <Stack gap="xs">
+                  <Text fw={600} size="sm">Capabilities invoked</Text>
+                  <Group gap="xs">
+                    {compiledCapabilitySummary.map((item) => {
+                      const editable = isGlobalEditableCapability(item.key);
+                      return (
+                        <Button
+                          key={item.key}
+                          variant={editable ? 'light' : 'default'}
+                          size="compact-xs"
+                          title={editable ? `${capabilitySummaryDetail(item)} · Click to configure` : capabilitySummaryDetail(item)}
+                          style={{ cursor: editable ? 'pointer' : 'default' }}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            if (editable) {
+                              onOpenCapabilityConfig?.(item.key);
+                            }
+                          }}
+                        >
+                          {capabilityDisplayLabel(item.key)}
+                        </Button>
+                      );
+                    })}
+                  </Group>
+                </Stack>
+              </Card>
+            ) : null}
 
             <ScrollArea h="100%" type="auto">
               <Stack gap="sm">
@@ -458,6 +547,65 @@ export function WorkflowBuilderEditor({ initialDefinition, onCompiledDefinitionC
                       {group.fields.map((field) => renderField(field, selectedStep.fields[field.key]))}
                     </Stack>
                   ))}
+
+                  {selectedStageCapabilitySummary ? <Divider label="Execution plan summary" /> : null}
+                  {selectedStageCapabilitySummary ? (
+                    <Alert color="blue" variant="light">
+                      {selectedStageCapabilitySummary.stage_types.length > 0
+                        ? `This stage contributes to the workflow-level capability summary through ${selectedStageCapabilitySummary.stage_types.join(', ')}.`
+                        : 'This stage contributes to the workflow-level capability summary.'}
+                    </Alert>
+                  ) : null}
+
+                  {selectedGovernancePolicies.length > 0 ? <Divider label="Governance policies" /> : null}
+                  {selectedGovernancePolicies.map((policy) => {
+                    const descriptor = (selectedDescriptor.available_governance_policies ?? []).find((item) => item.key === policy.key);
+                    if (!descriptor) {
+                      return null;
+                    }
+                    return (
+                      <Stack key={policy.key} gap="xs">
+                        <Switch
+                          label={descriptor.label}
+                          description={descriptor.description}
+                          checked={Boolean(policy.enabled)}
+                          onChange={(event) => {
+                            const nextPolicies = selectedGovernancePolicies.map((item) =>
+                              item.key === policy.key ? { ...item, enabled: event.currentTarget.checked } : item
+                            );
+                            updateStepGovernancePolicies(selectedStep.id, nextPolicies);
+                          }}
+                        />
+                        {policy.enabled ? descriptor.fields.map((field) => {
+                          const currentValue = (policy.config ?? {})[field.key] ?? field.default;
+                          return (
+                            <TextInput
+                              key={`${policy.key}:${field.key}`}
+                              label={field.label}
+                              description={field.description}
+                              placeholder={field.ui?.placeholder}
+                              value={String(typeof currentValue === 'number' ? currentValue : Number(currentValue ?? 0) || 0)}
+                              onChange={(event) => {
+                                const nextPolicies = selectedGovernancePolicies.map((item) => {
+                                  if (item.key !== policy.key) {
+                                    return item;
+                                  }
+                                  return {
+                                    ...item,
+                                    config: {
+                                      ...item.config,
+                                      [field.key]: Number(event.currentTarget.value || '0'),
+                                    },
+                                  };
+                                });
+                                updateStepGovernancePolicies(selectedStep.id, nextPolicies);
+                              }}
+                            />
+                          );
+                        }) : null}
+                      </Stack>
+                    );
+                  })}
 
                 </Stack>
               </ScrollArea>

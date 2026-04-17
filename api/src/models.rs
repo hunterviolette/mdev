@@ -68,6 +68,8 @@ pub struct WorkflowGlobalConfig {
     pub resources: Value,
     #[serde(default)]
     pub capabilities: Value,
+    #[serde(default)]
+    pub automation: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -124,6 +126,8 @@ pub struct WorkflowStepDefinition {
     pub id: String,
     pub name: String,
     pub step_type: String,
+    #[serde(default)]
+    pub governance: WorkflowStepGovernanceConfig,
     pub automation_mode: AutomationMode,
     #[serde(default)]
     pub execution: WorkflowStepExecutionConfig,
@@ -170,6 +174,8 @@ pub struct WorkflowStageDescriptor {
     #[serde(default)]
     pub editable_fields: Vec<WorkflowStageFieldGroup>,
     #[serde(default)]
+    pub available_governance_policies: Vec<WorkflowGovernancePolicyDescriptor>,
+    #[serde(default)]
     pub routes: Vec<WorkflowStageRoute>,
 }
 
@@ -179,6 +185,35 @@ pub struct WorkflowStageFieldGroup {
     pub label: String,
     #[serde(default)]
     pub fields: Vec<WorkflowStageField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowGovernancePolicyDescriptor {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub capability: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<WorkflowStageField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageGovernancePolicy {
+    pub key: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStepGovernanceConfig {
+    #[serde(default)]
+    pub policies: Vec<WorkflowStageGovernancePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +284,8 @@ pub struct WorkflowBuilderStageDocument {
     pub step_type: String,
     #[serde(default)]
     pub field_values: Value,
+    #[serde(default)]
+    pub governance_policies: Vec<WorkflowStageGovernancePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,10 +293,21 @@ pub struct CompileWorkflowBuilderRequest {
     pub document: WorkflowBuilderDocument,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowCapabilitySummaryItem {
+    pub key: String,
+    #[serde(default)]
+    pub stage_ids: Vec<String>,
+    #[serde(default)]
+    pub stage_types: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileWorkflowBuilderResponse {
     pub ok: bool,
     pub definition: WorkflowTemplateDefinition,
+    #[serde(default)]
+    pub capability_summary: Vec<WorkflowCapabilitySummaryItem>,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
