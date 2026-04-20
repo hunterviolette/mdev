@@ -11,7 +11,6 @@ use crate::{
 
 pub struct InferenceStageSettings {
     pub include_changeset_schema: bool,
-    pub include_apply_error: bool,
 }
 
 pub fn prepare_inference_stage_state(
@@ -29,10 +28,6 @@ pub fn prepare_inference_stage_state(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let enabled = inference_state
-        .get("prompt_fragment_enabled")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let mut fragments = ensure_object(
         inference_state
             .get("prompt_fragments")
@@ -51,10 +46,7 @@ pub fn prepare_inference_stage_state(
         step,
         "repo_context",
         step.prompt.include_repo_context,
-    ) || enabled
-        .get("repo_context")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    );
 
     let include_changeset_schema = inference_connection_enabled(
         &state,
@@ -62,11 +54,6 @@ pub fn prepare_inference_stage_state(
         "changeset_schema",
         settings.include_changeset_schema,
     );
-
-    let include_apply_error = automation
-        .get("include_apply_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(settings.include_apply_error);
 
     let user_input = state
         .get("prompt")
@@ -144,27 +131,9 @@ pub fn prepare_inference_stage_state(
             .remove("changeset_schema");
     }
 
-    if include_apply_error {
-        let apply_error_fragment = build_apply_error_prompt_fragment(global_state);
-        if let Some(fragment) = apply_error_fragment {
-            fragments
-                .as_object_mut()
-                .expect("prompt fragments must be object")
-                .insert("apply_error".to_string(), Value::String(fragment));
-        } else {
-            fragments
-                .as_object_mut()
-                .expect("prompt fragments must be object")
-                .remove("apply_error");
-        }
-    } else {
-        fragments
-            .as_object_mut()
-            .expect("prompt fragments must be object")
-            .remove("apply_error");
-    }
+    let transient_prompt_fragments = collect_active_transient_prompt_fragments(global_state);
 
-    let mut effective_enabled = enabled;
+    let mut effective_enabled = json!({});
     let enabled_obj = effective_enabled
         .as_object_mut()
         .expect("prompt fragment enabled must be object");
@@ -174,23 +143,21 @@ pub fn prepare_inference_stage_state(
         Value::Bool(user_input.is_some()),
     );
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
-    enabled_obj.insert(
-        "apply_error".to_string(),
-        Value::Bool(
-            include_apply_error
-                && fragments
-                    .get("apply_error")
-                    .and_then(Value::as_str)
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false),
-        ),
-    );
 
-    let prompt = compose_prompt_from_state(&effective_enabled, &fragments);
+    let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
+    obj.insert(
+        "transient_prompt_fragments".to_string(),
+        Value::Array(
+            transient_prompt_fragments
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        ),
+    );
 
     if let Some(repo_context) = repo_context {
         obj.insert("repo_context".to_string(), repo_context);
@@ -229,58 +196,22 @@ pub fn auto_apply_enabled(step: &WorkflowStepDefinition, state: &Value) -> bool 
         .unwrap_or(false)
 }
 
-fn build_apply_error_prompt_fragment(global_state: &Value) -> Option<String> {
-    let apply_state = global_state
+fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String> {
+    global_state
         .get("capabilities")
-        .and_then(|v| v.get("gateway_model/changeset"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let latest = apply_state
-        .get("latest_apply_error")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let summary = latest
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let lines = latest
-        .get("lines")
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get("active_prompt_fragments"))
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-
-    if summary.is_none() && lines.is_empty() {
-        return None;
-    }
-
-    let detail = if summary
-        .map(|value| value.contains("no JSON object found in changeset payload"))
-        .unwrap_or(false)
-    {
-        summary.unwrap().to_string()
-    } else {
-        match summary {
-            Some(summary) if !lines.is_empty() => format!("{}\n\n{}", summary, lines.join("\n")),
-            Some(summary) => summary.to_string(),
-            None => lines.join("\n"),
-        }
-    };
-
-    Some(format!(
-        "{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the apply errors.",
-        detail
-    ))
+        .unwrap_or_default()
 }
 
 pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
@@ -333,26 +264,12 @@ pub fn build_inference_execution_plan(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let inference_state = global_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let enabled = inference_state
-        .get("prompt_fragment_enabled")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
     let include_repo_context = inference_connection_enabled(
         local_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
-    ) || enabled
-        .get("repo_context")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    );
 
     let include_changeset_schema = inference_connection_enabled(
         local_state,
@@ -445,7 +362,6 @@ fn build_execution_plan(
 
     Ok(nodes)
 }
-
 
 fn ensure_object(value: Value) -> Value {
     match value {

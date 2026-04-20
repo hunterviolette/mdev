@@ -91,6 +91,19 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id TEXT PRIMARY KEY,
+            settings_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     let template_columns = sqlx::query("PRAGMA table_info(workflow_templates)")
         .fetch_all(db)
         .await?;

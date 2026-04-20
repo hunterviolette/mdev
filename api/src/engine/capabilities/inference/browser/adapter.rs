@@ -337,8 +337,41 @@ fn resolve_edge_executable(cfg: &BrowserConfig) -> String {
         "msedge.exe".to_string()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
+        let candidates = [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+        ];
+
+        for candidate in candidates {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+
+        "msedge".to_string()
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let candidates = [
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "msedge",
+        ];
+
+        for candidate in candidates {
+            if Command::new("sh")
+                .args(["-lc", &format!("command -v {} >/dev/null 2>&1", candidate)])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+            {
+                return candidate.to_string();
+            }
+        }
+
         "msedge".to_string()
     }
 }
@@ -410,7 +443,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
 
         match attempt {
             Ok(session_id) => {
-                info!(session_id = %session_id, attempt = attempt_index + 1, "browser attached successfully");
+                info!(session_id = %session_id, previous_session_id = %cfg.session_id.clone().unwrap_or_default(), attempt = attempt_index + 1, cdp_url = %cfg.cdp_url, target_url = %cfg.target_url, "browser attached successfully");
                 cfg.session_id = Some(session_id.clone());
                 return Ok(session_id);
             }

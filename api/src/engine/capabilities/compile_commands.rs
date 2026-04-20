@@ -11,6 +11,12 @@ pub async fn execute(
     config: Value,
 ) -> Result<CapabilityResult> {
     let commands = resolve_compile_commands(config, ctx.local_state, ctx.step.execution_logic.clone());
+    let execution_mode = ctx
+        .local_state
+        .get("execution")
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("manual");
 
     let repo_ref = ctx
         .local_state
@@ -20,7 +26,11 @@ pub async fn execute(
         .and_then(Value::as_str)
         .unwrap_or(ctx.repo_ref);
 
-    let result = execute_terminal_command(PathBuf::from(repo_ref).as_path(), commands)?;
+    let result = execute_terminal_command(
+        PathBuf::from(repo_ref).as_path(),
+        commands,
+        execution_mode,
+    )?;
 
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
@@ -64,10 +74,11 @@ fn resolve_compile_commands(config: Value, local_state: &Value, execution_logic:
         .unwrap_or_else(|| json!([]))
 }
 
-fn execute_terminal_command(repo: &Path, commands: Value) -> Result<Value> {
+fn execute_terminal_command(repo: &Path, commands: Value, execution_mode: &str) -> Result<Value> {
     let rows = commands.as_array().cloned().unwrap_or_default();
     let mut results = Vec::new();
     let mut ok = true;
+    let mut executed_any = false;
 
     for item in rows {
         let (command, label) = match item {
@@ -97,6 +108,7 @@ fn execute_terminal_command(repo: &Path, commands: Value) -> Result<Value> {
             continue;
         }
 
+        executed_any = true;
         let output = shell_command(repo, &command)
             .with_context(|| format!("failed to run compile command '{}'", command))?;
 
@@ -111,6 +123,21 @@ fn execute_terminal_command(repo: &Path, commands: Value) -> Result<Value> {
             "status": status,
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+        }));
+    }
+
+    if !executed_any {
+        let automatic = execution_mode.eq_ignore_ascii_case("automatic");
+        return Ok(json!({
+            "ok": automatic,
+            "results": [],
+            "message": if automatic {
+                "No compile commands configured. Autonomous run should pause at compile."
+            } else {
+                "No compile commands configured."
+            },
+            "no_commands_configured": true,
+            "skipped": automatic,
         }));
     }
 

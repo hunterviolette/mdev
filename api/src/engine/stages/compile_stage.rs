@@ -8,6 +8,14 @@ pub fn prepare_stage_state(
     local_state: Value,
 ) -> Result<Value> {
     let mut state = ensure_object(local_state);
+    let is_automatic = state
+        .get("execution")
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+        .map(|value| value.eq_ignore_ascii_case("automatic"))
+        .unwrap_or(false);
+    let has_compile_commands = compile_commands_present(&state, step.execution_logic.clone());
+
     let obj = state.as_object_mut().expect("stage state must be object");
 
     let execution_logic = obj
@@ -21,24 +29,31 @@ pub fn prepare_stage_state(
     if !exec_obj.contains_key("on_success") {
         exec_obj.insert(
             "on_success".to_string(),
-            json!({
-                "disposition": "move_next",
-                "message": "Compile stage completed successfully through backend workflow engine.",
-                "patch": {
-                    "global_state": {
-                        "capabilities": {
-                            "inference": {
-                                "prompt_fragment_enabled": {
-                                    "compile_error": false
-                                },
-                                "prompt_fragments": {
-                                    "compile_error": null
+            if is_automatic && !has_compile_commands {
+                json!({
+                    "disposition": "paused",
+                    "message": "Compile stage reached with no compile commands configured. Paused for manual intervention."
+                })
+            } else {
+                json!({
+                    "disposition": "move_next",
+                    "message": "Compile stage completed successfully through backend workflow engine.",
+                    "patch": {
+                        "global_state": {
+                            "capabilities": {
+                                "inference": {
+                                    "prompt_fragment_enabled": {
+                                        "compile_error": false
+                                    },
+                                    "prompt_fragments": {
+                                        "compile_error": null
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }),
+                })
+            },
         );
     }
 
@@ -57,6 +72,52 @@ pub fn prepare_stage_state(
     }
 
     Ok(state)
+}
+
+fn compile_commands_present(local_state: &Value, execution_logic: Value) -> bool {
+    resolved_compile_commands(local_state, execution_logic)
+        .as_array()
+        .map(|rows| {
+            rows.iter().any(|item| match item {
+                Value::String(command) => !command.trim().is_empty(),
+                Value::Object(obj) => obj
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(|command| !command.trim().is_empty())
+                    .unwrap_or(false),
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn resolved_compile_commands(local_state: &Value, execution_logic: Value) -> Value {
+    local_state
+        .get("capabilities")
+        .and_then(|v| v.get("compile_commands"))
+        .and_then(|v| v.get("commands"))
+        .cloned()
+        .or_else(|| {
+            local_state
+                .get("execution")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .or_else(|| {
+            local_state
+                .get("execution_logic")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .or_else(|| {
+            execution_logic
+                .get("compile_checks")
+                .and_then(|v| v.get("commands"))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!([]))
 }
 
 pub fn build_compile_error_patch(capability_results: &[Value]) -> Value {
@@ -92,12 +153,11 @@ pub fn build_compile_error_patch(capability_results: &[Value]) -> Value {
         "global_state": {
             "capabilities": {
                 "inference": {
-                    "prompt_fragment_enabled": {
-                        "compile_error": true
-                    },
-                    "prompt_fragments": {
-                        "compile_error": compile_fragment
-                    }
+                    "next_prompt_fragments": [
+                        {
+                            "text": compile_fragment
+                        }
+                    ]
                 }
             }
         }

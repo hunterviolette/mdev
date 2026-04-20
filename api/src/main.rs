@@ -23,7 +23,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenv();
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "workflow_api=debug,tower_http=info".into()))
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "workflow_api=info,workflow_api::engine::capabilities::inference::api::oai=info,workflow_api::engine::capabilities::inference::browser::adapter=info,workflow_api::routes::runs=info,tower_http=info".into()
+        }))
         .with(tracing_subscriber::fmt::layer())
         .init();
 

@@ -126,7 +126,25 @@ pub async fn persist_inference_config(ctx: &CapabilityContext<'_>, cfg: &Inferen
     let root = crate::engine::ensure_engine_root(&mut run.context);
     let global_state = ensure_object_slot(root, "global_state");
     let capabilities = ensure_object_slot(global_state, "capabilities");
-    capabilities.insert("inference".to_string(), serde_json::to_value(cfg)?);
+
+    let existing_inference = capabilities
+        .get("inference")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let next_inference = serde_json::to_value(cfg)?;
+
+    let mut merged = match existing_inference {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    if let Value::Object(next_map) = next_inference {
+        for (key, value) in next_map {
+            merged.insert(key, value);
+        }
+    }
+
+    capabilities.insert("inference".to_string(), Value::Object(merged));
     crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
 }
 
@@ -255,7 +273,7 @@ fn default_true() -> bool {
 }
 
 fn default_response_timeout_ms() -> u64 {
-    120_000
+    600_000
 }
 
 fn default_response_poll_ms() -> u64 {

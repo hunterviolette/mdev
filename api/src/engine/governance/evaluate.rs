@@ -21,7 +21,7 @@ pub async fn before_stage(
 ) -> Result<Vec<GovernanceDecision>> {
     ensure_governance_slots(run);
     let _ctx = GovernanceContext::new(run_id, run, Some(step), None, None, None, &[], &[]);
-    Ok(Vec::new())
+    Ok(evaluate_inference_stage_bootstrap(run, step))
 }
 
 pub async fn after_stage(
@@ -121,11 +121,17 @@ pub async fn after_capability(
         &[],
     );
 
-    Ok(match result.capability.as_str() {
+    let mut decisions = match result.capability.as_str() {
         "gateway_model/changeset" => evaluate_changeset_guardrails(run, step, result),
         "compile_commands" => evaluate_compile_guardrails(run, step, result),
         _ => Vec::new(),
-    })
+    };
+
+    if result.capability == "inference" {
+        decisions.extend(evaluate_inference_stage_consumption(run, step));
+    }
+
+    Ok(decisions)
 }
 
 pub fn pause_message(decisions: &[GovernanceDecision]) -> Option<String> {
@@ -156,6 +162,298 @@ pub fn injected_capabilities(decisions: &[GovernanceDecision]) -> Vec<Capability
             _ => None,
         })
         .collect()
+}
+
+fn evaluate_inference_stage_bootstrap(
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+) -> Vec<GovernanceDecision> {
+    let repo_context_enabled = stage_supports_repo_context(step)
+        .then(|| shared_inference_primitive_default_enabled(run, step, "repo_context"));
+    let changeset_schema_enabled = stage_supports_changeset_schema(step)
+        .then(|| shared_inference_primitive_default_enabled(run, step, "changeset_schema"));
+
+    let mut inference_patch = Map::new();
+
+    if let Some(enabled) = repo_context_enabled {
+        inference_patch.insert(
+            "repo_context".to_string(),
+            json!({
+                "enabled": enabled
+            }),
+        );
+    }
+
+    if let Some(enabled) = changeset_schema_enabled {
+        inference_patch.insert(
+            "changeset_schema".to_string(),
+            json!({
+                "enabled": enabled
+            }),
+        );
+    }
+
+    if inference_patch.is_empty() {
+        return Vec::new();
+    }
+
+    let mut decisions = vec![GovernanceDecision::MutateContext {
+        mutation: ContextMutation {
+            scope: GovernanceScope::Stage,
+            patch: json!({
+                "execution_logic": {
+                    "connections": {
+                        "inference": Value::Object(inference_patch)
+                    }
+                }
+            }),
+        },
+    }];
+
+    let mut stage_runtime_patch = Map::new();
+    if let Some(enabled) = repo_context_enabled {
+        stage_runtime_patch.insert(
+            "repo_context".to_string(),
+            json!({
+                "enabled": enabled,
+                "rehydrated_from_shared_runtime": true,
+                "last_trigger": "before_stage"
+            }),
+        );
+    }
+    if let Some(enabled) = changeset_schema_enabled {
+        stage_runtime_patch.insert(
+            "changeset_schema".to_string(),
+            json!({
+                "enabled": enabled,
+                "rehydrated_from_shared_runtime": true,
+                "last_trigger": "before_stage"
+            }),
+        );
+    }
+
+    if !stage_runtime_patch.is_empty() {
+        decisions.push(GovernanceDecision::MutateContext {
+            mutation: ContextMutation {
+                scope: GovernanceScope::Stage,
+                patch: json!({
+                    "inference_runtime": Value::Object(stage_runtime_patch)
+                }),
+            },
+        });
+    }
+
+    decisions
+}
+
+fn evaluate_inference_stage_consumption(
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+) -> Vec<GovernanceDecision> {
+    let current_stage_state = run
+        .context
+        .get("workflow_engine")
+        .and_then(|v| v.get("stage_state"))
+        .and_then(|v| v.get(step.id.as_str()))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let mut inference_patch = Map::new();
+
+    if stage_supports_repo_context(step)
+        && stage_inference_flag_enabled(&current_stage_state, "repo_context")
+    {
+        inference_patch.insert(
+            "repo_context".to_string(),
+            json!({
+                "enabled": false
+            }),
+        );
+    }
+
+    if stage_supports_changeset_schema(step)
+        && stage_inference_flag_enabled(&current_stage_state, "changeset_schema")
+    {
+        inference_patch.insert(
+            "changeset_schema".to_string(),
+            json!({
+                "enabled": false
+            }),
+        );
+    }
+
+    if inference_patch.is_empty() {
+        return Vec::new();
+    }
+
+    let mut decisions = vec![GovernanceDecision::MutateContext {
+        mutation: ContextMutation {
+            scope: GovernanceScope::Stage,
+            patch: json!({
+                "execution_logic": {
+                    "connections": {
+                        "inference": Value::Object(inference_patch.clone())
+                    }
+                }
+            }),
+        },
+    }];
+
+    let mut runtime_patch = Map::new();
+    if inference_patch.contains_key("repo_context") {
+        runtime_patch.insert(
+            "shared_stage_family:design_code".to_string(),
+            json!({
+                "repo_context": {
+                    "has_fired": true,
+                    "active": true,
+                    "last_trigger": "inference_consumed"
+                }
+            }),
+        );
+    }
+    if inference_patch.contains_key("changeset_schema") {
+        runtime_patch.insert(
+            "changeset_schema".to_string(),
+            json!({
+                "has_fired": true,
+                "active": true,
+                "last_trigger": "inference_consumed"
+            }),
+        );
+    }
+
+    if !runtime_patch.is_empty() {
+        decisions.push(GovernanceDecision::MutateContext {
+            mutation: ContextMutation {
+                scope: GovernanceScope::Global,
+                patch: json!({
+                    "capabilities": {
+                        "inference": {
+                            "connection_runtime": Value::Object(runtime_patch)
+                        }
+                    }
+                }),
+            },
+        });
+    }
+
+    decisions
+}
+
+fn has_stage_inference_flag(stage_state: &Value, key: &str) -> bool {
+    stage_state
+        .get("execution_logic")
+        .and_then(|v| v.get("connections"))
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("enabled"))
+        .is_some()
+}
+
+fn stage_inference_flag_enabled(stage_state: &Value, key: &str) -> bool {
+    stage_state
+        .get("execution_logic")
+        .and_then(|v| v.get("connections"))
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn stage_supports_repo_context(step: &WorkflowStepDefinition) -> bool {
+    step.step_type == "design"
+        || step.step_type == "code"
+        || step.prompt.include_repo_context
+        || step
+            .execution_logic
+            .get("connections")
+            .and_then(|v| v.get("inference"))
+            .and_then(|v| v.get("repo_context"))
+            .is_some()
+}
+
+fn stage_supports_changeset_schema(step: &WorkflowStepDefinition) -> bool {
+    step.step_type == "code"
+        || step.prompt.include_changeset_schema
+        || step
+            .execution_logic
+            .get("connections")
+            .and_then(|v| v.get("inference"))
+            .and_then(|v| v.get("changeset_schema"))
+            .is_some()
+}
+
+fn shared_inference_primitive_default_enabled(
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+    primitive_key: &str,
+) -> bool {
+    let connection_runtime = run
+        .context
+        .get("workflow_engine")
+        .and_then(|v| v.get("global_state"))
+        .and_then(|v| v.get("capabilities"))
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get("connection_runtime"));
+
+    let primitive_state = if primitive_key == "repo_context"
+        && (step.step_type == "design" || step.step_type == "code")
+    {
+        connection_runtime
+            .and_then(|v| v.get("shared_stage_family:design_code"))
+            .and_then(|v| v.get("repo_context"))
+    } else {
+        connection_runtime.and_then(|v| v.get(primitive_key))
+    };
+
+    let has_fired = primitive_state
+        .and_then(|v| v.get("has_fired"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let should_enable = !has_fired;
+    if should_enable {
+        let process_session_id = connection_runtime
+            .and_then(|v| v.get("process_session_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let browser_session_id = run
+            .context
+            .get("workflow_engine")
+            .and_then(|v| v.get("global_state"))
+            .and_then(|v| v.get("capabilities"))
+            .and_then(|v| v.get("inference"))
+            .and_then(|v| v.get("browser"))
+            .and_then(|v| v.get("session_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if primitive_state.is_none() {
+            tracing::warn!(
+                run_id = %run.id,
+                step_id = %step.id,
+                step_type = %step.step_type,
+                primitive_key = %primitive_key,
+                process_session_id = %process_session_id,
+                browser_session_id = %browser_session_id,
+                "shared inference primitive defaulted to enabled because runtime marker was missing"
+            );
+        } else {
+            tracing::warn!(
+                run_id = %run.id,
+                step_id = %step.id,
+                step_type = %step.step_type,
+                primitive_key = %primitive_key,
+                process_session_id = %process_session_id,
+                browser_session_id = %browser_session_id,
+                "shared inference primitive defaulted to enabled because has_fired was false"
+            );
+        }
+    }
+
+    should_enable
 }
 
 fn evaluate_changeset_guardrails(

@@ -24,7 +24,6 @@ pub fn prepare_stage_state(
         local_state,
         InferenceStageSettings {
             include_changeset_schema: step.prompt.include_changeset_schema,
-            include_apply_error: false,
         },
     )?;
 
@@ -48,20 +47,14 @@ pub fn prepare_stage_state(
                         "capabilities": {
                             "context_export": null,
                             "inference": {
-                                "connection_runtime": {
-                                    "shared_stage_family:design_code": null
+                                "next_prompt_fragments": null,
+                                "active_prompt_fragments": null,
+                                "prompt_fragments": {
+                                    "repo_context": null
                                 },
                                 "prompt_fragment_enabled": {
-                                    "apply_error": false,
                                     "repo_context": false
-                                },
-                                "prompt_fragments": {
-                                    "apply_error": null,
-                                    "repo_context": null
                                 }
-                            },
-                            "gateway_model/changeset": {
-                                "latest_apply_error": null
                             }
                         }
                     }
@@ -114,22 +107,28 @@ pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
         .cloned()
         .unwrap_or_default();
 
+    let detail = if summary.contains("no JSON object found in changeset payload") {
+        summary.clone()
+    } else if lines.is_empty() {
+        summary.clone()
+    } else {
+        format!("{}\n\n{}", summary, lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+    };
+
+    let fragment = format!(
+        "{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the apply errors.",
+        detail
+    );
+
     json!({
         "global_state": {
             "capabilities": {
-                "gateway_model/changeset": {
-                    "latest_apply_error": {
-                        "summary": summary,
-                        "lines": lines
-                    }
-                },
                 "inference": {
-                    "prompt_fragment_enabled": {
-                        "apply_error": true
-                    },
-                    "prompt_fragments": {
-                        "apply_error": null
-                    }
+                    "next_prompt_fragments": [
+                        {
+                            "text": fragment
+                        }
+                    ]
                 }
             }
         }

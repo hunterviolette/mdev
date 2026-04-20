@@ -399,3 +399,19 @@ pub struct RunActionRequest {
     #[serde(default)]
     pub payload: Value,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppSettings {
+    #[serde(default)]
+    pub browser: Value,
+    #[serde(default)]
+    pub bridges: Value,
+    #[serde(default)]
+    pub git: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PatchAppSettingsRequest {
+    #[serde(default)]
+    pub patch: Value,
+}

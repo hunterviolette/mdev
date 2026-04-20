@@ -6,6 +6,7 @@ mod repo_tree;
 mod runs;
 mod sap;
 mod review;
+mod settings;
 mod templates;
 mod workflow_builder;
 
@@ -14,6 +15,7 @@ use axum::Router;
 pub fn router() -> Router<crate::app_state::AppState> {
     Router::new()
         .merge(health::router())
+        .merge(settings::router())
         .merge(repo_tree::router())
         .merge(templates::router())
         .merge(review::router())

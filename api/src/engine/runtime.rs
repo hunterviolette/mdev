@@ -8,18 +8,26 @@ use crate::{
 };
 
 use super::{
-    append_engine_event, current_step, load_run, load_template_definition, set_run_status,
+    activate_next_prompt_fragments_for_stage,
+    append_engine_event,
+    clear_active_prompt_fragments_for_stage,
+    current_step,
+    load_run,
+    load_template_definition,
+    set_run_status,
 };
 use super::stages::{execute_stage, StageDisposition};
 use super::transitions::{resolve_next_target, should_auto_advance};
 
-pub async fn start_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
-    set_run_status(state, run_id, RunStatus::Queued, None).await?;
-    start_or_resume_automatic_run(state, run_id).await
+pub async fn start_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
+    let run = load_run(state, run_id).await?;
+    let current_step_id = requested_step_id.or(run.current_step_id.as_deref());
+    set_run_status(state, run_id, RunStatus::Queued, current_step_id).await?;
+    start_or_resume_automatic_run(state, run_id, requested_step_id).await
 }
 
 pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
-    start_or_resume_automatic_run(state, run_id).await
+    start_or_resume_automatic_run(state, run_id, None).await
 }
 
 pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
@@ -41,37 +49,28 @@ pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<
     execute_single_step(state, run_id, requested_step_id).await
 }
 
-async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
+async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
     let run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run).await?
         .ok_or_else(|| anyhow!("run has no template definition"))?;
 
-    let step = current_step(&definition, &run, None)?.clone();
-    if !step_is_auto_runnable(&step) {
-        set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
-        append_engine_event(
-            state,
-            run_id,
-            Some(step.id.as_str()),
-            "info",
-            "automatic_run_blocked",
-            "Current stage is not configured for autonomous execution.",
-            json!({
-                "step_id": step.id,
-                "step_type": step.step_type,
-                "automation_mode": format_automation_mode(&step),
-            }),
-        ).await?;
-
-        return Ok(json!({
-            "ok": true,
-            "status": "waiting",
+    let step = current_step(&definition, &run, requested_step_id)?.clone();
+    append_engine_event(
+        state,
+        run_id,
+        Some(step.id.as_str()),
+        "info",
+        "automatic_run_started",
+        "Autonomous run entered current stage runtime.",
+        json!({
             "step_id": step.id,
-            "message": "Current stage is not configured for autonomous execution.",
-        }));
-    }
+            "step_type": step.step_type,
+            "automation_mode": format_automation_mode(&step),
+            "auto_runnable": step_is_auto_runnable(&step),
+        }),
+    ).await?;
 
-    continue_until_wait(state, run_id, None).await
+    continue_until_wait(state, run_id, requested_step_id).await
 }
 
 fn step_is_auto_runnable(step: &super::WorkflowStepDefinition) -> bool {
@@ -96,7 +95,9 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
 
     set_run_status(state, run_id, RunStatus::Running, Some(step.id.as_str())).await?;
 
-    let outcome = execute_stage(state, run_id, &mut run, &step).await?;
+    activate_next_prompt_fragments_for_stage(&mut run);
+    let outcome = execute_stage(state, run_id, &mut run, &step, false).await?;
+    clear_active_prompt_fragments_for_stage(&mut run);
 
     let next_target = resolve_next_target(&definition, &step, &outcome);
     let status = match outcome.disposition {
@@ -143,7 +144,10 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
 
         set_run_status(state, run_id, RunStatus::Running, Some(step.id.as_str())).await?;
 
-        let outcome = execute_stage(state, run_id, &mut run, &step).await?;
+        activate_next_prompt_fragments_for_stage(&mut run);
+        let outcome = execute_stage(state, run_id, &mut run, &step, true).await?;
+        clear_active_prompt_fragments_for_stage(&mut run);
+
         append_engine_event(
             state,
             run_id,

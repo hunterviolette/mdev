@@ -63,13 +63,80 @@ fn sanitize_persisted_stage_state(local_state: Value) -> Value {
     };
 
     let dst = sanitized.as_object_mut().expect("sanitized stage state must be object");
-    for key in ["_stage_execution_id", "review"] {
+    for key in ["_stage_execution_id", "prompt", "execution_logic", "config", "review"] {
         if let Some(value) = src.get(key).cloned() {
             dst.insert(key.to_string(), value);
         }
     }
 
     sanitized
+}
+
+fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_value_object(inference);
+    let connection_runtime = inference_obj
+        .entry("connection_runtime".to_string())
+        .or_insert_with(|| json!({}));
+    let connection_runtime_obj = ensure_value_object(connection_runtime);
+
+    let current_process_session_id = state.process_session_id().to_string();
+    let persisted_process_session_id = connection_runtime_obj
+        .get("process_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if persisted_process_session_id == current_process_session_id {
+        return;
+    }
+
+    connection_runtime_obj.clear();
+    connection_runtime_obj.insert(
+        "process_session_id".to_string(),
+        Value::String(current_process_session_id),
+    );
+
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    let stage_state_obj = match stage_state.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    for stage_value in stage_state_obj.values_mut() {
+        let stage_obj = match stage_value.as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        let execution_logic = stage_obj
+            .entry("execution_logic".to_string())
+            .or_insert_with(|| json!({}));
+        let execution_logic_obj = ensure_value_object(execution_logic);
+        let connections = execution_logic_obj
+            .entry("connections".to_string())
+            .or_insert_with(|| json!({}));
+        let connections_obj = ensure_value_object(connections);
+        let inference_connections = connections_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_connections_obj = ensure_value_object(inference_connections);
+
+        if let Some(repo_context) = inference_connections_obj.get_mut("repo_context") {
+            let repo_context_obj = ensure_value_object(repo_context);
+            if repo_context_obj.contains_key("enabled") {
+                repo_context_obj.insert("enabled".to_string(), Value::Bool(true));
+            }
+        }
+    }
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
@@ -115,9 +182,12 @@ pub async fn execute_stage(
     run_id: Uuid,
     run: &mut WorkflowRun,
     step: &WorkflowStepDefinition,
+    automatic_execution: bool,
 ) -> Result<StageOutcome> {
     let stage_execution_id = Uuid::new_v4().to_string();
     let stage_started_at = Instant::now();
+
+    reset_session_scoped_inference_state(state, run);
 
     append_engine_event(
         state,
@@ -155,12 +225,6 @@ pub async fn execute_stage(
         .and_then(|obj| obj.get(step.id.as_str()))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let stage_override_state = root
-        .get("stage_overrides")
-        .and_then(Value::as_object)
-        .and_then(|obj| obj.get(step.id.as_str()))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
 
     let repo_ref = global_state
         .get("resources")
@@ -175,13 +239,24 @@ pub async fn execute_stage(
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
     };
-    merge_json_values(&mut local_state, &stage_override_state);
     let local_state_obj = local_state
         .as_object_mut()
         .ok_or_else(|| anyhow!("stage local state must be object"))?;
     local_state_obj.insert(
         "_stage_execution_id".to_string(),
         Value::String(stage_execution_id.clone()),
+    );
+    let execution_state = local_state_obj
+        .entry("execution".to_string())
+        .or_insert_with(|| json!({}));
+    let execution_state_obj = ensure_value_object(execution_state);
+    execution_state_obj.insert(
+        "mode".to_string(),
+        Value::String(if automatic_execution {
+            "automatic".to_string()
+        } else {
+            "manual".to_string()
+        }),
     );
 
     let prepared_local_state = prepare_stage_local_state(repo_ref.as_str(), &global_state, step, local_state)?;
@@ -205,6 +280,12 @@ pub async fn execute_stage(
         &capability_results,
     )
     .await?;
+
+    let latest_persisted_run = crate::engine::load_run(state, run_id)
+        .await
+        .unwrap_or_else(|_| run.clone());
+    run.context = latest_persisted_run.context;
+
     governance::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
 
     let branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
@@ -223,7 +304,28 @@ pub async fn execute_stage(
     {
         let root = ensure_engine_root(&mut run.context);
 
-        let mut merged_local_state = sanitize_persisted_stage_state(prepared_local_state.clone());
+        let existing_persisted_stage_state = root
+            .get("stage_state")
+            .and_then(Value::as_object)
+            .and_then(|obj| obj.get(step.id.as_str()))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let mut merged_local_state = sanitize_persisted_stage_state(existing_persisted_stage_state);
+
+        let prepared_persisted_stage_state = sanitize_persisted_stage_state(prepared_local_state.clone());
+        if let Some(prepared_obj) = prepared_persisted_stage_state.as_object() {
+            let merged_obj = merged_local_state
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("merged stage state must be object"))?;
+
+            for key in ["_stage_execution_id", "prompt", "config", "review"] {
+                if let Some(value) = prepared_obj.get(key).cloned() {
+                    merged_obj.insert(key.to_string(), value);
+                }
+            }
+        }
+
         if let Some(patch) = branch.patch.clone() {
             if let Some(global_patch) = patch.get("global_state") {
                 let global_state_slot = root
@@ -536,7 +638,6 @@ fn resolve_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: step.prompt.include_changeset_schema,
-                include_apply_error: false,
             },
         ),
         "design" => build_inference_execution_plan(
@@ -546,7 +647,6 @@ fn resolve_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: false,
-                include_apply_error: false,
             },
         ),
         "compile" => Ok(vec![StageExecutionNode {
@@ -586,16 +686,14 @@ fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<Stag
         .collect()
 }
 
-pub(crate) fn compose_prompt_from_state(enabled: &Value, fragments: &Value) -> String {
+pub(crate) fn compose_prompt_from_state(
+    enabled: &Value,
+    fragments: &Value,
+    transient_fragments: &[String],
+) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
-    let order = [
-        "user_input",
-        "repo_context",
-        "changeset_schema",
-        "apply_error",
-        "compile_error",
-    ];
+    let order = ["user_input", "repo_context", "changeset_schema"];
 
     let mut parts = Vec::new();
     for key in order {
@@ -608,6 +706,14 @@ pub(crate) fn compose_prompt_from_state(enabled: &Value, fragments: &Value) -> S
             parts.push(value.to_string());
         }
     }
+
+    for value in transient_fragments {
+        let value = value.trim();
+        if !value.is_empty() {
+            parts.push(value.to_string());
+        }
+    }
+
     parts.join("\n\n")
 }
 

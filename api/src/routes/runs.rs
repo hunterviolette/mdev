@@ -98,8 +98,37 @@ async fn run_action(
 
     let response = match action {
         "select_step" => {
+            let _ = crate::engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id).await;
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
-            engine::select_step(&state, run_id, step_id).await.map_err(internal)?
+
+            let mut run = engine::load_run(&state, run_id).await.map_err(internal)?;
+            let definition = engine::load_template_definition(&state, &run)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "run has no template definition".to_string()))?;
+            let step = definition
+                .steps
+                .iter()
+                .find(|item| item.id == step_id)
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, format!("unknown step_id {}", step_id)))?;
+
+            run.current_step_id = Some(step.id.clone());
+            let decisions = engine::governance::before_stage(&state, run_id, &mut run, step)
+                .await
+                .map_err(internal)?;
+            engine::governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)
+                .map_err(internal)?;
+            engine::persist_context(&state, run_id, &run.context).await.map_err(internal)?;
+            engine::set_run_status(&state, run_id, RunStatus::Waiting, Some(step.id.as_str()))
+                .await
+                .map_err(internal)?;
+
+            serde_json::json!({
+                "ok": true,
+                "run_id": run_id,
+                "current_step_id": step.id,
+                "status": "waiting"
+            })
         }
         "patch_global_state" => {
             engine::patch_global_state(&state, run_id, req.payload).await.map_err(internal)?
@@ -109,7 +138,7 @@ async fn run_action(
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
         }
         "start_run" => {
-            engine::start_run(&state, run_id).await.map_err(internal)?
+            engine::start_run(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
         "resume_run" => {
             engine::resume_run(&state, run_id).await.map_err(internal)?

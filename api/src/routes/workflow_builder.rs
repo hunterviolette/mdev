@@ -197,7 +197,6 @@ fn resolve_builder_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: step.prompt.include_changeset_schema,
-                include_apply_error: false,
             },
         ),
         "design" => build_inference_execution_plan(
@@ -207,7 +206,6 @@ fn resolve_builder_effective_execution_plan(
             local_state,
             InferenceStageSettings {
                 include_changeset_schema: false,
-                include_apply_error: false,
             },
         ),
         "compile" => Ok(vec![StageExecutionNode {
@@ -481,6 +479,19 @@ fn design_descriptor() -> WorkflowStageDescriptor {
     template.execution_plan = vec![
         capability_node("context_export"),
         capability_node_after("inference", vec!["context_export"]),
+        StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "gateway_model/changeset".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec!["inference".to_string()],
+            condition: json!({
+                "path": "execution_logic.automation.auto_apply_changeset",
+                "equals": true
+            }),
+        },
     ];
 
     WorkflowStageDescriptor {
@@ -530,8 +541,6 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
-            "include_apply_error": true,
-            "include_compile_error": true,
             "auto_apply_changeset": true,
             "max_consecutive_apply_failures": 1
         }
@@ -567,8 +576,6 @@ fn code_descriptor() -> WorkflowStageDescriptor {
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
                 bool_field("connections.repo_context.enabled", "Inject context", "execution_logic.connections.inference.repo_context.enabled", true),
                 bool_field("connections.changeset_schema.enabled", "Inject changeset schema", "execution_logic.connections.inference.changeset_schema.enabled", true),
-                bool_field("automation.include_apply_error", "Include apply errors", "execution_logic.automation.include_apply_error", true),
-                bool_field("automation.include_compile_error", "Include compile errors", "execution_logic.automation.include_compile_error", true),
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
                 int_field("automation.max_consecutive_apply_failures", "Max consecutive apply failures", "execution_logic.automation.max_consecutive_apply_failures", 1),
             ],

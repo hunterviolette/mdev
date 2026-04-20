@@ -19,7 +19,6 @@ pub fn prepare_stage_state(
         local_state,
         InferenceStageSettings {
             include_changeset_schema: false,
-            include_apply_error: false,
         },
     )?;
 
