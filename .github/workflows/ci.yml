@@ -11,13 +11,24 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NODE_VERSION: 24.14.0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  ci:
+  js:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - bridge
+          - adt-bridge
+          - web
 
     steps:
       - uses: actions/checkout@v5
@@ -25,19 +36,34 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            bridge/package-lock.json
+            adt-bridge/package-lock.json
+            web/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install bridge dependencies
-        working-directory: bridge
+      - name: Install dependencies
+        working-directory: ${{ matrix.app }}
         run: npm ci
 
-      - name: Build bridge
-        working-directory: bridge
+      - name: Build
+        working-directory: ${{ matrix.app }}
         run: npm run build
 
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
       - name: Cargo check
+        working-directory: api
         run: cargo check
 
       - name: Cargo test
+        working-directory: api
         run: cargo test
