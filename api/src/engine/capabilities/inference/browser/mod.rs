@@ -8,11 +8,18 @@ use sqlx::Row;
 
 use super::{ensure_object_slot, persist_inference_config, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
 use super::super::registry::{find_result, CapabilityContext, CapabilityResult};
-use crate::engine::capabilities::context_export;
+use crate::engine::capabilities::binding_specs;
 
 fn is_stale_session_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err).to_ascii_lowercase();
-    msg.contains("unknown session id") || msg.contains("unknown session_id") || msg.contains("disconnected")
+    msg.contains("unknown session id")
+        || msg.contains("unknown session_id")
+        || msg.contains("disconnected")
+        || msg.contains("target page, context or browser has been closed")
+        || msg.contains("target closed")
+        || msg.contains("browser has been closed")
+        || msg.contains("context has been closed")
+        || msg.contains("page has been closed")
 }
 
 pub async fn mark_session_rearm_needed_if_browser_session_is_stale(
@@ -28,7 +35,7 @@ pub async fn mark_session_rearm_needed_if_browser_session_is_stale(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let mut inference_cfg: InferenceConfig = serde_json::from_value(inference_value.clone()).unwrap_or_else(|_| InferenceConfig {
+    let mut inference_cfg: InferenceConfig = serde_json::from_value(inference_value).unwrap_or_else(|_| InferenceConfig {
         browser: BrowserConfig::default(),
         ..InferenceConfig::default()
     });
@@ -39,76 +46,43 @@ pub async fn mark_session_rearm_needed_if_browser_session_is_stale(
 
     let existing = inference_cfg.browser.session_id.clone().unwrap_or_default();
     if existing.trim().is_empty() {
-        return Ok(false);
+        crate::engine::on_browser_session_changed(state, run_id, "missing", "").await?;
+        return Ok(true);
     }
 
     let stale = match adapter::probe(&mut inference_cfg.browser) {
-        Ok(probe) => {
-            let page_missing = !probe.page_open;
-            let unusable_chat = !probe.ready && probe.url.trim().is_empty();
-            if page_missing || unusable_chat {
-                tracing::warn!(
-                    run_id = %run_id,
-                    browser_session_id = %existing,
-                    page_open = probe.page_open,
-                    ready = probe.ready,
-                    url = %probe.url,
-                    "browser probe succeeded on stage selection but no usable page is attached; marking session rearm needed"
-                );
-                true
-            } else {
-                false
-            }
-        }
+        Ok(probe) => !probe.page_open || (!probe.ready && probe.url.trim().is_empty()),
         Err(err) if is_stale_session_error(&err) => true,
         Err(err) => return Err(err),
     };
 
-    if !stale {
-        return Ok(false);
+    if stale {
+        crate::engine::on_browser_session_changed(state, run_id, &existing, "").await?;
     }
 
-    let inference = capabilities
-        .get_mut("inference")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities.inference missing"))?;
-    let connection_runtime = inference
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities.inference.connection_runtime must be an object"))?;
-
-    let removed_shared_design_code = connection_runtime.remove("shared_stage_family:design_code").is_some();
-    let removed_changeset_schema = connection_runtime.remove("changeset_schema").is_some();
-    connection_runtime.insert(
-        "session_rearm".to_string(),
-        json!({
-            "needed": true,
-            "reason": "browser_session_lost",
-            "previous_session_id": existing,
-            "next_session_id": Value::Null
-        }),
-    );
-
-    tracing::warn!(
-        run_id = %run_id,
-        browser_session_id = %inference_cfg.browser.session_id.clone().unwrap_or_default(),
-        removed_shared_design_code = removed_shared_design_code,
-        removed_changeset_schema = removed_changeset_schema,
-        "browser session is lost on stage selection; cleared session-scoped inference runtime and marked session_rearm.needed=true"
-    );
-
-    crate::engine::persist_context(state, run_id, &run.context).await?;
-    Ok(true)
+    Ok(stale)
 }
 
 fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
     let existing = browser.session_id.clone().unwrap_or_default();
     if !existing.trim().is_empty() {
         match adapter::probe(browser) {
-            Ok(_) => {
-                tracing::info!(session_id = %existing, target_url = %browser.target_url, "reusing existing browser bridge session");
-                return Ok(existing);
+            Ok(probe) => {
+                let stale = !probe.page_open || (!probe.ready && probe.url.trim().is_empty());
+                if !stale {
+                    tracing::info!(session_id = %existing, target_url = %browser.target_url, "reusing existing browser bridge session");
+                    return Ok(existing);
+                }
+
+                tracing::warn!(
+                    session_id = %existing,
+                    target_url = %browser.target_url,
+                    page_open = probe.page_open,
+                    ready = probe.ready,
+                    url = %probe.url,
+                    "stored browser bridge session probe indicates a stale session; attempting cdp recovery"
+                );
+                browser.session_id = None;
             }
             Err(err) if is_stale_session_error(&err) => {
                 tracing::warn!(session_id = %existing, error = %format!("{:#}", err), target_url = %browser.target_url, "stored browser bridge session is stale; attempting cdp recovery");
@@ -129,63 +103,24 @@ async fn clear_session_scoped_inference_runtime_on_new_browser_session(
     previous_session_id: &str,
     next_session_id: &str,
 ) -> Result<()> {
-    if previous_session_id.trim().is_empty() || previous_session_id == next_session_id {
-        return Ok(());
-    }
+    crate::engine::on_browser_session_changed(ctx.state, ctx.run_id, previous_session_id, next_session_id).await
+}
 
+async fn reset_session_scoped_shared_capability_lifecycle_on_new_browser_session(
+    ctx: &CapabilityContext<'_>,
+) -> Result<()> {
     let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    let root = crate::engine::ensure_engine_root(&mut run.context);
-    let global_state = root
-        .get_mut("global_state")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("workflow_engine.global_state missing"))?;
-    let capabilities = global_state
-        .get_mut("capabilities")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities missing"))?;
-    let inference = capabilities
-        .get_mut("inference")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities.inference missing"))?;
-    let connection_runtime = inference
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities.inference.connection_runtime must be an object"))?;
-
-    let removed_shared_design_code = connection_runtime.remove("shared_stage_family:design_code").is_some();
-    let removed_changeset_schema = connection_runtime.remove("changeset_schema").is_some();
-    connection_runtime.insert(
-        "session_rearm".to_string(),
-        json!({
-            "needed": true,
-            "reason": "browser_session_changed",
-            "previous_session_id": previous_session_id,
-            "next_session_id": next_session_id
-        }),
-    );
-
-    tracing::warn!(
-        run_id = %ctx.run_id,
-        previous_session_id = %previous_session_id,
-        next_session_id = %next_session_id,
-        removed_shared_design_code = removed_shared_design_code,
-        removed_changeset_schema = removed_changeset_schema,
-        "new browser bridge session detected; cleared session-scoped inference runtime so prompt fragments can rearm"
-    );
-
+    crate::engine::shared_capability_lifecycle::reset_session_scoped_shared_capability_lifecycle(&mut run);
+    crate::engine::refresh_inference_arm_state(&mut run, Some(ctx.step));
     crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
 }
 
 fn repo_context_upload_enabled(ctx: &CapabilityContext<'_>) -> bool {
-    ctx.local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("connections"))
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("repo_context"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(ctx.step.prompt.include_repo_context)
+    if !binding_specs::stage_supports_shared_capability(ctx.step, "repo_context") {
+        return false;
+    }
+
+    binding_specs::shared_capability_enabled(ctx.local_state, "repo_context", false)
 }
 
 fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityResult]) -> Result<Vec<PathBuf>> {
@@ -203,29 +138,6 @@ fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[Capabil
                     uploads.push(PathBuf::from(trimmed));
                 }
             }
-        }
-    }
-
-    if uploads.is_empty() {
-        let repo_context = ctx
-            .local_state
-            .get("capabilities")
-            .and_then(|v| v.get("context_export"))
-            .cloned();
-        if let Some(repo_context) = repo_context {
-            let normalized = context_export::normalize_context_export_payload(
-                repo_context,
-                ctx.local_state
-                    .get("resources")
-                    .and_then(|v| v.get("repo"))
-                    .cloned(),
-                ctx.repo_ref,
-            );
-            let rendered = context_export::render_context_export_text(normalized)?;
-            let mut temp_path = std::env::temp_dir();
-            temp_path.push(format!("repo_context_{}.txt", ctx.run_id));
-            std::fs::write(&temp_path, rendered.as_bytes())?;
-            uploads.push(temp_path);
         }
     }
 
@@ -315,6 +227,9 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
     let session_id = ensure_live_browser_session(&mut inference_cfg.browser)?;
     persist_inference_config(ctx, &inference_cfg).await?;
     clear_session_scoped_inference_runtime_on_new_browser_session(ctx, &previous_session_id, &session_id).await?;
+    if previous_session_id.trim() != session_id.trim() {
+        reset_session_scoped_shared_capability_lifecycle_on_new_browser_session(ctx).await?;
+    }
 
     let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
     let should_open_target = if target_url.is_empty() {

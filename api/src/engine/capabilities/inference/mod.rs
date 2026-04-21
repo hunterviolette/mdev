@@ -200,17 +200,33 @@ pub async fn execute(
         .or(configured_transport)
         .unwrap_or(InferenceTransport::Api);
 
-    let response = match selected_transport {
-        InferenceTransport::Browser => browser::execute(ctx, prior_results).await?,
-        InferenceTransport::Api => api::execute(ctx).await?,
-    };
-
     let sent_prompt = ctx
         .local_state
         .get("composed_prompt")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+
+    if selected_transport == InferenceTransport::Browser && sent_prompt.trim().is_empty() {
+        return Ok(CapabilityResult {
+            ok: false,
+            capability: "inference".to_string(),
+            payload: json!({
+                "message": "Browser inference prompt is empty before send_chat",
+                "prompt": sent_prompt,
+                "result": {
+                    "ok": false,
+                    "message": "Browser inference prompt is empty before send_chat"
+                }
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        });
+    }
+
+    let response = match selected_transport {
+        InferenceTransport::Browser => browser::execute(ctx, prior_results).await?,
+        InferenceTransport::Api => api::execute(ctx).await?,
+    };
 
     let response_ok = response
         .get("ok")

@@ -14,6 +14,8 @@ use super::{
     current_step,
     load_run,
     load_template_definition,
+    persist_context,
+    refresh_inference_arm_state,
     set_run_status,
 };
 use super::stages::{execute_stage, StageDisposition};
@@ -86,6 +88,29 @@ fn format_automation_mode(step: &super::WorkflowStepDefinition) -> &'static str 
     }
 }
 
+fn consume_single_use_inference_arm_state(run: &mut super::WorkflowRun, step: &super::WorkflowStepDefinition) {
+    let root = super::ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = global_state.as_object_mut().expect("global_state must be object");
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = capabilities.as_object_mut().expect("capabilities must be object");
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = inference.as_object_mut().expect("inference must be object");
+
+    if crate::engine::capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context") {
+        inference_obj.insert("repo_context_armed".to_string(), json!(false));
+    }
+    if crate::engine::capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema") {
+        inference_obj.insert("changeset_schema_armed".to_string(), json!(false));
+    }
+
+    inference_obj.remove("shared_inference_state");
+}
+
 async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run).await?
@@ -99,6 +124,17 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
     let outcome = execute_stage(state, run_id, &mut run, &step, false).await?;
     clear_active_prompt_fragments_for_stage(&mut run);
 
+    if matches!(
+        outcome.disposition,
+        StageDisposition::Success
+            | StageDisposition::MoveNext
+            | StageDisposition::MoveBack
+            | StageDisposition::Outcome(_)
+            | StageDisposition::Stay
+    ) {
+        consume_single_use_inference_arm_state(&mut run, &step);
+    }
+
     let next_target = resolve_next_target(&definition, &step, &outcome);
     let status = match outcome.disposition {
         StageDisposition::Paused => RunStatus::Paused,
@@ -107,6 +143,16 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
         StageDisposition::MoveNext | StageDisposition::MoveBack | StageDisposition::Outcome(_) | StageDisposition::Stay => RunStatus::Waiting,
         StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
     };
+    let next_step = next_target
+        .as_deref()
+        .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
+    refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
+    persist_context(state, run_id, &run.context).await?;
+    let next_step = next_target
+        .as_deref()
+        .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
+    refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
+    persist_context(state, run_id, &run.context).await?;
     let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
     set_run_status(state, run_id, status.clone(), current_step_id).await?;
 
@@ -148,6 +194,17 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
         let outcome = execute_stage(state, run_id, &mut run, &step, true).await?;
         clear_active_prompt_fragments_for_stage(&mut run);
 
+        if matches!(
+            outcome.disposition,
+            StageDisposition::Success
+                | StageDisposition::MoveNext
+                | StageDisposition::MoveBack
+                | StageDisposition::Outcome(_)
+                | StageDisposition::Stay
+        ) {
+            consume_single_use_inference_arm_state(&mut run, &step);
+        }
+
         append_engine_event(
             state,
             run_id,
@@ -164,6 +221,16 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
 
         let next_target = resolve_next_target(&definition, &step, &outcome);
         let auto_advance = should_auto_advance(&step, &outcome);
+        let next_step = next_target
+            .as_deref()
+            .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
+        refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
+        persist_context(state, run_id, &run.context).await?;
+        let next_step = next_target
+            .as_deref()
+            .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
+        refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
+        persist_context(state, run_id, &run.context).await?;
 
         match (&outcome.disposition, next_target.clone(), auto_advance) {
             (StageDisposition::Success, Some(target), true) => {

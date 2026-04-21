@@ -405,16 +405,14 @@ fn default_globals() -> WorkflowGlobalConfig {
         }),
         capabilities: json!({
             "inference": {
-                "provider": "openai",
-                "model": "gpt-5.4",
-                "temperature": 0.2,
-                "max_tokens": 8000,
-                "system_prompt": ""
             },
             "context_export": {
+                "enabled": false,
                 "save_path": "/tmp/repo_context.txt"
             },
-            "changeset_schema": {},
+            "changeset_schema": {
+                "enabled": false
+            },
             "gateway_model/changeset": {},
             "compile_commands": {
                 "commands": []
@@ -470,9 +468,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
         "connection_bundles": ["design_code_inference_default"],
         "connections": {
             "inference": {
-                "repo_context": {
-                    "enabled": true
-                }
+                "repo_context": {}
             }
         }
     });
@@ -505,7 +501,6 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             label: "Design".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
-                bool_field("connections.repo_context.enabled", "Inject context", "execution_logic.connections.inference.repo_context.enabled", true),
             ],
         }],
         available_governance_policies: vec![],
@@ -532,12 +527,8 @@ fn code_descriptor() -> WorkflowStageDescriptor {
         "connection_bundles": ["design_code_inference_default"],
         "connections": {
             "inference": {
-                "repo_context": {
-                    "enabled": true
-                },
-                "changeset_schema": {
-                    "enabled": true
-                }
+                "repo_context": {},
+                "changeset_schema": {}
             }
         },
         "automation": {
@@ -574,8 +565,6 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             label: "Code".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
-                bool_field("connections.repo_context.enabled", "Inject context", "execution_logic.connections.inference.repo_context.enabled", true),
-                bool_field("connections.changeset_schema.enabled", "Inject changeset schema", "execution_logic.connections.inference.changeset_schema.enabled", true),
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
                 int_field("automation.max_consecutive_apply_failures", "Max consecutive apply failures", "execution_logic.automation.max_consecutive_apply_failures", 1),
             ],

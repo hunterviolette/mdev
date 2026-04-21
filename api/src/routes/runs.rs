@@ -14,6 +14,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-runs", get(list_runs).post(create_run))
         .route("/api/workflow-runs/:run_id", get(get_run).delete(delete_run))
+        .route("/api/workflow-runs/:run_id/open", post(open_run))
         .route("/api/workflow-runs/:run_id/events", get(list_run_events))
         .route("/api/workflow-runs/:run_id/actions", post(run_action))
 }
@@ -34,6 +35,25 @@ async fn get_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
+    let row = sqlx::query(
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal)?;
+
+    Ok(Json(row_to_run(row)?))
+}
+
+async fn open_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
+    engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id)
+        .await
+        .map_err(internal)?;
+
     let row = sqlx::query(
         "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
@@ -118,6 +138,7 @@ async fn run_action(
                 .map_err(internal)?;
             engine::governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)
                 .map_err(internal)?;
+            engine::refresh_inference_arm_state(&mut run, Some(step));
             engine::persist_context(&state, run_id, &run.context).await.map_err(internal)?;
             engine::set_run_status(&state, run_id, RunStatus::Waiting, Some(step.id.as_str()))
                 .await
@@ -238,6 +259,25 @@ async fn create_run(
     }
 
     engine::merge_json_values(global_state, &seeded_global_state);
+
+    let initial_step = current_step_id
+        .as_deref()
+        .and_then(|step_id| definition.steps.iter().find(|step| step.id == step_id));
+
+    let mut seeded_run = WorkflowRun {
+        id,
+        template_id: req.template_id,
+        definition: definition.clone(),
+        status: status.clone(),
+        current_step_id: current_step_id.clone(),
+        title: req.title.clone(),
+        repo_ref: req.repo_ref.clone(),
+        context: run_context.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    engine::refresh_inference_arm_state(&mut seeded_run, initial_step);
+    run_context = seeded_run.context;
 
     sqlx::query(
         "INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"

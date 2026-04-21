@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::{changeset_schema, context_export},
+        capabilities::{binding_specs, changeset_schema, context_export},
         stages::compose_prompt_from_state,
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
@@ -35,21 +35,15 @@ pub fn prepare_inference_stage_state(
             .unwrap_or_else(|| json!({})),
     );
 
-    let automation = state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let include_repo_context = inference_connection_enabled(
-        &state,
+    let include_repo_context = shared_inference_primitive_enabled(
+        global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = inference_connection_enabled(
-        &state,
+    let include_changeset_schema = shared_inference_primitive_enabled(
+        global_state,
         step,
         "changeset_schema",
         settings.include_changeset_schema,
@@ -227,28 +221,17 @@ pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
     )
 }
 
-fn inference_connection_enabled(
-    state: &Value,
+fn shared_inference_primitive_enabled(
+    global_state: &Value,
     step: &WorkflowStepDefinition,
     key: &str,
-    default_enabled: bool,
+    _default_enabled: bool,
 ) -> bool {
-    state
-        .get("execution_logic")
-        .and_then(|v| v.get("connections"))
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get(key))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            step.execution_logic
-                .get("connections")
-                .and_then(|v| v.get("inference"))
-                .and_then(|v| v.get(key))
-                .and_then(|v| v.get("enabled"))
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(default_enabled)
+    if !binding_specs::stage_supports_shared_capability(step, key) {
+        return false;
+    }
+
+    binding_specs::shared_capability_enabled(global_state, key, false)
 }
 
 pub fn build_inference_execution_plan(
@@ -264,15 +247,15 @@ pub fn build_inference_execution_plan(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let include_repo_context = inference_connection_enabled(
-        local_state,
+    let include_repo_context = shared_inference_primitive_enabled(
+        global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = inference_connection_enabled(
-        local_state,
+    let include_changeset_schema = shared_inference_primitive_enabled(
+        global_state,
         step,
         "changeset_schema",
         settings.include_changeset_schema,

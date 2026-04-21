@@ -493,6 +493,12 @@ export function getRun(runId: string) {
   return fetchJson<WorkflowRun>(`/api/workflow-runs/${runId}`);
 }
 
+export function openWorkflowRun(runId: string) {
+  return fetchJson<WorkflowRun>(`/api/workflow-runs/${runId}/open`, {
+    method: 'POST'
+  });
+}
+
 export function createRun(body: { template_id?: string | null; title: string; repo_ref: string; definition?: WorkflowTemplateDefinition; context: Record<string, unknown> }) {
   return fetchJson<WorkflowRun>('/api/workflow-runs', {
     method: 'POST',

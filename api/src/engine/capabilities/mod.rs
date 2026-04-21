@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod binding_specs;
 pub mod context_export;
 pub mod changeset_schema;
 pub mod compile_commands;

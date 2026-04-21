@@ -91,30 +91,8 @@ export function defaultGlobals(): WorkflowGlobalConfig {
       },
     },
     capabilities: {
-      inference: {
-        provider: 'openai',
-        model: 'gpt-5.4',
-        temperature: 0.2,
-        max_tokens: 8000,
-        system_prompt: '',
-      },
-      context_export: {
-        save_path: '/tmp/repo_context.txt',
-      },
-      changeset_schema: {},
-      'gateway_model/changeset': {},
-      compile_commands: {
-        commands: [],
-      },
-      'sap/import': {},
-      'sap/export': {},
     },
     automation: {
-      guardrails: {
-        changeset_context_inject_after_failures: 3,
-        changeset_pause_after_failures: 6,
-        compile_pause_after_failures: 5,
-      },
     },
   };
 }

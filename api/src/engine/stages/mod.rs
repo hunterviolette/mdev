@@ -106,37 +106,8 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         Value::String(current_process_session_id),
     );
 
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = match stage_state.as_object_mut() {
-        Some(obj) => obj,
-        None => return,
-    };
-
-    for stage_value in stage_state_obj.values_mut() {
-        let stage_obj = match stage_value.as_object_mut() {
-            Some(obj) => obj,
-            None => continue,
-        };
-        let execution_logic = stage_obj
-            .entry("execution_logic".to_string())
-            .or_insert_with(|| json!({}));
-        let execution_logic_obj = ensure_value_object(execution_logic);
-        let connections = execution_logic_obj
-            .entry("connections".to_string())
-            .or_insert_with(|| json!({}));
-        let connections_obj = ensure_value_object(connections);
-        let inference_connections = connections_obj
-            .entry("inference".to_string())
-            .or_insert_with(|| json!({}));
-        let inference_connections_obj = ensure_value_object(inference_connections);
-
-        if let Some(repo_context) = inference_connections_obj.get_mut("repo_context") {
-            let repo_context_obj = ensure_value_object(repo_context);
-            if repo_context_obj.contains_key("enabled") {
-                repo_context_obj.insert("enabled".to_string(), Value::Bool(true));
-            }
-        }
-    }
+    inference_obj.remove("next_prompt_fragments");
+    inference_obj.remove("active_prompt_fragments");
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {

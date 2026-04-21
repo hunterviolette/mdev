@@ -1,6 +1,7 @@
 pub(crate) mod capabilities;
 pub(crate) mod governance;
 mod runtime;
+pub(crate) mod shared_capability_lifecycle;
 mod stages;
 mod transitions;
 
@@ -60,6 +61,17 @@ pub async fn load_template_definition(_state: &AppState, run: &WorkflowRun) -> R
 }
 
 async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut WorkflowRun) -> Result<bool> {
+    let had_nested_shared_state = run
+        .context
+        .get("workflow_engine")
+        .and_then(|v| v.get("global_state"))
+        .and_then(|v| v.get("capabilities"))
+        .and_then(|v| v.get("inference"))
+        .and_then(|v| v.get("shared_inference_state"))
+        .is_some();
+
+    normalize_inference_arm_state(run);
+
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
     let global_state_obj = global_state
@@ -92,12 +104,15 @@ async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut Workf
         .to_string();
 
     if persisted_process_session_id == current_process_session_id {
+        if had_nested_shared_state {
+            persist_context(state, run.id, &run.context).await?;
+            return Ok(true);
+        }
         return Ok(false);
     }
 
     let previous_connection_runtime = connection_runtime_obj.clone();
-    let had_prior_session_state = !previous_connection_runtime.is_empty();
-    let mut changed = had_prior_session_state;
+    let mut changed = !previous_connection_runtime.is_empty() || had_nested_shared_state;
 
     connection_runtime_obj.clear();
     connection_runtime_obj.insert(
@@ -110,49 +125,6 @@ async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut Workf
     }
     if inference_obj.remove("active_prompt_fragments").is_some() {
         changed = true;
-    }
-
-    if had_prior_session_state {
-        let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-        let stage_state_obj = stage_state
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("stage_state must be object"))?;
-
-        for stage_value in stage_state_obj.values_mut() {
-            let stage_obj = match stage_value.as_object_mut() {
-                Some(obj) => obj,
-                None => continue,
-            };
-            let execution_logic = stage_obj
-                .entry("execution_logic".to_string())
-                .or_insert_with(|| json!({}));
-            let execution_logic_obj = execution_logic
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("execution_logic must be object"))?;
-            let connections = execution_logic_obj
-                .entry("connections".to_string())
-                .or_insert_with(|| json!({}));
-            let connections_obj = connections
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("connections must be object"))?;
-            let inference_connections = connections_obj
-                .entry("inference".to_string())
-                .or_insert_with(|| json!({}));
-            let inference_connections_obj = inference_connections
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("inference connections must be object"))?;
-
-            if let Some(repo_context) = inference_connections_obj.get_mut("repo_context") {
-                let repo_context_obj = match repo_context.as_object_mut() {
-                    Some(obj) => obj,
-                    None => continue,
-                };
-                if repo_context_obj.get("enabled").and_then(Value::as_bool) != Some(true) {
-                    repo_context_obj.insert("enabled".to_string(), Value::Bool(true));
-                    changed = true;
-                }
-            }
-        }
     }
 
     if changed {
@@ -237,6 +209,47 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
+pub fn refresh_inference_arm_state(run: &mut WorkflowRun, _selected_step: Option<&WorkflowStepDefinition>) {
+    normalize_inference_arm_state(run);
+}
+
+fn normalize_inference_arm_state(run: &mut WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_value_object(inference);
+
+    let nested_repo_context_armed = inference_obj
+        .get("shared_inference_state")
+        .and_then(|v| v.get("repo_context_armed"))
+        .and_then(Value::as_bool);
+    let nested_changeset_schema_armed = inference_obj
+        .get("shared_inference_state")
+        .and_then(|v| v.get("changeset_schema_armed"))
+        .and_then(Value::as_bool);
+
+    if !inference_obj.contains_key("repo_context_armed") {
+        if let Some(value) = nested_repo_context_armed {
+            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(value));
+        }
+    }
+
+    if !inference_obj.contains_key("changeset_schema_armed") {
+        if let Some(value) = nested_changeset_schema_armed {
+            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(value));
+        }
+    }
+
+    inference_obj.remove("shared_inference_state");
+}
+
 pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Result<Value> {
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run)
@@ -253,6 +266,7 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
 
     let decisions = governance::before_stage(state, run_id, &mut run, step).await?;
     governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
+    refresh_inference_arm_state(&mut run, Some(step));
 
     update_run_context(&state.db, run_id, &run.context).await?;
     update_run_status(&state.db, run_id, RunStatus::Paused, Some(step.id.as_str())).await?;
@@ -268,12 +282,26 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
         _ => return Err(anyhow!("global payload must be object")),
     };
 
-    let global_state_snapshot = {
+    let selected_step = run
+        .current_step_id
+        .as_deref()
+        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id))
+        .cloned();
+
+    {
         let root = ensure_engine_root(&mut run.context);
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
         merge_json_values(global_state, &global_payload);
-        global_state.clone()
-    };
+    }
+
+    refresh_inference_arm_state(&mut run, selected_step.as_ref());
+
+    let global_state_snapshot = run
+        .context
+        .get("workflow_engine")
+        .and_then(|v| v.get("global_state"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     update_run_context(&state.db, run_id, &run.context).await?;
     Ok(json!({ "ok": true, "global_state": global_state_snapshot }))
@@ -334,6 +362,13 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
         governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
     }
 
+    let selected_step = run
+        .definition
+        .steps
+        .iter()
+        .find(|item| item.id == step_id)
+        .cloned();
+
     let root = ensure_engine_root(&mut run.context);
 
     let mut stage_payload = match payload {
@@ -359,6 +394,7 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
     merge_json_values(&mut merged, &Value::Object(stage_payload.clone()));
     *existing = merged.clone();
 
+    refresh_inference_arm_state(&mut run, selected_step.as_ref());
     update_run_context(&state.db, run_id, &run.context).await?;
     Ok(json!({ "ok": true, "step_id": step_id, "stage_state": merged }))
 }
@@ -578,6 +614,57 @@ pub(crate) async fn set_run_status(
 pub(crate) async fn persist_context(state: &AppState, run_id: Uuid, context: &Value) -> Result<()> {
     update_run_context(&state.db, run_id, context).await?;
     Ok(())
+}
+
+pub(crate) async fn on_browser_session_changed(
+    state: &AppState,
+    run_id: Uuid,
+    previous_session_id: &str,
+    next_session_id: &str,
+) -> Result<()> {
+    let mut run = load_run(state, run_id).await?;
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_value_object(inference);
+    let connection_runtime = inference_obj
+        .entry("connection_runtime".to_string())
+        .or_insert_with(|| json!({}));
+    let connection_runtime_obj = ensure_value_object(connection_runtime);
+
+    connection_runtime_obj.insert(
+        "session_rearm".to_string(),
+        json!({
+            "needed": true,
+            "reason": "browser_session_changed",
+            "previous_session_id": previous_session_id,
+            "next_session_id": next_session_id
+        }),
+    );
+
+    inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+    inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    inference_obj.remove("shared_inference_state");
+    inference_obj.remove("next_prompt_fragments");
+    inference_obj.remove("active_prompt_fragments");
+
+    tracing::warn!(
+        run_id = %run_id,
+        previous_session_id = %previous_session_id,
+        next_session_id = %next_session_id,
+        repo_context_armed = true,
+        changeset_schema_armed = true,
+        "browser inference session missing or stale; re-armed inference fragments for next run"
+    );
+
+    persist_context(state, run_id, &run.context).await
 }
 
 pub(crate) fn ensure_engine_root(context: &mut Value) -> &mut Map<String, Value> {

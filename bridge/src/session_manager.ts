@@ -526,7 +526,7 @@ export class SessionManager {
     return false;
   }
 
-  private async waitForPostClickSendResult(composer: Locator, beforeClickText: string, timeoutMs: number): Promise<'cleared' | 'changed' | 'unchanged'> {
+  private async waitForPostClickSendResult(page: Page, composer: Locator, beforeClickText: string, timeoutMs: number): Promise<'cleared' | 'changed' | 'busy' | 'unchanged'> {
     const cleared = await this.waitForComposerToClear(composer, Math.min(timeoutMs, 2500)).catch(() => false);
     if (cleared) {
       return 'cleared';
@@ -535,6 +535,11 @@ export class SessionManager {
     const changed = await this.waitForComposerTextChange(composer, beforeClickText, Math.min(timeoutMs, 1500)).catch(() => false);
     if (changed) {
       return 'changed';
+    }
+
+    const busy = await page.locator('button[data-testid="send-button"][disabled], button[aria-label*="stop" i], button[title*="stop" i]').first().isVisible().catch(() => false);
+    if (busy) {
+      return 'busy';
     }
 
     return 'unchanged';
@@ -566,8 +571,8 @@ export class SessionManager {
       attempts += 1;
       await submit.click({ timeout: Math.min(remainingMs, 5000) });
 
-      const postClick = await this.waitForPostClickSendResult(composer, lastText, Math.min(deadline - Date.now(), 5000));
-      if (postClick === 'cleared') {
+      const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 5000));
+      if (postClick === 'cleared' || postClick === 'changed' || postClick === 'busy') {
         return { sent: true, method: 'click', attempts };
       }
 
