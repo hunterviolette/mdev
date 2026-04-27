@@ -16,7 +16,7 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{pause_run, resume_run, run_step, start_run};
+pub use runtime::{force_wait_run, pause_run, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
@@ -344,7 +344,7 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
     let stage_missing = run
         .context
         .get("workflow_engine")
-        .and_then(|v| v.get("stage_state"))
+        .and_then(|v| v.get("stage_overrides"))
         .and_then(|v| v.get(step_id))
         .is_none();
 
@@ -387,9 +387,9 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
         }
     }
 
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    let stage_state_obj = stage_state.as_object_mut().ok_or_else(|| anyhow!("stage_state must be object"))?;
-    let existing = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
+    let stage_overrides = root.entry("stage_overrides".to_string()).or_insert_with(|| json!({}));
+    let stage_overrides_obj = stage_overrides.as_object_mut().ok_or_else(|| anyhow!("stage_overrides must be object"))?;
+    let existing = stage_overrides_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
     let mut merged = existing.clone();
     merge_json_values(&mut merged, &Value::Object(stage_payload.clone()));
     *existing = merged.clone();

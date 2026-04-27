@@ -24,12 +24,10 @@ use crate::{
         WorkflowStageField,
         WorkflowStageFieldGroup,
         WorkflowStageFieldUi,
-        WorkflowStageGovernancePolicy,
         WorkflowStageRoute,
         WorkflowStepAdvancementConfig,
         WorkflowStepDefinition,
         WorkflowStepExecutionConfig,
-        WorkflowStepGovernanceConfig,
         WorkflowStepPromptConfig,
         WorkflowTemplateDefinition,
         WorkflowTransition,
@@ -96,6 +94,8 @@ fn compile_document(
         definition: WorkflowTemplateDefinition {
             version: 1,
             globals,
+            governance: compile_governance(&catalog, &document.governance)
+                .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err))?,
             steps,
         },
         capability_summary,
@@ -125,8 +125,38 @@ fn compile_stage(
     }
 
     let mut step: WorkflowStepDefinition = serde_json::from_value(step_value).map_err(|err| err.to_string())?;
-    step.governance = compile_stage_governance(descriptor, stage, &step)?;
+    normalize_compile_commands_from_text(&mut step);
     Ok(step)
+}
+
+fn normalize_compile_commands_from_text(step: &mut WorkflowStepDefinition) {
+    if step.step_type != "compile" {
+        return;
+    }
+
+    let Some(commands_text) = step
+        .execution
+        .compile_checks
+        .get("commands_text")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+
+    let commands = commands_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|command| Value::String(command.to_string()))
+        .collect::<Vec<_>>();
+
+    if commands.is_empty() {
+        return;
+    }
+
+    if let Some(obj) = step.execution.compile_checks.as_object_mut() {
+        obj.insert("commands".to_string(), Value::Array(commands));
+    }
 }
 
 fn compile_workflow_capability_summary(
@@ -155,6 +185,12 @@ fn compile_workflow_capability_summary(
         stage_keys.sort();
         stage_keys.dedup();
 
+        if builder_stage_uses_inference(step) && !stage_keys.iter().any(|key| key == "context_export") {
+            stage_keys.push("context_export".to_string());
+            stage_keys.sort();
+            stage_keys.dedup();
+        }
+
         for key in stage_keys {
             let entry = by_key.entry(key.clone()).or_insert_with(|| WorkflowCapabilitySummaryItem {
                 key: key.clone(),
@@ -172,6 +208,17 @@ fn compile_workflow_capability_summary(
     }
 
     Ok(by_key.into_values().collect())
+}
+
+fn builder_stage_uses_inference(step: &WorkflowStepDefinition) -> bool {
+    step.step_type == "design"
+        || step.step_type == "code"
+        || step.execution_plan.iter().any(|node| node.key == "inference")
+        || step
+            .execution_logic
+            .get("connections")
+            .and_then(|v| v.get("inference"))
+            .is_some()
 }
 
 fn materialize_builder_stage_state(step: &WorkflowStepDefinition) -> Value {
@@ -287,42 +334,37 @@ fn applicable_governance_policies(
         .collect()
 }
 
-fn compile_stage_governance(
-    descriptor: &WorkflowStageDescriptor,
-    stage: &WorkflowBuilderStageDocument,
-    step: &WorkflowStepDefinition,
-) -> Result<WorkflowStepGovernanceConfig, String> {
-    let available = applicable_governance_policies(descriptor, step);
-    let mut compiled = Vec::new();
+fn compile_governance(catalog: &WorkflowBuilderCatalog, governance: &Value) -> Result<Value, String> {
+    let mut available = std::collections::BTreeMap::new();
+    for descriptor in &catalog.stage_descriptors {
+        for policy in &descriptor.available_governance_policies {
+            available.entry(policy.key.clone()).or_insert_with(|| policy.clone());
+        }
+    }
 
-    for selected in &stage.governance_policies {
-        let Some(policy_descriptor) = available.iter().find(|item| item.key == selected.key) else {
-            return Err(format!(
-                "{}: governance policy '{}' is not available for this stage",
-                stage.step_type,
-                selected.key
-            ));
+    let Some(governance_obj) = governance.as_object() else {
+        return Ok(json!({}));
+    };
+
+    let mut compiled = json!({});
+    for (policy_key, selected_config) in governance_obj {
+        let Some(policy_descriptor) = available.get(policy_key) else {
+            return Err(format!("governance policy '{}' is not available", policy_key));
         };
 
         let mut config = json!({});
         for field in &policy_descriptor.fields {
-            let selected_value = selected
-                .config
+            let selected_value = selected_config
                 .get(&field.key)
                 .cloned()
                 .unwrap_or_else(|| field.default.clone());
             set_path(&mut config, &field.key, selected_value)
-                .map_err(|err| format!("{}: governance policy '{}': {}", stage.step_type, selected.key, err))?;
+                .map_err(|err| format!("governance policy '{}': {}", policy_key, err))?;
         }
-
-        compiled.push(WorkflowStageGovernancePolicy {
-            key: selected.key.clone(),
-            enabled: selected.enabled,
-            config,
-        });
+        set_path(&mut compiled, policy_key, config)?;
     }
 
-    Ok(WorkflowStepGovernanceConfig { policies: compiled })
+    Ok(compiled)
 }
 
 fn default_builder_catalog() -> WorkflowBuilderCatalog {
@@ -344,17 +386,28 @@ fn changeset_governance_policy_descriptor() -> WorkflowGovernancePolicyDescripto
     WorkflowGovernancePolicyDescriptor {
         key: "changeset_file_failures".to_string(),
         label: "Changeset file failure guardrail".to_string(),
-        description: "Inject file context after repeated changeset failures and pause after too many consecutive failures for the same file.".to_string(),
+        description: "Inject targeted file context after repeated changeset failures, escalate to broad context if failures continue, and pause after too many consecutive failures for the same file.".to_string(),
         capability: "gateway_model/changeset".to_string(),
         required_capabilities: vec!["gateway_model/changeset".to_string()],
         fields: vec![
             WorkflowStageField {
                 key: "inject_context_after_consecutive_failures".to_string(),
-                label: "Inject context after failures".to_string(),
+                label: "Inject file context after failures".to_string(),
                 field_type: "integer".to_string(),
                 bind_to: "inject_context_after_consecutive_failures".to_string(),
                 default: json!(4),
-                description: "Number of consecutive failures for the same file before injecting context_export for that file.".to_string(),
+                description: "Number of consecutive failures for the same file before generating and uploading a targeted context_export for that file.".to_string(),
+                required: false,
+                options: Vec::new(),
+                ui: field_ui("number"),
+            },
+            WorkflowStageField {
+                key: "inject_broad_context_after_consecutive_failures".to_string(),
+                label: "Inject broad context after failures".to_string(),
+                field_type: "integer".to_string(),
+                bind_to: "inject_broad_context_after_consecutive_failures".to_string(),
+                default: json!(5),
+                description: "Number of consecutive failures for the same file before escalating from targeted file context to a broader context_export.".to_string(),
                 required: false,
                 options: Vec::new(),
                 ui: field_ui("number"),
@@ -429,7 +482,6 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
         id: step_type.to_string(),
         name: label.to_string(),
         step_type: step_type.to_string(),
-        governance: WorkflowStepGovernanceConfig::default(),
         automation_mode: automation_mode.clone(),
         execution: WorkflowStepExecutionConfig::default(),
         prompt: WorkflowStepPromptConfig {
@@ -517,8 +569,7 @@ fn code_descriptor() -> WorkflowStageDescriptor {
     };
     template.execution = WorkflowStepExecutionConfig {
         changeset_apply: json!({
-            "enabled": true,
-            "max_consecutive_failures": 1
+            "enabled": true
         }),
         compile_checks: json!({}),
     };
@@ -532,8 +583,7 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
-            "auto_apply_changeset": true,
-            "max_consecutive_apply_failures": 1
+            "auto_apply_changeset": true
         }
     });
     template.execution_plan = vec![
@@ -566,7 +616,6 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
-                int_field("automation.max_consecutive_apply_failures", "Max consecutive apply failures", "execution_logic.automation.max_consecutive_apply_failures", 1),
             ],
         }],
         available_governance_policies: vec![

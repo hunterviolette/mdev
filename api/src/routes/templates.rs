@@ -172,12 +172,6 @@ async fn get_workflow_builder_contract(
                         "default": true
                     },
                     {
-                        "key": "automation.max_consecutive_apply_failures",
-                        "label": "Max apply failures",
-                        "type": "integer",
-                        "default": 1
-                    },
-                    {
                         "key": "config.pause_policy.pause_on_enter",
                         "label": "Pause on enter",
                         "type": "boolean",

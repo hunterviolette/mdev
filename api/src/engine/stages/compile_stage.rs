@@ -14,9 +14,35 @@ pub fn prepare_stage_state(
         .and_then(Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("automatic"))
         .unwrap_or(false);
-    let has_compile_commands = compile_commands_present(&state, step.execution_logic.clone());
+
+    let compile_commands = resolved_compile_commands(
+        &state,
+        step.execution.compile_checks.clone(),
+        step.execution_logic.clone(),
+    );
+    let has_compile_commands = compile_commands_present(&compile_commands);
 
     let obj = state.as_object_mut().expect("stage state must be object");
+
+    let execution_state = obj
+        .entry("execution".to_string())
+        .or_insert_with(|| json!({}));
+    if !execution_state.is_object() {
+        *execution_state = json!({});
+    }
+    let execution_state_obj = execution_state.as_object_mut().expect("execution must be object");
+
+    let compile_checks = execution_state_obj
+        .entry("compile_checks".to_string())
+        .or_insert_with(|| json!({}));
+    if !compile_checks.is_object() {
+        *compile_checks = json!({});
+    }
+    let compile_checks_obj = compile_checks.as_object_mut().expect("compile_checks must be object");
+
+    if has_compile_commands {
+        compile_checks_obj.insert("commands".to_string(), compile_commands.clone());
+    }
 
     let execution_logic = obj
         .entry("execution_logic".to_string())
@@ -74,8 +100,8 @@ pub fn prepare_stage_state(
     Ok(state)
 }
 
-fn compile_commands_present(local_state: &Value, execution_logic: Value) -> bool {
-    resolved_compile_commands(local_state, execution_logic)
+fn compile_commands_present(commands: &Value) -> bool {
+    commands
         .as_array()
         .map(|rows| {
             rows.iter().any(|item| match item {
@@ -91,7 +117,7 @@ fn compile_commands_present(local_state: &Value, execution_logic: Value) -> bool
         .unwrap_or(false)
 }
 
-fn resolved_compile_commands(local_state: &Value, execution_logic: Value) -> Value {
+fn resolved_compile_commands(local_state: &Value, step_compile_checks: Value, execution_logic: Value) -> Value {
     local_state
         .get("capabilities")
         .and_then(|v| v.get("compile_commands"))
@@ -104,6 +130,14 @@ fn resolved_compile_commands(local_state: &Value, execution_logic: Value) -> Val
                 .and_then(|v| v.get("commands"))
                 .cloned()
         })
+        .or_else(|| commands_text_to_rows(
+            local_state
+                .get("execution")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands_text")),
+        ))
+        .or_else(|| step_compile_checks.get("commands").cloned())
+        .or_else(|| commands_text_to_rows(step_compile_checks.get("commands_text")))
         .or_else(|| {
             local_state
                 .get("execution_logic")
@@ -111,13 +145,40 @@ fn resolved_compile_commands(local_state: &Value, execution_logic: Value) -> Val
                 .and_then(|v| v.get("commands"))
                 .cloned()
         })
+        .or_else(|| commands_text_to_rows(
+            local_state
+                .get("execution_logic")
+                .and_then(|v| v.get("compile_checks"))
+                .and_then(|v| v.get("commands_text")),
+        ))
         .or_else(|| {
             execution_logic
                 .get("compile_checks")
                 .and_then(|v| v.get("commands"))
                 .cloned()
         })
+        .or_else(|| commands_text_to_rows(execution_logic.get("compile_checks").and_then(|v| v.get("commands_text"))))
         .unwrap_or_else(|| json!([]))
+}
+
+fn commands_text_to_rows(value: Option<&Value>) -> Option<Value> {
+    let text = value.and_then(Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let rows = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|command| Value::String(command.to_string()))
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(Value::Array(rows))
+    }
 }
 
 pub fn build_compile_error_patch(capability_results: &[Value]) -> Value {

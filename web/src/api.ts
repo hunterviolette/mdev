@@ -50,13 +50,10 @@ export type WorkflowExecutionNode = {
 
 export type WorkflowStageGovernancePolicy = {
   key: string;
-  enabled: boolean;
   config: Record<string, unknown>;
 };
 
-export type WorkflowStepGovernanceConfig = {
-  policies: WorkflowStageGovernancePolicy[];
-};
+export type WorkflowGovernanceConfig = Record<string, Record<string, unknown>>;
 
 export type WorkflowStepDefinition = {
   id: string;
@@ -69,7 +66,6 @@ export type WorkflowStepDefinition = {
   capabilities: WorkflowCapabilityBinding[];
   execution_logic?: Record<string, unknown>;
   execution_plan?: WorkflowExecutionNode[];
-  governance?: WorkflowStepGovernanceConfig;
   transitions: WorkflowTransition[];
   advancement?: WorkflowStepAdvancementConfig;
 };
@@ -83,6 +79,7 @@ export type WorkflowGlobalConfig = {
 export type WorkflowTemplateDefinition = {
   version: number;
   globals: WorkflowGlobalConfig;
+  governance?: WorkflowGovernanceConfig;
   steps: WorkflowStepDefinition[];
 };
 
@@ -155,12 +152,12 @@ export type WorkflowBuilderStageDocument = {
   name: string;
   step_type: string;
   field_values: Record<string, unknown>;
-  governance_policies?: WorkflowStageGovernancePolicy[];
 };
 
 export type WorkflowBuilderDocument = {
   version: number;
   globals: WorkflowGlobalConfig;
+  governance?: WorkflowGovernanceConfig;
   stages: WorkflowBuilderStageDocument[];
 };
 
@@ -547,6 +544,10 @@ export function resumeWorkflowRun(runId: string) {
 
 export function pauseWorkflowRun(runId: string) {
   return sendRunAction(runId, { action: 'pause_run' });
+}
+
+export function forceWaitWorkflowRun(runId: string) {
+  return sendRunAction(runId, { action: 'force_wait_run' });
 }
 
 export function selectWorkflowStep(runId: string, stepId: string) {

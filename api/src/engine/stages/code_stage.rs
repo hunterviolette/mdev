@@ -41,24 +41,7 @@ pub fn prepare_stage_state(
             "on_success".to_string(),
             json!({
                 "disposition": "move_next",
-                "message": "Code stage completed successfully through backend workflow engine.",
-                "patch": {
-                    "global_state": {
-                        "capabilities": {
-                            "context_export": null,
-                            "inference": {
-                                "next_prompt_fragments": null,
-                                "active_prompt_fragments": null,
-                                "prompt_fragments": {
-                                    "repo_context": null
-                                },
-                                "prompt_fragment_enabled": {
-                                    "repo_context": false
-                                }
-                            }
-                        }
-                    }
-                }
+                "message": "Code stage completed successfully through backend workflow engine."
             }),
         );
     }

@@ -12,10 +12,10 @@ use super::{
     append_engine_event,
     clear_active_prompt_fragments_for_stage,
     current_step,
+    ensure_engine_root,
     load_run,
     load_template_definition,
     persist_context,
-    refresh_inference_arm_state,
     set_run_status,
 };
 use super::stages::{execute_stage, StageDisposition};
@@ -33,18 +33,66 @@ pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Va
 }
 
 pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
-    let run = load_run(state, run_id).await?;
-    set_run_status(state, run_id, RunStatus::Paused, run.current_step_id.as_deref()).await?;
+    let mut run = load_run(state, run_id).await?;
+    if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+        let status = format!("{:?}", run.status).to_lowercase();
+        append_engine_event(
+            state,
+            run_id,
+            run.current_step_id.as_deref(),
+            "info",
+            "run_pause_ignored",
+            "Pause request ignored because the workflow run is not active.",
+            json!({ "status": status }),
+        ).await?;
+        return Ok(json!({
+            "ok": true,
+            "status": status,
+            "pause_requested": false,
+            "current_step_id": run.current_step_id,
+        }));
+    }
+
+    let root = ensure_engine_root(&mut run.context);
+    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+    let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+    run_state_obj.insert("pause_requested".to_string(), json!(true));
+    persist_context(state, run_id, &run.context).await?;
+
     append_engine_event(
         state,
         run_id,
         run.current_step_id.as_deref(),
         "info",
-        "run_paused",
-        "Workflow run paused by operator.",
+        "run_pause_requested",
+        "Workflow run will pause after the current stage finishes.",
         json!({}),
     ).await?;
-    Ok(json!({ "ok": true, "status": "paused", "current_step_id": run.current_step_id }))
+    Ok(json!({ "ok": true, "status": "pause_requested", "current_step_id": run.current_step_id }))
+}
+
+pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
+    let mut run = load_run(state, run_id).await?;
+    let root = ensure_engine_root(&mut run.context);
+    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
+        run_state.remove("pause_requested");
+    }
+    persist_context(state, run_id, &run.context).await?;
+
+    set_run_status(state, run_id, RunStatus::Waiting, run.current_step_id.as_deref()).await?;
+    append_engine_event(
+        state,
+        run_id,
+        run.current_step_id.as_deref(),
+        "warn",
+        "run_force_unlocked",
+        "Workflow run was force-unlocked by operator and returned to waiting state.",
+        json!({
+            "previous_status": format!("{:?}", run.status).to_lowercase(),
+            "current_step_id": run.current_step_id
+        }),
+    ).await?;
+    Ok(json!({ "ok": true, "status": "waiting", "current_step_id": run.current_step_id }))
 }
 
 pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
@@ -111,6 +159,22 @@ fn consume_single_use_inference_arm_state(run: &mut super::WorkflowRun, step: &s
     inference_obj.remove("shared_inference_state");
 }
 
+fn run_pause_requested(run: &super::WorkflowRun) -> bool {
+    run.context
+        .get("workflow_engine")
+        .and_then(|v| v.get("run_state"))
+        .and_then(|v| v.get("pause_requested"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn clear_run_pause_requested(run: &mut super::WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
+        run_state.remove("pause_requested");
+    }
+}
+
 async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run).await?
@@ -143,15 +207,6 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
         StageDisposition::MoveNext | StageDisposition::MoveBack | StageDisposition::Outcome(_) | StageDisposition::Stay => RunStatus::Waiting,
         StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
     };
-    let next_step = next_target
-        .as_deref()
-        .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
-    refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
-    persist_context(state, run_id, &run.context).await?;
-    let next_step = next_target
-        .as_deref()
-        .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
-    refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
     persist_context(state, run_id, &run.context).await?;
     let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
     set_run_status(state, run_id, status.clone(), current_step_id).await?;
@@ -159,7 +214,7 @@ async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: 
     Ok(json!({
         "ok": outcome.ok,
         "status": match status {
-            RunStatus::Draft => "draft",
+            RunStatus::Draft => "waiting",
             RunStatus::Queued => "queued",
             RunStatus::Running => "running",
             RunStatus::Waiting => "waiting",
@@ -221,15 +276,28 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
 
         let next_target = resolve_next_target(&definition, &step, &outcome);
         let auto_advance = should_auto_advance(&step, &outcome);
-        let next_step = next_target
-            .as_deref()
-            .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
-        refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
-        persist_context(state, run_id, &run.context).await?;
-        let next_step = next_target
-            .as_deref()
-            .and_then(|step_id| definition.steps.iter().find(|candidate| candidate.id == step_id));
-        refresh_inference_arm_state(&mut run, next_step.or(Some(&step)));
+        let latest_run = load_run(state, run_id).await?;
+        if run_pause_requested(&latest_run) {
+            clear_run_pause_requested(&mut run);
+            persist_context(state, run_id, &run.context).await?;
+            set_run_status(state, run_id, RunStatus::Paused, Some(step.id.as_str())).await?;
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "info",
+                "run_paused_after_stage",
+                "Workflow run paused after the current stage completed.",
+                json!({}),
+            ).await?;
+            return Ok(json!({
+                "ok": true,
+                "status": "paused",
+                "step_id": step.id,
+                "next_step_id": next_target,
+                "message": outcome.message,
+            }));
+        }
         persist_context(state, run_id, &run.context).await?;
 
         match (&outcome.disposition, next_target.clone(), auto_advance) {

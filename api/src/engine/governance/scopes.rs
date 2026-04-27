@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum GovernanceScope {
     Global,
     Run,
+    Governance,
     Stage,
     Capability,
 }

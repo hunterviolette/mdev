@@ -126,8 +126,6 @@ pub struct WorkflowStepDefinition {
     pub id: String,
     pub name: String,
     pub step_type: String,
-    #[serde(default)]
-    pub governance: WorkflowStepGovernanceConfig,
     pub automation_mode: AutomationMode,
     #[serde(default)]
     pub execution: WorkflowStepExecutionConfig,
@@ -152,6 +150,8 @@ pub struct WorkflowTemplateDefinition {
     pub version: u32,
     #[serde(default)]
     pub globals: WorkflowGlobalConfig,
+    #[serde(default)]
+    pub governance: Value,
     pub steps: Vec<WorkflowStepDefinition>,
 }
 
@@ -205,15 +205,7 @@ pub struct WorkflowGovernancePolicyDescriptor {
 pub struct WorkflowStageGovernancePolicy {
     pub key: String,
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
     pub config: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkflowStepGovernanceConfig {
-    #[serde(default)]
-    pub policies: Vec<WorkflowStageGovernancePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +266,8 @@ pub struct WorkflowBuilderDocument {
     #[serde(default)]
     pub globals: WorkflowGlobalConfig,
     #[serde(default)]
+    pub governance: Value,
+    #[serde(default)]
     pub stages: Vec<WorkflowBuilderStageDocument>,
 }
 
@@ -284,8 +278,6 @@ pub struct WorkflowBuilderStageDocument {
     pub step_type: String,
     #[serde(default)]
     pub field_values: Value,
-    #[serde(default)]
-    pub governance_policies: Vec<WorkflowStageGovernancePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

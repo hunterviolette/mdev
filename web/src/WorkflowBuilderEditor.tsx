@@ -26,10 +26,10 @@ import {
   type WorkflowCapabilitySummaryItem,
   type WorkflowStageDescriptor,
   type WorkflowStageField,
-  type WorkflowStageGovernancePolicy,
+  type WorkflowGovernanceConfig,
   type WorkflowTemplateDefinition,
 } from './api';
-import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, ensureStageGovernancePolicies, type BuilderStep } from './workflow_builder';
+import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, ensureGovernanceConfig, governancePolicyMapFromCatalog, type BuilderStep } from './workflow_builder';
 
 type WorkflowBuilderEditorProps = {
   initialDefinition?: WorkflowTemplateDefinition | null;
@@ -110,6 +110,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   const [catalog, setCatalog] = useState<Record<string, WorkflowStageDescriptor>>({});
   const [stageDescriptors, setStageDescriptors] = useState<WorkflowStageDescriptor[]>([]);
   const [steps, setSteps] = useState<BuilderStep[]>([]);
+  const [governance, setGovernance] = useState<WorkflowGovernanceConfig>({});
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [globalsRevision, setGlobalsRevision] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -127,11 +128,9 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
     [catalog, selectedStep]
   );
 
-  const selectedGovernancePolicies = useMemo(
-    () => (selectedStep && selectedDescriptor
-      ? ensureStageGovernancePolicies(selectedDescriptor, selectedStep.governancePolicies)
-      : []),
-    [selectedDescriptor, selectedStep]
+  const governancePolicies = useMemo(
+    () => governancePolicyMapFromCatalog({ version: 1, stage_descriptors: stageDescriptors }),
+    [stageDescriptors]
   );
 
   const selectedStageCapabilitySummary = useMemo(
@@ -153,6 +152,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
         const byType = descriptorMap(loadedCatalog);
         setCatalog(byType);
         setStageDescriptors(descriptors);
+        setGovernance(ensureGovernanceConfig(loadedCatalog, initialDefinition?.governance));
 
         const hydratedSteps = builderStepsFromDefinition(initialDefinition, loadedCatalog);
         setGlobalsRevision((prev) => prev + 1);
@@ -253,17 +253,16 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   }
 
 
-  function updateStepGovernancePolicies(stepId: string, governancePolicies: WorkflowStageGovernancePolicy[]) {
-    setSteps((prev) =>
-      prev.map((step) =>
-        step.id === stepId
-          ? {
-              ...step,
-              governancePolicies,
-            }
-          : step
-      )
-    );
+  function updateGovernancePolicy(policyKey: string, nextConfig: Record<string, unknown> | null) {
+    setGovernance((prev) => {
+      const next = { ...prev };
+      if (nextConfig) {
+        next[policyKey] = nextConfig;
+      } else {
+        delete next[policyKey];
+      }
+      return next;
+    });
     markDirty();
   }
 
@@ -342,7 +341,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
       setCompileState('compiling');
       setCompileMessage('Compiling backend-defined workflow');
       const result: CompileWorkflowBuilderResponse = await compileWorkflowBuilderDocument(
-        buildBuilderDocument(steps, (builderGlobals ?? initialDefinition?.globals ?? defaultGlobals()))
+        buildBuilderDocument(steps, builderGlobals ?? initialDefinition?.globals ?? defaultGlobals(), governance)
       );
       if (!result.ok) {
         const message = result.errors.length > 0 ? result.errors.join('\n') : 'Workflow compilation failed.';
@@ -557,52 +556,49 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                     </Alert>
                   ) : null}
 
-                  {selectedGovernancePolicies.length > 0 ? <Divider label="Governance policies" /> : null}
-                  {selectedGovernancePolicies.map((policy) => {
-                    const descriptor = (selectedDescriptor.available_governance_policies ?? []).find((item) => item.key === policy.key);
-                    if (!descriptor) {
-                      return null;
-                    }
+                  {Object.keys(governancePolicies).length > 0 ? <Divider label="Governance" /> : null}
+                  {Object.values(governancePolicies).map((descriptor) => {
+                    const config = governance[descriptor.key];
+                    const active = Boolean(config);
                     return (
-                      <Stack key={policy.key} gap="xs">
+                      <Stack key={descriptor.key} gap="xs">
                         <Switch
                           label={descriptor.label}
                           description={descriptor.description}
-                          checked={Boolean(policy.enabled)}
+                          checked={active}
                           onChange={(event) => {
-                            const nextPolicies = selectedGovernancePolicies.map((item) =>
-                              item.key === policy.key ? { ...item, enabled: event.currentTarget.checked } : item
+                            if (!event.currentTarget.checked) {
+                              updateGovernancePolicy(descriptor.key, null);
+                              return;
+                            }
+                            updateGovernancePolicy(
+                              descriptor.key,
+                              Object.fromEntries(descriptor.fields.map((field) => [field.key, field.default]))
                             );
-                            updateStepGovernancePolicies(selectedStep.id, nextPolicies);
                           }}
                         />
-                        {policy.enabled ? descriptor.fields.map((field) => {
-                          const currentValue = (policy.config ?? {})[field.key] ?? field.default;
-                          return (
-                            <TextInput
-                              key={`${policy.key}:${field.key}`}
-                              label={field.label}
-                              description={field.description}
-                              placeholder={field.ui?.placeholder}
-                              value={String(typeof currentValue === 'number' ? currentValue : Number(currentValue ?? 0) || 0)}
-                              onChange={(event) => {
-                                const nextPolicies = selectedGovernancePolicies.map((item) => {
-                                  if (item.key !== policy.key) {
-                                    return item;
-                                  }
-                                  return {
-                                    ...item,
-                                    config: {
-                                      ...item.config,
+                        {active ? (
+                          <Group grow align="flex-start">
+                            {descriptor.fields.map((field) => {
+                              const currentValue = config?.[field.key] ?? field.default;
+                              return (
+                                <TextInput
+                                  key={`${descriptor.key}:${field.key}`}
+                                  label={field.label}
+                                  description={field.description}
+                                  placeholder={field.ui?.placeholder}
+                                  value={String(typeof currentValue === 'number' ? currentValue : Number(currentValue ?? 0) || 0)}
+                                  onChange={(event) => {
+                                    updateGovernancePolicy(descriptor.key, {
+                                      ...(config ?? {}),
                                       [field.key]: Number(event.currentTarget.value || '0'),
-                                    },
-                                  };
-                                });
-                                updateStepGovernancePolicies(selectedStep.id, nextPolicies);
-                              }}
-                            />
-                          );
-                        }) : null}
+                                    });
+                                  }}
+                                />
+                              );
+                            })}
+                          </Group>
+                        ) : null}
                       </Stack>
                     );
                   })}

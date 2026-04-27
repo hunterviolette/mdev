@@ -49,9 +49,8 @@ pub async fn after_stage(
     let stage_pause = latest_run
         .context
         .get("workflow_engine")
-        .and_then(|v| v.get("stage_state"))
-        .and_then(|v| v.get(step.id.as_str()))
-        .and_then(|v| v.get("changeset_failures"))
+        .and_then(|v| v.get("governance"))
+        .and_then(|v| v.get("changeset_file_failures"))
         .and_then(|v| v.get("pause_reason"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
@@ -130,6 +129,19 @@ pub async fn after_capability(
 
     if result.capability == "inference" {
         decisions.extend(evaluate_inference_stage_consumption(run, step));
+
+        if result.ok {
+            decisions.push(GovernanceDecision::MutateContext {
+                mutation: ContextMutation {
+                    scope: GovernanceScope::Stage,
+                    patch: json!({
+                        "prompt": {
+                            "user_input": Value::Null
+                        }
+                    }),
+                },
+            });
+        }
     }
 
     Ok(decisions)
@@ -187,26 +199,34 @@ fn evaluate_inference_stage_consumption(
         .unwrap_or_else(|| json!({}));
 
     let mut inference_patch = Map::new();
+    let mut context_export_patch = Map::new();
 
     if shared_single_use_capability_should_clear(&global_state, step, "repo_context") {
         inference_patch.insert("repo_context_armed".to_string(), Value::Bool(false));
+        context_export_patch.insert("single_use_override".to_string(), Value::Null);
     }
 
     if shared_single_use_capability_should_clear(&global_state, step, "changeset_schema") {
         inference_patch.insert("changeset_schema_armed".to_string(), Value::Bool(false));
     }
 
-    if inference_patch.is_empty() {
+    if inference_patch.is_empty() && context_export_patch.is_empty() {
         return Vec::new();
+    }
+
+    let mut capabilities_patch = Map::new();
+    if !inference_patch.is_empty() {
+        capabilities_patch.insert("inference".to_string(), Value::Object(inference_patch));
+    }
+    if !context_export_patch.is_empty() {
+        capabilities_patch.insert("context_export".to_string(), Value::Object(context_export_patch));
     }
 
     vec![GovernanceDecision::MutateContext {
         mutation: ContextMutation {
             scope: GovernanceScope::Global,
             patch: json!({
-                "capabilities": {
-                    "inference": Value::Object(inference_patch)
-                }
+                "capabilities": Value::Object(capabilities_patch)
             }),
         },
     }]
@@ -248,27 +268,29 @@ fn evaluate_changeset_guardrails(
     step: &WorkflowStepDefinition,
     result: &CapabilityResult,
 ) -> Vec<GovernanceDecision> {
-    let thresholds = changeset_guardrails(run, step);
+    let Some(thresholds) = governance_policy_config(run, "changeset_file_failures") else {
+        return Vec::new();
+    };
     let inject_after = thresholds
         .get("inject_context_after_consecutive_failures")
         .and_then(Value::as_u64)
         .unwrap_or(4);
+    let inject_broad_after = thresholds
+        .get("inject_broad_context_after_consecutive_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(inject_after.saturating_add(3));
     let pause_after = thresholds
         .get("pause_after_consecutive_failures")
         .and_then(Value::as_u64)
         .unwrap_or(8);
 
     let mut decisions = Vec::new();
-    let current_stage_state = run
+    let current_files = run
         .context
         .get("workflow_engine")
-        .and_then(|v| v.get("stage_state"))
-        .and_then(|v| v.get(step.id.as_str()))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let current_files = current_stage_state
-        .get("changeset_failures")
+        .and_then(|v| v.get("governance"))
+        .and_then(|v| v.get("changeset_file_failures"))
+        .and_then(|v| v.get("state"))
         .and_then(|v| v.get("files"))
         .and_then(Value::as_object)
         .cloned()
@@ -290,11 +312,7 @@ fn evaluate_changeset_guardrails(
         if failed_paths.contains(path) {
             continue;
         }
-        next_files.insert(path.clone(), json!({
-            "consecutive_failures": 0,
-            "last_failure": Value::Null,
-            "context_injected": false
-        }));
+        next_files.insert(path.clone(), json!(0));
     }
 
     for file in failed_files {
@@ -305,29 +323,56 @@ fn evaluate_changeset_guardrails(
 
         let previous = current_files
             .get(path.as_str())
-            .and_then(|v| v.get("consecutive_failures"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let next = previous + 1;
-        let context_injected = next >= inject_after;
+        let should_export_broad = next >= inject_broad_after;
+        let should_export_targeted = next >= inject_after && !should_export_broad;
 
-        next_files.insert(path.clone(), json!({
-            "consecutive_failures": next,
-            "last_failure": file.clone(),
-            "context_injected": context_injected
-        }));
-
-        if next == inject_after {
-            decisions.push(GovernanceDecision::InjectCapability {
-                capability: CapabilityInjection {
-                    capability: "context_export".to_string(),
-                    config: json!({
-                        "include_files": [path.clone()],
-                        "git_ref": "WORKTREE"
+        if should_export_targeted {
+            decisions.push(GovernanceDecision::MutateContext {
+                mutation: ContextMutation {
+                    scope: GovernanceScope::Global,
+                    patch: json!({
+                        "capabilities": {
+                            "context_export": {
+                                "single_use_override": {
+                                    "include_files": [path.clone()],
+                                    "include_staged_diff": false,
+                                    "include_unstaged_diff": false,
+                                    "git_ref": "WORKTREE",
+                                    "save_path": targeted_context_save_path(run.id, path.as_str())
+                                }
+                            },
+                            "inference": {
+                                "repo_context_armed": true
+                            }
+                        }
                     }),
                 },
             });
         }
+
+        if should_export_broad {
+            decisions.push(GovernanceDecision::MutateContext {
+                mutation: ContextMutation {
+                    scope: GovernanceScope::Global,
+                    patch: json!({
+                        "capabilities": {
+                            "context_export": {
+                                "single_use_override": Value::Null
+                            },
+                            "inference": {
+                                "repo_context_armed": true
+                            }
+                        }
+                    }),
+                },
+            });
+        }
+
+        let stored_next = if should_export_targeted || should_export_broad { 0 } else { next };
+        next_files.insert(path.clone(), json!(stored_next));
 
         if next >= pause_after && pause_reason.is_none() {
             pause_reason = Some(format!(
@@ -340,11 +385,12 @@ fn evaluate_changeset_guardrails(
 
     decisions.push(GovernanceDecision::MutateContext {
         mutation: ContextMutation {
-            scope: GovernanceScope::Stage,
+            scope: GovernanceScope::Governance,
             patch: json!({
-                "changeset_failures": {
-                    "files": Value::Object(next_files),
-                    "latest_failure": if result.ok { Value::Null } else { result.payload.clone() },
+                "changeset_file_failures": {
+                    "state": {
+                        "files": Value::Object(next_files)
+                    },
                     "pause_reason": pause_reason.clone()
                 }
             }),
@@ -360,10 +406,12 @@ fn evaluate_changeset_guardrails(
 
 fn evaluate_compile_guardrails(
     run: &WorkflowRun,
-    step: &WorkflowStepDefinition,
+    _step: &WorkflowStepDefinition,
     result: &CapabilityResult,
 ) -> Vec<GovernanceDecision> {
-    let thresholds = compile_guardrails(run, step);
+    let Some(thresholds) = governance_policy_config(run, "compile_failures") else {
+        return Vec::new();
+    };
     let pause_after = thresholds
         .get("pause_after_consecutive_failures")
         .and_then(Value::as_u64)
@@ -398,7 +446,7 @@ fn evaluate_compile_guardrails(
             patch: json!({
                 "compile_failures": {
                     "consecutive": next,
-                    "latest_result": result.payload.clone(),
+                    "latest_result": compile_runtime_signal(result),
                     "pause_reason": pause_reason.clone()
                 }
             }),
@@ -412,39 +460,87 @@ fn evaluate_compile_guardrails(
     decisions
 }
 
-fn stage_policy_config(step: &WorkflowStepDefinition, policy_key: &str) -> Option<Value> {
-    step.governance
-        .policies
+fn targeted_context_save_path(run_id: Uuid, path: &str) -> String {
+    format!(
+        "/tmp/mdev_targeted_context_{}_{}.txt",
+        run_id,
+        sanitize_context_path_component(path)
+    )
+}
+
+fn sanitize_context_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "context".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn compact_changeset_file_failure(file: &Value) -> Value {
+    json!({
+        "path": file.get("path").cloned().unwrap_or(Value::Null),
+        "operation_index": file.get("operation_index").cloned().unwrap_or(Value::Null),
+        "operation_kind": file.get("operation_kind").cloned().unwrap_or(Value::Null),
+        "failed_actions": file.get("failed_actions").cloned().unwrap_or_else(|| json!([]))
+    })
+}
+
+fn compact_changeset_result(result: &CapabilityResult) -> Value {
+    json!({
+        "ok": result.ok,
+        "summary": result.payload.get("summary").cloned().unwrap_or(Value::Null),
+        "stats": result.payload.get("stats").cloned().unwrap_or(Value::Null),
+        "failing_files": result.payload
+            .get("failing_files")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(compact_changeset_file_failure).collect::<Vec<_>>())
+            .unwrap_or_default()
+    })
+}
+
+fn compile_runtime_signal(result: &CapabilityResult) -> Value {
+    let results = result
+        .payload
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let commands = results
         .iter()
-        .find(|policy| policy.enabled && policy.key == policy_key)
-        .map(|policy| policy.config.clone())
+        .filter_map(|row| row.get("command").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    let failed_command_count = results
+        .iter()
+        .filter(|row| row.get("status").and_then(Value::as_i64).unwrap_or(0) != 0)
+        .count();
+
+    json!({
+        "ok": result.ok,
+        "had_error": signals::compile_failed(result),
+        "has_compile_log": !results.is_empty(),
+        "failed_command_count": failed_command_count,
+        "commands": commands,
+        "no_commands_configured": result.payload.get("no_commands_configured").and_then(Value::as_bool).unwrap_or(false),
+        "skipped": result.payload.get("skipped").and_then(Value::as_bool).unwrap_or(false)
+    })
 }
 
-fn changeset_guardrails(run: &WorkflowRun, step: &WorkflowStepDefinition) -> Value {
-    stage_policy_config(step, "changeset_file_failures")
-        .or_else(|| {
-            run.context
-                .get("workflow_engine")
-                .and_then(|root| root.get("governance"))
-                .and_then(|gov| gov.get("guardrails"))
-                .cloned()
-        })
-        .unwrap_or_else(|| json!({
-            "inject_context_after_consecutive_failures": 4,
-            "pause_after_consecutive_failures": 8
-        }))
-}
-
-fn compile_guardrails(run: &WorkflowRun, step: &WorkflowStepDefinition) -> Value {
-    stage_policy_config(step, "compile_failures")
-        .or_else(|| {
-            run.context
-                .get("workflow_engine")
-                .and_then(|root| root.get("governance"))
-                .and_then(|gov| gov.get("guardrails"))
-                .cloned()
-        })
-        .unwrap_or_else(|| json!({
-            "pause_after_consecutive_failures": 5
-        }))
+fn governance_policy_config(run: &WorkflowRun, policy_key: &str) -> Option<Value> {
+    run.context
+        .get("workflow_engine")
+        .and_then(|root| root.get("governance"))
+        .and_then(|gov| gov.get(policy_key))
+        .cloned()
 }

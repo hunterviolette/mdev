@@ -87,6 +87,10 @@ fn apply_mutation(
             let slot = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
             merge_json_values(slot, &mutation.patch);
         }
+        GovernanceScope::Governance => {
+            let slot = root.entry("governance".to_string()).or_insert_with(|| json!({}));
+            merge_json_values(slot, &mutation.patch);
+        }
         GovernanceScope::Stage => {
             let step_id = step_id.ok_or_else(|| anyhow!("stage-scoped governance mutation requires step_id"))?;
             let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));

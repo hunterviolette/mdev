@@ -70,13 +70,8 @@ pub fn prepare_inference_stage_state(
     }
 
     let repo_context = if include_repo_context {
-        let context_export_state = global_state
-            .get("capabilities")
-            .and_then(|v| v.get("context_export"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
         let repo_context = context_export::normalize_context_export_payload(
-            context_export_state,
+            resolve_context_export_state(global_state),
             global_state.get("resources").and_then(|v| v.get("repo")).cloned(),
             repo_ref,
         );
@@ -208,6 +203,20 @@ fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String
         .unwrap_or_default()
 }
 
+fn resolve_context_export_state(global_state: &Value) -> Value {
+    let baseline = global_state
+        .get("capabilities")
+        .and_then(|v| v.get("context_export"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    baseline
+        .get("single_use_override")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or(baseline)
+}
+
 pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
     let save_path = repo_context
         .get("save_path")
@@ -267,13 +276,8 @@ pub fn build_inference_execution_plan(
         .unwrap_or(false);
 
     let repo_context = if include_repo_context {
-        let context_export_state = global_state
-            .get("capabilities")
-            .and_then(|v| v.get("context_export"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
         Some(context_export::normalize_context_export_payload(
-            context_export_state,
+            resolve_context_export_state(global_state),
             global_state.get("resources").and_then(|v| v.get("repo")).cloned(),
             repo_ref,
         ))

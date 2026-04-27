@@ -1,13 +1,13 @@
 use axum::{extract::{Path, State}, routing::{get, post}, Json, Router};
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
     engine,
-    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun},
+    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun, WorkflowTemplateDefinition},
 };
 
 pub fn router() -> Router<AppState> {
@@ -50,10 +50,6 @@ async fn open_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
-    engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id)
-        .await
-        .map_err(internal)?;
-
     let row = sqlx::query(
         "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
@@ -138,7 +134,6 @@ async fn run_action(
                 .map_err(internal)?;
             engine::governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)
                 .map_err(internal)?;
-            engine::refresh_inference_arm_state(&mut run, Some(step));
             engine::persist_context(&state, run_id, &run.context).await.map_err(internal)?;
             engine::set_run_status(&state, run_id, RunStatus::Waiting, Some(step.id.as_str()))
                 .await
@@ -166,6 +161,9 @@ async fn run_action(
         }
         "pause_run" => {
             engine::pause_run(&state, run_id).await.map_err(internal)?
+        }
+        "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
+            engine::force_wait_run(&state, run_id).await.map_err(internal)?
         }
         "run_step" | "run_current_step" => {
             if !req.payload.is_null() {
@@ -209,13 +207,96 @@ async fn run_action(
     Ok(Json(response))
 }
 
+fn seed_missing_browser_session_rearm(context: &mut Value) {
+    let root = engine::ensure_engine_root(context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    if !global_state.is_object() {
+        *global_state = json!({});
+    }
+    let Some(global_state_obj) = global_state.as_object_mut() else {
+        return;
+    };
+
+    let capabilities = global_state_obj.entry("capabilities".to_string()).or_insert_with(|| json!({}));
+    if !capabilities.is_object() {
+        *capabilities = json!({});
+    }
+    let Some(capabilities_obj) = capabilities.as_object_mut() else {
+        return;
+    };
+
+    let inference = capabilities_obj.entry("inference".to_string()).or_insert_with(|| json!({}));
+    if !inference.is_object() {
+        *inference = json!({});
+    }
+    let Some(inference_obj) = inference.as_object_mut() else {
+        return;
+    };
+
+    let transport = inference_obj
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("browser");
+    if !transport.eq_ignore_ascii_case("browser") {
+        return;
+    }
+
+    let session_id = inference_obj
+        .get("browser")
+        .and_then(|v| v.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if !session_id.is_empty() {
+        return;
+    }
+
+    let connection_runtime = inference_obj
+        .entry("connection_runtime".to_string())
+        .or_insert_with(|| json!({}));
+    if !connection_runtime.is_object() {
+        *connection_runtime = json!({});
+    }
+    let Some(connection_runtime_obj) = connection_runtime.as_object_mut() else {
+        return;
+    };
+
+    connection_runtime_obj.insert(
+        "session_rearm".to_string(),
+        json!({
+            "needed": true,
+            "reason": "browser_session_changed",
+            "previous_session_id": "missing",
+            "next_session_id": ""
+        }),
+    );
+
+    inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+    inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    inference_obj.remove("shared_inference_state");
+    inference_obj.remove("next_prompt_fragments");
+    inference_obj.remove("active_prompt_fragments");
+}
+
+fn seed_governance_context_from_definition(context: &mut Value, definition: &WorkflowTemplateDefinition) {
+    let root = engine::ensure_engine_root(context);
+    let governance = root.entry("governance".to_string()).or_insert_with(|| json!({}));
+    if !governance.is_object() {
+        *governance = json!({});
+    }
+
+    engine::merge_json_values(governance, &definition.governance);
+}
+
 async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
     let id = Uuid::new_v4();
-    let status = RunStatus::Draft;
+    let status = RunStatus::Waiting;
 
     let definition = if let Some(definition) = req.definition.clone() {
         definition
@@ -276,7 +357,9 @@ async fn create_run(
         created_at: now,
         updated_at: now,
     };
-    engine::refresh_inference_arm_state(&mut seeded_run, initial_step);
+    seed_missing_browser_session_rearm(&mut seeded_run.context);
+    seed_governance_context_from_definition(&mut seeded_run.context, &definition);
+    seed_compile_command_context_from_definition(&mut seeded_run.context, &definition);
     run_context = seeded_run.context;
 
     sqlx::query(
@@ -285,7 +368,7 @@ async fn create_run(
     .bind(id.to_string())
     .bind(req.template_id.map(|v| v.to_string()))
     .bind(serde_json::to_string_pretty(&definition).map_err(internal)?)
-    .bind("draft")
+    .bind("waiting")
     .bind(current_step_id.clone())
     .bind(&req.title)
     .bind(&req.repo_ref)
@@ -322,6 +405,84 @@ async fn create_run(
     }))
 }
 
+fn seed_compile_command_context_from_definition(context: &mut Value, definition: &WorkflowTemplateDefinition) {
+    let root = engine::ensure_engine_root(context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    if !stage_state.is_object() {
+        *stage_state = json!({});
+    }
+    let Some(stage_state_obj) = stage_state.as_object_mut() else {
+        return;
+    };
+
+    for step in definition.steps.iter().filter(|step| step.step_type == "compile") {
+        let commands = compile_commands_from_checks(&step.execution.compile_checks);
+        let has_commands = commands
+            .as_array()
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+        if !has_commands {
+            continue;
+        }
+
+        let stage = stage_state_obj.entry(step.id.clone()).or_insert_with(|| json!({}));
+        if !stage.is_object() {
+            *stage = json!({});
+        }
+        let Some(stage_obj) = stage.as_object_mut() else {
+            continue;
+        };
+
+        let execution = stage_obj.entry("execution".to_string()).or_insert_with(|| json!({}));
+        if !execution.is_object() {
+            *execution = json!({});
+        }
+        let Some(execution_obj) = execution.as_object_mut() else {
+            continue;
+        };
+
+        execution_obj.insert("compile_checks".to_string(), json!({
+            "commands": commands
+        }));
+    }
+}
+
+fn compile_commands_from_checks(checks: &Value) -> Value {
+    if let Some(rows) = checks.get("commands").and_then(Value::as_array) {
+        let commands = rows
+            .iter()
+            .filter_map(|item| {
+                if let Some(command) = item.as_str() {
+                    let command = command.trim();
+                    return (!command.is_empty()).then(|| Value::String(command.to_string()));
+                }
+
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                (!command.is_empty()).then(|| Value::String(command.to_string()))
+            })
+            .collect::<Vec<_>>();
+        if !commands.is_empty() {
+            return Value::Array(commands);
+        }
+    }
+
+    let commands = checks
+        .get("commands_text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| Value::String(line.to_string()))
+        .collect::<Vec<_>>();
+
+    Value::Array(commands)
+}
+
 fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowEvent, (axum::http::StatusCode, String)> {
     Ok(WorkflowEvent {
         id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
@@ -341,7 +502,7 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
         template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose().map_err(internal)?,
         definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str()).map_err(internal)?,
         status: match row.get::<String, _>("status").as_str() {
-            "draft" => RunStatus::Draft,
+            "draft" => RunStatus::Waiting,
             "queued" => RunStatus::Queued,
             "running" => RunStatus::Running,
             "waiting" => RunStatus::Waiting,

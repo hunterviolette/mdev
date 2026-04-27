@@ -6,7 +6,7 @@ import type {
   WorkflowGovernancePolicyDescriptor,
   WorkflowStageDescriptor,
   WorkflowStageField,
-  WorkflowStageGovernancePolicy,
+  WorkflowGovernanceConfig,
   WorkflowTemplateDefinition,
 } from './api';
 
@@ -15,7 +15,6 @@ export type BuilderStep = {
   name: string;
   stepType: string;
   fields: Record<string, unknown>;
-  governancePolicies?: WorkflowStageGovernancePolicy[];
 };
 
 export function capabilityDisplayLabel(capabilityKey: string): string {
@@ -45,21 +44,34 @@ export function governancePolicyMap(descriptor: WorkflowStageDescriptor): Record
   return Object.fromEntries((descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy]));
 }
 
-export function ensureStageGovernancePolicies(
-  descriptor: WorkflowStageDescriptor,
-  selected: WorkflowStageGovernancePolicy[] | undefined,
-): WorkflowStageGovernancePolicy[] {
-  const byKey = new Map((selected ?? []).map((item) => [item.key, item]));
-  return (descriptor.available_governance_policies ?? []).map((policy) => ({
-    key: policy.key,
-    enabled: byKey.get(policy.key)?.enabled ?? false,
-    config: Object.fromEntries(
-      policy.fields.map((field) => [
-        field.key,
-        (byKey.get(policy.key)?.config as Record<string, unknown> | undefined)?.[field.key] ?? field.default,
-      ])
-    ),
-  }));
+export function ensureGovernanceConfig(
+  catalog: WorkflowBuilderCatalog,
+  selected: WorkflowGovernanceConfig | undefined,
+): WorkflowGovernanceConfig {
+  const byKey = governancePolicyMapFromCatalog(catalog);
+  const selectedConfig = selected ?? {};
+  return Object.fromEntries(
+    Object.entries(selectedConfig)
+      .filter(([key]) => Boolean(byKey[key]))
+      .map(([key, config]) => {
+        const descriptor = byKey[key];
+        return [
+          key,
+          Object.fromEntries(
+            descriptor.fields.map((field) => [
+              field.key,
+              (config as Record<string, unknown> | undefined)?.[field.key] ?? field.default,
+            ])
+          ),
+        ];
+      })
+  );
+}
+
+export function governancePolicyMapFromCatalog(catalog: WorkflowBuilderCatalog): Record<string, WorkflowGovernancePolicyDescriptor> {
+  return Object.fromEntries(
+    catalog.stage_descriptors.flatMap((descriptor) => descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy])
+  );
 }
 
 export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, id?: string): BuilderStep {
@@ -68,7 +80,6 @@ export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, i
     name: descriptor.label,
     stepType: descriptor.step_type,
     fields: Object.fromEntries(flattenStageFields(descriptor).map((field) => [field.key, field.default])),
-    governancePolicies: ensureStageGovernancePolicies(descriptor, []),
   };
 }
 
@@ -78,7 +89,6 @@ export function buildStageDocument(step: BuilderStep): WorkflowBuilderStageDocum
     name: step.name,
     step_type: step.stepType,
     field_values: step.fields,
-    governance_policies: step.governancePolicies ?? [],
   };
 }
 
@@ -97,10 +107,11 @@ export function defaultGlobals(): WorkflowGlobalConfig {
   };
 }
 
-export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig): WorkflowBuilderDocument {
+export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig, governance?: WorkflowGovernanceConfig): WorkflowBuilderDocument {
   return {
     version: 1,
     globals: globals ?? defaultGlobals(),
+    governance: governance ?? {},
     stages: steps.map((step) => buildStageDocument(step)),
   };
 }
@@ -141,7 +152,6 @@ export function builderStepsFromDefinition(
         ...defaults,
         ...fieldValues,
       },
-      governancePolicies: ensureStageGovernancePolicies(descriptor, step.governance?.policies),
     }];
   });
 }

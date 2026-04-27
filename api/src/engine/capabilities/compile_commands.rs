@@ -10,7 +10,12 @@ pub async fn execute(
     _prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
-    let commands = resolve_compile_commands(config, ctx.local_state, ctx.step.execution_logic.clone());
+    let commands = resolve_compile_commands(
+        config,
+        ctx.local_state,
+        ctx.step.execution.compile_checks.clone(),
+        ctx.step.execution_logic.clone(),
+    );
     let execution_mode = ctx
         .local_state
         .get("execution")
@@ -40,38 +45,85 @@ pub async fn execute(
     })
 }
 
-fn resolve_compile_commands(config: Value, local_state: &Value, execution_logic: Value) -> Value {
-    config
-        .get("commands")
-        .cloned()
+fn resolve_compile_commands(config: Value, local_state: &Value, step_compile_checks: Value, execution_logic: Value) -> Value {
+    non_empty_commands(config.get("commands").cloned())
+        .or_else(|| commands_text_to_rows(config.get("commands_text")))
         .or_else(|| {
-            local_state
-                .get("capabilities")
-                .and_then(|v| v.get("compile_commands"))
-                .and_then(|v| v.get("commands"))
-                .cloned()
+            non_empty_commands(
+                local_state
+                    .get("capabilities")
+                    .and_then(|v| v.get("compile_commands"))
+                    .and_then(|v| v.get("commands"))
+                    .cloned(),
+            )
         })
         .or_else(|| {
-            local_state
-                .get("execution")
-                .and_then(|v| v.get("compile_checks"))
-                .and_then(|v| v.get("commands"))
-                .cloned()
+            non_empty_commands(
+                local_state
+                    .get("execution")
+                    .and_then(|v| v.get("compile_checks"))
+                    .and_then(|v| v.get("commands"))
+                    .cloned(),
+            )
         })
         .or_else(|| {
-            local_state
-                .get("execution_logic")
-                .and_then(|v| v.get("compile_checks"))
-                .and_then(|v| v.get("commands"))
-                .cloned()
+            commands_text_to_rows(
+                local_state
+                    .get("execution")
+                    .and_then(|v| v.get("compile_checks"))
+                    .and_then(|v| v.get("commands_text")),
+            )
+        })
+        .or_else(|| non_empty_commands(step_compile_checks.get("commands").cloned()))
+        .or_else(|| commands_text_to_rows(step_compile_checks.get("commands_text")))
+        .or_else(|| {
+            non_empty_commands(
+                local_state
+                    .get("execution_logic")
+                    .and_then(|v| v.get("compile_checks"))
+                    .and_then(|v| v.get("commands"))
+                    .cloned(),
+            )
         })
         .or_else(|| {
-            execution_logic
-                .get("compile_checks")
-                .and_then(|v| v.get("commands"))
-                .cloned()
+            commands_text_to_rows(
+                local_state
+                    .get("execution_logic")
+                    .and_then(|v| v.get("compile_checks"))
+                    .and_then(|v| v.get("commands_text")),
+            )
         })
+        .or_else(|| non_empty_commands(execution_logic.get("compile_checks").and_then(|v| v.get("commands")).cloned()))
+        .or_else(|| commands_text_to_rows(execution_logic.get("compile_checks").and_then(|v| v.get("commands_text"))))
         .unwrap_or_else(|| json!([]))
+}
+
+fn non_empty_commands(commands: Option<Value>) -> Option<Value> {
+    match commands {
+        Some(Value::Array(rows)) if !rows.is_empty() => Some(Value::Array(rows)),
+        Some(Value::String(command)) if !command.trim().is_empty() => Some(json!([command.trim()])),
+        _ => None,
+    }
+}
+
+fn commands_text_to_rows(value: Option<&Value>) -> Option<Value> {
+    let text = value.and_then(Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let rows = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|command| Value::String(command.to_string()))
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(Value::Array(rows))
+    }
 }
 
 fn execute_terminal_command(repo: &Path, commands: Value, execution_mode: &str) -> Result<Value> {

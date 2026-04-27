@@ -55,23 +55,6 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-fn sanitize_persisted_stage_state(local_state: Value) -> Value {
-    let mut sanitized = json!({});
-    let src = match local_state {
-        Value::Object(map) => map,
-        _ => return sanitized,
-    };
-
-    let dst = sanitized.as_object_mut().expect("sanitized stage state must be object");
-    for key in ["_stage_execution_id", "prompt", "execution_logic", "config", "review"] {
-        if let Some(value) = src.get(key).cloned() {
-            dst.insert(key.to_string(), value);
-        }
-    }
-
-    sanitized
-}
-
 fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) {
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
@@ -148,6 +131,38 @@ pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) 
     Ok(())
 }
 
+fn sanitize_stage_execution_prefix(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "stage".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
+    let root = ensure_engine_root(context);
+    let stage_executions = root
+        .entry("stage_executions".to_string())
+        .or_insert_with(|| json!([]));
+    if !stage_executions.is_array() {
+        *stage_executions = json!([]);
+    }
+    let stage_executions = stage_executions
+        .as_array_mut()
+        .expect("stage_executions must be array");
+
+    if !stage_executions.iter().any(|item| item.as_str() == Some(stage_execution_id)) {
+        stage_executions.push(Value::String(stage_execution_id.to_string()));
+    }
+}
+
 pub async fn execute_stage(
     state: &AppState,
     run_id: Uuid,
@@ -155,7 +170,7 @@ pub async fn execute_stage(
     step: &WorkflowStepDefinition,
     automatic_execution: bool,
 ) -> Result<StageOutcome> {
-    let stage_execution_id = Uuid::new_v4().to_string();
+    let stage_execution_id = format!("{}-{}", sanitize_stage_execution_prefix(&step.step_type), Uuid::new_v4());
     let stage_started_at = Instant::now();
 
     reset_session_scoped_inference_state(state, run);
@@ -191,10 +206,17 @@ pub async fn execute_stage(
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
     let existing_local_state = root
-        .get("stage_state")
+        .get("stage_overrides")
         .and_then(Value::as_object)
         .and_then(|obj| obj.get(step.id.as_str()))
         .cloned()
+        .or_else(|| {
+            root
+                .get("stage_state")
+                .and_then(Value::as_object)
+                .and_then(|obj| obj.get(step.id.as_str()))
+                .cloned()
+        })
         .unwrap_or_else(|| json!({}));
 
     let repo_ref = global_state
@@ -275,28 +297,6 @@ pub async fn execute_stage(
     {
         let root = ensure_engine_root(&mut run.context);
 
-        let existing_persisted_stage_state = root
-            .get("stage_state")
-            .and_then(Value::as_object)
-            .and_then(|obj| obj.get(step.id.as_str()))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-
-        let mut merged_local_state = sanitize_persisted_stage_state(existing_persisted_stage_state);
-
-        let prepared_persisted_stage_state = sanitize_persisted_stage_state(prepared_local_state.clone());
-        if let Some(prepared_obj) = prepared_persisted_stage_state.as_object() {
-            let merged_obj = merged_local_state
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("merged stage state must be object"))?;
-
-            for key in ["_stage_execution_id", "prompt", "config", "review"] {
-                if let Some(value) = prepared_obj.get(key).cloned() {
-                    merged_obj.insert(key.to_string(), value);
-                }
-            }
-        }
-
         if let Some(patch) = branch.patch.clone() {
             if let Some(global_patch) = patch.get("global_state") {
                 let global_state_slot = root
@@ -304,18 +304,23 @@ pub async fn execute_stage(
                     .or_insert_with(|| json!({}));
                 merge_json_values(global_state_slot, global_patch);
             }
-            if let Some(local_patch) = patch.get("local_state") {
-                merge_json_values(&mut merged_local_state, local_patch);
+        }
+
+        if let Some(stage_overrides) = root.get_mut("stage_overrides").and_then(Value::as_object_mut) {
+            stage_overrides.remove(step.id.as_str());
+            if stage_overrides.is_empty() {
+                root.remove("stage_overrides");
             }
         }
 
-        let stage_state_slot = root
-            .entry("stage_state".to_string())
-            .or_insert_with(|| json!({}));
-        let stage_state_obj = stage_state_slot
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("stage_state must be object"))?;
-        stage_state_obj.insert(step.id.clone(), merged_local_state);
+        if let Some(stage_state) = root.get_mut("stage_state").and_then(Value::as_object_mut) {
+            stage_state.remove(step.id.as_str());
+            if stage_state.is_empty() {
+                root.remove("stage_state");
+            }
+        }
+
+        record_stage_execution_id(&mut run.context, stage_execution_id.as_str());
     }
 
     persist_context(state, run_id, &run.context).await?;
