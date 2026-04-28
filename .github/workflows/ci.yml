@@ -18,6 +18,7 @@ concurrency:
 env:
   NODE_VERSION: 24.14.0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TURBO_TELEMETRY_DISABLED: 1
   WORKFLOW_API_HOST: 127.0.0.1
   WORKFLOW_API_PORT: 8788
   WORKFLOW_WEB_HOST: 127.0.0.1
@@ -39,7 +40,7 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --include=optional
 
       - name: Build Node workspaces
         run: npx turbo build
