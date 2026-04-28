@@ -67,7 +67,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install --include=optional
 
       - name: Build Node workspaces
         run: npx turbo build
@@ -171,7 +171,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install --include=optional
 
       - name: Build Node workspaces
         run: npx turbo build
@@ -275,7 +275,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install --include=optional
 
       - name: Build Node workspaces
         run: npx turbo build
@@ -364,7 +364,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node dependencies
-        run: npm ci
+        run: npm install --include=optional
 
       - name: Build Node workspaces
         run: npx turbo build
