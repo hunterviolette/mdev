@@ -211,15 +211,22 @@ export function ReviewDiffViewerPanel(props: ReviewDiffViewerPanelProps) {
   const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
   const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
 
-  const selectedTitle = state.selected_scope === 'staged' ? 'Staged diff' : 'Unstaged diff';
   const stagedTotals = useMemo(() => sumCounts(stagedFiles), [stagedFiles]);
   const unstagedTotals = useMemo(() => sumCounts(unstagedFiles), [unstagedFiles]);
   const allTotals = useMemo(() => sumCounts([...stagedFiles, ...unstagedFiles]), [stagedFiles, unstagedFiles]);
-  const selectedTotals = state.selected_scope === 'staged' ? stagedTotals : unstagedTotals;
   const selectedScopeFiles = useMemo(
     () => diffManifest?.files ?? (state.selected_scope === 'staged' ? stagedFiles : unstagedFiles),
     [diffManifest, state.selected_scope, stagedFiles, unstagedFiles]
   );
+  const selectedFile = state.selected_path
+    ? selectedScopeFiles.find((file) => file.path === state.selected_path) ?? null
+    : null;
+  const selectedTitle = selectedFile?.path ?? (state.selected_scope === 'staged' ? 'Staged diff' : 'Unstaged diff');
+  const selectedTotals = selectedFile
+    ? { additions: selectedFile.additions, deletions: selectedFile.deletions }
+    : state.selected_scope === 'staged'
+      ? stagedTotals
+      : unstagedTotals;
   const renderedDiffFileKeys = useMemo(
     () => selectedScopeFiles.map((file) => file.path),
     [selectedScopeFiles]
@@ -248,11 +255,13 @@ export function ReviewDiffViewerPanel(props: ReviewDiffViewerPanelProps) {
 
     try {
       const files = parsePatchFiles(diff.patch).flatMap((patch) => patch.files ?? []);
-      const selected = files.find((file) => file.name === state.selected_path) ?? null;
+      const selected =
+        files.find((file) => file.name === state.selected_path) ??
+        (files.length === 1 ? files[0] : null);
       return {
         fileCount: files.length,
-        containsSelectedFile: files.some((file) => file.name === state.selected_path),
-        isExactSelectedFilePayload: files.length === 1 && selected?.name === state.selected_path,
+        containsSelectedFile: Boolean(selected),
+        isExactSelectedFilePayload: files.length === 1 && Boolean(selected),
         selectedUnifiedLineCount: selected?.unifiedLineCount ?? 0,
       };
     } catch {
@@ -814,56 +823,68 @@ export function ReviewDiffViewerPanel(props: ReviewDiffViewerPanelProps) {
 
           <Box style={{ flex: 1, minHeight: 0 }}>
             <ScrollArea h="100%" type="auto">
-              <Stack gap="md">
-                <ScopeHeader
-                  title="Staged"
-                  active={state.selected_scope === 'staged' && state.selected_path === null}
-                  fileCount={stagedFiles.length}
-                  additions={stagedTotals.additions}
-                  deletions={stagedTotals.deletions}
-                  compactCounts={compactCounts}
-                  buttonLabel="Unstage all"
-                  actionBusy={actionBusy}
-                  onSelect={() => void patchState({ selected_scope: 'staged', selected_path: null })}
-                  onAction={() => runStageAction('unstage', 'staged', null)}
-                />
-                {stagedFiles.map((file) => (
-                  <FileRow
-                    key={`staged:${file.path}`}
-                    scope="staged"
-                    file={file}
-                    active={state.selected_scope === 'staged' && state.selected_path === file.path}
-                    actionBusy={actionBusy}
-                    onSelect={() => void patchState({ selected_scope: 'staged', selected_path: file.path })}
-                    onStage={() => runStageAction('stage', 'staged', file.path)}
-                    onUnstage={() => runStageAction('unstage', 'staged', file.path)}
-                  />
-                ))}
-                <Divider />
-                <ScopeHeader
-                  title="Unstaged"
-                  active={state.selected_scope === 'unstaged' && state.selected_path === null}
-                  fileCount={unstagedFiles.length}
-                  additions={unstagedTotals.additions}
-                  deletions={unstagedTotals.deletions}
-                  compactCounts={compactCounts}
-                  buttonLabel="Stage all"
-                  actionBusy={actionBusy}
-                  onSelect={() => void patchState({ selected_scope: 'unstaged', selected_path: null })}
-                  onAction={() => runStageAction('stage', 'unstaged', null)}
-                />
-                {unstagedFiles.map((file) => (
-                  <FileRow
-                    key={`unstaged:${file.path}`}
-                    scope="unstaged"
-                    file={file}
-                    active={state.selected_scope === 'unstaged' && state.selected_path === file.path}
-                    actionBusy={actionBusy}
-                    onSelect={() => void patchState({ selected_scope: 'unstaged', selected_path: file.path })}
-                    onStage={() => runStageAction('stage', 'unstaged', file.path)}
-                    onUnstage={() => runStageAction('unstage', 'unstaged', file.path)}
-                  />
-                ))}
+              <Stack gap="md" pr="xs">
+                <Card withBorder p="xs">
+                  <Stack gap="xs">
+                    <ScopeHeader
+                      title="Staged"
+                      active={state.selected_scope === 'staged' && state.selected_path === null}
+                      fileCount={stagedFiles.length}
+                      additions={stagedTotals.additions}
+                      deletions={stagedTotals.deletions}
+                      compactCounts={compactCounts}
+                      buttonLabel="Unstage all"
+                      actionBusy={actionBusy}
+                      onSelect={() => void patchState({ selected_scope: 'staged', selected_path: null })}
+                      onAction={() => runStageAction('unstage', 'staged', null)}
+                    />
+                    {stagedFiles.length > 0 ? stagedFiles.map((file) => (
+                      <FileRow
+                        key={`staged:${file.path}`}
+                        scope="staged"
+                        file={file}
+                        active={state.selected_scope === 'staged' && state.selected_path === file.path}
+                        actionBusy={actionBusy}
+                        onSelect={() => void patchState({ selected_scope: 'staged', selected_path: file.path })}
+                        onStage={() => runStageAction('stage', 'staged', file.path)}
+                        onUnstage={() => runStageAction('unstage', 'staged', file.path)}
+                      />
+                    )) : (
+                      <Text c="dimmed" size="xs" px="xs" py={4}>No staged files.</Text>
+                    )}
+                  </Stack>
+                </Card>
+
+                <Card withBorder p="xs">
+                  <Stack gap="xs">
+                    <ScopeHeader
+                      title="Unstaged"
+                      active={state.selected_scope === 'unstaged' && state.selected_path === null}
+                      fileCount={unstagedFiles.length}
+                      additions={unstagedTotals.additions}
+                      deletions={unstagedTotals.deletions}
+                      compactCounts={compactCounts}
+                      buttonLabel="Stage all"
+                      actionBusy={actionBusy}
+                      onSelect={() => void patchState({ selected_scope: 'unstaged', selected_path: null })}
+                      onAction={() => runStageAction('stage', 'unstaged', null)}
+                    />
+                    {unstagedFiles.length > 0 ? unstagedFiles.map((file) => (
+                      <FileRow
+                        key={`unstaged:${file.path}`}
+                        scope="unstaged"
+                        file={file}
+                        active={state.selected_scope === 'unstaged' && state.selected_path === file.path}
+                        actionBusy={actionBusy}
+                        onSelect={() => void patchState({ selected_scope: 'unstaged', selected_path: file.path })}
+                        onStage={() => runStageAction('stage', 'unstaged', file.path)}
+                        onUnstage={() => runStageAction('unstage', 'unstaged', file.path)}
+                      />
+                    )) : (
+                      <Text c="dimmed" size="xs" px="xs" py={4}>No unstaged files.</Text>
+                    )}
+                  </Stack>
+                </Card>
               </Stack>
             </ScrollArea>
           </Box>

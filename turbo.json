@@ -1,0 +1,39 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [
+    ".env",
+    ".env.example"
+  ],
+  "globalEnv": [
+    "WORKFLOW_API_HOST",
+    "WORKFLOW_API_PORT",
+    "WORKFLOW_WEB_HOST",
+    "WORKFLOW_WEB_PORT",
+    "WORKFLOW_BROWSER_CDP_HOST",
+    "WORKFLOW_BROWSER_CDP_PORT",
+    "WORKFLOW_BROWSER_BRIDGE_HOST",
+    "WORKFLOW_BROWSER_BRIDGE_PORT"
+  ],
+  "tasks": {
+    "build": {
+      "outputs": [
+        "dist/**",
+        "build/**",
+        ".vite/**",
+        "tsconfig.tsbuildinfo"
+      ]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "preview": {
+      "cache": false,
+      "persistent": true
+    },
+    "start": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

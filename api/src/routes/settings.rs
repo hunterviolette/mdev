@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::Row;
 
+use crate::runtime_env::{default_browser_bridge_url, default_browser_cdp_url};
+
 use crate::{
     app_state::AppState,
     models::{AppSettings, PatchAppSettingsRequest},
@@ -101,12 +103,14 @@ fn default_app_settings_value() -> Value {
         "browser": {
             "edge_executable_path": "",
             "chrome_executable_path": "",
-            "default_cdp_url": "http://127.0.0.1:9222",
+            "default_cdp_url": default_browser_cdp_url()
+                .expect("WORKFLOW_BROWSER_CDP_HOST and WORKFLOW_BROWSER_CDP_PORT must be set"),
             "default_inference_browser_url": "https://website.com/",
             "launch_on_connect": true
         },
         "bridges": {
-            "browser_bridge_url": "http://127.0.0.1:3001",
+            "browser_bridge_url": default_browser_bridge_url()
+                .expect("WORKFLOW_BROWSER_BRIDGE_HOST and WORKFLOW_BROWSER_BRIDGE_PORT must be set"),
             "auto_start": false,
             "poll_interval_ms": 2000,
             "connect_timeout_ms": 10000

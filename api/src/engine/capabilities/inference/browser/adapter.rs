@@ -257,7 +257,7 @@ fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
 
     let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
     let cdp_url = if cfg.cdp_url.trim().is_empty() {
-        "http://127.0.0.1:9222".to_string()
+        crate::runtime_env::default_browser_cdp_url()?
     } else {
         cfg.cdp_url.clone()
     };
@@ -268,14 +268,15 @@ fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
         .unwrap_or(cdp_url.trim())
         .split('/')
         .next()
-        .unwrap_or("127.0.0.1:9222")
+        .filter(|value| !value.trim().is_empty())
+        .context("browser CDP URL is missing host/port")?
         .to_string();
     let port = host_port
-        .split(':')
-        .nth(1)
-        .unwrap_or("9222")
+        .rsplit(':')
+        .next()
+        .context("browser CDP URL is missing port")?
         .parse::<u16>()
-        .unwrap_or(9222);
+        .context("browser CDP URL has invalid port")?;
     let launch_url = normalize_browser_url_for_launch(&cfg.target_url);
 
     info!(executable = %executable, user_data_dir = %user_data_dir.display(), port, launch_url = %launch_url, "launching Edge with remote debugging");

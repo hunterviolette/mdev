@@ -6,6 +6,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::runtime_env::default_browser_cdp_url as runtime_default_browser_cdp_url;
+
 use super::registry::{
     CapabilityContext,
     CapabilityInvocation,
@@ -277,7 +279,8 @@ fn default_profile() -> String {
 }
 
 fn default_cdp_url() -> String {
-    "http://127.0.0.1:9222".to_string()
+    runtime_default_browser_cdp_url()
+        .expect("WORKFLOW_BROWSER_CDP_HOST and WORKFLOW_BROWSER_CDP_PORT must be set")
 }
 
 fn default_model() -> String {

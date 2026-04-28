@@ -1,0 +1,28 @@
+{
+  "private": true,
+  "packageManager": "npm@10.9.2",
+  "workspaces": [
+    "web",
+    "bridge",
+    "adt-bridge"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,node \"npm run dev:api\" \"turbo dev --parallel\"",
+    "dev:api": "cd api && cargo run",
+    "dev:web": "turbo dev --filter=./web",
+    "dev:bridge": "turbo dev --filter=./bridge",
+    "dev:adt-bridge": "turbo dev --filter=./adt-bridge",
+    "build": "turbo build && npm run build:api",
+    "build:api": "cd api && cargo build",
+    "build:web": "turbo build --filter=./web",
+    "build:bridge": "turbo build --filter=./bridge",
+    "build:adt-bridge": "turbo build --filter=./adt-bridge",
+    "start:web": "npm run preview -w web",
+    "start:bridge": "npm run start -w bridge",
+    "start:adt-bridge": "npm run start -w adt-bridge"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "turbo": "^2.5.0"
+  }
+}

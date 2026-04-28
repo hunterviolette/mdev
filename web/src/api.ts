@@ -697,6 +697,168 @@ export function getReviewFilePatch(body: {
   });
 }
 
+export type ReviewCommitSummary = {
+  sha: string;
+  short_sha: string;
+  subject: string;
+  author_name: string;
+  author_email: string;
+  authored_at: string;
+  files_changed?: number | null;
+  additions?: number | null;
+  deletions?: number | null;
+};
+
+export type ReviewCommitListResponse = {
+  ok: boolean;
+  commits: ReviewCommitSummary[];
+  next_offset?: number | null;
+  has_more: boolean;
+};
+
+export type ReviewCommitReportExtensionBucket = {
+  extension: string;
+  additions: number;
+  deletions: number;
+  net: number;
+};
+
+export type ReviewCommitReportMonthBucket = {
+  month: string;
+  additions: number;
+  deletions: number;
+  net: number;
+  files_changed: number;
+  commits: number;
+  extensions: ReviewCommitReportExtensionBucket[];
+  groups?: ReviewCommitReportGroupBucket[];
+};
+
+export type ReviewCommitReportGroupBucket = {
+  key: string;
+  label: string;
+  additions: number;
+  deletions: number;
+  net: number;
+};
+
+export type ReviewCommitReportBucket = {
+  period: string;
+  additions: number;
+  deletions: number;
+  net: number;
+  files_changed: number;
+  commits: number;
+  groups: ReviewCommitReportGroupBucket[];
+};
+
+export type ReviewCommitReportResponse = {
+  ok: boolean;
+  commits: ReviewCommitSummary[];
+  months: ReviewCommitReportMonthBucket[];
+  buckets?: ReviewCommitReportBucket[];
+  aggregation_window?: string;
+  color_by?: string;
+  exclude_regex: string[];
+  next_offset?: number | null;
+  has_more: boolean;
+};
+
+export type ReviewCommitRefOption = {
+  value: string;
+  label: string;
+};
+
+export type ReviewCommitOptionsResponse = {
+  ok: boolean;
+  refs: ReviewCommitRefOption[];
+  default_ref: string;
+  default_since?: string | null;
+};
+
+export type ReviewCommitDiffManifestResponse = {
+  ok: boolean;
+  commit: string;
+  from_ref: string;
+  to_ref: string;
+  files: ReviewDiffManifestFileEntry[];
+};
+
+export type ReviewCommitDiffResponse = {
+  ok: boolean;
+  commit: string;
+  path?: string | null;
+  from_ref: string;
+  to_ref: string;
+  patch: string;
+};
+
+export function getReviewCommits(body: {
+  repo_ref: string;
+  limit?: number;
+  offset?: number;
+  since?: string | null;
+  until?: string | null;
+  exclude_regex?: string[] | null;
+}) {
+  return fetchJson<ReviewCommitListResponse>('/api/review/commits', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitReport(body: {
+  repo_ref: string;
+  limit?: number;
+  offset?: number;
+  ref_name?: string | null;
+  aggregation_window?: string | null;
+  color_by?: string | null;
+  since?: string | null;
+  until?: string | null;
+  include_paths?: string[] | null;
+  exclude_paths?: string[] | null;
+  include_extensions?: string[] | null;
+  exclude_extensions?: string[] | null;
+  include_regex?: string[] | null;
+  exclude_regex?: string[] | null;
+}) {
+  return fetchJson<ReviewCommitReportResponse>('/api/review/commit-dataset', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitOptions(body: { repo_ref: string }) {
+  return fetchJson<ReviewCommitOptionsResponse>('/api/review/commit-options', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitDiffManifest(body: {
+  repo_ref: string;
+  commit: string;
+}) {
+  return fetchJson<ReviewCommitDiffManifestResponse>('/api/review/commit/diff/manifest', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitDiff(body: {
+  repo_ref: string;
+  commit: string;
+  path?: string | null;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewCommitDiffResponse>('/api/review/commit/diff', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
 export function stageReviewDiff(body: {
   repo_ref: string;
   scope: ReviewDiffScope;

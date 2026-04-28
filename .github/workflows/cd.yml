@@ -13,8 +13,15 @@ permissions:
 
 env:
   APP_NAME: mdev
+  CARGO_BIN_NAME: workflow-api
   NODE_VERSION: 24.14.0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  WORKFLOW_API_HOST: 127.0.0.1
+  WORKFLOW_API_PORT: 8788
+  WORKFLOW_WEB_HOST: 127.0.0.1
+  WORKFLOW_WEB_PORT: 5173
+  WORKFLOW_BROWSER_CDP_HOST: 127.0.0.1
+  WORKFLOW_BROWSER_CDP_PORT: 9222
 
 jobs:
   verify-ci:
@@ -54,16 +61,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build bridge
-        working-directory: bridge
-        run: |
-          npm ci
-          npm run build
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build Node workspaces
+        run: npx turbo build
 
       - name: Build Rust app
+        working-directory: api
         run: cargo build --release
 
       - name: Download Node runtime
@@ -80,11 +90,19 @@ jobs:
           APP_ROOT="dist/${APP_NAME}.app/Contents"
           MACOS_DIR="$APP_ROOT/MacOS"
 
-          mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
+          mkdir -p \
+            "$MACOS_DIR/runtime" \
+            "$MACOS_DIR/bridge/dist" \
+            "$MACOS_DIR/adt-bridge/dist" \
+            "$MACOS_DIR/web/dist"
 
-          cp "target/release/${APP_NAME}" "$MACOS_DIR/${APP_NAME}"
+          cp "api/target/release/${CARGO_BIN_NAME}" "$MACOS_DIR/${APP_NAME}"
           cp "node-dist/node-v${NODE_VERSION}-darwin-x64/bin/node" "$MACOS_DIR/runtime/node"
+
           cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
+          cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
+          cp -R web/dist/. "$MACOS_DIR/web/dist/"
+
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
 
           export APP_ROOT VERSION
@@ -92,9 +110,9 @@ jobs:
           import os
           from pathlib import Path
 
-          info = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-          <plist version=\"1.0\">
+          info = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
             <dict>
               <key>CFBundleDisplayName</key>
               <string>mdev</string>
@@ -107,9 +125,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>{os.environ[\"VERSION\"]}</string>
+              <string>{os.environ["VERSION"]}</string>
               <key>CFBundleVersion</key>
-              <string>{os.environ[\"GITHUB_RUN_NUMBER\"]}</string>
+              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
               <key>LSMinimumSystemVersion</key>
               <string>12.0</string>
             </dict>
@@ -147,16 +165,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build bridge
-        working-directory: bridge
-        run: |
-          npm ci
-          npm run build
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build Node workspaces
+        run: npx turbo build
 
       - name: Build Rust app
+        working-directory: api
         run: cargo build --release
 
       - name: Download Node runtime
@@ -173,11 +194,19 @@ jobs:
           APP_ROOT="dist/${APP_NAME}.app/Contents"
           MACOS_DIR="$APP_ROOT/MacOS"
 
-          mkdir -p "$MACOS_DIR/runtime" "$MACOS_DIR/bridge/dist"
+          mkdir -p \
+            "$MACOS_DIR/runtime" \
+            "$MACOS_DIR/bridge/dist" \
+            "$MACOS_DIR/adt-bridge/dist" \
+            "$MACOS_DIR/web/dist"
 
-          cp "target/release/${APP_NAME}" "$MACOS_DIR/${APP_NAME}"
+          cp "api/target/release/${CARGO_BIN_NAME}" "$MACOS_DIR/${APP_NAME}"
           cp "node-dist/node-v${NODE_VERSION}-darwin-arm64/bin/node" "$MACOS_DIR/runtime/node"
+
           cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
+          cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
+          cp -R web/dist/. "$MACOS_DIR/web/dist/"
+
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
 
           export APP_ROOT VERSION
@@ -185,9 +214,9 @@ jobs:
           import os
           from pathlib import Path
 
-          info = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-          <plist version=\"1.0\">
+          info = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
             <dict>
               <key>CFBundleDisplayName</key>
               <string>mdev</string>
@@ -200,9 +229,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>{os.environ[\"VERSION\"]}</string>
+              <string>{os.environ["VERSION"]}</string>
               <key>CFBundleVersion</key>
-              <string>{os.environ[\"GITHUB_RUN_NUMBER\"]}</string>
+              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
               <key>LSMinimumSystemVersion</key>
               <string>12.0</string>
             </dict>
@@ -240,16 +269,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build bridge
-        working-directory: bridge
-        run: |
-          npm ci
-          npm run build
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build Node workspaces
+        run: npx turbo build
 
       - name: Build Rust app
+        working-directory: api
         run: cargo build --release
 
       - name: Download Node runtime
@@ -266,10 +298,21 @@ jobs:
           ROOT="dist/debroot"
           APPDIR="$ROOT/opt/${APP_NAME}"
 
-          mkdir -p "$ROOT/DEBIAN" "$APPDIR/runtime" "$APPDIR/bridge/dist" "$ROOT/usr/bin"
-          cp "target/release/${APP_NAME}" "$APPDIR/${APP_NAME}"
+          mkdir -p \
+            "$ROOT/DEBIAN" \
+            "$ROOT/usr/bin" \
+            "$APPDIR/runtime" \
+            "$APPDIR/bridge/dist" \
+            "$APPDIR/adt-bridge/dist" \
+            "$APPDIR/web/dist"
+
+          cp "api/target/release/${CARGO_BIN_NAME}" "$APPDIR/${APP_NAME}"
           cp "node-dist/node-v${NODE_VERSION}-linux-x64/bin/node" "$APPDIR/runtime/node"
+
           cp -R bridge/dist/. "$APPDIR/bridge/dist/"
+          cp -R adt-bridge/dist/. "$APPDIR/adt-bridge/dist/"
+          cp -R web/dist/. "$APPDIR/web/dist/"
+
           chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
           ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
 
@@ -278,8 +321,8 @@ jobs:
           import os
           from pathlib import Path
 
-          control = f"""Package: {os.environ[\"APP_NAME\"]}
-          Version: {os.environ[\"VERSION\"]}
+          control = f"""Package: {os.environ["APP_NAME"]}
+          Version: {os.environ["VERSION"]}
           Section: utils
           Priority: optional
           Architecture: amd64
@@ -315,16 +358,19 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build bridge
-        working-directory: bridge
-        run: |
-          npm ci
-          npm run build
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build Node workspaces
+        run: npx turbo build
 
       - name: Build Rust app
+        working-directory: api
         run: cargo build --release
 
       - name: Download Node runtime
@@ -338,11 +384,18 @@ jobs:
         shell: pwsh
         run: |
           $root = "dist/app"
+
           New-Item -ItemType Directory -Force -Path "$root/runtime" | Out-Null
           New-Item -ItemType Directory -Force -Path "$root/bridge/dist" | Out-Null
-          Copy-Item "target/release/mdev.exe" "$root/mdev.exe"
+          New-Item -ItemType Directory -Force -Path "$root/adt-bridge/dist" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root/web/dist" | Out-Null
+
+          Copy-Item "api/target/release/$env:CARGO_BIN_NAME.exe" "$root/$env:APP_NAME.exe"
           Copy-Item "node-dist/node-v$env:NODE_VERSION-win-x64/node.exe" "$root/runtime/node.exe"
+
           Copy-Item "bridge/dist/*" "$root/bridge/dist/" -Recurse
+          Copy-Item "adt-bridge/dist/*" "$root/adt-bridge/dist/" -Recurse
+          Copy-Item "web/dist/*" "$root/web/dist/" -Recurse
 
       - name: Install Inno Setup
         shell: pwsh

@@ -2,9 +2,10 @@ mod app_state;
 mod db;
 mod engine;
 mod models;
+mod runtime_env;
 mod routes;
 
-use std::{env, fs, net::SocketAddr, path::{Path, PathBuf}};
+use std::{env, fs, path::{Path, PathBuf}};
 
 use anyhow::Context;
 use dotenvy::dotenv;
@@ -31,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let repo_root = detect_repo_root(&cwd).context("failed to locate repo root containing web/ and api/")?;
+    let _ = dotenvy::from_path(repo_root.join(".env"));
 
     let data_dir = repo_root.join(".data");
     fs::create_dir_all(&data_dir).context("failed to create .data directory")?;
@@ -46,9 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let web_dist = repo_root.join("web").join("dist");
     let app = build_router(state, &web_dist);
 
-    let addr: SocketAddr = "127.0.0.1:8787"
-        .parse()
-        .context("invalid bind address")?;
+    let addr = crate::runtime_env::workflow_api_bind_addr()?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, web_dist = %web_dist.display(), "workflow api listening");

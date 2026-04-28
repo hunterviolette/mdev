@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::engine::capabilities::inference::BrowserConfig as BrowserTurnConfig;
 use crate::engine::capabilities::inference::browser::adapter as browser_bridge;
+use crate::runtime_env::default_browser_cdp_url;
 use super::sap_adt_manifest::{
     SapAdtManifestDocument,
     SapAdtManifestResource,
@@ -1146,7 +1147,8 @@ fn browser_cfg_from_state(sap: &SapAdtState) -> BrowserTurnConfig {
     BrowserTurnConfig {
         edge_executable: browser_executable_for_adt(),
         user_data_dir: String::new(),
-        cdp_url: "http://127.0.0.1:9222".to_string(),
+        cdp_url: default_browser_cdp_url()
+            .expect("WORKFLOW_BROWSER_CDP_HOST and WORKFLOW_BROWSER_CDP_PORT must be set"),
         page_url_contains,
         profile: browser_profile_for_adt(sap),
         session_id: sap.browser_session_id.clone(),

@@ -87,6 +87,11 @@ const ReviewDiffViewerPanel = lazy(async () => {
   return { default: mod.ReviewDiffViewerPanel };
 });
 
+const CommitSummaryPanel = lazy(async () => {
+  const mod = await import('./CommitSummaryPanel');
+  return { default: mod.CommitSummaryPanel };
+});
+
 const RepoMonacoFileEditorPanel = lazy(async () => {
   const mod = await import('./RepoMonacoFileEditorPanel');
   return { default: mod.RepoMonacoFileEditorPanel };
@@ -129,7 +134,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type WorkspaceTabKey = 'workflows' | 'diff' | 'files' | 'capabilities';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -364,7 +369,7 @@ const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
                 label="CDP URL"
                 value={browserCdpUrl}
                 onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
-                placeholder="http://127.0.0.1:9222"
+                placeholder="Backend default"
                 disabled={inferenceTransport !== 'browser'}
               />
             </SimpleGrid>
@@ -1198,7 +1203,7 @@ export function WorkflowShell() {
 
   const [inferenceTransport, setInferenceTransport] = useState<InferenceTransport>('api');
   const [browserTargetUrl, setBrowserTargetUrl] = useState('https://website.com/');
-  const [browserCdpUrl, setBrowserCdpUrl] = useState('http://127.0.0.1:9222');
+  const [browserCdpUrl, setBrowserCdpUrl] = useState('');
   const [browserSessionId, setBrowserSessionId] = useState('');
   const [browserProbe, setBrowserProbe] = useState<BrowserProbeResult | null>(null);
   const [inferenceBusy, setInferenceBusy] = useState(false);
@@ -1493,7 +1498,7 @@ export function WorkflowShell() {
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
 
-  const reviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
+  const persistedReviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
     return {
@@ -1507,6 +1512,20 @@ export function WorkflowShell() {
       whole_file: Boolean(sourceControl.whole_file)
     };
   }, [selectedStageState]);
+  const [localReviewSourceControlState, setLocalReviewSourceControlState] = useState<ReviewSourceControlState>({
+    selected_scope: 'unstaged',
+    selected_path: null,
+    diff_style: 'unified',
+    only_changes: true,
+    context_lines: 10,
+    whole_file: false
+  });
+  useEffect(() => {
+    if (selectedWorkflowStep?.step_type === 'review') {
+      setLocalReviewSourceControlState(persistedReviewSourceControlState);
+    }
+  }, [persistedReviewSourceControlState, selectedWorkflowStep?.step_type]);
+  const reviewSourceControlState = localReviewSourceControlState;
 
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
   const selectedRepoPathSet = useMemo(() => new Set(selectedRepoPaths), [selectedRepoPaths]);
@@ -1657,7 +1676,7 @@ export function WorkflowShell() {
     if (!inference) {
       setInferenceTransport('api');
       setBrowserTargetUrl('https://website.com/');
-      setBrowserCdpUrl('http://127.0.0.1:9222');
+      setBrowserCdpUrl('');
       setBrowserSessionId('');
       setBrowserProbe(null);
       return;
@@ -1667,7 +1686,7 @@ export function WorkflowShell() {
 
     const browser = (inference.browser ?? {}) as Record<string, unknown>;
     setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : 'http://127.0.0.1:9222');
+    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
     setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
     setBrowserProbe(null);
   }, [sharedInferenceState, selectedRun?.id]);
@@ -1781,7 +1800,7 @@ export function WorkflowShell() {
     setBrowserCdpUrl(
       typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
         ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
-        : 'http://127.0.0.1:9222'
+        : ''
     );
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
@@ -1860,7 +1879,7 @@ export function WorkflowShell() {
           },
           browser: {
             ...currentInferenceBrowser,
-            cdp_url: browserCdpUrl || 'http://127.0.0.1:9222',
+            ...(browserCdpUrl.trim() ? { cdp_url: browserCdpUrl.trim() } : {}),
             target_url: browserTargetUrl,
             session_id: browserSessionId.trim() || null
           }
@@ -3176,6 +3195,331 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+type MarkdownSegment =
+  | { kind: 'heading'; level: number; text: string }
+  | { kind: 'code'; language: string; text: string }
+  | { kind: 'paragraph'; text: string };
+
+function parseLightMarkdown(input: string): MarkdownSegment[] {
+  const lines = input.split(/\r?\n/);
+  const segments: MarkdownSegment[] = [];
+
+  let paragraph: string[] = [];
+  let inCode = false;
+  let codeLanguage = '';
+  let codeLines: string[] = [];
+
+  function flushParagraph() {
+    const text = paragraph.join('\n').trim();
+    if (text) {
+      segments.push({ kind: 'paragraph', text });
+    }
+    paragraph = [];
+  }
+
+  for (const line of lines) {
+    const fence = line.match(/^```([A-Za-z0-9_-]*)\s*$/);
+
+    if (fence) {
+      if (inCode) {
+        segments.push({
+          kind: 'code',
+          language: codeLanguage,
+          text: codeLines.join('\n'),
+        });
+        inCode = false;
+        codeLanguage = '';
+        codeLines = [];
+      } else {
+        flushParagraph();
+        inCode = true;
+        codeLanguage = fence[1] ?? '';
+        codeLines = [];
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      segments.push({
+        kind: 'heading',
+        level: heading[1].length,
+        text: heading[2],
+      });
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      continue;
+    }
+
+    paragraph.push(line);
+  }
+
+  if (inCode) {
+    segments.push({
+      kind: 'code',
+      language: codeLanguage,
+      text: codeLines.join('\n'),
+    });
+  }
+
+  flushParagraph();
+  return segments;
+}
+
+function looksLikeChangesetPayload(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed
+    .replace(/^```(?:json|changeset)?\s*/i, '')
+    .replace(/```$/i, '')
+    .replace(/\\"/g, '"');
+
+  return (
+    normalized.includes('"version"') &&
+    normalized.includes('"operations"') &&
+    normalized.includes('"op"')
+  );
+}
+
+function compactPreviewTitle(heading: string | null, text: string): string | null {
+  const normalizedHeading = heading?.trim().toLowerCase() ?? '';
+
+  if (normalizedHeading === 'changeset schema') {
+    return 'Changeset schema';
+  }
+
+  if (normalizedHeading === 'output' && looksLikeChangesetPayload(text)) {
+    return 'Changeset output';
+  }
+
+  if (!normalizedHeading && looksLikeChangesetPayload(text)) {
+    return 'Changeset payload';
+  }
+
+  return null;
+}
+
+function normalizeCompactPreviewContent(content: string): string {
+  const trimmed = content.trim();
+  const withoutLanguagePrefix = trimmed.replace(/^(JSON|json|CHANGESET|changeset)\s*(?=\{)/, '');
+
+  if (withoutLanguagePrefix.includes('\\n') && !withoutLanguagePrefix.includes('\n')) {
+    return withoutLanguagePrefix
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '  ')
+      .replace(/\\"/g, '"');
+  }
+
+  return withoutLanguagePrefix.replace(/\\"/g, '"');
+}
+
+function CompactPreviewBlock(props: { title: string; content: string; language?: string }) {
+  const [opened, setOpened] = useState(false);
+  const displayContent = normalizeCompactPreviewContent(props.content);
+  const lineCount = displayContent ? displayContent.split(/\r?\n/).length : 0;
+
+  return (
+    <>
+      <Box
+        p="sm"
+        style={{
+          border: '1px solid var(--mantine-color-dark-4)',
+          borderRadius: 12,
+          background: 'rgba(255,255,255,0.03)',
+        }}
+      >
+        <Group justify="space-between" align="center" gap="sm" wrap="nowrap">
+          <Stack gap={2} style={{ minWidth: 0 }}>
+            <Text fw={600} size="sm">{props.title}</Text>
+            <Text size="xs" c="dimmed">
+              Hidden by default · {lineCount.toLocaleString()} lines · {displayContent.length.toLocaleString()} chars
+            </Text>
+          </Stack>
+          <Button size="xs" variant="light" onClick={() => setOpened(true)}>
+            Open
+          </Button>
+        </Group>
+      </Box>
+
+      <Modal
+        opened={opened}
+        onClose={() => setOpened(false)}
+        title={props.title}
+        size="90vw"
+        centered
+        scrollAreaComponent={ScrollArea.Autosize}
+        styles={{
+          content: { height: '88vh' },
+          body: { height: 'calc(88vh - 72px)' },
+        }}
+      >
+        <Stack gap="xs" h="100%">
+          <Group justify="space-between" align="center">
+            <Text size="xs" c="dimmed">
+              {lineCount.toLocaleString()} lines · {displayContent.length.toLocaleString()} chars
+            </Text>
+            <Button size="xs" variant="light" onClick={() => setOpened(false)}>
+              Close
+            </Button>
+          </Group>
+
+          <Box
+            component="pre"
+            p="md"
+            style={{
+              flex: 1,
+              minHeight: 0,
+              margin: 0,
+              border: '1px solid var(--mantine-color-dark-4)',
+              borderRadius: 12,
+              overflow: 'auto',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              wordBreak: 'break-word',
+              fontFamily:
+                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace',
+              fontSize: 13,
+              lineHeight: 1.55,
+              background: 'rgba(0,0,0,0.22)',
+            }}
+          >
+            {props.language ? (
+              <Text component="div" size="xs" c="dimmed" mb="xs">
+                {props.language}
+              </Text>
+            ) : null}
+            <code>{displayContent}</code>
+          </Box>
+        </Stack>
+      </Modal>
+    </>
+  );
+}
+
+function MarkdownPreviewContent(props: { content: string; emptyText: string }) {
+  const text = props.content || props.emptyText;
+  const segments = parseLightMarkdown(text);
+  let activeHeading: string | null = null;
+  const hiddenIndexes = new Set<number>();
+
+  return (
+    <Stack gap="sm">
+      {segments.map((segment, index) => {
+        if (hiddenIndexes.has(index)) {
+          return null;
+        }
+
+        if (segment.kind === 'heading') {
+          activeHeading = segment.text;
+          const next = segments[index + 1];
+          const nextText = next?.kind === 'paragraph' || next?.kind === 'code' ? next.text : '';
+          const compactTitle = compactPreviewTitle(segment.text, nextText);
+
+          if (compactTitle && next) {
+            hiddenIndexes.add(index + 1);
+            return (
+              <CompactPreviewBlock
+                key={index}
+                title={compactTitle}
+                content={nextText}
+                language={next.kind === 'code' ? next.language : undefined}
+              />
+            );
+          }
+
+          return (
+            <Title
+              key={index}
+              order={Math.min(Math.max(segment.level + 2, 4), 6) as 4 | 5 | 6}
+              mt={index === 0 ? 0 : 'sm'}
+            >
+              {segment.text}
+            </Title>
+          );
+        }
+
+        if (segment.kind === 'code') {
+          const compactTitle = compactPreviewTitle(activeHeading, segment.text);
+          if (compactTitle) {
+            return (
+              <CompactPreviewBlock
+                key={index}
+                title={compactTitle}
+                content={segment.text}
+                language={segment.language}
+              />
+            );
+          }
+
+          return (
+            <Box
+              key={index}
+              component="pre"
+              p="md"
+              style={{
+                margin: 0,
+                border: '1px solid var(--mantine-color-dark-4)',
+                borderRadius: 12,
+                overflowX: 'auto',
+                whiteSpace: 'pre',
+                fontFamily:
+                  'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace',
+                fontSize: 13,
+                lineHeight: 1.55,
+                background: 'rgba(0,0,0,0.22)',
+              }}
+            >
+              {segment.language ? (
+                <Text component="div" size="xs" c="dimmed" mb="xs">
+                  {segment.language}
+                </Text>
+              ) : null}
+              <code>{segment.text}</code>
+            </Box>
+          );
+        }
+
+        const compactTitle = compactPreviewTitle(activeHeading, segment.text);
+        if (compactTitle) {
+          return (
+            <CompactPreviewBlock
+              key={index}
+              title={compactTitle}
+              content={segment.text}
+            />
+          );
+        }
+
+        return (
+          <Text
+            key={index}
+            size="sm"
+            style={{
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              wordBreak: 'break-word',
+              lineHeight: 1.7,
+            }}
+          >
+            {segment.text}
+          </Text>
+        );
+      })}
+    </Stack>
+  );
+}
+
 function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
     return (
       <Stack gap="xs" h="100%">
@@ -3188,10 +3532,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Button>
           </Group>
         </Group>
-        <Box p="md" h="100%" style={{ flex: 1, border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, minHeight: 220, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
-          <Text size="sm" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', lineHeight: 1.7, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace' }}>
-            {content || emptyText}
-          </Text>
+        <Box p="md" h="100%" style={{ flex: 1, border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, minHeight: 220, overflow: 'auto', background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
+          <MarkdownPreviewContent content={content} emptyText={emptyText} />
         </Box>
       </Stack>
     );
@@ -3381,6 +3723,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
   }
 
   async function persistReviewSourceControlState(next: ReviewSourceControlState) {
+    setLocalReviewSourceControlState(next);
     if (!selectedRun || !selectedWorkflowStep) return;
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     await patchWorkflowStageState(selectedRun.id, selectedWorkflowStep.id, {
@@ -3446,7 +3789,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     const browser = ((inference.browser as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
     setInferenceTransport(((typeof inference.transport === 'string' ? inference.transport : 'api') as InferenceTransport) ?? 'api');
     setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : '');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : 'http://127.0.0.1:9222');
+    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
     setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
   }
 
@@ -3602,13 +3945,16 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     try {
       setInferenceBusy(true);
       setInferenceStatus(null);
+      const browserPatch: Record<string, unknown> = {
+        target_url: browserTargetUrl.trim(),
+        session_id: browserSessionId.trim(),
+      };
+      if (browserCdpUrl.trim()) {
+        browserPatch.cdp_url = browserCdpUrl.trim();
+      }
       const inferencePatch = {
         transport: inferenceTransport,
-        browser: {
-          target_url: browserTargetUrl.trim(),
-          cdp_url: browserCdpUrl.trim(),
-          session_id: browserSessionId.trim(),
-        },
+        browser: browserPatch,
       };
       if (view === 'builder') {
         saveBuilderCapability('inference', inferencePatch);
@@ -3730,12 +4076,19 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
       if (key === '3') {
         if (hasRepoRef) {
-          setActiveWorkspaceTab('files');
+          setActiveWorkspaceTab('commits');
         }
         return;
       }
 
       if (key === '4') {
+        if (hasRepoRef) {
+          setActiveWorkspaceTab('files');
+        }
+        return;
+      }
+
+      if (key === '5') {
         setActiveWorkspaceTab('capabilities');
       }
     };
@@ -3756,8 +4109,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <Tabs.List>
                 <Tabs.Tab value="workflows">Workflow (Alt+1)</Tabs.Tab>
                 <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
-                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+3)</Tabs.Tab>
-                <Tabs.Tab value="capabilities">Capabilities (Alt+4)</Tabs.Tab>
+                <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
+                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
+                <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
               </Tabs.List>
             </Tabs>
           ) : null}
@@ -3864,6 +4218,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 onPersistState={persistReviewSourceControlState}
                 forceViewerOpen
               />
+            </Suspense>
+          ) : activeWorkspaceTab === 'commits' ? (
+            <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading commit summary…</Text></Group></Card>}>
+              <CommitSummaryPanel repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()} />
             </Suspense>
           ) : activeWorkspaceTab === 'files' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
@@ -4455,7 +4813,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     label="CDP URL"
                     value={browserCdpUrl}
                     onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
-                    placeholder="http://127.0.0.1:9222"
+                    placeholder="Backend default"
                   />
                 </SimpleGrid>
                 <Alert color="blue">Only backend-owned inference fields are persisted here. Browser defaults and runtime session behavior stay on the backend.</Alert>
@@ -4595,9 +4953,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             <Box p="lg" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
               <ScrollArea h="82vh" offsetScrollbars>
                 <Box maw={920} mx="auto">
-                  <Text size="sm" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', wordBreak: 'break-word', lineHeight: 1.8, letterSpacing: '0.01em', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace' }}>
-                    {previewViewerMode === 'stream' ? (stageStreamContent || 'No stage stream yet.') : previewViewerMode === 'prompt' ? (composedInferencePrompt || 'No prompt fragments enabled yet.') : (inferenceResponse || 'No inference response yet.')}
-                  </Text>
+                  <MarkdownPreviewContent
+                    content={previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse}
+                    emptyText={previewViewerMode === 'stream' ? 'No stage stream yet.' : previewViewerMode === 'prompt' ? 'No prompt fragments enabled yet.' : 'No inference response yet.'}
+                  />
                 </Box>
               </ScrollArea>
             </Box>
