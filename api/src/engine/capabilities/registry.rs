@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset_schema, compile_commands, context_export, gateway_model, inference, sap};
+use super::{changeset, compile_commands, context_export, git_patch_payload, inference, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -335,9 +335,10 @@ async fn dispatch(
     match invocation.capability.as_str() {
         "inference" => inference::execute(ctx, prior_results, invocation.config).await,
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
-        "changeset_schema" => changeset_schema::execute(ctx, prior_results, invocation.config).await,
-        "gateway_model/changeset" => gateway_model::changeset::execute(ctx, prior_results, invocation.config).await,
+        "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
+        "gateway_model/changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
+        "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
         "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,
         "sap/export" => sap::export::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),

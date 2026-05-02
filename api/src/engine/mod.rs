@@ -21,7 +21,7 @@ pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let row = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
     .bind(run_id.to_string())
     .fetch_one(&state.db)
@@ -44,6 +44,7 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
         current_step_id: row.get("current_step_id"),
         title: row.get("title"),
         repo_ref: row.get("repo_ref"),
+        workflow_key: row.get("workflow_key"),
         context: serde_json::from_str(row.get::<String, _>("context_json").as_str())?,
         created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())?.with_timezone(&chrono::Utc),
         updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())?.with_timezone(&chrono::Utc),
@@ -262,16 +263,21 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
         .ok_or_else(|| anyhow!("unknown step_id {}", step_id))?;
 
     run.current_step_id = Some(step.id.clone());
-    run.status = RunStatus::Paused;
+    run.status = RunStatus::Waiting;
 
     let decisions = governance::before_stage(state, run_id, &mut run, step).await?;
     governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
     refresh_inference_arm_state(&mut run, Some(step));
 
     update_run_context(&state.db, run_id, &run.context).await?;
-    update_run_status(&state.db, run_id, RunStatus::Paused, Some(step.id.as_str())).await?;
+    update_run_status(&state.db, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
 
-    Ok(json!({ "ok": true, "current_step_id": step.id }))
+    Ok(json!({
+        "ok": true,
+        "run_id": run_id,
+        "current_step_id": step.id,
+        "status": "waiting"
+    }))
 }
 
 pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) -> Result<Value> {

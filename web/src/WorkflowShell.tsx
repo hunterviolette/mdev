@@ -30,19 +30,24 @@ import {
 import { IconPlayerPause, IconPlayerPlay, IconRefresh, IconTrash } from '@tabler/icons-react';
 import {
   createRun,
+  applyWorkflowChangeset,
+  executeWorkflowCapability,
   createTemplate,
   deleteRun,
   deleteTemplate,
   getEventChainSummary,
+  getWorkflowChangeset,
   getChangesetSchema,
   getRun,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
   listRepoTree,
+  listWorkflowRepoTree,
   listRunEvents,
   validateRepoRef,
   listRuns,
+  listWorkflowChangesets,
   listTemplates,
   openEventStream,
   patchWorkflowGlobalState,
@@ -57,6 +62,8 @@ import {
   startWorkflowRun,
   type AutomationMode,
   type BrowserProbeResult,
+  type ApplyChangesetResponse,
+  type ChangesetAttemptSummary,
   type EventChainSummaryItem,
   type EventChainSummaryResponse,
   type InferenceTransport,
@@ -104,6 +111,7 @@ function openBuilderCapabilityConfig(
     openInference: () => void;
     openSchema: () => void;
     openApplyChangeset: () => void;
+    openGitPatchPayload: () => void;
   }
 ) {
   const normalized = capabilityKey.trim().toLowerCase();
@@ -122,6 +130,11 @@ function openBuilderCapabilityConfig(
     case 'changeset_apply':
     case 'changeset apply':
       handlers.openApplyChangeset();
+      return;
+    case 'git_patch_payload':
+    case 'git patch payload':
+    case 'git_patch':
+      handlers.openGitPatchPayload();
       return;
     case 'compile_commands':
       return;
@@ -1240,6 +1253,17 @@ export function WorkflowShell() {
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
+  const [globalApplyChangesetResult, setGlobalApplyChangesetResult] = useState<ApplyChangesetResponse | null>(null);
+  const [globalApplyChangesetPanelMode, setGlobalApplyChangesetPanelMode] = useState<'input' | 'output'>('input');
+  const [globalApplyChangesetHistory, setGlobalApplyChangesetHistory] = useState<ChangesetAttemptSummary[]>([]);
+  const [globalApplyChangesetHistoryBusy, setGlobalApplyChangesetHistoryBusy] = useState(false);
+  const [gitPatchPayloadOpen, setGitPatchPayloadOpen] = useState(false);
+  const [gitPatchPayloadMode, setGitPatchPayloadMode] = useState<'generate' | 'apply'>('generate');
+  const [gitPatchPayloadScope, setGitPatchPayloadScope] = useState<'staged' | 'unstaged' | 'both'>('both');
+  const [gitPatchPayloadText, setGitPatchPayloadText] = useState('');
+  const [gitPatchPayloadReverse, setGitPatchPayloadReverse] = useState(false);
+  const [gitPatchPayloadBusy, setGitPatchPayloadBusy] = useState(false);
+  const [gitPatchPayloadStatus, setGitPatchPayloadStatus] = useState<string | null>(null);
   const [responseViewerOpen, setResponseViewerOpen] = useState(false);
   const [compileErrorConfigOpen, setCompileErrorConfigOpen] = useState(false);
   const [runContextOpen, setRunContextOpen] = useState(false);
@@ -1703,7 +1727,9 @@ export function WorkflowShell() {
     const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
     const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
     setGlobalApplyChangesetText(typeof currentGatewayChangeset.draft === 'string' ? currentGatewayChangeset.draft : '');
-  }, [globalApplyChangesetOpen, selectedRun?.id, selectedRun?.context]);
+    setGlobalApplyChangesetResult(null);
+    void refreshChangesetHistory();
+  }, [globalApplyChangesetOpen, selectedRun?.id, selectedRun?.repo_ref, selectedRun?.context]);
 
   useEffect(() => {
     const step = selectedWorkflowStep;
@@ -1860,7 +1886,6 @@ export function WorkflowShell() {
         ...currentResources,
         repo: {
           ...((currentResources.repo as Record<string, unknown> | undefined) ?? {}),
-          repo_ref: resolveRepoRefForRun(selectedRun),
           git_ref: stageRepoContextGitRef || 'WORKTREE'
         }
       },
@@ -1915,11 +1940,28 @@ export function WorkflowShell() {
 
 
 
+  const repoTreeScopeKey = useMemo(() => [
+    view,
+    view === 'builder' ? repoRef.trim() : selectedRun?.id ?? '',
+    stageRepoContextGitRef.trim() || 'WORKTREE',
+    String(stageRepoContextSkipBinary),
+    String(stageRepoContextSkipGitignore)
+  ].join('|'), [
+    view,
+    repoRef,
+    selectedRun?.id,
+    stageRepoContextGitRef,
+    stageRepoContextSkipBinary,
+    stageRepoContextSkipGitignore
+  ]);
+
   useEffect(() => {
     if (!repoContextConfigOpen) return;
-    if (treeRootData) return;
+    setTreeRootData(null);
+    setTreeChildrenByParent({});
+    setSelectedRepoDirs(new Set());
     void loadRepoTreeForActiveRef('', true);
-  }, [repoContextConfigOpen, view, repoRef, selectedRun?.id, stageRepoContextGitRef, stageRepoContextSkipBinary, stageRepoContextSkipGitignore]);
+  }, [repoContextConfigOpen, repoTreeScopeKey]);
 
 
 
@@ -2781,6 +2823,16 @@ export function WorkflowShell() {
     setGlobalApplyChangesetText(typeof gatewayChangeset.draft === 'string' ? gatewayChangeset.draft : '');
   }
 
+  function loadBuilderGitPatchPayloadConfig() {
+    const globals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const gitPatchPayload = ((capabilities.git_patch_payload as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    setGitPatchPayloadMode(gitPatchPayload.mode === 'apply' ? 'apply' : 'generate');
+    setGitPatchPayloadScope(gitPatchPayload.scope === 'staged' || gitPatchPayload.scope === 'unstaged' ? gitPatchPayload.scope : 'both');
+    setGitPatchPayloadText(typeof gitPatchPayload.payload_text === 'string' ? gitPatchPayload.payload_text : '');
+    setGitPatchPayloadReverse(Boolean(gitPatchPayload.reverse));
+  }
+
   async function handleSaveGlobalChangesetSchema() {
     if (view === 'builder') {
       saveBuilderCapability('changeset_schema', {
@@ -2829,6 +2881,198 @@ export function WorkflowShell() {
     setGlobalApplyChangesetOpen(false);
   }
 
+  async function handleRunGitPatchPayload() {
+    if (!selectedRun?.id) {
+      setGitPatchPayloadStatus('Select or create a workflow run before using git patch payload.');
+      return;
+    }
+
+    try {
+      setGitPatchPayloadBusy(true);
+      setGitPatchPayloadStatus(null);
+      const input = gitPatchPayloadMode === 'apply'
+        ? {
+            mode: 'apply',
+            scope: gitPatchPayloadScope,
+            payload_text: gitPatchPayloadText,
+            reverse: gitPatchPayloadReverse,
+          }
+        : {
+            mode: 'generate',
+            scope: gitPatchPayloadScope,
+          };
+      const json = await executeWorkflowCapability(selectedRun.id, 'git_patch_payload', input);
+      const results = Array.isArray(json.results) ? json.results : [];
+      const first = results[0] as Record<string, unknown> | undefined;
+      const payload = first?.payload as Record<string, unknown> | undefined;
+
+      if (gitPatchPayloadMode === 'generate') {
+        const payloadText = typeof payload?.payload_text === 'string' ? payload.payload_text : '';
+        if (!payloadText) {
+          throw new Error('Git patch payload response did not include payload_text.');
+        }
+        setGitPatchPayloadText(payloadText);
+        setGitPatchPayloadStatus('Git patch payload generated.');
+      } else {
+        setGitPatchPayloadStatus('Git patch payload applied.');
+        await refreshRunDetails(selectedRun.id);
+      }
+    } catch (err) {
+      setGitPatchPayloadStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGitPatchPayloadBusy(false);
+    }
+  }
+
+  async function refreshChangesetHistory() {
+    if (!selectedRun?.id) {
+      setGlobalApplyChangesetHistory([]);
+      return;
+    }
+    try {
+      setGlobalApplyChangesetHistoryBusy(true);
+      const rows = await listWorkflowChangesets(selectedRun.workflow_key || selectedRun.id, 50);
+      setGlobalApplyChangesetHistory(rows);
+    } catch {
+      setGlobalApplyChangesetHistory([]);
+    } finally {
+      setGlobalApplyChangesetHistoryBusy(false);
+    }
+  }
+
+  async function handleLoadGlobalChangesetAttempt(item: ChangesetAttemptSummary, mode: 'input' | 'output') {
+    const workflowKey = selectedRun?.workflow_key || selectedRun?.id;
+    if (!workflowKey) return;
+    try {
+      setGlobalApplyChangesetHistoryBusy(true);
+      const detail = await getWorkflowChangeset(workflowKey, item.id);
+      setGlobalApplyChangesetText(detail.normalized_payload_json || detail.payload_text || '');
+      setGlobalApplyChangesetResult(changesetOutputWithoutPayload(detail.result_json));
+      setManualCapabilityResponse('');
+      setGlobalApplyChangesetPanelMode(mode);
+      setManualCapabilityStatus(mode === 'input' ? 'Loaded changeset input.' : 'Loaded changeset output.');
+    } catch (err) {
+      setManualCapabilityStatus(`Error loading changeset: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setGlobalApplyChangesetHistoryBusy(false);
+    }
+  }
+
+  async function handleApplyGlobalChangeset() {
+    if (!selectedRun?.id) {
+      setManualCapabilityStatus('Select or create a workflow run before applying a changeset.');
+      return;
+    }
+    await runManualCapability(async () => {
+      const json = await applyWorkflowChangeset(selectedRun.workflow_key || selectedRun.id, {
+        git_ref: 'WORKTREE',
+        payload_text: globalApplyChangesetText,
+      });
+      const cleanJson = changesetOutputWithoutPayload(json);
+      setGlobalApplyChangesetResult(cleanJson);
+      setGlobalApplyChangesetPanelMode('output');
+      await refreshChangesetHistory();
+      return cleanJson;
+    }, 'Changeset applied.');
+  }
+
+  function globalApplyResultText() {
+    if (!globalApplyChangesetResult) return '';
+    return JSON.stringify(changesetOutputWithoutPayload(globalApplyChangesetResult), null, 2);
+  }
+
+  function changesetOutputWithoutPayload(value: unknown): ApplyChangesetResponse {
+    const noisyKeys = new Set([
+      'normalized_payload_json',
+      'normalized_payload',
+      'payload_text',
+      'payload',
+      'input',
+      'changeset_payload'
+    ]);
+    const strip = (input: unknown): unknown => {
+      if (Array.isArray(input)) return input.map(strip);
+      if (!input || typeof input !== 'object') return input;
+      return Object.fromEntries(
+        Object.entries(input as Record<string, unknown>)
+          .filter(([key]) => !noisyKeys.has(key))
+          .map(([key, next]) => [key, strip(next)])
+      );
+    };
+    const stripped = strip(value);
+    return stripped && typeof stripped === 'object'
+      ? stripped as ApplyChangesetResponse
+      : { result: stripped } as ApplyChangesetResponse;
+  }
+
+  function compactRepoLabel(repoRef: string) {
+    const normalized = (repoRef || '').replace(/\\/g, '/').replace(/\/+$/g, '');
+    return normalized.split('/').filter(Boolean).pop() || repoRef || 'repo';
+  }
+
+  function changesetFileActionSummary(item: ChangesetAttemptSummary) {
+    if (item.file_action_summaries?.length) {
+      return item.file_action_summaries.map((file) => ({
+        path: file.path,
+        applied: file.applied || 0,
+        failed: file.failed || 0,
+        total: file.total || 0,
+      }));
+    }
+
+    const successFiles = item.successful_files || [];
+    const failedFiles = item.failed_files || [];
+    const paths = Array.from(new Set([...successFiles, ...failedFiles]));
+    const totalActions = Math.max(0, item.total_actions || 0);
+    const appliedActions = Math.max(0, item.applied_actions || 0);
+    const failedActions = Math.max(0, item.failed_actions || Math.max(0, totalActions - appliedActions));
+    if (!paths.length) return [];
+    if (paths.length === 1) return [{ path: paths[0], applied: appliedActions, failed: failedActions, total: totalActions }];
+    return paths.map((path, index) => {
+      const successful = successFiles.includes(path);
+      const failed = failedFiles.includes(path);
+      const baseTotal = Math.floor(totalActions / paths.length);
+      const totalRemainder = totalActions % paths.length;
+      const total = baseTotal + (index < totalRemainder ? 1 : 0);
+      const applied = successful ? Math.max(1, Math.floor(appliedActions / Math.max(1, successFiles.length))) : 0;
+      const failedCount = failed ? Math.max(1, Math.floor(failedActions / Math.max(1, failedFiles.length))) : Math.max(0, total - applied);
+      return { path, applied: Math.min(applied, total), failed: Math.min(failedCount, total), total };
+    });
+  }
+
+  async function copyTextToClipboard(text: string, label: string) {
+    if (!text) return;
+    await navigator.clipboard.writeText(text);
+    setManualCapabilityStatus(`${label} copied.`);
+  }
+
+  function newGlobalChangeset() {
+    setGlobalApplyChangesetText('');
+    setGlobalApplyChangesetResult(null);
+    setGlobalApplyChangesetPanelMode('input');
+    setManualCapabilityStatus(null);
+    setManualCapabilityResponse('');
+  }
+
+  function visibleGlobalChangesetPanelText() {
+    return globalApplyChangesetPanelMode === 'output'
+      ? (manualCapabilityResponse || globalApplyResultText())
+      : globalApplyChangesetText;
+  }
+
+  function changesetStatusColor(status: string) {
+    switch (status) {
+      case 'applied':
+        return 'green';
+      case 'partial':
+        return 'yellow';
+      case 'failed':
+        return 'red';
+      default:
+        return 'gray';
+    }
+  }
+
   async function handleDeleteRun(runId: string) {
     try {
       setBusy(true);
@@ -2870,30 +3114,36 @@ export function WorkflowShell() {
     setStageRepoContextIncludeFilesText(normalized.join('\n'));
   }
 
-  function resolveRepoRefForRun(run: WorkflowRun | null): string {
-    const workflowEngine = (run?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
-    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
-    const resources = (globalState.resources ?? {}) as Record<string, unknown>;
-    const repo = (resources.repo ?? {}) as Record<string, unknown>;
-    if (typeof repo.repo_ref === 'string' && repo.repo_ref.trim()) {
-      return String(repo.repo_ref);
-    }
-    if (typeof run?.repo_ref === 'string' && run.repo_ref.trim()) {
-      return run.repo_ref;
-    }
-    return repoRef;
+  function resolveActiveRepoRef(): string {
+    return view === 'builder' ? repoRef.trim() : '';
   }
 
-  function resolveActiveRepoRef(): string {
-    if (view === 'builder') {
-      return repoRef.trim();
+  async function listRepoTreeForCurrentScope(basePath: string): Promise<RepoTreeResponse> {
+    const gitRef = stageRepoContextGitRef.trim() || 'WORKTREE';
+    const options = {
+      basePath,
+      skipBinary: stageRepoContextSkipBinary,
+      skipGitignore: stageRepoContextSkipGitignore
+    };
+
+    if (view !== 'builder' && selectedRun?.id) {
+      return listWorkflowRepoTree(selectedRun.id, gitRef, options);
     }
-    return resolveRepoRefForRun(selectedRun).trim();
+
+    const activeRepoRef = repoRef.trim();
+    if (!activeRepoRef) {
+      throw new Error('Set a repo path to browse files.');
+    }
+
+    return listRepoTree(activeRepoRef, gitRef, options);
   }
 
   async function loadRepoTreeForActiveRef(basePath: string, replaceRoot = false) {
-    const activeRepoRef = resolveActiveRepoRef();
-    if (!activeRepoRef) {
+    if (view !== 'builder' && !selectedRun?.id) {
+      setTreeError('Select a workflow run to browse files.');
+      return;
+    }
+    if (view === 'builder' && !repoRef.trim()) {
       setTreeError('Set a repo path to browse files.');
       return;
     }
@@ -2909,16 +3159,11 @@ export function WorkflowShell() {
     });
 
     try {
-      const data = await listRepoTree(activeRepoRef, stageRepoContextGitRef, {
-        basePath,
-        skipBinary: stageRepoContextSkipBinary,
-        skipGitignore: stageRepoContextSkipGitignore
-      });
+      const data = await listRepoTreeForCurrentScope(basePath);
 
       if (replaceRoot) {
         setTreeRootData(data);
         setTreeChildrenByParent({ '': data.entries });
-        syncRepoSelectionState(selectedRepoPaths);
         setSelectedRepoDirs(new Set());
       } else {
         setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
@@ -2948,13 +3193,8 @@ export function WorkflowShell() {
     setPaths([path], !selectedRepoPathSet.has(path));
   }
 
-  async function loadTreeSubtree(run: WorkflowRun, basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[] }> {
-    const repoRefForTree = resolveRepoRefForRun(run);
-    const data = await listRepoTree(repoRefForTree, stageRepoContextGitRef, {
-      basePath,
-      skipBinary: stageRepoContextSkipBinary,
-      skipGitignore: stageRepoContextSkipGitignore
-    });
+  async function loadTreeSubtree(basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[] }> {
+    const data = await listRepoTreeForCurrentScope(basePath);
 
     const children: Record<string, RepoTreeEntry[]> = {
       [basePath]: data.entries
@@ -2965,7 +3205,7 @@ export function WorkflowShell() {
       if (entry.kind === 'file') {
         files.push(entry.path);
       } else if (entry.has_children) {
-        const nested = await loadTreeSubtree(run, entry.path);
+        const nested = await loadTreeSubtree(entry.path);
         Object.assign(children, nested.children);
         files.push(...nested.files);
       }
@@ -2974,92 +3214,12 @@ export function WorkflowShell() {
     return { children, files };
   }
 
-  async function loadTreeDir(run: WorkflowRun, basePath: string, replaceRoot = false) {
-    if (loadingTreeDirs.has(basePath)) return;
-
-    setTreeError(null);
-    if (replaceRoot) setTreeBusy(true);
-    setLoadingTreeDirs((prev) => {
-      const next = new Set(prev);
-      next.add(basePath);
-      return next;
-    });
-
-    try {
-      const repoRefForTree = resolveRepoRefForRun(run);
-      const data = await listRepoTree(repoRefForTree, stageRepoContextGitRef, {
-        basePath,
-        skipBinary: stageRepoContextSkipBinary,
-        skipGitignore: stageRepoContextSkipGitignore
-      });
-
-      if (replaceRoot) {
-        setTreeRootData(data);
-        setTreeChildrenByParent({ '': data.entries });
-        syncRepoSelectionState(selectedRepoPaths);
-        setSelectedRepoDirs(new Set());
-      } else {
-        setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
-      }
-    } catch (err) {
-      setTreeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingTreeDirs((prev) => {
-        const next = new Set(prev);
-        next.delete(basePath);
-        return next;
-      });
-      if (replaceRoot) setTreeBusy(false);
-    }
-  }
-
-  async function loadRepoTreeForRef(repoRefForTree: string, basePath: string, replaceRoot = false) {
-    if (loadingTreeDirs.has(basePath)) return;
-
-    const normalizedRepoRef = repoRefForTree.trim();
-    if (!normalizedRepoRef) return;
-
-    setTreeError(null);
-    if (replaceRoot) setTreeBusy(true);
-    setLoadingTreeDirs((prev) => {
-      const next = new Set(prev);
-      next.add(basePath);
-      return next;
-    });
-
-    try {
-      const data = await listRepoTree(normalizedRepoRef, stageRepoContextGitRef, {
-        basePath,
-        skipBinary: stageRepoContextSkipBinary,
-        skipGitignore: stageRepoContextSkipGitignore
-      });
-
-      if (replaceRoot) {
-        setTreeRootData(data);
-        setTreeChildrenByParent({ '': data.entries });
-        syncRepoSelectionState(selectedRepoPaths);
-        setSelectedRepoDirs(new Set());
-      } else {
-        setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
-      }
-    } catch (err) {
-      setTreeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingTreeDirs((prev) => {
-        const next = new Set(prev);
-        next.delete(basePath);
-        return next;
-      });
-      if (replaceRoot) setTreeBusy(false);
-    }
-  }
-
   async function toggleDirectory(entry: RepoTreeEntry, checked: boolean) {
-    const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
-    if (!activeRepoRef) return;
+    if (view !== 'builder' && !selectedRun?.id) return;
+    if (view === 'builder' && !repoRef.trim()) return;
 
     if (checked) {
-      const nested = await loadTreeSubtree({ repo_ref: activeRepoRef } as WorkflowRun, entry.path);
+      const nested = await loadTreeSubtree(entry.path);
       setTreeChildrenByParent((prev) => ({ ...prev, ...nested.children }));
       setSelectedRepoDirs((prev) => {
         const next = new Set(prev);
@@ -3077,9 +3237,7 @@ export function WorkflowShell() {
       return next;
     });
     setPaths(descendantFiles, false);
-  }
-
-  const composedInferencePrompt = useMemo(() => {
+  }  const composedInferencePrompt = useMemo(() => {
     if (selectedWorkflowStep?.id === 'compile') {
       return stageCompileCommandsText.trim()
         ? `### COMPILE COMMANDS\n${stageCompileCommandsText.trim()}`
@@ -3539,6 +3697,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     );
   }
 
+  function resolveRepoRefForRun(run: WorkflowRun | null): string {
+    const workflowEngine = (run?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const resources = (globalState.resources ?? {}) as Record<string, unknown>;
+    const repo = (resources.repo ?? {}) as Record<string, unknown>;
+
+    if (typeof repo.repo_ref === 'string' && repo.repo_ref.trim()) {
+      return String(repo.repo_ref);
+    }
+    if (typeof run?.repo_ref === 'string' && run.repo_ref.trim()) {
+      return run.repo_ref;
+    }
+    return repoRef;
+  }
+
   function renderStageStreamPanel(emptyText: string) {
     if (selectedWorkflowStep?.step_type === 'sap_import') {
       return (
@@ -3924,20 +4097,35 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     patchBuilderCapability(capabilityKey, patch);
   }
 
-  function handleSaveBuilderRepoContext() {
-    saveBuilderCapability('context_export', {
-      git_ref: stageRepoContextGitRef.trim() || 'WORKTREE',
-      include_files: selectedRepoPaths,
-      exclude_regex: stageRepoContextExcludeRegexText
-        .split('\n')
-        .map((item) => item.trim())
-        .filter(Boolean),
-      save_path: stageRepoContextSavePath.trim() || '/tmp/repo_context.txt',
-      skip_binary: stageRepoContextSkipBinary,
-      skip_gitignore: stageRepoContextSkipGitignore,
-      include_staged_diff: stageRepoContextIncludeStagedDiff,
-      include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
-    });
+  async function handleSaveBuilderRepoContext() {
+    const includeFiles = stageRepoContextIncludeFilesText
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const excludeRegex = stageRepoContextExcludeRegexText
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    if (view === 'builder') {
+      saveBuilderCapability('context_export', {
+        git_ref: stageRepoContextGitRef.trim() || 'WORKTREE',
+        include_files: includeFiles,
+        exclude_regex: excludeRegex,
+        save_path: stageRepoContextSavePath.trim() || '/tmp/repo_context.txt',
+        skip_binary: stageRepoContextSkipBinary,
+        skip_gitignore: stageRepoContextSkipGitignore,
+        include_staged_diff: stageRepoContextIncludeStagedDiff,
+        include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+      });
+      syncRepoSelectionState(includeFiles);
+      setRepoContextConfigOpen(false);
+      return;
+    }
+
+    if (!selectedRun) return;
+    await syncInteractiveGlobalState();
+    syncRepoSelectionState(includeFiles);
     setRepoContextConfigOpen(false);
   }
 
@@ -4204,6 +4392,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           loadBuilderApplyChangesetConfig();
                           setGlobalApplyChangesetOpen(true);
                         },
+                        openGitPatchPayload: () => {
+                          setError(null);
+                          syncBuilderRepoResource();
+                          loadBuilderGitPatchPayloadConfig();
+                          setGitPatchPayloadOpen(true);
+                        },
                       });
                     }}
                   />
@@ -4243,6 +4437,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 }}
                 onOpenApplyChangeset={() => {
                   setGlobalApplyChangesetOpen(true);
+                }}
+                onOpenGitPatchPayload={() => {
+                  setGitPatchPayloadOpen(true);
                 }}
               />
             </Card>
@@ -4708,7 +4905,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   onClick={() => {
                     const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
                     if (activeRepoRef) {
-                      void loadRepoTreeForRef(activeRepoRef, '', true);
+                      void loadRepoTreeForActiveRef('', true);
                     }
                   }}
                   disabled={!(view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim()}
@@ -4742,7 +4939,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 onLoadDir={(path) => {
                   const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
                   if (activeRepoRef) {
-                    void loadRepoTreeForRef(activeRepoRef, path, false);
+                    void loadRepoTreeForActiveRef(path, false);
                   }
                 }}
                 onToggleFile={toggleFile}
@@ -4868,9 +5065,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         </Modal>
 
         <Modal
-          opened={globalApplyChangesetOpen}
-          onClose={() => setGlobalApplyChangesetOpen(false)}
-          title="Manually apply changeset"
+          opened={gitPatchPayloadOpen}
+          onClose={() => setGitPatchPayloadOpen(false)}
+          title="Generate/apply git patch payload"
           size="min(1600px, calc(100vw - 64px))"
           centered
           padding="md"
@@ -4882,19 +5079,204 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           }}
         >
           <Stack h="100%" gap="md">
-            <Text size="sm" c="dimmed">Patch the workflow-global gateway changeset capability state.</Text>
-            <Textarea
-              label="Changeset draft"
-              value={globalApplyChangesetText}
-              onChange={(e) => setGlobalApplyChangesetText(e.currentTarget.value)}
-              placeholder="Paste a changeset draft to apply or persist globally for the workflow."
-              autosize={false}
-              styles={{ root: { flex: 1 }, wrapper: { flex: 1 }, input: { height: '100%', minHeight: 'calc(100vh - 280px)' } }}
+            <Text size="sm" c="dimmed">Generate a portable git patch payload from this repo, or apply one generated from another repo.</Text>
+            <Select
+              label="Mode"
+              value={gitPatchPayloadMode}
+              onChange={(value) => {
+                setGitPatchPayloadMode(value === 'apply' ? 'apply' : 'generate');
+                setGitPatchPayloadStatus(null);
+              }}
+              data={[
+                { label: 'Generate payload', value: 'generate' },
+                { label: 'Apply payload', value: 'apply' }
+              ]}
             />
-            <Group justify="flex-end">
-              <Button size="xs" variant="default" onClick={() => setGlobalApplyChangesetOpen(false)}>Cancel</Button>
-              <Button size="xs" onClick={() => void handleSaveGlobalApplyChangeset()} loading={busy}>Save</Button>
+            <Select
+              label="Scope"
+              value={gitPatchPayloadScope}
+              onChange={(value) => setGitPatchPayloadScope(value === 'staged' || value === 'unstaged' ? value : 'both')}
+              data={[
+                { label: 'Staged', value: 'staged' },
+                { label: 'Unstaged', value: 'unstaged' },
+                { label: 'Both', value: 'both' }
+              ]}
+            />
+            <Box style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              {gitPatchPayloadMode === 'generate' ? (
+                <Textarea
+                  label="Generated payload"
+                  value={gitPatchPayloadText}
+                  onChange={(event) => setGitPatchPayloadText(event.currentTarget.value)}
+                  autosize={false}
+                  styles={{ root: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }, wrapper: { flex: 1, minHeight: 0, display: 'flex' }, input: { height: '100%', minHeight: 0, fontFamily: 'monospace', overflowY: 'auto', resize: 'none' } }}
+                />
+              ) : (
+                <Stack h="100%" gap="xs" style={{ minHeight: 0 }}>
+                  <Textarea
+                    label="Payload to apply"
+                    value={gitPatchPayloadText}
+                    onChange={(event) => setGitPatchPayloadText(event.currentTarget.value)}
+                    autosize={false}
+                    styles={{ root: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }, wrapper: { flex: 1, minHeight: 0, display: 'flex' }, input: { height: '100%', minHeight: 0, fontFamily: 'monospace', overflowY: 'auto', resize: 'none' } }}
+                  />
+                  <Checkbox
+                    label="Reverse apply"
+                    checked={gitPatchPayloadReverse}
+                    onChange={(event) => setGitPatchPayloadReverse(event.currentTarget.checked)}
+                  />
+                </Stack>
+              )}
+            </Box>
+            {gitPatchPayloadStatus ? <Alert color={gitPatchPayloadStatus.toLowerCase().includes('error') ? 'red' : 'blue'}>{gitPatchPayloadStatus}</Alert> : null}
+            <Group justify="space-between">
+              <Group gap="xs">
+                {gitPatchPayloadText.trim() ? (
+                  <Button size="xs" variant="default" onClick={() => void navigator.clipboard.writeText(gitPatchPayloadText)}>Copy payload</Button>
+                ) : null}
+              </Group>
+              <Group gap="xs">
+                <Button size="xs" variant="default" onClick={() => setGitPatchPayloadOpen(false)}>Close</Button>
+                <Button size="xs" onClick={() => void handleRunGitPatchPayload()} loading={gitPatchPayloadBusy}>
+                  {gitPatchPayloadMode === 'apply' ? 'Apply payload' : 'Generate payload'}
+                </Button>
+              </Group>
             </Group>
+          </Stack>
+        </Modal>
+
+        <Modal
+          opened={globalApplyChangesetOpen}
+          onClose={() => setGlobalApplyChangesetOpen(false)}
+          title="Manually apply changeset"
+          size="min(1800px, calc(100vw - 32px))"
+          centered
+          padding="md"
+          zIndex={300}
+          withCloseButton
+          styles={{
+            body: { paddingTop: 0, height: 'calc(100vh - 120px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 16px)' }
+          }}
+        >
+          <Stack h="100%" gap="md">
+            <Group justify="space-between" align="center">
+              <Text size="sm" c="dimmed">Paste a changeset, apply it, then use the same box to review the result/error.</Text>
+              <Group gap="xs">
+                <Button size="xs" variant="default" onClick={() => setGlobalApplyChangesetPanelMode(globalApplyChangesetPanelMode === 'input' ? 'output' : 'input')} disabled={!globalApplyChangesetResult && globalApplyChangesetPanelMode === 'input'}>
+                  {globalApplyChangesetPanelMode === 'input' ? 'Show output' : 'Show input'}
+                </Button>
+                <Button size="xs" variant="default" onClick={newGlobalChangeset}>Clear / new</Button>
+                <Button size="xs" variant="light" onClick={() => void copyTextToClipboard(visibleGlobalChangesetPanelText(), 'Visible text')} disabled={!visibleGlobalChangesetPanelText().trim()}>Copy visible</Button>
+                <Button size="xs" variant="light" onClick={() => void copyTextToClipboard(globalApplyChangesetText, 'Last changeset')} disabled={!globalApplyChangesetText.trim()}>Copy changeset</Button>
+                <Button size="xs" variant="light" onClick={() => void refreshChangesetHistory()} loading={globalApplyChangesetHistoryBusy}>Refresh log</Button>
+              </Group>
+            </Group>
+
+            {manualCapabilityStatus ? <Alert color={manualCapabilityStatus.toLowerCase().includes('error') || manualCapabilityStatus.toLowerCase().includes('failed') ? 'red' : 'blue'} variant="light">{manualCapabilityStatus}</Alert> : null}
+
+            <Grid gutter="md" style={{ flex: 1, minHeight: 0, height: 'calc(100vh - 230px)', overflow: 'hidden' }}>
+              <Grid.Col span={8} style={{ minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                <Stack gap="xs" style={{ flex: 1, minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                  <Group justify="space-between" align="center">
+                    <Text fw={600} size="sm">{globalApplyChangesetPanelMode === 'input' ? 'Changeset payload' : 'Apply result'}</Text>
+                    <Badge variant="light">{globalApplyChangesetPanelMode === 'input' ? 'input' : 'output'}</Badge>
+                  </Group>
+
+                  {globalApplyChangesetPanelMode === 'input' ? (
+                    <Box style={{ flex: 1, minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                      <Textarea
+                        value={globalApplyChangesetText}
+                        onChange={(e) => setGlobalApplyChangesetText(e.currentTarget.value)}
+                        placeholder="Paste a version 1 changeset JSON payload."
+                        autosize={false}
+                        style={{ flex: 1, minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}
+                        styles={{ root: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }, wrapper: { flex: 1, minHeight: 0, display: 'flex' }, input: { height: 'calc(100vh - 360px)', minHeight: 360, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace', overflowY: 'auto', resize: 'none' } }}
+                      />
+                    </Box>
+                  ) : (
+                    <Box
+                      component="pre"
+                      p="sm"
+                      style={{
+                        flex: 1,
+                        minHeight: 0,
+                        height: '100%',
+                        margin: 0,
+                        overflow: 'auto',
+                        border: '1px solid var(--mantine-color-dark-4)',
+                        borderRadius: 12,
+                        whiteSpace: 'pre-wrap',
+                        overflowWrap: 'anywhere',
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        background: 'rgba(0,0,0,0.20)'
+                      }}
+                    >
+                      {manualCapabilityResponse || globalApplyResultText() || 'Apply output and errors will appear here.'}
+                    </Box>
+                  )}
+
+                  <Group justify="flex-end" style={{ flex: '0 0 auto' }}>
+                    <Button size="xs" variant="default" onClick={() => setGlobalApplyChangesetOpen(false)}>Close</Button>
+                    <Button size="xs" variant="default" onClick={() => setGlobalApplyChangesetPanelMode(globalApplyChangesetPanelMode === 'input' ? 'output' : 'input')} disabled={!globalApplyChangesetResult && globalApplyChangesetPanelMode === 'input'}>
+                      {globalApplyChangesetPanelMode === 'input' ? 'Output' : 'Input'}
+                    </Button>
+                    <Button size="xs" variant="light" onClick={() => void handleSaveGlobalApplyChangeset()} loading={busy} disabled={globalApplyChangesetPanelMode !== 'input'}>Save draft</Button>
+                    <Button size="xs" onClick={() => void handleApplyGlobalChangeset()} loading={manualCapabilityBusy} disabled={!globalApplyChangesetText.trim() || globalApplyChangesetPanelMode !== 'input'}>Apply changeset</Button>
+                  </Group>
+                </Stack>
+              </Grid.Col>
+
+              <Grid.Col span={4} style={{ minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                <Stack gap="xs" style={{ flex: 1, minHeight: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                  <Group justify="space-between" align="center">
+                    <Text fw={600} size="sm">Changeset log</Text>
+                    <Badge variant="light">{globalApplyChangesetHistory.length}</Badge>
+                  </Group>
+                  <ScrollArea h="100%" type="auto" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12 }}>
+                    <Stack gap="xs" p="xs">
+                      {globalApplyChangesetHistory.length === 0 ? (
+                        <Text size="sm" c="dimmed">No logged changesets yet.</Text>
+                      ) : globalApplyChangesetHistory.map((item) => {
+                        const fileSummaries = changesetFileActionSummary(item);
+                        return (
+                          <Card key={item.id} withBorder p="xs">
+                            <Stack gap={6}>
+                              <Group justify="space-between" gap="xs" wrap="nowrap">
+                                <Group gap={6} wrap="nowrap">
+                                  <Badge color={changesetStatusColor(item.status)} variant="light">{item.status}</Badge>
+                                  <Badge variant="outline">{compactRepoLabel(item.repo_ref)}</Badge>
+                                </Group>
+                                <Text size="xs" c="dimmed">{new Date(item.created_at).toLocaleString()}</Text>
+                              </Group>
+                              <Text size="xs" lineClamp={2}>{item.display_summary || item.error_summary || 'No summary'}</Text>
+                              {fileSummaries.length ? (
+                                <details>
+                                  <summary>{fileSummaries.length} modified files</summary>
+                                  <Stack gap={4} mt={6}>
+                                    {fileSummaries.map((file) => (
+                                      <Group key={file.path} justify="space-between" gap="xs" wrap="nowrap">
+                                        <Text size="xs" truncate>{file.path}</Text>
+                                        <Text size="xs" c="dimmed" style={{ whiteSpace: 'nowrap' }}>{file.applied}/{file.total} applied{file.failed ? `, ${file.failed} failed` : ''}</Text>
+                                      </Group>
+                                    ))}
+                                  </Stack>
+                                </details>
+                              ) : null}
+                              <Group gap="xs">
+                                <Button size="xs" variant="light" onClick={() => void handleLoadGlobalChangesetAttempt(item, 'input')}>View input</Button>
+                                <Button size="xs" variant="light" onClick={() => void handleLoadGlobalChangesetAttempt(item, 'output')}>View output</Button>
+                              </Group>
+                            </Stack>
+                          </Card>
+                        );
+                      })}
+                    </Stack>
+                  </ScrollArea>
+                </Stack>
+              </Grid.Col>
+            </Grid>
           </Stack>
         </Modal>
 

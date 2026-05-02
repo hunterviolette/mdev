@@ -233,6 +233,7 @@ export type WorkflowRun = {
   current_step_id: string | null;
   title: string;
   repo_ref: string;
+  workflow_key: string;
   context: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -598,7 +599,111 @@ export function getChangesetSchema() {
   }>(`/api/capabilities/changeset-schema`);
 }
 
+export function listWorkflowCapabilities(runId: string) {
+  return fetchJson<Record<string, unknown>>(`/api/workflow-runs/${runId}/capabilities`);
+}
+
+export function executeWorkflowCapability(runId: string, capabilityId: string, input: unknown) {
+  return fetchJson<Record<string, unknown>>(`/api/workflow-runs/${runId}/capabilities/${encodeURIComponent(capabilityId)}/execute`, {
+    method: 'POST',
+    body: JSON.stringify({ input })
+  });
+}
+
+export function listWorkflowRepoTree(
+  runId: string,
+  gitRef = 'WORKTREE',
+  options?: { basePath?: string; skipBinary?: boolean; skipGitignore?: boolean }
+) {
+  const params = new URLSearchParams({
+    git_ref: gitRef || 'WORKTREE',
+    base_path: options?.basePath ?? '',
+    skip_binary: String(Boolean(options?.skipBinary)),
+    skip_gitignore: String(Boolean(options?.skipGitignore))
+  });
+  return fetchJson<RepoTreeResponse>(`/api/workflow-runs/${runId}/repository/tree?${params.toString()}`);
+}
+
+export function readWorkflowFile(runId: string, path: string) {
+  const params = new URLSearchParams({ path });
+  return fetchJson<FileContentsResponse>(`/api/workflow-runs/${runId}/filesystem/read?${params.toString()}`);
+}
+
+export function writeWorkflowFile(runId: string, body: { path: string; contents: string }) {
+  return fetchJson<MutatePathResponse>(`/api/workflow-runs/${runId}/filesystem/write`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export type ChangesetAttemptSummary = {
+  id: string;
+  run_id: string | null;
+  step_id: string | null;
+  repo_ref: string;
+  git_ref: string;
+  direction: string;
+  reverses_attempt_id: string | null;
+  source: string;
+  status: 'applied' | 'failed' | 'partial' | string;
+  total_ops: number;
+  applied_ops: number;
+  failed_ops: number;
+  skipped_ops: number;
+  total_actions: number;
+  applied_actions: number;
+  failed_actions: number;
+  touched_file_count: number;
+  success_rate: number;
+  created_count: number;
+  modified_count: number;
+  deleted_count: number;
+  moved_count: number;
+  duration_ms: number | null;
+  error_summary: string | null;
+  display_summary: string;
+  created_at: string;
+  successful_files: string[];
+  failed_files?: string[];
+  file_action_summaries?: Array<{ path: string; applied: number; failed: number; total: number }>;
+};
+
+export type ChangesetAttemptDetail = ChangesetAttemptSummary & {
+  payload_text: string;
+  normalized_payload_json: string;
+  result_json: unknown;
+};
+
+export type ApplyChangesetResponse = Record<string, unknown> & {
+  ok?: boolean;
+  summary?: string;
+  status?: string;
+  lines?: string[];
+  payload_text?: string;
+  normalized_payload?: string;
+  changeset_attempt_id?: string;
+  stats?: Record<string, unknown>;
+};
+
+export function listWorkflowChangesets(workflowKey: string, limit = 50) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return fetchJson<ChangesetAttemptSummary[]>(`/api/workflows/${encodeURIComponent(workflowKey)}/changesets?${params.toString()}`);
+}
+
+export function getWorkflowChangeset(workflowKey: string, attemptId: string) {
+  return fetchJson<ChangesetAttemptDetail>(`/api/workflows/${encodeURIComponent(workflowKey)}/changesets/${encodeURIComponent(attemptId)}`);
+}
+
+export function applyWorkflowChangeset(workflowKey: string, body: { git_ref?: string; payload_text: string }) {
+  return fetchJson<ApplyChangesetResponse>(`/api/workflows/${encodeURIComponent(workflowKey)}/changesets/apply`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
 export type ReviewDiffScope = 'staged' | 'unstaged';
+
+export type GitPatchScope = 'staged' | 'unstaged' | 'both';
 
 export type ReviewStatusFileEntry = {
   path: string;
@@ -628,6 +733,15 @@ export type ReviewDiffResponse = {
   patch: string;
 };
 
+export type GitPatchResponse = {
+  ok: boolean;
+  scope: GitPatchScope;
+  from_ref: string;
+  to_ref: string;
+  base_head: string;
+  patch: string;
+};
+
 export function getReviewStatus(repoRef: string) {
   return fetchJson<ReviewStatusResponse>('/api/review/status', {
     method: 'POST',
@@ -643,6 +757,18 @@ export function getReviewDiff(body: {
   whole_file?: boolean;
 }) {
   return fetchJson<ReviewDiffResponse>('/api/review/diff', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function generateGitApplyPatch(body: {
+  repo_ref: string;
+  scope: GitPatchScope;
+  paths?: string[] | null;
+  context_lines?: number;
+}) {
+  return fetchJson<GitPatchResponse>('/api/review/git-patch', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -878,6 +1004,57 @@ export function unstageReviewDiff(body: {
   return fetchJson<{ ok: boolean }>('/api/review/unstage', {
     method: 'POST',
     body: JSON.stringify(body)
+  });
+}
+
+export function getWorkflowReviewStatus(runId: string) {
+  return fetchJson<ReviewStatusResponse>(`/api/workflow-runs/${runId}/review/status`);
+}
+
+export function getWorkflowReviewDiff(runId: string, body: {
+  scope: ReviewDiffScope;
+  path?: string | null;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  const params = new URLSearchParams({
+    scope: body.scope,
+    path: body.path ?? '',
+    context_lines: String(body.context_lines ?? ''),
+    whole_file: String(Boolean(body.whole_file))
+  });
+  return fetchJson<ReviewDiffResponse>(`/api/workflow-runs/${runId}/review/diff?${params.toString()}`);
+}
+
+export function getWorkflowReviewDiffManifest(runId: string, scope: ReviewDiffScope) {
+  const params = new URLSearchParams({ scope });
+  return fetchJson<ReviewDiffManifestResponse>(`/api/workflow-runs/${runId}/review/diff/manifest?${params.toString()}`);
+}
+
+export function stageWorkflowReviewDiff(runId: string, body: { scope: ReviewDiffScope; path?: string | null }) {
+  return fetchJson<{ ok: boolean }>(`/api/workflow-runs/${runId}/review/stage`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function unstageWorkflowReviewDiff(runId: string, body: { scope: ReviewDiffScope; path?: string | null }) {
+  return fetchJson<{ ok: boolean }>(`/api/workflow-runs/${runId}/review/unstage`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getWorkflowCommits(runId: string, body?: {
+  limit?: number;
+  offset?: number;
+  since?: string | null;
+  until?: string | null;
+  exclude_regex?: string[] | null;
+}) {
+  return fetchJson<ReviewCommitListResponse>(`/api/workflow-runs/${runId}/commits`, {
+    method: 'POST',
+    body: JSON.stringify(body ?? {})
   });
 }
 

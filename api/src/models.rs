@@ -328,6 +328,8 @@ pub struct WorkflowRun {
     pub title: String,
     pub repo_ref: String,
     #[serde(default)]
+    pub workflow_key: String,
+    #[serde(default)]
     pub context: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -378,6 +380,8 @@ pub struct CreateRunRequest {
     pub template_id: Option<Uuid>,
     pub title: String,
     pub repo_ref: String,
+    #[serde(default)]
+    pub workflow_key: Option<String>,
     #[serde(default)]
     pub definition: Option<WorkflowTemplateDefinition>,
     #[serde(default)]

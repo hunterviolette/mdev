@@ -5,6 +5,13 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 const WORKTREE_REF: &str = "WORKTREE";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPatchScope {
+    Staged,
+    Unstaged,
+    Both,
+}
+
 
 pub fn ensure_git_installed() -> Result<()> {
     let out = Command::new("git").arg("--version").output();
@@ -33,6 +40,38 @@ pub fn run_git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
         bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(out.stdout)
+}
+
+pub fn generate_git_apply_patch(
+    repo: &Path,
+    scope: GitPatchScope,
+    paths: Option<&[String]>,
+    context_lines: Option<u32>,
+) -> Result<String> {
+    ensure_git_repo(repo)?;
+
+    let mut args: Vec<String> = vec!["diff".to_string(), "--binary".to_string()];
+
+    if let Some(context_lines) = context_lines {
+        args.push(format!("--unified={context_lines}"));
+    }
+
+    match scope {
+        GitPatchScope::Staged => args.push("--cached".to_string()),
+        GitPatchScope::Unstaged => {}
+        GitPatchScope::Both => args.push("HEAD".to_string()),
+    }
+
+    if let Some(paths) = paths {
+        if !paths.is_empty() {
+            args.push("--".to_string());
+            args.extend(paths.iter().cloned());
+        }
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_git(repo, &arg_refs)?;
+    String::from_utf8(out).context("git diff output was not valid UTF-8")
 }
 
 pub fn run_git_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {

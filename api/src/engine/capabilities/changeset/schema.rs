@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::registry::{CapabilityContext, CapabilityInvocationRequest, CapabilityResult};
+use crate::engine::capabilities::registry::{CapabilityContext, CapabilityInvocationRequest, CapabilityResult};
 
 pub const CHANGESET_SCHEMA_EXAMPLE: &str = r#"{
   \"version\": 1,

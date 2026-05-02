@@ -1,20 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use axum::{routing::post, Json, Router};
+use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     app_state::AppState,
     engine::capabilities::git::git::{
+        generate_git_apply_patch,
         git_diff_stats,
         git_status,
         git_untracked_line_stats,
         run_git,
         run_git_allow_fail,
+        GitPatchScope,
     },
 };
+
+use super::workflow_scope::resolve_workflow_scope;
 
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,17 @@ pub struct ReviewMultiFileContentsRequest {
     #[serde(default)]
     pub paths: Option<Vec<String>>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewGitPatchRequest {
+    pub repo_ref: String,
+    pub scope: String,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct ReviewCommitListRequest {
@@ -199,6 +214,55 @@ pub struct ReviewStageActionRequest {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkflowReviewDiffQuery {
+    pub scope: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+    #[serde(default)]
+    pub whole_file: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowReviewManifestQuery {
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowStageActionRequest {
+    pub scope: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowCommitListQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowCommitListRequest {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub exclude_regex: Option<Vec<String>>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ReviewStatusFileEntry {
     pub path: String,
@@ -280,6 +344,17 @@ pub struct ReviewMultiFileContentsResponse {
     pub files: Vec<ReviewMultiFileContentsEntry>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReviewGitPatchResponse {
+    pub ok: bool,
+    pub scope: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub base_head: String,
+    pub patch: String,
+}
+
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ReviewCommitSummary {
     pub sha: String,
@@ -348,6 +423,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/review/diff/manifest", post(review_diff_manifest))
         .route("/api/review/diff/file", post(review_file_patch))
         .route("/api/review/diff/multifile", post(review_multifile_contents))
+        .route("/api/review/git-patch", post(review_git_patch))
         .route("/api/review/commits", post(review_commits))
         .route("/api/review/commit-report", post(review_commit_report))
         .route("/api/review/commit-dataset", post(review_commit_report))
@@ -356,8 +432,107 @@ pub fn router() -> Router<AppState> {
         .route("/api/review/commit/diff/manifest", post(review_commit_diff_manifest))
         .route("/api/review/stage", post(review_stage))
         .route("/api/review/unstage", post(review_unstage))
+        .route("/api/workflow-runs/:run_id/review/status", get(workflow_review_status))
+        .route("/api/workflow-runs/:run_id/review/diff", get(workflow_review_diff))
+        .route("/api/workflow-runs/:run_id/review/diff/manifest", get(workflow_review_diff_manifest))
+        .route("/api/workflow-runs/:run_id/review/stage", post(workflow_review_stage))
+        .route("/api/workflow-runs/:run_id/review/unstage", post(workflow_review_unstage))
+        .route("/api/workflow-runs/:run_id/commits", get(workflow_review_commits_get).post(workflow_review_commits_post))
 }
 
+
+async fn workflow_review_status(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+) -> Result<Json<ReviewStatusResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_status(Json(ReviewRepoRequest { repo_ref: scope.repo_ref })).await
+}
+
+async fn workflow_review_diff(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Query(query): Query<WorkflowReviewDiffQuery>,
+) -> Result<Json<ReviewDiffResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_diff(Json(ReviewDiffRequest {
+        repo_ref: scope.repo_ref,
+        scope: query.scope,
+        path: query.path,
+        context_lines: query.context_lines,
+        whole_file: query.whole_file,
+    })).await
+}
+
+async fn workflow_review_diff_manifest(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Query(query): Query<WorkflowReviewManifestQuery>,
+) -> Result<Json<ReviewDiffManifestResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_diff_manifest(Json(ReviewDiffManifestRequest {
+        repo_ref: scope.repo_ref,
+        scope: query.scope,
+    })).await
+}
+
+async fn workflow_review_stage(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Json(req): Json<WorkflowStageActionRequest>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_stage(Json(ReviewStageActionRequest {
+        repo_ref: scope.repo_ref,
+        scope: req.scope,
+        path: req.path,
+    })).await
+}
+
+async fn workflow_review_unstage(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Json(req): Json<WorkflowStageActionRequest>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_unstage(Json(ReviewStageActionRequest {
+        repo_ref: scope.repo_ref,
+        scope: req.scope,
+        path: req.path,
+    })).await
+}
+
+async fn workflow_review_commits_get(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Query(query): Query<WorkflowCommitListQuery>,
+) -> Result<Json<ReviewCommitListResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_commits(Json(ReviewCommitListRequest {
+        repo_ref: scope.repo_ref,
+        limit: query.limit,
+        offset: query.offset,
+        since: query.since,
+        until: query.until,
+        exclude_regex: None,
+    })).await
+}
+
+async fn workflow_review_commits_post(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Json(req): Json<WorkflowCommitListRequest>,
+) -> Result<Json<ReviewCommitListResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_commits(Json(ReviewCommitListRequest {
+        repo_ref: scope.repo_ref,
+        limit: req.limit,
+        offset: req.offset,
+        since: req.since,
+        until: req.until,
+        exclude_regex: req.exclude_regex,
+    })).await
+}
 
 fn parse_numstat_line(line: &str) -> Option<(String, u64, u64)> {
     let mut parts = line.splitn(3, '\t');
@@ -1051,6 +1226,18 @@ fn refs_for_scope(scope: &str) -> Result<(String, String, bool), (axum::http::St
     }
 }
 
+fn git_patch_scope(scope: &str) -> Result<(GitPatchScope, String, String), (axum::http::StatusCode, String)> {
+    match scope {
+        "staged" => Ok((GitPatchScope::Staged, "HEAD".to_string(), "INDEX".to_string())),
+        "unstaged" => Ok((GitPatchScope::Unstaged, "INDEX".to_string(), "WORKTREE".to_string())),
+        "both" => Ok((GitPatchScope::Both, "HEAD".to_string(), "WORKTREE".to_string())),
+        other => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unsupported git patch scope {other}"),
+        )),
+    }
+}
+
 fn read_text_for_review_ref(repo: &std::path::Path, git_ref: &str, path: &str) -> Result<String, (axum::http::StatusCode, String)> {
     let bytes = match git_ref {
         "WORKTREE" => match std::fs::read(repo.join(path)) {
@@ -1276,6 +1463,33 @@ async fn review_diff(
         path: req.path,
         from_ref,
         to_ref,
+        patch,
+    }))
+}
+
+async fn review_git_patch(
+    Json(req): Json<ReviewGitPatchRequest>,
+) -> Result<Json<ReviewGitPatchResponse>, (axum::http::StatusCode, String)> {
+    let repo = PathBuf::from(&req.repo_ref);
+    let (scope, from_ref, to_ref) = git_patch_scope(&req.scope)?;
+    let patch = generate_git_apply_patch(
+        &repo,
+        scope,
+        req.paths.as_deref(),
+        req.context_lines.map(|value| value.min(1000)),
+    )
+    .map_err(internal)?;
+    let base_head = String::from_utf8(run_git(&repo, &["rev-parse", "HEAD"]).map_err(internal)?)
+        .map_err(internal)?
+        .trim()
+        .to_string();
+
+    Ok(Json(ReviewGitPatchResponse {
+        ok: true,
+        scope: req.scope,
+        from_ref,
+        to_ref,
+        base_head,
         patch,
     }))
 }

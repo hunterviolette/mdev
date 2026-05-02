@@ -95,8 +95,14 @@ pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json
     Ok(json!({ "ok": true, "status": "waiting", "current_step_id": run.current_step_id }))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    Manual,
+    Autonomous,
+}
+
 pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
-    execute_single_step(state, run_id, requested_step_id).await
+    run_stages(state, run_id, requested_step_id, RunMode::Manual).await
 }
 
 async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
@@ -120,7 +126,7 @@ async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested
         }),
     ).await?;
 
-    continue_until_wait(state, run_id, requested_step_id).await
+    run_stages(state, run_id, requested_step_id, RunMode::Autonomous).await
 }
 
 fn step_is_auto_runnable(step: &super::WorkflowStepDefinition) -> bool {
@@ -175,68 +181,36 @@ fn clear_run_pause_requested(run: &mut super::WorkflowRun) {
     }
 }
 
-async fn execute_single_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
-    let mut run = load_run(state, run_id).await?;
-    let definition = load_template_definition(state, &run).await?
-        .ok_or_else(|| anyhow!("run has no template definition"))?;
-
-    let step = current_step(&definition, &run, requested_step_id)?.clone();
-
-    set_run_status(state, run_id, RunStatus::Running, Some(step.id.as_str())).await?;
-
-    activate_next_prompt_fragments_for_stage(&mut run);
-    let outcome = execute_stage(state, run_id, &mut run, &step, false).await?;
-    clear_active_prompt_fragments_for_stage(&mut run);
-
-    if matches!(
-        outcome.disposition,
-        StageDisposition::Success
-            | StageDisposition::MoveNext
-            | StageDisposition::MoveBack
-            | StageDisposition::Outcome(_)
-            | StageDisposition::Stay
-    ) {
-        consume_single_use_inference_arm_state(&mut run, &step);
-    }
-
-    let next_target = resolve_next_target(&definition, &step, &outcome);
-    let status = match outcome.disposition {
-        StageDisposition::Paused => RunStatus::Paused,
-        StageDisposition::Success => RunStatus::Waiting,
-        StageDisposition::RetryStage => RunStatus::Waiting,
-        StageDisposition::MoveNext | StageDisposition::MoveBack | StageDisposition::Outcome(_) | StageDisposition::Stay => RunStatus::Waiting,
-        StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
-    };
-    persist_context(state, run_id, &run.context).await?;
-    let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
-    set_run_status(state, run_id, status.clone(), current_step_id).await?;
-
-    Ok(json!({
-        "ok": outcome.ok,
-        "status": match status {
-            RunStatus::Draft => "waiting",
-            RunStatus::Queued => "queued",
-            RunStatus::Running => "running",
-            RunStatus::Waiting => "waiting",
-            RunStatus::Paused => "paused",
-            RunStatus::Success => "success",
-            RunStatus::Error => "error",
-            RunStatus::Cancelled => "cancelled",
-        },
-        "step_id": step.id,
-        "next_step_id": next_target,
-        "message": outcome.message,
-        "disposition": format_disposition(&outcome.disposition),
-        "capability_results": outcome.capability_results,
-        "local_state": outcome.local_state,
-    }))
-}
-
-async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
+async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>, mode: RunMode) -> Result<serde_json::Value> {
     let mut last_payload = json!({ "ok": true, "status": "waiting" });
     let mut requested = requested_step_id.map(|s| s.to_string());
+    let mut hops = 0usize;
 
     loop {
+        let automatic = matches!(mode, RunMode::Autonomous);
+        if automatic {
+            hops += 1;
+        }
+        if automatic && hops > 50 {
+            let run = load_run(state, run_id).await?;
+            set_run_status(state, run_id, RunStatus::Waiting, run.current_step_id.as_deref()).await?;
+            append_engine_event(
+                state,
+                run_id,
+                run.current_step_id.as_deref(),
+                "warn",
+                "automatic_run_stopped",
+                "Automatic run stopped after too many stage transitions.",
+                json!({ "max_hops": 50 }),
+            ).await?;
+            return Ok(json!({
+                "ok": false,
+                "status": "waiting",
+                "current_step_id": run.current_step_id,
+                "message": "Automatic run stopped after too many stage transitions."
+            }));
+        }
+
         let mut run = load_run(state, run_id).await?;
         let definition = load_template_definition(state, &run).await?
             .ok_or_else(|| anyhow!("run has no template definition"))?;
@@ -246,7 +220,7 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
         set_run_status(state, run_id, RunStatus::Running, Some(step.id.as_str())).await?;
 
         activate_next_prompt_fragments_for_stage(&mut run);
-        let outcome = execute_stage(state, run_id, &mut run, &step, true).await?;
+        let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
         clear_active_prompt_fragments_for_stage(&mut run);
 
         if matches!(
@@ -275,7 +249,7 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
         ).await?;
 
         let next_target = resolve_next_target(&definition, &step, &outcome);
-        let auto_advance = should_auto_advance(&step, &outcome);
+        let auto_advance = automatic && should_auto_advance(&step, &outcome);
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
             clear_run_pause_requested(&mut run);
@@ -299,6 +273,41 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
             }));
         }
         persist_context(state, run_id, &run.context).await?;
+
+        if matches!(mode, RunMode::Manual) {
+            let status = match outcome.disposition {
+                StageDisposition::Paused => RunStatus::Paused,
+                StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
+                StageDisposition::Success
+                | StageDisposition::RetryStage
+                | StageDisposition::MoveNext
+                | StageDisposition::MoveBack
+                | StageDisposition::Outcome(_)
+                | StageDisposition::Stay => RunStatus::Waiting,
+            };
+            let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
+            set_run_status(state, run_id, status.clone(), current_step_id).await?;
+
+            return Ok(json!({
+                "ok": outcome.ok,
+                "status": match status {
+                    RunStatus::Draft => "waiting",
+                    RunStatus::Queued => "queued",
+                    RunStatus::Running => "running",
+                    RunStatus::Waiting => "waiting",
+                    RunStatus::Paused => "paused",
+                    RunStatus::Success => "success",
+                    RunStatus::Error => "error",
+                    RunStatus::Cancelled => "cancelled",
+                },
+                "step_id": step.id,
+                "next_step_id": next_target,
+                "message": outcome.message,
+                "disposition": format_disposition(&outcome.disposition),
+                "capability_results": outcome.capability_results,
+                "local_state": outcome.local_state,
+            }));
+        }
 
         match (&outcome.disposition, next_target.clone(), auto_advance) {
             (StageDisposition::Success, Some(target), true) => {
@@ -420,8 +429,23 @@ async fn continue_until_wait(state: &AppState, run_id: Uuid, requested_step_id: 
                 requested = Some(target);
                 continue;
             }
+            (StageDisposition::Stay, _, _) => {
+                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+                return Ok(json!({
+                    "ok": outcome.ok,
+                    "status": "waiting",
+                    "step_id": step.id,
+                    "message": outcome.message,
+                }));
+            }
             _ => {
-                return Ok(last_payload);
+                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+                return Ok(json!({
+                    "ok": outcome.ok,
+                    "status": "waiting",
+                    "step_id": step.id,
+                    "message": outcome.message,
+                }));
             }
         }
     }

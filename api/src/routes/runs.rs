@@ -5,6 +5,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
+    db::new_workflow_key,
     app_state::AppState,
     engine,
     models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun, WorkflowTemplateDefinition},
@@ -21,7 +22,7 @@ pub fn router() -> Router<AppState> {
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
     )
     .fetch_all(&state.db)
     .await
@@ -36,7 +37,7 @@ async fn get_run(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let row = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
     .bind(run_id.to_string())
     .fetch_one(&state.db)
@@ -51,7 +52,7 @@ async fn open_run(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let row = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
     )
     .bind(run_id.to_string())
     .fetch_one(&state.db)
@@ -296,6 +297,13 @@ async fn create_run(
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
     let id = Uuid::new_v4();
+    let workflow_key = req
+        .workflow_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| new_workflow_key(&req.repo_ref));
     let status = RunStatus::Waiting;
 
     let definition = if let Some(definition) = req.definition.clone() {
@@ -353,6 +361,7 @@ async fn create_run(
         current_step_id: current_step_id.clone(),
         title: req.title.clone(),
         repo_ref: req.repo_ref.clone(),
+        workflow_key: workflow_key.clone(),
         context: run_context.clone(),
         created_at: now,
         updated_at: now,
@@ -363,7 +372,7 @@ async fn create_run(
     run_context = seeded_run.context;
 
     sqlx::query(
-        "INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(id.to_string())
     .bind(req.template_id.map(|v| v.to_string()))
@@ -372,6 +381,7 @@ async fn create_run(
     .bind(current_step_id.clone())
     .bind(&req.title)
     .bind(&req.repo_ref)
+    .bind(&workflow_key)
     .bind(serde_json::to_string(&run_context).map_err(internal)?)
     .bind(now.to_rfc3339())
     .bind(now.to_rfc3339())
@@ -399,6 +409,7 @@ async fn create_run(
         current_step_id: current_step_id.clone(),
         title: req.title,
         repo_ref: req.repo_ref,
+        workflow_key,
         context: run_context,
         created_at: now,
         updated_at: now,
@@ -514,6 +525,7 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
         current_step_id: row.get("current_step_id"),
         title: row.get("title"),
         repo_ref: row.get("repo_ref"),
+        workflow_key: row.get("workflow_key"),
         context: serde_json::from_str(row.get::<String, _>("context_json").as_str()).map_err(internal)?,
         created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
         updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str()).map_err(internal)?.with_timezone(&Utc),

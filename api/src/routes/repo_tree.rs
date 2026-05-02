@@ -1,13 +1,16 @@
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command};
 
 use anyhow::Context;
-use axum::{extract::Query, routing::get, Json, Router};
+use axum::{extract::{Path as AxumPath, Query, State}, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 
+use super::workflow_scope::resolve_workflow_scope;
+
 #[derive(Debug, Deserialize)]
 pub struct RepoTreeQuery {
+    #[serde(default)]
     pub repo_ref: String,
     #[serde(default = "default_git_ref")]
     pub git_ref: String,
@@ -68,6 +71,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/repo-tree", get(get_repo_tree))
         .route("/api/repo-files", get(get_repo_files))
         .route("/api/repo/validate", get(validate_repo_ref))
+        .route("/api/workflow-runs/:run_id/repository/tree", get(get_workflow_repo_tree))
 }
 
 async fn get_repo_tree(
@@ -118,6 +122,21 @@ async fn get_repo_files(
         files,
         refreshed_at: chrono::Utc::now().to_rfc3339(),
     }))
+}
+
+async fn get_workflow_repo_tree(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<uuid::Uuid>,
+    Query(query): Query<RepoTreeQuery>,
+) -> Result<Json<RepoTreeResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    get_repo_tree(Query(RepoTreeQuery {
+        repo_ref: scope.repo_ref,
+        git_ref: if query.git_ref.trim().is_empty() { scope.git_ref } else { query.git_ref },
+        base_path: query.base_path,
+        skip_binary: query.skip_binary,
+        skip_gitignore: query.skip_gitignore,
+    })).await
 }
 
 async fn validate_repo_ref(

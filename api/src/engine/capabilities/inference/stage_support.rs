@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::{binding_specs, changeset_schema, context_export},
+        capabilities::{binding_specs, changeset::schema as changeset_schema, context_export},
         stages::compose_prompt_from_state,
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
@@ -250,12 +250,6 @@ pub fn build_inference_execution_plan(
     local_state: &Value,
     settings: InferenceStageSettings,
 ) -> Result<Vec<StageExecutionNode>> {
-    let automation = local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
     let include_repo_context = shared_inference_primitive_enabled(
         global_state,
         step,
@@ -270,10 +264,7 @@ pub fn build_inference_execution_plan(
         settings.include_changeset_schema,
     );
 
-    let auto_apply_changeset = automation
-        .get("auto_apply_changeset")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let auto_apply_changeset = auto_apply_enabled(step, local_state);
 
     let repo_context = if include_repo_context {
         Some(context_export::normalize_context_export_payload(

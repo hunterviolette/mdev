@@ -1,4 +1,5 @@
 mod capabilities;
+mod changesets;
 mod event_chains;
 mod filesystem;
 mod health;
@@ -9,6 +10,7 @@ mod review;
 mod settings;
 mod templates;
 mod workflow_builder;
+mod workflow_scope;
 
 use axum::Router;
 
@@ -25,4 +27,5 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(filesystem::router())
         .merge(event_chains::router())
         .merge(capabilities::router())
+        .merge(changesets::router())
 }

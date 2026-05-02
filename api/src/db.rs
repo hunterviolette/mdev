@@ -1,6 +1,88 @@
 use std::str::FromStr;
+use std::collections::HashMap;
 
 use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, Row, SqlitePool};
+use uuid::Uuid;
+
+use crate::engine::capabilities::changeset::persistence::{CHANGESET_ATTEMPTS_TABLE_SQL, CHANGESET_FILE_EFFECTS_TABLE_SQL};
+
+pub fn repo_basename_for_workflow_key(repo_ref: &str) -> String {
+    let normalized = repo_ref.trim().replace('\\', "/");
+    let raw = normalized
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("workflow");
+
+    let mut out = raw
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect::<String>();
+
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() { "workflow".to_string() } else { out }
+}
+
+pub fn new_workflow_key(repo_ref: &str) -> String {
+    format!("{}-{}", repo_basename_for_workflow_key(repo_ref), Uuid::new_v4())
+}
+
+async fn backfill_workflow_keys(db: &SqlitePool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, title, repo_ref FROM workflow_runs WHERE TRIM(COALESCE(workflow_key, '')) = '' ORDER BY created_at ASC, id ASC",
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut keys_by_group = HashMap::<(String, String), String>::new();
+    for row in rows {
+        let id: String = row.get("id");
+        let title: String = row.get("title");
+        let repo_ref: String = row.get("repo_ref");
+        let key = keys_by_group
+            .entry((title, repo_ref.clone()))
+            .or_insert_with(|| new_workflow_key(&repo_ref))
+            .clone();
+
+        sqlx::query("UPDATE workflow_runs SET workflow_key = ? WHERE id = ?")
+            .bind(key)
+            .bind(id)
+            .execute(db)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn backfill_changeset_workflow_keys(db: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE changeset_attempts
+        SET workflow_key = (
+            SELECT workflow_runs.workflow_key
+            FROM workflow_runs
+            WHERE workflow_runs.id = changeset_attempts.run_id
+        )
+        WHERE TRIM(COALESCE(workflow_key, '')) = ''
+          AND run_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM workflow_runs
+              WHERE workflow_runs.id = changeset_attempts.run_id
+                AND TRIM(COALESCE(workflow_runs.workflow_key, '')) != ''
+          )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
 
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(url)?
@@ -40,6 +122,7 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             current_step_id TEXT,
             title TEXT NOT NULL,
             repo_ref TEXT NOT NULL,
+            workflow_key TEXT NOT NULL DEFAULT '',
             context_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -87,6 +170,42 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query(CHANGESET_ATTEMPTS_TABLE_SQL)
+        .execute(db)
+        .await?;
+
+    sqlx::query(CHANGESET_FILE_EFFECTS_TABLE_SQL)
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_attempts_repo_created ON changeset_attempts (repo_ref, created_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow_key ON workflow_runs (workflow_key)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_attempts_workflow_created ON changeset_attempts (workflow_key, created_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_attempts_status ON changeset_attempts (status)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_attempts_reverses ON changeset_attempts (reverses_attempt_id)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_file_effects_attempt ON changeset_file_effects (attempt_id, op_index, action_index)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_changeset_file_effects_action_status ON changeset_file_effects (action, status)")
+    .execute(db)
+    .await?;
+
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_templates_name ON workflow_templates (name)")
     .execute(db)
     .await?;
@@ -127,6 +246,33 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             .execute(db)
             .await?;
     }
+
+    let run_columns = sqlx::query("PRAGMA table_info(workflow_runs)")
+        .fetch_all(db)
+        .await?;
+    let has_run_workflow_key = run_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "workflow_key");
+    if !has_run_workflow_key {
+        sqlx::query("ALTER TABLE workflow_runs ADD COLUMN workflow_key TEXT NOT NULL DEFAULT ''")
+            .execute(db)
+            .await?;
+    }
+
+    let attempt_columns = sqlx::query("PRAGMA table_info(changeset_attempts)")
+        .fetch_all(db)
+        .await?;
+    let has_attempt_workflow_key = attempt_columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "workflow_key");
+    if !has_attempt_workflow_key {
+        sqlx::query("ALTER TABLE changeset_attempts ADD COLUMN workflow_key TEXT NOT NULL DEFAULT ''")
+            .execute(db)
+            .await?;
+    }
+
+    backfill_workflow_keys(db).await?;
+    backfill_changeset_workflow_keys(db).await?;
 
     sqlx::query(
         r#"

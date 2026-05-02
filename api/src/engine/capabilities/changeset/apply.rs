@@ -1,9 +1,14 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{collections::HashSet, fs, path::{Path, PathBuf}, time::Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::engine::capabilities::changeset::persistence::{
+    insert_changeset_log_from_result,
+    ChangesetAttemptContext,
+    ChangesetFileEffectLog,
+};
 use crate::engine::capabilities::registry::{
     find_result,
     CapabilityContext,
@@ -164,7 +169,13 @@ pub async fn execute(
         });
     }
 
+    let source = config
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("workflow")
+        .to_string();
     let target = resolve_apply_changeset_target(ctx, config)?;
+    let started = Instant::now();
 
     let result = match execute_changeset_apply(
         PathBuf::from(&target.repo_ref).as_path(),
@@ -201,6 +212,32 @@ pub async fn execute(
         }));
     }
 
+    match log_changeset_attempt(
+        ctx,
+        &target,
+        &source,
+        &payload_text,
+        &result,
+        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+    ).await {
+        Ok(attempt_id) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("changeset_attempt_id".to_string(), Value::String(attempt_id));
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                run_id = %ctx.run_id,
+                step_id = %ctx.step.id.as_str(),
+                repo_ref = %target.repo_ref.as_str(),
+                git_ref = %target.git_ref.as_str(),
+                source = %source,
+                error = %format!("{:#}", err),
+                "changeset applied, but failed to persist changeset attempt log"
+            );
+        }
+    }
+
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
         capability: "gateway_model/changeset".to_string(),
@@ -209,7 +246,7 @@ pub async fn execute(
     })
 }
 
-fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Result<Value> {
+pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Result<Value> {
     let normalized = normalize_changeset_payload_text(payload_text)?;
     let payload: ChangeSetPayload = serde_json::from_str(&normalized)
         .context("failed to decode normalized changeset")?;
@@ -400,6 +437,182 @@ fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Re
         "failing_files": failing_files,
         "normalized_payload": normalized,
     }))
+}
+
+async fn log_changeset_attempt(
+    ctx: &CapabilityContext<'_>,
+    target: &ApplyChangesetTarget,
+    source: &str,
+    payload_text: &str,
+    result: &Value,
+    duration_ms: i64,
+) -> Result<String> {
+    let normalized_payload = result
+        .get("normalized_payload")
+        .and_then(Value::as_str)
+        .unwrap_or(payload_text)
+        .to_string();
+    let parsed_payload = serde_json::from_str::<ChangeSetPayload>(&normalized_payload).ok();
+    let file_effects = parsed_payload
+        .as_ref()
+        .map(|payload| build_file_effect_logs(payload, result))
+        .unwrap_or_default();
+
+    insert_changeset_log_from_result(
+        &ctx.state.db,
+        ChangesetAttemptContext {
+            run_id: Some(ctx.run_id.to_string()),
+            step_id: Some(ctx.step.id.clone()),
+            workflow_key: None,
+            repo_ref: target.repo_ref.as_str(),
+            git_ref: target.git_ref.as_str(),
+            source,
+            payload_text,
+            duration_ms,
+        },
+        result,
+        file_effects,
+    )
+    .await
+}
+
+
+fn build_file_effect_logs(payload: &ChangeSetPayload, result: &Value) -> Vec<ChangesetFileEffectLog> {
+    payload
+        .operations
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, op)| operation_effect_logs(idx + 1, op, result))
+        .collect()
+}
+
+fn operation_effect_logs(op_index: usize, op: &Operation, result: &Value) -> Vec<ChangesetFileEffectLog> {
+    match op {
+        Operation::Edit { path, changes } => changes
+            .iter()
+            .enumerate()
+            .map(|(change_idx, change)| {
+                let status = edit_action_status(op_index, change_idx + 1, change, result);
+                let error = edit_action_error(op_index, change_idx + 1, result);
+                ChangesetFileEffectLog {
+                    op_index: op_index as i64,
+                    action_index: (change_idx + 1) as i64,
+                    action: change.action.clone(),
+                    path_before: Some(path.clone()),
+                    path_after: Some(path.clone()),
+                    status,
+                    forward_op_json: serde_json::to_string(change).unwrap_or_else(|_| "{}".to_string()),
+                    error,
+                }
+            })
+            .collect(),
+        Operation::Write { path, .. } => vec![operation_effect_log(op_index, "write", None, Some(path.clone()), op, result)],
+        Operation::Delete { path } => vec![operation_effect_log(op_index, "delete", Some(path.clone()), None, op, result)],
+        Operation::Move { from, to } => vec![operation_effect_log(op_index, "move", Some(from.clone()), Some(to.clone()), op, result)],
+    }
+}
+
+fn operation_effect_log(
+    op_index: usize,
+    action: &str,
+    path_before: Option<String>,
+    path_after: Option<String>,
+    op: &Operation,
+    result: &Value,
+) -> ChangesetFileEffectLog {
+    ChangesetFileEffectLog {
+        op_index: op_index as i64,
+        action_index: 1,
+        action: action.to_string(),
+        path_before,
+        path_after,
+        status: operation_status(op_index, result),
+        forward_op_json: serde_json::to_string(op).unwrap_or_else(|_| "{}".to_string()),
+        error: operation_error(op_index, result),
+    }
+}
+
+fn result_lines(result: &Value) -> Vec<String> {
+    result
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn operation_status(op_index: usize, result: &Value) -> String {
+    let ok_line = format!("[{}] ok", op_index);
+    let failed_prefix = format!("[{}] FAILED:", op_index);
+    let partial_prefix = format!("[{}] PARTIAL:", op_index);
+    let lines = result_lines(result);
+    if lines.iter().any(|line| line == &ok_line) {
+        "applied".to_string()
+    } else if lines.iter().any(|line| line.starts_with(&partial_prefix)) {
+        "partial".to_string()
+    } else if lines.iter().any(|line| line.starts_with(&failed_prefix)) {
+        "failed".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn operation_error(op_index: usize, result: &Value) -> Option<String> {
+    let failed_prefix = format!("[{}] FAILED: ", op_index);
+    result_lines(result)
+        .into_iter()
+        .find_map(|line| line.strip_prefix(&failed_prefix).map(str::to_string))
+}
+
+fn edit_action_status(op_index: usize, action_index: usize, change: &EditAction, result: &Value) -> String {
+    let descriptor = describe_edit_change(action_index, change);
+    let pass = format!("  - {}", descriptor.replacen("edit[", "PASS edit[", 1));
+    let fail = format!("  - {}", descriptor.replacen("edit[", "FAIL edit[", 1));
+    let operation_header = format!("[{}] edit ", op_index);
+    let next_header = format!("[{}] ", op_index + 1);
+    let mut in_operation = false;
+
+    for line in result_lines(result) {
+        if line.starts_with(&operation_header) {
+            in_operation = true;
+            continue;
+        }
+        if in_operation && line.starts_with(&next_header) {
+            break;
+        }
+        if in_operation && line == pass {
+            return "applied".to_string();
+        }
+        if in_operation && line == fail {
+            return "failed".to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn edit_action_error(op_index: usize, action_index: usize, result: &Value) -> Option<String> {
+    result
+        .get("failing_files")
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files.iter().find_map(|file| {
+                let file_op_index = file.get("operation_index").and_then(Value::as_u64)? as usize;
+                if file_op_index != op_index {
+                    return None;
+                }
+                file.get("failed_actions")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .find_map(|action| {
+                        let failed_index = action.get("index").and_then(Value::as_u64)? as usize;
+                        if failed_index == action_index {
+                            action.get("error").and_then(Value::as_str).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+            })
+        })
 }
 
 fn extract_json_object_slice(text: &str) -> Option<&str> {
