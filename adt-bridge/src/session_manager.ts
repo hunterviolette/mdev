@@ -364,7 +364,8 @@ export class SessionManager {
 
   async syntaxCheck(cmd: SyntaxCheckCommand) {
     const state = this.getSession(cmd.session_id);
-    const resp = await state.client.syntaxCheck(cmd.object_uri);
+    const resp = await state.client.runCheckruns(cmd.object_uri);
+    console.error(`[sap_adt] http label=run_checkruns method=POST status=${resp.status} url=/sap/bc/adt/checkruns?reporters=abapCheckRun`);
     const problems = parseProblems(resp.body);
     return {
       session_id: state.sessionId,
@@ -373,7 +374,12 @@ export class SessionManager {
       ok: resp.status >= 200 && resp.status < 300 && problems.length === 0,
       problems,
       xml: resp.body,
-      headers: resp.headers
+      headers: resp.headers,
+      debug: {
+        command: 'syntax_check',
+        reporter: 'abapCheckRun',
+        inactive_version: true
+      }
     };
   }
 

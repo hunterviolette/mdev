@@ -11,12 +11,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NODE_VERSION: 24.14.0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TURBO_TELEMETRY_DISABLED: 1
+  WORKFLOW_API_HOST: 127.0.0.1
+  WORKFLOW_API_PORT: 8788
+  WORKFLOW_WEB_HOST: 127.0.0.1
+  WORKFLOW_WEB_PORT: 5173
+  WORKFLOW_BROWSER_CDP_HOST: 127.0.0.1
+  WORKFLOW_BROWSER_CDP_PORT: 9222
 
 jobs:
-  ci:
+  js:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,19 +36,28 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: npm install --include=optional
 
-      - name: Install bridge dependencies
-        working-directory: bridge
-        run: npm ci
+      - name: Build Node workspaces
+        run: npx turbo build
+  rust:
+    runs-on: ubuntu-latest
 
-      - name: Build bridge
-        working-directory: bridge
-        run: npm run build
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
 
       - name: Cargo check
+        working-directory: api
         run: cargo check
 
       - name: Cargo test
+        working-directory: api
         run: cargo test

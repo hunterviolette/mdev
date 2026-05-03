@@ -128,6 +128,7 @@ export class AdtClient {
     const workDir = await mkdtemp(path.join(os.tmpdir(), 'mdev-adt-curl-'));
     const headerFile = path.join(workDir, 'headers.txt');
     const bodyFile = path.join(workDir, 'body.txt');
+    const requestBodyFile = path.join(workDir, 'request-body.bin');
     const args: string[] = [
       '--silent',
       '--show-error',
@@ -165,7 +166,8 @@ export class AdtClient {
     }
 
     if (body !== undefined) {
-      args.push('--data-binary', body);
+      await writeFile(requestBodyFile, body, 'utf8');
+      args.push('--data-binary', `@${requestBodyFile}`);
     }
 
     args.push(url);
