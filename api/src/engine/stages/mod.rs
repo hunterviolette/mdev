@@ -2,6 +2,7 @@ mod code_stage;
 mod compile_stage;
 mod design_stage;
 mod review_stage;
+mod merge_patches_stage;
 mod sap_export_stage;
 mod sap_import_stage;
 mod sap_syntax_stage;
@@ -253,6 +254,9 @@ pub async fn execute_stage(
     );
 
     let prepared_local_state = prepare_stage_local_state(repo_ref.as_str(), &global_state, step, local_state)?;
+    if step.step_type.as_str() == "merge_patches" {
+        return merge_patches_stage::execute_stage(state, run_id, run, step, repo_ref.as_str(), prepared_local_state).await;
+    }
     let plan = resolve_effective_execution_plan(&global_state, repo_ref.as_str(), step, &prepared_local_state)?;
     let prepared_local_state_obj = prepared_local_state
         .as_object()
@@ -333,6 +337,26 @@ pub async fn execute_stage(
         local_state: prepared_local_state,
     };
 
+    if outcome.ok {
+        if let Err(err) = crate::supervisor::apply_refined_feature_output_from_workflow(state, run, &outcome.capability_results).await {
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "error",
+                "supervisor_planner_item_apply_failed",
+                "Failed to apply refined planner item output",
+                json!({
+                    "step_id": step.id,
+                    "step_type": step.step_type,
+                    "error": err.to_string(),
+                    "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
+                }),
+            )
+            .await?;
+        }
+    }
+
     append_engine_event(
         state,
         run_id,
@@ -366,6 +390,7 @@ fn prepare_stage_local_state(
         "code" => code_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
         "compile" => compile_stage::prepare_stage_state(step, local_state),
         "review" => review_stage::prepare_stage_state(step, local_state),
+        "merge_patches" => merge_patches_stage::prepare_stage_state(step, local_state),
         "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
         "sap_syntax" => sap_syntax_stage::prepare_stage_state(step, local_state),
         "sap_export" => sap_export_stage::prepare_stage_state(step, local_state),
@@ -635,6 +660,7 @@ fn resolve_effective_execution_plan(
             run_after: vec![],
             condition: Value::Null,
         }]),
+        "merge_patches" => Ok(vec![]),
         _ => {
             if !step.execution_plan.is_empty() {
                 Ok(step.execution_plan.clone())
@@ -669,7 +695,7 @@ pub(crate) fn compose_prompt_from_state(
 ) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
-    let order = ["user_input", "repo_context", "changeset_schema"];
+    let order = ["user_input", "repo_context", "changeset_schema", "planner_schema"];
 
     let mut parts = Vec::new();
     for key in order {

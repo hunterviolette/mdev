@@ -223,6 +223,35 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS supervisor_runs (
+            id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT NOT NULL,
+            root_repo_path TEXT NOT NULL,
+            snapshot_path TEXT,
+            integration_path TEXT,
+            features_json TEXT NOT NULL DEFAULT '[]',
+            child_runs_json TEXT NOT NULL DEFAULT '[]',
+            integration_run_id TEXT,
+            final_patch_path TEXT,
+            merge_report_json TEXT NOT NULL DEFAULT '{}',
+            validation_report_json TEXT NOT NULL DEFAULT '{}',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_supervisor_runs_status_updated ON supervisor_runs (status, updated_at)")
+    .execute(db)
+    .await?;
+
     let template_columns = sqlx::query("PRAGMA table_info(workflow_templates)")
         .fetch_all(db)
         .await?;

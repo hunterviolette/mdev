@@ -50,28 +50,107 @@ pub fn generate_git_apply_patch(
 ) -> Result<String> {
     ensure_git_repo(repo)?;
 
-    let mut args: Vec<String> = vec!["diff".to_string(), "--binary".to_string()];
-
-    if let Some(context_lines) = context_lines {
-        args.push(format!("--unified={context_lines}"));
-    }
-
     match scope {
-        GitPatchScope::Staged => args.push("--cached".to_string()),
-        GitPatchScope::Unstaged => {}
-        GitPatchScope::Both => args.push("HEAD".to_string()),
-    }
+        GitPatchScope::Both => generate_git_apply_patch_with_untracked(repo, paths, context_lines),
+        GitPatchScope::Staged | GitPatchScope::Unstaged => {
+            let mut args: Vec<String> = vec!["diff".to_string(), "--binary".to_string()];
 
-    if let Some(paths) = paths {
-        if !paths.is_empty() {
-            args.push("--".to_string());
-            args.extend(paths.iter().cloned());
+            if let Some(context_lines) = context_lines {
+                args.push(format!("--unified={context_lines}"));
+            }
+
+            match scope {
+                GitPatchScope::Staged => args.push("--cached".to_string()),
+                GitPatchScope::Unstaged => {}
+                GitPatchScope::Both => unreachable!(),
+            }
+
+            if let Some(paths) = paths {
+                if !paths.is_empty() {
+                    args.push("--".to_string());
+                    args.extend(paths.iter().cloned());
+                }
+            }
+
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = run_git(repo, &arg_refs)?;
+            String::from_utf8(out).context("git diff output was not valid UTF-8")
         }
     }
+}
 
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_git(repo, &arg_refs)?;
-    String::from_utf8(out).context("git diff output was not valid UTF-8")
+fn generate_git_apply_patch_with_untracked(
+    repo: &Path,
+    paths: Option<&[String]>,
+    context_lines: Option<u32>,
+) -> Result<String> {
+    let git_dir = String::from_utf8(run_git(repo, &["rev-parse", "--git-dir"])?).context("git dir was not valid UTF-8")?;
+    let git_dir = git_dir.trim();
+    let git_dir_path = {
+        let path = PathBuf::from(git_dir);
+        if path.is_absolute() { path } else { repo.join(path) }
+    };
+    let temp_index = git_dir_path.join(format!("mdev_patch_index_{}", std::process::id()));
+    let head_tree = String::from_utf8(run_git(repo, &["rev-parse", "HEAD^{tree}"])?).context("HEAD tree was not valid UTF-8")?;
+    let head_tree = head_tree.trim().to_string();
+
+    let mut read_tree = Command::new("git");
+    read_tree
+        .arg("-C")
+        .arg(repo)
+        .arg("read-tree")
+        .arg(&head_tree)
+        .env("GIT_INDEX_FILE", &temp_index);
+    let read_tree_out = read_tree.output().with_context(|| format!("failed to run git read-tree in {:?}", repo))?;
+    if !read_tree_out.status.success() {
+        let _ = std::fs::remove_file(&temp_index);
+        bail!("git read-tree failed: {}", String::from_utf8_lossy(&read_tree_out.stderr).trim());
+    }
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(repo).arg("add").arg("-A");
+    if let Some(paths) = paths {
+        if !paths.is_empty() {
+            add.arg("--");
+            for path in paths {
+                add.arg(path);
+            }
+        }
+    }
+    add.env("GIT_INDEX_FILE", &temp_index);
+    let add_out = add.output().with_context(|| format!("failed to run git add in {:?}", repo))?;
+    if !add_out.status.success() {
+        let _ = std::fs::remove_file(&temp_index);
+        bail!("git add failed: {}", String::from_utf8_lossy(&add_out.stderr).trim());
+    }
+
+    let mut diff = Command::new("git");
+    diff.arg("-C")
+        .arg(repo)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--binary");
+    if let Some(context_lines) = context_lines {
+        diff.arg(format!("--unified={context_lines}"));
+    }
+    diff.arg("HEAD");
+    if let Some(paths) = paths {
+        if !paths.is_empty() {
+            diff.arg("--");
+            for path in paths {
+                diff.arg(path);
+            }
+        }
+    }
+    diff.env("GIT_INDEX_FILE", &temp_index);
+    let diff_out = diff.output().with_context(|| format!("failed to run git diff in {:?}", repo))?;
+    let _ = std::fs::remove_file(&temp_index);
+
+    if !diff_out.status.success() {
+        bail!("git diff failed: {}", String::from_utf8_lossy(&diff_out.stderr).trim());
+    }
+
+    String::from_utf8(diff_out.stdout).context("git diff output was not valid UTF-8")
 }
 
 pub fn run_git_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {

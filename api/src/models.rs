@@ -155,6 +155,19 @@ pub struct WorkflowTemplateDefinition {
     pub steps: Vec<WorkflowStepDefinition>,
 }
 
+
+pub use crate::supervisor::models::{
+    CreateSupervisorRunRequest,
+    ExecutionPlanItem,
+    FeaturePlanItem,
+    FeaturePlanItemStatus,
+    SupervisorActionRequest,
+    SupervisorChildRun,
+    SupervisorExecutionStrategy,
+    SupervisorRun,
+    SupervisorStatus,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowBuilderCatalog {
     pub version: u32,

@@ -120,6 +120,45 @@ pub fn prepare_inference_stage_state(
             .remove("changeset_schema");
     }
 
+    let include_planner_schema = global_state
+        .get("capabilities")
+        .and_then(|v| v.get("supervisor_planner_item"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || inference_state
+            .get("prompt_fragment_enabled")
+            .and_then(|v| v.get("planner_schema"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+    let planner_schema_fragment = if include_planner_schema {
+        fragments
+            .get("planner_schema")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| crate::supervisor::planner_schema::PLANNER_SCHEMA_PROMPT_FRAGMENT.to_string())
+    } else {
+        String::new()
+    };
+
+    if include_planner_schema {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert(
+                "planner_schema".to_string(),
+                Value::String(planner_schema_fragment),
+            );
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("planner_schema");
+    }
+
     let transient_prompt_fragments = collect_active_transient_prompt_fragments(global_state);
 
     let mut effective_enabled = json!({});
@@ -132,6 +171,7 @@ pub fn prepare_inference_stage_state(
         Value::Bool(user_input.is_some()),
     );
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
+    enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 
     let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
 

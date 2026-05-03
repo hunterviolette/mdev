@@ -2,6 +2,7 @@ mod app_state;
 mod db;
 mod engine;
 mod models;
+mod supervisor;
 mod runtime_env;
 mod routes;
 

@@ -87,6 +87,7 @@ import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
+import { SupervisorPanel } from './SupervisorPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 
 const ReviewDiffViewerPanel = lazy(async () => {
@@ -147,7 +148,8 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
+type MonitorHomeView = 'workflows' | 'supervisors';
+type WorkspaceTabKey = 'workflows' | 'supervisor' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -487,6 +489,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   stageApplyError: string;
   stageCompileError: string;
   stageCompileCommandsText: string;
+  stageUserInput: string;
   inferenceConnectionStatus: InferenceConnectionStatus;
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
@@ -510,6 +513,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     stageApplyError,
     stageCompileError,
     stageCompileCommandsText,
+    stageUserInput,
     inferenceConnectionStatus,
     inferenceTransport,
     sharedInferenceState,
@@ -528,6 +532,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   } = props;
 
   const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
+  const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
@@ -541,8 +546,23 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     || !!selectedWorkflowStep.prompt?.include_changeset_schema
   );
   const usesCompileCommands = stepUsesCapability(selectedWorkflowStep, 'compile_commands');
+  const designModeDraftValue = fieldDrafts['config.design_mode'];
+  const designMode = typeof designModeDraftValue === 'string'
+    ? designModeDraftValue
+    : readStringValue(selectedWorkflowStep, 'config.design_mode', 'v1');
+  const structuredOutput = (selectedWorkflowStep?.execution_logic as Record<string, unknown> | undefined)?.structured_output as Record<string, unknown> | undefined;
+  const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
+  const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
+  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(structuredOutput?.fine_feature_format_armed);
+  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(structuredOutput?.auto_normalize_and_apply_to_planner);
+
+  useEffect(() => {
+    setPlannerSchemaArmedDraft(null);
+    setPlannerAutoApplyDraft(null);
+  }, [selectedWorkflowStep?.id]);
 
   const modifierActions = useMemo<StageModifierAction[]>(() => {
+
     const actions: StageModifierAction[] = [];
 
     if (usesRepoContext) {
@@ -571,6 +591,25 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
         onToggle: onToggleSharedChangesetSchema,
         helperText: 'Shared global capability surfaced in this stage.'
       });
+    }
+
+    if (selectedWorkflowStep?.step_type === 'design' && designMode === 'v2') {
+      actions.push({
+        key: 'planner_schema',
+        label: 'Planner schema',
+        buttonLabel: 'Configure',
+        status: fineFeatureFormatArmed ? 'Armed' : 'Off',
+        color: fineFeatureFormatArmed ? 'green' : 'gray',
+        toggleLabel: fineFeatureFormatArmed ? 'Disarm' : 'Arm',
+        toggleColor: fineFeatureFormatArmed ? 'orange' : 'green',
+        onToggle: () => {
+          const next = !fineFeatureFormatArmed;
+          setPlannerSchemaArmedDraft(next);
+          onPatchSelectedStepConfig('execution_logic.structured_output.fine_feature_format_armed', next);
+        },
+        helperText: 'Require model output in the supervisor planner schema.'
+      });
+
     }
 
     if (usesInference) {
@@ -617,6 +656,9 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     onOpenSchemaConfig,
     onToggleSharedChangesetSchema,
     usesInference,
+    designMode,
+    fineFeatureFormatArmed,
+    autoNormalizeAndApplyToPlanner,
     inferenceConnectionStatus,
     inferenceTransport,
     onOpenInferenceConfig,
@@ -627,6 +669,10 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   ]);
 
   function valueForField(field: WorkflowStageField): unknown {
+    if (field.bind_to === 'prompt.user_input') {
+      return stageUserInput;
+    }
+
     if (field.bind_to === 'execution.compile_checks.commands_text') {
       return stageCompileCommandsText;
     }
@@ -642,15 +688,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     return current ?? field.default;
   }
 
-  const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
-
   useEffect(() => {
     setFieldDrafts(
       Object.fromEntries(
         fields.map((field) => [field.key, valueForField(field)])
       )
     );
-  }, [fields, selectedWorkflowStep?.id, stageCompileCommandsText]);
+  }, [fields, selectedWorkflowStep?.id, stageCompileCommandsText, stageUserInput]);
 
   function updateField(field: WorkflowStageField, value: unknown) {
     setFieldDrafts((prev) => ({
@@ -683,6 +727,21 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           value={String(typeof value === 'number' ? value : Number(value ?? field.default ?? 0) || 0)}
           onChange={(event) => updateField(field, Number(event.currentTarget.value || '0'))}
           disabled={disabled}
+        />
+      );
+    }
+
+    if (field.ui?.control === 'select') {
+      return (
+        <Select
+          key={field.key}
+          label={field.label}
+          description={field.description}
+          data={(field.options ?? []).map((option) => ({ value: option.value, label: option.label }))}
+          value={typeof value === 'string' ? value : String(field.default ?? '')}
+          onChange={(nextValue) => updateField(field, nextValue ?? field.default ?? '')}
+          disabled={disabled}
+          clearable={!field.required}
         />
       );
     }
@@ -724,6 +783,19 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           {group.fields.map((field) => renderField(field))}
         </Stack>
       ))}
+      {selectedWorkflowStep?.step_type === 'design' && designMode === 'v2' ? (
+        <Switch
+          label="Planner apply"
+          description="Normalize model output and apply it to the planner feature without deleting the rough prompt."
+          checked={autoNormalizeAndApplyToPlanner}
+          onChange={(event) => {
+            const next = event.currentTarget.checked;
+            setPlannerAutoApplyDraft(next);
+            onPatchSelectedStepConfig('execution_logic.structured_output.auto_normalize_and_apply_to_planner', next);
+          }}
+          disabled={disabled}
+        />
+      ) : null}
       {selectedWorkflowStep?.step_type === 'review' ? (
         <Group>
           <Button variant="light" onClick={onOpenChanges} disabled={disabled}>
@@ -1090,6 +1162,7 @@ export function WorkflowShell() {
   const [view, setView] = useState<ShellView>('monitor');
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
+  const [monitorHomeView, setMonitorHomeView] = useState<MonitorHomeView>('workflows');
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1134,6 +1207,45 @@ export function WorkflowShell() {
           compile_commands: {
             ...currentCompileCommands,
             commands: compileCommands
+          }
+        }
+      });
+    } else if (bindTo === 'execution_logic.structured_output.fine_feature_format_armed' || bindTo === 'execution_logic.structured_output.auto_normalize_and_apply_to_planner') {
+      const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+      const currentSupervisorPlannerItem = (currentCapabilities.supervisor_planner_item as Record<string, unknown> | undefined) ?? {};
+      const currentInference = (currentCapabilities.inference as Record<string, unknown> | undefined) ?? {};
+      const currentPromptFragments = (currentInference.prompt_fragments as Record<string, unknown> | undefined) ?? {};
+      const currentPromptFragmentEnabled = (currentInference.prompt_fragment_enabled as Record<string, unknown> | undefined) ?? {};
+      const currentStructuredOutput = (selectedWorkflowStep.execution_logic as Record<string, unknown> | undefined)?.structured_output as Record<string, unknown> | undefined;
+      const plannerSchemaArmed = bindTo === 'execution_logic.structured_output.fine_feature_format_armed'
+        ? Boolean(value)
+        : Boolean(currentStructuredOutput?.fine_feature_format_armed);
+      const plannerAutoApply = bindTo === 'execution_logic.structured_output.auto_normalize_and_apply_to_planner'
+        ? Boolean(value)
+        : Boolean(currentStructuredOutput?.auto_normalize_and_apply_to_planner);
+
+      void patchWorkflowGlobalState(selectedRunId, {
+        ...currentGlobalState,
+        capabilities: {
+          ...currentCapabilities,
+          inference: {
+            ...currentInference,
+            prompt_fragments: {
+              ...currentPromptFragments,
+              planner_schema: ''
+            },
+            prompt_fragment_enabled: {
+              ...currentPromptFragmentEnabled,
+              planner_schema: plannerSchemaArmed
+            }
+          },
+          supervisor_planner_item: {
+            ...currentSupervisorPlannerItem,
+            enabled: plannerSchemaArmed,
+            auto_normalize_and_apply_to_planner: plannerAutoApply,
+            preserve_rough_definition: true,
+            schema_id: 'supervisor_feature_plan_item_v1'
           }
         }
       });
@@ -1879,6 +1991,7 @@ export function WorkflowShell() {
     const currentCompileCommands = (currentCapabilities.compile_commands as Record<string, unknown> | undefined) ?? {};
     const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
     const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
+    const currentSupervisorPlannerItem = (currentCapabilities.supervisor_planner_item as Record<string, unknown> | undefined) ?? {};
 
     return {
       ...currentGlobalState,
@@ -1928,6 +2041,13 @@ export function WorkflowShell() {
         },
         'gateway_model/changeset': {
           ...currentGatewayChangeset
+        },
+        supervisor_planner_item: {
+          ...currentSupervisorPlannerItem,
+          enabled: Boolean(currentSupervisorPlannerItem.enabled),
+          auto_normalize_and_apply_to_planner: Boolean(currentSupervisorPlannerItem.auto_normalize_and_apply_to_planner),
+          preserve_rough_definition: true,
+          schema_id: 'supervisor_feature_plan_item_v1'
         },
         compile_commands: {
           ...currentCompileCommands,
@@ -3782,8 +3902,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     };
 
     if (stepType === 'design') {
+      const designMode = readStringValue(step, 'config.design_mode', 'v1');
+      payload.config = {
+        design_mode: designMode
+      };
       payload.execution_logic = {
         kind: 'design_stage_policy',
+        mode: designMode,
         connection_bundles: ['design_code_inference_default'],
         connections: {
           inference: {
@@ -4446,13 +4571,18 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : monitorView === 'workflow_list' ? (
             <Stack>
               <Card withBorder>
-                <Stack>
+                <Stack gap="sm">
                   <Group justify="space-between" align="center" wrap="wrap">
-                    <Title order={4}>Workflow list</Title>
+                    <Stack gap={2}>
+                      <Title order={4}>Workspace monitor</Title>
+                      <Text size="sm" c="dimmed">Switch between single workflow runs and repo-level supervisor orchestration.</Text>
+                    </Stack>
                     <Group>
-                      <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
-                        New workflow
-                      </Button>
+                      {monitorHomeView === 'workflows' ? (
+                        <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
+                          New workflow
+                        </Button>
+                      ) : null}
                       <Button
                         size="xs"
                         variant="default"
@@ -4463,73 +4593,106 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       </Button>
                     </Group>
                   </Group>
-                  <Table striped highlightOnHover>
-                    <Table.Thead>
-                      <Table.Tr>
-                        <Table.Th>Workflow</Table.Th>
-                        <Table.Th>Status</Table.Th>
-                        <Table.Th>Current step</Table.Th>
-                        <Table.Th>Repo</Table.Th>
-                        <Table.Th>Updated</Table.Th>
-                        <Table.Th>Actions</Table.Th>
-                      </Table.Tr>
-                    </Table.Thead>
-                    <Table.Tbody>
-                      {runs.map((run) => (
-                        <Table.Tr key={run.id} onClick={() => void openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
-                          <Table.Td>{run.title}</Table.Td>
-                          <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
-                          <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
-                          <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
-                          <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
-                          <Table.Td>
-                            <Group gap="xs">
-                              <Button size="xs" variant="light" onClick={(e) => { e.stopPropagation(); void openWorkflow(run.id); }}>Open</Button>
-                              <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
-                            </Group>
-                          </Table.Td>
-                        </Table.Tr>
-                      ))}
-                    </Table.Tbody>
-                  </Table>
+                  <Tabs value={monitorHomeView} onChange={(value) => setMonitorHomeView((value as MonitorHomeView) ?? 'workflows')}>
+                    <Tabs.List>
+                      <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
+                      <Tabs.Tab value="supervisors">Supervisors</Tabs.Tab>
+                    </Tabs.List>
+                  </Tabs>
                 </Stack>
               </Card>
 
-              <Card withBorder>
-                <Stack>
-                  <Group justify="space-between">
-                    <Title order={4}>Global summary</Title>
-                    <Button variant="light" size="xs" onClick={() => void refreshRunsAndTemplates()}>Refresh summary</Button>
-                  </Group>
-                  {Object.keys(allWorkflowEvents).length === 0 ? (
-                    <Text c="dimmed">No active workflow summaries yet.</Text>
-                  ) : (
+              {monitorHomeView === 'supervisors' ? (
+                <SupervisorPanel onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)} />
+              ) : (
+                <>
+                  <Card withBorder>
                     <Stack>
-                      {runs.filter((run) => allWorkflowEvents[run.id]?.length).map((run) => {
-                        const latestEvent = allWorkflowEvents[run.id][allWorkflowEvents[run.id].length - 1] ?? null;
-                        return (
-                          <Card key={run.id} withBorder>
-                            <Group justify="space-between" align="flex-start">
-                              <Stack gap={4}>
-                                <Text fw={600}>{run.title}</Text>
-                                <Text size="sm" c="dimmed">{run.repo_ref}</Text>
+                      <Group justify="space-between" align="center" wrap="wrap">
+                        <Title order={4}>Workflow list</Title>
+                        <Group>
+                          <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
+                            New workflow
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="default"
+                            leftSection={<IconRefresh size={16} />}
+                            onClick={() => void refreshRunsAndTemplates()}
+                          >
+                            Refresh
+                          </Button>
+                        </Group>
+                      </Group>
+                      <Table striped highlightOnHover>
+                        <Table.Thead>
+                          <Table.Tr>
+                            <Table.Th>Workflow</Table.Th>
+                            <Table.Th>Status</Table.Th>
+                            <Table.Th>Current step</Table.Th>
+                            <Table.Th>Repo</Table.Th>
+                            <Table.Th>Updated</Table.Th>
+                            <Table.Th>Actions</Table.Th>
+                          </Table.Tr>
+                        </Table.Thead>
+                        <Table.Tbody>
+                          {runs.map((run) => (
+                            <Table.Tr key={run.id} onClick={() => void openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
+                              <Table.Td>{run.title}</Table.Td>
+                              <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
+                              <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
+                              <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
+                              <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
+                              <Table.Td>
                                 <Group gap="xs">
-                                  <Badge color={statusColor(run.status)}>{run.status}</Badge>
-                                  <Code>{run.current_step_id ?? '-'}</Code>
+                                  <Button size="xs" variant="light" onClick={(e) => { e.stopPropagation(); void openWorkflow(run.id); }}>Open</Button>
+                                  <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
                                 </Group>
-                              </Stack>
-                              <Stack gap={4} align="flex-end">
-                                <Text size="xs" c="dimmed">{latestEvent ? formatTimestamp(latestEvent.created_at) : '-'}</Text>
-                                <Text size="sm">{latestEvent ? summarizeEvent(latestEvent) : 'No events'}</Text>
-                              </Stack>
-                            </Group>
-                          </Card>
-                        );
-                      })}
+                              </Table.Td>
+                            </Table.Tr>
+                          ))}
+                        </Table.Tbody>
+                      </Table>
                     </Stack>
-                  )}
-                </Stack>
-              </Card>
+                  </Card>
+
+                  <Card withBorder>
+                    <Stack>
+                      <Group justify="space-between">
+                        <Title order={4}>Global summary</Title>
+                        <Button variant="light" size="xs" onClick={() => void refreshRunsAndTemplates()}>Refresh summary</Button>
+                      </Group>
+                      {Object.keys(allWorkflowEvents).length === 0 ? (
+                        <Text c="dimmed">No active workflow summaries yet.</Text>
+                      ) : (
+                        <Stack>
+                          {runs.filter((run) => allWorkflowEvents[run.id]?.length).map((run) => {
+                            const latestEvent = allWorkflowEvents[run.id][allWorkflowEvents[run.id].length - 1] ?? null;
+                            return (
+                              <Card key={run.id} withBorder>
+                                <Group justify="space-between" align="flex-start">
+                                  <Stack gap={4}>
+                                    <Text fw={600}>{run.title}</Text>
+                                    <Text size="sm" c="dimmed">{run.repo_ref}</Text>
+                                    <Group gap="xs">
+                                      <Badge color={statusColor(run.status)}>{run.status}</Badge>
+                                      <Code>{run.current_step_id ?? '-'}</Code>
+                                    </Group>
+                                  </Stack>
+                                  <Stack gap={4} align="flex-end">
+                                    <Text size="xs" c="dimmed">{latestEvent ? formatTimestamp(latestEvent.created_at) : '-'}</Text>
+                                    <Text size="sm">{latestEvent ? summarizeEvent(latestEvent) : 'No events'}</Text>
+                                  </Stack>
+                                </Group>
+                              </Card>
+                            );
+                          })}
+                        </Stack>
+                      )}
+                    </Stack>
+                  </Card>
+                </>
+              )}
             </Stack>
           ) : (
             <Grid align="start">
@@ -4678,6 +4841,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     stageApplyError={stageApplyError}
                                     stageCompileError={stageCompileError}
                                     stageCompileCommandsText={stageCompileCommandsText}
+                                    stageUserInput={stageUserInput}
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}

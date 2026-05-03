@@ -23,6 +23,7 @@ use crate::{
         WorkflowStageDescriptor,
         WorkflowStageField,
         WorkflowStageFieldGroup,
+        WorkflowStageFieldOption,
         WorkflowStageFieldUi,
         WorkflowStageRoute,
         WorkflowStepAdvancementConfig,
@@ -515,8 +516,19 @@ fn design_descriptor() -> WorkflowStageDescriptor {
         include_changeset_schema: false,
         include_user_context: true,
     };
+    template.config = json!({
+        "design_mode": "v1"
+    });
+    template.execution_logic["structured_output"] = json!({
+        "fine_feature_format_armed": false,
+        "auto_normalize_and_apply_to_planner": false,
+        "preserve_rough_definition": true,
+        "schema_id": "supervisor_feature_plan_item_v1",
+        "apply_handler": "supervisor_planner_item"
+    });
     template.execution_logic = json!({
         "kind": "design_stage_policy",
+        "mode": "v1",
         "connection_bundles": ["design_code_inference_default"],
         "connections": {
             "inference": {
@@ -552,6 +564,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             key: "design".to_string(),
             label: "Design".to_string(),
             fields: vec![
+                select_field("config.design_mode", "Design mode", "config.design_mode", "v1", vec![("v1", "v1"), ("v2", "v2")]),
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
             ],
         }],
@@ -911,6 +924,23 @@ fn text_field(key: &str, label: &str, bind_to: &str, default: &str) -> WorkflowS
         required: false,
         options: Vec::new(),
         ui: if multiline { field_ui("textarea") } else { field_ui("text") },
+    }
+}
+
+fn select_field(key: &str, label: &str, bind_to: &str, default: &str, options: Vec<(&str, &str)>) -> WorkflowStageField {
+    WorkflowStageField {
+        key: key.to_string(),
+        label: label.to_string(),
+        field_type: "text".to_string(),
+        bind_to: bind_to.to_string(),
+        default: Value::String(default.to_string()),
+        description: String::new(),
+        required: true,
+        options: options.into_iter().map(|(value, label)| WorkflowStageFieldOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        }).collect(),
+        ui: field_ui("select"),
     }
 }
 

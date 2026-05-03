@@ -1,0 +1,173 @@
+import { useEffect, useMemo, useState } from 'react';
+import { Alert, Badge, Button, Card, Group, Stack, Table, Text, TextInput, Title } from '@mantine/core';
+import { listTemplates, type WorkflowTemplate } from './api';
+import { SupervisorPlannerModal } from './SupervisorPlannerModal';
+import { SupervisorSprintModal } from './SupervisorSprintModal';
+import { createSupervisorRun, deleteSupervisorRun, listSupervisorRuns, runSupervisorAction, type SupervisorRun } from './supervisor_api';
+
+function hasVisibleSprint(status: string): boolean {
+  return ['snapshotting', 'running_children', 'running_integration', 'validating', 'ready_to_apply', 'applied', 'failed', 'cancelled'].includes(status);
+}
+
+function sprintButtonLabel(run: SupervisorRun): string {
+  return hasVisibleSprint(run.status) ? 'View sprint' : 'Start sprint';
+}
+
+type Props = {
+  onOpenWorkflowRun?: (workflowRunId: string) => Promise<void> | void;
+};
+
+export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
+  const [runs, setRuns] = useState<SupervisorRun[]>([]);
+  const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [plannerOpen, setPlannerOpen] = useState(false);
+  const [sprintOpen, setSprintOpen] = useState(false);
+  const [title, setTitle] = useState('Supervisor');
+  const [rootRepoPath, setRootRepoPath] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0], [runs, selectedId]);
+
+  async function refresh() {
+    const [nextRuns, nextTemplates] = await Promise.all([listSupervisorRuns(), listTemplates()]);
+    setRuns(nextRuns);
+    setTemplates(nextTemplates);
+  }
+
+  useEffect(() => {
+    refresh().catch((err) => setError(String(err)));
+  }, []);
+
+  async function createEmptySupervisor() {
+    setError(null);
+    try {
+      const run = await createSupervisorRun({
+        title,
+        root_repo_path: rootRepoPath,
+        strategy: 'series',
+        workflow_template_id: null,
+        integration_template_id: null,
+        feature_plan_items: [],
+        execution_plan_items: [],
+        context: {}
+      });
+      await refresh();
+      setSelectedId(run.id);
+      setPlannerOpen(true);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function startOrViewSprint() {
+    if (!selected) return;
+    setError(null);
+    try {
+      if (hasVisibleSprint(selected.status)) {
+        setSprintOpen(true);
+        return;
+      }
+      setSprintOpen(true);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function removeRun() {
+    if (!selected) return;
+    setError(null);
+    try {
+      await deleteSupervisorRun(selected.id);
+      setSelectedId(null);
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  return (
+    <Stack gap="md">
+      <Title order={3}>Supervisors</Title>
+      {error ? <Alert color="red">{error}</Alert> : null}
+
+      <Card withBorder>
+        <Stack gap="sm">
+          <Text fw={700}>Create supervisor</Text>
+          <Group grow align="flex-end">
+            <TextInput label="Title" value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+            <TextInput label="Root repo path" value={rootRepoPath} onChange={(event) => setRootRepoPath(event.currentTarget.value)} />
+          </Group>
+          <Group>
+            <Button onClick={createEmptySupervisor}>Create supervisor</Button>
+          </Group>
+        </Stack>
+      </Card>
+
+      <Card withBorder>
+        <Table striped highlightOnHover>
+          <Table.Thead>
+            <Table.Tr>
+              <Table.Th>Title</Table.Th>
+              <Table.Th>Status</Table.Th>
+              <Table.Th>Current sprint strategy</Table.Th>
+              <Table.Th>Planner ideas</Table.Th>
+              <Table.Th>Next sprint items</Table.Th>
+              <Table.Th>Updated</Table.Th>
+            </Table.Tr>
+          </Table.Thead>
+          <Table.Tbody>
+            {runs.map((run) => (
+              <Table.Tr key={run.id} onClick={() => setSelectedId(run.id)} style={{ cursor: 'pointer' }}>
+                <Table.Td>{run.title}</Table.Td>
+                <Table.Td><Badge>{run.status}</Badge></Table.Td>
+                <Table.Td>{run.strategy}</Table.Td>
+                <Table.Td>{run.feature_plan_items.length}</Table.Td>
+                <Table.Td>{run.execution_plan_items.length}</Table.Td>
+                <Table.Td>{run.updated_at}</Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+      </Card>
+
+      {selected ? (
+        <Card withBorder>
+          <Stack gap="sm">
+            <Group justify="space-between">
+              <Group>
+                <Text fw={700}>{selected.title}</Text>
+                <Badge>{selected.status}</Badge>
+                <Badge variant="light">{selected.strategy}</Badge>
+              </Group>
+              <Group>
+                <Button variant="light" onClick={() => setPlannerOpen(true)}>Planner</Button>
+                <Button onClick={startOrViewSprint}>{sprintButtonLabel(selected)}</Button>
+                <Button color="red" variant="subtle" onClick={removeRun}>Delete</Button>
+              </Group>
+            </Group>
+            <Text size="sm">Planner ideas: {selected.feature_plan_items.length}</Text>
+            <Text size="sm">Next sprint items: {selected.execution_plan_items.length}</Text>
+          </Stack>
+        </Card>
+      ) : null}
+
+      <SupervisorPlannerModal
+        opened={plannerOpen}
+        run={selected}
+        templates={templates}
+        onClose={() => setPlannerOpen(false)}
+        onSaved={refresh}
+        onWorkflowRunCreated={onOpenWorkflowRun}
+      />
+
+      <SupervisorSprintModal
+        opened={sprintOpen}
+        run={selected}
+        templates={templates}
+        onClose={() => setSprintOpen(false)}
+        onChanged={refresh}
+      />
+    </Stack>
+  );
+}
