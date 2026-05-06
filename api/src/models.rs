@@ -156,11 +156,14 @@ pub struct WorkflowTemplateDefinition {
 }
 
 
-pub use crate::supervisor::models::{
-    CreateSupervisorRunRequest,
+pub use crate::engine::capabilities::planner::{
     ExecutionPlanItem,
     FeaturePlanItem,
     FeaturePlanItemStatus,
+};
+
+pub use crate::supervisor::models::{
+    CreateSupervisorRunRequest,
     SupervisorActionRequest,
     SupervisorChildRun,
     SupervisorExecutionStrategy,
@@ -237,7 +240,16 @@ pub struct WorkflowStageField {
     #[serde(default)]
     pub options: Vec<WorkflowStageFieldOption>,
     #[serde(default)]
+    pub visible_when: Vec<WorkflowStageFieldVisibility>,
+    #[serde(default)]
     pub ui: WorkflowStageFieldUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldVisibility {
+    pub path: String,
+    #[serde(default)]
+    pub equals: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

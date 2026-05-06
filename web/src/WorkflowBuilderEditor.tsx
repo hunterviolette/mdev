@@ -105,6 +105,13 @@ function isGlobalEditableCapability(capabilityKey: string) {
   ].includes(normalized);
 }
 
+function workflowBuilderFieldVisible(field: WorkflowStageField, fields: Record<string, unknown>) {
+  return (field.visible_when ?? []).every((condition) => {
+    const value = fields[condition.path];
+    return value === condition.equals;
+  });
+}
+
 
 export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCompiledDefinitionChange, onError, onOpenCapabilityConfig }: WorkflowBuilderEditorProps) {
   const [catalog, setCatalog] = useState<Record<string, WorkflowStageDescriptor>>({});
@@ -543,7 +550,9 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                       <Text fw={600} size="sm">
                         {group.label}
                       </Text>
-                      {group.fields.map((field) => renderField(field, selectedStep.fields[field.key]))}
+                      {group.fields
+                        .filter((field) => workflowBuilderFieldVisible(field, selectedStep.fields))
+                        .map((field) => renderField(field, selectedStep.fields[field.key]))}
                     </Stack>
                   ))}
 

@@ -242,27 +242,28 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               <Badge variant="light">{features.length}</Badge>
             </Group>
             {features.length === 0 ? <Text size="sm" c="dimmed">No features yet.</Text> : null}
+            <Group justify="space-between" align="flex-end">
+              <Select
+                label="Feature filter"
+                value={featureFilter}
+                onChange={(value) => setFeatureFilter(value ?? 'all')}
+                data={[
+                  { value: 'all', label: 'All features' },
+                  { value: 'rough', label: 'Rough' },
+                  { value: 'fine', label: 'Fine' },
+                  { value: 'scheduled', label: 'Scheduled' },
+                  { value: 'completed', label: 'Completed' },
+                  { value: 'unscheduled', label: 'Unscheduled' }
+                ]}
+                allowDeselect={false}
+                w={260}
+              />
+              <Text size="sm" c="dimmed">{visibleFeatures.length} shown / {features.length} total</Text>
+            </Group>
             <Table striped highlightOnHover>
               <Table.Thead>
                 <Table.Tr>
-                  <Group justify="space-between" align="flex-end">
-                    <Select
-                      label="Feature filter"
-                      value={featureFilter}
-                      onChange={(value) => setFeatureFilter(value ?? 'all')}
-                      data={[
-                        { value: 'all', label: 'All features' },
-                        { value: 'rough', label: 'Rough' },
-                        { value: 'fine', label: 'Fine' },
-                        { value: 'scheduled', label: 'Scheduled' },
-                        { value: 'completed', label: 'Completed' },
-                        { value: 'unscheduled', label: 'Unscheduled' }
-                      ]}
-                      allowDeselect={false}
-                      w={260}
-                    />
-                    <Text size="sm" c="dimmed">{visibleFeatures.length} shown / {features.length} total</Text>
-                  </Group>
+
                   <Table.Th>Feature</Table.Th>
                   <Table.Th>Definition</Table.Th>
                   <Table.Th>Requirements</Table.Th>

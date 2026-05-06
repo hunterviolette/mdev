@@ -95,6 +95,11 @@ export type WorkflowStageFieldUi = {
   format?: string;
 };
 
+export type WorkflowStageFieldVisibility = {
+  path: string;
+  equals: unknown;
+};
+
 export type WorkflowStageField = {
   key: string;
   label: string;
@@ -104,6 +109,7 @@ export type WorkflowStageField = {
   description?: string;
   required?: boolean;
   options?: WorkflowStageFieldOption[];
+  visible_when?: WorkflowStageFieldVisibility[];
   ui?: WorkflowStageFieldUi;
 };
 

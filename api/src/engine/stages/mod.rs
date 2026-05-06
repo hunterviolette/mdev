@@ -22,7 +22,7 @@ use crate::{
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowCapabilityBinding, WorkflowRun, WorkflowStepDefinition},
 };
 
-use super::capabilities::{execute_capability_invocations, CapabilityContext, CapabilityInvocation};
+use super::capabilities::{execute_capability_invocations, planner, CapabilityContext, CapabilityInvocation};
 use super::governance;
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
@@ -204,8 +204,17 @@ pub async fn execute_stage(
         });
     }
 
+    let supervisor_context = run.context.get("supervisor").cloned();
     let root = ensure_engine_root(&mut run.context);
-    let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
+    let mut global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
+    if let Some(supervisor_context) = supervisor_context {
+        if !global_state.is_object() {
+            global_state = json!({});
+        }
+        if let Some(global_obj) = global_state.as_object_mut() {
+            global_obj.insert("supervisor".to_string(), supervisor_context);
+        }
+    }
     let existing_local_state = root
         .get("stage_overrides")
         .and_then(Value::as_object)
@@ -228,6 +237,9 @@ pub async fn execute_stage(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(run.repo_ref.as_str())
         .to_string();
+
+    planner::apply_repo_planner_capability(&state.db, &mut global_state, repo_ref.as_str()).await?;
+    root.insert("global_state".to_string(), global_state.clone());
 
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
@@ -336,26 +348,6 @@ pub async fn execute_stage(
         capability_results: capability_results.clone(),
         local_state: prepared_local_state,
     };
-
-    if outcome.ok {
-        if let Err(err) = crate::supervisor::apply_refined_feature_output_from_workflow(state, run, &outcome.capability_results).await {
-            append_engine_event(
-                state,
-                run_id,
-                Some(step.id.as_str()),
-                "error",
-                "supervisor_planner_item_apply_failed",
-                "Failed to apply refined planner item output",
-                json!({
-                    "step_id": step.id,
-                    "step_type": step.step_type,
-                    "error": err.to_string(),
-                    "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
-                }),
-            )
-            .await?;
-        }
-    }
 
     append_engine_event(
         state,
@@ -695,7 +687,7 @@ pub(crate) fn compose_prompt_from_state(
 ) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
-    let order = ["user_input", "repo_context", "changeset_schema", "planner_schema"];
+    let order = ["user_input", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
 
     let mut parts = Vec::new();
     for key in order {

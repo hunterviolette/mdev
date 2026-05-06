@@ -8,8 +8,8 @@ use crate::{
     app_state::AppState,
     db::new_workflow_key,
     engine,
+    engine::capabilities::planner::FeaturePlanItem,
     models::{AutomationMode, WorkflowGlobalConfig, WorkflowStepDefinition, WorkflowStepExecutionConfig, WorkflowStepPromptConfig, WorkflowStepAdvancementConfig, WorkflowTemplateDefinition},
-    supervisor::models::FeaturePlanItem,
 };
 
 pub async fn spawn_series_workflow_on_integration(
@@ -24,12 +24,79 @@ pub async fn spawn_series_workflow_on_integration(
         Some(template_id) => load_template_definition(state, template_id).await?,
         None => return Err(anyhow!("workflow_template_id is required for supervisor series runs")),
     };
+    let selected_feature_id = items.first().map(|item| item.id.clone());
+    let planner = selected_feature_id
+        .as_ref()
+        .map(|id| {
+            let selected_feature = items
+                .iter()
+                .find(|item| item.id == *id)
+                .or_else(|| items.first());
+            let mut planner = json!({
+                "fragment_armed": true,
+                "schema_armed": false,
+                "auto_apply_armed": false,
+                "selected_feature_id": id,
+                "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
+                "schema_id": "supervisor_feature_plan_item_v1",
+                "preserve_rough_definition": true
+            });
+            if let Some(selected_feature) = selected_feature {
+                if let Some(obj) = planner.as_object_mut() {
+                    obj.insert("selected_feature".to_string(), serde_json::to_value(selected_feature).unwrap_or_else(|_| json!({})));
+                }
+            }
+            planner
+        })
+        .unwrap_or_else(|| json!({
+            "fragment_armed": false,
+            "schema_armed": false,
+            "auto_apply_armed": false,
+            "schema_id": "supervisor_feature_plan_item_v1",
+            "preserve_rough_definition": true
+        }));
+
     insert_and_start_run(state, title, integration_path, template_id, definition, json!({
         "supervisor": supervisor_context,
         "input_source": "feature_plan_items",
-        "feature_plan_items": items,
-        "workflow_input": render_feature_plan_items(items)
+        "workflow_engine": {
+            "global_state": {
+                "capabilities": {
+                    "planner": planner
+                }
+            }
+        }
     })).await
+}
+
+fn template_structured_output(definition: &WorkflowTemplateDefinition) -> Value {
+    definition
+        .steps
+        .iter()
+        .find_map(|step| step.execution_logic.get("structured_output"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn apply_supervisor_planner_template_controls(supervisor_context: &mut Value, definition: &WorkflowTemplateDefinition) {
+    let template_structured_output = template_structured_output(definition);
+    let context_structured_output = supervisor_context
+        .get("structured_output")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let mut structured_output = template_structured_output;
+    if let (Some(target), Some(source)) = (structured_output.as_object_mut(), context_structured_output.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    } else if !context_structured_output.is_null() {
+        structured_output = context_structured_output;
+    }
+
+    if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
+        supervisor_obj.insert("structured_output".to_string(), structured_output);
+    }
 }
 
 pub async fn spawn_feature_plan_item_workflow(
@@ -43,12 +110,64 @@ pub async fn spawn_feature_plan_item_workflow(
         Some(template_id) => load_template_definition(state, template_id).await?,
         None => return Err(anyhow!("workflow_template_id is required for supervisor parallel runs")),
     };
-    insert_and_start_run(state, &item.title, shard_path, template_id, definition, json!({
+    let is_supervisor_planner_feature = supervisor_context
+        .get("input_source")
+        .and_then(Value::as_str)
+        == Some("supervisor_planner_feature");
+
+    let mut supervisor_context = supervisor_context;
+    if is_supervisor_planner_feature {
+        apply_supervisor_planner_template_controls(&mut supervisor_context, &definition);
+    }
+    if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
+        supervisor_obj.insert("feature_id".to_string(), Value::String(item.id.clone()));
+    }
+
+    let structured_output = supervisor_context
+        .get("structured_output")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let planner = json!({
+        "fragment_armed": structured_output
+            .get("fragment_armed")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        "schema_armed": structured_output
+            .get("schema_armed")
+            .or_else(|| structured_output.get("fine_feature_format_armed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "auto_apply_armed": structured_output
+            .get("auto_apply_armed")
+            .or_else(|| structured_output.get("auto_normalize_and_apply_to_planner"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "selected_feature_id": item.id,
+        "selected_feature": item,
+        "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
+        "schema_id": structured_output
+            .get("schema_id")
+            .and_then(Value::as_str)
+            .unwrap_or("supervisor_feature_plan_item_v1"),
+        "preserve_rough_definition": structured_output
+            .get("preserve_rough_definition")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    });
+
+    let context = json!({
         "supervisor": supervisor_context,
-        "input_source": "feature_plan_item",
-        "feature_plan_item": item,
-        "workflow_input": render_feature_plan_item(item)
-    })).await
+        "workflow_engine": {
+            "global_state": {
+                "capabilities": {
+                    "planner": planner
+                }
+            }
+        }
+    });
+
+    insert_and_start_run(state, &item.title, shard_path, template_id, definition, context).await
 }
 
 pub async fn spawn_integration_workflow(
@@ -69,32 +188,6 @@ pub async fn spawn_integration_workflow(
     })).await
 }
 
-fn render_feature_plan_items(items: &[FeaturePlanItem]) -> String {
-    items.iter().map(render_feature_plan_item).collect::<Vec<_>>().join("\n\n---\n\n")
-}
-
-fn render_feature_plan_item(item: &FeaturePlanItem) -> String {
-    let mut out = Vec::new();
-    out.push(format!("Feature: {}", item.title));
-    if !item.summary.trim().is_empty() {
-        out.push(format!("Summary:\n{}", item.summary.trim()));
-    }
-    push_list(&mut out, "Requirements", &item.requirements);
-    push_list(&mut out, "Acceptance criteria", &item.acceptance_criteria);
-    push_list(&mut out, "Implementation notes", &item.implementation_notes);
-    push_list(&mut out, "Review expectations", &item.review_expectations);
-    push_list(&mut out, "Target files or areas", &item.target_files_or_areas);
-    push_list(&mut out, "Dependencies", &item.dependencies);
-    out.join("\n\n")
-}
-
-fn push_list(out: &mut Vec<String>, label: &str, values: &[String]) {
-    let values = values.iter().map(|value| value.trim()).filter(|value| !value.is_empty()).collect::<Vec<_>>();
-    if values.is_empty() {
-        return;
-    }
-    out.push(format!("{}:\n{}", label, values.iter().map(|value| format!("- {}", value)).collect::<Vec<_>>().join("\n")));
-}
 
 async fn load_template_definition(state: &AppState, template_id: Uuid) -> Result<WorkflowTemplateDefinition> {
     let row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
@@ -105,6 +198,68 @@ async fn load_template_definition(state: &AppState, template_id: Uuid) -> Result
         return Err(anyhow!("workflow template {} not found", template_id));
     };
     Ok(serde_json::from_str(row.get::<String, _>("definition_json").as_str())?)
+}
+
+fn feature_plan_items_prompt_fragment(items: &[FeaturePlanItem]) -> String {
+    items.iter().map(feature_plan_item_prompt_fragment).collect::<Vec<_>>().join("\n\n---\n\n")
+}
+
+fn feature_plan_item_prompt_fragment(item: &FeaturePlanItem) -> String {
+    serde_json::to_string_pretty(item).unwrap_or_else(|_| format!("{}\n\n{}", item.title, item.summary))
+}
+
+fn seed_template_globals_into_context(context: &mut Value, definition: &WorkflowTemplateDefinition, repo_path: &str) -> Result<()> {
+    let root = engine::ensure_engine_root(context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let runtime_global_state = global_state.clone();
+    let mut seeded_global_state = serde_json::to_value(definition.globals.clone())?;
+
+    if !seeded_global_state.is_object() {
+        seeded_global_state = json!({});
+    }
+
+    engine::merge_json_values(&mut seeded_global_state, &runtime_global_state);
+    *global_state = seeded_global_state;
+
+    let global_obj = global_state.as_object_mut().ok_or_else(|| anyhow!("global_state must be object"))?;
+    let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
+    if !resources.is_object() {
+        *resources = json!({});
+    }
+    let resources_obj = resources.as_object_mut().ok_or_else(|| anyhow!("resources must be object"))?;
+    let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
+    if !repo.is_object() {
+        *repo = json!({});
+    }
+    let repo_obj = repo.as_object_mut().ok_or_else(|| anyhow!("repo resource must be object"))?;
+    repo_obj.insert("repo_ref".to_string(), json!(repo_path));
+    repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
+    Ok(())
+}
+
+fn seed_workflow_input_into_start_step(context: &mut Value, step_id: Option<&str>, include_workflow_input: bool) -> Result<()> {
+    let Some(step_id) = step_id else {
+        return Ok(());
+    };
+
+    let root = engine::ensure_engine_root(context);
+    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
+    if !stage_state.is_object() {
+        *stage_state = json!({});
+    }
+    let stage_state_obj = stage_state.as_object_mut().ok_or_else(|| anyhow!("stage_state must be object"))?;
+    let stage = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
+    if !stage.is_object() {
+        *stage = json!({});
+    }
+    let stage_obj = stage.as_object_mut().ok_or_else(|| anyhow!("stage state must be object"))?;
+    let prompt = stage_obj.entry("prompt".to_string()).or_insert_with(|| json!({}));
+    if !prompt.is_object() {
+        *prompt = json!({});
+    }
+    let prompt_obj = prompt.as_object_mut().ok_or_else(|| anyhow!("stage prompt must be object"))?;
+    prompt_obj.insert("include_workflow_input".to_string(), Value::Bool(include_workflow_input));
+    Ok(())
 }
 
 async fn insert_and_start_run(
@@ -118,7 +273,16 @@ async fn insert_and_start_run(
     let id = Uuid::new_v4();
     let key = new_workflow_key(repo_path);
     let now = Utc::now();
-    let current_step_id = definition.steps.first().map(|step| step.id.clone());
+    let requested_start_step_id = context
+        .get("supervisor")
+        .and_then(|value| value.get("workflow_start_step_id"))
+        .and_then(Value::as_str)
+        .or_else(|| context.get("workflow_start_step_id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_step_id = requested_start_step_id
+        .and_then(|step_id| definition.steps.iter().find(|step| step.id == step_id).map(|step| step.id.clone()))
+        .or_else(|| definition.steps.first().map(|step| step.id.clone()));
     if let Some(obj) = definition.globals.resources.as_object_mut() {
         let repo = obj.entry("repo").or_insert_with(|| json!({}));
         if let Some(repo_obj) = repo.as_object_mut() {
@@ -126,34 +290,9 @@ async fn insert_and_start_run(
             repo_obj.insert("git_ref".to_string(), Value::String("WORKTREE".to_string()));
         }
     }
-    if let Some(workflow_input) = context
-        .get("workflow_input")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-    {
-        let context_obj = context.as_object_mut().ok_or_else(|| anyhow!("workflow context must be an object"))?;
-        let workflow_engine = context_obj.entry("workflow_engine".to_string()).or_insert_with(|| json!({}));
-        let workflow_engine_obj = workflow_engine.as_object_mut().ok_or_else(|| anyhow!("workflow_engine context must be an object"))?;
-        let global_state = workflow_engine_obj.entry("global_state".to_string()).or_insert_with(|| json!({}));
-        let global_state_obj = global_state.as_object_mut().ok_or_else(|| anyhow!("workflow_engine.global_state must be an object"))?;
-        let capabilities = global_state_obj.entry("capabilities".to_string()).or_insert_with(|| json!({}));
-        let capabilities_obj = capabilities.as_object_mut().ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities must be an object"))?;
-        let inference = capabilities_obj.entry("inference".to_string()).or_insert_with(|| json!({}));
-        let inference_obj = inference.as_object_mut().ok_or_else(|| anyhow!("workflow_engine.global_state.capabilities.inference must be an object"))?;
-        {
-            let prompt_fragments = inference_obj.entry("prompt_fragments".to_string()).or_insert_with(|| json!({}));
-            let prompt_fragments_obj = prompt_fragments.as_object_mut().ok_or_else(|| anyhow!("inference.prompt_fragments must be an object"))?;
-            prompt_fragments_obj.insert("user_input".to_string(), Value::String(workflow_input.clone()));
-            prompt_fragments_obj.insert("planner_schema".to_string(), Value::String(String::new()));
-        }
-        {
-            let prompt_fragment_enabled = inference_obj.entry("prompt_fragment_enabled".to_string()).or_insert_with(|| json!({}));
-            let prompt_fragment_enabled_obj = prompt_fragment_enabled.as_object_mut().ok_or_else(|| anyhow!("inference.prompt_fragment_enabled must be an object"))?;
-            prompt_fragment_enabled_obj.insert("user_input".to_string(), Value::Bool(true));
-            prompt_fragment_enabled_obj.insert("planner_schema".to_string(), Value::Bool(false));
-        }
+    seed_template_globals_into_context(&mut context, &definition, repo_path)?;
+    if let Some(context_obj) = context.as_object_mut() {
+        context_obj.remove("workflow_input");
     }
     sqlx::query("INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(id.to_string())

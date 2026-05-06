@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::{binding_specs, changeset::schema as changeset_schema, context_export},
+        capabilities::{binding_specs, changeset::schema as changeset_schema, context_export, planner},
         stages::compose_prompt_from_state,
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
@@ -69,6 +69,25 @@ pub fn prepare_inference_stage_state(
             .remove("user_input");
     }
 
+    let include_planning_fragment = planner::planner_fragment_enabled(global_state, step);
+    let planning_fragment = if include_planning_fragment {
+        planner::build_planning_fragment(global_state)
+    } else {
+        String::new()
+    };
+
+    if include_planning_fragment && !planning_fragment.trim().is_empty() {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert("planning_fragment".to_string(), Value::String(planning_fragment));
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("planning_fragment");
+    }
+
     let repo_context = if include_repo_context {
         let repo_context = context_export::normalize_context_export_payload(
             resolve_context_export_state(global_state),
@@ -120,26 +139,10 @@ pub fn prepare_inference_stage_state(
             .remove("changeset_schema");
     }
 
-    let include_planner_schema = global_state
-        .get("capabilities")
-        .and_then(|v| v.get("supervisor_planner_item"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || inference_state
-            .get("prompt_fragment_enabled")
-            .and_then(|v| v.get("planner_schema"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    let include_planner_schema = planner::planner_schema_enabled(global_state, step);
 
     let planner_schema_fragment = if include_planner_schema {
-        fragments
-            .get("planner_schema")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| crate::supervisor::planner_schema::PLANNER_SCHEMA_PROMPT_FRAGMENT.to_string())
+        planner::schema::PLANNER_SCHEMA_PROMPT_FRAGMENT.to_string()
     } else {
         String::new()
     };
@@ -170,6 +173,7 @@ pub fn prepare_inference_stage_state(
         "user_input".to_string(),
         Value::Bool(user_input.is_some()),
     );
+    enabled_obj.insert("planning_fragment".to_string(), Value::Bool(include_planning_fragment && fragments.get("planning_fragment").and_then(Value::as_str).map(|value| !value.trim().is_empty()).unwrap_or(false)));
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
     enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 

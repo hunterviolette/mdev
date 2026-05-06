@@ -1,12 +1,8 @@
-pub const PLANNER_SCHEMA_PROMPT_FRAGMENT: &str = r#"Respond with only valid JSON matching this supervisor planner feature schema:
+pub const PLANNER_SCHEMA_PROMPT_FRAGMENT: &str = r#"Respond with only raw JSON matching this exact supervisor planner refinement schema:
 
 {
   "feature": {
-    "id": "existing-feature-id",
-    "title": "Short feature title",
-    "status": "fine",
     "summary": "Clear refined feature summary.",
-    "rough_summary": "Original rough feature prompt preserved exactly when available.",
     "requirements": [
       "Concrete implementation requirement"
     ],
@@ -26,11 +22,12 @@ pub const PLANNER_SCHEMA_PROMPT_FRAGMENT: &str = r#"Respond with only valid JSON
 }
 
 Rules:
-- Output JSON only.
+- Output raw JSON only.
 - Do not wrap the JSON in markdown.
-- Preserve the existing feature id.
-- Set status to "fine".
-- Preserve rough_summary when it is present.
+- Do not include any fields outside the schema above.
+- Do not include id, title, status, rough_summary, header name, refinement_workflow_run_id, or timestamps.
+- The server owns id, title/header, status, rough_summary, and workflow linkage.
+- Leave arrays empty only when there is genuinely no content for that section.
 - Put likely affected files, modules, screens, endpoints, or subsystems in target_files_or_areas.
 - Do not include implementation code unless it belongs in implementation_notes.
 "#;

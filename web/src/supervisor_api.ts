@@ -148,6 +148,7 @@ export async function updateSupervisorPlan(
   sprintConfig: {
     sprint_strategy: SupervisorExecutionStrategy;
     workflow_template_id?: string | null;
+    workflow_start_step_id?: string | null;
     integration_template_id?: string | null;
     planner_refinement_template_id?: string | null;
   }

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset, compile_commands, context_export, git_patch_payload, inference, sap};
+use super::{changeset, compile_commands, context_export, git_patch_payload, inference, planner, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -90,6 +90,10 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
+    if capability == "supervisor_planner_item" {
+        return Ok(());
+    }
+
     if capability == policy.entrypoint || policy.allowed_invocations.iter().any(|item| item == capability) {
         return Ok(());
     }
@@ -302,11 +306,22 @@ pub(crate) async fn execute_capability_chain(
             .chain(results.iter().map(|item| item.capability.clone()))
             .collect();
 
-        let follow_ups = follow_up_vec(&result.follow_ups)
+        let mut follow_ups = follow_up_vec(&result.follow_ups)
             .into_iter()
             .chain(governance_follow_ups.into_iter())
             .filter(|item| !existing_capabilities.contains(&item.capability))
             .collect::<Vec<_>>();
+
+        if result.capability == "inference"
+            && supervisor_planner_item_auto_apply_enabled(&ctx)
+            && !existing_capabilities.contains("supervisor_planner_item")
+            && !queue.iter().any(|item| item.capability == "supervisor_planner_item")
+        {
+            follow_ups.push(CapabilityInvocation {
+                capability: "supervisor_planner_item".to_string(),
+                config: json!({}),
+            });
+        }
 
         queue.extend(follow_ups);
         results.push(result);
@@ -326,6 +341,26 @@ fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation>
     }
 }
 
+fn supervisor_planner_item_auto_apply_enabled(ctx: &CapabilityContext<'_>) -> bool {
+    let planner = ctx
+        .local_state
+        .get("capabilities")
+        .and_then(|value| value.get("planner"));
+
+    let has_selected_feature_id = planner
+        .and_then(|value| value.get("selected_feature_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    let auto_apply_enabled = planner
+        .and_then(|value| value.get("auto_apply_armed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    has_selected_feature_id && auto_apply_enabled
+}
+
 async fn dispatch(
     ctx: &CapabilityContext<'_>,
     _policy: &StageCapabilityPolicy,
@@ -337,6 +372,7 @@ async fn dispatch(
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
         "gateway_model/changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
+        "supervisor_planner_item" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
         "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,

@@ -45,7 +45,10 @@ async fn supervisor_action(
     Path(supervisor_id): Path<Uuid>,
     Json(req): Json<SupervisorActionRequest>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let response = match req.action.as_str() {
+    let action = req.action.clone();
+    tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action requested");
+
+    let response = match action.as_str() {
         "start" => supervisor::start_supervisor_run(&state, supervisor_id).await,
         "tick" => supervisor::tick_supervisor_run(&state, supervisor_id).await,
         "apply" => supervisor::apply_supervisor_final_patch(&state, supervisor_id).await,
@@ -55,9 +58,19 @@ async fn supervisor_action(
         other => Err(anyhow::anyhow!("unsupported supervisor action {}", other)),
     };
 
-    response.map(Json).map_err(internal)
+    match response {
+        Ok(value) => {
+            tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action completed");
+            Ok(Json(value))
+        }
+        Err(err) => {
+            tracing::error!(supervisor_id = %supervisor_id, action = %action, error = %err, "supervisor action failed");
+            Err(internal(err))
+        }
+    }
 }
 
 fn internal(err: impl std::fmt::Display) -> (axum::http::StatusCode, String) {
+    tracing::error!(error = %err, "supervisor route error");
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }

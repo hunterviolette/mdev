@@ -117,7 +117,14 @@ export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlo
 }
 
 export function descriptorMap(catalog: WorkflowBuilderCatalog): Record<string, WorkflowStageDescriptor> {
-  return Object.fromEntries(catalog.stage_descriptors.map((descriptor) => [descriptor.step_type, descriptor]));
+  const out: Record<string, WorkflowStageDescriptor> = {};
+  for (const descriptor of catalog.stage_descriptors) {
+    out[descriptor.step_type] = descriptor;
+    out[descriptor.step_type.trim().toLowerCase()] = descriptor;
+    out[descriptor.label] = descriptor;
+    out[descriptor.label.trim().toLowerCase()] = descriptor;
+  }
+  return out;
 }
 
 export function builderStepsFromDefinition(

@@ -273,7 +273,7 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().any(|b| *b == 0)
 }
 
-fn is_gitignored(repo: &Path, rel: &str) -> Result<bool> {
+pub(crate) fn is_gitignored(repo: &Path, rel: &str) -> Result<bool> {
     let output = Command::new("git")
         .arg("check-ignore")
         .arg("--quiet")

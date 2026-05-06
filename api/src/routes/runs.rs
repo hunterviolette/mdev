@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     db::new_workflow_key,
     app_state::AppState,
-    engine,
+    engine::{self, capabilities::planner},
     models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun, WorkflowTemplateDefinition},
 };
 
@@ -28,8 +28,59 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun
     .await
     .map_err(internal)?;
 
-    let runs = rows.into_iter().map(row_to_run).collect::<Result<Vec<_>, _>>()?;
+    let runs = rows.into_iter().filter_map(row_to_run_readable).collect::<Vec<_>>();
     Ok(Json(runs))
+}
+
+fn row_to_run_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowRun> {
+    let id = row.try_get::<String, _>("id").unwrap_or_else(|_| "<unreadable>".to_string());
+    let title = row.try_get::<String, _>("title").unwrap_or_else(|_| "<unreadable>".to_string());
+    let status = row.try_get::<String, _>("status").unwrap_or_else(|_| "<unreadable>".to_string());
+    let workflow_key = row.try_get::<String, _>("workflow_key").unwrap_or_else(|_| "<unreadable>".to_string());
+    let definition_len = row.try_get::<String, _>("definition_json").map(|value| value.len()).unwrap_or(0);
+    let context_len = row.try_get::<String, _>("context_json").map(|value| value.len()).unwrap_or(0);
+
+    match row_to_run(row) {
+        Ok(run) => Some(run),
+        Err(err) => {
+            tracing::error!(
+                run_id = %id,
+                title = %title,
+                status_value = %status,
+                workflow_key = %workflow_key,
+                definition_json_bytes = definition_len,
+                context_json_bytes = context_len,
+                response_status = ?err.0,
+                error = %err.1,
+                "failed to deserialize workflow run row while listing runs"
+            );
+            None
+        }
+    }
+}
+
+fn row_to_run_for_open(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::StatusCode, String)> {
+    let id = row.try_get::<String, _>("id").unwrap_or_else(|_| "<unreadable>".to_string());
+    let title = row.try_get::<String, _>("title").unwrap_or_else(|_| "<unreadable>".to_string());
+    let status = row.try_get::<String, _>("status").unwrap_or_else(|_| "<unreadable>".to_string());
+    let workflow_key = row.try_get::<String, _>("workflow_key").unwrap_or_else(|_| "<unreadable>".to_string());
+    let definition_len = row.try_get::<String, _>("definition_json").map(|value| value.len()).unwrap_or(0);
+    let context_len = row.try_get::<String, _>("context_json").map(|value| value.len()).unwrap_or(0);
+
+    row_to_run(row).map_err(|err| {
+        tracing::error!(
+            run_id = %id,
+            title = %title,
+            status_value = %status,
+            workflow_key = %workflow_key,
+            definition_json_bytes = definition_len,
+            context_json_bytes = context_len,
+            response_status = ?err.0,
+            error = %err.1,
+            "failed to read workflow run row while opening run"
+        );
+        (axum::http::StatusCode::NOT_FOUND, format!("workflow run {} is no longer readable: {}", id, err.1))
+    })
 }
 
 async fn get_run(
@@ -44,7 +95,7 @@ async fn get_run(
     .await
     .map_err(internal)?;
 
-    Ok(Json(row_to_run(row)?))
+    Ok(Json(row_to_run_for_open(row)?))
 }
 
 async fn open_run(
@@ -59,7 +110,7 @@ async fn open_run(
     .await
     .map_err(internal)?;
 
-    Ok(Json(row_to_run(row)?))
+    Ok(Json(row_to_run_for_open(row)?))
 }
 
 async fn list_run_events(
@@ -74,7 +125,7 @@ async fn list_run_events(
     .await
     .map_err(internal)?;
 
-    let events = rows.into_iter().map(row_to_event).collect::<Result<Vec<_>, _>>()?;
+    let events = rows.into_iter().filter_map(row_to_event_readable).collect::<Vec<_>>();
     Ok(Json(events))
 }
 
@@ -326,28 +377,33 @@ async fn create_run(
 
     let root = engine::ensure_engine_root(&mut run_context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let runtime_global_state = global_state.clone();
     let mut seeded_global_state = serde_json::to_value(definition.globals.clone()).map_err(internal)?;
 
     if !seeded_global_state.is_object() {
         seeded_global_state = json!({});
     }
 
-    if let Some(global_obj) = seeded_global_state.as_object_mut() {
-        let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
-        if !resources.is_object() {
-            *resources = json!({});
-        }
-        let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
-        let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
-        if !repo.is_object() {
-            *repo = json!({});
-        }
-        let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
-        repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
-        repo_obj.entry("git_ref".to_string()).or_insert_with(|| json!("WORKTREE"));
-    }
+    engine::merge_json_values(&mut seeded_global_state, &runtime_global_state);
+    *global_state = seeded_global_state;
 
-    engine::merge_json_values(global_state, &seeded_global_state);
+    let global_obj = global_state.as_object_mut().ok_or_else(|| internal("global_state must be object"))?;
+    let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
+    if !resources.is_object() {
+        *resources = json!({});
+    }
+    let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
+    let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
+    if !repo.is_object() {
+        *repo = json!({});
+    }
+    let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
+    repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
+    repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
+
+    planner::apply_repo_planner_capability(&state.db, global_state, &req.repo_ref)
+        .await
+        .map_err(internal)?;
 
     let initial_step = current_step_id
         .as_deref()
@@ -494,24 +550,182 @@ fn compile_commands_from_checks(checks: &Value) -> Value {
     Value::Array(commands)
 }
 
-fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowEvent, (axum::http::StatusCode, String)> {
-    Ok(WorkflowEvent {
-        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
-        run_id: Uuid::parse_str(row.get::<String, _>("run_id").as_str()).map_err(internal)?,
-        step_id: row.get("step_id"),
-        level: row.get("level"),
-        kind: row.get("kind"),
-        message: row.get("message"),
-        payload: serde_json::from_str(row.get::<String, _>("payload_json").as_str()).map_err(internal)?,
-        created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
-    })
+fn row_to_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEvent> {
+    let id_raw = row.try_get::<String, _>("id").ok()?;
+    let run_id_raw = row.try_get::<String, _>("run_id").ok()?;
+    let payload_raw = row.try_get::<String, _>("payload_json").unwrap_or_else(|_| "{}".to_string());
+    let created_at_raw = row.try_get::<String, _>("created_at").ok()?;
+    let payload = parse_event_payload_json(id_raw.as_str(), payload_raw.as_str());
+
+    match (
+        Uuid::parse_str(id_raw.as_str()),
+        Uuid::parse_str(run_id_raw.as_str()),
+        chrono::DateTime::parse_from_rfc3339(created_at_raw.as_str()),
+    ) {
+        (Ok(id), Ok(run_id), Ok(created_at)) => Some(WorkflowEvent {
+            id,
+            run_id,
+            step_id: row.get("step_id"),
+            level: row.get("level"),
+            kind: row.get("kind"),
+            message: row.get("message"),
+            payload,
+            created_at: created_at.with_timezone(&Utc),
+        }),
+        _ => {
+            tracing::warn!(event_id = %id_raw, run_id = %run_id_raw, "workflow event row is unreadable; omitting event");
+            None
+        }
+    }
+}
+
+fn parse_event_payload_json(event_id: &str, raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut value) => {
+            normalize_planner_for_read(&mut value);
+            value
+        },
+        Err(err) => {
+            tracing::warn!(
+                event_id = %event_id,
+                payload_json_bytes = raw.len(),
+                payload_json_preview = %json_preview_for_log(trimmed),
+                error = %err,
+                "workflow event payload_json is malformed; using empty payload"
+            );
+            json!({})
+        }
+    }
+}
+
+fn json_preview_for_log(raw: &str) -> String {
+    raw.chars().take(512).collect::<String>()
+}
+
+fn parse_definition_json_for_run(run_id: &str, raw: &str) -> WorkflowTemplateDefinition {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<WorkflowTemplateDefinition>(trimmed) {
+        Ok(definition) => definition,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run_id,
+                definition_json_bytes = raw.len(),
+                definition_json_trimmed_bytes = trimmed.len(),
+                definition_json_preview = %json_preview_for_log(trimmed),
+                error = %err,
+                "workflow run definition_json is malformed; using empty readable definition"
+            );
+            WorkflowTemplateDefinition {
+                version: 1,
+                globals: Default::default(),
+                governance: json!({}),
+                steps: Vec::new(),
+            }
+        }
+    }
+}
+
+fn parse_context_json_for_run(run_id: &str, raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(run_id = %run_id, "workflow run context_json is empty; using empty context");
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut value) => {
+            normalize_planner_for_read(&mut value);
+            value
+        }
+        Err(err) => {
+            tracing::warn!(run_id = %run_id, error = %err, "workflow run context_json is malformed; using empty context");
+            json!({})
+        }
+    }
+}
+
+fn normalize_planner_for_read(context: &mut Value) {
+    let Some(capabilities) = context
+        .get_mut("workflow_engine")
+        .and_then(|value| value.get_mut("global_state"))
+        .and_then(|value| value.get_mut("capabilities"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    capabilities.remove("planner_fragment");
+
+    if let Some(inference) = capabilities
+        .get_mut("inference")
+        .and_then(Value::as_object_mut)
+    {
+        inference.remove("planner");
+    }
+
+    let Some(planner) = capabilities
+        .get_mut("planner")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    planner.remove("selected_feature");
+    planner.remove("feature_plan_items");
+    planner.remove("selected_feature_ids");
+    planner.remove("enabled");
+}
+
+fn parse_optional_uuid_for_run(run_id: &str, field_name: &str, raw: Option<String>) -> Option<Uuid> {
+    let raw = raw?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match Uuid::parse_str(raw.as_str()) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(run_id = %run_id, field = %field_name, value = %raw, error = %err, "workflow run UUID field is malformed; ignoring field");
+            None
+        }
+    }
+}
+
+fn parse_datetime_for_run(run_id: &str, field_name: &str, raw: &str) -> chrono::DateTime<Utc> {
+    let trimmed = raw.trim();
+
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return value.with_timezone(&Utc);
+    }
+
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return chrono::DateTime::<Utc>::from_naive_utc_and_offset(value, Utc);
+    }
+
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+        return chrono::DateTime::<Utc>::from_naive_utc_and_offset(value, Utc);
+    }
+
+    tracing::warn!(run_id = %run_id, field = %field_name, value = %trimmed, "workflow run timestamp is malformed; using current time");
+    Utc::now()
 }
 
 fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::StatusCode, String)> {
+    let id_raw: String = row.get("id");
+    let context_raw: String = row.get("context_json");
+    let created_at_raw: String = row.get("created_at");
+    let updated_at_raw: String = row.get("updated_at");
+    let id = Uuid::parse_str(id_raw.as_str()).map_err(internal)?;
+
     Ok(WorkflowRun {
-        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
-        template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose().map_err(internal)?,
-        definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str()).map_err(internal)?,
+        id,
+        template_id: parse_optional_uuid_for_run(id_raw.as_str(), "template_id", row.get::<Option<String>, _>("template_id")),
+        definition: parse_definition_json_for_run(id_raw.as_str(), row.get::<String, _>("definition_json").as_str()),
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Waiting,
             "queued" => RunStatus::Queued,
@@ -526,12 +740,14 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
         title: row.get("title"),
         repo_ref: row.get("repo_ref"),
         workflow_key: row.get("workflow_key"),
-        context: serde_json::from_str(row.get::<String, _>("context_json").as_str()).map_err(internal)?,
-        created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
-        updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str()).map_err(internal)?.with_timezone(&Utc),
+        context: parse_context_json_for_run(id_raw.as_str(), context_raw.as_str()),
+        created_at: parse_datetime_for_run(id_raw.as_str(), "created_at", created_at_raw.as_str()),
+        updated_at: parse_datetime_for_run(id_raw.as_str(), "updated_at", updated_at_raw.as_str()),
     })
 }
 
 fn internal<E: std::fmt::Display>(err: E) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    let message = err.to_string();
+    tracing::error!(error = %message, "workflow route internal error");
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, message)
 }

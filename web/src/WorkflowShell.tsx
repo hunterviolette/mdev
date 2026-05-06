@@ -86,6 +86,7 @@ import {
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
+import { getSupervisorRun, listSupervisorRuns, type FeaturePlanItem } from './supervisor_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
@@ -493,11 +494,14 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   inferenceConnectionStatus: InferenceConnectionStatus;
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
+  sharedPlannerFragmentState: Record<string, unknown> | null;
   stageIncludeRepoContext: boolean;
   stageIncludeChangesetSchema: boolean;
   disabled: boolean;
   onToggleSharedRepoContext: () => void;
   onToggleSharedChangesetSchema: () => void;
+  onTogglePlanningFragment: () => void;
+  onOpenPlannerFragmentConfig: () => void;
   onPatchSelectedStepConfig: (key: string, value: unknown) => void;
   onOpenInferenceConfig: () => void;
   onOpenRepoConfig: () => void;
@@ -517,11 +521,14 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     inferenceConnectionStatus,
     inferenceTransport,
     sharedInferenceState,
+    sharedPlannerFragmentState,
     stageIncludeRepoContext,
     stageIncludeChangesetSchema,
     disabled,
     onToggleSharedRepoContext,
     onToggleSharedChangesetSchema,
+    onTogglePlanningFragment,
+    onOpenPlannerFragmentConfig,
     onPatchSelectedStepConfig,
     onOpenInferenceConfig,
     onOpenRepoConfig,
@@ -550,16 +557,22 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const designMode = typeof designModeDraftValue === 'string'
     ? designModeDraftValue
     : readStringValue(selectedWorkflowStep, 'config.design_mode', 'v1');
-  const structuredOutput = (selectedWorkflowStep?.execution_logic as Record<string, unknown> | undefined)?.structured_output as Record<string, unknown> | undefined;
+  const plannerCapabilityState = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
   const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
   const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
-  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(structuredOutput?.fine_feature_format_armed);
-  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(structuredOutput?.auto_normalize_and_apply_to_planner);
+  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed);
+  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed);
+  const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
+  const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed);
 
   useEffect(() => {
     setPlannerSchemaArmedDraft(null);
     setPlannerAutoApplyDraft(null);
-  }, [selectedWorkflowStep?.id]);
+  }, [
+    selectedWorkflowStep?.id,
+    plannerCapabilityState.schema_armed,
+    plannerCapabilityState.auto_apply_armed
+  ]);
 
   const modifierActions = useMemo<StageModifierAction[]>(() => {
 
@@ -593,23 +606,47 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       });
     }
 
-    if (selectedWorkflowStep?.step_type === 'design' && designMode === 'v2') {
+    if (hasBackendPlanningFragment) {
+      actions.push({
+        key: 'planning_fragment',
+        label: 'Planning fragment',
+        buttonLabel: 'Configure',
+        onOpen: onOpenPlannerFragmentConfig,
+        toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
+        toggleColor: planningFragmentArmed ? 'orange' : 'green',
+        onToggle: onTogglePlanningFragment,
+        helperText: 'Select a planner feature to inject into the next prompt.'
+      });
+    }
+
+    if (hasBackendPlanningFragment && selectedWorkflowStep?.step_type === 'design') {
       actions.push({
         key: 'planner_schema',
         label: 'Planner schema',
-        buttonLabel: 'Configure',
-        status: fineFeatureFormatArmed ? 'Armed' : 'Off',
-        color: fineFeatureFormatArmed ? 'green' : 'gray',
+        buttonLabel: '',
         toggleLabel: fineFeatureFormatArmed ? 'Disarm' : 'Arm',
         toggleColor: fineFeatureFormatArmed ? 'orange' : 'green',
         onToggle: () => {
           const next = !fineFeatureFormatArmed;
           setPlannerSchemaArmedDraft(next);
-          onPatchSelectedStepConfig('execution_logic.structured_output.fine_feature_format_armed', next);
+          onPatchSelectedStepConfig('capabilities.planner.schema_armed', next);
         },
         helperText: 'Require model output in the supervisor planner schema.'
       });
 
+      actions.push({
+        key: 'planner_auto_apply',
+        label: 'Planner auto apply',
+        buttonLabel: '',
+        toggleLabel: autoNormalizeAndApplyToPlanner ? 'Disarm' : 'Arm',
+        toggleColor: autoNormalizeAndApplyToPlanner ? 'orange' : 'green',
+        onToggle: () => {
+          const next = !autoNormalizeAndApplyToPlanner;
+          setPlannerAutoApplyDraft(next);
+          onPatchSelectedStepConfig('capabilities.planner.auto_apply_armed', next);
+        },
+        helperText: 'Apply valid design-stage planner output back to the selected planner feature.'
+      });
     }
 
     if (usesInference) {
@@ -655,6 +692,10 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     usesChangesetSchema,
     onOpenSchemaConfig,
     onToggleSharedChangesetSchema,
+    hasBackendPlanningFragment,
+    planningFragmentArmed,
+    onTogglePlanningFragment,
+    onOpenPlannerFragmentConfig,
     usesInference,
     designMode,
     fineFeatureFormatArmed,
@@ -702,6 +743,24 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       [field.key]: value
     }));
     onPatchSelectedStepConfig(field.bind_to, value);
+  }
+
+  function valueAtPath(root: unknown, path: string): unknown {
+    return path.split('.').filter(Boolean).reduce<unknown>((cursor, part) => {
+      if (cursor && typeof cursor === 'object' && part in cursor) {
+        return (cursor as Record<string, unknown>)[part];
+      }
+      return undefined;
+    }, root);
+  }
+
+  function fieldVisible(field: WorkflowStageField) {
+    return (field.visible_when ?? []).every((condition) => {
+      const value = condition.path in fieldDrafts
+        ? fieldDrafts[condition.path]
+        : valueAtPath(selectedWorkflowStep, condition.path);
+      return value === condition.equals;
+    });
   }
 
   function renderField(field: WorkflowStageField) {
@@ -776,26 +835,23 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   return (
     <Stack>
       <Title order={6}>{descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs</Title>
-      {!descriptor ? <Text c="dimmed" size="sm">No backend descriptor found for this stage type.</Text> : null}
+      {!descriptor ? (
+        <Textarea
+          label="User input"
+          value={stageUserInput}
+          onChange={(event) => onPatchSelectedStepConfig('prompt.user_input', event.currentTarget.value)}
+          disabled={disabled}
+          minRows={2}
+          autosize
+        />
+      ) : null}
       {descriptor?.editable_fields.map((group) => (
         <Stack key={group.key} gap="xs">
           {descriptor?.editable_fields.length > 1 ? <Text fw={600} size="sm">{group.label}</Text> : null}
-          {group.fields.map((field) => renderField(field))}
+          {group.fields.filter((field) => fieldVisible(field)).map((field) => renderField(field))}
         </Stack>
       ))}
-      {selectedWorkflowStep?.step_type === 'design' && designMode === 'v2' ? (
-        <Switch
-          label="Planner apply"
-          description="Normalize model output and apply it to the planner feature without deleting the rough prompt."
-          checked={autoNormalizeAndApplyToPlanner}
-          onChange={(event) => {
-            const next = event.currentTarget.checked;
-            setPlannerAutoApplyDraft(next);
-            onPatchSelectedStepConfig('execution_logic.structured_output.auto_normalize_and_apply_to_planner', next);
-          }}
-          disabled={disabled}
-        />
-      ) : null}
+
       {selectedWorkflowStep?.step_type === 'review' ? (
         <Group>
           <Button variant="light" onClick={onOpenChanges} disabled={disabled}>
@@ -1210,45 +1266,36 @@ export function WorkflowShell() {
           }
         }
       });
-    } else if (bindTo === 'execution_logic.structured_output.fine_feature_format_armed' || bindTo === 'execution_logic.structured_output.auto_normalize_and_apply_to_planner') {
+    } else if (bindTo === 'capabilities.planner.schema_armed' || bindTo === 'capabilities.planner.auto_apply_armed') {
       const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
       const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      const currentSupervisorPlannerItem = (currentCapabilities.supervisor_planner_item as Record<string, unknown> | undefined) ?? {};
-      const currentInference = (currentCapabilities.inference as Record<string, unknown> | undefined) ?? {};
-      const currentPromptFragments = (currentInference.prompt_fragments as Record<string, unknown> | undefined) ?? {};
-      const currentPromptFragmentEnabled = (currentInference.prompt_fragment_enabled as Record<string, unknown> | undefined) ?? {};
-      const currentStructuredOutput = (selectedWorkflowStep.execution_logic as Record<string, unknown> | undefined)?.structured_output as Record<string, unknown> | undefined;
-      const plannerSchemaArmed = bindTo === 'execution_logic.structured_output.fine_feature_format_armed'
+      const currentPlanner = (currentCapabilities.planner as Record<string, unknown> | undefined) ?? {};
+      const plannerSchemaArmed = bindTo === 'capabilities.planner.schema_armed'
         ? Boolean(value)
-        : Boolean(currentStructuredOutput?.fine_feature_format_armed);
-      const plannerAutoApply = bindTo === 'execution_logic.structured_output.auto_normalize_and_apply_to_planner'
+        : Boolean(currentPlanner.schema_armed);
+      const plannerAutoApply = bindTo === 'capabilities.planner.auto_apply_armed'
         ? Boolean(value)
-        : Boolean(currentStructuredOutput?.auto_normalize_and_apply_to_planner);
+        : Boolean(currentPlanner.auto_apply_armed);
 
-      void patchWorkflowGlobalState(selectedRunId, {
-        ...currentGlobalState,
-        capabilities: {
-          ...currentCapabilities,
-          inference: {
-            ...currentInference,
-            prompt_fragments: {
-              ...currentPromptFragments,
-              planner_schema: ''
-            },
-            prompt_fragment_enabled: {
-              ...currentPromptFragmentEnabled,
-              planner_schema: plannerSchemaArmed
+      void (async () => {
+        await patchWorkflowGlobalState(selectedRunId, {
+          ...currentGlobalState,
+          capabilities: {
+            ...currentCapabilities,
+            planner: {
+              ...currentPlanner,
+              schema_armed: plannerSchemaArmed,
+              auto_apply_armed: plannerAutoApply,
+              selected_feature_id: currentPlanner.selected_feature_id ?? selectedPlannerFeatureId ?? null,
+              supervisor_run_id: currentPlanner.supervisor_run_id ?? plannerSupervisorRunId,
+              schema_id: 'supervisor_feature_plan_item_v1',
+              preserve_rough_definition: true
             }
-          },
-          supervisor_planner_item: {
-            ...currentSupervisorPlannerItem,
-            enabled: plannerSchemaArmed,
-            auto_normalize_and_apply_to_planner: plannerAutoApply,
-            preserve_rough_definition: true,
-            schema_id: 'supervisor_feature_plan_item_v1'
           }
-        }
-      });
+        });
+        await refreshRunDetails(selectedRunId);
+      })();
+      return;
     } else if (bindTo === 'execution_logic.automation.inject_context') {
       setStageIncludeRepoContext(Boolean(value));
     } else if (bindTo === 'execution_logic.automation.inject_changeset_schema') {
@@ -1362,6 +1409,11 @@ export function WorkflowShell() {
   const [globalInferenceConfigOpen, setGlobalInferenceConfigOpen] = useState(false);
   const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
+  const [plannerFragmentConfigOpen, setPlannerFragmentConfigOpen] = useState(false);
+  const [plannerSelectedFeatureIdDraft, setPlannerSelectedFeatureIdDraft] = useState<string | null>(null);
+  const [plannerFeatureSearch, setPlannerFeatureSearch] = useState('');
+  const [remotePlannerFeatureItems, setRemotePlannerFeatureItems] = useState<FeaturePlanItem[]>([]);
+  const [plannerFeatureViewItem, setPlannerFeatureViewItem] = useState<Record<string, unknown> | null>(null);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
@@ -1596,10 +1648,11 @@ export function WorkflowShell() {
     [workflowBuilderCatalog]
   );
 
-  const selectedStageDescriptor = useMemo(
-    () => selectedWorkflowStep ? workflowStageDescriptors[selectedWorkflowStep.step_type] ?? null : null,
-    [selectedWorkflowStep, workflowStageDescriptors]
-  );
+  const selectedStageDescriptor = useMemo(() => {
+    if (!selectedWorkflowStep) return null;
+    const stepType = selectedWorkflowStep.step_type;
+    return workflowStageDescriptors[stepType] ?? workflowStageDescriptors[stepType.trim().toLowerCase()] ?? null;
+  }, [selectedWorkflowStep, workflowStageDescriptors]);
 
   const inferenceRequiredForSelectedStep = useMemo(
     () => stepUsesCapability(selectedWorkflowStep, 'inference'),
@@ -1616,6 +1669,120 @@ export function WorkflowShell() {
     const inference = (capabilities.inference ?? null) as Record<string, unknown> | null;
     return inference;
   }, [selectedRun?.context]);
+  const sharedPlannerFragmentState = useMemo(() => {
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    return (capabilities.planner ?? null) as Record<string, unknown> | null;
+  }, [selectedRun?.context]);
+  const supervisorContext = useMemo(() => {
+    return ((selectedRun?.context as Record<string, unknown> | undefined)?.supervisor ?? null) as Record<string, unknown> | null;
+  }, [selectedRun?.context]);
+
+  const plannerSupervisorRunId = useMemo(() => {
+    const fromPlanner = sharedPlannerFragmentState?.supervisor_run_id;
+    if (typeof fromPlanner === 'string' && fromPlanner.trim()) return fromPlanner;
+    const fromSupervisor = supervisorContext?.supervisor_run_id;
+    if (typeof fromSupervisor === 'string' && fromSupervisor.trim()) return fromSupervisor;
+    return null;
+  }, [sharedPlannerFragmentState, supervisorContext]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const selectedFeatureId = typeof sharedPlannerFragmentState?.selected_feature_id === 'string'
+      ? sharedPlannerFragmentState.selected_feature_id
+      : null;
+    const repoRef = typeof selectedRun?.repo_ref === 'string' ? selectedRun.repo_ref : '';
+
+    async function loadPlannerFeatures() {
+      if (plannerSupervisorRunId) {
+        const run = await getSupervisorRun(plannerSupervisorRunId);
+        return run.feature_plan_items ?? [];
+      }
+
+      if (!selectedFeatureId && !repoRef.trim()) {
+        return [];
+      }
+
+      const runs = await listSupervisorRuns();
+      const normalizedRepoRef = repoRef.replace(/\\/g, '/').toLowerCase();
+      const matchingRun = runs.find((run) => {
+        const normalizedRoot = run.root_repo_path.replace(/\\/g, '/').toLowerCase();
+        const hasSelectedFeature = selectedFeatureId
+          ? run.feature_plan_items.some((item) => item.id === selectedFeatureId)
+          : false;
+        const repoMatches = normalizedRepoRef && normalizedRoot && normalizedRepoRef.startsWith(normalizedRoot);
+        return hasSelectedFeature || repoMatches;
+      });
+      return matchingRun?.feature_plan_items ?? [];
+    }
+
+    loadPlannerFeatures()
+      .then((items) => {
+        if (!cancelled) setRemotePlannerFeatureItems(items);
+      })
+      .catch(() => {
+        if (!cancelled) setRemotePlannerFeatureItems([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [plannerSupervisorRunId, selectedRun?.repo_ref, sharedPlannerFragmentState]);
+
+  const plannerFeatureItems = useMemo(() => {
+    const remoteItems = remotePlannerFeatureItems;
+    const supervisorItems = Array.isArray(supervisorContext?.feature_plan_items)
+      ? supervisorContext.feature_plan_items
+      : [];
+    const items = remoteItems.length > 0
+      ? remoteItems
+      : supervisorItems;
+    const seen = new Set<string>();
+    return items.filter((item): item is Record<string, unknown> => {
+      if (!item || typeof item !== 'object') return false;
+      const id = typeof item.id === 'string' ? item.id : '';
+      if (!id) return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }, [remotePlannerFeatureItems, sharedPlannerFragmentState, supervisorContext]);
+
+  const plannerFeatureOptions = useMemo(() => plannerFeatureItems
+    .map((item) => {
+      const id = typeof item.id === 'string' ? item.id : '';
+      const title = typeof item.title === 'string' && item.title.trim()
+        ? item.title.trim()
+        : typeof item.summary === 'string' && item.summary.trim()
+          ? item.summary.trim()
+          : id;
+      return id ? { value: id, label: title } : null;
+    })
+    .filter((item): item is { value: string; label: string } => item !== null), [plannerFeatureItems]);
+
+  const selectedPlannerFeatureId = plannerSelectedFeatureIdDraft
+    ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null)
+    ?? (typeof supervisorContext?.feature_id === 'string' && supervisorContext.feature_id.trim() ? supervisorContext.feature_id : null);
+
+  const selectedPlannerFeatureIds = selectedPlannerFeatureId ? [selectedPlannerFeatureId] : [];
+  const selectedPlannerFeature = useMemo(() => {
+    if (!selectedPlannerFeatureId) return null;
+    return plannerFeatureItems.find((item) => item.id === selectedPlannerFeatureId) ?? null;
+  }, [plannerFeatureItems, selectedPlannerFeatureId]);
+
+  const filteredPlannerFeatureItems = useMemo(() => {
+    const needle = plannerFeatureSearch.trim().toLowerCase();
+    if (!needle) return plannerFeatureItems;
+    return plannerFeatureItems.filter((item) => {
+      const title = typeof item.title === 'string' ? item.title : '';
+      const summary = typeof item.summary === 'string' ? item.summary : '';
+      const status = typeof item.status === 'string' ? item.status : '';
+      return title.toLowerCase().includes(needle)
+        || summary.toLowerCase().includes(needle)
+        || status.toLowerCase().includes(needle);
+    });
+  }, [plannerFeatureItems, plannerFeatureSearch]);
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const stageOverrides = (workflowEngine?.stage_overrides ?? {}) as Record<string, unknown>;
@@ -1991,7 +2158,7 @@ export function WorkflowShell() {
     const currentCompileCommands = (currentCapabilities.compile_commands as Record<string, unknown> | undefined) ?? {};
     const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
     const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
-    const currentSupervisorPlannerItem = (currentCapabilities.supervisor_planner_item as Record<string, unknown> | undefined) ?? {};
+    const currentPlanner = (currentCapabilities.planner as Record<string, unknown> | undefined) ?? {};
 
     return {
       ...currentGlobalState,
@@ -2022,6 +2189,15 @@ export function WorkflowShell() {
             session_id: browserSessionId.trim() || null
           }
         },
+        planner: {
+          fragment_armed: Boolean(currentPlanner.fragment_armed),
+          schema_armed: Boolean(currentPlanner.schema_armed),
+          auto_apply_armed: Boolean(currentPlanner.auto_apply_armed),
+          selected_feature_id: currentPlanner.selected_feature_id ?? null,
+          supervisor_run_id: currentPlanner.supervisor_run_id ?? null,
+          schema_id: 'supervisor_feature_plan_item_v1',
+          preserve_rough_definition: true
+        },
         context_export: {
           ...currentContextExport,
           enabled: stageIncludeRepoContext,
@@ -2042,13 +2218,7 @@ export function WorkflowShell() {
         'gateway_model/changeset': {
           ...currentGatewayChangeset
         },
-        supervisor_planner_item: {
-          ...currentSupervisorPlannerItem,
-          enabled: Boolean(currentSupervisorPlannerItem.enabled),
-          auto_normalize_and_apply_to_planner: Boolean(currentSupervisorPlannerItem.auto_normalize_and_apply_to_planner),
-          preserve_rough_definition: true,
-          schema_id: 'supervisor_feature_plan_item_v1'
-        },
+
         compile_commands: {
           ...currentCompileCommands,
           commands: compileCommands
@@ -4020,6 +4190,47 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     });
   }
 
+  async function onTogglePlanningFragment() {
+    if (!selectedRun?.id) return;
+    const nextEnabled = !Boolean(sharedPlannerFragmentState?.fragment_armed);
+    const plannerPatch: Record<string, unknown> = {
+      ...((sharedPlannerFragmentState ?? {}) as Record<string, unknown>),
+      fragment_armed: nextEnabled,
+      selected_feature_id: selectedPlannerFeatureId ?? null,
+      selected_feature: nextEnabled ? selectedPlannerFeature : null,
+      supervisor_run_id: plannerSupervisorRunId,
+      schema_id: 'supervisor_feature_plan_item_v1',
+      preserve_rough_definition: true
+    };
+    await patchGlobalCapabilityState({
+      capabilities: {
+        planner: plannerPatch
+      }
+    });
+  }
+
+  async function savePlannerFragmentSelection(featureId: string | null) {
+    if (!selectedRun?.id) return;
+    setPlannerSelectedFeatureIdDraft(featureId);
+    const selectedFeature = featureId
+      ? plannerFeatureItems.find((item) => item.id === featureId) ?? null
+      : null;
+    await patchGlobalCapabilityState({
+      capabilities: {
+        planner: {
+          ...((sharedPlannerFragmentState ?? {}) as Record<string, unknown>),
+          fragment_armed: Boolean(featureId),
+          selected_feature_id: featureId,
+          selected_feature: selectedFeature,
+          supervisor_run_id: plannerSupervisorRunId,
+          schema_id: 'supervisor_feature_plan_item_v1',
+          preserve_rough_definition: true
+        }
+      }
+    });
+    setPlannerFragmentConfigOpen(false);
+  }
+
   async function persistReviewSourceControlState(next: ReviewSourceControlState) {
     setLocalReviewSourceControlState(next);
     if (!selectedRun || !selectedWorkflowStep) return;
@@ -4845,11 +5056,14 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}
+                                    sharedPlannerFragmentState={sharedPlannerFragmentState}
                                     stageIncludeRepoContext={stageIncludeRepoContext}
                                     stageIncludeChangesetSchema={stageIncludeChangesetSchema}
                                     disabled={isBackendRunLocked}
                                     onToggleSharedRepoContext={onToggleSharedRepoContext}
                                     onToggleSharedChangesetSchema={onToggleSharedChangesetSchema}
+                                    onTogglePlanningFragment={onTogglePlanningFragment}
+                                    onOpenPlannerFragmentConfig={() => setPlannerFragmentConfigOpen(true)}
                                     onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
                                     onOpenInferenceConfig={openGlobalInferenceConfig}
                                     onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
@@ -5124,6 +5338,177 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <Button size="xs" onClick={handleSaveBuilderRepoContext}>Save</Button>
             </Group>
           </Stack>
+        </Modal>
+
+        <Modal
+          opened={plannerFragmentConfigOpen}
+          onClose={() => setPlannerFragmentConfigOpen(false)}
+          title="Planning fragment"
+          size="calc(100vw - 96px)"
+          centered
+          zIndex={300}
+        >
+          <Stack gap="md">
+            <TextInput
+              label="Search planner features"
+              placeholder="Search by feature name, summary, or status"
+              value={plannerFeatureSearch}
+              onChange={(event) => setPlannerFeatureSearch(event.currentTarget.value)}
+            />
+            {plannerFeatureItems.length === 0 ? (
+              <Text c="dimmed" size="sm">No planner features available.</Text>
+            ) : filteredPlannerFeatureItems.length === 0 ? (
+              <Text c="dimmed" size="sm">No planner features match the current search.</Text>
+            ) : (
+              <ScrollArea h="calc(100vh - 330px)" type="auto">
+                <Table striped highlightOnHover withTableBorder>
+                  <Table.Thead>
+                    <Table.Tr>
+                      <Table.Th>Feature</Table.Th>
+                      <Table.Th>Status</Table.Th>
+                      <Table.Th>Last modified</Table.Th>
+                      <Table.Th>Actions</Table.Th>
+                    </Table.Tr>
+                  </Table.Thead>
+                  <Table.Tbody>
+                    {filteredPlannerFeatureItems.map((item) => {
+                      const id = typeof item.id === 'string' ? item.id : '';
+                      const title = typeof item.title === 'string' && item.title.trim()
+                        ? item.title.trim()
+                        : typeof item.summary === 'string' && item.summary.trim()
+                          ? item.summary.trim()
+                          : id;
+                      const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
+                      const status = typeof item.status === 'string' && item.status.trim() ? item.status.trim() : 'available';
+                      const modified = typeof item.updated_at === 'string' && item.updated_at.trim()
+                        ? item.updated_at.trim()
+                        : typeof item.updatedAt === 'string' && item.updatedAt.trim()
+                          ? item.updatedAt.trim()
+                          : typeof item.last_modified === 'string' && item.last_modified.trim()
+                            ? item.last_modified.trim()
+                            : typeof item.modified_at === 'string' && item.modified_at.trim()
+                              ? item.modified_at.trim()
+                              : '';
+                      const isSelected = selectedPlannerFeatureIds.includes(id);
+
+                      return (
+                        <Table.Tr key={id || title}>
+                          <Table.Td>
+                            <Stack gap={2}>
+                              <Group gap="xs" wrap="nowrap">
+                                <Text fw={600} size="sm">{title}</Text>
+                                {isSelected ? <Badge size="xs" color="green" variant="light">Selected</Badge> : null}
+                              </Group>
+                              {summary ? <Text size="xs" c="dimmed" lineClamp={2}>{summary}</Text> : null}
+                            </Stack>
+                          </Table.Td>
+                          <Table.Td><Badge variant="light">{status}</Badge></Table.Td>
+                          <Table.Td><Text size="sm" c={modified ? undefined : 'dimmed'}>{modified || '—'}</Text></Table.Td>
+                          <Table.Td>
+                            <Group gap="xs" wrap="nowrap">
+                              <Button size="xs" variant="light" onClick={() => setPlannerFeatureViewItem(item)}>View</Button>
+                              <Button size="xs" onClick={() => void savePlannerFragmentSelection(id)} disabled={!id || isSelected}>Select</Button>
+                            </Group>
+                          </Table.Td>
+                        </Table.Tr>
+                      );
+                    })}
+                  </Table.Tbody>
+                </Table>
+              </ScrollArea>
+            )}
+            <Group justify="space-between">
+              <Button size="xs" variant="light" color="red" onClick={() => void savePlannerFragmentSelection(null)} disabled={selectedPlannerFeatureIds.length === 0}>Clear selection</Button>
+              <Button size="xs" variant="default" onClick={() => setPlannerFragmentConfigOpen(false)}>Close</Button>
+            </Group>
+          </Stack>
+        </Modal>
+
+        <Modal
+          opened={plannerFeatureViewItem !== null}
+          onClose={() => setPlannerFeatureViewItem(null)}
+          title="Planner feature"
+          size="calc(100vw - 96px)"
+          centered
+          zIndex={310}
+        >
+          {plannerFeatureViewItem ? (
+            <Stack gap="md">
+              <Group justify="space-between" align="flex-start">
+                <Stack gap={4} style={{ minWidth: 0, flex: 1 }}>
+                  <Text fw={700} size="lg">{String(plannerFeatureViewItem.title ?? plannerFeatureViewItem.summary ?? plannerFeatureViewItem.id ?? '')}</Text>
+                  {typeof plannerFeatureViewItem.status === 'string' ? <Badge variant="light">{plannerFeatureViewItem.status}</Badge> : null}
+                </Stack>
+                <Button
+                  size="xs"
+                  onClick={() => {
+                    const id = typeof plannerFeatureViewItem.id === 'string' ? plannerFeatureViewItem.id : null;
+                    if (id) void savePlannerFragmentSelection(id);
+                  }}
+                  disabled={typeof plannerFeatureViewItem.id !== 'string' || selectedPlannerFeatureIds.includes(plannerFeatureViewItem.id)}
+                >
+                  Select
+                </Button>
+              </Group>
+              {typeof plannerFeatureViewItem.rough_summary === 'string' && plannerFeatureViewItem.rough_summary.trim() ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Original rough feature prompt</Text>
+                  <Text size="sm">{plannerFeatureViewItem.rough_summary}</Text>
+                </Stack>
+              ) : null}
+              {typeof plannerFeatureViewItem.summary === 'string' && plannerFeatureViewItem.summary.trim() ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Refined feature summary</Text>
+                  <Text size="sm">{plannerFeatureViewItem.summary}</Text>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.requirements) && plannerFeatureViewItem.requirements.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Detailed requirements</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.requirements.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.acceptance_criteria) && plannerFeatureViewItem.acceptance_criteria.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Acceptance criteria</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.acceptance_criteria.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.implementation_notes) && plannerFeatureViewItem.implementation_notes.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Implementation notes</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.implementation_notes.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.review_expectations) && plannerFeatureViewItem.review_expectations.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Review expectations</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.review_expectations.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.dependencies) && plannerFeatureViewItem.dependencies.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Dependencies</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.dependencies.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              {Array.isArray(plannerFeatureViewItem.target_files_or_areas) && plannerFeatureViewItem.target_files_or_areas.length > 0 ? (
+                <Stack gap="xs">
+                  <Text fw={600}>Target files or areas</Text>
+                  <Stack gap={4}>{plannerFeatureViewItem.target_files_or_areas.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
+                </Stack>
+              ) : null}
+              <Divider />
+              <SimpleGrid cols={{ base: 1, md: 2 }}>
+                {typeof plannerFeatureViewItem.id === 'string' ? (
+                  <Text size="xs" c="dimmed">Feature id: {plannerFeatureViewItem.id}</Text>
+                ) : null}
+                {typeof plannerFeatureViewItem.refinement_workflow_run_id === 'string' ? (
+                  <Text size="xs" c="dimmed">Refinement workflow run: {plannerFeatureViewItem.refinement_workflow_run_id}</Text>
+                ) : null}
+              </SimpleGrid>
+            </Stack>
+          ) : null}
         </Modal>
 
         <Modal

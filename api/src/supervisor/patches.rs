@@ -6,13 +6,13 @@ pub fn create_baseline(repo_path: &Path) -> Result<()> {
     run(repo_path, "git", &["init"])?;
     run(repo_path, "git", &["config", "user.email", "mdev-supervisor@example.invalid"])?;
     run(repo_path, "git", &["config", "user.name", "mdev supervisor"])?;
-    run(repo_path, "git", &["add", "."])?;
+    run(repo_path, "git", &["add", "-A", "--", ".", ":(exclude).mdev", ":(exclude).mdev/**"])?;
     let _ = run(repo_path, "git", &["commit", "-m", "supervisor baseline"]);
     Ok(())
 }
 
 pub fn generate_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
-    run(repo_path, "git", &["add", "-A"])?;
+    run(repo_path, "git", &["add", "-A", "--", ".", ":(exclude).mdev", ":(exclude).mdev/**"])?;
 
     let output = Command::new("git")
         .arg("diff")
