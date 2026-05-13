@@ -205,6 +205,17 @@ async fn run_action(
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
         }
+        "resolve_disposition_review" => {
+            let disposition = req
+                .payload
+                .get("disposition")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?;
+            engine::resolve_disposition_review(&state, run_id, disposition).await.map_err(internal)?
+        }
+        "prepare_stage" | "prepare_current_stage" => {
+            engine::prepare_run_stage_for_execution(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+        }
         "start_run" => {
             engine::start_run(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
@@ -425,6 +436,14 @@ async fn create_run(
     seed_missing_browser_session_rearm(&mut seeded_run.context);
     seed_governance_context_from_definition(&mut seeded_run.context, &definition);
     seed_compile_command_context_from_definition(&mut seeded_run.context, &definition);
+    if let Some(step) = initial_step {
+        let decisions = engine::governance::before_stage(&state, id, &mut seeded_run, step)
+            .await
+            .map_err(internal)?;
+        engine::governance::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)
+            .map_err(internal)?;
+        engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
+    }
     run_context = seeded_run.context;
 
     sqlx::query(

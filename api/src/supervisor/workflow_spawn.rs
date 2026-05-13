@@ -9,7 +9,7 @@ use crate::{
     db::new_workflow_key,
     engine,
     engine::capabilities::planner::FeaturePlanItem,
-    models::{AutomationMode, WorkflowGlobalConfig, WorkflowStepDefinition, WorkflowStepExecutionConfig, WorkflowStepPromptConfig, WorkflowStepAdvancementConfig, WorkflowTemplateDefinition},
+    models::{AutomationMode, RunStatus, WorkflowGlobalConfig, WorkflowRun, WorkflowStepDefinition, WorkflowStepExecutionConfig, WorkflowStepPromptConfig, WorkflowStepAdvancementConfig, WorkflowTemplateDefinition},
 };
 
 pub async fn spawn_series_workflow_on_integration(
@@ -99,6 +99,13 @@ fn apply_supervisor_planner_template_controls(supervisor_context: &mut Value, de
     }
 }
 
+fn is_sprint_feature_context(supervisor_context: &Value) -> bool {
+    supervisor_context
+        .get("input_source")
+        .and_then(Value::as_str)
+        == Some("supervisor_sprint_feature")
+}
+
 pub async fn spawn_feature_plan_item_workflow(
     state: &AppState,
     item: &FeaturePlanItem,
@@ -114,6 +121,7 @@ pub async fn spawn_feature_plan_item_workflow(
         .get("input_source")
         .and_then(Value::as_str)
         == Some("supervisor_planner_feature");
+    let is_supervisor_sprint_feature = is_sprint_feature_context(&supervisor_context);
 
     let mut supervisor_context = supervisor_context;
     if is_supervisor_planner_feature {
@@ -159,9 +167,15 @@ pub async fn spawn_feature_plan_item_workflow(
     let context = json!({
         "supervisor": supervisor_context,
         "workflow_engine": {
+            "run_state": {
+                "pause_requested": false
+            },
             "global_state": {
                 "capabilities": {
-                    "planner": planner
+                    "planner": planner,
+                    "context_export": {
+                        "enabled": is_supervisor_sprint_feature
+                    }
                 }
             }
         }
@@ -280,6 +294,10 @@ async fn insert_and_start_run(
         .or_else(|| context.get("workflow_start_step_id").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let is_supervisor_sprint_feature = context
+        .get("supervisor")
+        .map(is_sprint_feature_context)
+        .unwrap_or(false);
     let current_step_id = requested_start_step_id
         .and_then(|step_id| definition.steps.iter().find(|step| step.id == step_id).map(|step| step.id.clone()))
         .or_else(|| definition.steps.first().map(|step| step.id.clone()));
@@ -294,6 +312,30 @@ async fn insert_and_start_run(
     if let Some(context_obj) = context.as_object_mut() {
         context_obj.remove("workflow_input");
     }
+
+    let initial_step = current_step_id
+        .as_deref()
+        .and_then(|step_id| definition.steps.iter().find(|step| step.id == step_id));
+    let mut seeded_run = WorkflowRun {
+        id,
+        template_id,
+        definition: definition.clone(),
+        status: RunStatus::Draft,
+        current_step_id: current_step_id.clone(),
+        title: title.to_string(),
+        repo_ref: repo_path.to_string(),
+        workflow_key: key.clone(),
+        context,
+        created_at: now,
+        updated_at: now,
+    };
+    if let Some(step) = initial_step {
+        let decisions = engine::governance::before_stage(state, id, &mut seeded_run, step).await?;
+        engine::governance::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)?;
+        engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
+    }
+    context = seeded_run.context;
+
     sqlx::query("INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(id.to_string())
         .bind(template_id.map(|value| value.to_string()))

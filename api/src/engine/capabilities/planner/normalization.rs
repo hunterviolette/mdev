@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::models::WorkflowStepDefinition;
 
@@ -212,6 +212,12 @@ pub fn normalize_planner_features(step: &mut WorkflowStepDefinition, global_stat
 
     if step.step_type == "design" {
         let _ = set_path(&mut step.config, "design_mode", Value::String("v2".to_string()));
+        let _ = set_path(&mut step.execution_logic, "automation.disposition_review.enabled", Value::Bool(true));
+        let _ = set_path(
+            &mut step.execution_logic,
+            "automation.disposition_review.available_dispositions",
+            json!(["move_next", "pause"]),
+        );
     }
 }
 

@@ -98,6 +98,48 @@ fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
     Ok(session_id)
 }
 
+fn browser_probe_url_matches(probe_url: &str, target_url: &str) -> bool {
+    let expected = target_url.trim().trim_end_matches('/');
+    if expected.is_empty() {
+        return true;
+    }
+    let actual = probe_url.trim().trim_end_matches('/');
+    actual == expected
+}
+
+fn wait_for_browser_chat_ready(browser: &mut BrowserConfig, target_url: &str) -> Result<BrowserProbeResult> {
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(browser.response_timeout_ms.max(15_000));
+    let poll = std::time::Duration::from_millis(browser.dom_poll_ms.clamp(250, 2_000));
+    let mut last_probe: Option<BrowserProbeResult> = None;
+
+    loop {
+        match adapter::probe(browser) {
+            Ok(probe) => {
+                if probe.ready && browser_probe_url_matches(&probe.url, target_url) {
+                    return Ok(probe);
+                }
+                last_probe = Some(probe);
+            }
+            Err(err) if is_stale_session_error(&err) => return Err(err),
+            Err(err) => {
+                if started.elapsed() >= timeout {
+                    return Err(err);
+                }
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            if let Some(probe) = last_probe {
+                return Ok(probe);
+            }
+            return adapter::probe(browser);
+        }
+
+        std::thread::sleep(poll);
+    }
+}
+
 async fn clear_session_scoped_inference_runtime_on_new_browser_session(
     ctx: &CapabilityContext<'_>,
     previous_session_id: &str,
@@ -245,26 +287,26 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         adapter::open_url(&mut inference_cfg.browser, &target_url)?;
     }
 
-    let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
-    if let Some(probe) = current_probe.as_ref() {
-        if !probe.ready {
-            persist_inference_config(ctx, &inference_cfg).await?;
-            return Ok(json!({
-                "transport": "browser",
-                "text": "",
-                "conversation_id": Value::Null,
-                "browser_session_id": inference_cfg.browser.session_id,
-                "probe": probe,
-                "ok": false,
-                "message": format!(
-                    "Browser page is not chat-ready; send was skipped (page_open={}, chat_input_found={}, chat_input_visible={}, url={})",
-                    probe.page_open,
-                    probe.chat_input_found,
-                    probe.chat_input_visible,
-                    probe.url
-                )
-            }));
-        }
+    let readiness_target_url = inference_cfg.browser.target_url.trim().to_string();
+    let readiness_probe = wait_for_browser_chat_ready(&mut inference_cfg.browser, &readiness_target_url)?;
+    if !readiness_probe.ready || !browser_probe_url_matches(&readiness_probe.url, &readiness_target_url) {
+        persist_inference_config(ctx, &inference_cfg).await?;
+        return Ok(json!({
+            "transport": "browser",
+            "text": "",
+            "conversation_id": Value::Null,
+            "browser_session_id": inference_cfg.browser.session_id,
+            "probe": readiness_probe,
+            "ok": false,
+            "message": format!(
+                "Browser page is not chat-ready on the expected target URL after readiness wait; send was skipped (page_open={}, chat_input_found={}, chat_input_visible={}, url={}, expected_url={})",
+                readiness_probe.page_open,
+                readiness_probe.chat_input_found,
+                readiness_probe.chat_input_visible,
+                readiness_probe.url,
+                readiness_target_url
+            )
+        }));
     }
 
     let upload_paths = dependency_upload_paths(ctx, prior_results)?;

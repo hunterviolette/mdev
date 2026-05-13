@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    engine,
     engine::capabilities::planner::{
         extract_inference_text, normalize_refined_feature_plan_item, ExecutionPlanItem,
         FeaturePlanItem, FeaturePlanItemStatus,
@@ -333,12 +334,18 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
             template_id,
             supervisor_context(&run, &workspace),
         ).await?;
+        let start_result = engine::start_run(state, child_run_id, None).await?;
+        let child_status = start_result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("waiting")
+            .to_string();
         children.push(SupervisorChildRun {
             execution_item_id: item.id.clone(),
             title: item.title.clone(),
             shard_path,
             workflow_run_id: Some(child_run_id),
-            status: "running".to_string(),
+            status: child_status,
             patch_path: None,
         });
     }
@@ -525,7 +532,7 @@ fn supervisor_context(run: &SupervisorRun, workspace: &repo_snapshot::Supervisor
         "snapshot_path": workspace.snapshot,
         "integration_path": workspace.integration,
         "patches_path": workspace.patches,
-        "workflow_start_step_id": run.context.get("workflow_start_step_id").and_then(Value::as_str)
+        "input_source": "supervisor_sprint_feature"
     })
 }
 

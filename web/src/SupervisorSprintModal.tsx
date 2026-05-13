@@ -61,39 +61,18 @@ function isChildFailed(child: SupervisorChildRun): boolean {
 export function SupervisorSprintModal({ opened, run, templates, onClose, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [workflowTemplateId, setWorkflowTemplateId] = useState<string | null>(null);
-  const [workflowStartStepId, setWorkflowStartStepId] = useState<string | null>(null);
   const [integrationTemplateId, setIntegrationTemplateId] = useState<string | null>(null);
   const [strategy, setStrategy] = useState<SupervisorExecutionStrategy>('series');
 
   const templateOptions = useMemo(() => templates.map((template) => ({ value: template.id, label: template.name })), [templates]);
-  const selectedWorkflowTemplate = useMemo(() => templates.find((template) => template.id === workflowTemplateId) ?? null, [templates, workflowTemplateId]);
-  const workflowStartStepOptions = useMemo(() => {
-    return (selectedWorkflowTemplate?.definition.steps ?? []).map((step) => ({
-      value: step.id,
-      label: `${step.name} (${step.step_type})`
-    }));
-  }, [selectedWorkflowTemplate]);
 
   useEffect(() => {
     if (!opened || !run) return;
     setStrategy(run.strategy);
     setWorkflowTemplateId(typeof run.context?.workflow_template_id === 'string' ? run.context.workflow_template_id : null);
-    setWorkflowStartStepId(typeof run.context?.workflow_start_step_id === 'string' ? run.context.workflow_start_step_id : null);
     setIntegrationTemplateId(typeof run.context?.integration_template_id === 'string' ? run.context.integration_template_id : null);
     setError(null);
   }, [opened, run?.id]);
-
-  useEffect(() => {
-    if (!opened) return;
-    if (!selectedWorkflowTemplate) {
-      setWorkflowStartStepId(null);
-      return;
-    }
-    const steps = selectedWorkflowTemplate.definition.steps ?? [];
-    if (workflowStartStepId && steps.some((step) => step.id === workflowStartStepId)) return;
-    const preferred = steps.find((step) => step.step_type === 'code') ?? steps[0];
-    setWorkflowStartStepId(preferred?.id ?? null);
-  }, [opened, selectedWorkflowTemplate, workflowStartStepId]);
 
   const scheduledItemsForStart = useMemo<ExecutionPlanItem[]>(() => {
     if (!run) return [];
@@ -127,10 +106,6 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
         setError('Select a workflow template before starting the sprint.');
         return;
       }
-      if (!workflowStartStepId) {
-        setError('Select a workflow start stage before starting the sprint.');
-        return;
-      }
       if (strategy === 'parallel' && !integrationTemplateId) {
         setError('Select an integration workflow before starting a parallel sprint.');
         return;
@@ -143,7 +118,6 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
       await updateSupervisorPlan(run.id, run.feature_plan_items, sprintItems, {
         sprint_strategy: strategy,
         workflow_template_id: workflowTemplateId,
-        workflow_start_step_id: workflowStartStepId,
         integration_template_id: strategy === 'parallel' ? integrationTemplateId : null
       });
       await runSupervisorAction(run.id, 'start');
@@ -205,15 +179,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                         allowDeselect={false}
                       />
                     </Group>
-                    <Select
-                      label="Start stage"
-                      placeholder="Select workflow start stage"
-                      value={workflowStartStepId}
-                      onChange={setWorkflowStartStepId}
-                      data={workflowStartStepOptions}
-                      searchable
-                      disabled={!workflowTemplateId}
-                    />
+
                     {strategy === 'parallel' ? (
                       <Select
                         label="Integration workflow"
@@ -274,6 +240,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                         <Table.Td>{index + 1}</Table.Td>
                         <Table.Td>{sprintTitle(run, item.feature_plan_item_id)}</Table.Td>
                         <Table.Td>{workflowName(templates, item.workflow_template_id ?? workflowTemplateId)}</Table.Td>
+                        <Table.Td>design</Table.Td>
                       </Table.Tr>
                     ))}
                   </Table.Tbody>
@@ -316,6 +283,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                     <Table.Thead>
                       <Table.Tr>
                         <Table.Th>Workflow</Table.Th>
+                        <Table.Th>Backend entrypoint</Table.Th>
                         <Table.Th>Workflow run</Table.Th>
                         <Table.Th>Status</Table.Th>
                       </Table.Tr>

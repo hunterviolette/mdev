@@ -16,7 +16,7 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{force_wait_run, pause_run, resume_run, run_step, start_run};
+pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
@@ -260,8 +260,38 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-pub fn refresh_inference_arm_state(run: &mut WorkflowRun, _selected_step: Option<&WorkflowStepDefinition>) {
+pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
     normalize_inference_arm_state(run);
+
+    let Some(step) = selected_step else {
+        return;
+    };
+
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_value_object(inference);
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context")
+        && !inference_obj.contains_key("repo_context_armed")
+    {
+        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema")
+        && !inference_obj.contains_key("changeset_schema_armed")
+    {
+        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    }
+
+    inference_obj.remove("shared_inference_state");
 }
 
 fn normalize_inference_arm_state(run: &mut WorkflowRun) {
@@ -287,14 +317,14 @@ fn normalize_inference_arm_state(run: &mut WorkflowRun) {
         .and_then(Value::as_bool);
 
     if !inference_obj.contains_key("repo_context_armed") {
-        if let Some(value) = nested_repo_context_armed {
-            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(value));
+        if nested_repo_context_armed == Some(true) {
+            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
         }
     }
 
     if !inference_obj.contains_key("changeset_schema_armed") {
-        if let Some(value) = nested_changeset_schema_armed {
-            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(value));
+        if nested_changeset_schema_armed == Some(true) {
+            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
         }
     }
 
@@ -314,10 +344,6 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
 
     run.current_step_id = Some(step.id.clone());
     run.status = RunStatus::Waiting;
-
-    let decisions = governance::before_stage(state, run_id, &mut run, step).await?;
-    governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
-    refresh_inference_arm_state(&mut run, Some(step));
 
     update_run_context(&state.db, run_id, &run.context).await?;
     update_run_status(&state.db, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;

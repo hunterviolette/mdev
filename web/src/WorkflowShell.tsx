@@ -53,8 +53,10 @@ import {
   patchWorkflowGlobalState,
   patchWorkflowStageState,
   pauseWorkflowRun,
+  prepareWorkflowStage,
   forceWaitWorkflowRun,
   resumeWorkflowRun,
+  resolveWorkflowDispositionReview,
   sapScanExportCandidates,
   sapSearchObjects,
   runCurrentWorkflowStep,
@@ -1369,6 +1371,8 @@ export function WorkflowShell() {
 
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [pendingStageSelectionId, setPendingStageSelectionId] = useState<string | null>(null);
+  const [pendingDispositionAutoRun, setPendingDispositionAutoRun] = useState<{ runId: string; stepId: string; runAutomatically: boolean } | null>(null);
+  const [pauseRequestBusy, setPauseRequestBusy] = useState(false);
   const [manualCapabilityStatus, setManualCapabilityStatus] = useState<string | null>(null);
   const [manualCapabilityBusy, setManualCapabilityBusy] = useState(false);
   const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
@@ -1474,8 +1478,14 @@ export function WorkflowShell() {
   );
   const canRequestRunPause = Boolean(
     selectedRunId
-    && !manualCapabilityBusy
-    && (selectedRun?.status === 'queued' || selectedRun?.status === 'running')
+    && !pauseRequestBusy
+    && (
+      selectedRun?.status === 'queued'
+      || selectedRun?.status === 'running'
+      || selectedRun?.status === 'waiting'
+      || busy
+      || manualCapabilityBusy
+    )
   );
   const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
 
@@ -1483,11 +1493,32 @@ export function WorkflowShell() {
     return selectedRun?.definition ?? null;
   }, [selectedRun?.definition]);
 
+  const pendingDispositionReview = useMemo(() => {
+    const workflowEngine = ((selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine ?? undefined) as Record<string, unknown> | undefined;
+    const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
+    const blockedOn = (runState.blocked_on ?? null) as Record<string, unknown> | null;
+    if (!blockedOn || blockedOn.kind !== 'disposition_review') return null;
+    const available = Array.isArray(blockedOn.available_dispositions)
+      ? blockedOn.available_dispositions.filter((item): item is string => item === 'move_next' || item === 'pause')
+      : ['move_next', 'pause'];
+    return {
+      stageId: typeof blockedOn.stage_id === 'string' ? blockedOn.stage_id : selectedRun?.current_step_id ?? '',
+      stageType: typeof blockedOn.stage_type === 'string' ? blockedOn.stage_type : '',
+      recommendedDisposition: typeof blockedOn.recommended_disposition === 'string' ? blockedOn.recommended_disposition : '',
+      nextStepId: typeof blockedOn.next_step_id === 'string' ? blockedOn.next_step_id : '',
+      message: typeof blockedOn.message === 'string' ? blockedOn.message : '',
+      availableDispositions: available.length > 0 ? available : ['move_next', 'pause']
+    };
+  }, [selectedRun?.context, selectedRun?.current_step_id]);
+
+  const hasPendingDispositionReview = Boolean(pendingDispositionReview);
+
   const selectedRunStepId = selectedStepId ?? selectedRun?.current_step_id ?? selectedRunDefinition?.steps[0]?.id ?? null;
 
   const selectedWorkflowStep = useMemo(() => {
     return selectedRunDefinition?.steps.find((step) => step.id === selectedRunStepId) ?? null;
   }, [selectedRunDefinition, selectedRunStepId]);
+
 
   const [sapImportPackageName, setSapImportPackageName] = useState('');
   const [sapImportIncludeSubpackages, setSapImportIncludeSubpackages] = useState(true);
@@ -1667,8 +1698,21 @@ export function WorkflowShell() {
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
     const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
     const inference = (capabilities.inference ?? null) as Record<string, unknown> | null;
+    const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
+    const lastPreparedStage = (runState.last_prepared_stage ?? null) as Record<string, unknown> | null;
+    const preparedStepId = typeof lastPreparedStage?.step_id === 'string' ? lastPreparedStage.step_id : null;
+    const preparedInference = (lastPreparedStage?.inference ?? null) as Record<string, unknown> | null;
+
+    if (preparedStepId && preparedStepId === selectedRunStepId && preparedInference) {
+      return {
+        ...(inference ?? {}),
+        ...preparedInference,
+        last_prepared_stage: lastPreparedStage
+      };
+    }
+
     return inference;
-  }, [selectedRun?.context]);
+  }, [selectedRun?.context, selectedRunStepId]);
   const sharedPlannerFragmentState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
@@ -1801,6 +1845,30 @@ export function WorkflowShell() {
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
 
+  useEffect(() => {
+    if (!pendingDispositionAutoRun) return;
+    if (!selectedRun || selectedRun.id !== pendingDispositionAutoRun.runId) return;
+    if (selectedRun.current_step_id !== pendingDispositionAutoRun.stepId) return;
+    if (selectedRunStepId !== pendingDispositionAutoRun.stepId) return;
+    if (!selectedWorkflowStep || selectedWorkflowStep.id !== pendingDispositionAutoRun.stepId) return;
+    if (hasPendingDispositionReview || isBackendRunLocked) return;
+
+    const pending = pendingDispositionAutoRun;
+    setPendingDispositionAutoRun(null);
+    window.setTimeout(() => {
+      const action = pending.runAutomatically
+        ? startWorkflowRun(pending.runId)
+        : runCurrentWorkflowStep(pending.runId, pending.stepId);
+      void action
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => {
+          void refreshRunDetails(pending.runId);
+        });
+    }, 0);
+  }, [pendingDispositionAutoRun, selectedRun?.id, selectedRun?.current_step_id, selectedRunStepId, selectedWorkflowStep?.id, hasPendingDispositionReview, isBackendRunLocked]);
+
   const persistedReviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
@@ -1932,6 +2000,40 @@ export function WorkflowShell() {
     }
     void refreshRunDetails(selectedRunId);
   }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    const shouldPoll = Boolean(
+      busy
+      || manualCapabilityBusy
+      || pauseRequestBusy
+      || selectedRun?.status === 'queued'
+      || selectedRun?.status === 'running'
+    );
+    if (!shouldPoll) return;
+
+    let cancelled = false;
+    const runId = selectedRunId;
+
+    async function pollRun() {
+      if (cancelled) return;
+      try {
+        await refreshRunDetails(runId);
+        await refreshLiveMonitor(runId);
+      } catch {
+      }
+    }
+
+    void pollRun();
+    const timer = window.setInterval(() => {
+      void pollRun();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedRunId, selectedRun?.status, busy, manualCapabilityBusy, pauseRequestBusy]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -2742,6 +2844,24 @@ export function WorkflowShell() {
     if (selectedRunIdRef.current === runId) {
       setEvents((prev) => mergeWorkflowEvents(prev, incoming));
     }
+    const payload = incoming.payload as Record<string, unknown>;
+    const snapshotContext = payload.final_context ?? payload.run_context ?? payload.prepared_context;
+    if (snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
+      const snapshotStatus = typeof payload.prepared_status === 'string'
+        ? payload.prepared_status as WorkflowRunStatus
+        : typeof payload.status === 'string'
+          ? payload.status as WorkflowRunStatus
+          : undefined;
+      const snapshotStepId = typeof payload.current_step_id === 'string'
+        ? payload.current_step_id
+        : incoming.step_id;
+      setRuns((prev) => prev.map((run) => run.id === runId ? {
+        ...run,
+        ...(snapshotStatus ? { status: snapshotStatus } : {}),
+        current_step_id: snapshotStepId ?? run.current_step_id,
+        context: snapshotContext as Record<string, unknown>
+      } : run));
+    }
     scheduleRunRefresh(runId);
   }
 
@@ -2996,16 +3116,28 @@ export function WorkflowShell() {
   async function handleStartRun() {
     if (!selectedRunId) return;
     const runId = selectedRunId;
-    setBusy(true);
-    setError(null);
-    void startWorkflowRun(runId)
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        void refreshRunDetails(runId);
-      });
-    window.setTimeout(() => setBusy(false), 250);
+    try {
+      setBusy(true);
+      setError(null);
+      const prepared = await prepareWorkflowStage(runId);
+      const preparedRun = prepared.run;
+      if (preparedRun) {
+        setRuns((prev) => [
+          preparedRun,
+          ...prev.filter((item) => item.id !== preparedRun.id)
+        ]);
+        setSelectedRunId(preparedRun.id);
+      } else {
+        await refreshRunDetails(runId);
+      }
+      await startWorkflowRun(runId);
+      await refreshRunDetails(runId);
+      await refreshLiveMonitor(runId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const currentAutonomousStep = selectedRunDefinition?.steps.find((step) => step.id === selectedRun?.current_step_id)
@@ -3033,15 +3165,17 @@ export function WorkflowShell() {
 
   async function handlePauseRun() {
     if (!selectedRunId) return;
+    const runId = selectedRunId;
     try {
-      setBusy(true);
+      setPauseRequestBusy(true);
       setError(null);
-      await pauseWorkflowRun(selectedRunId);
-      await refreshRunDetails(selectedRunId);
+      await pauseWorkflowRun(runId);
+      await refreshRunDetails(runId);
+      await refreshLiveMonitor(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setPauseRequestBusy(false);
     }
   }
 
@@ -4246,6 +4380,24 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await refreshSelectedRunArtifacts();
   }
 
+  async function handleDispositionReview(disposition: string) {
+    if (!selectedRun) return;
+    const runId = selectedRun.id;
+    await runManualCapability(async () => {
+      const json = await resolveWorkflowDispositionReview(runId, disposition) as Record<string, unknown>;
+      await refreshSelectedRunArtifacts();
+
+      if (disposition === 'move_next') {
+        const nextStepId = typeof json.current_step_id === 'string' ? json.current_step_id : null;
+        if (nextStepId) {
+          setSelectedStepId(nextStepId);
+        }
+      }
+
+      return json;
+    }, `Disposition selected: ${disposition}.`);
+  }
+
   async function handleManualPatchStageState() {
     if (!selectedRun || !selectedRunStepId) return;
     const stepId = selectedRunStepId;
@@ -4926,7 +5078,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
                               <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !canRunCurrentStageAutomatically || isBackendRunLocked}>Run autonomously</Button>
-                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy && canRequestRunPause} disabled={!canRequestRunPause}>Pause after stage</Button>
+                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>Pause after stage</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
                               <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Force unlock</Button>
                             </Group>
@@ -4941,8 +5093,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 <Title order={6}>Workflow controls</Title>
                               </Group>
                               <Group>
-                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked}>Save stage inputs</Button>
-                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked} loading={manualCapabilityBusy}>Run stage</Button>
+                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview}>Save stage inputs</Button>
+                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview} loading={manualCapabilityBusy}>Run stage</Button>
                                 <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
                               </Group>
                             </Stack>
@@ -5015,6 +5167,38 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Stack>
                             {!inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
                               <>
+                                {pendingDispositionReview ? (
+                                  <Card withBorder>
+                                    <Stack gap="sm">
+                                      <Alert color="yellow" title="Stage outcome needs a disposition">
+                                        <Stack gap={4}>
+                                          <Text size="sm">{pendingDispositionReview.message || 'Review the completed stage output and choose how the workflow should continue.'}</Text>
+                                          <Text size="xs" c="dimmed">Stage: {pendingDispositionReview.stageId}</Text>
+                                          {pendingDispositionReview.nextStepId ? <Text size="xs" c="dimmed">Next: {pendingDispositionReview.nextStepId}</Text> : null}
+                                          {pendingDispositionReview.recommendedDisposition ? <Text size="xs" c="dimmed">Recommended: {pendingDispositionReview.recommendedDisposition}</Text> : null}
+                                        </Stack>
+                                      </Alert>
+                                      <Group gap="xs" wrap="wrap">
+                                        {pendingDispositionReview.availableDispositions.map((disposition) => {
+                                          const label = disposition === 'move_next' ? 'Continue' : 'Pause';
+                                          const color = disposition === 'pause' ? 'yellow' : undefined;
+                                          return (
+                                            <Button
+                                              key={disposition}
+                                              variant={disposition === 'move_next' ? 'filled' : 'light'}
+                                              color={color}
+                                              loading={manualCapabilityBusy}
+                                              disabled={busy || manualCapabilityBusy}
+                                              onClick={() => void handleDispositionReview(disposition)}
+                                            >
+                                              {label}
+                                            </Button>
+                                          );
+                                        })}
+                                      </Group>
+                                    </Stack>
+                                  </Card>
+                                ) : null}
                                 {selectedWorkflowStep?.step_type === 'sap_import' ? (
                                   <SapImportStageControlsPanel
                                     status={sapImportStatus}

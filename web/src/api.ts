@@ -317,9 +317,11 @@ export type WorkflowRunActionResult = {
   ok: boolean;
   status?: string;
   step_id?: string;
+  current_step_id?: string;
   next_step_id?: string;
   step_type?: string;
-  message?: string;
+  message?: string | null;
+  run?: WorkflowRun;
   local_state?: Record<string, unknown>;
   execution_plan?: Array<Record<string, unknown>>;
   capability_results?: Array<Record<string, unknown>>;
@@ -545,6 +547,10 @@ export function startWorkflowRun(runId: string) {
   return sendRunAction(runId, { action: 'start_run' });
 }
 
+export function prepareWorkflowStage(runId: string, stepId?: string | null) {
+  return sendRunAction(runId, { action: 'prepare_stage', step_id: stepId ?? undefined });
+}
+
 export function resumeWorkflowRun(runId: string) {
   return sendRunAction(runId, { action: 'resume_run' });
 }
@@ -570,6 +576,13 @@ export function runCurrentWorkflowStep(
     action: 'run_step',
     step_id: stepId ?? undefined,
     payload
+  });
+}
+
+export function resolveWorkflowDispositionReview(runId: string, disposition: string) {
+  return sendRunAction(runId, {
+    action: 'resolve_disposition_review',
+    payload: { disposition }
   });
 }
 

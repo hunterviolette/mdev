@@ -281,9 +281,8 @@ export class SessionManager {
       preferredSelector,
       'button[data-testid="send-button"]',
       'button[aria-label*="send" i]',
-      'button[type="submit"]',
-      'form button',
-      'button'
+      'button[title*="send" i]',
+      'button[type="submit"]'
     ].filter((selector): selector is string => Boolean(selector));
 
     let best: { locator: Locator; score: number } | null = null;
@@ -445,7 +444,7 @@ export class SessionManager {
       isContentEditable: (el as HTMLElement).isContentEditable
     }));
 
-    await composer.click({ timeout: 5000 });
+    await composer.click({ timeout: 20000 });
 
     if (info.isContentEditable) {
       await composer.evaluate((el) => {
@@ -562,16 +561,16 @@ export class SessionManager {
         break;
       }
 
-      const submit = await this.waitForSendReady(page, composer, submitSelector, Math.min(remainingMs, 5000));
+      const submit = await this.waitForSendReady(page, composer, submitSelector, Math.min(remainingMs, 20000));
       if (!submit) {
         await page.waitForTimeout(500).catch(() => {});
         continue;
       }
 
       attempts += 1;
-      await submit.click({ timeout: Math.min(remainingMs, 5000) });
+      await submit.click({ timeout: Math.min(remainingMs, 20000) });
 
-      const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 5000));
+      const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 20000));
       if (postClick === 'cleared' || postClick === 'changed' || postClick === 'busy') {
         return { sent: true, method: 'click', attempts };
       }

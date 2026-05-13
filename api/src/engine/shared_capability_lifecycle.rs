@@ -17,13 +17,47 @@ fn inferred_default_enabled(step: Option<&WorkflowStepDefinition>, primitive_key
 }
 
 fn effective_enabled(global_state: &Value, step: Option<&WorkflowStepDefinition>, primitive_key: &str) -> bool {
-    let storage_key = binding_specs::shared_capability_storage_key(primitive_key);
-    global_state
-        .get("capabilities")
-        .and_then(|v| v.get(storage_key))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| inferred_default_enabled(step, primitive_key))
+    binding_specs::shared_capability_enabled(
+        global_state,
+        primitive_key,
+        inferred_default_enabled(step, primitive_key),
+    )
+}
+
+fn set_shared_capability_enabled(capabilities_obj: &mut Map<String, Value>, primitive_key: &str, enabled: Option<bool>) {
+    if primitive_key == "planner_fragment" {
+        let planner = capabilities_obj
+            .entry("planner".to_string())
+            .or_insert_with(|| json!({}));
+        let planner_obj = ensure_object(planner);
+        match enabled {
+            Some(value) => {
+                planner_obj.insert("fragment_armed".to_string(), Value::Bool(value));
+            }
+            None => {
+                planner_obj.remove("fragment_armed");
+            }
+        }
+        return;
+    }
+
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_object(inference);
+    let key = match primitive_key {
+        "repo_context" => "repo_context_armed",
+        "changeset_schema" => "changeset_schema_armed",
+        _ => "enabled",
+    };
+    match enabled {
+        Some(value) => {
+            inference_obj.insert(key.to_string(), Value::Bool(value));
+        }
+        None => {
+            inference_obj.remove(key);
+        }
+    }
 }
 
 pub fn refresh_shared_capability_arm_state(
@@ -56,7 +90,8 @@ pub fn refresh_shared_capability_arm_state(
         "shared_inference_state".to_string(),
         json!({
             "repo_context_armed": repo_context_armed,
-            "changeset_schema_armed": changeset_schema_armed
+            "changeset_schema_armed": changeset_schema_armed,
+            "planner_fragment_armed": effective_enabled(&global_snapshot, selected_step, "planner_fragment")
         }),
     );
 }
@@ -70,7 +105,7 @@ pub fn consume_shared_capabilities_for_step(run: &mut WorkflowRun, step: &Workfl
         .or_insert_with(|| json!({}));
     let capabilities_obj = ensure_object(capabilities);
 
-    for primitive_key in ["repo_context", "changeset_schema"] {
+    for primitive_key in ["repo_context", "changeset_schema", "planner_fragment"] {
         if !binding_specs::stage_supports_shared_capability(step, primitive_key) {
             continue;
         }
@@ -81,15 +116,15 @@ pub fn consume_shared_capabilities_for_step(run: &mut WorkflowRun, step: &Workfl
             continue;
         }
 
-        let storage_key = binding_specs::shared_capability_storage_key(primitive_key).to_string();
-        let capability_value = capabilities_obj
-            .entry(storage_key)
-            .or_insert_with(|| json!({}));
-        let capability_obj = ensure_object(capability_value);
-        capability_obj.insert("enabled".to_string(), Value::Bool(false));
+        set_shared_capability_enabled(capabilities_obj, primitive_key, Some(false));
     }
 
-    refresh_shared_capability_arm_state(run, Some(step));
+    if let Some(inference_obj) = capabilities_obj
+        .get_mut("inference")
+        .and_then(Value::as_object_mut)
+    {
+        inference_obj.remove("shared_inference_state");
+    }
 }
 
 pub fn reset_session_scoped_shared_capability_lifecycle(run: &mut WorkflowRun) {
@@ -101,7 +136,7 @@ pub fn reset_session_scoped_shared_capability_lifecycle(run: &mut WorkflowRun) {
         .or_insert_with(|| json!({}));
     let capabilities_obj = ensure_object(capabilities);
 
-    for primitive_key in ["repo_context", "changeset_schema"] {
+    for primitive_key in ["repo_context", "changeset_schema", "planner_fragment"] {
         if !matches!(
             binding_specs::shared_capability_lifecycle(primitive_key),
             binding_specs::SharedCapabilityLifecycle::SingleUseGlobal
@@ -109,11 +144,6 @@ pub fn reset_session_scoped_shared_capability_lifecycle(run: &mut WorkflowRun) {
             continue;
         }
 
-        let storage_key = binding_specs::shared_capability_storage_key(primitive_key).to_string();
-        let capability_value = capabilities_obj
-            .entry(storage_key)
-            .or_insert_with(|| json!({}));
-        let capability_obj = ensure_object(capability_value);
-        capability_obj.remove("enabled");
+        set_shared_capability_enabled(capabilities_obj, primitive_key, None);
     }
 }

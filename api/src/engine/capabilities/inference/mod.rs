@@ -241,7 +241,9 @@ pub async fn execute(
         .unwrap_or("")
         .to_string();
 
-    let capability_ok = response_ok && (!sent_prompt.trim().is_empty() || response_text.trim().is_empty() || selected_transport != InferenceTransport::Browser);
+    let capability_ok = response_ok
+        && !sent_prompt.trim().is_empty()
+        && (ctx.step.step_type != "code" || !response_text.trim().is_empty());
 
     let message = if capability_ok {
         "Inference capability executed.".to_string()

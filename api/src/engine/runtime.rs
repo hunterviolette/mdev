@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    engine::{governance, refresh_inference_arm_state},
     models::RunStatus,
 };
 
@@ -19,7 +20,7 @@ use super::{
     set_run_status,
 };
 use super::stages::{execute_stage, StageDisposition};
-use super::transitions::{resolve_next_target, should_auto_advance};
+use super::transitions::{next_step_id, resolve_next_target, should_auto_advance};
 
 pub async fn start_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
     let run = load_run(state, run_id).await?;
@@ -34,7 +35,25 @@ pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Va
 
 pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
-    if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+    let disposition_review_waiting = matches!(run.status, RunStatus::Waiting)
+        && run
+            .context
+            .get("workflow_engine")
+            .and_then(|v| v.get("run_state"))
+            .and_then(|v| v.get("blocked_on"))
+            .and_then(|v| v.get("kind"))
+            .and_then(Value::as_str)
+            == Some("disposition_review");
+    let autonomous_pause_eligible = if matches!(run.status, RunStatus::Waiting) {
+        load_template_definition(state, &run)
+            .await?
+            .and_then(|definition| current_step(&definition, &run, None).ok().map(step_is_auto_runnable))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if !matches!(run.status, RunStatus::Queued | RunStatus::Running) && !disposition_review_waiting && !autonomous_pause_eligible {
         let status = format!("{:?}", run.status).to_lowercase();
         append_engine_event(
             state,
@@ -95,10 +114,350 @@ pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json
     Ok(json!({ "ok": true, "status": "waiting", "current_step_id": run.current_step_id }))
 }
 
+pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposition: &str) -> Result<serde_json::Value> {
+    let mut run = load_run(state, run_id).await?;
+    let blocked_on = run
+        .context
+        .get("workflow_engine")
+        .and_then(|v| v.get("run_state"))
+        .and_then(|v| v.get("blocked_on"))
+        .cloned()
+        .ok_or_else(|| anyhow!("workflow is not waiting on disposition review"))?;
+
+    let blocked_kind = blocked_on
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if blocked_kind != "disposition_review" {
+        return Err(anyhow!("workflow is blocked on {}, not disposition_review", blocked_kind));
+    }
+
+    let stage_id = blocked_on
+        .get("stage_id")
+        .and_then(Value::as_str)
+        .or(run.current_step_id.as_deref())
+        .ok_or_else(|| anyhow!("disposition review is missing stage_id"))?
+        .to_string();
+    let next_target = blocked_on
+        .get("next_step_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string());
+    let resume_mode = blocked_on
+        .get("resume_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("manual")
+        .to_string();
+
+    if !matches!(disposition, "move_next" | "pause" | "paused") {
+        return Err(anyhow!("unsupported disposition {}", disposition));
+    }
+
+    {
+        let root = ensure_engine_root(&mut run.context);
+        let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+        let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+        run_state_obj.remove("blocked_on");
+    }
+    persist_context(state, run_id, &run.context).await?;
+
+    match disposition {
+        "pause" | "paused" => {
+            set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
+            append_engine_event(
+                state,
+                run_id,
+                Some(stage_id.as_str()),
+                "info",
+                "disposition_review_resolved",
+                "Operator paused workflow at disposition review.",
+                json!({ "disposition": "pause", "stage_id": stage_id }),
+            ).await?;
+            Ok(json!({
+                "ok": true,
+                "status": "paused",
+                "disposition": "pause",
+                "current_step_id": stage_id,
+                "followup_action": "pause"
+            }))
+        }
+        "move_next" => {
+            let definition = load_template_definition(state, &run).await?
+                .ok_or_else(|| anyhow!("run has no template definition"))?;
+            let target = next_target
+                .or_else(|| next_step_id(&definition, Some(stage_id.as_str())))
+                .ok_or_else(|| anyhow!("disposition review has no next stage"))?;
+            let target_step = current_step(&definition, &run, Some(target.as_str()))?.clone();
+            append_engine_event(
+                state,
+                run_id,
+                Some(stage_id.as_str()),
+                "info",
+                "disposition_review_resolved",
+                "Operator approved moving to the next stage after disposition review.",
+                json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": target }),
+            ).await?;
+
+            let latest_run = load_run(state, run_id).await?;
+            if run_pause_requested(&latest_run) {
+                let mut paused_run = latest_run;
+                clear_run_pause_requested(&mut paused_run);
+                persist_context(state, run_id, &paused_run.context).await?;
+                set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
+                append_engine_event(
+                    state,
+                    run_id,
+                    Some(stage_id.as_str()),
+                    "info",
+                    "run_paused_after_stage",
+                    "Workflow run paused after the current stage completed.",
+                    json!({}),
+                ).await?;
+                return Ok(json!({
+                    "ok": true,
+                    "status": "paused",
+                    "disposition": "pause",
+                    "current_step_id": stage_id,
+                    "next_step_id": target,
+                }));
+            }
+
+            set_current_step_waiting(state, run_id, target.as_str()).await?;
+
+            append_engine_event(
+                state,
+                run_id,
+                Some(target.as_str()),
+                "info",
+                "disposition_transition_committed",
+                "Disposition review transition committed before backend continuation.",
+                json!({
+                    "disposition": "move_next",
+                    "from_step_id": stage_id,
+                    "current_step_id": target,
+                    "resume_mode": resume_mode,
+                    "auto_runnable": step_is_auto_runnable(&target_step),
+                }),
+            ).await?;
+
+            continue_from_disposition_transition(
+                state,
+                run_id,
+                target.as_str(),
+                resume_mode.as_str(),
+                &target_step,
+            ).await
+        }
+        other => Err(anyhow!("unsupported disposition {}", other)),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispositionFollowupAction {
+    StartAutonomous,
+    RunStage,
+    Pause,
+    None,
+}
+
+fn resolve_disposition_followup_action(
+    resume_mode: &str,
+    target_step: &super::WorkflowStepDefinition,
+) -> DispositionFollowupAction {
+    match resume_mode {
+        "autonomous" => DispositionFollowupAction::StartAutonomous,
+        "pause" | "paused" => DispositionFollowupAction::Pause,
+        "none" | "wait" | "waiting" => DispositionFollowupAction::None,
+        _ if step_is_auto_runnable(target_step) => DispositionFollowupAction::StartAutonomous,
+        _ => DispositionFollowupAction::RunStage,
+    }
+}
+
+fn format_disposition_followup_action(action: DispositionFollowupAction) -> &'static str {
+    match action {
+        DispositionFollowupAction::StartAutonomous => "start_run",
+        DispositionFollowupAction::RunStage => "run_step",
+        DispositionFollowupAction::Pause => "pause",
+        DispositionFollowupAction::None => "none",
+    }
+}
+
+async fn continue_from_disposition_transition(
+    state: &AppState,
+    run_id: Uuid,
+    target_step_id: &str,
+    resume_mode: &str,
+    target_step: &super::WorkflowStepDefinition,
+) -> Result<serde_json::Value> {
+    let followup_action = resolve_disposition_followup_action(resume_mode, target_step);
+
+    append_engine_event(
+        state,
+        run_id,
+        Some(target_step_id),
+        "info",
+        "disposition_transition_committed",
+        "Disposition review transition committed; backend continuation policy selected follow-up action.",
+        json!({
+            "step_id": target_step_id,
+            "resume_mode": resume_mode,
+            "auto_runnable": step_is_auto_runnable(target_step),
+            "followup_action": format_disposition_followup_action(followup_action),
+        }),
+    ).await?;
+
+    match followup_action {
+        DispositionFollowupAction::StartAutonomous => {
+            start_run(state, run_id, Some(target_step_id)).await
+        }
+        DispositionFollowupAction::RunStage => {
+            run_step(state, run_id, Some(target_step_id)).await
+        }
+        DispositionFollowupAction::Pause => {
+            set_run_status(state, run_id, RunStatus::Paused, Some(target_step_id)).await?;
+            Ok(json!({
+                "ok": true,
+                "status": "paused",
+                "disposition": "move_next",
+                "current_step_id": target_step_id,
+                "followup_action": "pause"
+            }))
+        }
+        DispositionFollowupAction::None => {
+            set_run_status(state, run_id, RunStatus::Waiting, Some(target_step_id)).await?;
+            Ok(json!({
+                "ok": true,
+                "status": "waiting",
+                "disposition": "move_next",
+                "current_step_id": target_step_id,
+                "followup_action": "none"
+            }))
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunMode {
     Manual,
     Autonomous,
+}
+
+struct PreparedStage {
+    run: super::WorkflowRun,
+    step: super::WorkflowStepDefinition,
+    pause_message: Option<String>,
+}
+
+async fn prepare_stage_for_execution(
+    state: &AppState,
+    run_id: Uuid,
+    requested_step_id: Option<&str>,
+    mode: RunMode,
+) -> Result<PreparedStage> {
+    let mut run = load_run(state, run_id).await?;
+    let definition = load_template_definition(state, &run).await?
+        .ok_or_else(|| anyhow!("run has no template definition"))?;
+    let step = current_step(&definition, &run, requested_step_id)?.clone();
+
+    run.current_step_id = Some(step.id.clone());
+
+    let decisions = governance::before_stage(state, run_id, &mut run, &step).await?;
+    governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
+    refresh_inference_arm_state(&mut run, Some(&step));
+
+    let prepared_inference_snapshot = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("global_state"))
+        .and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("inference"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    {
+        let root = ensure_engine_root(&mut run.context);
+        let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+        let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+        run_state_obj.insert("last_prepared_stage".to_string(), json!({
+            "step_id": step.id,
+            "step_type": step.step_type,
+            "inference": prepared_inference_snapshot
+        }));
+    }
+
+    let pause_message = governance::pause_message(&decisions);
+    let prepared_status = if pause_message.is_some() {
+        RunStatus::Waiting
+    } else {
+        RunStatus::Running
+    };
+
+    persist_context(state, run_id, &run.context).await?;
+    set_run_status(state, run_id, prepared_status, Some(step.id.as_str())).await?;
+
+    let refreshed_run = load_run(state, run_id).await?;
+
+    let prepared_global_state = refreshed_run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("global_state"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let prepared_stage_overrides = refreshed_run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("stage_overrides"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    append_engine_event(
+        state,
+        run_id,
+        Some(step.id.as_str()),
+        "info",
+        "stage_prepared_for_execution",
+        "Governance prepared stage before execution.",
+        json!({
+            "step_id": step.id,
+            "step_type": step.step_type,
+            "current_step_id": step.id,
+            "status": if pause_message.is_some() { "waiting" } else { "running" },
+            "prepared_status": if pause_message.is_some() { "waiting" } else { "running" },
+            "run_mode": match mode {
+                RunMode::Manual => "manual",
+                RunMode::Autonomous => "autonomous",
+            },
+            "paused_by_governance": pause_message.is_some(),
+            "prepared_context": refreshed_run.context.clone(),
+            "prepared_global_state": prepared_global_state,
+            "prepared_stage_overrides": prepared_stage_overrides
+        }),
+    ).await?;
+
+    Ok(PreparedStage {
+        run: refreshed_run,
+        step,
+        pause_message,
+    })
+}
+
+pub async fn prepare_run_stage_for_execution(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
+    let prepared = prepare_stage_for_execution(
+        state,
+        run_id,
+        requested_step_id,
+        RunMode::Autonomous,
+    ).await?;
+
+    Ok(json!({
+        "ok": prepared.pause_message.is_none(),
+        "status": if prepared.pause_message.is_some() { "waiting" } else { "running" },
+        "current_step_id": prepared.step.id,
+        "step_id": prepared.step.id,
+        "step_type": prepared.step.step_type,
+        "message": prepared.pause_message,
+        "run": prepared.run
+    }))
 }
 
 pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
@@ -143,26 +502,7 @@ fn format_automation_mode(step: &super::WorkflowStepDefinition) -> &'static str 
 }
 
 fn consume_single_use_inference_arm_state(run: &mut super::WorkflowRun, step: &super::WorkflowStepDefinition) {
-    let root = super::ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = global_state.as_object_mut().expect("global_state must be object");
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = capabilities.as_object_mut().expect("capabilities must be object");
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = inference.as_object_mut().expect("inference must be object");
-
-    if crate::engine::capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context") {
-        inference_obj.insert("repo_context_armed".to_string(), json!(false));
-    }
-    if crate::engine::capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema") {
-        inference_obj.insert("changeset_schema_armed".to_string(), json!(false));
-    }
-
-    inference_obj.remove("shared_inference_state");
+    crate::engine::shared_capability_lifecycle::consume_shared_capabilities_for_step(run, step);
 }
 
 fn run_pause_requested(run: &super::WorkflowRun) -> bool {
@@ -179,6 +519,114 @@ fn clear_run_pause_requested(run: &mut super::WorkflowRun) {
     if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
         run_state.remove("pause_requested");
     }
+}
+
+fn stage_disposition_review_enabled(
+    step: &super::WorkflowStepDefinition,
+    outcome: &super::stages::StageOutcome,
+) -> bool {
+    let step_enabled = step
+        .execution_logic
+        .get("automation")
+        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let outcome_enabled = outcome
+        .local_state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"))
+        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    step_enabled || outcome_enabled
+}
+
+fn disposition_review_options(
+    step: &super::WorkflowStepDefinition,
+    outcome: &super::stages::StageOutcome,
+) -> Value {
+    let configured = outcome
+        .local_state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"))
+        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("available_dispositions"))
+        .cloned()
+        .or_else(|| {
+            step.execution_logic
+                .get("automation")
+                .and_then(|v| v.get("disposition_review"))
+                .and_then(|v| v.get("available_dispositions"))
+                .cloned()
+        });
+
+    normalize_disposition_review_options(configured)
+}
+
+fn normalize_disposition_review_options(configured: Option<Value>) -> Value {
+    let options = configured
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| match value.as_str() {
+            Some("move_next") => Some(json!("move_next")),
+            Some("pause") => Some(json!("pause")),
+            _ => None,
+        })
+        .collect::<Vec<Value>>();
+
+    if options.is_empty() {
+        json!(["move_next", "pause"])
+    } else {
+        Value::Array(options)
+    }
+}
+
+fn clear_pending_disposition_review(run: &mut super::WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
+        run_state.remove("blocked_on");
+    }
+}
+
+async fn set_current_step_waiting(state: &AppState, run_id: Uuid, step_id: &str) -> Result<()> {
+    let mut run = load_run(state, run_id).await?;
+    let definition = load_template_definition(state, &run).await?
+        .ok_or_else(|| anyhow!("run has no template definition"))?;
+    let step = current_step(&definition, &run, Some(step_id))?;
+
+    run.current_step_id = Some(step.id.clone());
+    run.status = RunStatus::Waiting;
+
+    persist_context(state, run_id, &run.context).await?;
+    set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+
+    Ok(())
+}
+
+fn set_pending_disposition_review(
+    run: &mut super::WorkflowRun,
+    step: &super::WorkflowStepDefinition,
+    outcome: &super::stages::StageOutcome,
+    next_target: Option<String>,
+) {
+    let root = ensure_engine_root(&mut run.context);
+    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+    let run_state_obj = run_state.as_object_mut().expect("run_state must be object");
+    run_state_obj.insert("blocked_on".to_string(), json!({
+        "kind": "disposition_review",
+        "stage_id": step.id,
+        "stage_type": step.step_type,
+        "recommended_disposition": format_disposition(&outcome.disposition),
+        "available_dispositions": disposition_review_options(step, outcome),
+        "next_step_id": next_target,
+        "message": outcome.message,
+        "resume_mode": "autonomous"
+    }));
 }
 
 async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>, mode: RunMode) -> Result<serde_json::Value> {
@@ -211,13 +659,26 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }));
         }
 
-        let mut run = load_run(state, run_id).await?;
+        let prepared = prepare_stage_for_execution(
+            state,
+            run_id,
+            requested.take().as_deref(),
+            mode,
+        ).await?;
+        let mut run = prepared.run;
+        let step = prepared.step;
         let definition = load_template_definition(state, &run).await?
             .ok_or_else(|| anyhow!("run has no template definition"))?;
 
-        let step = current_step(&definition, &run, requested.take().as_deref())?.clone();
-
-        set_run_status(state, run_id, RunStatus::Running, Some(step.id.as_str())).await?;
+        if let Some(message) = prepared.pause_message {
+            return Ok(json!({
+                "ok": false,
+                "status": "waiting",
+                "current_step_id": step.id,
+                "message": message,
+                "disposition": "paused"
+            }));
+        }
 
         activate_next_prompt_fragments_for_stage(&mut run);
         let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
@@ -245,11 +706,45 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 "disposition": format_disposition(&outcome.disposition),
                 "capability_results": outcome.capability_results,
                 "local_state": outcome.local_state,
+                "final_context": run.context.clone(),
             }),
         ).await?;
 
+        clear_pending_disposition_review(&mut run);
         let next_target = resolve_next_target(&definition, &step, &outcome);
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
+        if automatic && stage_disposition_review_enabled(&step, &outcome) {
+            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone());
+            persist_context(state, run_id, &run.context).await?;
+            set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "info",
+                "workflow_waiting_for_disposition_review",
+                "Workflow automation is waiting for operator disposition review.",
+                json!({
+                    "stage_id": step.id,
+                    "stage_type": step.step_type,
+                    "recommended_disposition": format_disposition(&outcome.disposition),
+                    "available_dispositions": disposition_review_options(&step, &outcome),
+                    "next_step_id": next_target.clone(),
+                    "resume_mode": "autonomous",
+                }),
+            ).await?;
+            return Ok(json!({
+                "ok": outcome.ok,
+                "status": "waiting",
+                "blocked_on": "disposition_review",
+                "step_id": step.id,
+                "next_step_id": next_target,
+                "message": outcome.message,
+                "disposition": format_disposition(&outcome.disposition),
+                "capability_results": outcome.capability_results,
+                "local_state": outcome.local_state,
+            }));
+        }
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
             clear_run_pause_requested(&mut run);

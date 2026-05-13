@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     ensure_governance_slots, signals, CapabilityInjection, ContextMutation, GovernanceContext,
-    GovernanceDecision, GovernanceHook, GovernanceScope,
+    GovernanceDecision, GovernanceScope,
 };
 
 pub async fn before_stage(
@@ -178,10 +178,59 @@ pub fn injected_capabilities(decisions: &[GovernanceDecision]) -> Vec<Capability
 }
 
 fn evaluate_inference_stage_bootstrap(
-    _run: &WorkflowRun,
-    _step: &WorkflowStepDefinition,
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
 ) -> Vec<GovernanceDecision> {
-    Vec::new()
+    let workflow_engine = run
+        .context
+        .get("workflow_engine")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let global_state = workflow_engine
+        .get("global_state")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let mut inference_patch = Map::new();
+    let mut planner_patch = Map::new();
+
+    if shared_single_use_capability_should_bootstrap(&global_state, step, "repo_context") {
+        inference_patch.insert("repo_context_armed".to_string(), Value::Bool(true));
+    }
+
+    if shared_single_use_capability_should_bootstrap(&global_state, step, "changeset_schema") {
+        inference_patch.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    }
+
+    if shared_single_use_capability_should_bootstrap(&global_state, step, "planner_fragment")
+        && global_state
+            .get("capabilities")
+            .and_then(|v| v.get("planner"))
+            .is_some()
+    {
+        planner_patch.insert("fragment_armed".to_string(), Value::Bool(true));
+    }
+
+    if inference_patch.is_empty() && planner_patch.is_empty() {
+        return Vec::new();
+    }
+
+    let mut capabilities_patch = Map::new();
+    if !inference_patch.is_empty() {
+        capabilities_patch.insert("inference".to_string(), Value::Object(inference_patch));
+    }
+    if !planner_patch.is_empty() {
+        capabilities_patch.insert("planner".to_string(), Value::Object(planner_patch));
+    }
+
+    vec![GovernanceDecision::MutateContext {
+        mutation: ContextMutation {
+            scope: GovernanceScope::Global,
+            patch: json!({
+                "capabilities": Value::Object(capabilities_patch)
+            }),
+        },
+    }]
 }
 
 fn evaluate_inference_stage_consumption(
@@ -200,6 +249,7 @@ fn evaluate_inference_stage_consumption(
 
     let mut inference_patch = Map::new();
     let mut context_export_patch = Map::new();
+    let mut planner_patch = Map::new();
 
     if shared_single_use_capability_should_clear(&global_state, step, "repo_context") {
         inference_patch.insert("repo_context_armed".to_string(), Value::Bool(false));
@@ -210,7 +260,11 @@ fn evaluate_inference_stage_consumption(
         inference_patch.insert("changeset_schema_armed".to_string(), Value::Bool(false));
     }
 
-    if inference_patch.is_empty() && context_export_patch.is_empty() {
+    if shared_single_use_capability_should_clear(&global_state, step, "planner_fragment") {
+        planner_patch.insert("fragment_armed".to_string(), Value::Bool(false));
+    }
+
+    if inference_patch.is_empty() && context_export_patch.is_empty() && planner_patch.is_empty() {
         return Vec::new();
     }
 
@@ -220,6 +274,9 @@ fn evaluate_inference_stage_consumption(
     }
     if !context_export_patch.is_empty() {
         capabilities_patch.insert("context_export".to_string(), Value::Object(context_export_patch));
+    }
+    if !planner_patch.is_empty() {
+        capabilities_patch.insert("planner".to_string(), Value::Object(planner_patch));
     }
 
     vec![GovernanceDecision::MutateContext {
@@ -240,6 +297,43 @@ fn has_stage_inference_flag(stage_state: &Value, key: &str) -> bool {
         .and_then(|v| v.get(key))
         .and_then(|v| v.get("enabled"))
         .is_some()
+}
+
+fn shared_single_use_capability_has_explicit_state(global_state: &Value, primitive_key: &str) -> bool {
+    match primitive_key {
+        "repo_context" => global_state
+            .get("capabilities")
+            .and_then(|v| v.get("inference"))
+            .and_then(|v| v.get("repo_context_armed"))
+            .and_then(Value::as_bool)
+            .is_some(),
+        "changeset_schema" => global_state
+            .get("capabilities")
+            .and_then(|v| v.get("inference"))
+            .and_then(|v| v.get("changeset_schema_armed"))
+            .and_then(Value::as_bool)
+            .is_some(),
+        "planner_fragment" => global_state
+            .get("capabilities")
+            .and_then(|v| v.get("planner"))
+            .and_then(|v| v.get("fragment_armed"))
+            .and_then(Value::as_bool)
+            .is_some(),
+        _ => false,
+    }
+}
+
+fn shared_single_use_capability_should_bootstrap(
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+    primitive_key: &str,
+) -> bool {
+    binding_specs::stage_supports_shared_capability(step, primitive_key)
+        && !shared_single_use_capability_has_explicit_state(global_state, primitive_key)
+        && matches!(
+            binding_specs::shared_capability_lifecycle(primitive_key),
+            binding_specs::SharedCapabilityLifecycle::SingleUseGlobal
+        )
 }
 
 fn shared_single_use_capability_should_clear(

@@ -588,7 +588,14 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
         },
         config: json!({}),
         capabilities: Vec::<WorkflowCapabilityBinding>::new(),
-        execution_logic: json!({}),
+        execution_logic: json!({
+            "automation": {
+                "disposition_review": {
+                    "enabled": false,
+                    "available_dispositions": ["move_next", "pause"]
+                }
+            }
+        }),
         execution_plan: Vec::<StageExecutionNode>::new(),
         transitions: Vec::<WorkflowTransition>::new(),
         advancement: WorkflowStepAdvancementConfig {
@@ -606,7 +613,7 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
 }
 
 fn design_descriptor() -> WorkflowStageDescriptor {
-    let mut template = base_stage_template("design", "Design", AutomationMode::Manual);
+    let mut template = base_stage_template("design", "Design", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: true,
         include_changeset_schema: false,
@@ -621,12 +628,26 @@ fn design_descriptor() -> WorkflowStageDescriptor {
                 "repo_context": {}
             }
         },
+        "automation": {
+            "disposition_review": {
+                "enabled": true,
+                "available_dispositions": ["move_next", "pause"]
+            }
+        },
         "structured_output": {
             "fine_feature_format_armed": false,
             "auto_normalize_and_apply_to_planner": false,
             "preserve_rough_definition": true,
             "schema_id": "supervisor_feature_plan_item_v1",
             "apply_handler": "supervisor_planner_item"
+        },
+        "on_success": {
+            "disposition": "move_next",
+            "message": "Design stage completed successfully through backend workflow engine."
+        },
+        "on_error": {
+            "disposition": "stay",
+            "message": "Design stage failed during backend workflow execution."
         }
     });
     template.execution_plan = vec![

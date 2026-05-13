@@ -191,19 +191,6 @@ pub async fn execute_stage(
     )
     .await?;
 
-    let before_decisions = governance::before_stage(state, run_id, run, step).await?;
-    governance::apply_context_mutations(run, &before_decisions, Some(step.id.as_str()), None)?;
-    if let Some(message) = governance::pause_message(&before_decisions) {
-        persist_context(state, run_id, &run.context).await?;
-        return Ok(StageOutcome {
-            ok: false,
-            disposition: StageDisposition::Paused,
-            message,
-            capability_results: Vec::new(),
-            local_state: json!({}),
-        });
-    }
-
     let supervisor_context = run.context.get("supervisor").cloned();
     let root = ensure_engine_root(&mut run.context);
     let mut global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
