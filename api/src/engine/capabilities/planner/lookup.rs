@@ -354,22 +354,7 @@ fn existing_planner_fragment_is_populated(global_state: &Value) -> bool {
         .filter(|value| !value.trim().is_empty())
         .is_some();
 
-    if !has_selected_feature_id {
-        return false;
-    }
-
-    planner
-        .get("fragment_armed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || planner
-            .get("schema_armed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || planner
-            .get("auto_apply_armed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    has_selected_feature_id
 }
 
 fn ensure_object_field<'a>(root: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {

@@ -22,6 +22,7 @@ env:
   WORKFLOW_WEB_PORT: 5173
   WORKFLOW_BROWSER_CDP_HOST: 127.0.0.1
   WORKFLOW_BROWSER_CDP_PORT: 9222
+  PLAYWRIGHT_BROWSERS_PATH: dist/playwright-browsers
 
 jobs:
   verify-ci:
@@ -72,6 +73,9 @@ jobs:
       - name: Build Node workspaces
         run: npx turbo build
 
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
       - name: Build Rust app
         working-directory: api
         run: cargo build --release
@@ -103,7 +107,12 @@ jobs:
           cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
           cp -R web/dist/. "$MACOS_DIR/web/dist/"
 
+          mkdir -p "$MACOS_DIR/browsers"
+          cp -R dist/playwright-browsers/. "$MACOS_DIR/browsers/"
+          cp -R node_modules "$MACOS_DIR/node_modules"
+
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
+          find "$MACOS_DIR/browsers" -type f \( -name chrome -o -name Chromium \) -exec chmod +x {} \;
 
           export APP_ROOT VERSION
           python3 - <<'PY'
@@ -176,6 +185,9 @@ jobs:
       - name: Build Node workspaces
         run: npx turbo build
 
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
       - name: Build Rust app
         working-directory: api
         run: cargo build --release
@@ -207,7 +219,12 @@ jobs:
           cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
           cp -R web/dist/. "$MACOS_DIR/web/dist/"
 
+          mkdir -p "$MACOS_DIR/browsers"
+          cp -R dist/playwright-browsers/. "$MACOS_DIR/browsers/"
+          cp -R node_modules "$MACOS_DIR/node_modules"
+
           chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
+          find "$MACOS_DIR/browsers" -type f \( -name chrome -o -name Chromium \) -exec chmod +x {} \;
 
           export APP_ROOT VERSION
           python3 - <<'PY'
@@ -280,6 +297,9 @@ jobs:
       - name: Build Node workspaces
         run: npx turbo build
 
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
       - name: Build Rust app
         working-directory: api
         run: cargo build --release
@@ -313,7 +333,12 @@ jobs:
           cp -R adt-bridge/dist/. "$APPDIR/adt-bridge/dist/"
           cp -R web/dist/. "$APPDIR/web/dist/"
 
+          mkdir -p "$APPDIR/browsers"
+          cp -R dist/playwright-browsers/. "$APPDIR/browsers/"
+          cp -R node_modules "$APPDIR/node_modules"
+
           chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
+          find "$APPDIR/browsers" -type f -name chrome -exec chmod +x {} \;
           ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
 
           export ROOT VERSION APP_NAME
@@ -369,6 +394,9 @@ jobs:
       - name: Build Node workspaces
         run: npx turbo build
 
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
       - name: Build Rust app
         working-directory: api
         run: cargo build --release
@@ -389,6 +417,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$root/bridge/dist" | Out-Null
           New-Item -ItemType Directory -Force -Path "$root/adt-bridge/dist" | Out-Null
           New-Item -ItemType Directory -Force -Path "$root/web/dist" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root/browsers" | Out-Null
 
           Copy-Item "api/target/release/$env:CARGO_BIN_NAME.exe" "$root/$env:APP_NAME.exe"
           Copy-Item "node-dist/node-v$env:NODE_VERSION-win-x64/node.exe" "$root/runtime/node.exe"
@@ -396,6 +425,8 @@ jobs:
           Copy-Item "bridge/dist/*" "$root/bridge/dist/" -Recurse
           Copy-Item "adt-bridge/dist/*" "$root/adt-bridge/dist/" -Recurse
           Copy-Item "web/dist/*" "$root/web/dist/" -Recurse
+          Copy-Item "dist/playwright-browsers/*" "$root/browsers/" -Recurse
+          Copy-Item "node_modules" "$root/node_modules" -Recurse
 
       - name: Install Inno Setup
         shell: pwsh

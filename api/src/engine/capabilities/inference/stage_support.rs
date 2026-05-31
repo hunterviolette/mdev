@@ -69,7 +69,12 @@ pub fn prepare_inference_stage_state(
             .remove("user_input");
     }
 
-    let include_planning_fragment = planner::planner_fragment_enabled(global_state, step);
+    let include_planning_fragment = shared_inference_primitive_enabled(
+        global_state,
+        step,
+        "planner_fragment",
+        false,
+    ) && planner::planner_fragment_enabled(global_state, step);
     let planning_fragment = if include_planning_fragment {
         planner::build_planning_fragment(global_state)
     } else {
@@ -268,10 +273,18 @@ pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("/tmp/repo_context.txt");
+    let inline = repo_context
+        .get("inline_repo_context_in_prompt")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    format!(
-        "Repo context is attached as a file generated from backend export ({save_path}). Use the uploaded attachment as repository context."
-    )
+    if inline {
+        "Repo context is included inline under ### REPO CONTEXT in this prompt. Use it as repository context.".to_string()
+    } else {
+        format!(
+            "Repo context is attached as a file generated from backend export ({save_path}). Use the uploaded attachment as repository context."
+        )
+    }
 }
 
 fn shared_inference_primitive_enabled(

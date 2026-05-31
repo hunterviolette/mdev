@@ -136,7 +136,7 @@ pub fn reset_session_scoped_shared_capability_lifecycle(run: &mut WorkflowRun) {
         .or_insert_with(|| json!({}));
     let capabilities_obj = ensure_object(capabilities);
 
-    for primitive_key in ["repo_context", "changeset_schema", "planner_fragment"] {
+    for primitive_key in ["repo_context", "changeset_schema"] {
         if !matches!(
             binding_specs::shared_capability_lifecycle(primitive_key),
             binding_specs::SharedCapabilityLifecycle::SingleUseGlobal
@@ -146,4 +146,6 @@ pub fn reset_session_scoped_shared_capability_lifecycle(run: &mut WorkflowRun) {
 
         set_shared_capability_enabled(capabilities_obj, primitive_key, None);
     }
+
+    set_shared_capability_enabled(capabilities_obj, "planner_fragment", Some(false));
 }

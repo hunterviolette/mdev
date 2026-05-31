@@ -467,6 +467,21 @@ export class SessionManager {
     await page.keyboard.insertText(text);
   }
 
+  private async appendChatComposerText(page: Page, composer: Locator, text: string): Promise<void> {
+    await composer.click({ timeout: 20000 });
+    const spacer = text.startsWith('\n') ? '' : '\n\n';
+    await page.keyboard.insertText(spacer + text);
+  }
+
+  private async pasteLargeContextAsClipboardText(page: Page, composer: Locator, text: string): Promise<void> {
+    await composer.click({ timeout: 20000 });
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+    await page.evaluate(async (value) => {
+      await navigator.clipboard.writeText(value);
+    }, text);
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V');
+  }
+
   async sendChat(cmd: SendChatCommand) {
     const state = this.getSession(cmd.session_id);
     state.responseTimeoutMs = undefined;
@@ -477,16 +492,25 @@ export class SessionManager {
     if (state.pendingUploads.length > 0) {
       const uploadReady = await this.waitForPendingUploads(state, Math.min(timeout, 45000));
       if (!uploadReady) {
-        throw new Error(`Upload did not finish before send_chat for session ${state.sessionId}: ${state.pendingUploads.join(', ')}`);
+        const blockedUploads = state.pendingUploads.join(', ');
+        state.pendingUploads = [];
+        throw new Error(`Upload did not finish before send_chat for session ${state.sessionId}: ${blockedUploads}`);
       }
     }
 
     const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
+    const pastedContext = Boolean(cmd.pasted_context_text?.trim());
 
-    await this.writeChatComposerText(state.page, composer, cmd.text);
+    if (pastedContext) {
+      await this.pasteLargeContextAsClipboardText(state.page, composer, cmd.pasted_context_text ?? '');
+      await state.page.waitForTimeout(15000);
+      await this.appendChatComposerText(state.page, composer, cmd.text);
+    } else {
+      await this.writeChatComposerText(state.page, composer, cmd.text);
+    }
 
     const beforeSendText = await this.readComposerText(composer);
-    if (beforeSendText.length === 0) {
+    if (beforeSendText.length === 0 && !pastedContext) {
       return {
         session_id: state.sessionId,
         sent: false,

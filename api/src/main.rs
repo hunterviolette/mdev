@@ -6,7 +6,7 @@ mod supervisor;
 mod runtime_env;
 mod routes;
 
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
 
 use anyhow::Context;
 use dotenvy::dotenv;
@@ -31,14 +31,13 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let cwd = env::current_dir().context("failed to determine current directory")?;
-    let repo_root = detect_repo_root(&cwd).context("failed to locate repo root containing web/ and api/")?;
-    let _ = dotenvy::from_path(repo_root.join(".env"));
+    let layout = runtime_layout()?;
+    load_runtime_env(&layout.app_root);
 
-    let data_dir = repo_root.join(".data");
-    fs::create_dir_all(&data_dir).context("failed to create .data directory")?;
+    fs::create_dir_all(&layout.data_dir)
+        .with_context(|| format!("failed to create data directory {}", layout.data_dir.display()))?;
 
-    let db_path = data_dir.join("workflow.db");
+    let db_path = layout.data_dir.join("workflow.db");
     let db_url = format!("sqlite://{}", db_path.to_string_lossy().replace('\\', "/"));
 
     let db = db::connect(&db_url).await?;
@@ -46,13 +45,22 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db);
 
-    let web_dist = repo_root.join("web").join("dist");
-    let app = build_router(state, &web_dist);
+    let app = build_router(state, &layout.web_dist);
 
     let addr = crate::runtime_env::workflow_api_bind_addr()?;
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, web_dist = %web_dist.display(), "workflow api listening");
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::AddrInUse => {
+            tracing::info!(%addr, "mdev api already running; opening existing web ui");
+            open_mdev_web_ui(addr);
+            return Ok(());
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to bind workflow api to {addr}")),
+    };
+
+    tracing::info!(%addr, web_dist = %layout.web_dist.display(), data_dir = %layout.data_dir.display(), "workflow api listening");
+    open_mdev_web_ui(addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -75,6 +83,127 @@ fn build_router(state: AppState, web_dist: &Path) -> Router {
     } else {
         tracing::warn!(path = %web_dist.display(), "web/dist not found; serving backend routes only");
         api
+    }
+}
+
+struct RuntimeLayout {
+    app_root: PathBuf,
+    data_dir: PathBuf,
+    web_dist: PathBuf,
+}
+
+fn load_runtime_env(app_root: &Path) {
+    let env_path = app_root.join(".env");
+    if env_path.exists() {
+        let _ = dotenvy::from_path(env_path);
+        return;
+    }
+
+    let example_path = app_root.join(".env.example");
+    if example_path.exists() {
+        let _ = dotenvy::from_path(example_path);
+    }
+}
+
+fn runtime_layout() -> anyhow::Result<RuntimeLayout> {
+    let cwd = env::current_dir().context("failed to determine current directory")?;
+    if let Some(repo_root) = detect_repo_root(&cwd) {
+        return Ok(RuntimeLayout {
+            app_root: repo_root.clone(),
+            data_dir: repo_root.join(".data"),
+            web_dist: repo_root.join("web").join("dist"),
+        });
+    }
+
+    let exe = env::current_exe().context("failed to determine executable path")?;
+    let app_root = exe
+        .parent()
+        .context("executable has no parent directory")?
+        .to_path_buf();
+
+    Ok(RuntimeLayout {
+        web_dist: app_root.join("web").join("dist"),
+        data_dir: mdev_data_dir(&app_root),
+        app_root,
+    })
+}
+
+fn mdev_data_dir(app_root: &Path) -> PathBuf {
+    if let Ok(value) = env::var("MDEV_DATA_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(value) = env::var("LOCALAPPDATA") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(value) = env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("Library").join("Application Support").join("mdev");
+            }
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Ok(value) = env::var("XDG_DATA_HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+        if let Ok(value) = env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join(".local").join("share").join("mdev");
+            }
+        }
+    }
+
+    app_root.join(".data")
+}
+
+fn open_mdev_web_ui(addr: std::net::SocketAddr) {
+    if env::var("MDEV_NO_BROWSER_OPEN").ok().as_deref() == Some("1") {
+        return;
+    }
+
+    let url = format!("http://{}", addr);
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", &url]);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut command = Command::new("open");
+        command.arg(&url);
+        command
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut cmd = {
+        let mut command = Command::new("xdg-open");
+        command.arg(&url);
+        command
+    };
+
+    if let Err(err) = cmd.spawn() {
+        tracing::warn!(url = %url, error = %format!("{:#}", err), "failed to open mdev web ui");
     }
 }
 

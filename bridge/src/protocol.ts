@@ -49,6 +49,7 @@ export type SendChatCommand = {
   cmd: "send_chat";
   session_id: string;
   text: string;
+  pasted_context_text?: string;
   input_selector?: string;
   submit_selector?: string;
   timeout_ms?: number;

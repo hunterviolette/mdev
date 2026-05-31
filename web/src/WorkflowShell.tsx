@@ -562,10 +562,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const plannerCapabilityState = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
   const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
   const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
-  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed);
-  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed);
+  const selectedPlannerFeatureId = typeof plannerCapabilityState.selected_feature_id === 'string' && plannerCapabilityState.selected_feature_id.trim()
+    ? plannerCapabilityState.selected_feature_id
+    : null;
+  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed && selectedPlannerFeatureId);
+  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed && selectedPlannerFeatureId);
   const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
-  const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed);
+  const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
 
   useEffect(() => {
     setPlannerSchemaArmedDraft(null);
@@ -611,13 +614,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     if (hasBackendPlanningFragment) {
       actions.push({
         key: 'planning_fragment',
-        label: 'Planning fragment',
+        label: 'Planner fragment',
         buttonLabel: 'Configure',
         onOpen: onOpenPlannerFragmentConfig,
         toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
         toggleColor: planningFragmentArmed ? 'orange' : 'green',
         onToggle: onTogglePlanningFragment,
-        helperText: 'Select a planner feature to inject into the next prompt.'
+        helperText: 'Injects the selected planner feature into the next prompt.'
       });
     }
 
@@ -633,12 +636,12 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           setPlannerSchemaArmedDraft(next);
           onPatchSelectedStepConfig('capabilities.planner.schema_armed', next);
         },
-        helperText: 'Require model output in the supervisor planner schema.'
+        helperText: 'Inject planner schema into the next prompt.'
       });
 
       actions.push({
         key: 'planner_auto_apply',
-        label: 'Planner auto apply',
+        label: 'Planner apply',
         buttonLabel: '',
         toggleLabel: autoNormalizeAndApplyToPlanner ? 'Disarm' : 'Arm',
         toggleColor: autoNormalizeAndApplyToPlanner ? 'orange' : 'green',
@@ -698,6 +701,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     planningFragmentArmed,
     onTogglePlanningFragment,
     onOpenPlannerFragmentConfig,
+    selectedPlannerFeatureId,
     usesInference,
     designMode,
     fineFeatureFormatArmed,
@@ -1269,34 +1273,10 @@ export function WorkflowShell() {
         }
       });
     } else if (bindTo === 'capabilities.planner.schema_armed' || bindTo === 'capabilities.planner.auto_apply_armed') {
-      const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
-      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      const currentPlanner = (currentCapabilities.planner as Record<string, unknown> | undefined) ?? {};
-      const plannerSchemaArmed = bindTo === 'capabilities.planner.schema_armed'
-        ? Boolean(value)
-        : Boolean(currentPlanner.schema_armed);
-      const plannerAutoApply = bindTo === 'capabilities.planner.auto_apply_armed'
-        ? Boolean(value)
-        : Boolean(currentPlanner.auto_apply_armed);
-
-      void (async () => {
-        await patchWorkflowGlobalState(selectedRunId, {
-          ...currentGlobalState,
-          capabilities: {
-            ...currentCapabilities,
-            planner: {
-              ...currentPlanner,
-              schema_armed: plannerSchemaArmed,
-              auto_apply_armed: plannerAutoApply,
-              selected_feature_id: currentPlanner.selected_feature_id ?? selectedPlannerFeatureId ?? null,
-              supervisor_run_id: currentPlanner.supervisor_run_id ?? plannerSupervisorRunId,
-              schema_id: 'supervisor_feature_plan_item_v1',
-              preserve_rough_definition: true
-            }
-          }
-        });
-        await refreshRunDetails(selectedRunId);
-      })();
+      const plannerKey = bindTo === 'capabilities.planner.schema_armed' ? 'schema_armed' : 'auto_apply_armed';
+      void patchPlannerCapabilityState({
+        [plannerKey]: Boolean(value)
+      });
       return;
     } else if (bindTo === 'execution_logic.automation.inject_context') {
       setStageIncludeRepoContext(Boolean(value));
@@ -1397,6 +1377,7 @@ export function WorkflowShell() {
   const [stageRepoContextSkipGitignore, setStageRepoContextSkipGitignore] = useState(true);
   const [stageRepoContextIncludeStagedDiff, setStageRepoContextIncludeStagedDiff] = useState(false);
   const [stageRepoContextIncludeUnstagedDiff, setStageRepoContextIncludeUnstagedDiff] = useState(false);
+  const [stageRepoContextInlinePrompt, setStageRepoContextInlinePrompt] = useState(false);
   const [stageIncludeChangesetSchema, setStageIncludeChangesetSchema] = useState(true);
   const [stageChangesetSchemaText, setStageChangesetSchemaText] = useState('');
   const [stageApplyError, setStageApplyError] = useState('');
@@ -1705,8 +1686,8 @@ export function WorkflowShell() {
 
     if (preparedStepId && preparedStepId === selectedRunStepId && preparedInference) {
       return {
-        ...(inference ?? {}),
         ...preparedInference,
+        ...(inference ?? {}),
         last_prepared_stage: lastPreparedStage
       };
     }
@@ -2227,6 +2208,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
+    setStageRepoContextInlinePrompt(Boolean(repoContext.inline_repo_context_in_prompt));
   }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
 
   function buildInteractiveGlobalStatePayload() {
@@ -2310,7 +2292,8 @@ export function WorkflowShell() {
           skip_binary: stageRepoContextSkipBinary,
           skip_gitignore: stageRepoContextSkipGitignore,
           include_staged_diff: stageRepoContextIncludeStagedDiff,
-          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
+          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+          inline_repo_context_in_prompt: stageRepoContextInlinePrompt
         },
         changeset_schema: {
           ...currentChangesetSchema,
@@ -3203,6 +3186,31 @@ export function WorkflowShell() {
     await refreshRunDetails(selectedRun.id);
   }
 
+  async function patchPlannerCapabilityState(patch: Record<string, unknown>) {
+    if (!selectedRun?.id) return;
+    const currentPlanner = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
+    const nextSelectedFeatureId = Object.prototype.hasOwnProperty.call(patch, 'selected_feature_id')
+      ? patch.selected_feature_id
+      : currentPlanner.selected_feature_id ?? selectedPlannerFeatureId ?? null;
+    const normalizedSelectedFeatureId = typeof nextSelectedFeatureId === 'string' && nextSelectedFeatureId.trim()
+      ? nextSelectedFeatureId
+      : null;
+
+    await patchGlobalCapabilityState({
+      capabilities: {
+        planner: {
+          ...currentPlanner,
+          ...patch,
+          fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && normalizedSelectedFeatureId),
+          selected_feature_id: normalizedSelectedFeatureId,
+          supervisor_run_id: patch.supervisor_run_id ?? currentPlanner.supervisor_run_id ?? plannerSupervisorRunId,
+          schema_id: 'supervisor_feature_plan_item_v1',
+          preserve_rough_definition: true
+        }
+      }
+    });
+  }
+
   function loadBuilderRepoContextConfig() {
     const globals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
     const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
@@ -3231,6 +3239,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof contextExport.skip_gitignore === 'boolean' ? contextExport.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(contextExport.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(contextExport.include_unstaged_diff));
+    setStageRepoContextInlinePrompt(Boolean(contextExport.inline_repo_context_in_prompt));
   }
 
   function loadBuilderChangesetSchemaConfig() {
@@ -4326,20 +4335,16 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
   async function onTogglePlanningFragment() {
     if (!selectedRun?.id) return;
-    const nextEnabled = !Boolean(sharedPlannerFragmentState?.fragment_armed);
-    const plannerPatch: Record<string, unknown> = {
-      ...((sharedPlannerFragmentState ?? {}) as Record<string, unknown>),
+    const nextEnabled = !Boolean(sharedPlannerFragmentState?.fragment_armed && selectedPlannerFeatureId);
+    if (nextEnabled && !selectedPlannerFeatureId) {
+      setPlannerFragmentConfigOpen(true);
+      return;
+    }
+    await patchPlannerCapabilityState({
       fragment_armed: nextEnabled,
       selected_feature_id: selectedPlannerFeatureId ?? null,
       selected_feature: nextEnabled ? selectedPlannerFeature : null,
-      supervisor_run_id: plannerSupervisorRunId,
-      schema_id: 'supervisor_feature_plan_item_v1',
-      preserve_rough_definition: true
-    };
-    await patchGlobalCapabilityState({
-      capabilities: {
-        planner: plannerPatch
-      }
+      supervisor_run_id: plannerSupervisorRunId
     });
   }
 
@@ -4349,18 +4354,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     const selectedFeature = featureId
       ? plannerFeatureItems.find((item) => item.id === featureId) ?? null
       : null;
-    await patchGlobalCapabilityState({
-      capabilities: {
-        planner: {
-          ...((sharedPlannerFragmentState ?? {}) as Record<string, unknown>),
-          fragment_armed: Boolean(featureId),
-          selected_feature_id: featureId,
-          selected_feature: selectedFeature,
-          supervisor_run_id: plannerSupervisorRunId,
-          schema_id: 'supervisor_feature_plan_item_v1',
-          preserve_rough_definition: true
-        }
-      }
+    await patchPlannerCapabilityState({
+      fragment_armed: Boolean(featureId),
+      selected_feature_id: featureId,
+      selected_feature: selectedFeature,
+      supervisor_run_id: plannerSupervisorRunId
     });
     setPlannerFragmentConfigOpen(false);
   }
@@ -4605,6 +4603,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         skip_gitignore: stageRepoContextSkipGitignore,
         include_staged_diff: stageRepoContextIncludeStagedDiff,
         include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+        inline_repo_context_in_prompt: stageRepoContextInlinePrompt,
       });
       syncRepoSelectionState(includeFiles);
       setRepoContextConfigOpen(false);
@@ -5458,6 +5457,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(e) => setStageRepoContextSkipGitignore(e.currentTarget.checked)} />
               <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(e) => setStageRepoContextIncludeStagedDiff(e.currentTarget.checked)} />
               <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(e) => setStageRepoContextIncludeUnstagedDiff(e.currentTarget.checked)} />
+              <Switch label="Inline repo context in prompt instead of uploading attachment" checked={stageRepoContextInlinePrompt} onChange={(e) => setStageRepoContextInlinePrompt(e.currentTarget.checked)} />
             </SimpleGrid>
             <Group justify="space-between">
               <Group>
@@ -5527,7 +5527,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         <Modal
           opened={plannerFragmentConfigOpen}
           onClose={() => setPlannerFragmentConfigOpen(false)}
-          title="Planning fragment"
+          title="Planner Fragment"
           size="calc(100vw - 96px)"
           centered
           zIndex={300}

@@ -8,7 +8,7 @@ use sqlx::Row;
 
 use super::{ensure_object_slot, persist_inference_config, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
 use super::super::registry::{find_result, CapabilityContext, CapabilityResult};
-use crate::engine::capabilities::binding_specs;
+use crate::engine::capabilities::{binding_specs, context_export};
 
 fn is_stale_session_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err).to_ascii_lowercase();
@@ -186,6 +186,46 @@ fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[Capabil
     Ok(uploads)
 }
 
+fn repo_context_inline_prompt_enabled(ctx: &CapabilityContext<'_>) -> bool {
+    if !repo_context_upload_enabled(ctx) {
+        return false;
+    }
+
+    ctx.local_state
+        .get("repo_context")
+        .and_then(|v| v.get("inline_repo_context_in_prompt"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            ctx.local_state
+                .get("capabilities")
+                .and_then(|v| v.get("context_export"))
+                .and_then(|v| v.get("inline_repo_context_in_prompt"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn repo_context_payload(ctx: &CapabilityContext<'_>) -> Option<Value> {
+    ctx.local_state.get("repo_context").cloned().or_else(|| {
+        ctx.local_state
+            .get("capabilities")
+            .and_then(|v| v.get("context_export"))
+            .cloned()
+    })
+}
+
+fn append_repo_context_prompt(prompt: &mut String, context_text: &str) {
+    prompt.push_str("\n\n### REPO CONTEXT\n");
+    prompt.push_str("Repository context is included inline below.\n\n");
+    prompt.push_str("```text\n");
+    prompt.push_str(context_text);
+    if !context_text.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("```");
+}
+
+
 async fn load_app_settings_value(ctx: &CapabilityContext<'_>) -> Result<Value> {
     let row = sqlx::query("SELECT settings_json FROM app_settings WHERE id = ?")
         .bind("global")
@@ -309,8 +349,24 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         }));
     }
 
-    let upload_paths = dependency_upload_paths(ctx, prior_results)?;
+    let inline_repo_context = repo_context_inline_prompt_enabled(ctx);
+    let pasted_context_text = if inline_repo_context {
+        match repo_context_payload(ctx) {
+            Some(payload) => Some(context_export::render_context_export_text(payload)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let pasted_context_enabled = pasted_context_text.is_some();
+
+    let upload_paths = if pasted_context_enabled {
+        Vec::new()
+    } else {
+        dependency_upload_paths(ctx, prior_results)?
+    };
     let mut uploaded_files = Vec::new();
+
     for upload_path in upload_paths.iter() {
         if upload_path.exists() {
             adapter::upload_file(&mut inference_cfg.browser, upload_path.as_path())?;
@@ -318,7 +374,11 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         }
     }
 
-    let result = adapter::send_chat_and_wait(&mut inference_cfg.browser, &prompt)?;
+    let result = adapter::send_chat_and_wait_with_pasted_context(
+        &mut inference_cfg.browser,
+        &prompt,
+        pasted_context_text.as_deref(),
+    )?;
     persist_inference_config(ctx, &inference_cfg).await?;
 
     let probe = match adapter::probe(&mut inference_cfg.browser) {
@@ -359,6 +419,7 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         "browser_session_id": result.browser_session_id,
         "probe": probe,
         "uploaded_files": uploaded_files,
+        "repo_context_inline_prompt": inline_repo_context,
         "send": bridge_result.get("send").cloned().unwrap_or(Value::Null),
         "read": bridge_result.get("read").cloned().unwrap_or(Value::Null)
     }))
