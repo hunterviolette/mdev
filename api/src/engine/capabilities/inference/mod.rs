@@ -1,5 +1,7 @@
 pub mod api;
 pub mod browser;
+pub mod panel;
+pub mod session;
 pub mod stage_support;
 
 use anyhow::Result;
@@ -80,10 +82,16 @@ impl Default for BrowserConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
     pub transport: InferenceTransport,
+    #[serde(default)]
+    pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub runtime: Value,
     #[serde(default)]
     pub browser: BrowserConfig,
 }
@@ -92,8 +100,11 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             transport: InferenceTransport::Api,
+            provider: "openai".to_string(),
             model: default_model(),
+            endpoint: String::new(),
             conversation_id: None,
+            runtime: json!({}),
             browser: BrowserConfig::default(),
         }
     }
@@ -123,32 +134,7 @@ pub struct BrowserProbeResult {
     pub ready: bool,
 }
 
-pub async fn persist_inference_config(ctx: &CapabilityContext<'_>, cfg: &InferenceConfig) -> Result<()> {
-    let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    let root = crate::engine::ensure_engine_root(&mut run.context);
-    let global_state = ensure_object_slot(root, "global_state");
-    let capabilities = ensure_object_slot(global_state, "capabilities");
-
-    let existing_inference = capabilities
-        .get("inference")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let next_inference = serde_json::to_value(cfg)?;
-
-    let mut merged = match existing_inference {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-
-    if let Value::Object(next_map) = next_inference {
-        for (key, value) in next_map {
-            merged.insert(key, value);
-        }
-    }
-
-    capabilities.insert("inference".to_string(), Value::Object(merged));
-    crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
-}
+pub use session::persist_inference_config;
 
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
@@ -156,51 +142,18 @@ pub async fn execute(
     _config: Value,
 ) -> Result<CapabilityResult> {
     let policy = super::registry::stage_capability_policy(ctx.step)?;
-    let include_changeset_schema = ctx
-        .local_state
-        .get("prompt_fragment_enabled")
-        .and_then(|v| v.get("changeset_schema"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let consumed_capabilities = consumed_inference_capabilities(ctx.local_state);
 
     let mut follow_ups = Vec::new();
-    if include_changeset_schema && policy.allowed_invocations.iter().any(|item| *item == "changeset_schema") {
+    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| item == "changeset") {
         follow_ups.push(CapabilityInvocation {
-            capability: "changeset_schema".to_string(),
+            capability: "changeset".to_string(),
             config: json!({}),
         });
     }
 
-    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| item == "gateway_model/changeset") {
-        follow_ups.push(CapabilityInvocation {
-            capability: "gateway_model/changeset".to_string(),
-            config: json!({}),
-        });
-    }
-
-    let runtime_transport = ctx
-        .local_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .or_else(|| ctx.local_state.get("inference").cloned())
-        .and_then(|v| serde_json::from_value::<InferenceConfig>(v).ok())
-        .map(|cfg| cfg.transport);
-
-    let configured_transport = ctx
-        .step
-        .config
-        .get("inference_transport")
-        .and_then(Value::as_str)
-        .and_then(|value| match value {
-            "browser" => Some(InferenceTransport::Browser),
-            "api" => Some(InferenceTransport::Api),
-            _ => None,
-        });
-
-    let selected_transport = runtime_transport
-        .or(configured_transport)
-        .unwrap_or(InferenceTransport::Api);
+    let resolved_session = session::resolve_inference_session(ctx).await?;
+    let selected_transport = resolved_session.config.transport.clone();
 
     let sent_prompt = ctx
         .local_state
@@ -263,6 +216,7 @@ pub async fn execute(
             "message": message,
             "prompt": sent_prompt,
             "result": response,
+            "consumed_capabilities": consumed_capabilities,
         }),
         follow_ups: if capability_ok {
             if follow_ups.is_empty() {
@@ -274,6 +228,49 @@ pub async fn execute(
             CapabilityInvocationRequest::None
         },
     })
+}
+
+fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
+    let enabled = local_state
+        .get("prompt_fragment_enabled")
+        .and_then(Value::as_object);
+
+    let mut consumed = Vec::new();
+
+    if enabled
+        .and_then(|items| items.get("repo_context"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("repo_context".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("changeset_schema"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("changeset_schema".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("planning_fragment"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("planner_fragment".to_string());
+    }
+
+    if local_state
+        .get("transient_prompt_fragments")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+    {
+        consumed.push("prompt_fragments".to_string());
+    }
+
+    consumed
 }
 
 fn default_profile() -> String {

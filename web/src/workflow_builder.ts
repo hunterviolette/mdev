@@ -23,7 +23,7 @@ export function capabilityDisplayLabel(capabilityKey: string): string {
       return 'Context export';
     case 'inference':
       return 'Inference';
-    case 'gateway_model/changeset':
+    case 'changeset':
       return 'ChangeSet apply';
     case 'compile_commands':
       return 'Compile commands';
@@ -101,10 +101,57 @@ export function defaultGlobals(): WorkflowGlobalConfig {
       },
     },
     capabilities: {
+      inference: {
+        default_session: 'coding',
+        stage_sessions: {
+          design: 'coding',
+          code: 'coding',
+          review: 'review',
+        },
+        sessions: {
+          coding: {
+            provider: 'openai',
+            transport: 'api',
+            model: 'gpt-4.1',
+            runtime: {},
+          },
+          review: {
+            provider: 'openai',
+            transport: 'api',
+            model: 'gpt-4.1',
+            runtime: {},
+          },
+        },
+      },
     },
     automation: {
     },
   };
+}
+
+export function inferenceEnabledStageTypes(catalog: WorkflowBuilderCatalog, steps: BuilderStep[]): string[] {
+  const descriptors = descriptorMap(catalog);
+  const seen = new Set<string>();
+
+  for (const step of steps) {
+    const descriptor = descriptors[step.stepType];
+    const capabilities = descriptor?.definition_template?.capabilities ?? [];
+    const executionPlan = descriptor?.definition_template?.execution_plan ?? [];
+    const hasInference = capabilities.some((item) => item.capability === 'inference' && item.enabled !== false)
+      || executionPlan.some((item) => item.kind === 'capability' && item.key === 'inference' && item.enabled !== false);
+
+    if (hasInference) {
+      seen.add(step.stepType);
+    }
+  }
+
+  return Array.from(seen);
+}
+
+export function inferenceSessionNames(globals: WorkflowGlobalConfig): string[] {
+  const inference = (globals.capabilities?.inference ?? {}) as Record<string, unknown>;
+  const sessions = (inference.sessions ?? {}) as Record<string, unknown>;
+  return Object.keys(sessions);
 }
 
 export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig, governance?: WorkflowGovernanceConfig): WorkflowBuilderDocument {

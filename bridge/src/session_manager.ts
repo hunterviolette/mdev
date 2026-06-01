@@ -129,10 +129,10 @@ export class SessionManager {
         throw new Error(`No existing tab matched page_url_contains: ${pageUrlContains}`);
       }
     } else {
-      const pages = context.pages();
-      page = pages[0];
-      if (!page) {
-        throw new Error('No existing page available in persistent browser context');
+      page = await context.newPage();
+      const targetUrl = cmd.url?.trim();
+      if (targetUrl) {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout });
       }
     }
 

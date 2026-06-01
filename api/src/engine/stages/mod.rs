@@ -1,3 +1,4 @@
+pub mod capability_contract;
 mod code_stage;
 mod compile_stage;
 mod design_stage;
@@ -47,6 +48,19 @@ pub struct StageOutcome {
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
+}
+
+pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> capability_contract::StageCapabilities {
+    match step.step_type.as_str() {
+        "code" => code_stage::capabilities(),
+        "compile" => compile_stage::capabilities(),
+        "review" => review_stage::capabilities(),
+        "merge_patches" => merge_patches_stage::capabilities(),
+        "sap_import" => sap_import_stage::capabilities(),
+        "sap_syntax" => sap_syntax_stage::capabilities(),
+        "sap_export" => sap_export_stage::capabilities(),
+        _ => design_stage::capabilities(),
+    }
 }
 
 fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -430,7 +444,7 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
         ("compile", "compile_commands", "compile_error_to_code_prompt") => {
             Some(compile_stage::build_compile_error_patch(capability_results))
         }
-        ("code", "gateway_model/changeset", "apply_error_to_code_prompt") => {
+        ("code", "changeset", "apply_error_to_code_prompt") => {
             Some(code_stage::build_apply_error_patch(capability_results))
         }
         ("sap_syntax", "sap/export", "sap_syntax_success_state") => {
@@ -548,10 +562,17 @@ async fn run_capability_plan(
     Ok(results
         .into_iter()
         .map(|item| {
+            let consumed_capabilities = item
+                .payload
+                .get("consumed_capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+
             json!({
                 "key": item.capability,
                 "ok": item.ok,
-                "result": item.payload
+                "result": item.payload,
+                "consumed_capabilities": consumed_capabilities
             })
         })
         .collect())

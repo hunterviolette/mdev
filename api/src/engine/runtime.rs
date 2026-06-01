@@ -502,7 +502,6 @@ fn format_automation_mode(step: &super::WorkflowStepDefinition) -> &'static str 
 }
 
 fn consume_single_use_inference_arm_state(run: &mut super::WorkflowRun, step: &super::WorkflowStepDefinition) {
-    crate::engine::shared_capability_lifecycle::consume_shared_capabilities_for_step(run, step);
 }
 
 fn run_pause_requested(run: &super::WorkflowRun) -> bool {

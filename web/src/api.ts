@@ -83,6 +83,32 @@ export type WorkflowTemplateDefinition = {
   steps: WorkflowStepDefinition[];
 };
 
+export type InferenceConfigPanelSession = {
+  name: string;
+  transport: 'api' | 'browser' | string;
+  provider?: string | null;
+  model?: string | null;
+  endpoint?: string | null;
+  browser_url?: string | null;
+  is_default: boolean;
+};
+
+export type InferenceConfigPanelStageMapping = {
+  stage_type: string;
+  session: string;
+};
+
+export type InferenceConfigPanel = {
+  sessions: InferenceConfigPanelSession[];
+  stage_mappings: InferenceConfigPanelStageMapping[];
+};
+
+export type InferenceConfigPanelResponse = {
+  ok: boolean;
+  panel: InferenceConfigPanel;
+  inference: Record<string, unknown>;
+};
+
 export type WorkflowStageFieldOption = {
   value: string;
   label: string;
@@ -385,6 +411,17 @@ export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument
   return fetchJson<CompileWorkflowBuilderResponse>('/api/workflow-builder/compile', {
     method: 'POST',
     body: JSON.stringify({ document })
+  });
+}
+
+export function buildWorkflowBuilderInferencePanel(body: {
+  definition: WorkflowTemplateDefinition;
+  globals: WorkflowGlobalConfig;
+  panel?: InferenceConfigPanel;
+}) {
+  return fetchJson<InferenceConfigPanelResponse>('/api/workflow-builder/inference-panel', {
+    method: 'POST',
+    body: JSON.stringify(body)
   });
 }
 

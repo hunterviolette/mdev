@@ -12,6 +12,10 @@ use crate::{
 
 use super::{StageDisposition, StageOutcome};
 
+pub fn capabilities() -> crate::engine::stages::capability_contract::StageCapabilities {
+    crate::engine::stages::capability_contract::StageCapabilities::empty()
+}
+
 pub fn prepare_stage_state(step: &WorkflowStepDefinition, mut local_state: Value) -> Result<Value> {
     if !local_state.is_object() {
         local_state = json!({});

@@ -1,7 +1,7 @@
 pub(crate) mod capabilities;
 pub(crate) mod governance;
 mod runtime;
-pub(crate) mod shared_capability_lifecycle;
+
 mod stages;
 mod transitions;
 
@@ -292,6 +292,55 @@ pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<
     }
 
     inference_obj.remove("shared_inference_state");
+}
+
+pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
+    normalize_inference_arm_state(run);
+
+    let Some(step) = selected_step else {
+        return;
+    };
+
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context") {
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+        inference_obj.remove("shared_inference_state");
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema") {
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+        inference_obj.remove("shared_inference_state");
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment") {
+        let planner = capabilities_obj
+            .entry("planner".to_string())
+            .or_insert_with(|| json!({}));
+        let planner_obj = ensure_value_object(planner);
+        let has_selected_feature = planner_obj
+            .get("selected_feature_id")
+            .and_then(Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if has_selected_feature {
+            planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
+        }
+    }
 }
 
 fn normalize_inference_arm_state(run: &mut WorkflowRun) {

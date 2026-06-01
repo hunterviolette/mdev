@@ -45,7 +45,7 @@ fn resolve_apply_changeset_target(ctx: &CapabilityContext<'_>, config: Value) ->
     let capability_state = ctx
         .local_state
         .get("capabilities")
-        .and_then(|v| v.get("gateway_model/changeset"))
+        .and_then(|v| v.get("changeset"))
         .cloned()
         .unwrap_or_else(|| json!({}));
 

@@ -1,7 +1,14 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::models::WorkflowStepDefinition;
+use crate::{
+    engine::stages::capability_contract::StageCapabilities,
+    models::WorkflowStepDefinition,
+};
+
+pub fn capabilities() -> StageCapabilities {
+    StageCapabilities::new(["compile_commands"])
+}
 
 pub fn prepare_stage_state(
     step: &WorkflowStepDefinition,

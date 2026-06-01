@@ -371,7 +371,7 @@ async fn dispatch(
         "inference" => inference::execute(ctx, prior_results, invocation.config).await,
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
-        "gateway_model/changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
+        "changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
         "supervisor_planner_item" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,

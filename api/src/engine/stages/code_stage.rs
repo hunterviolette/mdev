@@ -2,13 +2,20 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::capabilities::inference::stage_support::{
-        auto_apply_enabled,
-        prepare_inference_stage_state,
-        InferenceStageSettings,
+    engine::{
+        capabilities::inference::stage_support::{
+            auto_apply_enabled,
+            prepare_inference_stage_state,
+            InferenceStageSettings,
+        },
+        stages::capability_contract::StageCapabilities,
     },
     models::WorkflowStepDefinition,
 };
+
+pub fn capabilities() -> StageCapabilities {
+    StageCapabilities::new(["inference", "changeset"])
+}
 
 pub fn prepare_stage_state(
     repo_ref: &str,

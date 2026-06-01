@@ -75,9 +75,9 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
       <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
         <CapabilityCard
           eyebrow="Inference"
-          title="Inference defaults"
-          description="Set the workflow-level inference transport and defaults used by stages that call model capabilities."
-          buttonLabel="Configure inference"
+          title="Inference sessions"
+          description="Manage reusable named inference sessions and map inference-enabled workflow stages to those sessions."
+          buttonLabel="Manage sessions"
           onClick={onOpenInference}
           badge={<Badge color="blue" variant="light">Core</Badge>}
         />

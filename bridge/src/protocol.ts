@@ -17,6 +17,7 @@ export type ConnectOverCdpCommand = {
   session_id?: string;
   profile?: string;
   cdp_url: string;
+  url?: string;
   page_url_contains?: string;
   wait_for?: string;
   timeout_ms?: number;

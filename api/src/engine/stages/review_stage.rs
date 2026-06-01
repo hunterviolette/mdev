@@ -3,6 +3,10 @@ use serde_json::{json, Value};
 
 use crate::models::WorkflowStepDefinition;
 
+pub fn capabilities() -> crate::engine::stages::capability_contract::StageCapabilities {
+    crate::engine::stages::capability_contract::StageCapabilities::new(["inference"])
+}
+
 pub fn prepare_stage_state(
     step: &WorkflowStepDefinition,
     local_state: Value,

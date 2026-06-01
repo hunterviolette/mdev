@@ -381,7 +381,7 @@ fn build_execution_plan(
     if auto_apply_changeset {
         nodes.push(StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
-            key: "gateway_model/changeset".to_string(),
+            key: "changeset".to_string(),
             enabled: true,
             config: json!({}),
             input_mapping: json!({

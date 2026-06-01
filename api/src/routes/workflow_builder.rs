@@ -1,5 +1,6 @@
 use axum::{extract::State, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
+use crate::engine::capabilities::inference::panel::{build_inference_config_panel, inference_config_from_panel, InferenceConfigPanel};
 
 use crate::{
     app_state::AppState,
@@ -41,6 +42,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-builder-catalog", get(get_workflow_builder_catalog))
         .route("/api/workflow-builder/compile", post(compile_workflow_builder))
+        .route("/api/workflow-builder/inference-panel", post(build_workflow_builder_inference_panel))
 }
 
 async fn get_workflow_builder_catalog(
@@ -56,6 +58,41 @@ async fn compile_workflow_builder(
     let catalog = default_builder_catalog();
     let compiled = compile_document(&state, &catalog, req.document).await?;
     Ok(Json(compiled))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct InferencePanelRequest {
+    definition: WorkflowTemplateDefinition,
+    #[serde(default)]
+    globals: WorkflowGlobalConfig,
+    #[serde(default)]
+    panel: Option<InferenceConfigPanel>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct InferencePanelResponse {
+    ok: bool,
+    panel: InferenceConfigPanel,
+    inference: Value,
+}
+
+async fn build_workflow_builder_inference_panel(
+    Json(req): Json<InferencePanelRequest>,
+) -> Result<Json<InferencePanelResponse>, (axum::http::StatusCode, String)> {
+    let inference = req
+        .panel
+        .clone()
+        .map(|panel| inference_config_from_panel(&req.globals, panel))
+        .unwrap_or_else(|| req.globals.capabilities.get("inference").cloned().unwrap_or_else(|| json!({})));
+    let panel = req
+        .panel
+        .unwrap_or_else(|| build_inference_config_panel(&req.definition, &req.globals));
+
+    Ok(Json(InferencePanelResponse {
+        ok: true,
+        panel,
+        inference,
+    }))
 }
 
 async fn compile_document(
@@ -471,7 +508,7 @@ fn changeset_governance_policy_descriptor() -> WorkflowGovernancePolicyDescripto
         key: "changeset_file_failures".to_string(),
         label: "Changeset file failure guardrail".to_string(),
         description: "Inject targeted file context after repeated changeset failures, escalate to broad context if failures continue, and pause after too many consecutive failures for the same file.".to_string(),
-        capability: "gateway_model/changeset".to_string(),
+        capability: "changeset".to_string(),
         required_capabilities: vec!["gateway_model/changeset".to_string()],
         fields: vec![
             WorkflowStageField {
@@ -546,6 +583,26 @@ fn default_globals() -> WorkflowGlobalConfig {
         }),
         capabilities: json!({
             "inference": {
+                "default_session": "coding",
+                "stage_sessions": {
+                    "design": "coding",
+                    "code": "coding",
+                    "review": "review"
+                },
+                "sessions": {
+                    "coding": {
+                        "provider": "openai",
+                        "transport": "api",
+                        "model": "gpt-4.1",
+                        "runtime": {}
+                    },
+                    "review": {
+                        "provider": "openai",
+                        "transport": "api",
+                        "model": "gpt-4.1",
+                        "runtime": {}
+                    }
+                }
             },
             "context_export": {
                 "enabled": false,

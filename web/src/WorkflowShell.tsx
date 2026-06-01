@@ -86,6 +86,7 @@ import {
   type WorkflowTransition
 } from './api';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
+import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
 import { getSupervisorRun, listSupervisorRuns, type FeaturePlanItem } from './supervisor_api';
@@ -4458,6 +4459,20 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     setGlobalInferenceConfigOpen(true);
   }
 
+  function currentInferencePanelGlobals(): Record<string, unknown> | null {
+    if (view === 'builder') {
+      return (builderGlobals ?? compiledBuilderDefinition?.globals ?? loadedTemplateDefinition?.globals ?? null) as Record<string, unknown> | null;
+    }
+    return (((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? null) as Record<string, unknown> | null;
+  }
+
+  function currentInferencePanelDefinition(): WorkflowTemplateDefinition | null {
+    if (view === 'builder') {
+      return compiledBuilderDefinition ?? loadedTemplateDefinition ?? null;
+    }
+    return selectedRunDefinition;
+  }
+
   function normalizeBuilderDefinition(definition?: WorkflowTemplateDefinition | null): WorkflowTemplateDefinition | null {
     if (!definition) {
       return null;
@@ -4654,6 +4669,35 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         },
       });
       setInferenceStatus('Global inference defaults saved.');
+      await refreshSelectedRunArtifacts();
+    } catch (err) {
+      setInferenceStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInferenceBusy(false);
+    }
+  }
+
+  async function handleSaveInferenceSessionsPanel(inferencePatch: Record<string, unknown>) {
+    try {
+      setInferenceBusy(true);
+      setInferenceStatus(null);
+      if (view === 'builder') {
+        saveBuilderCapability('inference', inferencePatch);
+        setInferenceStatus('Inference sessions saved.');
+        setGlobalInferenceConfigOpen(false);
+        return;
+      }
+      if (!selectedRun) return;
+      const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+      await patchWorkflowGlobalState(selectedRun.id, {
+        capabilities: {
+          ...currentCapabilities,
+          inference: inferencePatch,
+        },
+      });
+      setInferenceStatus('Inference sessions saved.');
+      setGlobalInferenceConfigOpen(false);
       await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
@@ -5709,56 +5753,15 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
           }}
         >
-          <Stack gap="md">
-            <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <Select
-                label="Mode"
-                value={inferenceTransport}
-                onChange={(value) => setInferenceTransport((value as InferenceTransport) ?? 'api')}
-                data={[
-                  { value: 'api', label: 'API' },
-                  { value: 'browser', label: 'Browser' }
-                ]}
-                allowDeselect={false}
-              />
-              <TextInput
-                label="Session ID"
-                value={browserSessionId}
-                onChange={(e) => setBrowserSessionId(e.currentTarget.value)}
-                disabled={inferenceTransport !== 'browser'}
-                placeholder="Optional existing browser session"
-              />
-            </SimpleGrid>
-
-            {inferenceTransport === 'browser' ? (
-              <Stack gap="md">
-                <SimpleGrid cols={{ base: 1, md: 2 }}>
-                  <TextInput
-                    label="Browser URL"
-                    value={browserTargetUrl}
-                    onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)}
-                    placeholder="https://website.com/"
-                  />
-                  <TextInput
-                    label="CDP URL"
-                    value={browserCdpUrl}
-                    onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
-                    placeholder="Backend default"
-                  />
-                </SimpleGrid>
-                <Alert color="blue">Only backend-owned inference fields are persisted here. Browser defaults and runtime session behavior stay on the backend.</Alert>
-              </Stack>
-            ) : (
-              <Alert color="blue">API mode only persists the transport choice. Model, max tokens, temperature, provider, and system prompt are not stored in workflow global state.</Alert>
-            )}
-
-            {inferenceStatus ? <Alert color={inferenceStatus.toLowerCase().includes('saved') ? 'green' : 'red'}>{inferenceStatus}</Alert> : null}
-
-            <Group justify="flex-end">
-              <Button size="xs" variant="default" onClick={() => setGlobalInferenceConfigOpen(false)}>Cancel</Button>
-              <Button size="xs" onClick={() => void handleSaveGlobalInference()} loading={inferenceBusy}>Save</Button>
-            </Group>
-          </Stack>
+          <InferenceSessionsPanel
+            opened={globalInferenceConfigOpen}
+            globals={currentInferencePanelGlobals()}
+            definition={currentInferencePanelDefinition()}
+            busy={inferenceBusy}
+            status={inferenceStatus}
+            onCancel={() => setGlobalInferenceConfigOpen(false)}
+            onSave={handleSaveInferenceSessionsPanel}
+          />
         </Modal>
 
         <Modal

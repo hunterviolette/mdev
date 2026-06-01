@@ -249,7 +249,7 @@ struct BridgeClient {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
-    launched_browser: Option<Child>,
+    launched_browsers: Vec<Child>,
 }
 
 impl BridgeClient {
@@ -258,7 +258,7 @@ impl BridgeClient {
             child: None,
             stdin: None,
             stdout: None,
-            launched_browser: None,
+            launched_browsers: Vec::new(),
         }
     }
 
@@ -329,7 +329,7 @@ impl BridgeClient {
             let _ = child.wait();
         }
 
-        if let Some(mut browser) = self.launched_browser.take() {
+        for mut browser in self.launched_browsers.drain(..) {
             let _ = browser.kill();
             let _ = browser.wait();
         }
@@ -351,12 +351,12 @@ pub fn shutdown_browser_bridge() {
 fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
     let executable = resolve_browser_executable(cfg);
 
-    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
     let cdp_url = if cfg.cdp_url.trim().is_empty() {
         crate::runtime_env::default_browser_cdp_url()?
     } else {
         cfg.cdp_url.clone()
     };
+    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
     let host_port = cdp_url
         .trim()
         .strip_prefix("http://")
@@ -382,6 +382,7 @@ fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
         .arg(format!("--user-data-dir={}", user_data_dir.to_string_lossy()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--new-window")
         .arg(launch_url)
         .spawn()
         .with_context(|| format!("failed to launch mdev browser via {}", executable))?;
@@ -507,7 +508,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
             info!(cdp_url = %cfg.cdp_url, "attempting to launch edge with remote debugging");
             let child = launch_edge(cfg)?;
             if let Ok(mut client) = bridge_client().lock() {
-                client.launched_browser = Some(child);
+                client.launched_browsers.push(child);
             }
         }
     }
@@ -521,6 +522,10 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         std::thread::sleep(Duration::from_millis(250));
     }
 
+    if !cdp_reachable(&cfg.cdp_url) {
+        return Err(anyhow!("CDP endpoint did not become reachable after browser launch: {}", cfg.cdp_url));
+    }
+
     let mut last_err: Option<anyhow::Error> = None;
     for attempt_index in 0..20 {
         let attempt = (|| -> Result<String> {
@@ -529,6 +534,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
             client.ensure_started()?;
             let mut payload = bridge_cmd("connect_over_cdp");
             payload["cdp_url"] = Value::String(cfg.cdp_url.clone());
+            payload["url"] = Value::String(normalize_browser_url_for_launch(&cfg.target_url));
             payload["profile"] = Value::String(if cfg.profile.is_empty() { "auto".to_string() } else { cfg.profile.clone() });
             let page_url_contains = if !cfg.page_url_contains.trim().is_empty() {
                 cfg.page_url_contains.trim().to_string()
