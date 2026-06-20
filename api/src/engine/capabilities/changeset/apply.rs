@@ -4,10 +4,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::engine::capabilities::changeset::persistence::{
-    insert_changeset_log_from_result,
-    ChangesetAttemptContext,
-    ChangesetFileEffectLog,
+use crate::engine::capabilities::{
+    changeset::persistence::{
+        insert_changeset_log_from_result,
+        ChangesetAttemptContext,
+        ChangesetFileEffectLog,
+    },
+    inference::model_output::extract_json_object_slice,
 };
 use crate::engine::capabilities::registry::{
     find_result,
@@ -615,54 +618,6 @@ fn edit_action_error(op_index: usize, action_index: usize, result: &Value) -> Op
         })
 }
 
-fn extract_json_object_slice(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (idx, &byte) in bytes.iter().enumerate() {
-        let ch = byte as char;
-
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if start.is_none() {
-                    start = Some(idx);
-                }
-                depth += 1;
-            }
-            '}' => {
-                if depth == 0 {
-                    continue;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(start_idx) = start {
-                        return Some(&text[start_idx..=idx]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
 
 fn normalize_changeset_payload_text(payload_text: &str) -> Result<String> {
     let mut text = payload_text.trim().to_string();

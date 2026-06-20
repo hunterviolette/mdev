@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset, compile_commands, context_export, git_patch_payload, inference, planner, sap};
+use super::{changeset, compile_commands, context_export, git_patch_payload, inference, planner, review_validation, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -375,6 +375,7 @@ async fn dispatch(
         "supervisor_planner_item" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
+        "review_validation" => review_validation::execute(ctx, prior_results, invocation.config).await,
         "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,
         "sap/export" => sap::export::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),

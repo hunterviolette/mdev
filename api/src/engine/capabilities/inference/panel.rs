@@ -133,7 +133,7 @@ pub fn build_inference_config_panel(
         .iter()
         .find(|session| session.is_default)
         .map(|session| session.name.clone())
-        .unwrap_or_else(|| sessions[0].name.clone());
+        .unwrap_or_else(|| "coding".to_string());
 
     let configured_stage_sessions = inference_obj
         .and_then(|value| value.get("stage_sessions"))

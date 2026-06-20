@@ -846,7 +846,10 @@ fn review_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("review", "Review", AutomationMode::Manual);
     template.execution_logic = json!({
         "kind": "review_stage_policy",
-        "require_manual_approval": true
+        "require_manual_approval": true,
+        "ai_review": {
+            "enabled": false
+        }
     });
     template.execution_plan = vec![];
 
@@ -854,17 +857,18 @@ fn review_descriptor() -> WorkflowStageDescriptor {
         step_type: "review".to_string(),
         label: "Review".to_string(),
         category: "core".to_string(),
-        description: "Review stage with backend-owned approval policy.".to_string(),
+        description: "Review stage with backend-owned validation and approval policy.".to_string(),
         definition_template: template,
         editable_fields: vec![WorkflowStageFieldGroup {
             key: "review".to_string(),
             label: "Review".to_string(),
             fields: vec![
-                bool_field("execution_logic.require_manual_approval", "Require manual approval", "execution_logic.require_manual_approval", true),
+                bool_field("execution_logic.require_manual_approval", "Manual approval", "execution_logic.require_manual_approval", true),
+                bool_field("execution_logic.ai_review.enabled", "AI review", "execution_logic.ai_review.enabled", false),
             ],
         }],
         available_governance_policies: vec![],
-        routes: default_routes("", "design", "review"),
+        routes: default_routes("", "code", "review"),
     }
 }
 

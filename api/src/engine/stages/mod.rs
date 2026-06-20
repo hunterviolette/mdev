@@ -7,6 +7,7 @@ mod merge_patches_stage;
 mod sap_export_stage;
 mod sap_import_stage;
 mod sap_syntax_stage;
+mod stage_utility;
 
 use std::time::Instant;
 
@@ -176,6 +177,16 @@ fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
     if !stage_executions.iter().any(|item| item.as_str() == Some(stage_execution_id)) {
         stage_executions.push(Value::String(stage_execution_id.to_string()));
     }
+}
+
+fn local_state_disposition_review_enabled(local_state: &Value) -> bool {
+    local_state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"))
+        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 pub async fn execute_stage(
@@ -350,17 +361,27 @@ pub async fn execute_stage(
         local_state: prepared_local_state,
     };
 
+    let pending_disposition_review = outcome.ok && local_state_disposition_review_enabled(&outcome.local_state);
     append_engine_event(
         state,
         run_id,
         Some(step.id.as_str()),
         if outcome.ok { "info" } else { "error" },
-        "stage_execution_completed",
-        "Stage executed through backend workflow engine",
+        if pending_disposition_review {
+            "stage_execution_waiting_for_disposition_review"
+        } else {
+            "stage_execution_completed"
+        },
+        if pending_disposition_review {
+            "Stage execution is waiting for operator disposition review."
+        } else {
+            "Stage executed through backend workflow engine"
+        },
         json!({
             "step_id": step.id,
             "step_type": step.step_type,
             "ok": outcome.ok,
+            "pending_disposition_review": pending_disposition_review,
             "message": outcome.message,
             "disposition": format_disposition(&outcome.disposition),
             "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -382,7 +403,7 @@ fn prepare_stage_local_state(
     match step.step_type.as_str() {
         "code" => code_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
         "compile" => compile_stage::prepare_stage_state(step, local_state),
-        "review" => review_stage::prepare_stage_state(step, local_state),
+        "review" => review_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
         "merge_patches" => merge_patches_stage::prepare_stage_state(step, local_state),
         "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
         "sap_syntax" => sap_syntax_stage::prepare_stage_state(step, local_state),
@@ -446,6 +467,9 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
         }
         ("code", "changeset", "apply_error_to_code_prompt") => {
             Some(code_stage::build_apply_error_patch(capability_results))
+        }
+        ("review", "review_validation", "review_failure_to_code_prompt") => {
+            Some(review_stage::build_review_failure_patch(capability_results))
         }
         ("sap_syntax", "sap/export", "sap_syntax_success_state") => {
             Some(sap_syntax_stage::build_sap_syntax_success_patch(capability_results))
@@ -650,6 +674,12 @@ fn resolve_effective_execution_plan(
                 include_changeset_schema: false,
             },
         ),
+        "review" => review_stage::build_review_execution_plan(
+            repo_ref,
+            global_state,
+            step,
+            local_state,
+        ),
         "compile" => Ok(vec![StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
             key: "compile_commands".to_string(),
@@ -695,7 +725,7 @@ pub(crate) fn compose_prompt_from_state(
 ) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
-    let order = ["user_input", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
+    let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
 
     let mut parts = Vec::new();
     for key in order {

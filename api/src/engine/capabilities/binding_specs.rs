@@ -29,6 +29,7 @@ pub fn stage_supports_shared_capability(step: &WorkflowStepDefinition, primitive
         "repo_context" => {
             step.step_type == "design"
                 || step.step_type == "code"
+                || step.step_type == "review"
                 || step.prompt.include_repo_context
                 || step
                     .execution_logic
@@ -49,6 +50,7 @@ pub fn stage_supports_shared_capability(step: &WorkflowStepDefinition, primitive
         }
         "planner_fragment" => {
             step.step_type == "design"
+                || step.step_type == "review"
                 || step
                     .execution_logic
                     .get("connections")

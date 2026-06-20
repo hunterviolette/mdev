@@ -6,6 +6,7 @@ pub mod compile_commands;
 pub mod filesystem;
 pub mod git;
 pub mod git_patch_payload;
+pub mod review_validation;
 pub mod inference;
 pub mod planner;
 pub mod sap;

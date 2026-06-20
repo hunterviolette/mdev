@@ -28,15 +28,18 @@ pub async fn resolve_inference_session(ctx: &CapabilityContext<'_>) -> Result<Re
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    let sessions = inference
+        .get("sessions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("inference capability must define a sessions map"))?;
+
     let session_name = explicit_stage_session(ctx)
         .or_else(|| mapped_stage_session(&inference, ctx.step.step_type.as_str()))
         .or_else(|| inference.get("default_session").and_then(Value::as_str).map(str::to_string))
-        .or_else(|| first_session_name(&inference))
-        .ok_or_else(|| anyhow!("inference capability has no configured sessions"))?;
+        .ok_or_else(|| anyhow!("inference capability must define default_session or a stage session mapping"))?;
 
-    let session_value = inference
-        .get("sessions")
-        .and_then(|v| v.get(session_name.as_str()))
+    let session_value = sessions
+        .get(session_name.as_str())
         .cloned()
         .ok_or_else(|| anyhow!("inference session '{}' is not configured", session_name))?;
 
@@ -106,7 +109,6 @@ pub fn selected_session_from_local_state(local_state: &Value) -> Option<String> 
 pub fn resolve_stage_session_name(inference: &Value, step_type: &str) -> Option<String> {
     mapped_stage_session(inference, step_type)
         .or_else(|| inference.get("default_session").and_then(Value::as_str).map(str::to_string))
-        .or_else(|| first_session_name(inference))
 }
 
 fn explicit_stage_session(ctx: &CapabilityContext<'_>) -> Option<String> {
@@ -130,13 +132,6 @@ fn mapped_stage_session(inference: &Value, step_type: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn first_session_name(inference: &Value) -> Option<String> {
-    inference
-        .get("sessions")
-        .and_then(Value::as_object)
-        .and_then(|sessions| sessions.keys().next().cloned())
 }
 
 fn default_provider_for_transport(transport: &InferenceTransport) -> &'static str {

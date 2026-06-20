@@ -12,6 +12,7 @@ use super::{
     activate_next_prompt_fragments_for_stage,
     append_engine_event,
     clear_active_prompt_fragments_for_stage,
+    event_meta,
     current_step,
     ensure_engine_root,
     load_run,
@@ -114,6 +115,67 @@ pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json
     Ok(json!({ "ok": true, "status": "waiting", "current_step_id": run.current_step_id }))
 }
 
+async fn latest_stage_execution_id_for_step(
+    state: &AppState,
+    run_id: Uuid,
+    stage_id: &str,
+) -> Result<Option<String>> {
+    let value = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT stage_execution_id
+        FROM workflow_events
+        WHERE run_id = ?
+          AND step_id = ?
+          AND stage_execution_id IS NOT NULL
+          AND TRIM(stage_execution_id) != ''
+        ORDER BY sequence_no DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(stage_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    Ok(value)
+}
+
+async fn append_disposition_stage_completion_event(
+    state: &AppState,
+    run_id: Uuid,
+    stage_id: &str,
+    stage_execution_id: Option<&str>,
+    ok: bool,
+    disposition: &str,
+    message: &str,
+    next_step_id: Option<&str>,
+) -> Result<()> {
+    let mut payload = json!({
+        "step_id": stage_id,
+        "ok": ok,
+        "message": message,
+        "disposition": disposition,
+        "event_meta": event_meta(stage_execution_id, None, None, true)
+    });
+
+    if let Some(next_step_id) = next_step_id {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("next_step_id".to_string(), Value::String(next_step_id.to_string()));
+        }
+    }
+
+    append_engine_event(
+        state,
+        run_id,
+        Some(stage_id),
+        if ok { "info" } else { "warn" },
+        "stage_execution_completed",
+        message,
+        payload,
+    )
+    .await
+}
+
 pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposition: &str) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
     let blocked_on = run
@@ -148,6 +210,16 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
         .and_then(Value::as_str)
         .unwrap_or("manual")
         .to_string();
+    let stage_execution_id = match blocked_on
+        .get("stage_execution_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+    {
+        Some(value) => Some(value),
+        None => latest_stage_execution_id_for_step(state, run_id, stage_id.as_str()).await?,
+    };
+
 
     if !matches!(disposition, "move_next" | "pause" | "paused") {
         return Err(anyhow!("unsupported disposition {}", disposition));
@@ -163,6 +235,17 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
 
     match disposition {
         "pause" | "paused" => {
+            append_disposition_stage_completion_event(
+                state,
+                run_id,
+                stage_id.as_str(),
+                stage_execution_id.as_deref(),
+                false,
+                "paused",
+                "Stage paused by operator at disposition review.",
+                None,
+            ).await?;
+
             set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
             append_engine_event(
                 state,
@@ -185,8 +268,41 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
             let definition = load_template_definition(state, &run).await?
                 .ok_or_else(|| anyhow!("run has no template definition"))?;
             let target = next_target
-                .or_else(|| next_step_id(&definition, Some(stage_id.as_str())))
-                .ok_or_else(|| anyhow!("disposition review has no next stage"))?;
+                .or_else(|| next_step_id(&definition, Some(stage_id.as_str())));
+
+            if target.is_none() {
+                append_engine_event(
+                    state,
+                    run_id,
+                    Some(stage_id.as_str()),
+                    "info",
+                    "disposition_review_resolved",
+                    "Operator approved terminal review stage; workflow completed successfully.",
+                    json!({ "disposition": "move_next", "stage_id": stage_id }),
+                ).await?;
+
+                append_disposition_stage_completion_event(
+                    state,
+                    run_id,
+                    stage_id.as_str(),
+                    stage_execution_id.as_deref(),
+                    true,
+                    "success",
+                    "Terminal review approved. Workflow completed successfully.",
+                    None,
+                ).await?;
+
+                set_run_status(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
+                return Ok(json!({
+                    "ok": true,
+                    "status": "success",
+                    "disposition": "move_next",
+                    "current_step_id": stage_id,
+                    "followup_action": "complete_workflow"
+                }));
+            }
+
+            let target = target.expect("target checked above");
             let target_step = current_step(&definition, &run, Some(target.as_str()))?.clone();
             append_engine_event(
                 state,
@@ -221,6 +337,17 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                     "next_step_id": target,
                 }));
             }
+
+            append_disposition_stage_completion_event(
+                state,
+                run_id,
+                stage_id.as_str(),
+                stage_execution_id.as_deref(),
+                true,
+                "move_next",
+                "Stage completed after operator disposition review.",
+                Some(target.as_str()),
+            ).await?;
 
             set_current_step_waiting(state, run_id, target.as_str()).await?;
 
@@ -612,19 +739,27 @@ fn set_pending_disposition_review(
     step: &super::WorkflowStepDefinition,
     outcome: &super::stages::StageOutcome,
     next_target: Option<String>,
+    resume_mode: &str,
 ) {
     let root = ensure_engine_root(&mut run.context);
     let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
     let run_state_obj = run_state.as_object_mut().expect("run_state must be object");
+    let stage_execution_id = outcome
+        .local_state
+        .get("_stage_execution_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
     run_state_obj.insert("blocked_on".to_string(), json!({
         "kind": "disposition_review",
         "stage_id": step.id,
         "stage_type": step.step_type,
+        "stage_execution_id": stage_execution_id,
         "recommended_disposition": format_disposition(&outcome.disposition),
         "available_dispositions": disposition_review_options(step, outcome),
         "next_step_id": next_target,
         "message": outcome.message,
-        "resume_mode": "autonomous"
+        "resume_mode": resume_mode
     }));
 }
 
@@ -694,6 +829,44 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             consume_single_use_inference_arm_state(&mut run, &step);
         }
 
+        let pending_disposition_review = outcome.ok && stage_disposition_review_enabled(&step, &outcome);
+
+        if pending_disposition_review {
+            clear_pending_disposition_review(&mut run);
+            let next_target = resolve_next_target(&definition, &step, &outcome);
+            let disposition_resume_mode = if automatic { "autonomous" } else { "manual" };
+            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode);
+            persist_context(state, run_id, &run.context).await?;
+            set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "info",
+                "workflow_waiting_for_disposition_review",
+                "Workflow is waiting for operator disposition review.",
+                json!({
+                    "stage_id": step.id,
+                    "stage_type": step.step_type,
+                    "recommended_disposition": format_disposition(&outcome.disposition),
+                    "available_dispositions": disposition_review_options(&step, &outcome),
+                    "next_step_id": next_target.clone(),
+                    "resume_mode": disposition_resume_mode,
+                }),
+            ).await?;
+            return Ok(json!({
+                "ok": true,
+                "status": "waiting",
+                "blocked_on": "disposition_review",
+                "step_id": step.id,
+                "next_step_id": next_target,
+                "message": outcome.message,
+                "disposition": format_disposition(&outcome.disposition),
+                "capability_results": outcome.capability_results,
+                "local_state": outcome.local_state,
+            }));
+        }
+
         append_engine_event(
             state,
             run_id,
@@ -712,38 +885,6 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         clear_pending_disposition_review(&mut run);
         let next_target = resolve_next_target(&definition, &step, &outcome);
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
-        if automatic && stage_disposition_review_enabled(&step, &outcome) {
-            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone());
-            persist_context(state, run_id, &run.context).await?;
-            set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
-            append_engine_event(
-                state,
-                run_id,
-                Some(step.id.as_str()),
-                "info",
-                "workflow_waiting_for_disposition_review",
-                "Workflow automation is waiting for operator disposition review.",
-                json!({
-                    "stage_id": step.id,
-                    "stage_type": step.step_type,
-                    "recommended_disposition": format_disposition(&outcome.disposition),
-                    "available_dispositions": disposition_review_options(&step, &outcome),
-                    "next_step_id": next_target.clone(),
-                    "resume_mode": "autonomous",
-                }),
-            ).await?;
-            return Ok(json!({
-                "ok": outcome.ok,
-                "status": "waiting",
-                "blocked_on": "disposition_review",
-                "step_id": step.id,
-                "next_step_id": next_target,
-                "message": outcome.message,
-                "disposition": format_disposition(&outcome.disposition),
-                "capability_results": outcome.capability_results,
-                "local_state": outcome.local_state,
-            }));
-        }
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
             clear_run_pause_requested(&mut run);
@@ -817,16 +958,15 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 continue;
             }
             (StageDisposition::RetryStage, Some(target), _) => {
-                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
-                last_payload = json!({
+                set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
+                return Ok(json!({
                     "ok": outcome.ok,
-                    "status": "running",
+                    "status": "waiting",
                     "step_id": step.id,
                     "next_step_id": target,
                     "message": outcome.message,
-                });
-                requested = next_target;
-                continue;
+                    "disposition": "retry_stage"
+                }));
             }
             (StageDisposition::MoveNext, Some(target), _) | (StageDisposition::MoveBack, Some(target), _) => {
                 set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;

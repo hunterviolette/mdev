@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use crate::{
     engine::{
         capabilities::inference::stage_support::{prepare_inference_stage_state, InferenceStageSettings},
-        stages::capability_contract::StageCapabilities,
+        stages::{capability_contract::StageCapabilities, stage_utility},
     },
     models::WorkflowStepDefinition,
 };
@@ -36,36 +36,23 @@ pub fn prepare_stage_state(
     if !execution_logic.is_object() {
         *execution_logic = json!({});
     }
-    let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
-
     let config_design_v2 = step
         .config
         .get("design_mode")
         .and_then(Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("v2"))
         .unwrap_or(false);
-    let logic_design_v2 = exec_obj
+    let logic_design_v2 = execution_logic
         .get("mode")
         .and_then(Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("v2"))
         .unwrap_or(false);
 
     if config_design_v2 || logic_design_v2 {
-        let automation = exec_obj.entry("automation".to_string()).or_insert_with(|| json!({}));
-        if !automation.is_object() {
-            *automation = json!({});
-        }
-        let automation_obj = automation.as_object_mut().expect("automation must be object");
-        let disposition_review = automation_obj
-            .entry("disposition_review".to_string())
-            .or_insert_with(|| json!({}));
-        if !disposition_review.is_object() {
-            *disposition_review = json!({});
-        }
-        let disposition_obj = disposition_review.as_object_mut().expect("disposition_review must be object");
-        disposition_obj.insert("enabled".to_string(), Value::Bool(true));
-        disposition_obj.insert("available_dispositions".to_string(), json!(["move_next", "pause"]));
+        stage_utility::enable_continue_or_pause_checkpoint(execution_logic);
     }
+
+    let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
 
     if !exec_obj.contains_key("on_success") {
         exec_obj.insert(

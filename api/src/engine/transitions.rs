@@ -33,7 +33,7 @@ pub fn should_auto_advance(step: &WorkflowStepDefinition, outcome: &StageOutcome
         StageDisposition::Success => step.advancement.auto_advance_on_success,
         StageDisposition::Error | StageDisposition::ErrorCode(_) => step.advancement.auto_advance_on_error,
         StageDisposition::Paused => step.advancement.auto_advance_on_paused,
-        StageDisposition::RetryStage => true,
+        StageDisposition::RetryStage => false,
         StageDisposition::MoveNext | StageDisposition::MoveBack => true,
         StageDisposition::Outcome(_) | StageDisposition::Stay => false,
     }

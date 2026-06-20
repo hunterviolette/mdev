@@ -3,6 +3,7 @@ pub mod browser;
 pub mod panel;
 pub mod session;
 pub mod stage_support;
+pub mod model_output;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -141,11 +142,15 @@ pub async fn execute(
     prior_results: &[CapabilityResult],
     _config: Value,
 ) -> Result<CapabilityResult> {
-    let policy = super::registry::stage_capability_policy(ctx.step)?;
+    let policy = super::registry::stage_capability_policy(ctx.step).ok();
     let consumed_capabilities = consumed_inference_capabilities(ctx.local_state);
 
     let mut follow_ups = Vec::new();
-    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| item == "changeset") {
+    let changeset_allowed = policy
+        .as_ref()
+        .map(|policy| policy.allowed_invocations.iter().any(|item| item == "changeset"))
+        .unwrap_or(false);
+    if ctx.step.step_type == "code" && changeset_allowed {
         follow_ups.push(CapabilityInvocation {
             capability: "changeset".to_string(),
             config: json!({}),

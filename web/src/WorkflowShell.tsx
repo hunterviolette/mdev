@@ -323,106 +323,6 @@ function statusColor(status: WorkflowRunStatus) {
   }
 }
 
-const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
-  inferenceConnectionStatus: InferenceConnectionStatus;
-  inferenceReady: boolean;
-  inferenceSummaryText: string;
-  inferenceTransport: InferenceTransport;
-  browserTargetUrl: string;
-  browserCdpUrl: string;
-  inferenceBusy: boolean;
-  inferenceStatus: string | null;
-  hideInlineCard?: boolean;
-  onOpenConfig: () => void;
-  onTransportChange: (value: InferenceTransport) => void;
-  onBrowserTargetUrlChange: (value: string) => void;
-  onBrowserCdpUrlChange: (value: string) => void;
-  onSaveConfig: () => void;
-}) {
-  const {
-    inferenceConnectionStatus,
-    inferenceReady,
-    inferenceTransport,
-    browserTargetUrl,
-    browserCdpUrl,
-    inferenceBusy,
-    inferenceStatus,
-    hideInlineCard = false,
-    onOpenConfig,
-    onTransportChange,
-    onBrowserTargetUrlChange,
-    onBrowserCdpUrlChange,
-    onSaveConfig
-  } = props;
-
-  const showInlineConfig = !hideInlineCard && !inferenceReady;
-
-  return (
-    <>
-      {!hideInlineCard ? (
-        <Stack gap="md">
-          <Group justify="space-between" align="center" wrap="nowrap">
-            <Group gap="xs" wrap="nowrap">
-              <Text size="sm" fw={600}>Inference status</Text>
-              <Badge color={inferenceConnectionStatus.color} variant="light">
-                {inferenceTransport === 'browser' ? 'Browser' : 'API'}
-              </Badge>
-            </Group>
-            {!showInlineConfig ? <Button size="xs" variant="subtle" onClick={onOpenConfig}>Configure</Button> : null}
-          </Group>
-
-          {showInlineConfig ? (
-          <Stack gap="md">
-            <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <Select
-                label="Mode"
-                value={inferenceTransport}
-                onChange={(value) => onTransportChange((value as InferenceTransport) ?? 'api')}
-                data={[
-                  { value: 'api', label: 'API' },
-                  { value: 'browser', label: 'Browser' }
-                ]}
-                allowDeselect={false}
-              />
-              <TextInput
-                label="CDP URL"
-                value={browserCdpUrl}
-                onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
-                placeholder="Backend default"
-                disabled={inferenceTransport !== 'browser'}
-              />
-            </SimpleGrid>
-
-            {inferenceTransport === 'browser' ? (
-              <Stack gap="md">
-                <TextInput
-                  label="Browser URL"
-                  value={browserTargetUrl}
-                  onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
-                  placeholder="https://website.com/"
-                />
-                <Alert color="blue">Only transport and browser connection details are configured here.</Alert>
-                <Group>
-                  <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-                </Group>
-              </Stack>
-            ) : (
-              <Group>
-                <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-              </Group>
-            )}
-
-            {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-          </Stack>
-          ) : null}
-        </Stack>
-      ) : null}
-
-
-    </>
-  );
-});
-
 function stepUsesCapability(step: WorkflowStepDefinition | null | undefined, capabilityKey: string): boolean {
   if (!step) return false;
   return (step.execution_plan ?? []).some((node) => node.kind === 'capability' && node.enabled !== false && node.key === capabilityKey);
@@ -1359,9 +1259,6 @@ export function WorkflowShell() {
   const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
 
   const [inferenceTransport, setInferenceTransport] = useState<InferenceTransport>('api');
-  const [browserTargetUrl, setBrowserTargetUrl] = useState('https://website.com/');
-  const [browserCdpUrl, setBrowserCdpUrl] = useState('');
-  const [browserSessionId, setBrowserSessionId] = useState('');
   const [browserProbe, setBrowserProbe] = useState<BrowserProbeResult | null>(null);
   const [inferenceBusy, setInferenceBusy] = useState(false);
   const [inferenceStatus, setInferenceStatus] = useState<string | null>(null);
@@ -2062,19 +1959,14 @@ export function WorkflowShell() {
     const inference = (sharedInferenceState ?? null) as Record<string, unknown> | null;
     if (!inference) {
       setInferenceTransport('api');
-      setBrowserTargetUrl('https://website.com/');
-      setBrowserCdpUrl('');
-      setBrowserSessionId('');
       setBrowserProbe(null);
       return;
     }
 
-    setInferenceTransport((inference.transport as InferenceTransport) ?? 'api');
-
-    const browser = (inference.browser ?? {}) as Record<string, unknown>;
-    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
-    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
+    const sessions = ((inference.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const defaultSessionName = typeof inference.default_session === 'string' ? inference.default_session : '';
+    const defaultSession = defaultSessionName ? ((sessions[defaultSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(defaultSession.transport === 'browser' ? 'browser' : 'api');
     setBrowserProbe(null);
   }, [sharedInferenceState, selectedRun?.id]);
 
@@ -2180,17 +2072,10 @@ export function WorkflowShell() {
         ? Boolean(selectedAutomation.auto_apply_changeset)
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
-    setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
-    setBrowserTargetUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
-        : 'https://website.com'
-    );
-    setBrowserCdpUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
-        : ''
-    );
+    const inferenceSessions = ((inferenceConfig.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const inferenceSessionName = typeof inferenceConfig.default_session === 'string' ? inferenceConfig.default_session : '';
+    const inferenceSession = inferenceSessionName ? ((inferenceSessions[inferenceSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(inferenceSession.transport === 'browser' ? 'browser' : 'api');
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
     setSelectedRepoPaths(includeFiles);
@@ -4443,18 +4328,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     }
   }
 
-  function loadGlobalInferenceConfigFromGlobals(globals?: Record<string, unknown> | null) {
-    const capabilities = ((globals?.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const inference = ((capabilities.inference as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const browser = ((inference.browser as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    setInferenceTransport(((typeof inference.transport === 'string' ? inference.transport : 'api') as InferenceTransport) ?? 'api');
-    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : '');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
-    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
-  }
-
   function openGlobalInferenceConfig() {
-    loadGlobalInferenceConfigFromGlobals((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? null);
     setInferenceStatus(null);
     setGlobalInferenceConfigOpen(true);
   }
@@ -4629,52 +4503,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await syncInteractiveGlobalState();
     syncRepoSelectionState(includeFiles);
     setRepoContextConfigOpen(false);
-  }
-
-  async function handleSaveGlobalInference() {
-    try {
-      setInferenceBusy(true);
-      setInferenceStatus(null);
-      const browserPatch: Record<string, unknown> = {
-        target_url: browserTargetUrl.trim(),
-        session_id: browserSessionId.trim(),
-      };
-      if (browserCdpUrl.trim()) {
-        browserPatch.cdp_url = browserCdpUrl.trim();
-      }
-      const inferencePatch = {
-        transport: inferenceTransport,
-        browser: browserPatch,
-      };
-      if (view === 'builder') {
-        saveBuilderCapability('inference', inferencePatch);
-        setInferenceStatus('Global inference defaults saved.');
-        return;
-      }
-      if (!selectedRun) return;
-      const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
-      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      const currentInference = (currentCapabilities.inference as Record<string, unknown> | undefined) ?? {};
-      await patchWorkflowGlobalState(selectedRun.id, {
-        capabilities: {
-          ...currentCapabilities,
-          inference: {
-            ...currentInference,
-            ...inferencePatch,
-            browser: {
-              ...((currentInference.browser as Record<string, unknown> | undefined) ?? {}),
-              ...(inferencePatch.browser as Record<string, unknown>)
-            }
-          },
-        },
-      });
-      setInferenceStatus('Global inference defaults saved.');
-      await refreshSelectedRunArtifacts();
-    } catch (err) {
-      setInferenceStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setInferenceBusy(false);
-    }
   }
 
   async function handleSaveInferenceSessionsPanel(inferencePatch: Record<string, unknown>) {
@@ -5300,23 +5128,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     onOpenChanges={() => setActiveWorkspaceTab('diff')}
                                   />
                                 )}
-                                <InferenceConnectionCard
-                                  inferenceConnectionStatus={inferenceConnectionStatus}
-                                  inferenceReady={inferenceReady}
-                                  inferenceSummaryText={inferenceSummaryText}
-                                  inferenceTransport={inferenceTransport}
-                                  browserTargetUrl={browserTargetUrl}
-                                  browserCdpUrl={browserCdpUrl}
-                                  inferenceBusy={inferenceBusy}
-                                  inferenceStatus={inferenceStatus}
 
-                                  hideInlineCard
-                                  onOpenConfig={openGlobalInferenceConfig}
-                                  onTransportChange={(value) => setInferenceTransport(value)}
-                                  onBrowserTargetUrlChange={setBrowserTargetUrl}
-                                  onBrowserCdpUrlChange={setBrowserCdpUrl}
-                                  onSaveConfig={() => void handleSaveGlobalInference()}
-                                />
                               </>
                             ) : null}
                           </Stack>

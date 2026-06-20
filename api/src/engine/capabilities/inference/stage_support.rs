@@ -34,6 +34,17 @@ pub fn prepare_inference_stage_state(
             .cloned()
             .unwrap_or_else(|| json!({})),
     );
+    let review_failure_fragment = fragments
+        .get("review_failure")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(fragment) = review_failure_fragment.as_deref() {
+        if let Some(obj) = fragments.as_object_mut() {
+            obj.insert("review_failure".to_string(), Value::String(fragment.to_string()));
+        }
+    }
 
     let include_repo_context = shared_inference_primitive_enabled(
         global_state,
@@ -180,6 +191,7 @@ pub fn prepare_inference_stage_state(
     );
     enabled_obj.insert("planning_fragment".to_string(), Value::Bool(include_planning_fragment && fragments.get("planning_fragment").and_then(Value::as_str).map(|value| !value.trim().is_empty()).unwrap_or(false)));
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
+    enabled_obj.insert("review_failure".to_string(), Value::Bool(review_failure_fragment.is_some()));
     enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 
     let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
