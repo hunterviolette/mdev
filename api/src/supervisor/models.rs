@@ -18,6 +18,7 @@ pub enum SupervisorStatus {
     Created,
     Snapshotting,
     RunningChildren,
+    DevelopmentComplete,
     RunningIntegration,
     Validating,
     ReadyToApply,
@@ -72,6 +73,19 @@ pub struct CreateSupervisorRunRequest {
     pub execution_plan_items: Vec<ExecutionPlanItem>,
     #[serde(default)]
     pub context: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsureSupervisorPlannerRequest {
+    pub root_repo_path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsureSupervisorPlannerResponse {
+    pub created: bool,
+    pub supervisor_run: SupervisorRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

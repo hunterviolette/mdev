@@ -5,10 +5,12 @@ type GlobalCapabilitiesPanelProps = {
   onOpenInference: () => void;
   onOpenRepoFragment: () => void;
   onOpenChangesetSchema: () => void;
+  onOpenPlanner: () => void;
   onOpenApplyChangeset: () => void;
   onOpenGitPatchPayload: () => void;
   repoContextArmed: boolean;
   changesetSchemaArmed: boolean;
+  plannerArmed: boolean;
 };
 
 type CapabilityCardProps = {
@@ -53,10 +55,12 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
     onOpenInference,
     onOpenRepoFragment,
     onOpenChangesetSchema,
+    onOpenPlanner,
     onOpenApplyChangeset,
     onOpenGitPatchPayload,
     repoContextArmed,
     changesetSchemaArmed,
+    plannerArmed,
   } = props;
 
   return (
@@ -96,6 +100,14 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           buttonLabel="Patch schema"
           onClick={onOpenChangesetSchema}
           badge={<ArmedBadge armed={changesetSchemaArmed} />}
+        />
+        <CapabilityCard
+          eyebrow="Planner"
+          title="Repo planner"
+          description="Create or edit the repo-level supervisor planner shared by every workflow using this repo root."
+          buttonLabel="Open planner"
+          onClick={onOpenPlanner}
+          badge={<ArmedBadge armed={plannerArmed} />}
         />
         <CapabilityCard
           eyebrow="Apply"

@@ -690,7 +690,16 @@ fn resolve_effective_execution_plan(
             run_after: vec![],
             condition: Value::Null,
         }]),
-        "merge_patches" => Ok(vec![]),
+        "merge_patches" => Ok(vec![StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "git_patch_payload".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec![],
+            condition: Value::Null,
+        }]),
         _ => {
             if !step.execution_plan.is_empty() {
                 Ok(step.execution_plan.clone())

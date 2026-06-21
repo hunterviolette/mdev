@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Alert, Badge, Button, Card, Group, Modal, Select, Stack, Table, Text, Textarea, TextInput } from '@mantine/core';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Badge, Button, Card, Checkbox, Group, Modal, Select, Stack, Table, Text, Textarea, TextInput } from '@mantine/core';
 import type { WorkflowTemplate } from './api';
 import { refineSupervisorFeature, updateSupervisorPlan, type FeaturePlanItem, type SupervisorRun } from './supervisor_api';
 
@@ -10,6 +10,9 @@ type Props = {
   onClose: () => void;
   onSaved: () => Promise<void> | void;
   onWorkflowRunCreated?: (workflowRunId: string) => Promise<void> | void;
+  selectionMode?: boolean;
+  selectedFeatureId?: string | null;
+  onSelectFeature?: (feature: FeaturePlanItem) => Promise<void> | void;
 };
 
 function emptyPlannerItem(index: number): FeaturePlanItem {
@@ -35,6 +38,44 @@ function lines(value: string): string[] {
 
 function text(values: string[]): string {
   return values.join('\n');
+}
+
+function importString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function importStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean);
+}
+
+function importFeature(value: unknown, index: number): FeaturePlanItem {
+  const item = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const status = importString(item.status);
+  const normalizedStatus: FeaturePlanItem['status'] = status === 'fine' || status === 'scheduled' || status === 'completed' ? status : 'rough';
+  return {
+    id: importString(item.id).trim() || crypto.randomUUID(),
+    title: importString(item.title).trim() || `Feature ${index + 1}`,
+    status: normalizedStatus,
+    summary: importString(item.summary),
+    rough_summary: typeof item.rough_summary === 'string' ? item.rough_summary : null,
+    refinement_workflow_run_id: typeof item.refinement_workflow_run_id === 'string' ? item.refinement_workflow_run_id : null,
+    requirements: importStringArray(item.requirements),
+    acceptance_criteria: importStringArray(item.acceptance_criteria),
+    implementation_notes: importStringArray(item.implementation_notes),
+    review_expectations: importStringArray(item.review_expectations),
+    target_files_or_areas: importStringArray(item.target_files_or_areas),
+    dependencies: importStringArray(item.dependencies)
+  };
+}
+
+function exportedPlannerFilename(run: SupervisorRun | null | undefined): string {
+  const base = (run?.title ?? 'planner')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'planner';
+  return `${base}-features.json`;
 }
 
 function definitionLabel(status: FeaturePlanItem['status']): string {
@@ -75,12 +116,15 @@ function normalizeFeature(item: FeaturePlanItem, index: number): FeaturePlanItem
   };
 }
 
-export function SupervisorPlannerModal({ opened, run, templates, onClose, onSaved, onWorkflowRunCreated }: Props) {
+export function SupervisorPlannerModal({ opened, run, templates, onClose, onSaved, onWorkflowRunCreated, selectionMode = false, selectedFeatureId = null, onSelectFeature }: Props) {
   const [features, setFeatures] = useState<FeaturePlanItem[]>([]);
   const [expandedFeatureId, setExpandedFeatureId] = useState<string | null>(null);
   const [refinementTemplateId, setRefinementTemplateId] = useState<string | null>(null);
   const [featureFilter, setFeatureFilter] = useState<string>('all');
   const [error, setError] = useState<string | null>(null);
+  const [exportFeatureIds, setExportFeatureIds] = useState<Set<string>>(new Set());
+  const [exportMode, setExportMode] = useState<'all' | 'selected'>('all');
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const templateOptions = useMemo(() => templates.map((template) => ({ value: template.id, label: template.name })), [templates]);
   const scheduledFeatureIds = useMemo(() => new Set((run?.execution_plan_items ?? []).map((item) => item.feature_plan_item_id)), [run?.execution_plan_items]);
   const visibleFeatures = useMemo(() => features.map((item, index) => ({ item, index })).filter(({ item }) => {
@@ -104,6 +148,13 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     setError(null);
   }, [opened, run?.id, defaultRefinementTemplate?.id]);
 
+  useEffect(() => {
+    setExportFeatureIds((prev) => {
+      const currentIds = new Set(features.map((item) => item.id));
+      return new Set(Array.from(prev).filter((id) => currentIds.has(id)));
+    });
+  }, [features]);
+
   function updateFeature(index: number, patch: Partial<FeaturePlanItem>) {
     setFeatures((prev) => prev.map((item, idx) => idx === index ? { ...item, ...patch } : item));
   }
@@ -118,6 +169,85 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
 
   function removeFeature(index: number) {
     setFeatures((prev) => prev.filter((_, idx) => idx !== index));
+  }
+
+  function downloadFeatures() {
+    const selectedFeatures = exportMode === 'all'
+      ? features
+      : features.filter((item) => exportFeatureIds.has(item.id));
+    if (selectedFeatures.length === 0) {
+      setError('Select at least one feature to download.');
+      return;
+    }
+    const payload = {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      root_repo_path: run?.root_repo_path ?? null,
+      export_mode: exportMode,
+      features: selectedFeatures.map((item, index) => normalizeFeature(item, index))
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = exportedPlannerFilename(run);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function toggleExportFeature(featureId: string, checked: boolean) {
+    setExportFeatureIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(featureId);
+      else next.delete(featureId);
+      return next;
+    });
+  }
+
+  function selectAllExportFeatures() {
+    setExportFeatureIds(new Set(features.map((item) => item.id)));
+    setExportMode('selected');
+  }
+
+  function clearExportFeatures() {
+    setExportFeatureIds(new Set());
+    setExportMode('selected');
+  }
+
+  async function importFeaturesFile(file: File | null | undefined) {
+    if (!file) return;
+    setError(null);
+    try {
+      const payload = JSON.parse(await file.text()) as unknown;
+      const rawFeatures = Array.isArray(payload)
+        ? payload
+        : Array.isArray((payload as Record<string, unknown> | null)?.features)
+          ? ((payload as Record<string, unknown>).features as unknown[])
+          : null;
+      if (!rawFeatures) {
+        setError('Planner import must be a JSON feature array or an object with a features array.');
+        return;
+      }
+      setFeatures((prev) => {
+        const existingIds = new Set(prev.map((item) => item.id));
+        const imported = rawFeatures.map((item, index) => {
+          const feature = importFeature(item, prev.length + index);
+          if (existingIds.has(feature.id)) {
+            feature.id = crypto.randomUUID();
+          }
+          existingIds.add(feature.id);
+          return feature;
+        });
+        if (imported.length > 0) setExpandedFeatureId(imported[0].id);
+        return [...prev, ...imported];
+      });
+    } catch (err) {
+      setError(`Planner import failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (importInputRef.current) importInputRef.current.value = '';
+    }
   }
 
   async function saveFeature(index: number): Promise<FeaturePlanItem | null> {
@@ -229,10 +359,29 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
       <Stack gap="md">
         {error ? <Alert color="red">{error}</Alert> : null}
         <Group justify="space-between">
-          <Text size="sm" c="dimmed">Create rough features as a single prompt. Refinement is handled by a design workflow that emits structured output back into this planner.</Text>
+          <Text size="sm" c="dimmed">{selectionMode ? 'Open, add, edit, save, or select a planner feature for this workflow.' : 'Create rough features as a single prompt. Refinement is handled by a design workflow that emits structured output back into this planner.'}</Text>
           <Group>
-            <Select value={effectiveRefinementTemplateId} onChange={setRefinementTemplateId} data={templateOptions} placeholder="Refinement workflow" searchable w={300} />
-            <Button size="xs" variant="light" onClick={addFeature}>Add feature</Button>
+            {!selectionMode ? <Select value={effectiveRefinementTemplateId} onChange={setRefinementTemplateId} data={templateOptions} placeholder="Refinement workflow" searchable w={300} /> : null}
+            <Button size="xs" variant="light" onClick={addFeature}>New feature</Button>
+            <Select
+              size="xs"
+              w={180}
+              value={exportMode}
+              onChange={(value) => setExportMode(value === 'selected' ? 'selected' : 'all')}
+              data={[
+                { value: 'all', label: 'Download all' },
+                { value: 'selected', label: 'Download selected' }
+              ]}
+            />
+            <Button size="xs" variant="default" onClick={downloadFeatures} disabled={features.length === 0 || (exportMode === 'selected' && exportFeatureIds.size === 0)}>Download JSON</Button>
+            <Button size="xs" variant="default" onClick={() => importInputRef.current?.click()}>Upload JSON</Button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={(event) => void importFeaturesFile(event.currentTarget.files?.[0])}
+            />
           </Group>
         </Group>
         <Card withBorder>
@@ -260,10 +409,17 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               />
               <Text size="sm" c="dimmed">{visibleFeatures.length} shown / {features.length} total</Text>
             </Group>
+            {exportMode === 'selected' ? (
+              <Group>
+                <Text size="xs" c="dimmed">{exportFeatureIds.size} selected for download</Text>
+                <Button size="compact-xs" variant="subtle" onClick={selectAllExportFeatures} disabled={features.length === 0}>Select all</Button>
+                <Button size="compact-xs" variant="subtle" color="gray" onClick={clearExportFeatures} disabled={exportFeatureIds.size === 0}>Clear</Button>
+              </Group>
+            ) : null}
             <Table striped highlightOnHover>
               <Table.Thead>
                 <Table.Tr>
-
+                  {exportMode === 'selected' ? <Table.Th>Download</Table.Th> : null}
                   <Table.Th>Feature</Table.Th>
                   <Table.Th>Definition</Table.Th>
                   <Table.Th>Requirements</Table.Th>
@@ -274,6 +430,14 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               <Table.Tbody>
                 {visibleFeatures.map(({ item, index }) => (
                   <Table.Tr key={`${item.id}-${index}`}>
+                    {exportMode === 'selected' ? (
+                      <Table.Td>
+                        <Checkbox
+                          checked={exportFeatureIds.has(item.id)}
+                          onChange={(event) => toggleExportFeature(item.id, event.currentTarget.checked)}
+                        />
+                      </Table.Td>
+                    ) : null}
                     <Table.Td>
                       <Stack gap={2}>
                         <Text fw={600}>{item.title}</Text>
@@ -286,13 +450,19 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
                     <Table.Td>
                       <Group justify="flex-end" gap="xs">
                         <Button size="xs" variant="light" onClick={() => setExpandedFeatureId(expandedFeatureId === item.id ? null : item.id)}>{expandedFeatureId === item.id ? 'Close' : 'Open'}</Button>
-                        <Button size="xs" variant="light" onClick={() => refineFeature(index)}>Refine</Button>
-                        {scheduledFeatureIds.has(item.id) ? (
-                          <Button size="xs" variant="subtle" color="orange" onClick={() => unscheduleFeature(item.id)}>Unschedule</Button>
+                        {selectionMode ? (
+                          <Button size="xs" variant={selectedFeatureId === item.id ? 'filled' : 'light'} onClick={() => onSelectFeature?.(item)}>{selectedFeatureId === item.id ? 'Selected' : 'Select'}</Button>
                         ) : (
-                          <Button size="xs" variant="subtle" onClick={() => scheduleFeature(index)} disabled={item.status !== 'fine'}>Schedule</Button>
+                          <>
+                            <Button size="xs" variant="light" onClick={() => refineFeature(index)}>Refine</Button>
+                            {scheduledFeatureIds.has(item.id) ? (
+                              <Button size="xs" variant="subtle" color="orange" onClick={() => unscheduleFeature(item.id)}>Unschedule</Button>
+                            ) : (
+                              <Button size="xs" variant="subtle" onClick={() => scheduleFeature(index)} disabled={item.status !== 'fine'}>Schedule</Button>
+                            )}
+                            <Button size="xs" color="red" variant="subtle" onClick={() => removeFeature(index)}>Remove</Button>
+                          </>
                         )}
-                        <Button size="xs" color="red" variant="subtle" onClick={() => removeFeature(index)}>Remove</Button>
                       </Group>
                     </Table.Td>
                   </Table.Tr>
@@ -333,7 +503,11 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               ) : null}
               <Group justify="flex-end">
                 <Button variant="default" onClick={() => saveFeature(index)}>Save feature</Button>
-                <Button variant="light" onClick={() => refineFeature(index)}>Refine with workflow</Button>
+                {selectionMode ? (
+                  <Button variant={selectedFeatureId === item.id ? 'filled' : 'light'} onClick={() => onSelectFeature?.(item)}>{selectedFeatureId === item.id ? 'Selected' : 'Select'}</Button>
+                ) : (
+                  <Button variant="light" onClick={() => refineFeature(index)}>Refine with workflow</Button>
+                )}
               </Group>
             </Stack>
           </Card>

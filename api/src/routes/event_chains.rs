@@ -125,12 +125,18 @@ async fn build_event_chain_summary(
                 .map(|(_, name)| name.clone())
                 .unwrap_or_else(|| step_id.clone());
 
-            let completed_stage_event = stage_rows
+            let terminal_stage_event = stage_rows
                 .iter()
                 .rev()
-                .find(|event| event.kind == "stage_execution_completed");
+                .find(|event| {
+                    event.capability_invocation_id.is_none()
+                        && (event.kind == "stage_execution_completed"
+                            || event.kind == "stage_executed"
+                            || event.kind.ends_with("_completed")
+                            || event.kind.ends_with("_failed"))
+                });
 
-            let duration_ms = completed_stage_event.and_then(|event| {
+            let stage_terminal_duration_ms = terminal_stage_event.and_then(|event| {
                 event.payload
                     .get("duration_ms")
                     .and_then(Value::as_i64)
@@ -216,17 +222,46 @@ async fn build_event_chain_summary(
 
             capabilities.sort_by(|a, b| a.latest_created_at.cmp(&b.latest_created_at));
 
+            let capability_terminal = !capabilities.is_empty() && capabilities.iter().all(|capability| !capability.is_active);
+            let capability_failed = capabilities.iter().any(|capability| capability.status_label == "ERROR");
+            let stage_is_active = terminal_stage_event.is_none() && !capability_terminal;
+            let inferred_latest_kind = if terminal_stage_event.is_none() && capability_terminal {
+                if capability_failed { "capability_stage_failed".to_string() } else { "capability_stage_completed".to_string() }
+            } else {
+                latest.kind.clone()
+            };
+            let inferred_latest_message = if terminal_stage_event.is_none() && capability_terminal {
+                capabilities
+                    .last()
+                    .map(|capability| capability.message.clone())
+                    .unwrap_or_else(|| latest.message.clone())
+            } else {
+                latest.message.clone()
+            };
+            let inferred_latest_level = if terminal_stage_event.is_none() && capability_terminal {
+                if capability_failed { "error".to_string() } else { "info".to_string() }
+            } else {
+                latest.level.clone()
+            };
+            let duration_ms = stage_terminal_duration_ms.or_else(|| {
+                if capability_terminal {
+                    capabilities.iter().filter_map(|capability| capability.duration_ms).max()
+                } else {
+                    None
+                }
+            });
+
             Some(StageChainSummary {
                 key: format!("{}-{}", step_id, stage_execution_id),
                 step_id: step_id.clone(),
                 label,
                 stage_execution_id,
-                latest_kind: latest.kind.clone(),
-                latest_message: latest.message.clone(),
-                latest_level: latest.level.clone(),
+                latest_kind: inferred_latest_kind,
+                latest_message: inferred_latest_message,
+                latest_level: inferred_latest_level,
                 latest_created_at: latest.created_at.clone(),
-                is_current: run.current_step_id.as_deref() == Some(step_id.as_str()) && completed_stage_event.is_none(),
-                is_active: completed_stage_event.is_none(),
+                is_current: run.current_step_id.as_deref() == Some(step_id.as_str()) && stage_is_active,
+                is_active: stage_is_active,
                 event_count: stage_rows.len(),
                 duration_ms,
                 capabilities,

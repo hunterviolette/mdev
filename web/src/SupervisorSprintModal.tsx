@@ -19,16 +19,29 @@ function canApply(status: string): boolean {
   return status === 'ready_to_apply';
 }
 
+function canStartIntegration(run: SupervisorRun, integrationTemplateId: string | null): boolean {
+  return Boolean(integrationTemplateId) && ['development_complete', 'running_integration', 'ready_to_apply', 'failed'].includes(run.status) && run.child_runs.length > 0;
+}
+
 function canCancel(status: string): boolean {
   return ['snapshotting', 'running_children', 'running_integration', 'validating'].includes(status);
+}
+
+function canRestartIntegration(run: SupervisorRun, integrationTemplateId: string | null): boolean {
+  const hasIntegrationTarget = Boolean(integrationTemplateId) || Boolean(run.integration_run_id) || typeof run.context?.integration_template_id === 'string';
+  return hasIntegrationTarget && run.child_runs.length > 0 && ['running_integration', 'validating', 'ready_to_apply', 'failed'].includes(run.status);
 }
 
 function canStart(status: string): boolean {
   return ['created', 'cancelled', 'failed'].includes(status);
 }
 
+function canStartNextSprint(status: string): boolean {
+  return ['applied', 'ready_to_apply', 'failed', 'cancelled'].includes(status);
+}
+
 function statusBadgeColor(status: string): string {
-  if (['success', 'ready_to_apply', 'applied', 'completed'].includes(status)) return 'green';
+  if (['success', 'development_complete', 'ready_to_apply', 'applied', 'completed'].includes(status)) return 'green';
   if (['error', 'failed'].includes(status)) return 'red';
   if (status === 'cancelled') return 'gray';
   if (['snapshotting', 'running', 'running_children', 'running_integration', 'validating', 'queued'].includes(status)) return 'blue';
@@ -48,6 +61,37 @@ function shortId(value: string | null | undefined): string {
 function workflowName(templates: WorkflowTemplate[], id: string | null | undefined): string {
   if (!id) return '—';
   return templates.find((template) => template.id === id)?.name ?? id;
+}
+
+function sprintStageState(run: SupervisorRun, stage: 'development' | 'integration' | 'apply'): 'active' | 'complete' | 'up_next' | 'blocked' {
+  if (stage === 'development') {
+    if (['created', 'snapshotting', 'running_children'].includes(run.status)) return 'active';
+    if (['development_complete', 'running_integration', 'validating', 'ready_to_apply', 'applied'].includes(run.status)) return 'complete';
+    return 'blocked';
+  }
+  if (stage === 'integration') {
+    if (['running_integration', 'validating'].includes(run.status)) return 'active';
+    if (['ready_to_apply', 'applied'].includes(run.status)) return 'complete';
+    if (run.status === 'development_complete') return 'up_next';
+    return 'blocked';
+  }
+  if (run.status === 'applied') return 'complete';
+  if (run.status === 'ready_to_apply') return 'active';
+  return 'up_next';
+}
+
+function sprintStageBadgeColor(state: 'active' | 'complete' | 'up_next' | 'blocked'): string {
+  if (state === 'complete') return 'green';
+  if (state === 'active') return 'blue';
+  if (state === 'blocked') return 'red';
+  return 'gray';
+}
+
+function sprintStageLabel(state: 'active' | 'complete' | 'up_next' | 'blocked'): string {
+  if (state === 'complete') return 'COMPLETE';
+  if (state === 'active') return 'ACTIVE';
+  if (state === 'blocked') return 'BLOCKED';
+  return 'UP NEXT';
 }
 
 function isChildDone(child: SupervisorChildRun): boolean {
@@ -106,8 +150,8 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
         setError('Select a workflow template before starting the sprint.');
         return;
       }
-      if (strategy === 'parallel' && !integrationTemplateId) {
-        setError('Select an integration workflow before starting a parallel sprint.');
+      if (!integrationTemplateId) {
+        setError('Select an integration workflow before starting the sprint.');
         return;
       }
       const sprintItems = scheduledItemsForStart;
@@ -118,7 +162,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
       await updateSupervisorPlan(run.id, run.feature_plan_items, sprintItems, {
         sprint_strategy: strategy,
         workflow_template_id: workflowTemplateId,
-        integration_template_id: strategy === 'parallel' ? integrationTemplateId : null
+        integration_template_id: integrationTemplateId
       });
       await runSupervisorAction(run.id, 'start');
       await onChanged();
@@ -127,10 +171,28 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
     }
   }
 
-  async function action(actionName: 'tick' | 'apply' | 'cancel') {
+  async function action(actionName: 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'reopen_development' | 'new_sprint') {
     if (!run) return;
     setError(null);
     try {
+      if (actionName === 'start_integration') {
+        if (!integrationTemplateId) {
+          setError('Select an integration workflow before starting integration.');
+          return;
+        }
+        await updateSupervisorPlan(run.id, run.feature_plan_items, scheduledItemsForStart, {
+          sprint_strategy: strategy,
+          workflow_template_id: workflowTemplateId,
+          integration_template_id: integrationTemplateId
+        });
+      }
+      if (actionName === 'restart_integration' && integrationTemplateId) {
+        await updateSupervisorPlan(run.id, run.feature_plan_items, scheduledItemsForStart, {
+          sprint_strategy: strategy,
+          workflow_template_id: workflowTemplateId,
+          integration_template_id: integrationTemplateId
+        });
+      }
       await runSupervisorAction(run.id, actionName);
       await onChanged();
     } catch (err) {
@@ -157,7 +219,43 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                   </Text>
                 </Group>
 
-                {canStart(run.status) ? (
+                <Group grow align="stretch">
+                  {(['development', 'integration', 'apply'] as const).map((stage, index) => {
+                    const stageState = sprintStageState(run, stage);
+                    return (
+                      <Card key={stage} withBorder>
+                        <Stack gap={4}>
+                          <Badge w="fit-content" color={sprintStageBadgeColor(stageState)}>{index + 1}</Badge>
+                          <Text fw={700}>{stage === 'development' ? 'Development' : stage === 'integration' ? 'Integration' : 'Apply'}</Text>
+                          <Text size="xs" c="dimmed">
+                            {stage === 'development' ? 'Feature workflows' : stage === 'integration' ? 'Live worktree integration' : 'Complete sprint'}
+                          </Text>
+                          <Badge w="fit-content" color={sprintStageBadgeColor(stageState)}>{sprintStageLabel(stageState)}</Badge>
+                          {stage === 'development' && stageState === 'active' && canStart(run.status) ? (
+                            <Button mt="xs" size="xs" onClick={startSprint}>{run.status === 'created' ? 'Start sprint' : 'Restart sprint'}</Button>
+                          ) : null}
+                          {stage === 'development' && ['running_integration', 'ready_to_apply', 'applied', 'failed'].includes(run.status) ? (
+                            <Button mt="xs" size="xs" variant="light" onClick={() => action('reopen_development')}>Reopen development</Button>
+                          ) : null}
+                          {stage === 'development' && run.status === 'applied' ? (
+                            <Button mt="xs" size="xs" variant="light" onClick={() => action('new_sprint')}>Start next sprint</Button>
+                          ) : null}
+                          {stage === 'integration' && stageState === 'up_next' ? (
+                            <Button mt="xs" size="xs" disabled={!canStartIntegration(run, integrationTemplateId)} onClick={() => action('start_integration')}>Start integration</Button>
+                          ) : null}
+                          {stage === 'integration' && ['running_integration', 'ready_to_apply', 'applied', 'failed'].includes(run.status) ? (
+                            <Button mt="xs" size="xs" variant="light" disabled={!canRestartIntegration(run, integrationTemplateId)} onClick={() => action('restart_integration')}>Restart integration</Button>
+                          ) : null}
+                          {stage === 'apply' && stageState === 'active' ? (
+                            <Button mt="xs" size="xs" disabled={!canApply(run.status)} onClick={() => action('apply')}>Apply sprint</Button>
+                          ) : null}
+                        </Stack>
+                      </Card>
+                    );
+                  })}
+                </Group>
+
+                {canStart(run.status) || ['development_complete', 'running_integration', 'validating', 'ready_to_apply', 'failed'].includes(run.status) ? (
                   <Stack gap="sm">
                     <Group grow align="flex-end">
                       <Select
@@ -180,16 +278,14 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                       />
                     </Group>
 
-                    {strategy === 'parallel' ? (
-                      <Select
-                        label="Integration workflow"
-                        placeholder="Select integration workflow"
-                        value={integrationTemplateId}
-                        onChange={setIntegrationTemplateId}
-                        data={templateOptions}
-                        searchable
-                      />
-                    ) : null}
+                    <Select
+                      label="Integration workflow"
+                      placeholder="Select integration workflow"
+                      value={integrationTemplateId}
+                      onChange={setIntegrationTemplateId}
+                      data={templateOptions}
+                      searchable
+                    />
                   </Stack>
                 ) : null}
 
@@ -304,14 +400,35 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
               </Stack>
             </Card>
 
-            <Group justify="flex-end">
-              {canStart(run.status) ? (
-                <Button onClick={startSprint}>{run.status === 'created' ? 'Start sprint' : 'Restart sprint'}</Button>
-              ) : null}
-              <Button variant="light" onClick={() => action('tick')}>Refresh sprint status</Button>
-              <Button disabled={!canApply(run.status)} onClick={() => action('apply')}>Apply sprint</Button>
-              <Button color="red" variant="light" disabled={!canCancel(run.status)} onClick={() => action('cancel')}>Cancel sprint</Button>
-            </Group>
+            {Array.isArray(run.context?.sprint_history) && run.context.sprint_history.length > 0 ? (
+              <Card withBorder>
+                <Stack gap="xs">
+                  <Group justify="space-between">
+                    <Text fw={700}>Sprint history</Text>
+                    <Badge variant="light">{run.context.sprint_history.length}</Badge>
+                  </Group>
+                  <Table striped withTableBorder>
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>Sprint</Table.Th>
+                        <Table.Th>Applied</Table.Th>
+                        <Table.Th>Features</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {(run.context.sprint_history as any[]).map((sprint, index) => (
+                        <Table.Tr key={String(sprint.sprint_id ?? index)}>
+                          <Table.Td>{String(sprint.title ?? sprint.sprint_id ?? `Sprint ${index + 1}`)}</Table.Td>
+                          <Table.Td>{String(sprint.applied_at ?? '—')}</Table.Td>
+                          <Table.Td>{Array.isArray(sprint.features) ? sprint.features.length : 0}</Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                </Stack>
+              </Card>
+            ) : null}
+
           </>
         ) : null}
       </Stack>

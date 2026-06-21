@@ -3,7 +3,7 @@ import { Alert, Badge, Button, Card, Group, Stack, Table, Text, TextInput, Title
 import { listTemplates, type WorkflowTemplate } from './api';
 import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { SupervisorSprintModal } from './SupervisorSprintModal';
-import { createSupervisorRun, deleteSupervisorRun, listSupervisorRuns, runSupervisorAction, type SupervisorRun } from './supervisor_api';
+import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, listSupervisorRuns, runSupervisorAction, type SupervisorRun } from './supervisor_api';
 
 function hasVisibleSprint(status: string): boolean {
   return ['snapshotting', 'running_children', 'running_integration', 'validating', 'ready_to_apply', 'applied', 'failed', 'cancelled'].includes(status);
@@ -69,6 +69,22 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
         return;
       }
       setSprintOpen(true);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openPlannerForSelectedRepo() {
+    if (!selected) return;
+    setError(null);
+    try {
+      const response = await ensureSupervisorPlannerRun({
+        root_repo_path: selected.root_repo_path,
+        title: selected.title
+      });
+      await refresh();
+      setSelectedId(response.supervisor_run.id);
+      setPlannerOpen(true);
     } catch (err) {
       setError(String(err));
     }
@@ -141,7 +157,7 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
                 <Badge variant="light">{selected.strategy}</Badge>
               </Group>
               <Group>
-                <Button variant="light" onClick={() => setPlannerOpen(true)}>Planner</Button>
+                <Button variant="light" onClick={() => void openPlannerForSelectedRepo()}>Planner</Button>
                 <Button onClick={startOrViewSprint}>{sprintButtonLabel(selected)}</Button>
                 <Button color="red" variant="subtle" onClick={removeRun}>Delete</Button>
               </Group>

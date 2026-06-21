@@ -277,8 +277,8 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                     Some(stage_id.as_str()),
                     "info",
                     "disposition_review_resolved",
-                    "Operator approved terminal review stage; workflow completed successfully.",
-                    json!({ "disposition": "move_next", "stage_id": stage_id }),
+                    "Operator approved the final workflow stage; workflow completed successfully.",
+                    json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": Value::Null }),
                 ).await?;
 
                 append_disposition_stage_completion_event(
@@ -288,7 +288,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                     stage_execution_id.as_deref(),
                     true,
                     "success",
-                    "Terminal review approved. Workflow completed successfully.",
+                    "Final workflow stage completed successfully after disposition review.",
                     None,
                 ).await?;
 
@@ -298,6 +298,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                     "status": "success",
                     "disposition": "move_next",
                     "current_step_id": stage_id,
+                    "next_step_id": Value::Null,
                     "followup_action": "complete_workflow"
                 }));
             }
@@ -311,7 +312,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 "info",
                 "disposition_review_resolved",
                 "Operator approved moving to the next stage after disposition review.",
-                json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": target }),
+                json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": target.clone() }),
             ).await?;
 
             let latest_run = load_run(state, run_id).await?;

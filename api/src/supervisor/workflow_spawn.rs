@@ -192,13 +192,31 @@ pub async fn spawn_integration_workflow(
     template_id: Option<Uuid>,
     supervisor_context: Value,
 ) -> Result<Uuid> {
-    let definition = match template_id {
+    let mut definition = match template_id {
         Some(template_id) => load_template_definition(state, template_id).await?,
         None => integration_definition(),
     };
+
+    for step in definition.steps.iter_mut() {
+        if step.step_type == "merge_patches" {
+            if !step.config.is_object() {
+                step.config = json!({});
+            }
+            if let Some(obj) = step.config.as_object_mut() {
+                obj.insert("patches".to_string(), Value::Array(patch_paths.clone()));
+            }
+        }
+    }
+
     insert_and_start_run(state, title, integration_path, template_id, definition, json!({
         "supervisor": supervisor_context,
-        "patches": patch_paths
+        "workflow_engine": {
+            "global_state": {
+                "supervisor": {
+                    "patches": patch_paths
+                }
+            }
+        }
     })).await
 }
 
@@ -358,29 +376,80 @@ fn integration_definition() -> WorkflowTemplateDefinition {
         version: 1,
         globals: WorkflowGlobalConfig::default(),
         governance: json!({}),
-        steps: vec![WorkflowStepDefinition {
-            id: "merge".to_string(),
-            name: "Merge patches".to_string(),
-            step_type: "code".to_string(),
-            automation_mode: AutomationMode::Automatic,
-            execution: WorkflowStepExecutionConfig::default(),
-            prompt: WorkflowStepPromptConfig {
-                include_repo_context: true,
-                include_changeset_schema: true,
-                include_user_context: true,
+        steps: vec![
+            WorkflowStepDefinition {
+                id: "merge_patches".to_string(),
+                name: "Merge patches".to_string(),
+                step_type: "merge_patches".to_string(),
+                automation_mode: AutomationMode::Automatic,
+                execution: WorkflowStepExecutionConfig::default(),
+                prompt: WorkflowStepPromptConfig {
+                    include_repo_context: false,
+                    include_changeset_schema: false,
+                    include_user_context: true,
+                },
+                config: json!({}),
+                capabilities: Vec::new(),
+                execution_logic: json!({
+                    "kind": "merge_patches_stage_policy",
+                    "automation": {
+                        "apply_patches": true
+                    },
+                    "on_success": {
+                        "disposition": "move_next",
+                        "message": "Patches merged successfully."
+                    },
+                    "on_error": {
+                        "disposition": "stay",
+                        "message": "Patch merge failed."
+                    }
+                }),
+                execution_plan: Vec::new(),
+                transitions: Vec::new(),
+                advancement: WorkflowStepAdvancementConfig {
+                    mode: Some("automatic".to_string()),
+                    auto_run_on_enter: true,
+                    auto_advance_on_success: true,
+                    auto_advance_on_error: false,
+                    auto_advance_on_paused: false,
+                },
             },
-            config: json!({}),
-            capabilities: Vec::new(),
-            execution_logic: json!({}),
-            execution_plan: Vec::new(),
-            transitions: Vec::new(),
-            advancement: WorkflowStepAdvancementConfig {
-                mode: Some("auto".to_string()),
-                auto_run_on_enter: true,
-                auto_advance_on_success: false,
-                auto_advance_on_error: false,
-                auto_advance_on_paused: false,
-            },
-        }],
+            WorkflowStepDefinition {
+                id: "review".to_string(),
+                name: "Review".to_string(),
+                step_type: "review".to_string(),
+                automation_mode: AutomationMode::Manual,
+                execution: WorkflowStepExecutionConfig::default(),
+                prompt: WorkflowStepPromptConfig {
+                    include_repo_context: false,
+                    include_changeset_schema: false,
+                    include_user_context: true,
+                },
+                config: json!({}),
+                capabilities: Vec::new(),
+                execution_logic: json!({
+                    "kind": "review_stage_policy",
+                    "require_manual_approval": true,
+                    "ai_review": {
+                        "enabled": false
+                    },
+                    "automation": {
+                        "disposition_review": {
+                            "enabled": true,
+                            "available_dispositions": ["move_next", "pause"]
+                        }
+                    }
+                }),
+                execution_plan: Vec::new(),
+                transitions: Vec::new(),
+                advancement: WorkflowStepAdvancementConfig {
+                    mode: Some("manual".to_string()),
+                    auto_run_on_enter: false,
+                    auto_advance_on_success: false,
+                    auto_advance_on_error: false,
+                    auto_advance_on_paused: false,
+                },
+            }
+        ],
     }
 }

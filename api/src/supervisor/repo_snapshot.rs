@@ -49,6 +49,18 @@ pub fn create_workspace(root_repo_path: &str, supervisor_id: Uuid, items: &[Feat
     Ok(workspace)
 }
 
+pub fn refresh_integration_from_worktree(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
+    let workspace = workspace_for(root_repo_path, supervisor_id)?;
+    fs::create_dir_all(&workspace.root)?;
+    fs::create_dir_all(&workspace.shards)?;
+    fs::create_dir_all(&workspace.patches)?;
+    fs::create_dir_all(&workspace.logs)?;
+    copy_repo_tree(Path::new(root_repo_path), &workspace.integration, Some(&workspace.root))?;
+    tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, integration = %workspace.integration.display(), "refreshed supervisor integration shard from current worktree");
+    Ok(workspace)
+}
+
+
 pub fn shard_path(workspace: &SupervisorWorkspace, execution_item_id: &str) -> PathBuf {
     workspace.shards.join(sanitize_path_segment(execution_item_id))
 }

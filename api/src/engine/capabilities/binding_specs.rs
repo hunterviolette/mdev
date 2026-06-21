@@ -50,6 +50,7 @@ pub fn stage_supports_shared_capability(step: &WorkflowStepDefinition, primitive
         }
         "planner_fragment" => {
             step.step_type == "design"
+                || step.step_type == "code"
                 || step.step_type == "review"
                 || step
                     .execution_logic

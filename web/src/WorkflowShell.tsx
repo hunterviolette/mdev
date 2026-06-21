@@ -89,9 +89,10 @@ import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
-import { getSupervisorRun, listSupervisorRuns, type FeaturePlanItem } from './supervisor_api';
+import { ensureSupervisorPlannerRun, getSupervisorRun, listSupervisorRuns, type FeaturePlanItem, type SupervisorRun } from './supervisor_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
+import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 
 const ReviewDiffViewerPanel = lazy(async () => {
@@ -398,13 +399,15 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
   sharedPlannerFragmentState: Record<string, unknown> | null;
+  plannerAvailableForRepo: boolean;
+  activePlannerFeatureTitle: string | null;
   stageIncludeRepoContext: boolean;
   stageIncludeChangesetSchema: boolean;
   disabled: boolean;
   onToggleSharedRepoContext: () => void;
   onToggleSharedChangesetSchema: () => void;
   onTogglePlanningFragment: () => void;
-  onOpenPlannerFragmentConfig: () => void;
+  onOpenPlanner: () => void;
   onPatchSelectedStepConfig: (key: string, value: unknown) => void;
   onOpenInferenceConfig: () => void;
   onOpenRepoConfig: () => void;
@@ -425,13 +428,15 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     inferenceTransport,
     sharedInferenceState,
     sharedPlannerFragmentState,
+    plannerAvailableForRepo,
+    activePlannerFeatureTitle,
     stageIncludeRepoContext,
     stageIncludeChangesetSchema,
     disabled,
     onToggleSharedRepoContext,
     onToggleSharedChangesetSchema,
     onTogglePlanningFragment,
-    onOpenPlannerFragmentConfig,
+    onOpenPlanner,
     onPatchSelectedStepConfig,
     onOpenInferenceConfig,
     onOpenRepoConfig,
@@ -470,6 +475,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed && selectedPlannerFeatureId);
   const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
   const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
+  const plannerSupportedStep = selectedWorkflowStep?.step_type === 'design' || selectedWorkflowStep?.step_type === 'code' || selectedWorkflowStep?.step_type === 'review';
+  const showPlannerControls = Boolean(hasBackendPlanningFragment || planningFragmentArmed || selectedPlannerFeatureId || (plannerAvailableForRepo && plannerSupportedStep));
 
   useEffect(() => {
     setPlannerSchemaArmedDraft(null);
@@ -512,20 +519,22 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       });
     }
 
-    if (hasBackendPlanningFragment) {
+    if (showPlannerControls) {
       actions.push({
         key: 'planning_fragment',
         label: 'Planner fragment',
-        buttonLabel: 'Configure',
-        onOpen: onOpenPlannerFragmentConfig,
+        buttonLabel: 'Open planner',
+        onOpen: onOpenPlanner,
         toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
         toggleColor: planningFragmentArmed ? 'orange' : 'green',
         onToggle: onTogglePlanningFragment,
-        helperText: 'Injects the selected planner feature into the next prompt.'
+        helperText: activePlannerFeatureTitle
+          ? `Selected feature: ${activePlannerFeatureTitle}`
+          : 'No planner feature selected.'
       });
     }
 
-    if (hasBackendPlanningFragment && selectedWorkflowStep?.step_type === 'design') {
+    if (showPlannerControls && selectedWorkflowStep?.step_type === 'design') {
       actions.push({
         key: 'planner_schema',
         label: 'Planner schema',
@@ -599,10 +608,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     onOpenSchemaConfig,
     onToggleSharedChangesetSchema,
     hasBackendPlanningFragment,
+    plannerAvailableForRepo,
+    showPlannerControls,
     planningFragmentArmed,
     onTogglePlanningFragment,
-    onOpenPlannerFragmentConfig,
+    onOpenPlanner,
     selectedPlannerFeatureId,
+    activePlannerFeatureTitle,
     usesInference,
     designMode,
     fineFeatureFormatArmed,
@@ -1296,7 +1308,10 @@ export function WorkflowShell() {
   const [plannerSelectedFeatureIdDraft, setPlannerSelectedFeatureIdDraft] = useState<string | null>(null);
   const [plannerFeatureSearch, setPlannerFeatureSearch] = useState('');
   const [remotePlannerFeatureItems, setRemotePlannerFeatureItems] = useState<FeaturePlanItem[]>([]);
+  const [repoPlannerAvailable, setRepoPlannerAvailable] = useState(false);
   const [plannerFeatureViewItem, setPlannerFeatureViewItem] = useState<Record<string, unknown> | null>(null);
+  const [supervisorPlannerOpen, setSupervisorPlannerOpen] = useState(false);
+  const [supervisorPlannerRun, setSupervisorPlannerRun] = useState<SupervisorRun | null>(null);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
@@ -1347,7 +1362,7 @@ export function WorkflowShell() {
   }, []);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
-  const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting' || selectedRun?.status === 'draft';
+  const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting' || selectedRun?.status === 'draft' || selectedRun?.status === 'success';
   const isManualMode = isInteractiveMode;
   const isBackendRunLocked = Boolean(
     busy
@@ -1620,6 +1635,7 @@ export function WorkflowShell() {
     async function loadPlannerFeatures() {
       if (plannerSupervisorRunId) {
         const run = await getSupervisorRun(plannerSupervisorRunId);
+        if (!cancelled) setRepoPlannerAvailable(true);
         return run.feature_plan_items ?? [];
       }
 
@@ -1637,6 +1653,7 @@ export function WorkflowShell() {
         const repoMatches = normalizedRepoRef && normalizedRoot && normalizedRepoRef.startsWith(normalizedRoot);
         return hasSelectedFeature || repoMatches;
       });
+      if (!cancelled) setRepoPlannerAvailable(Boolean(matchingRun));
       return matchingRun?.feature_plan_items ?? [];
     }
 
@@ -1647,6 +1664,9 @@ export function WorkflowShell() {
       .catch(() => {
         if (!cancelled) setRemotePlannerFeatureItems([]);
       });
+    if (!plannerSupervisorRunId && !selectedRun?.repo_ref?.trim()) {
+      setRepoPlannerAvailable(false);
+    }
 
     return () => {
       cancelled = true;
@@ -3095,6 +3115,33 @@ export function WorkflowShell() {
         }
       }
     });
+  }
+
+  async function openRepoSupervisorPlanner() {
+    const rootRepoPath = (selectedRun?.repo_ref ?? repoRef ?? '').trim();
+    if (!rootRepoPath) {
+      setError('Repo path is required before opening the planner.');
+      return;
+    }
+
+    try {
+      setError(null);
+      const rootParts = rootRepoPath.replace(/\\/g, '/').split('/').filter(Boolean);
+      const repoName = rootParts[rootParts.length - 1] ?? 'Repo';
+      const response = await ensureSupervisorPlannerRun({
+        root_repo_path: rootRepoPath,
+        title: `${repoName} Planner`
+      });
+      setSupervisorPlannerRun(response.supervisor_run);
+      setSupervisorPlannerOpen(true);
+      if (selectedRun?.id) {
+        await patchPlannerCapabilityState({
+          supervisor_run_id: response.supervisor_run.id
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   function loadBuilderRepoContextConfig() {
@@ -4651,6 +4698,33 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         <Stack>
           {error ? <Alert color="red">{error}</Alert> : null}
 
+          {supervisorPlannerRun ? (
+            <SupervisorPlannerModal
+              opened={supervisorPlannerOpen}
+              run={supervisorPlannerRun}
+              templates={templates}
+              onClose={() => setSupervisorPlannerOpen(false)}
+              onSaved={async () => {
+                const refreshed = await getSupervisorRun(supervisorPlannerRun.id);
+                setSupervisorPlannerRun(refreshed);
+                if (selectedRun?.id) await refreshRunDetails(selectedRun.id);
+              }}
+              selectionMode
+              selectedFeatureId={selectedPlannerFeatureId}
+              onSelectFeature={async (feature) => {
+                setPlannerSelectedFeatureIdDraft(feature.id);
+                await patchPlannerCapabilityState({
+                  fragment_armed: true,
+                  selected_feature_id: feature.id,
+                  selected_feature: feature,
+                  supervisor_run_id: supervisorPlannerRun.id
+                });
+                setSupervisorPlannerOpen(false);
+              }}
+              onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
+            />
+          ) : null}
+
           {view !== 'builder' && monitorView === 'workflow_detail' ? (
             <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
               <Tabs.List>
@@ -4785,6 +4859,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <GlobalCapabilitiesPanel
                 repoContextArmed={!!sharedInferenceState?.repo_context_armed}
                 changesetSchemaArmed={!!sharedInferenceState?.changeset_schema_armed}
+                plannerArmed={!!sharedPlannerFragmentState?.supervisor_run_id}
                 onOpenInference={() => {
                   openGlobalInferenceConfig();
                 }}
@@ -4793,6 +4868,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 }}
                 onOpenChangesetSchema={() => {
                   setChangesetSchemaConfigOpen(true);
+                }}
+                onOpenPlanner={() => {
+                  void openRepoSupervisorPlanner();
                 }}
                 onOpenApplyChangeset={() => {
                   setGlobalApplyChangesetOpen(true);
@@ -4948,7 +5026,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Stack gap="md">
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
-                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !canRunCurrentStageAutomatically || isBackendRunLocked}>Run autonomously</Button>
+                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || (!canRunCurrentStageAutomatically && selectedRun?.status !== 'success') || isBackendRunLocked}>Run autonomously</Button>
                               <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>Pause after stage</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
                               <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Force unlock</Button>
@@ -5112,13 +5190,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}
                                     sharedPlannerFragmentState={sharedPlannerFragmentState}
+                  plannerAvailableForRepo={repoPlannerAvailable || Boolean(plannerSupervisorRunId)}
+                  activePlannerFeatureTitle={selectedPlannerFeature
+                    ? (typeof selectedPlannerFeature.title === 'string' && selectedPlannerFeature.title.trim()
+                        ? selectedPlannerFeature.title.trim()
+                        : typeof selectedPlannerFeature.summary === 'string' && selectedPlannerFeature.summary.trim()
+                          ? selectedPlannerFeature.summary.trim()
+                          : null)
+                    : null}
                                     stageIncludeRepoContext={stageIncludeRepoContext}
                                     stageIncludeChangesetSchema={stageIncludeChangesetSchema}
                                     disabled={isBackendRunLocked}
                                     onToggleSharedRepoContext={onToggleSharedRepoContext}
                                     onToggleSharedChangesetSchema={onToggleSharedChangesetSchema}
                                     onTogglePlanningFragment={onTogglePlanningFragment}
-                                    onOpenPlannerFragmentConfig={() => setPlannerFragmentConfigOpen(true)}
+                                    onOpenPlanner={openRepoSupervisorPlanner}
                                     onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
                                     onOpenInferenceConfig={openGlobalInferenceConfig}
                                     onOpenRepoConfig={() => setRepoContextConfigOpen(true)}

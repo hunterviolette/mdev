@@ -20,7 +20,7 @@ use crate::{
     },
     models::{RunStatus, WorkflowRun},
 };
-use models::{CreateSupervisorRunRequest, SupervisorActionRequest, SupervisorChildRun, SupervisorExecutionStrategy, SupervisorRun, SupervisorStatus};
+use models::{CreateSupervisorRunRequest, EnsureSupervisorPlannerRequest, EnsureSupervisorPlannerResponse, SupervisorActionRequest, SupervisorChildRun, SupervisorExecutionStrategy, SupervisorRun, SupervisorStatus};
 
 pub async fn list_supervisor_runs(state: &AppState) -> Result<Vec<SupervisorRun>> {
     let rows = sqlx::query("SELECT * FROM supervisor_runs ORDER BY updated_at DESC")
@@ -37,6 +37,26 @@ pub async fn load_supervisor_run(state: &AppState, id: Uuid) -> Result<Superviso
     row_to_supervisor_run(row)
 }
 
+pub async fn load_supervisor_run_reconciled(state: &AppState, id: Uuid) -> Result<SupervisorRun> {
+    let run = load_supervisor_run(state, id).await?;
+    if matches!(run.status, SupervisorStatus::RunningChildren | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating) {
+        let _ = tick_supervisor_run(state, id).await?;
+        load_supervisor_run(state, id).await
+    } else {
+        Ok(run)
+    }
+}
+
+pub async fn list_supervisor_runs_reconciled(state: &AppState) -> Result<Vec<SupervisorRun>> {
+    let runs = list_supervisor_runs(state).await?;
+    for run in &runs {
+        if matches!(run.status, SupervisorStatus::RunningChildren | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating) {
+            let _ = tick_supervisor_run(state, run.id).await;
+        }
+    }
+    list_supervisor_runs(state).await
+}
+
 pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunRequest) -> Result<SupervisorRun> {
     let id = Uuid::new_v4();
     let now = Utc::now();
@@ -48,10 +68,8 @@ pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunReq
         if let Some(template_id) = req.workflow_template_id {
             obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
         }
-        if matches!(req.strategy, SupervisorExecutionStrategy::Parallel) {
-            if let Some(template_id) = req.integration_template_id {
-                obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-            }
+        if let Some(template_id) = req.integration_template_id {
+            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
         }
     }
     let execution_plan_items = req.execution_plan_items;
@@ -76,6 +94,75 @@ pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunReq
     };
     insert_supervisor_run(state, &run).await?;
     Ok(run)
+}
+
+pub async fn ensure_supervisor_planner_run(state: &AppState, req: EnsureSupervisorPlannerRequest) -> Result<EnsureSupervisorPlannerResponse> {
+    let normalized_root = normalize_repo_root(&req.root_repo_path);
+    if normalized_root.is_empty() {
+        return Err(anyhow!("root_repo_path is required"));
+    }
+
+    let runs = list_supervisor_runs(state).await?;
+    if let Some(run) = runs.into_iter().find(|run| repo_roots_match(&run.root_repo_path, &normalized_root) && is_repo_planner_run(run)) {
+        return Ok(EnsureSupervisorPlannerResponse {
+            created: false,
+            supervisor_run: run,
+        });
+    }
+
+    let mut context = json!({
+        "planner_kind": "repo_root",
+        "repo_root_key": normalized_root,
+    });
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("root_repo_path".to_string(), Value::String(normalized_root.clone()));
+    }
+
+    let run = create_supervisor_run(state, CreateSupervisorRunRequest {
+        title: req.title.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| repo_planner_title(&normalized_root)),
+        root_repo_path: normalized_root,
+        strategy: SupervisorExecutionStrategy::Series,
+        workflow_template_id: None,
+        integration_template_id: None,
+        feature_plan_items: Vec::new(),
+        execution_plan_items: Vec::new(),
+        context,
+    }).await?;
+
+    Ok(EnsureSupervisorPlannerResponse {
+        created: true,
+        supervisor_run: run,
+    })
+}
+
+fn repo_roots_match(left: &str, right: &str) -> bool {
+    normalize_repo_root(left) == normalize_repo_root(right)
+}
+
+fn normalize_repo_root(value: &str) -> String {
+    let replaced = value.trim().replace('\\', "/");
+    let trimmed = replaced.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed
+    }
+}
+
+fn repo_planner_title(root: &str) -> String {
+    let name = root
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or("Repo");
+    format!("{} Planner", name)
+}
+
+fn is_repo_planner_run(run: &SupervisorRun) -> bool {
+    run.context
+        .get("planner_kind")
+        .and_then(Value::as_str)
+        .map(|value| value == "repo_root")
+        .unwrap_or_else(|| run.child_runs.is_empty() && run.integration_run_id.is_none() && run.final_patch_path.is_none())
 }
 
 pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
@@ -114,13 +201,9 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
         } else if payload.get("planner_refinement_template_id").is_some() {
             obj.remove("planner_refinement_template_id");
         }
-        if matches!(run.strategy, SupervisorExecutionStrategy::Parallel) {
-            if let Some(template_id) = payload.get("integration_template_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-                obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-            } else if payload.get("integration_template_id").is_some() {
-                obj.remove("integration_template_id");
-            }
-        } else {
+        if let Some(template_id) = payload.get("integration_template_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
+        } else if payload.get("integration_template_id").is_some() {
             obj.remove("integration_template_id");
         }
     }
@@ -135,7 +218,7 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
         .collect::<Vec<_>>();
     for item in &mut planner_items {
         let is_scheduled = scheduled_feature_ids.iter().any(|id| id == &item.id);
-        if is_scheduled && !matches!(item.status, FeaturePlanItemStatus::Completed) {
+        if is_scheduled && !matches!(item.status, FeaturePlanItemStatus::Completed | FeaturePlanItemStatus::Applied) {
             item.status = FeaturePlanItemStatus::Scheduled;
         } else if !is_scheduled && matches!(item.status, FeaturePlanItemStatus::Scheduled) {
             item.status = FeaturePlanItemStatus::Fine;
@@ -282,6 +365,25 @@ pub async fn apply_refined_feature_output_from_workflow(state: &AppState, workfl
     Ok(())
 }
 
+pub async fn start_next_supervisor_sprint(state: &AppState, id: Uuid) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    if !matches!(run.status, SupervisorStatus::Applied | SupervisorStatus::ReadyToApply | SupervisorStatus::Failed | SupervisorStatus::Cancelled) {
+        return Err(anyhow!("current sprint must be completed, ready, failed, or cancelled before starting another sprint"));
+    }
+    run.execution_plan_items.clear();
+    run.child_runs.clear();
+    run.integration_run_id = None;
+    run.final_patch_path = None;
+    run.merge_report = json!({});
+    run.validation_report = json!({});
+    run.snapshot_path = None;
+    run.integration_path = None;
+    run.status = SupervisorStatus::Created;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
+
 pub async fn delete_supervisor_run(state: &AppState, id: Uuid) -> Result<()> {
     sqlx::query("DELETE FROM supervisor_runs WHERE id = ?")
         .bind(id.to_string())
@@ -301,10 +403,17 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
         return Err(anyhow!("sprint has no scheduled planner items"));
     }
     run.status = SupervisorStatus::Snapshotting;
+    if !run.context.is_object() {
+        run.context = json!({});
+    }
+    if let Some(obj) = run.context.as_object_mut() {
+        obj.insert("current_sprint_id".to_string(), Value::String(Uuid::new_v4().to_string()));
+        obj.insert("current_sprint_started_at".to_string(), Value::String(Utc::now().to_rfc3339()));
+    }
     let scheduled_items = scheduled_feature_plan_items(&run)?;
     let scheduled_feature_ids = scheduled_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
     for item in &mut run.feature_plan_items {
-        if scheduled_feature_ids.iter().any(|id| id == &item.id) && !matches!(item.status, FeaturePlanItemStatus::Completed) {
+        if scheduled_feature_ids.iter().any(|id| id == &item.id) && !matches!(item.status, FeaturePlanItemStatus::Completed | FeaturePlanItemStatus::Applied) {
             item.status = FeaturePlanItemStatus::Scheduled;
         }
     }
@@ -381,7 +490,13 @@ pub async fn tick_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
 
 pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
-    let final_patch = run.final_patch_path.clone().ok_or_else(|| anyhow!("final patch is not available"))?;
+    if matches!(run.status, SupervisorStatus::RunningIntegration) {
+        tick_integration(state, &mut run).await?;
+    }
+    if !matches!(run.status, SupervisorStatus::ReadyToApply) {
+        return Err(anyhow!("integration workflow must complete successfully before applying sprint"));
+    }
+    let final_patch = run.final_patch_path.clone().filter(|value| !value.trim().is_empty()).ok_or_else(|| anyhow!("integration completed without a final patch"))?;
     patches::apply_final_patch_to_root(&PathBuf::from(&run.root_repo_path), &PathBuf::from(final_patch))?;
     let completed_at = Utc::now();
     let completed_at_text = completed_at.to_rfc3339();
@@ -390,11 +505,23 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
         .iter()
         .map(|item| item.feature_plan_item_id.clone())
         .collect::<Vec<_>>();
+    let sprint_id = run
+        .context
+        .get("current_sprint_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let sprint_title = format!("Sprint completed {}", completed_at_text);
+
     for item in &mut run.feature_plan_items {
         if scheduled_feature_ids.iter().any(|id| id == &item.id) {
-            item.status = FeaturePlanItemStatus::Completed;
+            item.status = FeaturePlanItemStatus::Applied;
+            item.applied_sprint_id = Some(sprint_id.clone());
+            item.applied_sprint_title = Some(sprint_title.clone());
+            item.applied_at = Some(completed_at_text.clone());
         }
     }
+
     let completed_features = run
         .feature_plan_items
         .iter()
@@ -402,20 +529,124 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
         .map(|item| json!({
             "id": item.id,
             "title": item.title,
-            "completed_at": completed_at_text
+            "applied_at": completed_at_text,
+            "applied_sprint_id": sprint_id,
+            "applied_sprint_title": sprint_title
         }))
         .collect::<Vec<_>>();
+
+    let sprint_record = json!({
+        "sprint_id": sprint_id,
+        "title": sprint_title,
+        "status": "applied",
+        "applied_at": completed_at_text,
+        "root_repo_path": run.root_repo_path,
+        "snapshot_path": run.snapshot_path,
+        "integration_path": run.integration_path,
+        "integration_run_id": run.integration_run_id,
+        "final_patch_path": run.final_patch_path,
+        "features": completed_features,
+        "child_runs": run.child_runs
+    });
+
     if !run.context.is_object() {
         run.context = json!({});
     }
     if let Some(obj) = run.context.as_object_mut() {
         obj.insert("sprint_completed_at".to_string(), Value::String(completed_at_text.clone()));
-        obj.insert("completed_features".to_string(), Value::Array(completed_features));
+        obj.insert("completed_features".to_string(), sprint_record.get("features").cloned().unwrap_or_else(|| json!([])));
+        let history = obj.entry("sprint_history".to_string()).or_insert_with(|| json!([]));
+        if let Some(items) = history.as_array_mut() {
+            items.push(sprint_record);
+        }
+        obj.remove("current_sprint_id");
+        obj.remove("current_sprint_started_at");
     }
     run.status = SupervisorStatus::Applied;
     run.updated_at = completed_at;
     update_supervisor_run(state, &run).await?;
     Ok(json!({ "ok": true, "status": "applied", "sprint_completed_at": completed_at_text }))
+}
+
+fn supervisor_patch_paths(run: &SupervisorRun) -> Vec<Value> {
+    run.child_runs.iter().filter_map(|child| {
+        child.patch_path.as_ref().map(|patch_path| json!({
+            "execution_item_id": child.execution_item_id,
+            "title": child.title,
+            "patch_path": patch_path,
+            "workflow_run_id": child.workflow_run_id
+        }))
+    }).collect::<Vec<_>>()
+}
+
+async fn spawn_live_integration_workflow(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
+    let workspace = repo_snapshot::refresh_integration_from_worktree(&run.root_repo_path, run.id)?;
+    patches::create_baseline(&workspace.integration)?;
+    let integration_path = workspace.integration.to_string_lossy().to_string();
+    let patch_paths = supervisor_patch_paths(run);
+    let integration_run_id = workflow_spawn::spawn_integration_workflow(
+        state,
+        &format!("{} merge integration", run.title),
+        &integration_path,
+        patch_paths,
+        context_uuid(&run.context, "integration_template_id"),
+        json!({
+            "supervisor_run_id": run.id,
+            "strategy": run.strategy,
+            "root_repo_path": run.root_repo_path,
+            "snapshot_path": run.snapshot_path,
+            "integration_path": integration_path,
+            "live_worktree": false,
+            "integration_source": "current_worktree_copy"
+        }),
+    ).await?;
+    let _ = engine::start_run(state, integration_run_id, None).await?;
+    run.integration_path = Some(integration_path);
+    run.integration_run_id = Some(integration_run_id);
+    run.final_patch_path = None;
+    run.status = SupervisorStatus::RunningIntegration;
+    Ok(())
+}
+
+pub async fn reopen_supervisor_development(state: &AppState, id: Uuid) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    run.integration_run_id = None;
+    run.final_patch_path = None;
+    run.merge_report = json!({});
+    run.validation_report = json!({});
+    run.status = SupervisorStatus::DevelopmentComplete;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
+
+pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    if run.child_runs.is_empty() {
+        return Err(anyhow!("development has not produced any feature workflow runs"));
+    }
+    run.integration_run_id = None;
+    run.final_patch_path = None;
+    run.merge_report = json!({});
+    run.validation_report = json!({});
+    spawn_live_integration_workflow(state, &mut run).await?;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
+
+pub async fn start_supervisor_integration_workflow(state: &AppState, id: Uuid) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    if !matches!(run.status, SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::ReadyToApply | SupervisorStatus::Failed) {
+        return Err(anyhow!("development must complete before integration can start"));
+    }
+    if run.child_runs.is_empty() {
+        return Err(anyhow!("development has not produced any feature workflow runs"));
+    }
+    spawn_live_integration_workflow(state, &mut run).await?;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
 async fn tick_children(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
@@ -445,30 +676,7 @@ async fn tick_children(state: &AppState, run: &mut SupervisorRun) -> Result<()> 
     }
 
     if all_done && !matches!(run.status, SupervisorStatus::Failed) {
-        let integration_path = run.integration_path.clone().ok_or_else(|| anyhow!("integration path missing"))?;
-        let patch_paths = run.child_runs.iter().filter_map(|child| {
-            child.patch_path.as_ref().map(|patch_path| json!({
-                "execution_item_id": child.execution_item_id,
-                "title": child.title,
-                "patch_path": patch_path,
-                "workflow_run_id": child.workflow_run_id
-            }))
-        }).collect::<Vec<_>>();
-        let integration_run_id = workflow_spawn::spawn_integration_workflow(
-            state,
-            &format!("{} merge integration", run.title),
-            &integration_path,
-            patch_paths,
-            context_uuid(&run.context, "integration_template_id"),
-            json!({
-                "supervisor_run_id": run.id,
-                "strategy": run.strategy,
-                "snapshot_path": run.snapshot_path,
-                "integration_path": run.integration_path
-            }),
-        ).await?;
-        run.integration_run_id = Some(integration_run_id);
-        run.status = SupervisorStatus::RunningIntegration;
+        run.status = SupervisorStatus::DevelopmentComplete;
     }
     Ok(())
 }
@@ -479,17 +687,18 @@ async fn tick_integration(state: &AppState, run: &mut SupervisorRun) -> Result<(
     };
     let integration_run = crate::engine::load_run(state, integration_run_id).await?;
     match integration_run.status {
-        RunStatus::Success | RunStatus::Waiting | RunStatus::Paused => {
-            if let Some(integration_path) = run.integration_path.clone() {
-                let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-                let final_patch = workspace.patches.join("final.patch");
-                patches::generate_patch(&PathBuf::from(integration_path), &final_patch)?;
-                run.final_patch_path = Some(final_patch.to_string_lossy().to_string());
-                run.status = SupervisorStatus::ReadyToApply;
-            }
+        RunStatus::Success => {
+            let integration_path = run.integration_path.clone().filter(|value| !value.trim().is_empty()).ok_or_else(|| anyhow!("integration path missing"))?;
+            let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
+            let final_patch = workspace.patches.join("integration-final.patch");
+            patches::generate_patch(&PathBuf::from(integration_path), &final_patch)?;
+            run.final_patch_path = Some(final_patch.to_string_lossy().to_string());
+            run.status = SupervisorStatus::ReadyToApply;
+        }
+        RunStatus::Waiting | RunStatus::Paused | RunStatus::Queued | RunStatus::Running | RunStatus::Draft => {
+            run.status = SupervisorStatus::RunningIntegration;
         }
         RunStatus::Error | RunStatus::Cancelled => run.status = SupervisorStatus::Failed,
-        _ => {}
     }
     Ok(())
 }
@@ -648,6 +857,7 @@ fn parse_status(value: &str) -> SupervisorStatus {
     match value {
         "snapshotting" => SupervisorStatus::Snapshotting,
         "running_children" => SupervisorStatus::RunningChildren,
+        "development_complete" => SupervisorStatus::DevelopmentComplete,
         "running_integration" => SupervisorStatus::RunningIntegration,
         "validating" => SupervisorStatus::Validating,
         "ready_to_apply" => SupervisorStatus::ReadyToApply,
@@ -670,6 +880,7 @@ fn status_supervisor_str(value: &SupervisorStatus) -> &'static str {
         SupervisorStatus::Created => "created",
         SupervisorStatus::Snapshotting => "snapshotting",
         SupervisorStatus::RunningChildren => "running_children",
+        SupervisorStatus::DevelopmentComplete => "development_complete",
         SupervisorStatus::RunningIntegration => "running_integration",
         SupervisorStatus::Validating => "validating",
         SupervisorStatus::ReadyToApply => "ready_to_apply",

@@ -1,6 +1,6 @@
 export type SupervisorExecutionStrategy = 'series' | 'parallel';
 
-export type FeaturePlanItemStatus = 'rough' | 'fine' | 'scheduled' | 'completed' | 'refined' | 'approved';
+export type FeaturePlanItemStatus = 'rough' | 'fine' | 'scheduled' | 'applied' | 'completed' | 'refined' | 'approved';
 
 export type FeaturePlanItem = {
   id: string;
@@ -9,6 +9,9 @@ export type FeaturePlanItem = {
   summary: string;
   rough_summary?: string | null;
   refinement_workflow_run_id?: string | null;
+  applied_sprint_id?: string | null;
+  applied_sprint_title?: string | null;
+  applied_at?: string | null;
   requirements: string[];
   acceptance_criteria: string[];
   implementation_notes: string[];
@@ -61,6 +64,16 @@ export type CreateSupervisorRunRequest = {
   feature_plan_items: FeaturePlanItem[];
   execution_plan_items?: ExecutionPlanItem[];
   context?: Record<string, unknown>;
+};
+
+export type EnsureSupervisorPlannerRequest = {
+  root_repo_path: string;
+  title?: string | null;
+};
+
+export type EnsureSupervisorPlannerResponse = {
+  created: boolean;
+  supervisor_run: SupervisorRun;
 };
 
 function canonicalFeatureStatus(status: FeaturePlanItemStatus): FeaturePlanItemStatus {
@@ -129,6 +142,20 @@ export async function createSupervisorRun(request: CreateSupervisorRunRequest): 
   return normalizeSupervisorRun(await response.json());
 }
 
+export async function ensureSupervisorPlannerRun(request: EnsureSupervisorPlannerRequest): Promise<EnsureSupervisorPlannerResponse> {
+  const response = await fetch('/api/supervisor-runs/ensure-planner', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  return {
+    created: Boolean(payload.created),
+    supervisor_run: normalizeSupervisorRun(payload.supervisor_run)
+  };
+}
+
 export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
   const response = await fetch(`/api/supervisor-runs/${id}`);
   if (!response.ok) throw new Error(await response.text());
@@ -171,7 +198,7 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'update_plan' | 'refine_feature', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'refine_feature', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -495,6 +495,7 @@ fn default_builder_catalog() -> WorkflowBuilderCatalog {
             design_descriptor(),
             code_descriptor(),
             compile_descriptor(),
+            merge_patches_descriptor(),
             review_descriptor(),
             sap_import_descriptor(),
             sap_syntax_descriptor(),
@@ -839,6 +840,42 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
         }],
         available_governance_policies: vec![compile_governance_policy_descriptor()],
         routes: default_routes("review", "compile", "compile"),
+    }
+}
+
+fn merge_patches_descriptor() -> WorkflowStageDescriptor {
+    let mut template = base_stage_template("merge_patches", "Merge patches", AutomationMode::Automatic);
+    template.prompt = WorkflowStepPromptConfig {
+        include_repo_context: false,
+        include_changeset_schema: false,
+        include_user_context: true,
+    };
+    template.config = json!({});
+    template.execution_logic = json!({
+        "kind": "merge_patches_stage_policy",
+        "automation": {
+            "apply_patches": true
+        },
+        "on_success": {
+            "disposition": "move_next",
+            "message": "Patches merged successfully."
+        },
+        "on_error": {
+            "disposition": "stay",
+            "message": "Patch merge failed."
+        }
+    });
+    template.execution_plan = Vec::<StageExecutionNode>::new();
+
+    WorkflowStageDescriptor {
+        step_type: "merge_patches".to_string(),
+        label: "Merge patches".to_string(),
+        category: "core".to_string(),
+        description: "Apply supervisor child workflow patches in order against the integration worktree.".to_string(),
+        definition_template: template,
+        editable_fields: vec![],
+        available_governance_policies: vec![],
+        routes: default_routes("review", "merge_patches", "merge_patches"),
     }
 }
 
