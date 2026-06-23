@@ -2173,10 +2173,7 @@ export function WorkflowShell() {
             ...promptFragmentEnabled
           },
           browser: {
-            ...currentInferenceBrowser,
-            ...(browserCdpUrl.trim() ? { cdp_url: browserCdpUrl.trim() } : {}),
-            target_url: browserTargetUrl,
-            session_id: browserSessionId.trim() || null
+            ...currentInferenceBrowser
           }
         },
         planner: {
@@ -3054,6 +3051,10 @@ export function WorkflowShell() {
 
   async function handlePauseRun() {
     if (!selectedRunId) return;
+    if (hasPendingDispositionReview) {
+      await handleDispositionReview('pause');
+      return;
+    }
     const runId = selectedRunId;
     try {
       setPauseRequestBusy(true);
@@ -3603,8 +3604,10 @@ export function WorkflowShell() {
       return next;
     });
     setPaths(descendantFiles, false);
-  }  const composedInferencePrompt = useMemo(() => {
-    if (selectedWorkflowStep?.id === 'compile') {
+  }
+
+  const composedInferencePrompt = useMemo(() => {
+    if (selectedWorkflowStep?.step_type === 'compile') {
       return stageCompileCommandsText.trim()
         ? `### COMPILE COMMANDS\n${stageCompileCommandsText.trim()}`
         : '';
@@ -3673,7 +3676,7 @@ export function WorkflowShell() {
     const parts: string[] = [];
     if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
 
-    if (selectedWorkflowStep?.id === 'compile') {
+    if (selectedWorkflowStep?.step_type === 'compile') {
       const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
       let compileResults: Array<Record<string, unknown>> = [];
 
@@ -3709,7 +3712,7 @@ export function WorkflowShell() {
 
     if (inferenceResponse.trim()) parts.push(`### OUTPUT\n${inferenceResponse}`);
     return parts.join('\n\n');
-  }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.id]);
+  }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.step_type]);
 
   function getBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
@@ -5027,7 +5030,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
                               <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || (!canRunCurrentStageAutomatically && selectedRun?.status !== 'success') || isBackendRunLocked}>Run autonomously</Button>
-                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>Pause after stage</Button>
+                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
                               <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Force unlock</Button>
                             </Group>

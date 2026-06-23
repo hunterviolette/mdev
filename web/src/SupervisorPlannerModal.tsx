@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Badge, Button, Card, Checkbox, Group, Modal, Select, Stack, Table, Text, Textarea, TextInput } from '@mantine/core';
 import type { WorkflowTemplate } from './api';
-import { refineSupervisorFeature, updateSupervisorPlan, type FeaturePlanItem, type SupervisorRun } from './supervisor_api';
+import { applyPlannerImport, previewPlannerImport, refineSupervisorFeature, updateSupervisorPlan, type FeaturePlanItem, type PlannerImportAction, type PlannerImportPreviewResponse, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   opened: boolean;
@@ -124,6 +124,9 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
   const [error, setError] = useState<string | null>(null);
   const [exportFeatureIds, setExportFeatureIds] = useState<Set<string>>(new Set());
   const [exportMode, setExportMode] = useState<'all' | 'selected'>('all');
+  const [importPayload, setImportPayload] = useState<unknown | null>(null);
+  const [importPreview, setImportPreview] = useState<PlannerImportPreviewResponse | null>(null);
+  const [importActions, setImportActions] = useState<Record<number, PlannerImportAction>>({});
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const templateOptions = useMemo(() => templates.map((template) => ({ value: template.id, label: template.name })), [templates]);
   const scheduledFeatureIds = useMemo(() => new Set((run?.execution_plan_items ?? []).map((item) => item.feature_plan_item_id)), [run?.execution_plan_items]);
@@ -146,6 +149,9 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     setExpandedFeatureId(nextFeatures[0]?.id ?? null);
     setRefinementTemplateId(contextString(run, 'planner_refinement_template_id') ?? contextString(run, 'workflow_template_id') ?? defaultRefinementTemplate?.id ?? null);
     setError(null);
+    setImportPayload(null);
+    setImportPreview(null);
+    setImportActions({});
   }, [opened, run?.id, defaultRefinementTemplate?.id]);
 
   useEffect(() => {
@@ -218,35 +224,41 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
 
   async function importFeaturesFile(file: File | null | undefined) {
     if (!file) return;
+    if (!run) {
+      setError('Planner must be loaded before importing features.');
+      return;
+    }
     setError(null);
     try {
       const payload = JSON.parse(await file.text()) as unknown;
-      const rawFeatures = Array.isArray(payload)
-        ? payload
-        : Array.isArray((payload as Record<string, unknown> | null)?.features)
-          ? ((payload as Record<string, unknown>).features as unknown[])
-          : null;
-      if (!rawFeatures) {
-        setError('Planner import must be a JSON feature array or an object with a features array.');
-        return;
-      }
-      setFeatures((prev) => {
-        const existingIds = new Set(prev.map((item) => item.id));
-        const imported = rawFeatures.map((item, index) => {
-          const feature = importFeature(item, prev.length + index);
-          if (existingIds.has(feature.id)) {
-            feature.id = crypto.randomUUID();
-          }
-          existingIds.add(feature.id);
-          return feature;
-        });
-        if (imported.length > 0) setExpandedFeatureId(imported[0].id);
-        return [...prev, ...imported];
-      });
+      const preview = await previewPlannerImport(run.id, payload);
+      setImportPayload(payload);
+      setImportPreview(preview);
+      setImportActions(Object.fromEntries(preview.items.map((item) => [item.import_index, item.default_action])) as Record<number, PlannerImportAction>);
     } catch (err) {
       setError(`Planner import failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       if (importInputRef.current) importInputRef.current.value = '';
+    }
+  }
+
+  async function applyReviewedImport() {
+    if (!run || !importPayload || !importPreview) return;
+    setError(null);
+    try {
+      const decisions = importPreview.items.map((item) => ({
+        import_index: item.import_index,
+        action: importActions[item.import_index] ?? item.default_action,
+        existing_feature_id: item.existing_feature_id ?? null
+      }));
+      const response = await applyPlannerImport(run.id, importPayload, decisions);
+      setFeatures(response.supervisor_run.feature_plan_items ?? []);
+      setImportPayload(null);
+      setImportPreview(null);
+      setImportActions({});
+      await onSaved();
+    } catch (err) {
+      setError(`Planner import apply failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -382,8 +394,72 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               style={{ display: 'none' }}
               onChange={(event) => void importFeaturesFile(event.currentTarget.files?.[0])}
             />
+            {importPreview ? <Button size="xs" variant="filled" onClick={() => void applyReviewedImport()}>Apply import review</Button> : null}
           </Group>
         </Group>
+        {importPreview ? (
+          <Card withBorder>
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={700}>Import review</Text>
+                <Group gap="xs">
+                  <Badge variant="light">{importPreview.summary.accepted} new</Badge>
+                  <Badge color="yellow" variant="light">{importPreview.summary.duplicates} duplicates</Badge>
+                  <Badge color="orange" variant="light">{importPreview.summary.conflicts} conflicts</Badge>
+                  <Badge color="red" variant="light">{importPreview.summary.invalid} invalid</Badge>
+                </Group>
+              </Group>
+              <Text size="sm" c="dimmed">Finish this import review before returning to the feature list. Use another planner page if you need to compare existing feature details.</Text>
+              <Table striped highlightOnHover>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>#</Table.Th>
+                    <Table.Th>Status</Table.Th>
+                    <Table.Th>Feature</Table.Th>
+                    <Table.Th>Reason</Table.Th>
+                    <Table.Th>Action</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {importPreview.items.map((item) => (
+                    <Table.Tr key={item.import_index}>
+                      <Table.Td>{item.import_index + 1}</Table.Td>
+                      <Table.Td><Badge color={item.status === 'accepted' ? 'green' : item.status === 'duplicate' ? 'yellow' : item.status === 'conflict' ? 'orange' : 'red'}>{item.status}</Badge></Table.Td>
+                      <Table.Td>
+                        <Stack gap={2}>
+                          <Text fw={600}>{item.feature?.title ?? 'Invalid item'}</Text>
+                          {item.existing_title ? <Text size="xs" c="dimmed">Existing: {item.existing_title}</Text> : null}
+                        </Stack>
+                      </Table.Td>
+                      <Table.Td><Text size="sm">{item.reason}</Text></Table.Td>
+                      <Table.Td>
+                        <Select
+                          size="xs"
+                          value={importActions[item.import_index] ?? item.default_action}
+                          onChange={(value) => setImportActions((prev) => ({ ...prev, [item.import_index]: (value ?? item.default_action) as PlannerImportAction }))}
+                          data={[
+                            { value: 'create', label: 'Create' },
+                            { value: 'create_copy', label: 'Create copy' },
+                            { value: 'replace_existing', label: 'Replace existing' },
+                            { value: 'skip', label: 'Skip' },
+                            { value: 'reject', label: 'Reject' }
+                          ]}
+                          allowDeselect={false}
+                          w={170}
+                        />
+                      </Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+              <Group justify="flex-end">
+                <Button variant="default" onClick={() => { setImportPayload(null); setImportPreview(null); setImportActions({}); }}>Cancel import</Button>
+                <Button onClick={() => void applyReviewedImport()}>Apply selected actions</Button>
+              </Group>
+            </Stack>
+          </Card>
+        ) : (
+          <>
         <Card withBorder>
           <Stack gap="sm">
             <Group justify="space-between">
@@ -512,6 +588,8 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
             </Stack>
           </Card>
         ) : null)}
+          </>
+        )}
       </Stack>
     </Modal>
   );

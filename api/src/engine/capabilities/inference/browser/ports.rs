@@ -8,6 +8,24 @@ use super::super::super::registry::CapabilityContext;
 
 const DEFAULT_START: u16 = 9222;
 
+fn preferred_profile_cdp_url(current: &str, host: &str) -> String {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() && cdp_port(trimmed).is_some() {
+        return trimmed.to_string();
+    }
+
+    let (start, _) = configured_range();
+    format!("http://{}:{}", host, start)
+}
+
+fn dynamic_profile_port_allocation_enabled() -> bool {
+    std::env::var("WORKFLOW_BROWSER_DYNAMIC_PROFILE_PORTS")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+
 pub async fn allocate_cdp_url_for_session(
     ctx: &CapabilityContext<'_>,
     session_name: &str,
@@ -42,6 +60,15 @@ pub async fn allocate_cdp_url_for_session(
         return Ok(shared);
     }
 
+    let preferred = preferred_profile_cdp_url(current, &host);
+    if !dynamic_profile_port_allocation_enabled() {
+        return Ok(preferred);
+    }
+
+    if cdp_reachable(&preferred) {
+        return Ok(preferred);
+    }
+
     let reserved_ports = reserved_ports_for_other_sessions(&inference, session_name, process_session_id.as_str());
     let (start, end) = configured_range();
 
@@ -59,6 +86,15 @@ pub async fn allocate_cdp_url_for_session(
 
 pub fn allocate_cdp_url(current: &str) -> Result<String> {
     let host = cdp_host(current).unwrap_or_else(|| "127.0.0.1".to_string());
+    let preferred = preferred_profile_cdp_url(current, &host);
+    if !dynamic_profile_port_allocation_enabled() {
+        return Ok(preferred);
+    }
+
+    if cdp_reachable(&preferred) {
+        return Ok(preferred);
+    }
+
     let (start, end) = configured_range();
 
     for port in start..=end {

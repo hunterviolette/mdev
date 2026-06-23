@@ -1,13 +1,14 @@
 import { Alert, Badge, Button, Card, Group, Modal, Select, Stack, Table, Text } from '@mantine/core';
 import { useEffect, useMemo, useState } from 'react';
 import type { WorkflowTemplate } from './api';
-import { runSupervisorAction, updateSupervisorPlan, type ExecutionPlanItem, type SupervisorChildRun, type SupervisorExecutionStrategy, type SupervisorRun } from './supervisor_api';
+import { runSupervisorAction, updateSupervisorPlan, type SupervisorChildRun, type SupervisorExecutionStrategy, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   opened: boolean;
   run: SupervisorRun | null | undefined;
   templates: WorkflowTemplate[];
   onClose: () => void;
+  onOpenPlanner: () => void;
   onChanged: () => Promise<void> | void;
 };
 
@@ -38,6 +39,10 @@ function canStart(status: string): boolean {
 
 function canStartNextSprint(status: string): boolean {
   return ['applied', 'ready_to_apply', 'failed', 'cancelled'].includes(status);
+}
+
+function canRestartSprint(status: string): boolean {
+  return ['snapshotting', 'running_children', 'development_complete', 'running_integration', 'validating', 'ready_to_apply', 'failed', 'cancelled'].includes(status);
 }
 
 function statusBadgeColor(status: string): string {
@@ -95,14 +100,14 @@ function sprintStageLabel(state: 'active' | 'complete' | 'up_next' | 'blocked'):
 }
 
 function isChildDone(child: SupervisorChildRun): boolean {
-  return ['success', 'waiting', 'paused'].includes(child.status);
+  return ['success', 'completed'].includes(child.status);
 }
 
 function isChildFailed(child: SupervisorChildRun): boolean {
   return ['error', 'cancelled'].includes(child.status);
 }
 
-export function SupervisorSprintModal({ opened, run, templates, onClose, onChanged }: Props) {
+export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenPlanner, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [workflowTemplateId, setWorkflowTemplateId] = useState<string | null>(null);
   const [integrationTemplateId, setIntegrationTemplateId] = useState<string | null>(null);
@@ -118,7 +123,16 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
     setError(null);
   }, [opened, run?.id]);
 
-  const scheduledItemsForStart = useMemo<ExecutionPlanItem[]>(() => {
+  useEffect(() => {
+    if (!opened || !run) return;
+    if (!['snapshotting', 'running_children', 'running_integration', 'validating'].includes(run.status)) return;
+    const timer = window.setInterval(() => {
+      void onChanged();
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [opened, run?.id, run?.status, onChanged]);
+
+  const scheduledItemsForStart = useMemo(() => {
     if (!run) return [];
     return (run.execution_plan_items ?? []).map((item, index) => ({
       ...item,
@@ -171,7 +185,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
     }
   }
 
-  async function action(actionName: 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'reopen_development' | 'new_sprint') {
+  async function action(actionName: 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint') {
     if (!run) return;
     setError(null);
     try {
@@ -214,9 +228,14 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                     <Badge color={statusBadgeColor(run.status)}>{run.status}</Badge>
                     <Badge variant="light">{strategy}</Badge>
                   </Group>
-                  <Text size="sm" c="dimmed">
-                    Progress: {progress.completed}/{progress.total}{progress.failed > 0 ? `, ${progress.failed} failed` : ''}
-                  </Text>
+                  <Group gap="xs">
+                    <Text size="sm" c="dimmed">
+                      Progress: {progress.completed}/{progress.total}{progress.failed > 0 ? `, ${progress.failed} failed` : ''}
+                    </Text>
+                    {canRestartSprint(run.status) ? (
+                      <Button size="xs" color="red" variant="light" onClick={() => action('restart_sprint')}>Restart sprint</Button>
+                    ) : null}
+                  </Group>
                 </Group>
 
                 <Group grow align="stretch">
@@ -319,28 +338,34 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
             <Card withBorder>
               <Stack gap="sm">
                 <Group justify="space-between">
-                  <Text fw={700}>Scheduled sprint items</Text>
-                  <Badge variant="light">{scheduledItemsForStart.length}</Badge>
+                  <Group>
+                    <Text fw={700}>Scheduled sprint items</Text>
+                    <Badge variant="light">{scheduledItemsForStart.length}</Badge>
+                  </Group>
+                  <Button size="xs" variant="light" onClick={onOpenPlanner}>Manage features in planner</Button>
                 </Group>
-                <Table striped withTableBorder>
-                  <Table.Thead>
-                    <Table.Tr>
-                      <Table.Th>Order</Table.Th>
-                      <Table.Th>Feature</Table.Th>
-                      <Table.Th>Workflow template</Table.Th>
-                    </Table.Tr>
-                  </Table.Thead>
-                  <Table.Tbody>
-                    {scheduledItemsForStart.map((item, index) => (
-                      <Table.Tr key={`${item.feature_plan_item_id}-${index}`}>
-                        <Table.Td>{index + 1}</Table.Td>
-                        <Table.Td>{sprintTitle(run, item.feature_plan_item_id)}</Table.Td>
-                        <Table.Td>{workflowName(templates, item.workflow_template_id ?? workflowTemplateId)}</Table.Td>
-                        <Table.Td>design</Table.Td>
+                {scheduledItemsForStart.length > 0 ? (
+                  <Table striped withTableBorder>
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th>Order</Table.Th>
+                        <Table.Th>Feature</Table.Th>
+                        <Table.Th>Workflow template</Table.Th>
                       </Table.Tr>
-                    ))}
-                  </Table.Tbody>
-                </Table>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {scheduledItemsForStart.map((item, index) => (
+                        <Table.Tr key={`${item.feature_plan_item_id}-${index}`}>
+                          <Table.Td>{index + 1}</Table.Td>
+                          <Table.Td>{sprintTitle(run, item.feature_plan_item_id)}</Table.Td>
+                          <Table.Td>{workflowName(templates, item.workflow_template_id ?? workflowTemplateId)}</Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                ) : (
+                  <Text size="sm" c="dimmed">No planner features are scheduled for this sprint. Use the planner to add features to the next sprint.</Text>
+                )}
               </Stack>
             </Card>
 
@@ -407,24 +432,62 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onChang
                     <Text fw={700}>Sprint history</Text>
                     <Badge variant="light">{run.context.sprint_history.length}</Badge>
                   </Group>
-                  <Table striped withTableBorder>
-                    <Table.Thead>
-                      <Table.Tr>
-                        <Table.Th>Sprint</Table.Th>
-                        <Table.Th>Applied</Table.Th>
-                        <Table.Th>Features</Table.Th>
-                      </Table.Tr>
-                    </Table.Thead>
-                    <Table.Tbody>
-                      {(run.context.sprint_history as any[]).map((sprint, index) => (
-                        <Table.Tr key={String(sprint.sprint_id ?? index)}>
-                          <Table.Td>{String(sprint.title ?? sprint.sprint_id ?? `Sprint ${index + 1}`)}</Table.Td>
-                          <Table.Td>{String(sprint.applied_at ?? '—')}</Table.Td>
-                          <Table.Td>{Array.isArray(sprint.features) ? sprint.features.length : 0}</Table.Td>
-                        </Table.Tr>
-                      ))}
-                    </Table.Tbody>
-                  </Table>
+                  <Stack gap="sm">
+                    {(run.context.sprint_history as any[]).map((sprint, index) => {
+                      const childRuns = Array.isArray(sprint.child_runs) ? sprint.child_runs : [];
+                      const features = Array.isArray(sprint.features) ? sprint.features : [];
+                      return (
+                        <Card key={String(sprint.sprint_id ?? index)} withBorder>
+                          <Stack gap="xs">
+                            <Group justify="space-between">
+                              <Group>
+                                <Text fw={600}>{String(sprint.title ?? sprint.sprint_id ?? `Sprint ${index + 1}`)}</Text>
+                                <Badge color={statusBadgeColor(String(sprint.status ?? 'applied'))}>{String(sprint.status ?? 'applied')}</Badge>
+                              </Group>
+                              <Text size="xs" c="dimmed">{String(sprint.applied_at ?? '—')}</Text>
+                            </Group>
+                            <Table striped withTableBorder>
+                              <Table.Thead>
+                                <Table.Tr>
+                                  <Table.Th>Feature</Table.Th>
+                                  <Table.Th>Applied</Table.Th>
+                                  <Table.Th>Workflow run</Table.Th>
+                                  <Table.Th>Status</Table.Th>
+                                  <Table.Th>Patch path</Table.Th>
+                                </Table.Tr>
+                              </Table.Thead>
+                              <Table.Tbody>
+                                {features.map((feature: any, featureIndex: number) => {
+                                  const child = childRuns.find((item: any) => item.execution_item_id === feature.id || item.title === feature.title);
+                                  return (
+                                    <Table.Tr key={String(feature.id ?? featureIndex)}>
+                                      <Table.Td>{String(feature.title ?? feature.id ?? `Feature ${featureIndex + 1}`)}</Table.Td>
+                                      <Table.Td>{String(feature.applied_at ?? sprint.applied_at ?? '—')}</Table.Td>
+                                      <Table.Td>{shortId(child?.workflow_run_id)}</Table.Td>
+                                      <Table.Td>{child?.status ? <Badge color={statusBadgeColor(String(child.status))}>{String(child.status)}</Badge> : '—'}</Table.Td>
+                                      <Table.Td>{formatValue(child?.patch_path)}</Table.Td>
+                                    </Table.Tr>
+                                  );
+                                })}
+                              </Table.Tbody>
+                            </Table>
+                            <Table withTableBorder>
+                              <Table.Tbody>
+                                <Table.Tr>
+                                  <Table.Th>Integration workflow run</Table.Th>
+                                  <Table.Td>{shortId(sprint.integration_run_id)}</Table.Td>
+                                </Table.Tr>
+                                <Table.Tr>
+                                  <Table.Th>Final patch</Table.Th>
+                                  <Table.Td>{formatValue(sprint.final_patch_path)}</Table.Td>
+                                </Table.Tr>
+                              </Table.Tbody>
+                            </Table>
+                          </Stack>
+                        </Card>
+                      );
+                    })}
+                  </Stack>
                 </Stack>
               </Card>
             ) : null}

@@ -17,7 +17,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_supervisor_runs(State(state): State<AppState>) -> Result<Json<Vec<SupervisorRun>>, (axum::http::StatusCode, String)> {
-    supervisor::list_supervisor_runs_reconciled(&state).await.map(Json).map_err(internal)
+    supervisor::list_supervisor_runs(&state).await.map(Json).map_err(internal)
 }
 
 async fn create_supervisor_run(
@@ -38,7 +38,7 @@ async fn get_supervisor_run(
     State(state): State<AppState>,
     Path(supervisor_id): Path<Uuid>,
 ) -> Result<Json<SupervisorRun>, (axum::http::StatusCode, String)> {
-    supervisor::load_supervisor_run_reconciled(&state, supervisor_id).await.map(Json).map_err(internal)
+    supervisor::load_supervisor_run(&state, supervisor_id).await.map(Json).map_err(internal)
 }
 
 async fn delete_supervisor_run(
@@ -64,7 +64,10 @@ async fn supervisor_action(
         "cancel" => supervisor::cancel_supervisor_run(&state, supervisor_id).await,
         "reopen_development" => supervisor::reopen_supervisor_development(&state, supervisor_id).await,
         "restart_integration" => supervisor::restart_supervisor_integration_workflow(&state, supervisor_id).await,
+        "restart_sprint" => supervisor::restart_current_supervisor_sprint(&state, supervisor_id).await,
         "update_plan" => supervisor::update_supervisor_plan(&state, supervisor_id, req.payload).await,
+        "preview_planner_import" => supervisor::preview_supervisor_planner_import(&state, supervisor_id, req.payload).await,
+        "apply_planner_import" => supervisor::apply_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "refine_feature" => supervisor::refine_supervisor_feature(&state, supervisor_id, req.payload).await,
         "new_sprint" => supervisor::start_next_supervisor_sprint(&state, supervisor_id).await,
         other => Err(anyhow::anyhow!("unsupported supervisor action {}", other)),

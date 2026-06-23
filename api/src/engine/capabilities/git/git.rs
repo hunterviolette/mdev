@@ -1333,11 +1333,6 @@ pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
     let has_unified_hunk = patch.contains("\n@@ -") || patch.starts_with("@@ -");
     let has_cr = patch.as_bytes().iter().any(|&b| b == b'\r');
 
-    let debug_path = repo.join(".describe_repo_last_patch.patch");
-    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
-        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
-    }
-
     match run_git_with_input(repo, &["apply", "--whitespace=nowarn", "-"], patch.as_bytes()) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -1345,33 +1340,26 @@ pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
             preview = preview.replace('\n', "\\n");
             preview = preview.replace('\r', "\\r");
 
-            let check = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["apply", "--check", "--whitespace=nowarn"])
-                .arg(&debug_path)
-                .output();
+            let check = run_git_with_input(
+                repo,
+                &["apply", "--check", "--whitespace=nowarn", "-"],
+                patch.as_bytes(),
+            );
 
-            let mut check_msg = String::new();
-            if let Ok(o) = check {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                check_msg.push_str(&format!(
-                    "git apply --check exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
-                    o.status.code(),
-                    stdout,
-                    stderr
-                ));
-            }
+            let check_msg = match check {
+                Ok(stdout) => format!(
+                    "git apply --check succeeded unexpectedly\nstdout:\n{}\n",
+                    String::from_utf8_lossy(&stdout)
+                ),
+                Err(err) => format!("git apply --check failed: {:#}\n", err),
+            };
 
             bail!(
                 "git apply failed.\n\
                  patch_len={len} nl_count={nl_count} has_diff_git={has_diff_git} has_unified_hunk={has_unified_hunk} has_cr={has_cr}\n\
-                 debug_patch_file={}\n\
                  preview='{}'\n\
                  underlying_error={:#}\n\
                  {}",
-                debug_path.display(),
                 preview,
                 e,
                 check_msg
@@ -1387,11 +1375,6 @@ pub fn apply_git_patch_reverse(repo: &Path, patch_text: &str) -> Result<()> {
         patch.push('\n');
     }
 
-    let debug_path = repo.join(".describe_repo_last_patch_reverse.patch");
-    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
-        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
-    }
-
     match run_git_with_input(
         repo,
         &["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn", "-"],
@@ -1399,37 +1382,31 @@ pub fn apply_git_patch_reverse(repo: &Path, patch_text: &str) -> Result<()> {
     ) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let check = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args([
+            let check = run_git_with_input(
+                repo,
+                &[
                     "apply",
                     "--check",
                     "--reverse",
                     "--unidiff-zero",
                     "--whitespace=nowarn",
-                ])
-                .arg(&debug_path)
-                .output();
+                    "-",
+                ],
+                patch.as_bytes(),
+            );
 
-            let mut check_msg = String::new();
-            if let Ok(o) = check {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                check_msg.push_str(&format!(
-                    "git apply --check --reverse exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
-                    o.status.code(),
-                    stdout,
-                    stderr
-                ));
-            }
+            let check_msg = match check {
+                Ok(stdout) => format!(
+                    "git apply --check --reverse succeeded unexpectedly\nstdout:\n{}\n",
+                    String::from_utf8_lossy(&stdout)
+                ),
+                Err(err) => format!("git apply --check --reverse failed: {:#}\n", err),
+            };
 
             bail!(
                 "git apply --reverse failed.\n\
-                 debug_patch_file={}\n\
                  underlying_error={:#}\n\
                  {}",
-                debug_path.display(),
                 e,
                 check_msg
             );

@@ -76,6 +76,50 @@ export type EnsureSupervisorPlannerResponse = {
   supervisor_run: SupervisorRun;
 };
 
+export type PlannerImportStatus = 'accepted' | 'duplicate' | 'conflict' | 'invalid';
+export type PlannerImportAction = 'create' | 'create_copy' | 'replace_existing' | 'skip' | 'reject';
+
+export type PlannerImportPreviewItem = {
+  import_index: number;
+  status: PlannerImportStatus;
+  default_action: PlannerImportAction;
+  reason: string;
+  feature?: FeaturePlanItem;
+  existing_feature_id?: string | null;
+  existing_title?: string | null;
+  content_fingerprint?: string | null;
+  raw?: unknown;
+};
+
+export type PlannerImportPreviewResponse = {
+  ok: boolean;
+  summary: {
+    total: number;
+    accepted: number;
+    duplicates: number;
+    conflicts: number;
+    invalid: number;
+  };
+  items: PlannerImportPreviewItem[];
+};
+
+export type PlannerImportDecision = {
+  import_index: number;
+  action: PlannerImportAction;
+  existing_feature_id?: string | null;
+};
+
+export type PlannerImportApplyResponse = {
+  ok: boolean;
+  summary: {
+    created: number;
+    replaced: number;
+    skipped: number;
+    rejected: number;
+  };
+  supervisor_run: SupervisorRun;
+};
+
 function canonicalFeatureStatus(status: FeaturePlanItemStatus): FeaturePlanItemStatus {
   if (status === 'refined' || status === 'approved') return 'fine';
   return status;
@@ -186,6 +230,21 @@ export async function updateSupervisorPlan(
   });
 }
 
+export async function previewPlannerImport(id: string, payload: unknown): Promise<PlannerImportPreviewResponse> {
+  return runSupervisorAction(id, 'preview_planner_import', payload as Record<string, unknown>) as Promise<PlannerImportPreviewResponse>;
+}
+
+export async function applyPlannerImport(id: string, payload: unknown, decisions: PlannerImportDecision[]): Promise<PlannerImportApplyResponse> {
+  const response = await runSupervisorAction(id, 'apply_planner_import', {
+    import: payload,
+    decisions
+  });
+  return {
+    ...response,
+    supervisor_run: normalizeSupervisorRun(response.supervisor_run as SupervisorRun)
+  } as PlannerImportApplyResponse;
+}
+
 export type RefineSupervisorFeatureResponse = {
   ok: boolean;
   workflow_run_id: string;
@@ -198,7 +257,7 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'refine_feature', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

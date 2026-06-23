@@ -252,6 +252,116 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS planner_repos (
+            id TEXT PRIMARY KEY,
+            root_repo_path TEXT NOT NULL UNIQUE,
+            repo_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS planner_features (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprints (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            sprint_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            workflow_run_id TEXT,
+            supervisor_run_id TEXT,
+            sprint_started_at TEXT,
+            development_started_at TEXT,
+            development_completed_at TEXT,
+            integration_started_at TEXT,
+            integration_completed_at TEXT,
+            sprint_completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}'
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprint_features (
+            id TEXT PRIMARY KEY,
+            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+            feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'planned',
+            completed_at TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (sprint_id, feature_id)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprint_events (
+            id TEXT PRIMARY KEY,
+            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+            sequence_no INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            feature_id TEXT REFERENCES planner_features(id) ON DELETE SET NULL,
+            actor TEXT NOT NULL DEFAULT 'system',
+            message TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE (sprint_id, sequence_no)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_order ON planner_features (repo_id, sort_order)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprints_repo_key ON sprints (repo_id, sprint_key)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_sprint_order ON sprint_features (sprint_id, sort_order)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_events_sprint_seq ON sprint_events (sprint_id, sequence_no)")
+    .execute(db)
+    .await?;
+
     let template_columns = sqlx::query("PRAGMA table_info(workflow_templates)")
         .fetch_all(db)
         .await?;

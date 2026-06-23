@@ -5,14 +5,6 @@ import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { SupervisorSprintModal } from './SupervisorSprintModal';
 import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, listSupervisorRuns, runSupervisorAction, type SupervisorRun } from './supervisor_api';
 
-function hasVisibleSprint(status: string): boolean {
-  return ['snapshotting', 'running_children', 'running_integration', 'validating', 'ready_to_apply', 'applied', 'failed', 'cancelled'].includes(status);
-}
-
-function sprintButtonLabel(run: SupervisorRun): string {
-  return hasVisibleSprint(run.status) ? 'View sprint' : 'Start sprint';
-}
-
 type Props = {
   onOpenWorkflowRun?: (workflowRunId: string) => Promise<void> | void;
 };
@@ -60,14 +52,10 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
     }
   }
 
-  async function startOrViewSprint() {
+  async function openSprint() {
     if (!selected) return;
     setError(null);
     try {
-      if (hasVisibleSprint(selected.status)) {
-        setSprintOpen(true);
-        return;
-      }
       setSprintOpen(true);
     } catch (err) {
       setError(String(err));
@@ -88,6 +76,11 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  function openPlannerFromSprint() {
+    setSprintOpen(false);
+    setPlannerOpen(true);
   }
 
   async function removeRun() {
@@ -158,7 +151,7 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
               </Group>
               <Group>
                 <Button variant="light" onClick={() => void openPlannerForSelectedRepo()}>Planner</Button>
-                <Button onClick={startOrViewSprint}>{sprintButtonLabel(selected)}</Button>
+                <Button onClick={openSprint}>Sprint</Button>
                 <Button color="red" variant="subtle" onClick={removeRun}>Delete</Button>
               </Group>
             </Group>
@@ -182,6 +175,7 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
         run={selected}
         templates={templates}
         onClose={() => setSprintOpen(false)}
+        onOpenPlanner={openPlannerFromSprint}
         onChanged={refresh}
       />
     </Stack>

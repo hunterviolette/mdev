@@ -54,6 +54,10 @@ pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Val
         false
     };
 
+    if disposition_review_waiting {
+        return resolve_disposition_review(state, run_id, "pause").await;
+    }
+
     if !matches!(run.status, RunStatus::Queued | RunStatus::Running) && !disposition_review_waiting && !autonomous_pause_eligible {
         let status = format!("{:?}", run.status).to_lowercase();
         append_engine_event(
@@ -293,6 +297,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 ).await?;
 
                 set_run_status(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
+                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
                 return Ok(json!({
                     "ok": true,
                     "status": "success",
@@ -983,6 +988,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }
             (StageDisposition::MoveNext, None, _) => {
                 set_run_status(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
+                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": outcome.ok,
                     "status": "success",
@@ -1002,6 +1008,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }
             (StageDisposition::Success, None, _) => {
                 set_run_status(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
+                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": true,
                     "status": "success",
@@ -1042,6 +1049,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }
             (StageDisposition::Error, _, _) | (StageDisposition::ErrorCode(_), _, _) => {
                 set_run_status(state, run_id, RunStatus::Error, Some(step.id.as_str())).await?;
+                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Error, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": false,
                     "status": "error",
