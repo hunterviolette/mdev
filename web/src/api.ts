@@ -1063,6 +1063,16 @@ export function unstageReviewDiff(body: {
   });
 }
 
+export function discardWorkflowReviewDiff(runId: string, body: {
+  scope: ReviewDiffScope;
+  path?: string | null;
+}) {
+  return fetchJson<{ ok: boolean }>(`/api/workflow-runs/${encodeURIComponent(runId)}/review/discard`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
 export function getWorkflowReviewStatus(runId: string) {
   return fetchJson<ReviewStatusResponse>(`/api/workflow-runs/${runId}/review/status`);
 }

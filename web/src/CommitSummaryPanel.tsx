@@ -1,4 +1,4 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -6,7 +6,6 @@ import {
   Button,
   Card,
   Checkbox,
-  Code,
   Divider,
   Group,
   Loader,
@@ -19,8 +18,8 @@ import {
   Text,
   TextInput,
 } from '@mantine/core';
-import { parsePatchFiles, type FileDiffMetadata } from '@pierre/diffs';
-import { FileDiff, PatchDiff, Virtualizer } from '@pierre/diffs/react';
+import { DiffCode, inspectUnifiedPatch } from './DiffCode';
+import { DiffTree, type DiffTreeFile } from './DiffTree';
 import {
   getReviewCommitDiff,
   getReviewCommitDiffManifest,
@@ -111,7 +110,7 @@ const DEFAULT_REVIEW_STATE: CommitReviewState = {
   selected_path: null,
   diff_style: 'unified',
   only_changes: true,
-  context_lines: 10,
+  context_lines: 4,
   whole_file: false,
 };
 
@@ -127,8 +126,8 @@ function statusCode(file: ReviewDiffManifestFileEntry): string {
 }
 
 function clampContextLines(value: number | string | null | undefined): number {
-  const numeric = typeof value === 'number' ? value : Number(value ?? 10);
-  if (!Number.isFinite(numeric)) return 10;
+  const numeric = typeof value === 'number' ? value : Number(value ?? 4);
+  if (!Number.isFinite(numeric)) return 4;
   return Math.max(0, Math.min(1000, Math.round(numeric)));
 }
 
@@ -143,94 +142,6 @@ function sumCounts(files: ReviewDiffManifestFileEntry[]) {
   );
 }
 
-type SafePatchDiffProps = {
-  patch: string;
-  diffStyle: DiffStyle;
-};
-
-type SafePatchDiffState = {
-  error: string | null;
-};
-
-class SafePatchDiff extends Component<SafePatchDiffProps, SafePatchDiffState> {
-  state: SafePatchDiffState = { error: null };
-
-  static getDerivedStateFromError(error: unknown): SafePatchDiffState {
-    return { error: error instanceof Error ? error.message : String(error) };
-  }
-
-  componentDidCatch() {}
-
-  componentDidUpdate(prevProps: SafePatchDiffProps) {
-    if ((prevProps.patch !== this.props.patch || prevProps.diffStyle !== this.props.diffStyle) && this.state.error) {
-      this.setState({ error: null });
-    }
-  }
-
-  render() {
-    if (this.state.error) {
-      return (
-        <Stack gap="sm">
-          <Alert color="yellow">The rich diff renderer failed for this patch. Showing the raw patch instead.</Alert>
-          <Text size="xs" c="dimmed">{this.state.error}</Text>
-          <Code block>{this.props.patch}</Code>
-        </Stack>
-      );
-    }
-
-    return (
-      <PatchDiff
-        patch={this.props.patch}
-        options={{ theme: { dark: 'pierre-dark', light: 'pierre-light' }, diffStyle: this.props.diffStyle }}
-      />
-    );
-  }
-}
-
-type SafeFileDiffProps = {
-  fileDiff: FileDiffMetadata;
-  patch: string;
-  diffStyle: DiffStyle;
-};
-
-type SafeFileDiffState = {
-  error: string | null;
-};
-
-class SafeFileDiff extends Component<SafeFileDiffProps, SafeFileDiffState> {
-  state: SafeFileDiffState = { error: null };
-
-  static getDerivedStateFromError(error: unknown): SafeFileDiffState {
-    return { error: error instanceof Error ? error.message : String(error) };
-  }
-
-  componentDidCatch() {}
-
-  componentDidUpdate(prevProps: SafeFileDiffProps) {
-    if ((prevProps.fileDiff !== this.props.fileDiff || prevProps.patch !== this.props.patch || prevProps.diffStyle !== this.props.diffStyle) && this.state.error) {
-      this.setState({ error: null });
-    }
-  }
-
-  render() {
-    if (this.state.error) {
-      return (
-        <Stack gap="sm">
-          <Alert color="yellow">The rich diff renderer failed for this patch. Showing the raw patch instead.</Alert>
-          <Text size="xs" c="dimmed">{this.state.error}</Text>
-          <Code block>{this.props.patch}</Code>
-        </Stack>
-      );
-    }
-
-    return (
-      <FileDiff
-        fileDiff={this.props.fileDiff}
-        options={{ theme: { dark: 'pierre-dark', light: 'pierre-light' }, diffStyle: this.props.diffStyle }}
-      />
-    );
-  }
-}
 
 function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null; mode: CommitAnalyticsMode }) {
   const { report, mode } = props;
@@ -537,47 +448,6 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
   );
 }
 
-function CommitFileRow(props: {
-  file: ReviewDiffManifestFileEntry;
-  active: boolean;
-  onSelect: () => void;
-}) {
-  const { file, active, onSelect } = props;
-  return (
-    <Box
-      onClick={onSelect}
-      style={{
-        cursor: 'pointer',
-        padding: '8px 10px',
-        borderRadius: 8,
-        background: active ? 'rgba(34, 139, 230, 0.16)' : 'rgba(255,255,255,0.02)',
-        border: active ? '1px solid rgba(34, 139, 230, 0.4)' : '1px solid rgba(255,255,255,0.05)'
-      }}
-    >
-      <Group justify="space-between" align="center" wrap="nowrap">
-        <Group gap="xs" wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-          <Badge variant="outline">{statusCode(file)}</Badge>
-          <Text size="sm" fw={active ? 700 : 500} style={{ wordBreak: 'break-word' }}>{file.path}</Text>
-        </Group>
-        <Group gap={6} wrap="nowrap">
-          <Badge color="green" variant="light">+{file.additions}</Badge>
-          <Badge color="red" variant="light">-{file.deletions}</Badge>
-          <Button
-            size="compact-xs"
-            variant={active ? 'filled' : 'light'}
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect();
-            }}
-          >
-            {active ? 'Viewing' : 'View diff'}
-          </Button>
-        </Group>
-      </Group>
-    </Box>
-  );
-}
-
 export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const { repoRef } = props;
   const [commits, setCommits] = useState<ReviewCommitSummary[]>([]);
@@ -605,6 +475,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [filePatchByPath, setFilePatchByPath] = useState<Record<string, string>>({});
   const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
   const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
+  const [collapsedTreeDirs, setCollapsedTreeDirs] = useState<Record<string, boolean>>({});
   const [reviewState, setReviewState] = useState<CommitReviewState>(DEFAULT_REVIEW_STATE);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -788,50 +659,34 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     if (!reviewState.selected_path || !diff?.patch?.trim()) {
       return { fileCount: 0, containsSelectedFile: false, isExactSelectedFilePayload: false, selectedUnifiedLineCount: 0 };
     }
-
-    try {
-      const files = parsePatchFiles(diff.patch).flatMap((patch) => patch.files ?? []);
-      const selected = files.find((file) => file.name === reviewState.selected_path) ?? null;
-      return {
-        fileCount: files.length,
-        containsSelectedFile: files.some((file) => file.name === reviewState.selected_path),
-        isExactSelectedFilePayload: files.length === 1 && selected?.name === reviewState.selected_path,
-        selectedUnifiedLineCount: selected?.unifiedLineCount ?? 0,
-      };
-    } catch {
-      return { fileCount: 0, containsSelectedFile: false, isExactSelectedFilePayload: false, selectedUnifiedLineCount: 0 };
-    }
+    return inspectUnifiedPatch(diff.patch, reviewState.selected_path);
   }, [reviewState.selected_path, diff?.patch]);
-
-  const parsedFileDiffByPath = useMemo<Record<string, FileDiffMetadata | null>>(() => {
-    const next: Record<string, FileDiffMetadata | null> = {};
-    for (const file of diffManifest?.files ?? []) {
-      const patch = filePatchByPath[file.path];
-      if (!patch || !patch.trim()) {
-        next[file.path] = null;
-        continue;
-      }
-      try {
-        const parsed = parsePatchFiles(patch).flatMap((item) => item.files ?? []);
-        next[file.path] = parsed.find((entry) => entry.name === file.path) ?? parsed[0] ?? null;
-      } catch {
-        next[file.path] = null;
-      }
-    }
-    return next;
-  }, [diffManifest, filePatchByPath]);
 
   const commitDiffRows = useMemo(() => {
     return (diffManifest?.files ?? []).map((file) => ({
       file,
-      parsed: parsedFileDiffByPath[file.path] ?? null,
       patch: filePatchByPath[file.path] ?? '',
     }));
-  }, [diffManifest, parsedFileDiffByPath, filePatchByPath]);
+  }, [diffManifest, filePatchByPath]);
 
   const manifestFiles = diffManifest?.files ?? [];
   const manifestTotals = useMemo(() => sumCounts(manifestFiles), [manifestFiles]);
+  const commitBrowserFiles = useMemo<DiffTreeFile[]>(() => manifestFiles.map((file) => ({
+    path: file.path,
+    status: statusCode(file),
+    additions: file.additions,
+    deletions: file.deletions,
+  })), [manifestFiles]);
   const hasCommitDiffRows = commitDiffRows.length > 0;
+  const groupedCommitPatch = useMemo(() => {
+    return commitDiffRows
+      .filter(({ patch }) => patch.trim())
+      .map(({ patch }) => patch.trimEnd())
+      .join('\n');
+  }, [commitDiffRows]);
+  const groupedCommitPatchLoading = useMemo(() => {
+    return commitDiffRows.some(({ file }) => Boolean(filePatchBusyByPath[file.path]));
+  }, [commitDiffRows, filePatchBusyByPath]);
   const allCommitRowsCollapsed = hasCommitDiffRows && commitDiffRows.every(({ file }) => collapsedByPath[file.path] !== false);
 
   function exportCommitAnalyticsCsv() {
@@ -973,6 +828,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
       setFilePatchByPath({});
       setFilePatchBusyByPath(Object.fromEntries(manifest.files.map((file) => [file.path, true])));
       setCollapsedByPath(Object.fromEntries(manifest.files.map((file) => [file.path, false])));
+      setCollapsedTreeDirs({});
 
       const patchEntries = await Promise.all(
         manifest.files.map(async (file) => {
@@ -1038,6 +894,13 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
 
   function toggleCommitRowCollapsed(path: string) {
     setCollapsedByPath((current) => ({ ...current, [path]: !(current[path] ?? false) }));
+  }
+
+  function toggleCommitTreeDir(path: string) {
+    setCollapsedTreeDirs((current) => ({
+      ...current,
+      [path]: !current[path],
+    }));
   }
 
   useEffect(() => {
@@ -1163,50 +1026,29 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
             ) : selectedFilePatch ? (
               <ScrollArea h="100%" type="auto">
                 <Box p={0} style={{ overflow: 'hidden' }}>
-                  <SafePatchDiff patch={selectedFilePatch} diffStyle={reviewState.diff_style} />
+                  <DiffCode patch={selectedFilePatch} diffStyle={reviewState.diff_style} />
                 </Box>
               </ScrollArea>
             ) : (
               <Text size="sm" c="dimmed">No diff available for this commit selection.</Text>
             )
           ) : hasCommitDiffRows ? (
-            <ScrollArea h="100%" type="auto">
-              <Box p="xs" style={{ minHeight: '100%' }}>
-                <Virtualizer contentStyle={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                  {commitDiffRows.map(({ file, parsed, patch }) => {
-                    const collapsed = collapsedByPath[file.path] ?? false;
-                    return (
-                      <Card key={file.path} withBorder p={0} style={{ overflow: 'hidden' }}>
-                        <Box px="sm" py="xs" style={{ position: 'sticky', top: 0, zIndex: 2, background: 'var(--mantine-color-body)', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                          <Group justify="space-between" wrap="nowrap" gap="xs">
-                            <Group gap="xs" wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-                              <Badge variant="outline">{statusCode(file)}</Badge>
-                              <Button size="compact-xs" variant="subtle" onClick={() => toggleCommitRowCollapsed(file.path)}>{collapsed ? 'Expand' : 'Collapse'}</Button>
-                              <Text size="sm" fw={600} style={{ wordBreak: 'break-word' }}>{file.path}</Text>
-                            </Group>
-                            <Group gap="xs" wrap="nowrap">
-                              <Badge color="green" variant="light">+{file.additions}</Badge>
-                              <Badge color="red" variant="light">-{file.deletions}</Badge>
-                            </Group>
-                          </Group>
-                        </Box>
-                        {!collapsed ? (
-                          parsed ? (
-                            <Box p={0} style={{ overflow: 'hidden' }}><SafeFileDiff fileDiff={parsed} patch={patch} diffStyle={reviewState.diff_style} /></Box>
-                          ) : filePatchBusyByPath[file.path] ? (
-                            <Box p="md"><Group justify="center" py="lg"><Loader size="sm" /></Group></Box>
-                          ) : patch ? (
-                            <Box p="md"><Code block>{patch}</Code></Box>
-                          ) : (
-                            <Box p="md"><Text c="dimmed" size="sm">No diff available.</Text></Box>
-                          )
-                        ) : null}
-                      </Card>
-                    );
-                  })}
-                </Virtualizer>
-              </Box>
-            </ScrollArea>
+            <Box style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {groupedCommitPatch.trim() ? (
+                <Box style={{ flex: 1, minHeight: 0 }}>
+                  <DiffCode
+                    patch={groupedCommitPatch}
+                    diffStyle={reviewState.diff_style}
+                    collapsedPaths={collapsedByPath}
+                    onToggleFile={toggleCommitRowCollapsed}
+                  />
+                </Box>
+              ) : groupedCommitPatchLoading ? (
+                <Group justify="center" py="xl"><Loader size="sm" /></Group>
+              ) : (
+                <Text size="sm" c="dimmed">No expanded file diffs available.</Text>
+              )}
+            </Box>
           ) : (
             <Text size="sm" c="dimmed">No diff available for this commit selection.</Text>
           )}
@@ -1214,55 +1056,114 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
       </Card>
 
       <Card withBorder p="sm" style={{ minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <Group justify="space-between" mb="sm">
-          <Text fw={700}>Diff browser</Text>
-          <Button size="compact-xs" variant="subtle" onClick={() => setReviewOpen(false)}>Hide</Button>
-        </Group>
-        <SegmentedControl
-          value={reviewState.diff_style}
-          onChange={(value) => void patchReviewState({ diff_style: value as DiffStyle })}
-          data={[{ label: 'Unified', value: 'unified' }, { label: 'Split', value: 'split' }]}
-          fullWidth
-        />
-        <Group gap="md" mt="sm">
-          <Checkbox checked={reviewState.only_changes} onChange={(event) => void patchReviewState({ only_changes: event.currentTarget.checked })} label="Only show changes" />
-          <Checkbox checked={reviewState.whole_file} onChange={(event) => void patchReviewState({ whole_file: event.currentTarget.checked })} label="Whole file" />
-        </Group>
-        <NumberInput
-          label="Context lines"
-          min={0}
-          max={1000}
-          step={1}
-          value={reviewState.context_lines}
-          disabled={reviewState.whole_file}
-          onChange={(value) => void patchReviewState({ context_lines: clampContextLines(value) })}
-          mt="sm"
-        />
-        <Divider my="sm" />
-        <Button
-          variant={reviewState.selected_path === null ? 'filled' : 'default'}
-          onClick={() => void patchReviewState({ selected_path: null })}
-          style={{ justifyContent: 'space-between' }}
-        >
-          <Group gap="xs" wrap="nowrap">
-            <Text fw={700} size="sm">Commit</Text>
-            <Badge variant="light">{manifestFiles.length}</Badge>
-            <Badge color="green" variant="light">+{manifestTotals.additions}</Badge>
-            <Badge color="red" variant="light">-{manifestTotals.deletions}</Badge>
+        <Stack gap="sm" style={{ minHeight: 0 }}>
+          <Group justify="space-between" align="center">
+            <Text fw={700}>Diff browser</Text>
+            <Button size="xs" variant="subtle" onClick={() => setReviewOpen(false)}>Hide</Button>
           </Group>
-        </Button>
-        <ScrollArea mt="sm" style={{ flex: 1, minHeight: 0 }} type="auto">
-          <Stack gap="xs">
-            {manifestFiles.map((file) => (
-              <CommitFileRow
-                key={file.path}
-                file={file}
-                active={reviewState.selected_path === file.path}
-                onSelect={() => void patchReviewState({ selected_path: file.path })}
-              />
-            ))}
-          </Stack>
-        </ScrollArea>
+          <SegmentedControl
+            value={reviewState.diff_style}
+            onChange={(value) => void patchReviewState({ diff_style: value as DiffStyle })}
+            data={[{ label: 'Unified', value: 'unified' }, { label: 'Split', value: 'split' }]}
+            fullWidth
+          />
+          <Group>
+            <Checkbox
+              checked={reviewState.only_changes && !reviewState.whole_file}
+              onChange={(event) => void patchReviewState({
+                only_changes: event.currentTarget.checked,
+                whole_file: event.currentTarget.checked ? false : reviewState.whole_file,
+              })}
+              label="Only show changes"
+            />
+            <Checkbox
+              checked={reviewState.whole_file}
+              onChange={(event) => void patchReviewState({
+                whole_file: event.currentTarget.checked,
+                only_changes: event.currentTarget.checked ? false : reviewState.only_changes,
+              })}
+              label="Whole file"
+            />
+          </Group>
+          <NumberInput
+            label="Context lines"
+            min={0}
+            max={1000}
+            step={1}
+            value={reviewState.context_lines}
+            disabled={reviewState.whole_file}
+            onChange={(value) => void patchReviewState({ context_lines: clampContextLines(value) })}
+          />
+        </Stack>
+
+        <Card withBorder p={6} mt="sm" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <Box
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              gap: 6,
+              alignItems: 'center',
+              padding: 4,
+              borderRadius: 7,
+              background: reviewState.selected_path === null ? 'rgba(34, 139, 230, 0.14)' : 'rgba(255,255,255,0.025)',
+              border: reviewState.selected_path === null ? '1px solid rgba(34, 139, 230, 0.34)' : '1px solid rgba(255,255,255,0.07)',
+            }}
+          >
+            <Box
+              onClick={() => void patchReviewState({ selected_path: null })}
+              style={{
+                minWidth: 0,
+                height: 24,
+                cursor: 'pointer',
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) auto auto auto',
+                gap: 6,
+                alignItems: 'center',
+                paddingInline: 6,
+                borderRadius: 5,
+              }}
+            >
+              <Text size="sm" fw={800} truncate>Commit</Text>
+              <Badge size="xs" variant={reviewState.selected_path === null ? 'filled' : 'light'}>{manifestFiles.length}</Badge>
+              <Badge size="xs" color="green" variant="light">+{manifestTotals.additions}</Badge>
+              <Badge size="xs" color="red" variant="light">-{manifestTotals.deletions}</Badge>
+            </Box>
+            <Button
+              size="compact-xs"
+              variant={reviewState.selected_path === null ? 'filled' : 'subtle'}
+              onClick={() => void patchReviewState({ selected_path: null })}
+              style={{ height: 24, minHeight: 24 }}
+            >
+              {reviewState.selected_path === null ? 'Viewing' : 'View all'}
+            </Button>
+          </Box>
+
+          {!reviewState.selected_path && hasCommitDiffRows ? (
+            <Group gap={6} mt={6} mb={4} wrap="nowrap">
+              <Button size="compact-xs" variant="default" onClick={() => setAllCommitRowsCollapsed(false)}>Expand all</Button>
+              <Button size="compact-xs" variant="default" onClick={() => setAllCommitRowsCollapsed(true)}>Collapse all</Button>
+              <Badge size="xs" variant="light">{commitDiffRows.filter(({ file }) => collapsedByPath[file.path] === false).length}/{commitDiffRows.length} files expanded</Badge>
+              {groupedCommitPatchLoading ? <Badge size="xs" variant="light">Loading patches…</Badge> : null}
+            </Group>
+          ) : null}
+
+          <Box style={{ flex: 1, minHeight: 0 }}>
+            <ScrollArea h="100%" type="auto">
+              <Box pr="xs">
+                <DiffTree
+                  files={commitBrowserFiles}
+                  selectedPath={reviewState.selected_path}
+                  collapsedDirs={collapsedTreeDirs}
+                  actionLabel="View"
+                  activeActionLabel="Viewing"
+                  onToggleDir={toggleCommitTreeDir}
+                  onSelectFile={(path) => void patchReviewState({ selected_path: path })}
+                  onFileAction={(path) => void patchReviewState({ selected_path: path })}
+                />
+              </Box>
+            </ScrollArea>
+          </Box>
+        </Card>
       </Card>
     </Box>
   ) : null;

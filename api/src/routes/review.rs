@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use regex::Regex;
@@ -19,6 +19,8 @@ use crate::{
 };
 
 use super::workflow_scope::resolve_workflow_scope;
+
+const WHOLE_FILE_CONTEXT_LINES: u32 = i32::MAX as u32;
 
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +439,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/workflow-runs/:run_id/review/diff/manifest", get(workflow_review_diff_manifest))
         .route("/api/workflow-runs/:run_id/review/stage", post(workflow_review_stage))
         .route("/api/workflow-runs/:run_id/review/unstage", post(workflow_review_unstage))
+        .route("/api/workflow-runs/:run_id/review/discard", axum::routing::post(workflow_review_discard))
         .route("/api/workflow-runs/:run_id/commits", get(workflow_review_commits_get).post(workflow_review_commits_post))
 }
 
@@ -496,6 +499,19 @@ async fn workflow_review_unstage(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let scope = resolve_workflow_scope(&state, run_id).await?;
     review_unstage(Json(ReviewStageActionRequest {
+        repo_ref: scope.repo_ref,
+        scope: req.scope,
+        path: req.path,
+    })).await
+}
+
+async fn workflow_review_discard(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+    Json(req): Json<WorkflowStageActionRequest>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    review_discard(Json(ReviewStageActionRequest {
         repo_ref: scope.repo_ref,
         scope: req.scope,
         path: req.path,
@@ -1130,7 +1146,7 @@ async fn review_commit_diff(
     let repo = PathBuf::from(&req.repo_ref);
     let from_ref = commit_parent_ref(&repo, &req.commit)?;
     let to_ref = req.commit.clone();
-    let effective_context = if req.whole_file { 2147483647 } else { req.context_lines.unwrap_or(10).min(1000) };
+    let effective_context = if req.whole_file { WHOLE_FILE_CONTEXT_LINES } else { req.context_lines.unwrap_or(4).min(1000) };
     let unified_arg = format!("--unified={}", effective_context);
 
     let mut args = vec!["diff".to_string(), unified_arg, from_ref.clone(), to_ref.clone()];
@@ -1381,6 +1397,99 @@ async fn review_diff_manifest(
     }))
 }
 
+fn run_untracked_file_patch(
+    repo: &PathBuf,
+    path: &str,
+    effective_context: u32,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let unified_arg = format!("--unified={effective_context}");
+
+    let try_null = run_git_allow_fail(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-index",
+            &unified_arg,
+            "--",
+            "/dev/null",
+            path,
+        ],
+    )
+    .map_err(internal)?;
+
+    if try_null.0 == 0 || try_null.0 == 1 {
+        return String::from_utf8(try_null.1).map_err(internal);
+    }
+
+    let try_nul = run_git_allow_fail(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-index",
+            &unified_arg,
+            "--",
+            "NUL",
+            path,
+        ],
+    )
+    .map_err(internal)?;
+
+    if try_nul.0 == 0 || try_nul.0 == 1 {
+        return String::from_utf8(try_nul.1).map_err(internal);
+    }
+
+    Err(internal(format!(
+        "failed to create untracked file diff for {}: {}{}",
+        path,
+        String::from_utf8_lossy(&try_null.2),
+        String::from_utf8_lossy(&try_nul.2)
+    )))
+}
+
+fn unstaged_untracked_paths(
+    repo: &PathBuf,
+    selected_path: Option<&str>,
+) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
+    let status = git_status(repo).map_err(internal)?;
+    let selected = selected_path.map(|value| value.replace('\\', "/"));
+
+    Ok(status
+        .files
+        .into_iter()
+        .filter(|file| file.untracked)
+        .filter(|file| {
+            selected
+                .as_deref()
+                .map(|path| file.path.replace('\\', "/") == path)
+                .unwrap_or(true)
+        })
+        .map(|file| file.path)
+        .collect())
+}
+
+fn append_untracked_patches(
+    repo: &PathBuf,
+    patch: &mut String,
+    selected_path: Option<&str>,
+    effective_context: u32,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    for path in unstaged_untracked_paths(repo, selected_path)? {
+        let untracked_patch = run_untracked_file_patch(repo, &path, effective_context)?;
+        if !untracked_patch.trim().is_empty() {
+            if !patch.is_empty() && !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            patch.push_str(&untracked_patch);
+            if !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn review_file_patch(
     Json(req): Json<ReviewFilePatchRequest>,
 ) -> Result<Json<ReviewFilePatchResponse>, (axum::http::StatusCode, String)> {
@@ -1388,7 +1497,7 @@ async fn review_file_patch(
     let effective_context = if req.whole_file {
         2147483647
     } else {
-        req.context_lines.unwrap_or(10).min(1000)
+        req.context_lines.unwrap_or(4).min(1000)
     };
     let unified_arg = format!("--unified={}", effective_context);
     let (from_ref, to_ref, use_cached) = refs_for_scope(&req.scope)?;
@@ -1402,8 +1511,12 @@ async fn review_file_patch(
     args.push(req.path.clone());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let patch = String::from_utf8(run_git(&repo, &arg_refs).map_err(internal)?)
+    let mut patch = String::from_utf8(run_git(&repo, &arg_refs).map_err(internal)?)
         .map_err(internal)?;
+
+    if !use_cached {
+        append_untracked_patches(&repo, &mut patch, Some(&req.path), effective_context)?;
+    }
 
     Ok(Json(ReviewFilePatchResponse {
         ok: true,
@@ -1433,15 +1546,17 @@ async fn review_diff(
         .map(|value| vec!["--".to_string(), value.to_string()])
         .unwrap_or_default();
 
-    let (from_ref, to_ref, mut args): (String, String, Vec<String>) = match req.scope.as_str() {
+    let (from_ref, to_ref, include_untracked, mut args): (String, String, bool, Vec<String>) = match req.scope.as_str() {
         "staged" => (
             "HEAD".to_string(),
             "INDEX".to_string(),
+            false,
             vec!["diff".to_string(), "--cached".to_string(), unified_arg.clone()],
         ),
         "unstaged" => (
             "INDEX".to_string(),
             "WORKTREE".to_string(),
+            true,
             vec!["diff".to_string(), unified_arg.clone()],
         ),
         other => {
@@ -1454,8 +1569,12 @@ async fn review_diff(
 
     args.extend(path_args);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let patch = String::from_utf8(run_git(&repo, &arg_refs).map_err(internal)?)
+    let mut patch = String::from_utf8(run_git(&repo, &arg_refs).map_err(internal)?)
         .map_err(internal)?;
+
+    if include_untracked {
+        append_untracked_patches(&repo, &mut patch, req.path.as_deref(), effective_context)?;
+    }
 
     Ok(Json(ReviewDiffResponse {
         ok: true,
@@ -1566,6 +1685,57 @@ async fn review_unstage(
         }
         None => {
             run_git(&repo, &["restore", "--staged", "."]).map_err(internal)?;
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn delete_untracked_path(repo: &std::path::Path, path: &str) -> Result<(), (axum::http::StatusCode, String)> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.contains("..") || normalized.starts_with('/') {
+        return Err((axum::http::StatusCode::BAD_REQUEST, format!("refusing to discard unsafe path {path}")));
+    }
+
+    let full = repo.join(&normalized);
+    if !full.exists() {
+        return Ok(());
+    }
+
+    if full.is_dir() {
+        fs::remove_dir_all(&full).map_err(internal)?;
+    } else {
+        fs::remove_file(&full).map_err(internal)?;
+    }
+
+    Ok(())
+}
+
+async fn review_discard(
+    Json(req): Json<ReviewStageActionRequest>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if req.scope.as_str() != "unstaged" {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("discard is only supported for unstaged changes, got {}", req.scope),
+        ));
+    }
+
+    let repo = PathBuf::from(&req.repo_ref);
+    let status = git_status(&repo).map_err(internal)?;
+
+    match req.path.as_deref().filter(|value| !value.trim().is_empty()) {
+        Some(path) => {
+            let file = status.files.iter().find(|file| file.path == path);
+            if file.map(|file| file.untracked).unwrap_or(false) {
+                delete_untracked_path(&repo, path)?;
+            } else {
+                run_git(&repo, &["restore", "--worktree", "--", path]).map_err(internal)?;
+            }
+        }
+        None => {
+            run_git(&repo, &["restore", "--worktree", "."]).map_err(internal)?;
+            run_git(&repo, &["clean", "-fd", "--", "."]).map_err(internal)?;
         }
     }
 

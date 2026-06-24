@@ -88,16 +88,16 @@ import {
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
-import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
+import type { DiffPanelState } from './DiffPanel';
 import { ensureSupervisorPlannerRun, getSupervisorRun, listSupervisorRuns, type FeaturePlanItem, type SupervisorRun } from './supervisor_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
 import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 
-const ReviewDiffViewerPanel = lazy(async () => {
-  const mod = await import('./ReviewDiffViewerPanel');
-  return { default: mod.ReviewDiffViewerPanel };
+const DiffPanel = lazy(async () => {
+  const mod = await import('./DiffPanel');
+  return { default: mod.DiffPanel };
 });
 
 const CommitSummaryPanel = lazy(async () => {
@@ -1777,8 +1777,8 @@ export function WorkflowShell() {
         ? sourceControl.selected_path
         : null,
       diff_style: sourceControl.diff_style === 'split' ? 'split' : 'unified',
-      only_changes: sourceControl.only_changes !== false,
-      context_lines: typeof sourceControl.context_lines === 'number' ? sourceControl.context_lines : 10,
+      only_changes: Boolean(sourceControl.whole_file) ? false : sourceControl.only_changes !== false,
+      context_lines: typeof sourceControl.context_lines === 'number' ? sourceControl.context_lines : 4,
       whole_file: Boolean(sourceControl.whole_file)
     };
   }, [selectedStageState]);
@@ -1787,7 +1787,7 @@ export function WorkflowShell() {
     selected_path: null,
     diff_style: 'unified',
     only_changes: true,
-    context_lines: 10,
+    context_lines: 4,
     whole_file: false
   });
   useEffect(() => {
@@ -4107,7 +4107,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Group>
           </Stack>
         }>
-          <ReviewDiffViewerPanel
+          <DiffPanel
+            runId={selectedRunId}
             repoRef={resolveRepoRefForRun(selectedRun)}
             state={reviewSourceControlState}
             onPersistState={persistReviewSourceControlState}
@@ -4842,7 +4843,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Modal>
           ) : activeWorkspaceTab === 'diff' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading changes view…</Text></Group></Card>}>
-              <ReviewDiffViewerPanel
+              <DiffPanel
+                runId={selectedRunId}
                 repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
                 state={reviewSourceControlState}
                 onPersistState={persistReviewSourceControlState}
