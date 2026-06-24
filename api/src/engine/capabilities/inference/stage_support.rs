@@ -195,10 +195,13 @@ pub fn prepare_inference_stage_state(
     enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 
     let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
+    let model_input_blocks = build_model_input_blocks(&effective_enabled, &fragments, &transient_prompt_fragments);
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
+    obj.insert("model_input_blocks".to_string(), Value::Array(model_input_blocks.clone()));
+    obj.insert("prompt_blocks".to_string(), Value::Array(model_input_blocks));
     obj.insert(
         "transient_prompt_fragments".to_string(),
         Value::Array(
@@ -262,6 +265,82 @@ fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn build_model_input_blocks(enabled: &Value, fragments: &Value, transient_fragments: &[String]) -> Vec<Value> {
+    let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
+    let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
+    let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
+
+    let mut blocks = Vec::new();
+    for key in order {
+        let is_enabled = enabled_obj.get(key).and_then(Value::as_bool).unwrap_or(false);
+        if !is_enabled {
+            continue;
+        }
+        let content = fragments_obj.get(key).and_then(Value::as_str).unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        blocks.push(prompt_block(blocks.len(), key, prompt_fragment_label(key), prompt_fragment_role(key), prompt_fragment_source(key), content));
+    }
+
+    for content in transient_fragments {
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        blocks.push(prompt_block(blocks.len(), "transient_prompt_fragment", "Transient prompt fragment".to_string(), "capability", "inference", content));
+    }
+
+    blocks
+}
+
+fn prompt_block(index: usize, key: &str, label: String, role: &str, source: &str, content: &str) -> Value {
+    json!({
+        "index": index,
+        "id": key,
+        "key": key,
+        "capability_key": key,
+        "label": label,
+        "title": label,
+        "role": role,
+        "source": source,
+        "enabled": true,
+        "default_collapsed": role != "user",
+        "content_format": "markdown",
+        "char_count": content.chars().count(),
+        "content": content
+    })
+}
+
+fn prompt_fragment_role(key: &str) -> &'static str {
+    if key == "user_input" { "user" } else { "capability" }
+}
+
+fn prompt_fragment_source(key: &str) -> &'static str {
+    match key.split('_').next().unwrap_or("") {
+        "user" => "workflow_step",
+        "planning" | "planner" => "planner",
+        "repo" => "repo_context",
+        "changeset" => "changeset_schema",
+        "review" => "review_validation",
+        _ => "inference",
+    }
+}
+
+fn prompt_fragment_label(key: &str) -> String {
+    key.split('_')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn resolve_context_export_state(global_state: &Value) -> Value {

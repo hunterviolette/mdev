@@ -282,6 +282,995 @@ function extractCompileResultsFromPayload(payload: unknown): Array<Record<string
   return [];
 }
 
+
+type ModelIoDirection = 'input' | 'output' | 'error';
+
+type ModelIoContentBlock = {
+  index: number;
+  label: string;
+  capabilityKey: string;
+  contentFormat: string;
+  content: string;
+  role: string;
+  source: string;
+  enabled: boolean;
+  defaultCollapsed: boolean;
+  charCount: number;
+};
+
+type ModelIoTurn = {
+  id: string;
+  sequenceNo: number;
+  createdAt: string;
+  direction: ModelIoDirection;
+  role: string;
+  content: string;
+  provider: string;
+  model: string;
+  transport: string;
+  source: string;
+  stepId: string;
+  stageType: string;
+  blockLabel: string;
+  blocks: ModelIoContentBlock[];
+};
+
+type ModelIoSourceEvent = {
+  id: string;
+  kind: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  sequence_no?: number;
+  step_id?: string | null;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringFrom(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function formatModelIoContent(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return '';
+  if (/^```[\s\S]*```$/m.test(trimmed)) return trimmed;
+  return trimmed;
+}
+
+function findStructuredPayloadStart(content: string): number {
+  const lines = content.split('\n');
+  let offset = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '{' || trimmed === '[' || trimmed.startsWith('{"') || trimmed.startsWith('[{"')) {
+      return offset;
+    }
+    offset += line.length + 1;
+  }
+
+  return -1;
+}
+
+function tryPrettyJson(content: string): string {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content.trim();
+  }
+}
+
+function summarizeStructuredPayload(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      const feature = asRecord(record.feature);
+      const title = stringFrom(feature?.title) || stringFrom(record.title) || stringFrom(record.name);
+      const keys = Object.keys(record).slice(0, 8).join(', ');
+      if (title && keys) return `${title} · keys: ${keys}`;
+      if (title) return title;
+      if (keys) return `keys: ${keys}`;
+    }
+    if (Array.isArray(parsed)) return `${parsed.length} items`;
+  } catch {
+  }
+
+  const firstLine = content.trim().split('\n').find((line) => line.trim().length > 0) ?? '';
+  return firstLine.length > 140 ? `${firstLine.slice(0, 140)}…` : firstLine;
+}
+
+function formatCollapsibleStructuredPayload(content: string, label: string): string {
+  const summary = summarizeStructuredPayload(content);
+  const pretty = tryPrettyJson(content);
+  return `${label}${summary ? ` — ${summary}` : ''}\n\n\`\`\`json\n${pretty}\n\`\`\``;
+}
+
+function formatReadableModelIoContent(content: string, direction: ModelIoDirection): string {
+  const trimmed = formatModelIoContent(content);
+  if (!trimmed) return '';
+
+  const structuredStart = findStructuredPayloadStart(trimmed);
+  if (structuredStart > 0) {
+    return trimmed;
+  }
+
+  if (structuredStart === 0 && trimmed.length > 1200) {
+    return trimmed;
+  }
+
+  if (trimmed.length > 6000) {
+    return `Large ${direction} payload — ${trimmed.length.toLocaleString()} chars\n\n\`\`\`text\n${trimmed}\n\`\`\``;
+  }
+
+  return trimmed;
+}
+
+function readModelIoContentBlocks(meta: Record<string, unknown>, direction: ModelIoDirection): ModelIoContentBlock[] {
+  const candidates = [
+    meta.blocks,
+    direction === 'input' ? meta.input_blocks : meta.output_blocks,
+    direction === 'input' ? meta.prompt_blocks : meta.response_blocks,
+    meta.content_blocks
+  ];
+
+  const rawBlocks = candidates.find((candidate) => Array.isArray(candidate)) as Array<Record<string, unknown>> | undefined;
+  if (!rawBlocks) return [];
+
+  return rawBlocks.map((block, index) => {
+    const capabilityKey = stringFrom(block.capability_key) || stringFrom(block.capability) || stringFrom(block.key);
+    const label = stringFrom(block.label) || stringFrom(block.title) || labelFromCapabilityKey(capabilityKey) || `Block ${index + 1}`;
+    const role = stringFrom(block.role);
+    const charCount = typeof block.char_count === 'number' ? block.char_count : stringFrom(block.content).length;
+    return {
+      index,
+      label,
+      capabilityKey,
+      contentFormat: stringFrom(block.content_format) || stringFrom(block.format),
+      content: stringFrom(block.content),
+      role,
+      source: stringFrom(block.source),
+      enabled: block.enabled !== false,
+      defaultCollapsed: typeof block.default_collapsed === 'boolean' ? block.default_collapsed : role !== 'user',
+      charCount
+    };
+  });
+}
+
+function blockLabelForCodeFence(turnBlocks: ModelIoContentBlock[], fenceIndex: number, fallback: string): string {
+  const block = turnBlocks[fenceIndex];
+  if (!block) return fallback;
+  return block.label;
+}
+
+function labelFromCapabilityKey(key: string): string {
+  const normalized = key.trim();
+  if (!normalized) return '';
+  return normalized
+    .replace(/[\/_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function modelIoBlockLabelFromMeta(meta: Record<string, unknown>, direction: ModelIoDirection, fallbackLanguage = ''): string {
+  const explicitLabel = stringFrom(meta.block_label) || stringFrom(meta.label) || stringFrom(meta.title);
+  if (explicitLabel) return explicitLabel;
+
+  const capabilityKey = stringFrom(meta.capability_key) || stringFrom(meta.capability) || stringFrom(meta.source_capability) || stringFrom(meta.key);
+  const capabilityLabel = labelFromCapabilityKey(capabilityKey);
+  if (capabilityLabel) return `${capabilityLabel} ${direction === 'input' ? 'input' : direction === 'error' ? 'error' : 'output'}`;
+
+  const source = asRecord(meta.source);
+  const sourceCapability = source ? labelFromCapabilityKey(stringFrom(source.capability) || stringFrom(source.key)) : '';
+  if (sourceCapability) return `${sourceCapability} ${direction === 'input' ? 'input' : direction === 'error' ? 'error' : 'output'}`;
+
+  const language = fallbackLanguage.trim();
+  if (language) return `${language} block`;
+
+  return direction === 'input' ? 'Model input block' : direction === 'error' ? 'Model error block' : 'Model output block';
+}
+
+function pushModelIoTurn(
+  turns: ModelIoTurn[],
+  seen: Set<string>,
+  event: ModelIoSourceEvent,
+  direction: ModelIoDirection,
+  role: string,
+  content: string,
+  meta: Record<string, unknown>,
+  ordinal: number
+) {
+  const normalizedContent = formatReadableModelIoContent(content, direction);
+  if (!normalizedContent) return;
+
+  const key = [
+    direction,
+    role,
+    event.created_at,
+    stringFrom(meta.provider),
+    stringFrom(meta.model),
+    stringFrom(meta.transport),
+    stringFrom(meta.step_id) || event.step_id || '',
+    normalizedContent.slice(0, 512)
+  ].join('|');
+
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  turns.push({
+    id: `${event.id}:${direction}:${ordinal}`,
+    sequenceNo: event.sequence_no ?? ordinal,
+    createdAt: event.created_at,
+    direction,
+    role,
+    content: normalizedContent,
+    provider: stringFrom(meta.provider),
+    model: stringFrom(meta.model),
+    transport: stringFrom(meta.transport),
+    source: event.kind || event.message || 'model',
+    stepId: stringFrom(meta.step_id) || event.step_id || '',
+    stageType: stringFrom(meta.stage_type),
+    blockLabel: modelIoBlockLabelFromMeta(meta, direction),
+    blocks: readModelIoContentBlocks(meta, direction)
+  });
+}
+
+function pushInferencePayloadTurns(
+  turns: ModelIoTurn[],
+  seen: Set<string>,
+  event: ModelIoSourceEvent,
+  inferencePayload: Record<string, unknown>,
+  ordinalBase: number
+) {
+  const modelIo = asRecord(inferencePayload.model_io);
+  if (modelIo) {
+    pushModelIoTurn(turns, seen, event, 'input', 'user', stringFrom(modelIo.input), modelIo, ordinalBase);
+    pushModelIoTurn(turns, seen, event, stringFrom(modelIo.status) === 'failed' ? 'error' : 'output', 'assistant', stringFrom(modelIo.output), modelIo, ordinalBase + 1);
+    return;
+  }
+
+  const result = asRecord(inferencePayload.result);
+  const prompt = stringFrom(inferencePayload.prompt);
+  const output = stringFrom(result?.text);
+  const meta = {
+    provider: stringFrom(inferencePayload.provider),
+    model: stringFrom(inferencePayload.model),
+    transport: stringFrom(result?.transport),
+    capability_key: 'inference'
+  };
+
+  pushModelIoTurn(turns, seen, event, 'input', 'user', prompt, meta, ordinalBase);
+  pushModelIoTurn(turns, seen, event, stringFrom(result?.message) ? 'error' : 'output', 'assistant', output, meta, ordinalBase + 1);
+}
+
+function collectModelIoTurns(events: ModelIoSourceEvent[]): ModelIoTurn[] {
+  const turns: ModelIoTurn[] = [];
+  const seen = new Set<string>();
+
+  events.forEach((event, eventIndex) => {
+    const payload = asRecord(event.payload) ?? {};
+    const directModelIo = asRecord(payload.model_io);
+
+    if (directModelIo && stringFrom(directModelIo.content)) {
+      const direction = stringFrom(directModelIo.direction) as ModelIoDirection;
+      pushModelIoTurn(
+        turns,
+        seen,
+        event,
+        direction === 'input' || direction === 'error' ? direction : 'output',
+        stringFrom(directModelIo.role) || (direction === 'input' ? 'user' : 'assistant'),
+        stringFrom(directModelIo.content),
+        directModelIo,
+        eventIndex * 10
+      );
+    }
+
+    if (payload.capability === 'inference') {
+      const resultPayload = asRecord(payload.result);
+      if (resultPayload) {
+        pushInferencePayloadTurns(turns, seen, event, resultPayload, eventIndex * 10 + 1);
+      }
+    }
+
+    const capabilityResults = Array.isArray(payload.capability_results)
+      ? payload.capability_results as Array<Record<string, unknown>>
+      : [];
+
+    capabilityResults.forEach((entry, entryIndex) => {
+      if (stringFrom(entry.key) !== 'inference') return;
+      const resultPayload = asRecord(entry.result);
+      if (resultPayload) {
+        pushInferencePayloadTurns(turns, seen, event, resultPayload, eventIndex * 10 + entryIndex + 1);
+      }
+    });
+  });
+
+  return turns
+    .filter((turn, index, allTurns) => {
+      const key = [
+        turn.direction,
+        turn.role,
+        turn.stageType,
+        turn.stepId,
+        turn.provider,
+        turn.model,
+        turn.transport,
+        normalizeModelHistoryContentForDedupe(turn.content)
+      ].join('|');
+
+      return allTurns.findIndex((candidate) => [
+        candidate.direction,
+        candidate.role,
+        candidate.stageType,
+        candidate.stepId,
+        candidate.provider,
+        candidate.model,
+        candidate.transport,
+        normalizeModelHistoryContentForDedupe(candidate.content)
+      ].join('|') === key) === index;
+    })
+    .sort((a, b) => a.sequenceNo - b.sequenceNo || a.id.localeCompare(b.id));
+}
+
+function formatModelIoTranscript(turns: ModelIoTurn[], fallbackInput: string, fallbackOutput: string): string {
+  if (turns.length > 0) return `${turns.length.toLocaleString()} model history turns`;
+
+  const fallbackCount = [fallbackInput, fallbackOutput].filter((item) => item.trim()).length;
+  if (fallbackCount > 0) return `${fallbackCount.toLocaleString()} fallback model history turns`;
+
+  return '';
+}
+
+type ModelIoExchange = {
+  id: string;
+  sequenceNo: number;
+  createdAt: string;
+  stageType: string;
+  stepId: string;
+  provider: string;
+  model: string;
+  transport: string;
+  input?: ModelIoTurn;
+  output?: ModelIoTurn;
+  error?: ModelIoTurn;
+};
+
+function normalizeModelHistoryContentForDedupe(value: string | undefined): string {
+  return (value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 2000);
+}
+
+function groupModelIoExchanges(turns: ModelIoTurn[]): ModelIoExchange[] {
+  const exchanges: ModelIoExchange[] = [];
+  let current: ModelIoExchange | null = null;
+  const seenExchanges = new Set<string>();
+
+  turns.forEach((turn) => {
+    if (turn.direction === 'input' || !current) {
+      current = {
+        id: turn.id,
+        sequenceNo: turn.sequenceNo,
+        createdAt: turn.createdAt,
+        stageType: turn.stageType,
+        stepId: turn.stepId,
+        provider: turn.provider,
+        model: turn.model,
+        transport: turn.transport,
+        input: turn.direction === 'input' ? turn : undefined,
+        output: turn.direction === 'output' ? turn : undefined,
+        error: turn.direction === 'error' ? turn : undefined
+      };
+      exchanges.push(current);
+      return;
+    }
+
+    if (turn.direction === 'output') {
+      current.output = turn;
+      return;
+    }
+
+    if (turn.direction === 'error') {
+      current.error = turn;
+    }
+  });
+
+  return exchanges.filter((exchange) => {
+    const key = [
+      exchange.stageType,
+      exchange.stepId,
+      exchange.provider,
+      exchange.model,
+      exchange.transport,
+      normalizeModelHistoryContentForDedupe(exchange.input?.content),
+      normalizeModelHistoryContentForDedupe(exchange.output?.content),
+      normalizeModelHistoryContentForDedupe(exchange.error?.content)
+    ].join('|');
+
+    if (seenExchanges.has(key)) return false;
+    seenExchanges.add(key);
+    return true;
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatCodeBlockContent(language: string, code: string): string {
+  const normalizedLanguage = language.trim().toLowerCase();
+  const trimmedCode = code.trim();
+
+  if (normalizedLanguage === 'json') {
+    try {
+      return JSON.stringify(JSON.parse(trimmedCode), null, 2);
+    } catch {
+      return trimmedCode;
+    }
+  }
+
+  return trimmedCode;
+}
+
+function summarizeModelHistoryCodeBlock(label: string, language: string, code: string): string {
+  const normalizedLanguage = language.trim().toLowerCase() || 'text';
+  const trimmed = code.trim();
+  const blockKind = label || `${normalizedLanguage} block`;
+
+  if (!trimmed) return blockKind;
+
+  if (normalizedLanguage === 'json') {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return `${blockKind} · ${parsed.length.toLocaleString()} items`;
+      if (parsed && typeof parsed === 'object') {
+        const keys = Object.keys(parsed as Record<string, unknown>).slice(0, 6).join(', ');
+        if (keys) return `${blockKind} · keys: ${keys}`;
+      }
+    } catch {
+    }
+  }
+
+  const lineCount = trimmed.split('\n').length;
+  return `${blockKind} · ${lineCount.toLocaleString()} line${lineCount === 1 ? '' : 's'} · ${trimmed.length.toLocaleString()} chars`;
+}
+
+function shouldCollapseModelHistoryCodeBlock(language: string, code: string): boolean {
+  const normalizedLanguage = language.trim().toLowerCase() || 'text';
+  const trimmed = code.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 500) return true;
+  if (trimmed.split('\n').length > 12) return true;
+  return normalizedLanguage === 'json' || normalizedLanguage === 'rust' || normalizedLanguage === 'rs' || normalizedLanguage === 'typescript' || normalizedLanguage === 'ts' || normalizedLanguage === 'javascript' || normalizedLanguage === 'js' || normalizedLanguage === 'text';
+}
+
+function capabilityBlockLanguage(block: ModelIoContentBlock): string {
+  const format = block.contentFormat.trim().toLowerCase();
+  if (format === 'json' || format === 'application/json') return 'json';
+  if (format === 'rust' || format === 'rs') return 'rust';
+  if (format === 'typescript' || format === 'ts') return 'typescript';
+  if (format === 'javascript' || format === 'js') return 'javascript';
+  if (format === 'markdown' || format === 'md') return 'markdown';
+  return 'text';
+}
+
+function CapabilityContentBlock(props: { block: ModelIoContentBlock }) {
+  const language = capabilityBlockLanguage(props.block);
+  const code = formatCodeBlockContent(language, props.block.content);
+  const summary = summarizeModelHistoryCodeBlock(props.block.label, language, code);
+
+  if (props.block.role === 'user') {
+    return (
+      <Box p="sm">
+        <Code
+          block
+          style={{
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
+            fontSize: 12,
+            lineHeight: 1.55,
+          }}
+        >
+          {code}
+        </Code>
+      </Box>
+    );
+  }
+
+  return (
+    <Box p="sm">
+      <details open={!props.block.defaultCollapsed} style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+        <summary style={{ cursor: 'pointer' }}>
+          <Group component="span" gap="xs" wrap="wrap" align="center">
+            <Text component="span" size="xs" fw={700} tt="uppercase" style={{ letterSpacing: '0.06em' }}>
+              {props.block.label}
+            </Text>
+            {props.block.role ? <Badge size="xs" variant="outline">{props.block.role}</Badge> : null}
+            {props.block.source ? <Badge size="xs" variant="outline">{props.block.source}</Badge> : null}
+            <Badge size="xs" variant="outline">{(props.block.charCount || code.length).toLocaleString()} chars</Badge>
+            <Text component="span" size="xs" c="dimmed" style={{ minWidth: 160, flex: '1 1 280px' }}>
+              {summary}
+            </Text>
+          </Group>
+        </summary>
+        <Box mt="xs">
+          <Code
+            block
+            style={{
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              wordBreak: 'break-word',
+              fontSize: 12,
+              lineHeight: 1.55,
+            }}
+          >
+            {code}
+          </Code>
+        </Box>
+      </details>
+    </Box>
+  );
+}
+
+function renderCapabilityBlocks(blocks: ModelIoContentBlock[]): JSX.Element[] {
+  return blocks
+    .filter((block) => block.content.trim())
+    .map((block) => <CapabilityContentBlock key={`${block.index}:${block.capabilityKey}:${block.label}`} block={block} />);
+}
+
+function describeJsonValue(value: unknown): string {
+  if (Array.isArray(value)) return `${value.length.toLocaleString()} item${value.length === 1 ? '' : 's'}`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return `${keys.length.toLocaleString()} key${keys.length === 1 ? '' : 's'}${keys.length > 0 ? `: ${keys.slice(0, 6).join(', ')}` : ''}`;
+  }
+  if (typeof value === 'string') return `${value.length.toLocaleString()} chars`;
+  if (value === null) return 'null';
+  return typeof value;
+}
+
+function jsonBlockTitle(key: string, value: unknown, fallback: string): string {
+  const normalizedKey = key.trim();
+  if (normalizedKey) return labelFromCapabilityKey(normalizedKey);
+  if (Array.isArray(value)) return `${fallback} array`;
+  if (value && typeof value === 'object') return `${fallback} object`;
+  return fallback;
+}
+
+function renderJsonModelHistoryContent(content: string, fallbackLabel: string): JSX.Element[] | null {
+  const trimmed = content.trim();
+  if (!trimmed || !(trimmed.startsWith('{') || trimmed.startsWith('['))) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const entries = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? Object.entries(parsed as Record<string, unknown>)
+    : [['', parsed]] as Array<[string, unknown]>;
+
+  return entries.map(([key, value], index) => {
+    const pretty = JSON.stringify(value, null, 2);
+    const title = jsonBlockTitle(key, value, fallbackLabel || 'JSON response');
+    const summary = describeJsonValue(value);
+
+    return (
+      <Box key={`json-response-${index}-${key || 'root'}`} p="sm">
+        <details style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+          <summary style={{ cursor: 'pointer' }}>
+            <Group component="span" gap="xs" wrap="wrap" align="center">
+              <Text component="span" size="xs" fw={700} tt="uppercase" style={{ letterSpacing: '0.06em' }}>
+                {title}
+              </Text>
+              <Badge size="xs" variant="outline">json</Badge>
+              <Badge size="xs" variant="outline">{pretty.length.toLocaleString()} chars</Badge>
+              <Text component="span" size="xs" c="dimmed" style={{ minWidth: 160, flex: '1 1 280px' }}>
+                {summary}
+              </Text>
+            </Group>
+          </summary>
+          <Box mt="xs">
+            <Code
+              block
+              style={{
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                wordBreak: 'break-word',
+                fontSize: 12,
+                lineHeight: 1.55,
+              }}
+            >
+              {pretty}
+            </Code>
+          </Box>
+        </details>
+      </Box>
+    );
+  });
+}
+
+function ModelHistoryMarkdownContent(props: { content: string; direction: ModelIoDirection; blockLabel: string; blocks: ModelIoContentBlock[] }) {
+  const nodes: JSX.Element[] = [];
+  const explicitCapabilityBlocks = renderCapabilityBlocks(props.blocks);
+  const structuredJsonNodes = explicitCapabilityBlocks.length === 0
+    ? renderJsonModelHistoryContent(props.content, props.blockLabel || modelIoBlockLabelFromMeta({}, props.direction, 'json'))
+    : null;
+  if (structuredJsonNodes) return <Stack gap={0}>{structuredJsonNodes}</Stack>;
+
+  const fencePattern = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let index = 0;
+
+  while ((match = fencePattern.exec(props.content)) !== null) {
+    const before = props.content.slice(cursor, match.index);
+    const language = (match[1] || 'text').trim() || 'text';
+    const code = formatCodeBlockContent(language, match[2] || '');
+
+    if (before.trim()) {
+      nodes.push(
+        <Text
+          key={`text-${index}`}
+          component="div"
+          size="sm"
+          p="sm"
+          style={{
+            whiteSpace: 'pre-wrap',
+            lineHeight: 1.65,
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
+          }}
+        >
+          {before.trim()}
+        </Text>
+      );
+    }
+
+    const blockLabel = blockLabelForCodeFence(props.blocks, index, modelIoBlockLabelFromMeta({}, props.direction, language));
+    const collapseCode = shouldCollapseModelHistoryCodeBlock(language, code);
+    const codeSummary = summarizeModelHistoryCodeBlock(blockLabel, language, code);
+
+    nodes.push(
+      <Box key={`code-${index}`} p="sm">
+        {collapseCode ? (
+          <details style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+            <summary style={{ cursor: 'pointer' }}>
+              <Group component="span" gap="xs" wrap="nowrap">
+                <Badge size="xs" variant="light">{blockLabel}</Badge>
+                <Text component="span" size="xs" c="dimmed" truncate>
+                  {codeSummary}
+                </Text>
+              </Group>
+            </summary>
+            <Box mt="xs">
+              <Code
+                block
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  wordBreak: 'break-word',
+                  fontSize: 12,
+                  lineHeight: 1.55,
+                }}
+              >
+                {code}
+              </Code>
+            </Box>
+          </details>
+        ) : (
+          <>
+            <Group justify="space-between" mb={6}>
+              <Badge size="xs" variant="light">{blockLabel}</Badge>
+              <Badge size="xs" variant="outline">{code.length.toLocaleString()} chars</Badge>
+            </Group>
+            <Code
+              block
+              style={{
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                wordBreak: 'break-word',
+                fontSize: 12,
+                lineHeight: 1.55,
+              }}
+            >
+              {code}
+            </Code>
+          </>
+        )}
+      </Box>
+    );
+
+    cursor = match.index + match[0].length;
+    index += 1;
+  }
+
+  const after = props.content.slice(cursor);
+  if (after.trim()) {
+    nodes.push(
+      <Text
+        key={`text-${index}`}
+        component="div"
+        size="sm"
+        p="sm"
+        style={{
+          whiteSpace: 'pre-wrap',
+          lineHeight: 1.65,
+          overflowWrap: 'anywhere',
+          wordBreak: 'break-word',
+        }}
+      >
+        {after.trim()}
+      </Text>
+    );
+  }
+
+  return <Stack gap={0}>{explicitCapabilityBlocks.length > 0 ? explicitCapabilityBlocks : nodes}</Stack>;
+}
+
+function ModelTurnCard(props: { label: string; turn?: ModelIoTurn; tone: 'input' | 'output' | 'error' }) {
+  if (!props.turn) return null;
+
+  const toneStyles = props.tone === 'input'
+    ? { border: 'rgba(88,166,255,0.45)', background: 'rgba(56,139,253,0.08)', badge: 'blue' }
+    : props.tone === 'error'
+      ? { border: 'rgba(248,81,73,0.55)', background: 'rgba(248,81,73,0.08)', badge: 'red' }
+      : { border: 'rgba(63,185,80,0.45)', background: 'rgba(46,160,67,0.08)', badge: 'green' };
+
+  return (
+    <Box
+      p="md"
+      mt="sm"
+      style={{
+        border: `1px solid ${toneStyles.border}`,
+        background: toneStyles.background,
+        borderRadius: 12,
+        minWidth: 0,
+      }}
+    >
+      <Group justify="space-between" align="center" mb="xs">
+        <Group gap="xs">
+          <Text size="xs" fw={800} tt="uppercase" style={{ letterSpacing: '0.08em' }}>
+            {props.label}
+          </Text>
+          <Badge size="xs" variant="outline">
+            {props.turn.content.length.toLocaleString()} chars
+          </Badge>
+        </Group>
+        <Badge size="xs" color={toneStyles.badge} variant="light">
+          {props.turn.role}
+        </Badge>
+      </Group>
+      <Box
+        style={{
+          border: '1px solid rgba(139,148,158,0.18)',
+          borderRadius: 8,
+          background: 'rgba(0,0,0,0.14)',
+          overflow: 'hidden',
+        }}
+      >
+        <ModelHistoryMarkdownContent content={props.turn.content} direction={props.turn.direction} blockLabel={props.turn.blockLabel} blocks={props.turn.blocks} />
+      </Box>
+    </Box>
+  );
+}
+
+function modelHistoryCopyText(turns: ModelIoTurn[]): string {
+  const exchanges = groupModelIoExchanges(turns);
+  return exchanges
+    .map((exchange, index) => {
+      const lines = [
+        `Exchange ${index + 1}`,
+        [
+          exchange.createdAt ? `Time: ${formatTimestamp(exchange.createdAt)}` : '',
+          exchange.stageType ? `Stage: ${exchange.stageType}` : '',
+          exchange.stepId ? `Step: ${exchange.stepId}` : '',
+          exchange.model ? `Model: ${exchange.model}` : '',
+          exchange.provider ? `Provider: ${exchange.provider}` : '',
+          exchange.transport ? `Transport: ${exchange.transport}` : ''
+        ].filter(Boolean).join(' · '),
+        exchange.input ? `\nPROMPT SENT TO MODEL\n${exchange.input.content}` : '',
+        exchange.output ? `\nMODEL RESPONSE\n${exchange.output.content}` : '',
+        exchange.error ? `\nMODEL ERROR\n${exchange.error.content}` : ''
+      ];
+      return lines.filter(Boolean).join('\n');
+    })
+    .join('\n\n---\n\n');
+}
+
+function ModelHistoryContent(props: { turns: ModelIoTurn[]; fallbackInput: string; fallbackOutput: string; emptyText: string }) {
+  let turns = props.turns;
+
+  if (turns.length === 0) {
+    const fallbackTurns: ModelIoTurn[] = [];
+    if (props.fallbackInput.trim()) {
+      fallbackTurns.push({
+        id: 'fallback:input',
+        sequenceNo: 0,
+        createdAt: '',
+        direction: 'input',
+        role: 'user',
+        content: formatReadableModelIoContent(props.fallbackInput, 'input'),
+        provider: '',
+        model: '',
+        transport: '',
+        source: 'fallback',
+        stepId: '',
+        stageType: '',
+        blockLabel: 'Fallback model input',
+        blocks: []
+      });
+    }
+    if (props.fallbackOutput.trim()) {
+      fallbackTurns.push({
+        id: 'fallback:output',
+        sequenceNo: 1,
+        createdAt: '',
+        direction: 'output',
+        role: 'assistant',
+        content: formatReadableModelIoContent(props.fallbackOutput, 'output'),
+        provider: '',
+        model: '',
+        transport: '',
+        source: 'fallback',
+        stepId: '',
+        stageType: '',
+        blockLabel: 'Fallback model output',
+        blocks: []
+      });
+    }
+    turns = fallbackTurns;
+  }
+
+  const exchanges = groupModelIoExchanges(turns);
+  const [selectedExchangeIndex, setSelectedExchangeIndex] = useState<number | null>(null);
+  const [showTimeline, setShowTimeline] = useState(false);
+
+  useEffect(() => {
+    setSelectedExchangeIndex((previous) => {
+      if (previous === null) return null;
+      return Math.min(previous, Math.max(0, exchanges.length - 1));
+    });
+  }, [exchanges.length]);
+
+  if (exchanges.length === 0) {
+    return <Text size="sm" c="dimmed">{props.emptyText}</Text>;
+  }
+
+  const activeExchangeIndex = selectedExchangeIndex ?? exchanges.length - 1;
+  const exchange = exchanges[activeExchangeIndex] ?? exchanges[exchanges.length - 1];
+  const status = exchange.error ? 'failed' : exchange.output ? 'completed' : 'pending';
+  const statusColor = exchange.error ? 'red' : exchange.output ? 'green' : 'yellow';
+  const meta = [
+    exchange.createdAt ? formatTimestamp(exchange.createdAt) : '',
+    exchange.stageType ? `Stage: ${exchange.stageType}` : '',
+    exchange.stepId ? `Step: ${exchange.stepId}` : '',
+    exchange.model ? `Model: ${exchange.model}` : '',
+    exchange.provider ? `Provider: ${exchange.provider}` : '',
+    exchange.transport ? `Transport: ${exchange.transport}` : ''
+  ].filter(Boolean);
+
+  return (
+    <Stack gap="md">
+      <Card
+        withBorder
+        radius="md"
+        p="sm"
+        style={{
+          position: 'sticky',
+          top: 0,
+          zIndex: 3,
+          background: 'rgba(31,31,31,0.96)',
+          borderColor: 'rgba(139,148,158,0.32)',
+          backdropFilter: 'blur(8px)'
+        }}
+      >
+        <Stack gap="xs">
+          <Group justify="space-between" align="center">
+            <Group gap="xs">
+              <Badge variant="light">{exchanges.length.toLocaleString()} exchanges</Badge>
+              <Badge color={statusColor} variant="light">Viewing {activeExchangeIndex + 1}</Badge>
+              <Text size="xs" c="dimmed">
+                {exchange.createdAt ? formatTimestamp(exchange.createdAt) : 'Latest exchange'}
+              </Text>
+            </Group>
+            <Group gap="xs">
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(0)} disabled={activeExchangeIndex === 0}>
+                First
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(Math.max(0, activeExchangeIndex - 1))} disabled={activeExchangeIndex === 0}>
+                Previous
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(Math.min(exchanges.length - 1, activeExchangeIndex + 1))} disabled={activeExchangeIndex >= exchanges.length - 1}>
+                Next
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(null)} disabled={activeExchangeIndex >= exchanges.length - 1 && selectedExchangeIndex === null}>
+                Latest
+              </Button>
+              <Button size="compact-xs" variant="light" onClick={() => setShowTimeline((value) => !value)}>
+                {showTimeline ? 'Hide history' : 'Show history'}
+              </Button>
+            </Group>
+          </Group>
+          {showTimeline ? (
+            <Group gap={6} wrap="wrap">
+              {exchanges.map((item, index) => (
+                <Button
+                  key={`jump-${item.id}`}
+                  size="compact-xs"
+                  variant={index === activeExchangeIndex ? 'filled' : 'light'}
+                  color={item.error ? 'red' : item.output ? 'green' : 'yellow'}
+                  onClick={() => setSelectedExchangeIndex(index)}
+                >
+                  {index + 1}{item.createdAt ? ` · ${formatTimestamp(item.createdAt)}` : ''}
+                </Button>
+              ))}
+            </Group>
+          ) : null}
+        </Stack>
+      </Card>
+
+      <Card
+        id={`model-exchange-${activeExchangeIndex + 1}`}
+        key={exchange.id}
+        withBorder
+        radius="lg"
+        p="md"
+        style={{
+          scrollMarginTop: 96,
+          background: 'linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.025))',
+          borderColor: 'rgba(139,148,158,0.32)',
+          minWidth: 0,
+          maxHeight: 'calc(100vh - 280px)',
+          overflow: 'hidden',
+        }}
+      >
+        <Stack gap="sm">
+          <Group justify="space-between" align="flex-start" gap="md">
+            <Stack gap={4} style={{ minWidth: 0 }}>
+              <Text fw={800}>Exchange {activeExchangeIndex + 1}</Text>
+              <Text size="xs" c="dimmed" style={{ lineHeight: 1.45 }}>
+                {meta.join(' · ')}
+              </Text>
+            </Stack>
+            <Badge color={statusColor} variant="light">
+              {status}
+            </Badge>
+          </Group>
+          <Divider />
+          <ScrollArea.Autosize
+            mah="calc(100vh - 420px)"
+            type="auto"
+            offsetScrollbars
+            style={{ minHeight: 0 }}
+          >
+            <Stack gap="sm" pr="xs">
+              <ModelTurnCard label="Prompt sent to model" turn={exchange.input} tone="input" />
+              <ModelTurnCard label="Model response" turn={exchange.output} tone="output" />
+              <ModelTurnCard label="Model error" turn={exchange.error} tone="error" />
+            </Stack>
+          </ScrollArea.Autosize>
+        </Stack>
+      </Card>
+    </Stack>
+  );
+}
+
 function formatCompileStageStream(commandResults: Array<Record<string, unknown>>): string {
   const parts: string[] = ['### COMPILE RESULTS'];
 
@@ -3673,11 +4662,13 @@ export function WorkflowShell() {
   }, [events, selectedStepId, selectedLiveExecutionState, selectedLiveStageTrail]);
 
   const stageStreamContent = useMemo(() => {
-    const parts: string[] = [];
-    if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
 
     if (selectedWorkflowStep?.step_type === 'compile') {
-      const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+      const parts: string[] = [];
+      if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+
       let compileResults: Array<Record<string, unknown>> = [];
 
       for (let i = executionItems.length - 1; i >= 0; i -= 1) {
@@ -3689,7 +4680,6 @@ export function WorkflowShell() {
       }
 
       if (compileResults.length === 0) {
-        const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
         for (let i = stageEvents.length - 1; i >= 0; i -= 1) {
           const rows = extractCompileResultsFromPayload(stageEvents[i].payload);
           if (rows.length > 0) {
@@ -3710,9 +4700,28 @@ export function WorkflowShell() {
       return parts.join('\n\n');
     }
 
-    if (inferenceResponse.trim()) parts.push(`### OUTPUT\n${inferenceResponse}`);
-    return parts.join('\n\n');
+    const sourceEvents = events.length > 0 ? events : executionItems;
+    const turns = collectModelIoTurns(sourceEvents);
+
+    if (turns.length > 0) return `${turns.length.toLocaleString()} model history turns`;
+    if (selectedLiveExecutionState?.loading) return '### MODEL I/O HISTORY\nLoading workflow model history…';
+    if (selectedLiveExecutionState?.error) return `### MODEL I/O HISTORY\nUnable to load workflow model history: ${selectedLiveExecutionState.error}`;
+    return '';
   }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.step_type]);
+
+  const modelHistoryTurns = useMemo(() => {
+    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    const sourceEvents = events.length > 0 ? events : executionItems;
+    return collectModelIoTurns(sourceEvents);
+  }, [events, selectedLiveExecutionState]);
+
+  const modelHistoryText = useMemo(() => modelHistoryCopyText(modelHistoryTurns), [modelHistoryTurns]);
+
+  const previewViewerContent = previewViewerMode === 'stream'
+    ? (modelHistoryText || stageStreamContent)
+    : previewViewerMode === 'prompt'
+      ? composedInferencePrompt
+      : inferenceResponse;
 
   function getBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
@@ -4047,7 +5056,7 @@ function MarkdownPreviewContent(props: { content: string; emptyText: string }) {
   );
 }
 
-function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
+function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream', body?: React.ReactNode) {
     return (
       <Stack gap="xs" h="100%">
         <Group justify="space-between" align="center">
@@ -4060,7 +5069,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Group>
         </Group>
         <Box p="md" h="100%" style={{ flex: 1, border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, minHeight: 220, overflow: 'auto', background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
-          <MarkdownPreviewContent content={content} emptyText={emptyText} />
+          {body ?? <MarkdownPreviewContent content={content} emptyText={emptyText} />}
         </Box>
       </Stack>
     );
@@ -4099,27 +5108,60 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     }
     if (selectedWorkflowStep?.step_type === 'review') {
       return (
-        <Suspense fallback={
-          <Stack gap="sm" p="md">
-            <Group gap="xs">
-              <Loader size="sm" />
-              <Text size="sm" c="dimmed">Loading diff viewer…</Text>
-            </Group>
-          </Stack>
-        }>
-          <DiffPanel
-            runId={selectedRunId}
-            repoRef={resolveRepoRefForRun(selectedRun)}
-            state={reviewSourceControlState}
-            onPersistState={persistReviewSourceControlState}
-          />
-        </Suspense>
+        <Tabs defaultValue="model_io" h="100%" style={{ display: 'flex', flexDirection: 'column' }}>
+          <Tabs.List>
+            <Tabs.Tab value="model_io">Model history</Tabs.Tab>
+            <Tabs.Tab value="diff">Diff</Tabs.Tab>
+          </Tabs.List>
+          <Tabs.Panel value="model_io" pt="sm" style={{ flex: 1, minHeight: 0 }}>
+            {renderPreviewPanel(
+              'Model history',
+              stageStreamContent,
+              emptyText,
+              'stream',
+              <ModelHistoryContent
+                turns={modelHistoryTurns}
+                fallbackInput={composedInferencePrompt}
+                fallbackOutput={inferenceResponse}
+                emptyText={emptyText}
+              />
+            )}
+          </Tabs.Panel>
+          <Tabs.Panel value="diff" pt="sm" style={{ flex: 1, minHeight: 0 }}>
+            <Suspense fallback={
+              <Stack gap="sm" p="md">
+                <Group gap="xs">
+                  <Loader size="sm" />
+                  <Text size="sm" c="dimmed">Loading diff viewer…</Text>
+                </Group>
+              </Stack>
+            }>
+              <DiffPanel
+                runId={selectedRunId}
+                repoRef={resolveRepoRefForRun(selectedRun)}
+                state={reviewSourceControlState}
+                onPersistState={persistReviewSourceControlState}
+              />
+            </Suspense>
+          </Tabs.Panel>
+        </Tabs>
       );
     }
     if (selectedWorkflowStep?.step_type === 'sap_export') {
       return <></>;
     }
-    return renderPreviewPanel('Stage stream', stageStreamContent, emptyText, 'stream');
+    return renderPreviewPanel(
+      'Model history',
+      stageStreamContent,
+      emptyText,
+      'stream',
+      <ModelHistoryContent
+        turns={modelHistoryTurns}
+        fallbackInput={composedInferencePrompt}
+        fallbackOutput={inferenceResponse}
+        emptyText={emptyText}
+      />
+    );
   }
 
   function buildInteractiveStagePayload() {
@@ -5964,20 +7006,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           <Stack gap="md">
             <Group justify="space-between" align="center">
               <Group gap="xs">
-                <Badge variant="light">{(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse) ? `${(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).length.toLocaleString()} chars` : 'empty'}</Badge>
+                <Badge variant="light">{previewViewerMode === 'stream' && modelHistoryTurns.length > 0 ? `${groupModelIoExchanges(modelHistoryTurns).length.toLocaleString()} exchanges` : previewViewerContent ? `${previewViewerContent.length.toLocaleString()} chars` : 'empty'}</Badge>
                 <Text size="sm" c="dimmed">Wrapped and formatted for review</Text>
               </Group>
-              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse); }} disabled={!(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).trim()}>
+              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerContent); }} disabled={!previewViewerContent.trim()}>
                 {previewViewerMode === 'stream' ? 'Copy stream' : previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
               </Button>
             </Group>
             <Box p="lg" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
               <ScrollArea h="82vh" offsetScrollbars>
                 <Box maw={920} mx="auto">
-                  <MarkdownPreviewContent
-                    content={previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse}
-                    emptyText={previewViewerMode === 'stream' ? 'No stage stream yet.' : previewViewerMode === 'prompt' ? 'No prompt fragments enabled yet.' : 'No inference response yet.'}
-                  />
+                  {previewViewerMode === 'stream' ? (
+                    <ModelHistoryContent
+                      turns={modelHistoryTurns}
+                      fallbackInput={composedInferencePrompt}
+                      fallbackOutput={inferenceResponse}
+                      emptyText="No stage stream yet."
+                    />
+                  ) : (
+                    <MarkdownPreviewContent
+                      content={previewViewerContent}
+                      emptyText={previewViewerMode === 'prompt' ? 'No prompt fragments enabled yet.' : 'No inference response yet.'}
+                    />
+                  )}
                 </Box>
               </ScrollArea>
             </Box>

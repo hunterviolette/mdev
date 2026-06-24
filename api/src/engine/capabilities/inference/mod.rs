@@ -159,6 +159,8 @@ pub async fn execute(
 
     let resolved_session = session::resolve_inference_session(ctx).await?;
     let selected_transport = resolved_session.config.transport.clone();
+    let selected_provider = resolved_session.config.provider.clone();
+    let selected_model = resolved_session.config.model.clone();
 
     let sent_prompt = ctx
         .local_state
@@ -214,6 +216,8 @@ pub async fn execute(
             .to_string()
     };
 
+    let prompt_blocks = model_input_blocks(ctx.local_state);
+
     Ok(CapabilityResult {
         ok: capability_ok,
         capability: "inference".to_string(),
@@ -221,6 +225,21 @@ pub async fn execute(
             "message": message,
             "prompt": sent_prompt,
             "result": response,
+            "model_io": {
+                "provider": selected_provider,
+                "model": selected_model,
+                "transport": selected_transport,
+                "capability_key": "inference",
+                "block_label": "Inference model call",
+                "input": sent_prompt,
+                "output": response_text,
+                "content_format": "markdown",
+                "status": if capability_ok { "completed" } else { "failed" },
+                "step_id": ctx.step.id,
+                "stage_type": ctx.step.step_type,
+                "input_blocks": prompt_blocks,
+                "output_blocks": []
+            },
             "consumed_capabilities": consumed_capabilities,
         }),
         follow_ups: if capability_ok {
@@ -233,6 +252,73 @@ pub async fn execute(
             CapabilityInvocationRequest::None
         },
     })
+}
+
+fn model_input_blocks(local_state: &Value) -> Vec<Value> {
+    if let Some(items) = local_state
+        .get("model_input_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    if let Some(items) = local_state
+        .get("prompt_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    if let Some(items) = local_state
+        .get("composed_prompt_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    local_state
+        .get("transient_prompt_fragments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let object = item.as_object()?;
+                    let key = object
+                        .get("capability_key")
+                        .or_else(|| object.get("capability"))
+                        .or_else(|| object.get("key"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("prompt_fragment");
+                    let label = object
+                        .get("label")
+                        .or_else(|| object.get("title"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(key);
+                    let content = object
+                        .get("content")
+                        .or_else(|| object.get("text"))
+                        .or_else(|| object.get("value"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let content_format = object
+                        .get("content_format")
+                        .or_else(|| object.get("format"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("markdown");
+
+                    Some(json!({
+                        "index": index,
+                        "capability_key": key,
+                        "label": label,
+                        "content_format": content_format,
+                        "content": content
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
