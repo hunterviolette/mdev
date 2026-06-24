@@ -27,7 +27,7 @@ type FileTreeNode =
       deletions: number;
     };
 
-function buildFileTree(files: DiffBrowserTreeFile[]): FileTreeNode[] {
+function buildFileTree(files: DiffTreeFile[]): FileTreeNode[] {
   const root = new Map<string, FileTreeNode>();
   const childMaps = new WeakMap<Extract<FileTreeNode, { kind: 'dir' }>, Map<string, FileTreeNode>>();
 
@@ -242,7 +242,7 @@ function DiffTreeRow(props: {
 }
 
 export function DiffTree(props: {
-  files: DiffBrowserTreeFile[];
+  files: DiffTreeFile[];
   selectedPath: string | null;
   collapsedDirs: Record<string, boolean>;
   actionLabel?: string;

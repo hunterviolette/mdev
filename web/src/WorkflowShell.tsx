@@ -1768,7 +1768,7 @@ export function WorkflowShell() {
     }, 0);
   }, [pendingDispositionAutoRun, selectedRun?.id, selectedRun?.current_step_id, selectedRunStepId, selectedWorkflowStep?.id, hasPendingDispositionReview, isBackendRunLocked]);
 
-  const persistedReviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
+  const persistedDiffPanelState = useMemo<DiffPanelState>(() => {
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
     return {
@@ -1782,7 +1782,7 @@ export function WorkflowShell() {
       whole_file: Boolean(sourceControl.whole_file)
     };
   }, [selectedStageState]);
-  const [localReviewSourceControlState, setLocalReviewSourceControlState] = useState<ReviewSourceControlState>({
+  const [localReviewSourceControlState, setLocalReviewSourceControlState] = useState<DiffPanelState>({
     selected_scope: 'unstaged',
     selected_path: null,
     diff_style: 'unified',
@@ -1792,9 +1792,9 @@ export function WorkflowShell() {
   });
   useEffect(() => {
     if (selectedWorkflowStep?.step_type === 'review') {
-      setLocalReviewSourceControlState(persistedReviewSourceControlState);
+      setLocalReviewSourceControlState(persistedDiffPanelState);
     }
-  }, [persistedReviewSourceControlState, selectedWorkflowStep?.step_type]);
+  }, [persistedDiffPanelState, selectedWorkflowStep?.step_type]);
   const reviewSourceControlState = localReviewSourceControlState;
 
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
@@ -4300,7 +4300,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     setPlannerFragmentConfigOpen(false);
   }
 
-  async function persistReviewSourceControlState(next: ReviewSourceControlState) {
+  async function persistReviewSourceControlState(next: DiffPanelState) {
     setLocalReviewSourceControlState(next);
     if (!selectedRun || !selectedWorkflowStep) return;
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
