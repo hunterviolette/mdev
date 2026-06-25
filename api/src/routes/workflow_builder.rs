@@ -687,6 +687,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
+            "empty_user_input_default": "",
             "disposition_review": {
                 "enabled": true,
                 "available_dispositions": ["move_next", "pause"]
@@ -737,6 +738,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             label: "Design".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
+                text_field("automation.empty_user_input_default", "Empty user input default", "execution_logic.automation.empty_user_input_default", ""),
             ],
         }],
         available_governance_policies: vec![],
@@ -767,7 +769,8 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
-            "auto_apply_changeset": true
+            "auto_apply_changeset": true,
+            "empty_user_input_default": ""
         }
     });
     template.execution_plan = vec![
@@ -799,6 +802,7 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             label: "Code".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
+                text_field("automation.empty_user_input_default", "Empty user input default", "execution_logic.automation.empty_user_input_default", ""),
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
             ],
         }],
@@ -1130,7 +1134,9 @@ fn int_field(key: &str, label: &str, bind_to: &str, default: i64) -> WorkflowSta
 }
 
 fn text_field(key: &str, label: &str, bind_to: &str, default: &str) -> WorkflowStageField {
-    let multiline = key.ends_with("commands_text") || key.ends_with("manifest_paths_text");
+    let multiline = key.ends_with("commands_text")
+        || key.ends_with("manifest_paths_text")
+        || key.ends_with("empty_user_input_default");
     WorkflowStageField {
         key: key.to_string(),
         label: label.to_string(),

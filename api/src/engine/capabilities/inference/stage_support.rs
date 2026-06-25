@@ -9,6 +9,11 @@ use crate::{
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
+#[derive(Clone, Debug, Default)]
+pub struct InferenceStageHooks {
+    pub empty_user_input_default: Option<String>,
+}
+
 pub struct InferenceStageSettings {
     pub include_changeset_schema: bool,
 }
@@ -19,6 +24,24 @@ pub fn prepare_inference_stage_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
     settings: InferenceStageSettings,
+) -> Result<Value> {
+    prepare_inference_stage_state_with_hooks(
+        repo_ref,
+        global_state,
+        step,
+        local_state,
+        settings,
+        InferenceStageHooks::default(),
+    )
+}
+
+pub fn prepare_inference_stage_state_with_hooks(
+    repo_ref: &str,
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+    local_state: Value,
+    settings: InferenceStageSettings,
+    hooks: InferenceStageHooks,
 ) -> Result<Value> {
     let mut state = ensure_object(local_state);
 
@@ -60,13 +83,26 @@ pub fn prepare_inference_stage_state(
         settings.include_changeset_schema,
     );
 
-    let user_input = state
+    let include_planning_fragment = shared_inference_primitive_enabled(
+        global_state,
+        step,
+        "planner_fragment",
+        false,
+    ) && planner::planner_fragment_enabled(global_state, step);
+
+    let explicit_user_input = state
         .get("prompt")
         .and_then(|v| v.get("user_input"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let default_user_input = resolve_empty_user_input_default(
+        step,
+        &state,
+        hooks.empty_user_input_default.as_deref(),
+    );
+    let user_input = explicit_user_input.or(default_user_input);
 
     if let Some(user_input_fragment) = user_input.clone() {
         fragments
@@ -80,12 +116,6 @@ pub fn prepare_inference_stage_state(
             .remove("user_input");
     }
 
-    let include_planning_fragment = shared_inference_primitive_enabled(
-        global_state,
-        step,
-        "planner_fragment",
-        false,
-    ) && planner::planner_fragment_enabled(global_state, step);
     let planning_fragment = if include_planning_fragment {
         planner::build_planning_fragment(global_state)
     } else {
@@ -247,6 +277,36 @@ pub fn auto_apply_enabled(step: &WorkflowStepDefinition, state: &Value) -> bool 
                 .and_then(Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn resolve_empty_user_input_default(
+    step: &WorkflowStepDefinition,
+    state: &Value,
+    hook_default: Option<&str>,
+) -> Option<String> {
+    state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"))
+        .and_then(|v| v.get("empty_user_input_default"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            step.execution_logic
+                .get("automation")
+                .and_then(|v| v.get("empty_user_input_default"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            hook_default
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String> {

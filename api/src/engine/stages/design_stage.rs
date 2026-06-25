@@ -3,7 +3,15 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::inference::stage_support::{prepare_inference_stage_state, InferenceStageSettings},
+        capabilities::{
+            binding_specs,
+            inference::stage_support::{
+                prepare_inference_stage_state_with_hooks,
+                InferenceStageHooks,
+                InferenceStageSettings,
+            },
+            planner,
+        },
         stages::{capability_contract::StageCapabilities, stage_utility},
     },
     models::WorkflowStepDefinition,
@@ -19,13 +27,26 @@ pub fn prepare_stage_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
-    let mut state = prepare_inference_stage_state(
+    let planner_fragment_enabled = binding_specs::stage_supports_shared_capability(step, "planner_fragment")
+        && binding_specs::shared_capability_enabled(global_state, "planner_fragment", false)
+        && planner::planner_fragment_enabled(global_state, step);
+
+    let empty_user_input_default = if planner_fragment_enabled {
+        Some("are you aligned with the feature implementation?".to_string())
+    } else {
+        None
+    };
+
+    let mut state = prepare_inference_stage_state_with_hooks(
         repo_ref,
         global_state,
         step,
         local_state,
         InferenceStageSettings {
             include_changeset_schema: false,
+        },
+        InferenceStageHooks {
+            empty_user_input_default,
         },
     )?;
 
