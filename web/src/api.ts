@@ -290,10 +290,18 @@ export type EventChainCapabilitySummaryItem = {
   status_label: string;
   message: string;
   started_at: string | null;
+  completed_at?: string | null;
   duration_ms: number | null;
   latest_created_at: string;
+  latest_kind?: string;
+  latest_level?: string;
   is_active: boolean;
   event_count: number;
+  start_event_id?: string | null;
+  end_event_id?: string | null;
+  start_payload?: Record<string, unknown> | null;
+  end_payload?: Record<string, unknown> | null;
+  latest_payload?: Record<string, unknown> | null;
 };
 
 export type EventChainSummaryItem = {
@@ -337,6 +345,59 @@ export type StageExecutionChain = {
   step_id: string;
   stage_execution_id: string;
   items: StageExecutionEvent[];
+};
+
+export type RuntimeNode = {
+  key: string;
+  node_type: string;
+  id: string;
+  status: string;
+  title: string;
+  repo_ref: string;
+  workflow_key?: string | null;
+  current_step_id?: string | null;
+  updated_at: string;
+  payload: Record<string, unknown>;
+};
+
+export type RuntimeEdge = {
+  key: string;
+  parent_key: string;
+  child_key: string;
+  edge_type: string;
+  label: string;
+  sort_order: number;
+  payload: Record<string, unknown>;
+};
+
+export type RuntimeSnapshotResponse = {
+  nodes: RuntimeNode[];
+  edges: RuntimeEdge[];
+  latest_sequence_no: number;
+  server_time: string;
+};
+
+export type RuntimeEventEnvelope = {
+  scope: string;
+  node_key: string;
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  event: StageExecutionEvent;
+};
+
+export type RuntimeProjectionResponse = {
+  runs: EventChainSummaryResponse[];
+};
+
+export type RuntimeEventQuery = {
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  scope?: string | null;
+  after_sequence?: number | null;
 };
 
 export type WorkflowRunActionResult = {
@@ -571,6 +632,30 @@ export function getStageExecutionChain(runId: string, stepId: string, stageExecu
 
 export function openEventStream(runId: string, afterSequence = 0): EventSource {
   return new EventSource(`/api/workflow-runs/${runId}/events/stream?after_sequence=${afterSequence}`);
+}
+
+function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
+  const params = new URLSearchParams();
+  if (query.run_id) params.set('run_id', query.run_id);
+  if (query.supervisor_run_id) params.set('supervisor_run_id', query.supervisor_run_id);
+  if (query.workflow_key) params.set('workflow_key', query.workflow_key);
+  if (query.repo_ref) params.set('repo_ref', query.repo_ref);
+  if (query.scope) params.set('scope', query.scope);
+  if (typeof query.after_sequence === 'number') params.set('after_sequence', String(query.after_sequence));
+  const value = params.toString();
+  return value ? `?${value}` : '';
+}
+
+export function getRuntimeSnapshot(query: RuntimeEventQuery = {}) {
+  return fetchJson<RuntimeSnapshotResponse>(`/api/events/snapshot${runtimeEventQueryString(query)}`);
+}
+
+export function getRuntimeProjection(query: RuntimeEventQuery = {}) {
+  return fetchJson<RuntimeProjectionResponse>(`/api/events/projection${runtimeEventQueryString(query)}`);
+}
+
+export function openRuntimeEventStream(query: RuntimeEventQuery = {}): EventSource {
+  return new EventSource(`/api/events/stream${runtimeEventQueryString(query)}`);
 }
 
 export function sendRunAction(runId: string, body: { action: string; step_id?: string | null; payload?: Record<string, unknown> }) {

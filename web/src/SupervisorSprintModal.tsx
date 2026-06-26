@@ -1,4 +1,4 @@
-import { Alert, Badge, Button, Card, Group, Modal, Select, Stack, Table, Text } from '@mantine/core';
+import { Alert, Anchor, Badge, Button, Card, Group, Modal, Select, Stack, Table, Text } from '@mantine/core';
 import { useEffect, useMemo, useState } from 'react';
 import type { WorkflowTemplate } from './api';
 import { runSupervisorAction, updateSupervisorPlan, type SupervisorChildRun, type SupervisorExecutionStrategy, type SupervisorRun } from './supervisor_api';
@@ -61,6 +61,15 @@ function formatValue(value: string | null | undefined): string {
 function shortId(value: string | null | undefined): string {
   if (!value) return '—';
   return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value;
+}
+
+function workflowRoute(runId: string) {
+  return `/workflows/${encodeURIComponent(runId)}`;
+}
+
+function WorkflowRunAnchor({ runId }: { runId: string | null | undefined }) {
+  if (!runId) return <>—</>;
+  return <Anchor href={workflowRoute(runId)}>{shortId(runId)}</Anchor>;
 }
 
 function workflowName(templates: WorkflowTemplate[], id: string | null | undefined): string {
@@ -391,7 +400,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                       {run.child_runs.map((child) => (
                         <Table.Tr key={child.execution_item_id}>
                           <Table.Td>{child.title}</Table.Td>
-                          <Table.Td>{shortId(child.workflow_run_id)}</Table.Td>
+                          <Table.Td><WorkflowRunAnchor runId={child.workflow_run_id} /></Table.Td>
                           <Table.Td><Badge color={statusBadgeColor(child.status)}>{child.status}</Badge></Table.Td>
                           <Table.Td>{formatValue(child.shard_path)}</Table.Td>
                           <Table.Td>{formatValue(child.patch_path)}</Table.Td>
@@ -463,7 +472,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                                     <Table.Tr key={String(feature.id ?? featureIndex)}>
                                       <Table.Td>{String(feature.title ?? feature.id ?? `Feature ${featureIndex + 1}`)}</Table.Td>
                                       <Table.Td>{String(feature.applied_at ?? sprint.applied_at ?? '—')}</Table.Td>
-                                      <Table.Td>{shortId(child?.workflow_run_id)}</Table.Td>
+                                      <Table.Td><WorkflowRunAnchor runId={child?.workflow_run_id} /></Table.Td>
                                       <Table.Td>{child?.status ? <Badge color={statusBadgeColor(String(child.status))}>{String(child.status)}</Badge> : '—'}</Table.Td>
                                       <Table.Td>{formatValue(child?.patch_path)}</Table.Td>
                                     </Table.Tr>
@@ -475,7 +484,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                               <Table.Tbody>
                                 <Table.Tr>
                                   <Table.Th>Integration workflow run</Table.Th>
-                                  <Table.Td>{shortId(sprint.integration_run_id)}</Table.Td>
+                                  <Table.Td><WorkflowRunAnchor runId={sprint.integration_run_id} /></Table.Td>
                                 </Table.Tr>
                                 <Table.Tr>
                                   <Table.Th>Final patch</Table.Th>

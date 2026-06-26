@@ -2,6 +2,7 @@ import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from 'reac
 import {
   ActionIcon,
   Alert,
+  Anchor,
   AppShell,
   Badge,
   Box,
@@ -35,10 +36,11 @@ import {
   createTemplate,
   deleteRun,
   deleteTemplate,
-  getEventChainSummary,
   getWorkflowChangeset,
   getChangesetSchema,
   getRun,
+  getRuntimeProjection,
+  getRuntimeSnapshot,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -49,7 +51,6 @@ import {
   listRuns,
   listWorkflowChangesets,
   listTemplates,
-  openEventStream,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
   pauseWorkflowRun,
@@ -66,9 +67,10 @@ import {
   type BrowserProbeResult,
   type ApplyChangesetResponse,
   type ChangesetAttemptSummary,
-  type EventChainSummaryItem,
-  type EventChainSummaryResponse,
   type InferenceTransport,
+  type EventChainSummaryResponse,
+  type RuntimeEventEnvelope,
+  type RuntimeProjectionResponse,
   type RepoTreeResponse,
   type SapExportScanItem,
   type SapSearchObject,
@@ -94,6 +96,13 @@ import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
 import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
+import {
+  emptyRuntimeEventStore,
+  reduceRuntimeEvent,
+  reduceRuntimeSnapshot,
+  subscribeRuntimeEventBus,
+  type RuntimeEventStore
+} from './runtime_events';
 
 const DiffPanel = lazy(async () => {
   const mod = await import('./DiffPanel');
@@ -2122,7 +2131,14 @@ const workflowLiveBarKeyframes = `
 }
 `;
 
-export function WorkflowShell() {
+export function WorkflowShell(props: {
+  route?: {
+    path: string;
+    workflowRunId: string | null;
+    supervisorRunId: string | null;
+  };
+  navigate?: (path: string) => void;
+}) {
   const [view, setView] = useState<ShellView>('monitor');
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
@@ -2141,10 +2157,12 @@ export function WorkflowShell() {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [workflowBuilderCatalog, setWorkflowBuilderCatalog] = useState<WorkflowBuilderCatalog | null>(null);
+  const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEventStore>(emptyRuntimeEventStore);
+  const [runtimeProjectionsByRunId, setRuntimeProjectionsByRunId] = useState<Record<string, EventChainSummaryResponse>>({});
 
   const selectedRunIdRef = useRef<string | null>(null);
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
-  const runEventStreamsRef = useRef<Record<string, EventSource>>({});
+  const hydratedWorkflowEventRunsRef = useRef<Set<string>>(new Set());
   const runRefreshTimersRef = useRef<Record<string, number>>({});
 
 
@@ -2860,19 +2878,105 @@ export function WorkflowShell() {
   }, [selectedRunId]);
 
   useEffect(() => {
+    const routedRunId = props.route?.workflowRunId ?? null;
+    const routedSupervisorRunId = props.route?.supervisorRunId ?? null;
+
+    if (routedRunId) {
+      setView('monitor');
+      setMonitorView('workflow_detail');
+      setActiveWorkspaceTab('workflows');
+      if (routedRunId !== selectedRunIdRef.current) {
+        setSelectedRunId(routedRunId);
+        void refreshRunDetailsOnOpen(routedRunId);
+      }
+      return;
+    }
+
+    if (routedSupervisorRunId) {
+      setView('monitor');
+      setMonitorView('workflow_list');
+      setMonitorHomeView('supervisors');
+      setActiveWorkspaceTab('workflows');
+      return;
+    }
+  }, [props.route?.workflowRunId, props.route?.supervisorRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    if (monitorView !== 'workflow_detail') return;
+    if (props.route?.supervisorRunId) return;
+    if (props.route?.workflowRunId === selectedRunId) return;
+    props.navigate?.(`/workflows/${encodeURIComponent(selectedRunId)}`);
+  }, [selectedRunId, monitorView, props.route?.workflowRunId, props.route?.supervisorRunId, props.navigate]);
+
+  useEffect(() => {
     allWorkflowEventsRef.current = allWorkflowEvents;
   }, [allWorkflowEvents]);
 
   useEffect(() => {
     return () => {
-      for (const source of Object.values(runEventStreamsRef.current)) {
-        source.close();
-      }
-      runEventStreamsRef.current = {};
       for (const timer of Object.values(runRefreshTimersRef.current)) {
         window.clearTimeout(timer);
       }
       runRefreshTimersRef.current = {};
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadInitialGraph() {
+      try {
+        const snapshot = await getRuntimeSnapshot({ scope: 'all' });
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
+        hydrateRunsFromRuntimeSnapshot(snapshot.nodes);
+      } catch {
+      }
+    }
+
+    void loadInitialGraph();
+
+    const unsubscribe = subscribeRuntimeEventBus({
+      onOpen: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: true }));
+      },
+      onClose: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
+      },
+      onError: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
+        const runId = selectedRunIdRef.current;
+        if (runId) {
+          void hydrateWorkflowEventsFromHistory(runId);
+          void hydrateRuntimeProjection(runId);
+        }
+      },
+      onSnapshot: (snapshot) => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
+        hydrateRunsFromRuntimeSnapshot(snapshot.nodes ?? []);
+      },
+      onProjection: (projection) => {
+        if (cancelled) return;
+        setRuntimeProjectionsByRunId((prev) => ({
+          ...prev,
+          [projection.run_id]: projection
+        }));
+      },
+      onEvent: (incoming) => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeEvent(prev, incoming));
+        applyIncomingWorkflowEvent(incoming.event.run_id, incoming.event);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
     };
   }, []);
 
@@ -2886,77 +2990,70 @@ export function WorkflowShell() {
       setLiveExecutionTrails([]);
       return;
     }
-    void refreshRunDetails(selectedRunId);
-  }, [selectedRunId]);
+
+    const storedEvents = runtimeEvents.workflowEventsByRunId[selectedRunId] ?? [];
+    const workflowEvents = storedEvents as WorkflowEvent[];
+    const projection = runtimeProjectionsByRunId[selectedRunId] ?? null;
+    setEvents(workflowEvents);
+    setAllWorkflowEvents((prev) => prev[selectedRunId] === workflowEvents ? prev : {
+      ...prev,
+      [selectedRunId]: workflowEvents
+    });
+    setLiveExecutionTrails(projection ? mapLiveExecutionTrailsFromProjection(projection) : []);
+
+    if (!hydratedWorkflowEventRunsRef.current.has(selectedRunId)) {
+      hydratedWorkflowEventRunsRef.current.add(selectedRunId);
+      void hydrateWorkflowEventsFromHistory(selectedRunId);
+      void hydrateRuntimeProjection(selectedRunId);
+    } else if (!projection) {
+      void hydrateRuntimeProjection(selectedRunId);
+    }
+  }, [selectedRunId, runtimeEvents.workflowEventsByRunId, runtimeProjectionsByRunId]);
+
+  useEffect(() => {
+    setEventStreamConnected(runtimeEvents.connected);
+    setEventStreamStatusText(runtimeEvents.connected ? 'Runtime stream connected' : 'Runtime stream disconnected');
+  }, [runtimeEvents.connected]);
 
   useEffect(() => {
     if (!selectedRunId) return;
-    const shouldPoll = Boolean(
-      busy
+    if (monitorView !== 'workflow_detail') return;
+
+    const selectedStatus = selectedRun?.status ?? '';
+    const shouldPollBackend = selectedStatus === 'queued'
+      || selectedStatus === 'running'
+      || selectedStatus === 'waiting'
+      || busy
       || manualCapabilityBusy
-      || pauseRequestBusy
-      || selectedRun?.status === 'queued'
-      || selectedRun?.status === 'running'
-    );
-    if (!shouldPoll) return;
+      || pauseRequestBusy;
+
+    if (!shouldPollBackend) return;
 
     let cancelled = false;
     const runId = selectedRunId;
 
-    async function pollRun() {
+    async function refreshSelectedRunFromBackend() {
       if (cancelled) return;
       try {
-        await refreshRunDetails(runId);
-        await refreshLiveMonitor(runId);
+        await Promise.all([
+          refreshRunDetails(runId),
+          hydrateRuntimeProjection(runId)
+        ]);
       } catch {
       }
     }
 
-    void pollRun();
+    void refreshSelectedRunFromBackend();
     const timer = window.setInterval(() => {
-      void pollRun();
-    }, 1000);
+      void refreshSelectedRunFromBackend();
+    }, 3500);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [selectedRunId, selectedRun?.status, busy, manualCapabilityBusy, pauseRequestBusy]);
+  }, [selectedRunId, selectedRun?.status, monitorView, busy, manualCapabilityBusy, pauseRequestBusy]);
 
-  useEffect(() => {
-    if (!selectedRunId) {
-      setEventStreamConnected(false);
-      setEventStreamStatusText('Disconnected');
-      return;
-    }
-
-    connectRunEventStream(selectedRunId);
-
-    return () => {
-      if (selectedRunIdRef.current !== selectedRunId) {
-        setEventStreamConnected(false);
-        setEventStreamStatusText('Disconnected');
-      }
-    };
-  }, [selectedRunId]);
-
-  useEffect(() => {
-    const desired = new Set<string>();
-
-    if (monitorView === 'workflow_detail' && selectedRunId) {
-      desired.add(selectedRunId);
-    }
-
-    for (const runId of Object.keys(runEventStreamsRef.current)) {
-      if (!desired.has(runId)) {
-        disconnectRunEventStream(runId);
-      }
-    }
-
-    for (const runId of desired) {
-      connectRunEventStream(runId);
-    }
-  }, [monitorView, selectedRunId]);
 
   useEffect(() => {
     setSelectedStepId(selectedRun?.current_step_id ?? null);
@@ -3232,27 +3329,6 @@ export function WorkflowShell() {
 
 
 
-  useEffect(() => {
-    const desired = new Set(
-      runs
-        .filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting')
-        .map((run) => run.id)
-    );
-
-    if (selectedRunId) {
-      desired.add(selectedRunId);
-    }
-
-    for (const runId of Object.keys(runEventStreamsRef.current)) {
-      if (!desired.has(runId)) {
-        disconnectRunEventStream(runId);
-      }
-    }
-
-    for (const runId of desired) {
-      connectRunEventStream(runId);
-    }
-  }, [runs, selectedRunId]);
 
   useEffect(() => {
     const validTrailKeys = new Set(liveExecutionTrails.map((trail) => trail.key));
@@ -3303,14 +3379,6 @@ export function WorkflowShell() {
   }, [liveExecutionTrails, manuallyCollapsedLiveExecutionIds]);
 
   useEffect(() => {
-    for (const trail of liveExecutionTrails) {
-      if (isLiveExecutionExpanded(trail)) {
-        void ensureLiveExecutionChainLoaded(trail, trail.isActive || trail.isCurrent);
-      }
-    }
-  }, [liveExecutionTrails, selectedRunId, stickyCompletedLiveExecutionId]);
-
-  useEffect(() => {
     setLiveExecutionChains({});
     setExpandedLiveEventIds(new Set());
     setManuallyExpandedLiveExecutionIds(new Set());
@@ -3337,44 +3405,6 @@ export function WorkflowShell() {
     const resolvedRunId = nextSelectedRunId ?? selectedRunId ?? runsRes[0]?.id ?? null;
     setSelectedRunId(resolvedRunId);
     if (!selectedTemplateId && templatesRes[0]) setSelectedTemplateId(templatesRes[0].id);
-  }
-
-  function mapLiveExecutionTrails(summary: EventChainSummaryResponse): LiveStageTrail[] {
-    return summary.stages
-      .map((stage: EventChainSummaryItem) => ({
-        key: stage.key,
-        stepId: stage.step_id,
-        label: stage.label,
-        stageExecutionId: stage.stage_execution_id,
-        latestCreatedAt: stage.latest_created_at,
-        durationMs: stage.duration_ms,
-        isActive: stage.is_active,
-        isCurrent: stage.is_current,
-        capabilities: stage.capabilities
-          .map((capability) => ({
-            key: capability.key,
-            capabilityId: capability.capability_id,
-            name: capability.name,
-            statusColor: capability.status_color,
-            statusLabel: capability.status_label,
-            message: capability.message,
-            startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
-            startedAtRaw: capability.started_at ?? null,
-            durationText: formatDurationMs(capability.duration_ms, capability.started_at, capability.is_active ? null : capability.latest_created_at),
-            durationMs: capability.duration_ms,
-            latestCreatedAt: capability.latest_created_at,
-            isActive: capability.is_active,
-            isNew: false,
-            eventCount: capability.event_count,
-            latestLevel: capability.status_color === 'red' ? 'error' : capability.status_color === 'yellow' ? 'warn' : 'info',
-            latestKind: '',
-            latestPayload: null,
-            inputPayload: null,
-            outputPayload: null
-          }))
-          .sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt))
-      }))
-      .sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt));
   }
 
   function isLiveExecutionExpanded(trail: LiveStageTrail): boolean {
@@ -3541,7 +3571,11 @@ export function WorkflowShell() {
       status: capability.statusLabel,
       latest_kind: capability.latestKind,
       latest_level: capability.latestLevel,
-      input: capability.inputPayload ?? null,
+      start_event_payload: capability.inputPayload ?? null,
+      end_event_payload: capability.outputPayload ?? null,
+      latest_payload: capability.latestPayload ?? null,
+      input_payload: capability.inputPayload ?? null,
+      output_payload: capability.outputPayload ?? null,
       output: capability.outputPayload ?? capability.latestPayload ?? null
     };
   }
@@ -3570,6 +3604,64 @@ export function WorkflowShell() {
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
     return objectPayload.output ?? objectPayload.result ?? objectPayload.response ?? objectPayload.error ?? objectPayload.payload ?? objectPayload;
+  }
+
+  function capabilityDisplayMessageFromPayload(payload: unknown, fallback?: string | null): string {
+    const record = asRecord(payload);
+    if (!record) return fallback ?? '';
+
+    const result = asRecord(record.result);
+    const nestedPayload = asRecord(record.payload);
+    const nestedOutput = asRecord(record.output);
+    const nestedResponse = asRecord(record.response);
+    const nestedError = asRecord(record.error);
+
+    const candidates = [
+      record.error_message,
+      record.error,
+      nestedError?.message,
+      nestedError?.summary,
+      result?.error_message,
+      result?.error,
+      result?.message,
+      result?.summary,
+      result?.status,
+      nestedOutput?.error_message,
+      nestedOutput?.error,
+      nestedOutput?.message,
+      nestedOutput?.summary,
+      nestedOutput?.status,
+      nestedResponse?.error_message,
+      nestedResponse?.error,
+      nestedResponse?.message,
+      nestedResponse?.summary,
+      nestedResponse?.status,
+      nestedPayload?.error_message,
+      nestedPayload?.error,
+      nestedPayload?.message,
+      nestedPayload?.summary,
+      nestedPayload?.status,
+      record.message,
+      record.summary,
+      record.status
+    ];
+
+    for (const candidate of candidates) {
+      const value = stringFrom(candidate);
+      if (value) return value;
+    }
+
+    const lines = record.lines ?? result?.lines ?? nestedPayload?.lines ?? nestedOutput?.lines ?? nestedResponse?.lines;
+    if (Array.isArray(lines)) {
+      const value = lines
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .slice(0, 3)
+        .join('\n')
+        .trim();
+      if (value) return value;
+    }
+
+    return fallback ?? '';
   }
 
   function capabilityNameFromKind(kind: string): string {
@@ -3602,71 +3694,321 @@ export function WorkflowShell() {
     return formatDurationMs(end - start, startedAt, endedAt);
   }
 
+  function stripRuntimeContextFromCapabilityPayload(payload: unknown): unknown {
+    const record = asRecord(payload);
+    if (!record) return payload ?? null;
+    const runtimeKeys = new Set([
+      'run_context',
+      'final_context',
+      'prepared_context',
+      'workflow_engine',
+      'global_state',
+      'local_state',
+      'stage_state',
+      'capability_results',
+      'available_transitions',
+      'blocked_on',
+      'next_step_id',
+      'current_step_id'
+    ]);
+    const entries = Object.entries(record).filter(([key]) => !runtimeKeys.has(key));
+    if (entries.length === 0) return null;
+    return Object.fromEntries(entries);
+  }
+
+  function capabilitySpecificPayload(event: StageExecutionEvent | null | undefined): unknown {
+    if (!event) return null;
+    if (!event.capability_invocation_id && isStageResultEvent(event)) return null;
+    return stripRuntimeContextFromCapabilityPayload(event.payload);
+  }
+
+  function capabilityResultSpecificPayload(result: Record<string, unknown>): unknown {
+    return stripRuntimeContextFromCapabilityPayload(result.result ?? result);
+  }
+
+  function normalizeCapabilityOrderKey(value: string): string {
+    return value.trim().toLowerCase().replace(/[\s\/_-]+/g, '');
+  }
+
+  function capabilityDefinitionOrderForStep(stepId: string): Map<string, number> {
+    const step = selectedRunDefinition?.steps.find((item) => item.id === stepId);
+    const order = new Map<string, number>();
+    let index = 0;
+    for (const node of step?.execution_plan ?? []) {
+      if (node.kind !== 'capability' || node.enabled === false) continue;
+      const rawKey = stringFrom((node as unknown as Record<string, unknown>).key);
+      if (!rawKey) continue;
+      order.set(normalizeCapabilityOrderKey(rawKey), index);
+      order.set(normalizeCapabilityOrderKey(formatCapabilityLabel(rawKey)), index);
+      index += 1;
+    }
+    return order;
+  }
+
   function buildLiveCapabilitiesFromEvents(trail: LiveStageTrail, rawEvents: StageExecutionEvent[]): LiveCapabilityTrail[] {
-    const eventsAsc = rawEvents.slice().sort((a, b) => a.sequence_no - b.sequence_no);
+    const eventsAsc = rawEvents.slice().sort((a, b) => a.sequence_no - b.sequence_no || a.created_at.localeCompare(b.created_at));
     const grouped = new Map<string, StageExecutionEvent[]>();
 
     for (const event of eventsAsc) {
-      const capabilityId = event.capability_invocation_id;
+      const eventPayload = asRecord(event.payload) ?? {};
+      const capabilityKey = stringFrom(eventPayload.capability)
+        || stringFrom(eventPayload.capability_key)
+        || stringFrom(eventPayload.key)
+        || stringFrom(eventPayload.name);
+      const capabilityId = event.capability_invocation_id
+        ?? (capabilityKey ? `${trail.stageExecutionId}:capability:${capabilityKey}` : null);
       if (!capabilityId) continue;
       const bucket = grouped.get(capabilityId) ?? [];
       bucket.push(event);
       grouped.set(capabilityId, bucket);
     }
 
-    const mapped = trail.capabilities.map((capability) => {
-      const capabilityEvents = grouped.get(capability.capabilityId) ?? [];
+    const mapped: LiveCapabilityTrail[] = [];
+
+    const firstSequenceByCapabilityId = new Map<string, number>();
+    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
+      const firstEvent = capabilityEvents[0] ?? null;
+      if (firstEvent) {
+        firstSequenceByCapabilityId.set(capabilityId, firstEvent.sequence_no);
+      }
+    }
+
+    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
       const firstEvent = capabilityEvents[0] ?? null;
       const lastEvent = capabilityEvents[capabilityEvents.length - 1] ?? null;
       const startedEvent = capabilityEvents.find((event) => event.kind.endsWith('_started')) ?? firstEvent;
-      const completedEvent = capabilityEvents.find((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) ?? lastEvent;
-      return {
-        ...capability,
-        statusColor: deriveCapabilityStatusColor(lastEvent, capability.statusColor),
-        statusLabel: deriveCapabilityStatusLabel(lastEvent, capability.statusLabel),
-        message: lastEvent?.message ?? capability.message,
-        latestCreatedAt: lastEvent?.created_at ?? capability.latestCreatedAt,
-        isActive: capabilityEvents.length > 0 ? !capabilityEvents.some((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) : capability.isActive,
-        isNew: capabilityEvents.some((event) => recentEventIds.has(event.id)),
-        eventCount: capabilityEvents.length > 0 ? capabilityEvents.length : capability.eventCount,
-        latestLevel: lastEvent?.level ?? capability.latestLevel,
-        latestKind: lastEvent?.kind ?? capability.latestKind,
-        latestPayload: lastEvent?.payload ?? capability.latestPayload,
-        startedAtRaw: startedEvent?.created_at ?? capability.startedAtRaw,
-        inputPayload: startedEvent ? deriveCapabilityPayload('input', startedEvent.payload) : capability.inputPayload,
-        outputPayload: completedEvent ? deriveCapabilityPayload('output', completedEvent.payload) : capability.outputPayload
-      };
-    });
-
-    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
-      if (mapped.some((capability) => capability.capabilityId === capabilityId)) continue;
-      const firstEvent = capabilityEvents[0] ?? null;
-      const lastEvent = capabilityEvents[capabilityEvents.length - 1] ?? null;
-      const capabilityName = formatCapabilityLabel(capabilityNameFromKind(lastEvent?.kind ?? firstEvent?.kind ?? capabilityId));
+      const completedEvent = capabilityEvents.slice().reverse().find((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) ?? null;
+      const statusEvent = completedEvent ?? lastEvent;
+      const startedPayload = asRecord(startedEvent?.payload) ?? {};
+      const lastPayload = asRecord(lastEvent?.payload) ?? {};
+      const capabilityName = formatCapabilityLabel(
+        stringFrom(startedPayload.capability)
+        || stringFrom(startedPayload.capability_key)
+        || stringFrom(startedPayload.key)
+        || stringFrom(startedPayload.name)
+        || stringFrom(lastPayload.capability)
+        || stringFrom(lastPayload.capability_key)
+        || stringFrom(lastPayload.key)
+        || stringFrom(lastPayload.name)
+        || capabilityNameFromKind(startedEvent?.kind ?? lastEvent?.kind ?? capabilityId)
+      );
       mapped.push({
         key: capabilityId,
         capabilityId,
         name: capabilityName,
-        statusColor: deriveCapabilityStatusColor(lastEvent, 'gray'),
-        statusLabel: deriveCapabilityStatusLabel(lastEvent, 'INFO'),
-        message: lastEvent?.message ?? capabilityName,
-        startedAtText: firstEvent ? formatTimestamp(firstEvent.created_at) : '—',
-        startedAtRaw: firstEvent?.created_at ?? null,
-        durationText: formatDuration(firstEvent?.created_at ?? null, lastEvent && (lastEvent.kind.endsWith('_completed') || lastEvent.kind.endsWith('_failed')) ? lastEvent.created_at : null),
+        statusColor: deriveCapabilityStatusColor(statusEvent, 'gray'),
+        statusLabel: deriveCapabilityStatusLabel(statusEvent, 'INFO'),
+        message: capabilityDisplayMessageFromPayload(
+          capabilitySpecificPayload(completedEvent) ?? capabilitySpecificPayload(statusEvent),
+          statusEvent?.message ?? capabilityName
+        ),
+        startedAtText: startedEvent ? formatTimestamp(startedEvent.created_at) : '—',
+        startedAtRaw: startedEvent?.created_at ?? null,
+        durationText: formatDuration(startedEvent?.created_at ?? null, completedEvent?.created_at ?? null),
         durationMs: null,
-        latestCreatedAt: lastEvent?.created_at ?? firstEvent?.created_at ?? '',
-        isActive: !capabilityEvents.some((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')),
+        latestCreatedAt: statusEvent?.created_at ?? firstEvent?.created_at ?? '',
+        isActive: completedEvent === null,
         isNew: capabilityEvents.some((event) => recentEventIds.has(event.id)),
         eventCount: capabilityEvents.length,
-        latestLevel: lastEvent?.level ?? 'info',
-        latestKind: lastEvent?.kind ?? '',
-        latestPayload: lastEvent?.payload ?? null,
-        inputPayload: firstEvent ? deriveCapabilityPayload('input', firstEvent.payload) : null,
-        outputPayload: lastEvent ? deriveCapabilityPayload('output', lastEvent.payload) : null
+        latestLevel: statusEvent?.level ?? 'info',
+        latestKind: statusEvent?.kind ?? '',
+        latestPayload: capabilitySpecificPayload(statusEvent),
+        inputPayload: capabilitySpecificPayload(startedEvent),
+        outputPayload: capabilitySpecificPayload(completedEvent)
       });
     }
 
-    return mapped.sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt));
+    const resultStageEvent = eventsAsc.slice().reverse().find((event) => isStageResultEvent(event)) ?? null;
+    const resultStagePayload = asRecord(resultStageEvent?.payload) ?? {};
+    const capabilityResults = Array.isArray(resultStagePayload.capability_results)
+      ? resultStagePayload.capability_results as Array<Record<string, unknown>>
+      : [];
+
+    const resultOrderByCapabilityName = new Map<string, number>();
+    capabilityResults.forEach((result, index) => {
+      const resultKey = stringFrom(result.key) || stringFrom(result.capability) || stringFrom(result.name);
+      if (resultKey) {
+        resultOrderByCapabilityName.set(normalizeCapabilityOrderKey(resultKey), index);
+        resultOrderByCapabilityName.set(normalizeCapabilityOrderKey(formatCapabilityLabel(resultKey)), index);
+      }
+    });
+
+    for (const result of capabilityResults) {
+      const resultKey = stringFrom(result.key) || stringFrom(result.capability) || stringFrom(result.name);
+      if (!resultKey) continue;
+      const resultLabel = formatCapabilityLabel(resultKey);
+      const existing = mapped.find((capability) => capability.name.toLowerCase() === resultLabel.toLowerCase());
+      const ok = result.ok !== false;
+      const resultPayload = capabilityResultSpecificPayload(result);
+      if (existing) {
+        const resultClosesCapability = existing.outputPayload == null;
+        existing.statusColor = ok ? 'green' : 'red';
+        existing.statusLabel = ok ? 'SUCCESS' : 'ERROR';
+        existing.isActive = false;
+        existing.outputPayload = existing.outputPayload ?? resultPayload;
+        existing.latestPayload = existing.latestPayload ?? resultPayload;
+        if (resultClosesCapability && resultStageEvent) {
+          existing.latestCreatedAt = resultStageEvent.created_at;
+          existing.latestKind = resultStageEvent.kind;
+          existing.durationText = formatDuration(existing.startedAtRaw, resultStageEvent.created_at);
+        }
+        existing.latestLevel = ok ? 'info' : 'error';
+        existing.message = capabilityDisplayMessageFromPayload(resultPayload, existing.message);
+        continue;
+      }
+
+      const capabilityId = `${trail.stageExecutionId}:result:${resultKey}`;
+      mapped.push({
+        key: capabilityId,
+        capabilityId,
+        name: resultLabel,
+        statusColor: ok ? 'green' : 'red',
+        statusLabel: ok ? 'SUCCESS' : 'ERROR',
+        message: capabilityDisplayMessageFromPayload(resultPayload, resultLabel),
+        startedAtText: resultStageEvent ? formatTimestamp(resultStageEvent.created_at) : '—',
+        startedAtRaw: resultStageEvent?.created_at ?? null,
+        durationText: 'elapsed —',
+        durationMs: null,
+        latestCreatedAt: resultStageEvent?.created_at ?? '',
+        isActive: false,
+        isNew: resultStageEvent ? recentEventIds.has(resultStageEvent.id) : false,
+        eventCount: 1,
+        latestLevel: ok ? 'info' : 'error',
+        latestKind: resultStageEvent?.kind ?? 'capability_result',
+        latestPayload: resultPayload,
+        inputPayload: null,
+        outputPayload: resultPayload
+      });
+    }
+
+    if (resultStageEvent) {
+      for (const capability of mapped) {
+        if (!capability.isActive) continue;
+        capability.isActive = false;
+        capability.statusColor = capability.statusColor === 'red' ? 'red' : 'green';
+        capability.statusLabel = capability.statusLabel === 'FAILED' || capability.statusLabel === 'ERROR' ? capability.statusLabel : 'SUCCESS';
+        capability.latestCreatedAt = resultStageEvent.created_at;
+        capability.latestKind = resultStageEvent.kind;
+        capability.latestLevel = capability.statusColor === 'red' ? 'error' : 'info';
+        capability.durationText = formatDuration(capability.startedAtRaw, resultStageEvent.created_at);
+      }
+    }
+
+    return mapped.sort((a, b) => {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+
+      const latestCreatedAtOrder = b.latestCreatedAt.localeCompare(a.latestCreatedAt);
+      if (latestCreatedAtOrder !== 0) return latestCreatedAtOrder;
+
+      const aFirstSequence = firstSequenceByCapabilityId.get(a.capabilityId) ?? Number.MAX_SAFE_INTEGER;
+      const bFirstSequence = firstSequenceByCapabilityId.get(b.capabilityId) ?? Number.MAX_SAFE_INTEGER;
+      if (aFirstSequence !== bFirstSequence) return bFirstSequence - aFirstSequence;
+
+      const aNameKey = normalizeCapabilityOrderKey(a.name);
+      const bNameKey = normalizeCapabilityOrderKey(b.name);
+      const aResultOrder = resultOrderByCapabilityName.get(aNameKey) ?? Number.MAX_SAFE_INTEGER;
+      const bResultOrder = resultOrderByCapabilityName.get(bNameKey) ?? Number.MAX_SAFE_INTEGER;
+      if (aResultOrder !== bResultOrder) return bResultOrder - aResultOrder;
+
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  function isTerminalStageEvent(event: StageExecutionEvent): boolean {
+    if (event.capability_invocation_id) return false;
+    return event.kind === 'stage_execution_completed'
+      || event.kind === 'stage_executed'
+      || event.kind === 'capability_stage_completed'
+      || event.kind === 'capability_stage_failed';
+  }
+
+  function isStageResultEvent(event: StageExecutionEvent): boolean {
+    if (event.capability_invocation_id) return false;
+    const payload = asRecord(event.payload) ?? {};
+    const capabilityResults = payload.capability_results;
+    return isTerminalStageEvent(event)
+      || event.kind === 'stage_execution_waiting_for_disposition_review'
+      || (Array.isArray(capabilityResults) && capabilityResults.length > 0);
+  }
+
+  function mapLiveExecutionTrailsFromProjection(projection: EventChainSummaryResponse): LiveStageTrail[] {
+    return projection.stages.map((stage) => ({
+      key: stage.key,
+      stepId: stage.step_id,
+      label: stage.label,
+      stageExecutionId: stage.stage_execution_id,
+      latestCreatedAt: stage.latest_created_at,
+      durationMs: stage.duration_ms,
+      isActive: stage.is_active,
+      isCurrent: stage.is_current,
+      capabilities: stage.capabilities.map((capability) => ({
+        key: capability.key,
+        capabilityId: capability.capability_id,
+        name: capability.name,
+        statusColor: capability.status_color,
+        statusLabel: capability.status_label,
+        message: capability.message,
+        startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
+        startedAtRaw: capability.started_at ?? null,
+        durationText: formatDurationMs(capability.duration_ms ?? null, capability.started_at ?? null, capability.completed_at ?? null),
+        durationMs: capability.duration_ms ?? null,
+        latestCreatedAt: capability.latest_created_at,
+        isActive: capability.is_active,
+        isNew: Boolean(capability.start_event_id && recentEventIds.has(capability.start_event_id))
+          || Boolean(capability.end_event_id && recentEventIds.has(capability.end_event_id)),
+        eventCount: capability.event_count,
+        latestLevel: capability.latest_level ?? capability.status_label.toLowerCase(),
+        latestKind: capability.latest_kind ?? '',
+        latestPayload: capability.latest_payload ?? capability.end_payload ?? capability.start_payload ?? null,
+        inputPayload: capability.start_payload ?? null,
+        outputPayload: capability.end_payload ?? null
+      }))
+    }));
+  }
+
+  function mergeStageExecutionEvents(existing: StageExecutionEvent[], incoming: StageExecutionEvent[]): StageExecutionEvent[] {
+    const byId = new Map<string, StageExecutionEvent>();
+    for (const event of existing) {
+      byId.set(event.id, event);
+    }
+    for (const event of incoming) {
+      byId.set(event.id, event);
+    }
+    return Array.from(byId.values()).sort((a, b) => a.sequence_no - b.sequence_no || a.created_at.localeCompare(b.created_at));
+  }
+
+  function mergeWorkflowEventsIntoRuntimeStore(runId: string, incoming: Array<WorkflowEvent | StageExecutionEvent>) {
+    const stageEvents = incoming.map((event) => event as StageExecutionEvent);
+    setRuntimeEvents((prev) => {
+      const merged = mergeStageExecutionEvents(prev.workflowEventsByRunId[runId] ?? [], stageEvents);
+      const latestSequenceNo = merged.reduce((latest, event) => Math.max(latest, event.sequence_no), prev.latestSequenceNo);
+      return {
+        ...prev,
+        workflowEventsByRunId: {
+          ...prev.workflowEventsByRunId,
+          [runId]: merged
+        },
+        latestSequenceNo
+      };
+    });
+  }
+
+  async function hydrateWorkflowEventsFromHistory(runId: string) {
+    const runEvents = await listRunEvents(runId);
+    mergeWorkflowEventsIntoRuntimeStore(runId, runEvents);
+  }
+
+  async function hydrateRuntimeProjection(runId: string) {
+    try {
+      const response: RuntimeProjectionResponse = await getRuntimeProjection({ run_id: runId });
+      const projection = response.runs.find((item) => item.run_id === runId) ?? response.runs[0] ?? null;
+      if (!projection) return;
+      setRuntimeProjectionsByRunId((prev) => ({
+        ...prev,
+        [projection.run_id]: projection
+      }));
+    } catch {
+    }
   }
 
   function mergeWorkflowEvents(existing: WorkflowEvent[], incoming: WorkflowEvent & { sequence_no?: number }): WorkflowEvent[] {
@@ -3674,32 +4016,65 @@ export function WorkflowShell() {
     return [...deduped, incoming].sort((a, b) => a.created_at.localeCompare(b.created_at));
   }
 
-  function getAfterSequence(runId: string): number {
-    const currentEvents = allWorkflowEventsRef.current[runId] ?? [];
-    return currentEvents.reduce((max, event) => {
-      const candidate = event as WorkflowEvent & { sequence_no?: number };
-      const value = typeof candidate.sequence_no === 'number' ? candidate.sequence_no : 0;
-      return Math.max(max, value);
-    }, 0);
+  function mergeWorkflowEngineRunState(context: Record<string, unknown>, runStatePatch: Record<string, unknown>): Record<string, unknown> {
+    const workflowEngine = asRecord(context.workflow_engine) ?? {};
+    const runState = asRecord(workflowEngine.run_state) ?? {};
+    return {
+      ...context,
+      workflow_engine: {
+        ...workflowEngine,
+        run_state: {
+          ...runState,
+          ...runStatePatch
+        }
+      }
+    };
   }
 
-  async function refreshRunRecord(runId: string) {
-    const run = await getRun(runId);
-    setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-  }
-
-  function scheduleRunRefresh(runId: string) {
-    const existing = runRefreshTimersRef.current[runId];
-    if (typeof existing === 'number') {
-      window.clearTimeout(existing);
+  function projectRunStateFromRuntimeEvent(run: WorkflowRun, incoming: StageExecutionEvent): WorkflowRun {
+    const payload = asRecord(incoming.payload) ?? {};
+    if (incoming.kind === 'stage_execution_waiting_for_disposition_review') {
+      const stepId = stringFrom(payload.step_id) || incoming.step_id || run.current_step_id || '';
+      const stepType = stringFrom(payload.step_type);
+      const disposition = stringFrom(payload.disposition) || 'move_next';
+      const message = stringFrom(payload.message) || incoming.message;
+      return {
+        ...run,
+        status: 'waiting',
+        current_step_id: stepId || run.current_step_id,
+        updated_at: incoming.created_at,
+        context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
+          blocked_on: {
+            kind: 'disposition_review',
+            stage_id: stepId,
+            stage_type: stepType,
+            recommended_disposition: disposition === 'paused' || disposition === 'pause' ? 'pause' : 'move_next',
+            next_step_id: '',
+            message,
+            available_dispositions: ['move_next', 'pause']
+          }
+        })
+      };
     }
-    runRefreshTimersRef.current[runId] = window.setTimeout(() => {
-      delete runRefreshTimersRef.current[runId];
-      void refreshRunRecord(runId);
-    }, 150);
+
+    if (isTerminalStageEvent(incoming)) {
+      const workflowEngine = asRecord((run.context as Record<string, unknown>).workflow_engine) ?? {};
+      const runState = asRecord(workflowEngine.run_state) ?? {};
+      const blockedOn = asRecord(runState.blocked_on);
+      if (blockedOn?.kind === 'disposition_review') return run;
+      return {
+        ...run,
+        updated_at: incoming.created_at,
+        context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
+          blocked_on: null
+        })
+      };
+    }
+
+    return run;
   }
 
-  function applyIncomingWorkflowEvent(runId: string, incoming: WorkflowEvent & { sequence_no?: number }) {
+  function applyIncomingWorkflowEvent(runId: string, incoming: StageExecutionEvent) {
     setRecentEventIds((prev) => {
       const next = new Set(prev);
       next.add(incoming.id);
@@ -3712,16 +4087,12 @@ export function WorkflowShell() {
         return next;
       });
     }, 1800);
-    setAllWorkflowEvents((prev) => ({
-      ...prev,
-      [runId]: mergeWorkflowEvents(prev[runId] ?? [], incoming)
-    }));
-    if (selectedRunIdRef.current === runId) {
-      setEvents((prev) => mergeWorkflowEvents(prev, incoming));
-    }
+
+    setRuns((prev) => prev.map((run) => run.id === runId ? projectRunStateFromRuntimeEvent(run, incoming) : run));
+
     const payload = incoming.payload as Record<string, unknown>;
     const snapshotContext = payload.final_context ?? payload.run_context ?? payload.prepared_context;
-    if (snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
+    if (incoming.kind !== 'stage_execution_waiting_for_disposition_review' && snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
       const snapshotStatus = typeof payload.prepared_status === 'string'
         ? payload.prepared_status as WorkflowRunStatus
         : typeof payload.status === 'string'
@@ -3734,110 +4105,81 @@ export function WorkflowShell() {
         ...run,
         ...(snapshotStatus ? { status: snapshotStatus } : {}),
         current_step_id: snapshotStepId ?? run.current_step_id,
-        context: snapshotContext as Record<string, unknown>
+        context: snapshotContext as Record<string, unknown>,
+        updated_at: incoming.created_at
       } : run));
     }
-    scheduleRunRefresh(runId);
   }
 
-  function connectRunEventStream(runId: string) {
-    if (runEventStreamsRef.current[runId]) {
-      return;
-    }
+  function hydrateRunsFromRuntimeSnapshot(nodes: Array<{ key: string; node_type: string; id: string; status: string; title: string; repo_ref: string; workflow_key?: string | null; current_step_id?: string | null; updated_at: string }>) {
+    const workflowNodes = nodes.filter((node) => node.node_type === 'workflow_run');
+    if (workflowNodes.length === 0) return;
 
-    const source = openEventStream(runId, getAfterSequence(runId));
-    runEventStreamsRef.current[runId] = source;
-
-    if (selectedRunIdRef.current === runId) {
-      setEventStreamConnected(false);
-      setEventStreamStatusText('Connecting');
-    }
-
-    source.onopen = () => {
-      if (selectedRunIdRef.current === runId) {
-        setEventStreamConnected(true);
-        setEventStreamStatusText('Live');
+    setRuns((prev) => {
+      const existingById = new Map(prev.map((run) => [run.id, run]));
+      for (const node of workflowNodes) {
+        const existing = existingById.get(node.id);
+        if (!existing) continue;
+        existingById.set(node.id, {
+          ...existing,
+          status: node.status as WorkflowRunStatus,
+          title: node.title,
+          repo_ref: node.repo_ref,
+          workflow_key: node.workflow_key ?? existing.workflow_key,
+          current_step_id: node.current_step_id ?? existing.current_step_id,
+          updated_at: node.updated_at
+        });
       }
-    };
-
-    source.addEventListener('workflow_event', (raw) => {
-      try {
-        const incoming = JSON.parse((raw as MessageEvent<string>).data) as WorkflowEvent & { sequence_no?: number };
-        applyIncomingWorkflowEvent(runId, incoming);
-        if (selectedRunIdRef.current === runId) {
-          setEventStreamConnected(true);
-          setEventStreamStatusText('Live');
-        }
-      } catch {
-      }
+      return Array.from(existingById.values()).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
     });
-
-    source.addEventListener('monitor_snapshot', (raw) => {
-      if (selectedRunIdRef.current !== runId) {
-        return;
-      }
-      try {
-        const summary = JSON.parse((raw as MessageEvent<string>).data) as EventChainSummaryResponse;
-        setLiveExecutionTrails(mapLiveExecutionTrails(summary));
-        setEventStreamConnected(true);
-        setEventStreamStatusText('Live');
-      } catch {
-      }
-    });
-
-    source.onerror = () => {
-      if (selectedRunIdRef.current === runId) {
-        setEventStreamConnected(false);
-        setEventStreamStatusText('Reconnecting');
-      }
-    };
-  }
-
-  function disconnectRunEventStream(runId: string) {
-    const source = runEventStreamsRef.current[runId];
-    if (source) {
-      source.close();
-      delete runEventStreamsRef.current[runId];
-    }
-    const timer = runRefreshTimersRef.current[runId];
-    if (typeof timer === 'number') {
-      window.clearTimeout(timer);
-      delete runRefreshTimersRef.current[runId];
-    }
   }
 
   async function refreshRunDetails(runId: string) {
     const [run, runEvents] = await Promise.all([getRun(runId), listRunEvents(runId)]);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    setEvents(runEvents);
-    setAllWorkflowEvents((prev) => ({ ...prev, [run.id]: runEvents }));
-    setSelectedRunId(run.id);
+    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
+    hydratedWorkflowEventRunsRef.current.add(run.id);
+    if (selectedRunIdRef.current === run.id) {
+      setSelectedRunId(run.id);
+    }
   }
 
   async function refreshRunDetailsOnOpen(runId: string) {
     const [run, runEvents] = await Promise.all([openWorkflowRun(runId), listRunEvents(runId)]);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    setEvents(runEvents);
-    setAllWorkflowEvents((prev) => ({ ...prev, [run.id]: runEvents }));
+    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
+    hydratedWorkflowEventRunsRef.current.add(run.id);
     setSelectedRunId(run.id);
   }
 
-  async function refreshLiveMonitor(runId: string) {
-    const summary = await getEventChainSummary(runId);
-    setLiveExecutionTrails(mapLiveExecutionTrails(summary));
+
+  function workflowRoute(runId: string) {
+    return `/workflows/${encodeURIComponent(runId)}`;
   }
 
+  function shouldUseBrowserNavigation(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) {
+    return event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+  }
+
+  function handleWorkflowLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }, runId: string) {
+    if (shouldUseBrowserNavigation(event)) return;
+    event.preventDefault();
+    void openWorkflow(runId);
+  }
 
   async function openWorkflow(runId: string) {
     setSelectedRunId(runId);
     setView('monitor');
     setMonitorView('workflow_detail');
+    setActiveWorkspaceTab('workflows');
+    props.navigate?.(workflowRoute(runId));
     void refreshRunDetailsOnOpen(runId);
-    void refreshLiveMonitor(runId);
   }
 
   function backToWorkflowList() {
     setMonitorView('workflow_list');
+    setMonitorHomeView('workflows');
+    props.navigate?.('/');
   }
 
   async function openBuilder() {
@@ -4007,7 +4349,6 @@ export function WorkflowShell() {
       }
       await startWorkflowRun(runId);
       await refreshRunDetails(runId);
-      await refreshLiveMonitor(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -4050,7 +4391,6 @@ export function WorkflowShell() {
       setError(null);
       await pauseWorkflowRun(runId);
       await refreshRunDetails(runId);
-      await refreshLiveMonitor(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -4624,17 +4964,6 @@ export function WorkflowShell() {
   }, [liveExecutionTrails, selectedStepId]);
 
   const selectedLiveExecutionState = selectedLiveStageTrail ? (liveExecutionChains[selectedLiveStageTrail.key] ?? null) : null;
-
-  useEffect(() => {
-    if (!selectedLiveStageTrail) return;
-    void ensureLiveExecutionChainLoaded(selectedLiveStageTrail, true);
-  }, [
-    selectedLiveStageTrail?.key,
-    selectedLiveStageTrail?.isActive,
-    selectedLiveStageTrail?.isCurrent,
-    selectedLiveStageTrail?.latestCreatedAt,
-    selectedRunId
-  ]);
 
   const inferenceResponse = useMemo(() => {
     const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
@@ -5251,12 +5580,30 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
   async function handleManualSelectStep(stepId: string | null) {
     if (!selectedRun || !stepId) return;
-    await runManualCapability(async () => {
-      const json = await selectWorkflowStep(selectedRun.id, stepId);
-      await refreshRunDetails(selectedRun.id);
-      return json as Record<string, unknown>;
-    }, `Selected stage ${stepId}.`);
-    setSelectedStepId(stepId);
+    const runId = selectedRun.id;
+    try {
+      setManualCapabilityBusy(true);
+      setManualCapabilityStatus(null);
+      const json = await selectWorkflowStep(runId, stepId);
+      setManualCapabilityResponse(JSON.stringify(json, null, 2));
+      setManualCapabilityStatus(`Selected stage ${stepId}.`);
+      setSelectedStepId(stepId);
+      setRuns((prev) => prev.map((run) => run.id === runId
+        ? {
+            ...run,
+            current_step_id: stepId,
+            status: 'waiting',
+            updated_at: new Date().toISOString()
+          }
+        : run
+      ));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setManualCapabilityStatus(message);
+      setManualCapabilityResponse('');
+    } finally {
+      setManualCapabilityBusy(false);
+    }
   }
 
   function handleStageCardClick(stepId: string) {
@@ -5962,7 +6309,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               </Card>
 
               {monitorHomeView === 'supervisors' ? (
-                <SupervisorPanel onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)} />
+                <SupervisorPanel
+                  supervisorRunId={props.route?.supervisorRunId ?? null}
+                  navigate={props.navigate}
+                  onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)}
+                />
               ) : (
                 <>
                   <Card withBorder>
@@ -5996,15 +6347,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         </Table.Thead>
                         <Table.Tbody>
                           {runs.map((run) => (
-                            <Table.Tr key={run.id} onClick={() => void openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
-                              <Table.Td>{run.title}</Table.Td>
+                            <Table.Tr key={run.id}>
+                              <Table.Td>
+                                <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)}>
+                                  {run.title}
+                                </Anchor>
+                              </Table.Td>
                               <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
                               <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
                               <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
                               <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
                               <Table.Td>
                                 <Group gap="xs">
-                                  <Button size="xs" variant="light" onClick={(e) => { e.stopPropagation(); void openWorkflow(run.id); }}>Open</Button>
+                                  <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)} size="sm">
+                                    Open
+                                  </Anchor>
                                   <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
                                 </Group>
                               </Table.Td>
@@ -6288,14 +6645,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Title order={5}>Live workflow events</Title>
                           <Badge color={eventStreamStatus.color} variant="light">Stream {eventStreamStatus.label}</Badge>
                         </Group>
-                        <Button variant="light" size="xs" onClick={() => selectedRunId && void refreshLiveMonitor(selectedRunId)}>Refresh events</Button>
+                        <Button variant="light" size="xs" onClick={() => selectedRunId && void Promise.all([hydrateWorkflowEventsFromHistory(selectedRunId), hydrateRuntimeProjection(selectedRunId)])}>Refresh events</Button>
                       </Group>
                       {liveExecutionTrails.length > 0 ? (
                         <Stack gap="xs">
                           {liveExecutionTrails.map((trail, index) => {
                             const trailExpanded = isLiveExecutionExpanded(trail);
-                            const executionState = liveExecutionChains[trail.key] ?? { loading: false, error: null, chain: null, latestCreatedAt: null };
-                            const rawEvents = (executionState.chain?.items ?? []).slice().sort((a, b) => b.sequence_no - a.sequence_no);
                             return (
                               <Box
                                 key={trail.key}
@@ -6346,16 +6701,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                   <Stack gap="xs" mt="sm">
                                     <Divider label="Capabilities" labelPosition="left" />
 
-                                    {executionState.loading ? <Loader size="sm" /> : null}
-                                    {executionState.error ? <Alert color="red">{executionState.error}</Alert> : null}
-                                    {!executionState.loading && !executionState.error && rawEvents.length === 0 ? (
-                                      <Text size="sm" c="dimmed">No execution events loaded.</Text>
-                                    ) : null}
-
                                     {(() => {
-                                      const capabilityCards = buildLiveCapabilitiesFromEvents(trail, rawEvents);
-                                      if (!executionState.loading && !executionState.error && capabilityCards.length === 0) {
-                                        return <Text size="sm" c="dimmed">No capability executions found.</Text>;
+                                      const capabilityCards = trail.capabilities;
+                                      if (capabilityCards.length === 0) {
+                                        return <Text size="sm" c="dimmed">No capability events in runtime store.</Text>;
                                       }
                                       return capabilityCards.map((capability) => {
                                         const eventExpanded = expandedLiveEventIds.has(capability.key);

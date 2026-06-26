@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Alert, Badge, Button, Card, Group, Stack, Table, Text, TextInput, Title } from '@mantine/core';
+import { Alert, Anchor, Badge, Button, Card, Group, Stack, Table, Text, TextInput, Title } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
 import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { SupervisorSprintModal } from './SupervisorSprintModal';
@@ -7,9 +7,19 @@ import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, l
 
 type Props = {
   onOpenWorkflowRun?: (workflowRunId: string) => Promise<void> | void;
+  supervisorRunId?: string | null;
+  navigate?: (path: string) => void;
 };
 
-export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
+function supervisorRoute(supervisorRunId: string) {
+  return `/supervisors/${encodeURIComponent(supervisorRunId)}`;
+}
+
+function shouldUseBrowserNavigation(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) {
+  return event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+}
+
+export function SupervisorPanel(props: Props) {
   const [runs, setRuns] = useState<SupervisorRun[]>([]);
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -20,6 +30,18 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0], [runs, selectedId]);
+
+  useEffect(() => {
+    if (!props.supervisorRunId) return;
+    setSelectedId(props.supervisorRunId);
+  }, [props.supervisorRunId]);
+
+  function handleSupervisorLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }, supervisorRunId: string) {
+    if (shouldUseBrowserNavigation(event)) return;
+    event.preventDefault();
+    setSelectedId(supervisorRunId);
+    props.navigate?.(supervisorRoute(supervisorRunId));
+  }
 
   async function refresh() {
     const [nextRuns, nextTemplates] = await Promise.all([listSupervisorRuns(), listTemplates()]);
@@ -127,8 +149,12 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
           </Table.Thead>
           <Table.Tbody>
             {runs.map((run) => (
-              <Table.Tr key={run.id} onClick={() => setSelectedId(run.id)} style={{ cursor: 'pointer' }}>
-                <Table.Td>{run.title}</Table.Td>
+              <Table.Tr key={run.id}>
+                <Table.Td>
+                  <Anchor href={supervisorRoute(run.id)} onClick={(event) => handleSupervisorLinkClick(event, run.id)}>
+                    {run.title}
+                  </Anchor>
+                </Table.Td>
                 <Table.Td><Badge>{run.status}</Badge></Table.Td>
                 <Table.Td>{run.strategy}</Table.Td>
                 <Table.Td>{run.feature_plan_items.length}</Table.Td>
@@ -167,7 +193,7 @@ export function SupervisorPanel({ onOpenWorkflowRun }: Props) {
         templates={templates}
         onClose={() => setPlannerOpen(false)}
         onSaved={refresh}
-        onWorkflowRunCreated={onOpenWorkflowRun}
+        onWorkflowRunCreated={props.onOpenWorkflowRun}
       />
 
       <SupervisorSprintModal
