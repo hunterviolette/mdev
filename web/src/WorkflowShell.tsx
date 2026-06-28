@@ -2135,7 +2135,9 @@ export function WorkflowShell(props: {
   route?: {
     path: string;
     workflowRunId: string | null;
+    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
     supervisorRunId: string | null;
+    supervisorView?: 'planner' | 'sprint' | null;
   };
   navigate?: (path: string) => void;
 }) {
@@ -2143,6 +2145,8 @@ export function WorkflowShell(props: {
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
   const [monitorHomeView, setMonitorHomeView] = useState<MonitorHomeView>('workflows');
+  const [supervisorCreateRequestToken, setSupervisorCreateRequestToken] = useState(0);
+  const [supervisorRefreshRequestToken, setSupervisorRefreshRequestToken] = useState(0);
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2369,6 +2373,16 @@ export function WorkflowShell(props: {
   }, []);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
+
+  useEffect(() => {
+    if (monitorView !== 'workflow_detail') return;
+    if (!selectedRun) return;
+    const runTitle = selectedRun.title?.trim() || 'Untitled';
+    const tabTitle = workflowTabTitle(activeWorkspaceTab);
+    document.title = tabTitle === 'workflow'
+      ? `Workflow · ${runTitle}`
+      : `Workflow · ${tabTitle} · ${runTitle}`;
+  }, [monitorView, selectedRun, activeWorkspaceTab]);
   const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting' || selectedRun?.status === 'draft' || selectedRun?.status === 'success';
   const isManualMode = isInteractiveMode;
   const isBackendRunLocked = Boolean(
@@ -2394,21 +2408,53 @@ export function WorkflowShell(props: {
     return selectedRun?.definition ?? null;
   }, [selectedRun?.definition]);
 
+  function normalizeCheckpointDisposition(disposition: string) {
+    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous') return 'continue_auto';
+    if (disposition === 'select_stage' || disposition === 'select' || disposition === 'continue_manual' || disposition === 'manual') return 'select_stage';
+    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous' || disposition === 'move_next' || disposition === 'continue') return 'continue_auto';
+    if (disposition === 'pause_error' || disposition === 'pause' || disposition === 'paused') return 'pause_error';
+    return disposition;
+  }
+
+  function checkpointDispositionLabel(disposition: string) {
+    switch (normalizeCheckpointDisposition(disposition)) {
+      case 'continue_auto':
+        return 'Continue';
+      case 'select_stage':
+        return 'Select';
+      case 'pause_error':
+        return 'Pause';
+      default:
+        return disposition.replace(/_/g, ' ');
+    }
+  }
+
+  function checkpointDispositionColor(disposition: string) {
+    switch (normalizeCheckpointDisposition(disposition)) {
+      case 'continue_auto':
+        return 'green';
+      case 'select_stage':
+        return 'blue';
+      case 'pause_error':
+        return 'yellow';
+      default:
+        return undefined;
+    }
+  }
+
   const pendingDispositionReview = useMemo(() => {
     const workflowEngine = ((selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine ?? undefined) as Record<string, unknown> | undefined;
     const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
     const blockedOn = (runState.blocked_on ?? null) as Record<string, unknown> | null;
-    if (!blockedOn || blockedOn.kind !== 'disposition_review') return null;
-    const available = Array.isArray(blockedOn.available_dispositions)
-      ? blockedOn.available_dispositions.filter((item): item is string => item === 'move_next' || item === 'pause')
-      : ['move_next', 'pause'];
+    if (!blockedOn || (blockedOn.kind !== 'operator_checkpoint' && blockedOn.kind !== 'disposition_review')) return null;
+
     return {
       stageId: typeof blockedOn.stage_id === 'string' ? blockedOn.stage_id : selectedRun?.current_step_id ?? '',
       stageType: typeof blockedOn.stage_type === 'string' ? blockedOn.stage_type : '',
       recommendedDisposition: typeof blockedOn.recommended_disposition === 'string' ? blockedOn.recommended_disposition : '',
       nextStepId: typeof blockedOn.next_step_id === 'string' ? blockedOn.next_step_id : '',
       message: typeof blockedOn.message === 'string' ? blockedOn.message : '',
-      availableDispositions: available.length > 0 ? available : ['move_next', 'pause']
+      availableDispositions: ['continue_auto', 'pause_error', 'select_stage']
     };
   }, [selectedRun?.context, selectedRun?.current_step_id]);
 
@@ -2878,13 +2924,47 @@ export function WorkflowShell(props: {
   }, [selectedRunId]);
 
   useEffect(() => {
+    const runId = selectedRunIdRef.current;
+    if (!runId) return;
+
+    const events = runtimeEvents.workflowEventsByRunId[runId] ?? [];
+    const latest = events[events.length - 1];
+    if (!latest) return;
+
+    const shouldHydrateSelectedRun = latest.kind === 'workflow_waiting_for_operator_checkpoint'
+      || latest.kind === 'stage_execution_waiting_for_operator_checkpoint'
+      || latest.kind === 'stage_execution_waiting_for_disposition_review'
+      || latest.kind === 'operator_checkpoint_resolved'
+      || latest.kind === 'stage_execution_completed'
+      || latest.kind === 'supervisor.workflow_terminal'
+      || latest.kind === 'run_started'
+      || latest.kind === 'run_status_changed';
+
+    if (!shouldHydrateSelectedRun) return;
+
+    let cancelled = false;
+    void getRun(runId)
+      .then((run) => {
+        if (cancelled) return;
+        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRunId, runtimeEvents.workflowEventsByRunId]);
+
+  useEffect(() => {
     const routedRunId = props.route?.workflowRunId ?? null;
     const routedSupervisorRunId = props.route?.supervisorRunId ?? null;
+    const routedPath = props.route?.path ?? window.location.pathname;
 
     if (routedRunId) {
-      setView('monitor');
-      setMonitorView('workflow_detail');
-      setActiveWorkspaceTab('workflows');
+      const routedWorkflowTab = workspaceTabFromRouteView(props.route?.workflowView ?? null);
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_detail' ? value : 'workflow_detail');
+      setActiveWorkspaceTab((value) => value === routedWorkflowTab ? value : routedWorkflowTab);
       if (routedRunId !== selectedRunIdRef.current) {
         setSelectedRunId(routedRunId);
         void refreshRunDetailsOnOpen(routedRunId);
@@ -2892,22 +2972,32 @@ export function WorkflowShell(props: {
       return;
     }
 
-    if (routedSupervisorRunId) {
-      setView('monitor');
-      setMonitorView('workflow_list');
-      setMonitorHomeView('supervisors');
-      setActiveWorkspaceTab('workflows');
+    if (routedSupervisorRunId || routedPath === '/supervisors') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'supervisors' ? value : 'supervisors');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
       return;
     }
-  }, [props.route?.workflowRunId, props.route?.supervisorRunId]);
+
+    if (routedPath === '/workflows' || routedPath === '/') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'workflows' ? value : 'workflows');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+    }
+  }, [props.route?.path, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId]);
 
   useEffect(() => {
     if (!selectedRunId) return;
     if (monitorView !== 'workflow_detail') return;
     if (props.route?.supervisorRunId) return;
-    if (props.route?.workflowRunId === selectedRunId) return;
-    props.navigate?.(`/workflows/${encodeURIComponent(selectedRunId)}`);
-  }, [selectedRunId, monitorView, props.route?.workflowRunId, props.route?.supervisorRunId, props.navigate]);
+    const nextPath = workflowTabRoute(selectedRunId, activeWorkspaceTab);
+    if ((props.route?.path ?? window.location.pathname) === nextPath) return;
+    props.navigate?.(nextPath);
+  }, [selectedRunId, monitorView, activeWorkspaceTab, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId, props.navigate]);
+
+
 
   useEffect(() => {
     allWorkflowEventsRef.current = allWorkflowEvents;
@@ -2971,6 +3061,10 @@ export function WorkflowShell(props: {
         if (cancelled) return;
         setRuntimeEvents((prev) => reduceRuntimeEvent(prev, incoming));
         applyIncomingWorkflowEvent(incoming.event.run_id, incoming.event);
+
+        if (incoming.event.run_id === selectedRunIdRef.current) {
+          void hydrateRuntimeProjection(incoming.event.run_id);
+        }
       }
     });
 
@@ -2981,7 +3075,7 @@ export function WorkflowShell(props: {
   }, []);
 
   useEffect(() => {
-    void refreshRunsAndTemplates();
+    void refreshRunsAndTemplates(props.route?.workflowRunId ?? undefined);
   }, []);
 
   useEffect(() => {
@@ -3399,11 +3493,22 @@ export function WorkflowShell(props: {
 
 
   async function refreshRunsAndTemplates(nextSelectedRunId?: string | null) {
+    const explicitSelection = arguments.length > 0;
     const [runsRes, templatesRes] = await Promise.all([listRuns(), listTemplates()]);
     setRuns(runsRes);
     setTemplates(templatesRes);
-    const resolvedRunId = nextSelectedRunId ?? selectedRunId ?? runsRes[0]?.id ?? null;
-    setSelectedRunId(resolvedRunId);
+
+    const routedRunId = props.route?.workflowRunId ?? null;
+    const currentSelectedRunId = selectedRunIdRef.current;
+    const resolvedRunId = explicitSelection
+      ? nextSelectedRunId ?? null
+      : routedRunId
+        ?? currentSelectedRunId
+        ?? (monitorView === 'workflow_detail' ? null : runsRes[0]?.id ?? null);
+
+    if (resolvedRunId !== selectedRunIdRef.current) {
+      setSelectedRunId(resolvedRunId);
+    }
     if (!selectedTemplateId && templatesRes[0]) setSelectedTemplateId(templatesRes[0].id);
   }
 
@@ -3580,8 +3685,33 @@ export function WorkflowShell(props: {
     };
   }
 
+  function payloadIndicatesUserWait(payload: unknown): boolean {
+    const record = asRecord(payload) ?? {};
+    const result = asRecord(record.result) ?? {};
+    const nestedResult = asRecord(result.result) ?? {};
+
+    return record.waiting_for_user === true
+      || record.needs_user_response === true
+      || result.waiting_for_user === true
+      || result.needs_user_response === true
+      || nestedResult.waiting_for_user === true
+      || nestedResult.needs_user_response === true;
+  }
+
+  function eventIndicatesOperatorCheckpointWait(event: StageExecutionEvent | null): boolean {
+    if (!event) return false;
+    const payload = asRecord(event.payload) ?? {};
+    const capability = typeof payload.capability === 'string' ? payload.capability : '';
+    return event.kind === 'operator_checkpoint_waiting'
+      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
+      || event.kind === 'workflow_waiting_for_operator_checkpoint'
+      || event.kind.endsWith('_waiting')
+      || (capability === 'operator_checkpoint' && payloadIndicatesUserWait(event.payload));
+  }
+
   function deriveCapabilityStatusLabel(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
+    if (eventIndicatesOperatorCheckpointWait(event)) return 'WAITING';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'FAILED';
     if (event.kind.endsWith('_completed')) return 'COMPLETE';
     if (event.kind.endsWith('_started')) return 'RUNNING';
@@ -3590,6 +3720,7 @@ export function WorkflowShell(props: {
 
   function deriveCapabilityStatusColor(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
+    if (eventIndicatesOperatorCheckpointWait(event)) return 'yellow';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'red';
     if (event.level === 'warn') return 'yellow';
     if (event.kind.endsWith('_started')) return 'blue';
@@ -3840,13 +3971,15 @@ export function WorkflowShell(props: {
       const existing = mapped.find((capability) => capability.name.toLowerCase() === resultLabel.toLowerCase());
       const ok = result.ok !== false;
       const resultPayload = capabilityResultSpecificPayload(result);
+      const resultRecord = asRecord(resultPayload) ?? {};
+      const resultWaitingForUser = resultKey === 'operator_checkpoint' && payloadIndicatesUserWait(resultPayload);
       if (existing) {
-        const resultClosesCapability = existing.outputPayload == null;
-        existing.statusColor = ok ? 'green' : 'red';
-        existing.statusLabel = ok ? 'SUCCESS' : 'ERROR';
-        existing.isActive = false;
-        existing.outputPayload = existing.outputPayload ?? resultPayload;
-        existing.latestPayload = existing.latestPayload ?? resultPayload;
+        const resultClosesCapability = existing.outputPayload == null && !resultWaitingForUser;
+        existing.statusColor = resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red';
+        existing.statusLabel = resultWaitingForUser ? 'WAITING' : ok ? 'SUCCESS' : 'ERROR';
+        existing.isActive = resultWaitingForUser;
+        existing.outputPayload = resultWaitingForUser ? existing.outputPayload : existing.outputPayload ?? resultPayload;
+        existing.latestPayload = resultPayload ?? existing.latestPayload;
         if (resultClosesCapability && resultStageEvent) {
           existing.latestCreatedAt = resultStageEvent.created_at;
           existing.latestKind = resultStageEvent.kind;
@@ -3862,26 +3995,26 @@ export function WorkflowShell(props: {
         key: capabilityId,
         capabilityId,
         name: resultLabel,
-        statusColor: ok ? 'green' : 'red',
-        statusLabel: ok ? 'SUCCESS' : 'ERROR',
+        statusColor: resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red',
+        statusLabel: resultWaitingForUser ? 'WAITING' : ok ? 'SUCCESS' : 'ERROR',
         message: capabilityDisplayMessageFromPayload(resultPayload, resultLabel),
         startedAtText: resultStageEvent ? formatTimestamp(resultStageEvent.created_at) : '—',
         startedAtRaw: resultStageEvent?.created_at ?? null,
         durationText: 'elapsed —',
         durationMs: null,
         latestCreatedAt: resultStageEvent?.created_at ?? '',
-        isActive: false,
+        isActive: resultWaitingForUser,
         isNew: resultStageEvent ? recentEventIds.has(resultStageEvent.id) : false,
         eventCount: 1,
         latestLevel: ok ? 'info' : 'error',
         latestKind: resultStageEvent?.kind ?? 'capability_result',
         latestPayload: resultPayload,
         inputPayload: null,
-        outputPayload: resultPayload
+        outputPayload: resultWaitingForUser ? null : resultPayload
       });
     }
 
-    if (resultStageEvent) {
+    if (resultStageEvent && !eventIndicatesOperatorCheckpointWait(resultStageEvent)) {
       for (const capability of mapped) {
         if (!capability.isActive) continue;
         capability.isActive = false;
@@ -3927,6 +4060,7 @@ export function WorkflowShell(props: {
     const payload = asRecord(event.payload) ?? {};
     const capabilityResults = payload.capability_results;
     return isTerminalStageEvent(event)
+      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
       || event.kind === 'stage_execution_waiting_for_disposition_review'
       || (Array.isArray(capabilityResults) && capabilityResults.length > 0);
   }
@@ -4033,7 +4167,7 @@ export function WorkflowShell(props: {
 
   function projectRunStateFromRuntimeEvent(run: WorkflowRun, incoming: StageExecutionEvent): WorkflowRun {
     const payload = asRecord(incoming.payload) ?? {};
-    if (incoming.kind === 'stage_execution_waiting_for_disposition_review') {
+    if (incoming.kind === 'stage_execution_waiting_for_operator_checkpoint' || incoming.kind === 'stage_execution_waiting_for_disposition_review') {
       const stepId = stringFrom(payload.step_id) || incoming.step_id || run.current_step_id || '';
       const stepType = stringFrom(payload.step_type);
       const disposition = stringFrom(payload.disposition) || 'move_next';
@@ -4045,13 +4179,13 @@ export function WorkflowShell(props: {
         updated_at: incoming.created_at,
         context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
           blocked_on: {
-            kind: 'disposition_review',
+            kind: 'operator_checkpoint',
             stage_id: stepId,
             stage_type: stepType,
-            recommended_disposition: disposition === 'paused' || disposition === 'pause' ? 'pause' : 'move_next',
+            recommended_disposition: disposition === 'paused' || disposition === 'pause' || disposition === 'pause_error' ? 'pause_error' : 'continue_manual',
             next_step_id: '',
             message,
-            available_dispositions: ['move_next', 'pause']
+            available_dispositions: ['continue_auto', 'continue_manual', 'pause_error']
           }
         })
       };
@@ -4061,7 +4195,7 @@ export function WorkflowShell(props: {
       const workflowEngine = asRecord((run.context as Record<string, unknown>).workflow_engine) ?? {};
       const runState = asRecord(workflowEngine.run_state) ?? {};
       const blockedOn = asRecord(runState.blocked_on);
-      if (blockedOn?.kind === 'disposition_review') return run;
+      if (blockedOn?.kind === 'operator_checkpoint' || blockedOn?.kind === 'disposition_review') return run;
       return {
         ...run,
         updated_at: incoming.created_at,
@@ -4092,7 +4226,7 @@ export function WorkflowShell(props: {
 
     const payload = incoming.payload as Record<string, unknown>;
     const snapshotContext = payload.final_context ?? payload.run_context ?? payload.prepared_context;
-    if (incoming.kind !== 'stage_execution_waiting_for_disposition_review' && snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
+    if (incoming.kind !== 'stage_execution_waiting_for_operator_checkpoint' && incoming.kind !== 'stage_execution_waiting_for_disposition_review' && snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
       const snapshotStatus = typeof payload.prepared_status === 'string'
         ? payload.prepared_status as WorkflowRunStatus
         : typeof payload.status === 'string'
@@ -4139,6 +4273,7 @@ export function WorkflowShell(props: {
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
     mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
     hydratedWorkflowEventRunsRef.current.add(run.id);
+    await hydrateRuntimeProjection(run.id);
     if (selectedRunIdRef.current === run.id) {
       setSelectedRunId(run.id);
     }
@@ -4149,12 +4284,59 @@ export function WorkflowShell(props: {
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
     mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
     hydratedWorkflowEventRunsRef.current.add(run.id);
+    await hydrateRuntimeProjection(run.id);
     setSelectedRunId(run.id);
   }
 
 
   function workflowRoute(runId: string) {
     return `/workflows/${encodeURIComponent(runId)}`;
+  }
+
+  function workflowTabRoute(runId: string, tab: WorkspaceTabKey) {
+    const base = workflowRoute(runId);
+    switch (tab) {
+      case 'diff':
+        return `${base}/changes`;
+      case 'commits':
+        return `${base}/commits`;
+      case 'files':
+        return `${base}/repository`;
+      case 'capabilities':
+        return `${base}/capabilities`;
+      default:
+        return base;
+    }
+  }
+
+  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null | undefined): WorkspaceTabKey {
+    switch (view) {
+      case 'changes':
+        return 'diff';
+      case 'commits':
+        return 'commits';
+      case 'repository':
+        return 'files';
+      case 'capabilities':
+        return 'capabilities';
+      default:
+        return 'workflows';
+    }
+  }
+
+  function workflowTabTitle(tab: WorkspaceTabKey): string {
+    switch (tab) {
+      case 'diff':
+        return 'changes';
+      case 'commits':
+        return 'commits';
+      case 'files':
+        return 'repository';
+      case 'capabilities':
+        return 'capabilities';
+      default:
+        return 'workflow';
+    }
   }
 
   function shouldUseBrowserNavigation(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) {
@@ -4172,14 +4354,20 @@ export function WorkflowShell(props: {
     setView('monitor');
     setMonitorView('workflow_detail');
     setActiveWorkspaceTab('workflows');
-    props.navigate?.(workflowRoute(runId));
+    props.navigate?.(workflowTabRoute(runId, 'workflows'));
     void refreshRunDetailsOnOpen(runId);
   }
 
   function backToWorkflowList() {
     setMonitorView('workflow_list');
     setMonitorHomeView('workflows');
-    props.navigate?.('/');
+    props.navigate?.('/workflows');
+  }
+
+  function handleWorkflowListLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }) {
+    if (shouldUseBrowserNavigation(event)) return;
+    event.preventDefault();
+    backToWorkflowList();
   }
 
   async function openBuilder() {
@@ -4405,6 +4593,7 @@ export function WorkflowShell(props: {
       setError(null);
       await forceWaitWorkflowRun(selectedRunId);
       await refreshRunDetails(selectedRunId);
+      setManualCapabilityStatus('Workflow execution cancelled and returned to operator control.');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -5704,22 +5893,23 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await refreshSelectedRunArtifacts();
   }
 
-  async function handleDispositionReview(disposition: string) {
+  async function handleDispositionReview(disposition: string, selectedStepId?: string | null) {
     if (!selectedRun) return;
     const runId = selectedRun.id;
+    const normalizedDisposition = normalizeCheckpointDisposition(disposition);
     await runManualCapability(async () => {
-      const json = await resolveWorkflowDispositionReview(runId, disposition) as Record<string, unknown>;
+      const json = await resolveWorkflowDispositionReview(runId, normalizedDisposition, selectedStepId) as Record<string, unknown>;
       await refreshSelectedRunArtifacts();
 
-      if (disposition === 'move_next') {
-        const nextStepId = typeof json.current_step_id === 'string' ? json.current_step_id : null;
+      if (normalizedDisposition === 'continue_auto' || normalizedDisposition === 'select_stage') {
+        const nextStepId = typeof json.current_step_id === 'string' ? json.current_step_id : selectedStepId ?? null;
         if (nextStepId) {
           setSelectedStepId(nextStepId);
         }
       }
 
       return json;
-    }, `Disposition selected: ${disposition}.`);
+    }, `Checkpoint selected: ${checkpointDispositionLabel(normalizedDisposition)}.`);
   }
 
   async function handleManualPatchStageState() {
@@ -6281,25 +6471,45 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   <Group justify="space-between" align="center" wrap="wrap">
                     <Stack gap={2}>
                       <Title order={4}>Workspace monitor</Title>
-                      <Text size="sm" c="dimmed">Switch between single workflow runs and repo-level supervisor orchestration.</Text>
                     </Stack>
                     <Group>
-                      {monitorHomeView === 'workflows' ? (
-                        <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
-                          New workflow
-                        </Button>
-                      ) : null}
+                      <Button
+                        size="xs"
+                        onClick={() => {
+                          if (monitorHomeView === 'workflows') {
+                            void openBuilder();
+                          } else {
+                            setSupervisorCreateRequestToken((value) => value + 1);
+                          }
+                        }}
+                        loading={monitorHomeView === 'workflows' ? busy : false}
+                      >
+                        {monitorHomeView === 'workflows' ? 'New workflow' : 'New supervisor'}
+                      </Button>
                       <Button
                         size="xs"
                         variant="default"
                         leftSection={<IconRefresh size={16} />}
-                        onClick={() => void refreshRunsAndTemplates()}
+                        onClick={() => {
+                          if (monitorHomeView === 'workflows') {
+                            void refreshRunsAndTemplates();
+                          } else {
+                            setSupervisorRefreshRequestToken((value) => value + 1);
+                          }
+                        }}
                       >
                         Refresh
                       </Button>
                     </Group>
                   </Group>
-                  <Tabs value={monitorHomeView} onChange={(value) => setMonitorHomeView((value as MonitorHomeView) ?? 'workflows')}>
+                  <Tabs
+                    value={monitorHomeView}
+                    onChange={(value) => {
+                      const next = (value as MonitorHomeView) ?? 'workflows';
+                      setMonitorHomeView((current) => current === next ? current : next);
+                      props.navigate?.(next === 'supervisors' ? '/supervisors' : '/workflows');
+                    }}
+                  >
                     <Tabs.List>
                       <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
                       <Tabs.Tab value="supervisors">Supervisors</Tabs.Tab>
@@ -6311,7 +6521,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               {monitorHomeView === 'supervisors' ? (
                 <SupervisorPanel
                   supervisorRunId={props.route?.supervisorRunId ?? null}
+                  supervisorView={props.route?.supervisorView ?? null}
                   navigate={props.navigate}
+                  createRequestedToken={supervisorCreateRequestToken}
+                  refreshRequestedToken={supervisorRefreshRequestToken}
                   onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)}
                 />
               ) : (
@@ -6320,19 +6533,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     <Stack>
                       <Group justify="space-between" align="center" wrap="wrap">
                         <Title order={4}>Workflow list</Title>
-                        <Group>
-                          <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
-                            New workflow
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="default"
-                            leftSection={<IconRefresh size={16} />}
-                            onClick={() => void refreshRunsAndTemplates()}
-                          >
-                            Refresh
-                          </Button>
-                        </Group>
                       </Group>
                       <Table striped highlightOnHover>
                         <Table.Thead>
@@ -6419,7 +6619,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       <Stack>
                         <Group justify="space-between">
                           <Group>
-                            <Button variant="light" onClick={backToWorkflowList}>Back to workflows</Button>
+                            <Button variant="light" component="a"
+              href="/workflows"
+              onClick={handleWorkflowListLinkClick}>Back to workflows</Button>
                             <div>
                               <Title order={4}>{selectedRun.title}</Title>
                               <Text c="dimmed">{selectedRun.repo_ref}</Text>
@@ -6433,7 +6635,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                               <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || (!canRunCurrentStageAutomatically && selectedRun?.status !== 'success') || isBackendRunLocked}>Run autonomously</Button>
                               <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
-                              <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Force unlock</Button>
+                              <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Cancel run</Button>
                             </Group>
                             <Stack gap={2} align="flex-end">
                               <Text size="xs" c="dimmed">Created: {formatTimestamp(selectedRun.created_at)}</Text>
@@ -6523,28 +6725,40 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 {pendingDispositionReview ? (
                                   <Card withBorder>
                                     <Stack gap="sm">
-                                      <Alert color="yellow" title="Stage outcome needs a disposition">
-                                        <Stack gap={4}>
-                                          <Text size="sm">{pendingDispositionReview.message || 'Review the completed stage output and choose how the workflow should continue.'}</Text>
-                                          <Text size="xs" c="dimmed">Stage: {pendingDispositionReview.stageId}</Text>
-                                          {pendingDispositionReview.nextStepId ? <Text size="xs" c="dimmed">Next: {pendingDispositionReview.nextStepId}</Text> : null}
-                                          {pendingDispositionReview.recommendedDisposition ? <Text size="xs" c="dimmed">Recommended: {pendingDispositionReview.recommendedDisposition}</Text> : null}
-                                        </Stack>
+                                      <Alert color="yellow" title="User input required">
+                                        <Text size="sm">Choose how the workflow should continue.</Text>
                                       </Alert>
                                       <Group gap="xs" wrap="wrap">
                                         {pendingDispositionReview.availableDispositions.map((disposition) => {
-                                          const label = disposition === 'move_next' ? 'Continue' : 'Pause';
-                                          const color = disposition === 'pause' ? 'yellow' : undefined;
+                                          const normalizedDisposition = normalizeCheckpointDisposition(disposition);
+                                          if (normalizedDisposition === 'select_stage') {
+                                            return (
+                                              <Select
+                                                key={normalizedDisposition}
+                                                size="xs"
+                                                placeholder="Select stage"
+                                                data={(selectedRun?.definition?.steps ?? []).map((step, index) => ({
+                                                  value: step.id,
+                                                  label: `${index + 1}. ${step.name || step.id}`
+                                                }))}
+                                                disabled={busy || manualCapabilityBusy}
+                                                onChange={(stepId) => {
+                                                  if (stepId) void handleDispositionReview('select_stage', stepId);
+                                                }}
+                                                w={150}
+                                              />
+                                            );
+                                          }
                                           return (
                                             <Button
-                                              key={disposition}
-                                              variant={disposition === 'move_next' ? 'filled' : 'light'}
-                                              color={color}
+                                              key={normalizedDisposition}
+                                              variant={normalizedDisposition === 'continue_auto' ? 'filled' : 'light'}
+                                              color={checkpointDispositionColor(normalizedDisposition)}
                                               loading={manualCapabilityBusy}
                                               disabled={busy || manualCapabilityBusy}
-                                              onClick={() => void handleDispositionReview(disposition)}
+                                              onClick={() => void handleDispositionReview(normalizedDisposition)}
                                             >
-                                              {label}
+                                              {checkpointDispositionLabel(normalizedDisposition)}
                                             </Button>
                                           );
                                         })}

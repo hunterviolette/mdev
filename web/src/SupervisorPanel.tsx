@@ -1,47 +1,103 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Alert, Anchor, Badge, Button, Card, Group, Stack, Table, Text, TextInput, Title } from '@mantine/core';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Badge, Button, Card, Group, Modal, Stack, Table, Text, TextInput } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
 import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { SupervisorSprintModal } from './SupervisorSprintModal';
-import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, listSupervisorRuns, runSupervisorAction, type SupervisorRun } from './supervisor_api';
+import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, listSupervisorRuns, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   onOpenWorkflowRun?: (workflowRunId: string) => Promise<void> | void;
   supervisorRunId?: string | null;
+  supervisorView?: 'planner' | 'sprint' | null;
   navigate?: (path: string) => void;
 };
 
-function supervisorRoute(supervisorRunId: string) {
-  return `/supervisors/${encodeURIComponent(supervisorRunId)}`;
+type SupervisorPanelProps = Props & {
+  createRequestedToken?: number;
+  refreshRequestedToken?: number;
+};
+
+function statusBadgeColor(status: string): string {
+  if (['running_children', 'running_integration', 'validating', 'ready_to_apply'].includes(status)) return 'blue';
+  if (['development_complete', 'applied', 'completed', 'success'].includes(status)) return 'green';
+  if (['failed', 'error'].includes(status)) return 'red';
+  if (status === 'cancelled') return 'gray';
+  return 'gray';
 }
 
-function shouldUseBrowserNavigation(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) {
-  return event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+function formatUpdatedAt(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
-export function SupervisorPanel(props: Props) {
+function supervisorPlannerPath(runId: string): string {
+  return `/supervisors/${encodeURIComponent(runId)}/planner`;
+}
+
+function supervisorSprintPath(runId: string): string {
+  return `/supervisors/${encodeURIComponent(runId)}/sprint`;
+}
+
+function shouldHandleLinkInApp(event: React.MouseEvent<HTMLAnchorElement>): boolean {
+  return event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+}
+
+
+export function SupervisorPanel(props: SupervisorPanelProps) {
   const [runs, setRuns] = useState<SupervisorRun[]>([]);
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const [plannerOpen, setPlannerOpen] = useState(false);
   const [sprintOpen, setSprintOpen] = useState(false);
   const [title, setTitle] = useState('Supervisor');
   const [rootRepoPath, setRootRepoPath] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const lastCreateRequestTokenRef = useRef(props.createRequestedToken ?? 0);
+  const lastRefreshRequestTokenRef = useRef(props.refreshRequestedToken ?? 0);
 
-  const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? runs[0], [runs, selectedId]);
+  const selected = useMemo(() => runs.find((run) => run.id === selectedId) ?? null, [runs, selectedId]);
 
   useEffect(() => {
-    if (!props.supervisorRunId) return;
-    setSelectedId(props.supervisorRunId);
-  }, [props.supervisorRunId]);
+    if (!selected) return;
+    if (props.supervisorView === 'planner') {
+      document.title = `Supervisor · ${selected.title} · planner`;
+      return;
+    }
+    if (props.supervisorView === 'sprint') {
+      document.title = `Supervisor · ${selected.title} · sprint`;
+      return;
+    }
+    if (props.supervisorRunId) {
+      document.title = `Supervisor · ${selected.title}`;
+    }
+  }, [selected, props.supervisorRunId, props.supervisorView]);
 
-  function handleSupervisorLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }, supervisorRunId: string) {
-    if (shouldUseBrowserNavigation(event)) return;
-    event.preventDefault();
-    setSelectedId(supervisorRunId);
-    props.navigate?.(supervisorRoute(supervisorRunId));
-  }
+  useEffect(() => {
+    if (!props.supervisorRunId) {
+      setPlannerOpen(false);
+      setSprintOpen(false);
+      return;
+    }
+    setSelectedId(props.supervisorRunId);
+    setPlannerOpen(props.supervisorView === 'planner');
+    setSprintOpen(props.supervisorView === 'sprint');
+  }, [props.supervisorRunId, props.supervisorView]);
+
+  useEffect(() => {
+    const nextToken = props.createRequestedToken ?? 0;
+    if (nextToken === lastCreateRequestTokenRef.current) return;
+    lastCreateRequestTokenRef.current = nextToken;
+    setCreateOpen(true);
+  }, [props.createRequestedToken]);
+
+  useEffect(() => {
+    const nextToken = props.refreshRequestedToken ?? 0;
+    if (nextToken === lastRefreshRequestTokenRef.current) return;
+    lastRefreshRequestTokenRef.current = nextToken;
+    refresh().catch((err) => setError(String(err)));
+  }, [props.refreshRequestedToken]);
 
   async function refresh() {
     const [nextRuns, nextTemplates] = await Promise.all([listSupervisorRuns(), listTemplates()]);
@@ -68,33 +124,35 @@ export function SupervisorPanel(props: Props) {
       });
       await refresh();
       setSelectedId(run.id);
+      setCreateOpen(false);
       setPlannerOpen(true);
+      setSprintOpen(false);
+      props.navigate?.(supervisorPlannerPath(run.id));
     } catch (err) {
       setError(String(err));
     }
   }
 
-  async function openSprint() {
-    if (!selected) return;
+  function openSprint(run: SupervisorRun) {
     setError(null);
-    try {
-      setSprintOpen(true);
-    } catch (err) {
-      setError(String(err));
-    }
+    setSelectedId(run.id);
+    setPlannerOpen(false);
+    setSprintOpen(true);
+    props.navigate?.(supervisorSprintPath(run.id));
   }
 
-  async function openPlannerForSelectedRepo() {
-    if (!selected) return;
+  async function openPlanner(run: SupervisorRun) {
     setError(null);
     try {
       const response = await ensureSupervisorPlannerRun({
-        root_repo_path: selected.root_repo_path,
-        title: selected.title
+        root_repo_path: run.root_repo_path,
+        title: run.title
       });
       await refresh();
       setSelectedId(response.supervisor_run.id);
+      setSprintOpen(false);
       setPlannerOpen(true);
+      props.navigate?.(supervisorPlannerPath(response.supervisor_run.id));
     } catch (err) {
       setError(String(err));
     }
@@ -103,40 +161,41 @@ export function SupervisorPanel(props: Props) {
   function openPlannerFromSprint() {
     setSprintOpen(false);
     setPlannerOpen(true);
+    if (selectedId) {
+      props.navigate?.(supervisorPlannerPath(selectedId));
+    }
   }
 
-  async function removeRun() {
-    if (!selected) return;
+  async function removeRun(run: SupervisorRun) {
     setError(null);
     try {
-      await deleteSupervisorRun(selected.id);
-      setSelectedId(null);
+      await deleteSupervisorRun(run.id);
+      if (selectedId === run.id) {
+        setSelectedId(null);
+      }
       await refresh();
     } catch (err) {
       setError(String(err));
     }
   }
 
+  function closeSupervisorModal() {
+    setPlannerOpen(false);
+    setSprintOpen(false);
+    props.navigate?.('/supervisors');
+  }
+
   return (
     <Stack gap="md">
-      <Title order={3}>Supervisors</Title>
       {error ? <Alert color="red">{error}</Alert> : null}
 
       <Card withBorder>
         <Stack gap="sm">
-          <Text fw={700}>Create supervisor</Text>
-          <Group grow align="flex-end">
-            <TextInput label="Title" value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
-            <TextInput label="Root repo path" value={rootRepoPath} onChange={(event) => setRootRepoPath(event.currentTarget.value)} />
+          <Group justify="space-between" align="center">
+            <Text fw={700} size="lg">Supervisors</Text>
           </Group>
-          <Group>
-            <Button onClick={createEmptySupervisor}>Create supervisor</Button>
-          </Group>
-        </Stack>
-      </Card>
 
-      <Card withBorder>
-        <Table striped highlightOnHover>
+          <Table striped highlightOnHover>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Title</Table.Th>
@@ -145,53 +204,73 @@ export function SupervisorPanel(props: Props) {
               <Table.Th>Planner ideas</Table.Th>
               <Table.Th>Next sprint items</Table.Th>
               <Table.Th>Updated</Table.Th>
+              <Table.Th>Actions</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
             {runs.map((run) => (
               <Table.Tr key={run.id}>
                 <Table.Td>
-                  <Anchor href={supervisorRoute(run.id)} onClick={(event) => handleSupervisorLinkClick(event, run.id)}>
-                    {run.title}
-                  </Anchor>
+                  <Text>{run.title}</Text>
                 </Table.Td>
-                <Table.Td><Badge>{run.status}</Badge></Table.Td>
+                <Table.Td><Badge color={statusBadgeColor(run.status)}>{run.status}</Badge></Table.Td>
                 <Table.Td>{run.strategy}</Table.Td>
                 <Table.Td>{run.feature_plan_items.length}</Table.Td>
                 <Table.Td>{run.execution_plan_items.length}</Table.Td>
-                <Table.Td>{run.updated_at}</Table.Td>
+                <Table.Td>{formatUpdatedAt(run.updated_at)}</Table.Td>
+                <Table.Td>
+                  <Group gap="xs" wrap="nowrap">
+                    <Button
+                      component="a"
+                      href={supervisorPlannerPath(run.id)}
+                      size="xs"
+                      variant="light"
+                      onClick={(event) => {
+                        if (!shouldHandleLinkInApp(event)) return;
+                        event.preventDefault();
+                        void openPlanner(run);
+                      }}
+                    >
+                      Planner
+                    </Button>
+                    <Button
+                      component="a"
+                      href={supervisorSprintPath(run.id)}
+                      size="xs"
+                      onClick={(event) => {
+                        if (!shouldHandleLinkInApp(event)) return;
+                        event.preventDefault();
+                        openSprint(run);
+                      }}
+                    >
+                      Sprint
+                    </Button>
+                    <Button size="xs" color="red" variant="subtle" onClick={() => void removeRun(run)}>Delete</Button>
+                  </Group>
+                </Table.Td>
               </Table.Tr>
             ))}
           </Table.Tbody>
-        </Table>
+          </Table>
+        </Stack>
       </Card>
 
-      {selected ? (
-        <Card withBorder>
-          <Stack gap="sm">
-            <Group justify="space-between">
-              <Group>
-                <Text fw={700}>{selected.title}</Text>
-                <Badge>{selected.status}</Badge>
-                <Badge variant="light">{selected.strategy}</Badge>
-              </Group>
-              <Group>
-                <Button variant="light" onClick={() => void openPlannerForSelectedRepo()}>Planner</Button>
-                <Button onClick={openSprint}>Sprint</Button>
-                <Button color="red" variant="subtle" onClick={removeRun}>Delete</Button>
-              </Group>
-            </Group>
-            <Text size="sm">Planner ideas: {selected.feature_plan_items.length}</Text>
-            <Text size="sm">Next sprint items: {selected.execution_plan_items.length}</Text>
-          </Stack>
-        </Card>
-      ) : null}
+      <Modal opened={createOpen} onClose={() => setCreateOpen(false)} title="Create supervisor" centered>
+        <Stack gap="sm">
+          <TextInput label="Title" value={title} onChange={(event) => setTitle(event.currentTarget.value)} />
+          <TextInput label="Root repo path" value={rootRepoPath} onChange={(event) => setRootRepoPath(event.currentTarget.value)} />
+          <Group justify="flex-end">
+            <Button variant="subtle" onClick={() => setCreateOpen(false)}>Cancel</Button>
+            <Button onClick={createEmptySupervisor}>Create supervisor</Button>
+          </Group>
+        </Stack>
+      </Modal>
 
       <SupervisorPlannerModal
         opened={plannerOpen}
         run={selected}
         templates={templates}
-        onClose={() => setPlannerOpen(false)}
+        onClose={closeSupervisorModal}
         onSaved={refresh}
         onWorkflowRunCreated={props.onOpenWorkflowRun}
       />
@@ -200,7 +279,7 @@ export function SupervisorPanel(props: Props) {
         opened={sprintOpen}
         run={selected}
         templates={templates}
-        onClose={() => setSprintOpen(false)}
+        onClose={closeSupervisorModal}
         onOpenPlanner={openPlannerFromSprint}
         onChanged={refresh}
       />

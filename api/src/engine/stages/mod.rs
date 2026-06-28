@@ -179,14 +179,84 @@ fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
     }
 }
 
-fn local_state_disposition_review_enabled(local_state: &Value) -> bool {
-    local_state
+fn operator_checkpoint_result(capability_results: &[Value]) -> Option<Value> {
+    capability_results.iter().find_map(|item| {
+        if item.get("key").and_then(Value::as_str) != Some("operator_checkpoint") {
+            return None;
+        }
+        let result = item.get("result")?.clone();
+        if result.get("needs_user_response").and_then(Value::as_bool) == Some(true) {
+            Some(result)
+        } else {
+            None
+        }
+    })
+}
+
+fn stage_operator_checkpoint_enabled(local_state: &Value) -> bool {
+    let automation = local_state
         .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("automation"));
+
+    automation
+        .and_then(|v| v.get("user_checkpoint"))
         .and_then(|v| v.get("enabled"))
         .and_then(Value::as_bool)
+        .or_else(|| {
+            automation
+                .and_then(|v| v.get("disposition_review"))
+                .and_then(|v| v.get("enabled"))
+                .and_then(Value::as_bool)
+        })
         .unwrap_or(false)
+}
+
+fn operator_checkpoint_config(local_state: &Value) -> Value {
+    let automation = local_state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"));
+
+    let configured = automation
+        .and_then(|v| v.get("user_checkpoint"))
+        .cloned()
+        .or_else(|| automation.and_then(|v| v.get("disposition_review")).cloned())
+        .unwrap_or_else(|| json!({}));
+
+    let mut config = if configured.is_object() { configured } else { json!({}) };
+    if let Some(obj) = config.as_object_mut() {
+        obj.entry("available_dispositions".to_string()).or_insert_with(|| {
+            json!(["continue_auto", "pause_error", "select_stage"])
+        });
+        obj.entry("recommended_disposition".to_string()).or_insert_with(|| json!("continue_auto"));
+    }
+    config
+}
+
+fn append_operator_checkpoint_to_plan(mut plan: Vec<StageExecutionNode>, local_state: &Value) -> Vec<StageExecutionNode> {
+    if !stage_operator_checkpoint_enabled(local_state) {
+        return plan;
+    }
+    if plan.iter().any(|node| node.kind == StageExecutionNodeKind::Capability && node.key == "operator_checkpoint") {
+        return plan;
+    }
+
+    let run_after = plan
+        .iter()
+        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
+        .map(|node| node.key.clone())
+        .collect::<Vec<_>>();
+
+    plan.push(StageExecutionNode {
+        kind: StageExecutionNodeKind::Capability,
+        key: "operator_checkpoint".to_string(),
+        enabled: true,
+        config: operator_checkpoint_config(local_state),
+        input_mapping: json!({}),
+        output_mapping: json!({}),
+        run_after,
+        condition: Value::Null,
+    });
+    plan
 }
 
 pub async fn execute_stage(
@@ -361,19 +431,22 @@ pub async fn execute_stage(
         local_state: prepared_local_state,
     };
 
-    let pending_disposition_review = outcome.ok && local_state_disposition_review_enabled(&outcome.local_state);
+    let pending_operator_checkpoint = outcome.ok
+        && operator_checkpoint_result(&outcome.capability_results).is_some();
+    let checkpoint_payload = operator_checkpoint_result(&outcome.capability_results).unwrap_or_else(|| json!({}));
+
     append_engine_event(
         state,
         run_id,
         Some(step.id.as_str()),
         if outcome.ok { "info" } else { "error" },
-        if pending_disposition_review {
-            "stage_execution_waiting_for_disposition_review"
+        if pending_operator_checkpoint {
+            "stage_execution_waiting_for_operator_checkpoint"
         } else {
             "stage_execution_completed"
         },
-        if pending_disposition_review {
-            "Stage execution is waiting for operator disposition review."
+        if pending_operator_checkpoint {
+            "Stage execution is waiting for operator checkpoint."
         } else {
             "Stage executed through backend workflow engine"
         },
@@ -381,7 +454,8 @@ pub async fn execute_stage(
             "step_id": step.id,
             "step_type": step.step_type,
             "ok": outcome.ok,
-            "pending_disposition_review": pending_disposition_review,
+            "pending_operator_checkpoint": pending_operator_checkpoint,
+            "checkpoint": checkpoint_payload,
             "message": outcome.message,
             "disposition": format_disposition(&outcome.disposition),
             "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -655,7 +729,7 @@ fn resolve_effective_execution_plan(
     step: &WorkflowStepDefinition,
     local_state: &Value,
 ) -> Result<Vec<StageExecutionNode>> {
-    match step.step_type.as_str() {
+    let plan = match step.step_type.as_str() {
         "code" => build_inference_execution_plan(
             repo_ref,
             global_state,
@@ -664,7 +738,7 @@ fn resolve_effective_execution_plan(
             InferenceStageSettings {
                 include_changeset_schema: step.prompt.include_changeset_schema,
             },
-        ),
+        )?,
         "design" => build_inference_execution_plan(
             repo_ref,
             global_state,
@@ -673,14 +747,14 @@ fn resolve_effective_execution_plan(
             InferenceStageSettings {
                 include_changeset_schema: false,
             },
-        ),
+        )?,
         "review" => review_stage::build_review_execution_plan(
             repo_ref,
             global_state,
             step,
             local_state,
-        ),
-        "compile" => Ok(vec![StageExecutionNode {
+        )?,
+        "compile" => vec![StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
             key: "compile_commands".to_string(),
             enabled: true,
@@ -689,8 +763,8 @@ fn resolve_effective_execution_plan(
             output_mapping: json!({}),
             run_after: vec![],
             condition: Value::Null,
-        }]),
-        "merge_patches" => Ok(vec![StageExecutionNode {
+        }],
+        "merge_patches" => vec![StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
             key: "git_patch_payload".to_string(),
             enabled: true,
@@ -699,15 +773,17 @@ fn resolve_effective_execution_plan(
             output_mapping: json!({}),
             run_after: vec![],
             condition: Value::Null,
-        }]),
+        }],
         _ => {
             if !step.execution_plan.is_empty() {
-                Ok(step.execution_plan.clone())
+                step.execution_plan.clone()
             } else {
-                Ok(synthesize_execution_plan(&step.capabilities))
+                synthesize_execution_plan(&step.capabilities)
             }
         }
-    }
+    };
+
+    Ok(append_operator_checkpoint_to_plan(plan, local_state))
 }
 
 fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<StageExecutionNode> {

@@ -221,6 +221,8 @@ export async function updateSupervisorPlan(
     workflow_template_id?: string | null;
     integration_template_id?: string | null;
     planner_refinement_template_id?: string | null;
+    feature_concurrency?: number | null;
+    integration_policy?: 'auto' | 'manual' | null;
   }
 ): Promise<Record<string, unknown>> {
   return runSupervisorAction(id, 'update_plan', {
@@ -257,7 +259,7 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'remove_child_workflow', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

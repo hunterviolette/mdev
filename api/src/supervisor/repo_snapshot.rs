@@ -61,6 +61,16 @@ pub fn refresh_integration_from_worktree(root_repo_path: &str, supervisor_id: Uu
 }
 
 
+pub fn create_shard_from_snapshot(workspace: &SupervisorWorkspace, execution_item_id: &str) -> Result<PathBuf> {
+    if !workspace.snapshot.is_dir() {
+        return Err(anyhow!("supervisor snapshot is missing at {}", workspace.snapshot.display()));
+    }
+    fs::create_dir_all(&workspace.shards)?;
+    let shard = shard_path(workspace, execution_item_id);
+    copy_tree(&workspace.snapshot, &shard)?;
+    Ok(shard)
+}
+
 pub fn shard_path(workspace: &SupervisorWorkspace, execution_item_id: &str) -> PathBuf {
     workspace.shards.join(sanitize_path_segment(execution_item_id))
 }

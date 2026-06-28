@@ -367,7 +367,21 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
   }
 
   return (
-    <Modal opened={opened} onClose={onClose} title={run ? `${run.title} planner` : 'Planner'} size="95%" centered>
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title={run ? `${run.title} planner` : 'Planner'}
+      size="calc(100vw - 32px)"
+      centered
+      padding="md"
+      styles={{
+        body: { paddingTop: 0, height: 'calc(100vh - 72px)', overflow: 'auto' },
+        content: {
+          background: 'var(--mantine-color-body)',
+          maxHeight: 'calc(100vh - 32px)',
+        },
+      }}
+    >
       <Stack gap="md">
         {error ? <Alert color="red">{error}</Alert> : null}
         <Group justify="space-between">

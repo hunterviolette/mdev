@@ -46,6 +46,13 @@ export function isTerminalRuntimeStatus(status: string | null | undefined) {
     || status === 'applied';
 }
 
+export function runtimeEventStatusForKind(kind: string, ok: boolean | null | undefined) {
+  if (kind.endsWith('_waiting') || kind === 'stage_execution_waiting_for_operator_checkpoint') return 'waiting';
+  if (ok === false) return 'error';
+  if (ok === true) return 'success';
+  return 'running';
+}
+
 export function reduceRuntimeSnapshot(previous: RuntimeEventStore, snapshot: RuntimeSnapshotResponse): RuntimeEventStore {
   const nodesByKey: Record<string, RuntimeNode> = {};
   const childrenByNodeKey: Record<string, RuntimeEdge[]> = {};
@@ -94,6 +101,61 @@ export function reduceRuntimeEvent(previous: RuntimeEventStore, envelope: Runtim
   };
 }
 
+const RUNTIME_EVENT_BUS_CHANNEL = 'mdev-runtime-event-bus-v1';
+const RUNTIME_EVENT_BUS_LEADER_KEY = 'mdev-runtime-event-bus-leader-v1';
+const RUNTIME_EVENT_BUS_LEADER_HEARTBEAT_MS = 2000;
+const RUNTIME_EVENT_BUS_LEADER_STALE_MS = 7000;
+
+type RuntimeEventBusBroadcastMessage = {
+  sourceId: string;
+  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event';
+  payload?: unknown;
+};
+
+type RuntimeEventBusLeaderRecord = {
+  tabId: string;
+  expiresAt: number;
+};
+
+function createRuntimeEventBusTabId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function readRuntimeEventBusLeader(): RuntimeEventBusLeaderRecord | null {
+  try {
+    const raw = window.localStorage.getItem(RUNTIME_EVENT_BUS_LEADER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RuntimeEventBusLeaderRecord;
+    if (!parsed?.tabId || typeof parsed.expiresAt !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeRuntimeEventBusLeader(tabId: string) {
+  try {
+    window.localStorage.setItem(RUNTIME_EVENT_BUS_LEADER_KEY, JSON.stringify({
+      tabId,
+      expiresAt: Date.now() + RUNTIME_EVENT_BUS_LEADER_STALE_MS
+    }));
+  } catch {
+  }
+}
+
+function clearRuntimeEventBusLeaderIfOwned(tabId: string) {
+  try {
+    const leader = readRuntimeEventBusLeader();
+    if (leader?.tabId === tabId) {
+      window.localStorage.removeItem(RUNTIME_EVENT_BUS_LEADER_KEY);
+    }
+  } catch {
+  }
+}
+
 type RuntimeEventBusHandlers = {
   onOpen?: () => void;
   onClose?: () => void;
@@ -107,13 +169,60 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
   let disposed = false;
   let source: EventSource | null = null;
   let reconnectTimer: number | null = null;
+  let electionTimer: number | null = null;
+  let heartbeatTimer: number | null = null;
   let reconnectAttempt = 0;
   let lastEventSequenceNo = 0;
+  let isLeader = false;
+  const tabId = createRuntimeEventBusTabId();
+  const channel = typeof BroadcastChannel !== 'undefined'
+    ? new BroadcastChannel(RUNTIME_EVENT_BUS_CHANNEL)
+    : null;
+
+  function applyBroadcastMessage(message: RuntimeEventBusBroadcastMessage) {
+    switch (message.type) {
+      case 'connected':
+        handlers.onOpen?.();
+        return;
+      case 'disconnected':
+        handlers.onClose?.();
+        return;
+      case 'runtime_snapshot':
+        handlers.onSnapshot?.(message.payload as RuntimeSnapshotResponse);
+        return;
+      case 'runtime_projection':
+        handlers.onProjection?.(message.payload as EventChainSummaryResponse);
+        return;
+      case 'runtime_event':
+        handlers.onEvent?.(message.payload as RuntimeEventEnvelope);
+        return;
+    }
+  }
+
+  function broadcast(type: RuntimeEventBusBroadcastMessage['type'], payload?: unknown, applyLocal = true) {
+    const message: RuntimeEventBusBroadcastMessage = { sourceId: tabId, type, payload };
+    if (applyLocal) applyBroadcastMessage(message);
+    channel?.postMessage(message);
+  }
 
   function clearReconnectTimer() {
     if (reconnectTimer !== null) {
       window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+  }
+
+  function clearElectionTimer() {
+    if (electionTimer !== null) {
+      window.clearInterval(electionTimer);
+      electionTimer = null;
+    }
+  }
+
+  function clearHeartbeatTimer() {
+    if (heartbeatTimer !== null) {
+      window.clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
   }
 
@@ -127,17 +236,17 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
   async function refreshSnapshotFromBackend() {
     try {
       const snapshot = await getRuntimeSnapshot({ scope: 'all' });
-      if (disposed) return;
-      handlers.onSnapshot?.(snapshot);
+      if (disposed || !isLeader) return;
+      broadcast('runtime_snapshot', snapshot);
     } catch {
     }
   }
 
   function scheduleReconnect() {
-    if (disposed || reconnectTimer !== null) return;
+    if (disposed || !isLeader || reconnectTimer !== null) return;
 
     closeSource();
-    handlers.onClose?.();
+    broadcast('disconnected');
 
     const delayMs = Math.min(1000 * 2 ** reconnectAttempt, 10000);
     reconnectAttempt += 1;
@@ -149,7 +258,7 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
   }
 
   function connect() {
-    if (disposed) return;
+    if (disposed || !isLeader) return;
 
     closeSource();
     const nextSource = openRuntimeEventStream({
@@ -159,54 +268,104 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     source = nextSource;
 
     nextSource.onopen = () => {
-      if (disposed) return;
+      if (disposed || !isLeader) return;
       reconnectAttempt = 0;
-      handlers.onOpen?.();
+      broadcast('connected');
       void refreshSnapshotFromBackend();
     };
 
     nextSource.addEventListener('runtime_snapshot', (raw) => {
-      if (disposed) return;
+      if (disposed || !isLeader) return;
       try {
         const snapshot = JSON.parse((raw as MessageEvent<string>).data) as RuntimeSnapshotResponse;
-        handlers.onSnapshot?.(snapshot);
+        broadcast('runtime_snapshot', snapshot);
       } catch {
       }
     });
 
     nextSource.addEventListener('runtime_projection', (raw) => {
-      if (disposed) return;
+      if (disposed || !isLeader) return;
       try {
         const projection = JSON.parse((raw as MessageEvent<string>).data) as EventChainSummaryResponse;
-        handlers.onProjection?.(projection);
+        broadcast('runtime_projection', projection);
       } catch {
       }
     });
 
     nextSource.addEventListener('runtime_event', (raw) => {
-      if (disposed) return;
+      if (disposed || !isLeader) return;
       try {
         const event = JSON.parse((raw as MessageEvent<string>).data) as RuntimeEventEnvelope;
         lastEventSequenceNo = Math.max(lastEventSequenceNo, event.event.sequence_no ?? 0);
-        handlers.onEvent?.(event);
+        broadcast('runtime_event', event);
       } catch {
       }
     });
 
     nextSource.onerror = () => {
-      if (disposed) return;
+      if (disposed || !isLeader) return;
       handlers.onError?.();
       scheduleReconnect();
     };
   }
 
-  connect();
+  function stopLeading() {
+    if (!isLeader) return;
+    isLeader = false;
+    clearReconnectTimer();
+    clearHeartbeatTimer();
+    closeSource();
+    clearRuntimeEventBusLeaderIfOwned(tabId);
+    broadcast('disconnected');
+  }
+
+  function startLeading() {
+    if (disposed || isLeader) return;
+    isLeader = true;
+    writeRuntimeEventBusLeader(tabId);
+    heartbeatTimer = window.setInterval(() => {
+      if (disposed || !isLeader) return;
+      writeRuntimeEventBusLeader(tabId);
+    }, RUNTIME_EVENT_BUS_LEADER_HEARTBEAT_MS);
+    connect();
+  }
+
+  function electLeader() {
+    if (disposed || isLeader) return;
+    const leader = readRuntimeEventBusLeader();
+    if (leader && leader.expiresAt > Date.now() && leader.tabId !== tabId) return;
+
+    writeRuntimeEventBusLeader(tabId);
+    const claimed = readRuntimeEventBusLeader();
+    if (claimed?.tabId === tabId) {
+      startLeading();
+    }
+  }
+
+  channel?.addEventListener('message', (event) => {
+    if (disposed) return;
+    const message = event.data as RuntimeEventBusBroadcastMessage;
+    if (!message || message.sourceId === tabId) return;
+    applyBroadcastMessage(message);
+  });
+
+  window.addEventListener('storage', (event) => {
+    if (disposed || event.key !== RUNTIME_EVENT_BUS_LEADER_KEY) return;
+    const leader = readRuntimeEventBusLeader();
+    if (isLeader && leader?.tabId && leader.tabId !== tabId && leader.expiresAt > Date.now()) {
+      stopLeading();
+    }
+  });
+
+  electLeader();
+  electionTimer = window.setInterval(electLeader, RUNTIME_EVENT_BUS_LEADER_HEARTBEAT_MS);
 
   return () => {
     if (disposed) return;
     disposed = true;
-    clearReconnectTimer();
-    closeSource();
+    clearElectionTimer();
+    stopLeading();
+    channel?.close();
     handlers.onClose?.();
   };
 }

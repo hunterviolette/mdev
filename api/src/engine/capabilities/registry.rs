@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset, compile_commands, context_export, git_patch_payload, inference, planner, review_validation, sap};
+use super::{changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, review_validation, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -90,7 +90,7 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
-    if capability == "supervisor_planner_item" {
+    if capability == "supervisor_planner_item" || capability == "operator_checkpoint" {
         return Ok(());
     }
 
@@ -191,7 +191,7 @@ pub(crate) async fn execute_capability_chain(
         )
         .await?;
 
-        let result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
+        let mut result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
             Ok(result) => {
                 tracing::info!(
                     run_id = %ctx.run_id,
@@ -246,6 +246,11 @@ pub(crate) async fn execute_capability_chain(
             }
         };
 
+        if let Some(obj) = result.payload.as_object_mut() {
+            obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone().unwrap_or_default()));
+            obj.insert("_capability_invocation_id".to_string(), Value::String(capability_invocation_id.clone()));
+        }
+
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let after_decisions = governance::after_capability(
             ctx.state,
@@ -273,16 +278,30 @@ pub(crate) async fn execute_capability_chain(
             governance::injected_capabilities(&after_decisions)
         };
 
+        let capability_waiting_for_user = result.capability == "operator_checkpoint"
+            && result.payload.get("needs_user_response").and_then(Value::as_bool) == Some(true);
+        let capability_event_kind = if capability_waiting_for_user {
+            format!("{}_waiting", result.capability)
+        } else {
+            format!("{}_completed", result.capability)
+        };
+        let capability_event_message = if capability_waiting_for_user {
+            "Operator checkpoint is waiting for user input.".to_string()
+        } else {
+            format!("{} completed", result.capability.replace('_', " "))
+        };
+
         append_engine_event(
             ctx.state,
             ctx.run_id,
             Some(ctx.step.id.as_str()),
             if result.ok { "info" } else { "error" },
-            &format!("{}_completed", result.capability),
-            &format!("{} completed", result.capability.replace('_', " ")),
+            capability_event_kind.as_str(),
+            capability_event_message.as_str(),
             json!({
                 "capability": result.capability,
                 "ok": result.ok,
+                "waiting_for_user": capability_waiting_for_user,
                 "duration_ms": i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
                 "result": result.payload,
                 "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
@@ -299,6 +318,11 @@ pub(crate) async fn execute_capability_chain(
             follow_up_count = follow_up_vec(&result.follow_ups).len(),
             "capability result recorded"
         );
+
+        if capability_waiting_for_user {
+            results.push(result);
+            break;
+        }
 
         let existing_capabilities: std::collections::HashSet<String> = queue
             .iter()
@@ -376,6 +400,7 @@ async fn dispatch(
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
         "review_validation" => review_validation::execute(ctx, prior_results, invocation.config).await,
+        "operator_checkpoint" => operator_checkpoint::execute(ctx, prior_results, invocation.config).await,
         "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,
         "sap/export" => sap::export::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),

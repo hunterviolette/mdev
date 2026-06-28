@@ -28,7 +28,10 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun
     .await
     .map_err(internal)?;
 
-    let runs = rows.into_iter().filter_map(row_to_run_readable).collect::<Vec<_>>();
+    let mut runs = rows.into_iter().filter_map(row_to_run_readable).collect::<Vec<_>>();
+    for run in &mut runs {
+        sanitize_run_for_current_process(&state, run);
+    }
     Ok(Json(runs))
 }
 
@@ -83,6 +86,58 @@ fn row_to_run_for_open(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axu
     })
 }
 
+fn run_has_stale_operator_checkpoint(state: &AppState, run: &WorkflowRun) -> bool {
+    let Some(blocked_on) = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+    else {
+        return false;
+    };
+
+    let kind = blocked_on
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if kind != "operator_checkpoint" && kind != "disposition_review" {
+        return false;
+    }
+
+    blocked_on
+        .get("process_session_id")
+        .and_then(Value::as_str)
+        .map(|session_id| session_id != state.process_session_id())
+        .unwrap_or(true)
+}
+
+fn sanitize_run_for_current_process(state: &AppState, run: &mut WorkflowRun) {
+    if !run_has_stale_operator_checkpoint(state, run) {
+        return;
+    }
+
+    if let Some(run_state) = run
+        .context
+        .get_mut("workflow_engine")
+        .and_then(|value| value.get_mut("run_state"))
+        .and_then(Value::as_object_mut)
+    {
+        run_state.remove("blocked_on");
+    }
+}
+
+fn map_workflow_run_query_error(run_id: Uuid, err: sqlx::Error) -> (axum::http::StatusCode, String) {
+    match err {
+        sqlx::Error::RowNotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("workflow run {} not found", run_id),
+        ),
+        other => internal(other),
+    }
+}
+
+
 async fn get_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
@@ -93,9 +148,11 @@ async fn get_run(
     .bind(run_id.to_string())
     .fetch_one(&state.db)
     .await
-    .map_err(internal)?;
+    .map_err(|err| map_workflow_run_query_error(run_id, err))?;
 
-    Ok(Json(row_to_run_for_open(row)?))
+    let mut run = row_to_run_for_open(row)?;
+    sanitize_run_for_current_process(&state, &mut run);
+    Ok(Json(run))
 }
 
 async fn open_run(
@@ -108,9 +165,11 @@ async fn open_run(
     .bind(run_id.to_string())
     .fetch_one(&state.db)
     .await
-    .map_err(internal)?;
+    .map_err(|err| map_workflow_run_query_error(run_id, err))?;
 
-    Ok(Json(row_to_run_for_open(row)?))
+    let mut run = row_to_run_for_open(row)?;
+    sanitize_run_for_current_process(&state, &mut run);
+    Ok(Json(run))
 }
 
 async fn list_run_events(
@@ -213,6 +272,30 @@ async fn run_action(
                 .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?;
             engine::resolve_disposition_review(&state, run_id, disposition).await.map_err(internal)?
         }
+        "resolve_operator_checkpoint" => {
+            let disposition = req
+                .payload
+                .get("disposition")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?;
+            let selected_step_id = req
+                .payload
+                .get("selected_step_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            engine::resolve_operator_checkpoint(&state, run_id, disposition, selected_step_id)
+                .await
+                .map_err(|err| {
+                    let message = err.to_string();
+                    if message.contains("workflow is not waiting on operator checkpoint")
+                        || message.contains("workflow is blocked on")
+                    {
+                        (axum::http::StatusCode::CONFLICT, message)
+                    } else {
+                        internal(message)
+                    }
+                })?
+        }
         "prepare_stage" | "prepare_current_stage" => {
             engine::prepare_run_stage_for_execution(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
@@ -225,7 +308,7 @@ async fn run_action(
         "pause_run" => {
             engine::pause_run(&state, run_id).await.map_err(internal)?
         }
-        "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
+        "cancel_run" | "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
             engine::force_wait_run(&state, run_id).await.map_err(internal)?
         }
         "run_step" | "run_current_step" => {

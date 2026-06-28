@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -23,14 +24,141 @@ use super::{
 use super::stages::{execute_stage, StageDisposition};
 use super::transitions::{next_step_id, resolve_next_target, should_auto_advance};
 
+fn run_status_label(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Draft => "draft",
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Waiting => "waiting",
+        RunStatus::Paused => "paused",
+        RunStatus::Success => "success",
+        RunStatus::Error => "error",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn run_is_waiting_on_operator_checkpoint(run: &super::WorkflowRun) -> bool {
+    matches!(run.status, RunStatus::Waiting)
+        && run
+            .context
+            .get("workflow_engine")
+            .and_then(|value| value.get("run_state"))
+            .and_then(|value| value.get("blocked_on"))
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            == Some("operator_checkpoint")
+}
+
+fn run_is_blocked_by_user_control(run: &super::WorkflowRun) -> bool {
+    run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("pause_after_stage")
+}
+
+fn run_blocked_on_label(run: &super::WorkflowRun) -> &'static str {
+    if run_is_waiting_on_operator_checkpoint(run) {
+        "operator_checkpoint"
+    } else if run_is_blocked_by_user_control(run) {
+        "pause_after_stage"
+    } else {
+        ""
+    }
+}
+
+fn clear_user_control_block(run: &mut super::WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    if let Some(run_state) = root.get_mut("run_state").and_then(|value| value.as_object_mut()) {
+        let should_clear = run_state
+            .get("blocked_on")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            == Some("pause_after_stage");
+        if should_clear {
+            run_state.remove("blocked_on");
+        }
+    }
+}
+
 pub async fn start_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
-    let run = load_run(state, run_id).await?;
-    let current_step_id = requested_step_id.or(run.current_step_id.as_deref());
-    set_run_status(state, run_id, RunStatus::Queued, current_step_id).await?;
-    start_or_resume_automatic_run(state, run_id, requested_step_id).await
+    let mut run = load_run(state, run_id).await?;
+    let definition = load_template_definition(state, &run)
+        .await?
+        .ok_or_else(|| anyhow!("run has no template definition"))?;
+    let repaired_step_id = requested_step_id
+        .map(str::to_string)
+        .or_else(|| run.current_step_id.clone())
+        .or_else(|| definition.steps.first().map(|step| step.id.clone()))
+        .ok_or_else(|| anyhow!("workflow run {} has no workflow steps", run_id))?;
+
+    if run.current_step_id.as_deref() != Some(repaired_step_id.as_str()) {
+        run.current_step_id = Some(repaired_step_id.clone());
+        set_run_status(state, run_id, run.status.clone(), Some(repaired_step_id.as_str())).await?;
+    }
+
+    if matches!(run.status, RunStatus::Queued | RunStatus::Running) || run_is_waiting_on_operator_checkpoint(&run) || run_is_blocked_by_user_control(&run) {
+        let blocked_on = run_blocked_on_label(&run);
+
+        tracing::warn!(
+            run_id = %run_id,
+            status = %run_status_label(&run.status),
+            current_step_id = ?run.current_step_id,
+            requested_step_id = ?requested_step_id,
+            repaired_step_id = %repaired_step_id,
+            blocked_on = %blocked_on,
+            "workflow autonomous start rejected because the run is already active or blocked"
+        );
+
+        return Ok(json!({
+            "ok": true,
+            "idempotent": true,
+            "started": false,
+            "status": run_status_label(&run.status),
+            "current_step_id": run.current_step_id,
+            "blocked_on": blocked_on,
+            "requires_user_release": blocked_on == "pause_after_stage"
+        }));
+    }
+
+    tracing::info!(
+        run_id = %run_id,
+        previous_status = %run_status_label(&run.status),
+        current_step_id = ?run.current_step_id,
+        requested_step_id = ?requested_step_id,
+        repaired_step_id = %repaired_step_id,
+        "workflow autonomous start accepted"
+    );
+
+    set_run_status(state, run_id, RunStatus::Queued, Some(repaired_step_id.as_str())).await?;
+    start_or_resume_automatic_run(state, run_id, Some(repaired_step_id.as_str())).await
 }
 
 pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
+    let mut run = load_run(state, run_id).await?;
+    if run_is_blocked_by_user_control(&run) {
+        let current_step_id = run.current_step_id.clone();
+        clear_user_control_block(&mut run);
+        persist_context(state, run_id, &run.context).await?;
+        tracing::info!(
+            run_id = %run_id,
+            current_step_id = ?current_step_id,
+            "workflow user-control checkpoint released by explicit resume"
+        );
+        append_engine_event(
+            state,
+            run_id,
+            current_step_id.as_deref(),
+            "info",
+            "user_control_released",
+            "Workflow user-control checkpoint was released by explicit resume.",
+            json!({ "blocked_on": "pause_after_stage" }),
+        ).await?;
+    }
+
     start_or_resume_automatic_run(state, run_id, None).await
 }
 
@@ -44,7 +172,7 @@ pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Val
             .and_then(|v| v.get("blocked_on"))
             .and_then(|v| v.get("kind"))
             .and_then(Value::as_str)
-            == Some("disposition_review");
+            == Some("operator_checkpoint");
     let autonomous_pause_eligible = if matches!(run.status, RunStatus::Waiting) {
         load_template_definition(state, &run)
             .await?
@@ -55,7 +183,7 @@ pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Val
     };
 
     if disposition_review_waiting {
-        return resolve_disposition_review(state, run_id, "pause").await;
+        return resolve_operator_checkpoint(state, run_id, "pause_error", None).await;
     }
 
     if !matches!(run.status, RunStatus::Queued | RunStatus::Running) && !disposition_review_waiting && !autonomous_pause_eligible {
@@ -97,10 +225,14 @@ pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Val
 
 pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
+    let previous_status = format!("{:?}", run.status).to_lowercase();
     let root = ensure_engine_root(&mut run.context);
-    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
-        run_state.remove("pause_requested");
-    }
+    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+    let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+    run_state_obj.remove("pause_requested");
+    run_state_obj.remove("blocked_on");
+    run_state_obj.insert("cancel_requested".to_string(), json!(true));
+    run_state_obj.insert("cancel_requested_at".to_string(), json!(Utc::now().to_rfc3339()));
     persist_context(state, run_id, &run.context).await?;
 
     set_run_status(state, run_id, RunStatus::Waiting, run.current_step_id.as_deref()).await?;
@@ -109,14 +241,14 @@ pub async fn force_wait_run(state: &AppState, run_id: Uuid) -> Result<serde_json
         run_id,
         run.current_step_id.as_deref(),
         "warn",
-        "run_force_unlocked",
-        "Workflow run was force-unlocked by operator and returned to waiting state.",
+        "run_cancel_requested",
+        "Workflow run cancellation was requested by operator and control returned to waiting state.",
         json!({
-            "previous_status": format!("{:?}", run.status).to_lowercase(),
+            "previous_status": previous_status,
             "current_step_id": run.current_step_id
         }),
     ).await?;
-    Ok(json!({ "ok": true, "status": "waiting", "current_step_id": run.current_step_id }))
+    Ok(json!({ "ok": true, "status": "waiting", "cancel_requested": true, "current_step_id": run.current_step_id }))
 }
 
 async fn latest_stage_execution_id_for_step(
@@ -180,7 +312,7 @@ async fn append_disposition_stage_completion_event(
     .await
 }
 
-pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposition: &str) -> Result<serde_json::Value> {
+pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposition: &str, selected_step_id: Option<&str>) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
     let blocked_on = run
         .context
@@ -188,21 +320,21 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
         .and_then(|v| v.get("run_state"))
         .and_then(|v| v.get("blocked_on"))
         .cloned()
-        .ok_or_else(|| anyhow!("workflow is not waiting on disposition review"))?;
+        .ok_or_else(|| anyhow!("workflow is not waiting on operator checkpoint"))?;
 
     let blocked_kind = blocked_on
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if blocked_kind != "disposition_review" {
-        return Err(anyhow!("workflow is blocked on {}, not disposition_review", blocked_kind));
+    if blocked_kind != "operator_checkpoint" {
+        return Err(anyhow!("workflow is blocked on {}, not operator_checkpoint", blocked_kind));
     }
 
     let stage_id = blocked_on
         .get("stage_id")
         .and_then(Value::as_str)
         .or(run.current_step_id.as_deref())
-        .ok_or_else(|| anyhow!("disposition review is missing stage_id"))?
+        .ok_or_else(|| anyhow!("operator checkpoint is missing stage_id"))?
         .to_string();
     let next_target = blocked_on
         .get("next_step_id")
@@ -225,9 +357,19 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
     };
 
 
-    if !matches!(disposition, "move_next" | "pause" | "paused") {
-        return Err(anyhow!("unsupported disposition {}", disposition));
-    }
+    let normalized_disposition = match disposition {
+        "continue_auto" | "auto" | "autonomous" | "move_next" | "continue" => "continue_auto",
+        "select_stage" | "select" | "continue_manual" | "manual" => "select_stage",
+        "pause_error" | "pause" | "paused" => "pause_error",
+        other => return Err(anyhow!("unsupported operator checkpoint disposition {}", other)),
+    };
+
+    let resume_mode = match normalized_disposition {
+        "continue_auto" => "autonomous".to_string(),
+        "select_stage" => "manual".to_string(),
+        "pause_error" => "none".to_string(),
+        _ => resume_mode,
+    };
 
     {
         let root = ensure_engine_root(&mut run.context);
@@ -237,16 +379,16 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
     }
     persist_context(state, run_id, &run.context).await?;
 
-    match disposition {
-        "pause" | "paused" => {
+    match normalized_disposition {
+        "pause_error" => {
             append_disposition_stage_completion_event(
                 state,
                 run_id,
                 stage_id.as_str(),
                 stage_execution_id.as_deref(),
                 false,
-                "paused",
-                "Stage paused by operator at disposition review.",
+                "pause_error",
+                "Stage paused by operator checkpoint.",
                 None,
             ).await?;
 
@@ -256,23 +398,30 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 run_id,
                 Some(stage_id.as_str()),
                 "info",
-                "disposition_review_resolved",
-                "Operator paused workflow at disposition review.",
-                json!({ "disposition": "pause", "stage_id": stage_id }),
+                "operator_checkpoint_resolved",
+                "Operator paused workflow at checkpoint.",
+                json!({ "disposition": "pause_error", "stage_id": stage_id }),
             ).await?;
             Ok(json!({
                 "ok": true,
                 "status": "paused",
-                "disposition": "pause",
+                "disposition": "pause_error",
                 "current_step_id": stage_id,
                 "followup_action": "pause"
             }))
         }
-        "move_next" => {
+        "continue_auto" | "select_stage" => {
             let definition = load_template_definition(state, &run).await?
                 .ok_or_else(|| anyhow!("run has no template definition"))?;
-            let target = next_target
-                .or_else(|| next_step_id(&definition, Some(stage_id.as_str())));
+            let target = if normalized_disposition == "select_stage" {
+                selected_step_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("selected_step_id is required for select_stage checkpoint disposition"))?
+                    .into()
+            } else {
+                next_target.or_else(|| next_step_id(&definition, Some(stage_id.as_str())))
+            };
 
             if target.is_none() {
                 append_engine_event(
@@ -280,9 +429,9 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                     run_id,
                     Some(stage_id.as_str()),
                     "info",
-                    "disposition_review_resolved",
-                    "Operator approved the final workflow stage; workflow completed successfully.",
-                    json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": Value::Null }),
+                    "operator_checkpoint_resolved",
+                    "Operator checkpoint approved the final workflow stage; workflow completed successfully.",
+                    json!({ "disposition": normalized_disposition, "stage_id": stage_id, "next_step_id": Value::Null }),
                 ).await?;
 
                 append_disposition_stage_completion_event(
@@ -301,7 +450,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 return Ok(json!({
                     "ok": true,
                     "status": "success",
-                    "disposition": "move_next",
+                    "disposition": normalized_disposition,
                     "current_step_id": stage_id,
                     "next_step_id": Value::Null,
                     "followup_action": "complete_workflow"
@@ -315,9 +464,9 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 run_id,
                 Some(stage_id.as_str()),
                 "info",
-                "disposition_review_resolved",
-                "Operator approved moving to the next stage after disposition review.",
-                json!({ "disposition": "move_next", "stage_id": stage_id, "next_step_id": target.clone() }),
+                "operator_checkpoint_resolved",
+                "Operator approved moving to the next stage after checkpoint.",
+                json!({ "disposition": normalized_disposition, "stage_id": stage_id, "next_step_id": target.as_str() }),
             ).await?;
 
             let latest_run = load_run(state, run_id).await?;
@@ -338,7 +487,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 return Ok(json!({
                     "ok": true,
                     "status": "paused",
-                    "disposition": "pause",
+                    "disposition": "pause_error",
                     "current_step_id": stage_id,
                     "next_step_id": target,
                 }));
@@ -350,8 +499,8 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 stage_id.as_str(),
                 stage_execution_id.as_deref(),
                 true,
-                "move_next",
-                "Stage completed after operator disposition review.",
+                normalized_disposition,
+                "Stage completed after operator checkpoint.",
                 Some(target.as_str()),
             ).await?;
 
@@ -365,7 +514,7 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
                 "disposition_transition_committed",
                 "Disposition review transition committed before backend continuation.",
                 json!({
-                    "disposition": "move_next",
+                    "disposition": normalized_disposition,
                     "from_step_id": stage_id,
                     "current_step_id": target,
                     "resume_mode": resume_mode,
@@ -383,6 +532,10 @@ pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposit
         }
         other => Err(anyhow!("unsupported disposition {}", other)),
     }
+}
+
+pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposition: &str) -> Result<serde_json::Value> {
+    resolve_operator_checkpoint(state, run_id, disposition, None).await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -473,6 +626,7 @@ async fn continue_from_disposition_transition(
 enum RunMode {
     Manual,
     Autonomous,
+    PrepareOnly,
 }
 
 struct PreparedStage {
@@ -519,11 +673,11 @@ async fn prepare_stage_for_execution(
     }
 
     let pause_message = governance::pause_message(&decisions);
-    let prepared_status = if pause_message.is_some() {
-        RunStatus::Waiting
-    } else {
-        RunStatus::Running
+    let prepared_status = match mode {
+        RunMode::Manual | RunMode::Autonomous => RunStatus::Running,
+        RunMode::PrepareOnly => RunStatus::Waiting,
     };
+    let prepared_status_label = run_status_label(&prepared_status);
 
     persist_context(state, run_id, &run.context).await?;
     set_run_status(state, run_id, prepared_status, Some(step.id.as_str())).await?;
@@ -554,11 +708,12 @@ async fn prepare_stage_for_execution(
             "step_id": step.id,
             "step_type": step.step_type,
             "current_step_id": step.id,
-            "status": if pause_message.is_some() { "waiting" } else { "running" },
-            "prepared_status": if pause_message.is_some() { "waiting" } else { "running" },
+            "status": prepared_status_label,
+            "prepared_status": prepared_status_label,
             "run_mode": match mode {
                 RunMode::Manual => "manual",
                 RunMode::Autonomous => "autonomous",
+                RunMode::PrepareOnly => "prepare_only",
             },
             "paused_by_governance": pause_message.is_some(),
             "prepared_context": refreshed_run.context.clone(),
@@ -579,12 +734,13 @@ pub async fn prepare_run_stage_for_execution(state: &AppState, run_id: Uuid, req
         state,
         run_id,
         requested_step_id,
-        RunMode::Autonomous,
+        RunMode::PrepareOnly,
     ).await?;
 
     Ok(json!({
         "ok": prepared.pause_message.is_none(),
-        "status": if prepared.pause_message.is_some() { "waiting" } else { "running" },
+        "status": "waiting",
+        "prepared": true,
         "current_step_id": prepared.step.id,
         "step_id": prepared.step.id,
         "step_type": prepared.step.step_type,
@@ -653,45 +809,85 @@ fn clear_run_pause_requested(run: &mut super::WorkflowRun) {
     }
 }
 
+fn run_cancel_requested(run: &super::WorkflowRun) -> bool {
+    run.context
+        .get("workflow_engine")
+        .and_then(|v| v.get("run_state"))
+        .and_then(|v| v.get("cancel_requested"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn clear_run_cancel_requested(run: &mut super::WorkflowRun) {
+    let root = ensure_engine_root(&mut run.context);
+    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
+        run_state.remove("cancel_requested");
+        run_state.remove("cancel_requested_at");
+    }
+}
+
+fn operator_checkpoint_result(outcome: &super::stages::StageOutcome) -> Option<Value> {
+    outcome.capability_results.iter().find_map(|item| {
+        let key = item
+            .get("key")
+            .or_else(|| item.get("capability"))
+            .and_then(Value::as_str)?;
+        if key != "operator_checkpoint" {
+            return None;
+        }
+        let result = item.get("result").or_else(|| item.get("payload"))?.clone();
+        if result.get("needs_user_response").and_then(Value::as_bool) == Some(true) {
+            Some(result)
+        } else {
+            None
+        }
+    })
+}
+
 fn stage_disposition_review_enabled(
     step: &super::WorkflowStepDefinition,
     outcome: &super::stages::StageOutcome,
 ) -> bool {
-    let step_enabled = step
-        .execution_logic
-        .get("automation")
-        .and_then(|v| v.get("disposition_review"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    if operator_checkpoint_result(outcome).is_some() {
+        return true;
+    }
 
-    let outcome_enabled = outcome
-        .local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .and_then(|v| v.get("disposition_review"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let automation_enabled = |automation: Option<&Value>| {
+        automation
+            .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
+            .and_then(|v| v.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
 
-    step_enabled || outcome_enabled
+    automation_enabled(step.execution_logic.get("automation"))
+        || automation_enabled(
+            outcome
+                .local_state
+                .get("execution_logic")
+                .and_then(|v| v.get("automation")),
+        )
 }
 
 fn disposition_review_options(
     step: &super::WorkflowStepDefinition,
     outcome: &super::stages::StageOutcome,
 ) -> Value {
+    if let Some(checkpoint) = operator_checkpoint_result(outcome) {
+        return normalize_disposition_review_options(checkpoint.get("available_dispositions").cloned());
+    }
+
     let configured = outcome
         .local_state
         .get("execution_logic")
         .and_then(|v| v.get("automation"))
-        .and_then(|v| v.get("disposition_review"))
+        .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
         .and_then(|v| v.get("available_dispositions"))
         .cloned()
         .or_else(|| {
             step.execution_logic
                 .get("automation")
-                .and_then(|v| v.get("disposition_review"))
+                .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
                 .and_then(|v| v.get("available_dispositions"))
                 .cloned()
         });
@@ -705,14 +901,16 @@ fn normalize_disposition_review_options(configured: Option<Value>) -> Value {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|value| match value.as_str() {
-            Some("move_next") => Some(json!("move_next")),
-            Some("pause") => Some(json!("pause")),
+            Some("continue_auto") | Some("auto") | Some("autonomous") => Some(json!("continue_auto")),
+            Some("select_stage") | Some("select") | Some("continue_manual") | Some("manual") => Some(json!("select_stage")),
+            Some("continue_auto") | Some("auto") | Some("autonomous") | Some("move_next") | Some("continue") => Some(json!("continue_auto")),
+            Some("pause_error") | Some("pause") | Some("paused") => Some(json!("pause_error")),
             _ => None,
         })
         .collect::<Vec<Value>>();
 
     if options.is_empty() {
-        json!(["move_next", "pause"])
+        json!(["continue_auto", "pause_error", "select_stage"])
     } else {
         Value::Array(options)
     }
@@ -746,6 +944,7 @@ fn set_pending_disposition_review(
     outcome: &super::stages::StageOutcome,
     next_target: Option<String>,
     resume_mode: &str,
+    process_session_id: &str,
 ) {
     let root = ensure_engine_root(&mut run.context);
     let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
@@ -756,15 +955,24 @@ fn set_pending_disposition_review(
         .and_then(Value::as_str)
         .unwrap_or("");
 
+    let checkpoint = operator_checkpoint_result(outcome).unwrap_or_else(|| json!({}));
     run_state_obj.insert("blocked_on".to_string(), json!({
-        "kind": "disposition_review",
+        "kind": "operator_checkpoint",
+        "process_session_id": process_session_id,
         "stage_id": step.id,
         "stage_type": step.step_type,
         "stage_execution_id": stage_execution_id,
-        "recommended_disposition": format_disposition(&outcome.disposition),
+        "capability_invocation_id": checkpoint.get("_capability_invocation_id").and_then(Value::as_str).unwrap_or(""),
+        "recommended_disposition": checkpoint
+            .get("recommended_disposition")
+            .and_then(Value::as_str)
+            .unwrap_or("continue_auto"),
         "available_dispositions": disposition_review_options(step, outcome),
         "next_step_id": next_target,
-        "message": outcome.message,
+        "message": checkpoint
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(outcome.message.as_str()),
         "resume_mode": resume_mode
     }));
 }
@@ -799,6 +1007,30 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }));
         }
 
+        let latest_run = load_run(state, run_id).await?;
+        if run_cancel_requested(&latest_run) {
+            let mut cancelled_run = latest_run;
+            clear_run_cancel_requested(&mut cancelled_run);
+            clear_pending_disposition_review(&mut cancelled_run);
+            persist_context(state, run_id, &cancelled_run.context).await?;
+            set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
+            append_engine_event(
+                state,
+                run_id,
+                cancelled_run.current_step_id.as_deref(),
+                "warn",
+                "run_cancelled",
+                "Workflow run stopped because operator cancellation was requested.",
+                json!({ "current_step_id": cancelled_run.current_step_id }),
+            ).await?;
+            return Ok(json!({
+                "ok": true,
+                "status": "waiting",
+                "cancelled": true,
+                "current_step_id": cancelled_run.current_step_id
+            }));
+        }
+
         let prepared = prepare_stage_for_execution(
             state,
             run_id,
@@ -824,6 +1056,35 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
         clear_active_prompt_fragments_for_stage(&mut run);
 
+        let latest_run = load_run(state, run_id).await?;
+        if run_cancel_requested(&latest_run) {
+            let mut cancelled_run = latest_run;
+            clear_run_cancel_requested(&mut cancelled_run);
+            clear_pending_disposition_review(&mut cancelled_run);
+            clear_active_prompt_fragments_for_stage(&mut cancelled_run);
+            persist_context(state, run_id, &cancelled_run.context).await?;
+            set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
+            append_engine_event(
+                state,
+                run_id,
+                cancelled_run.current_step_id.as_deref(),
+                "warn",
+                "run_cancelled_after_stage",
+                "Workflow run stopped after current stage because operator cancellation was requested.",
+                json!({
+                    "step_id": step.id,
+                    "current_step_id": cancelled_run.current_step_id
+                }),
+            ).await?;
+            return Ok(json!({
+                "ok": true,
+                "status": "waiting",
+                "cancelled": true,
+                "step_id": step.id,
+                "current_step_id": cancelled_run.current_step_id
+            }));
+        }
+
         if matches!(
             outcome.disposition,
             StageDisposition::Success
@@ -841,7 +1102,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             clear_pending_disposition_review(&mut run);
             let next_target = resolve_next_target(&definition, &step, &outcome);
             let disposition_resume_mode = if automatic { "autonomous" } else { "manual" };
-            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode);
+            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode, state.process_session_id());
             persist_context(state, run_id, &run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
             append_engine_event(
@@ -849,8 +1110,8 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 run_id,
                 Some(step.id.as_str()),
                 "info",
-                "workflow_waiting_for_disposition_review",
-                "Workflow is waiting for operator disposition review.",
+                "workflow_waiting_for_operator_checkpoint",
+                "Workflow is waiting for operator checkpoint.",
                 json!({
                     "stage_id": step.id,
                     "stage_type": step.step_type,
@@ -863,7 +1124,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             return Ok(json!({
                 "ok": true,
                 "status": "waiting",
-                "blocked_on": "disposition_review",
+                "blocked_on": "operator_checkpoint",
                 "step_id": step.id,
                 "next_step_id": next_target,
                 "message": outcome.message,
@@ -894,6 +1155,19 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
             clear_run_pause_requested(&mut run);
+            {
+                let root = ensure_engine_root(&mut run.context);
+                let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+                let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+                run_state_obj.insert("blocked_on".to_string(), json!({
+                    "kind": "pause_after_stage",
+                    "requires_user_release": true,
+                    "stage_id": step.id,
+                    "stage_type": step.step_type,
+                    "next_step_id": next_target,
+                    "message": "Workflow paused after stage and requires explicit user resume before autonomous progression can continue."
+                }));
+            }
             persist_context(state, run_id, &run.context).await?;
             set_run_status(state, run_id, RunStatus::Paused, Some(step.id.as_str())).await?;
             append_engine_event(
@@ -902,12 +1176,18 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 Some(step.id.as_str()),
                 "info",
                 "run_paused_after_stage",
-                "Workflow run paused after the current stage completed.",
-                json!({}),
+                "Workflow run paused after the current stage completed and now requires explicit user resume.",
+                json!({
+                    "blocked_on": "pause_after_stage",
+                    "requires_user_release": true,
+                    "next_step_id": next_target
+                }),
             ).await?;
             return Ok(json!({
                 "ok": true,
                 "status": "paused",
+                "blocked_on": "pause_after_stage",
+                "requires_user_release": true,
                 "step_id": step.id,
                 "next_step_id": next_target,
                 "message": outcome.message,

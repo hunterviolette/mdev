@@ -69,6 +69,7 @@ async fn supervisor_action(
         "preview_planner_import" => supervisor::preview_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "apply_planner_import" => supervisor::apply_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "refine_feature" => supervisor::refine_supervisor_feature(&state, supervisor_id, req.payload).await,
+        "remove_child_workflow" => supervisor::remove_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
         "new_sprint" => supervisor::start_next_supervisor_sprint(&state, supervisor_id).await,
         other => Err(anyhow::anyhow!("unsupported supervisor action {}", other)),
     };

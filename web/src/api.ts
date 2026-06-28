@@ -682,7 +682,7 @@ export function pauseWorkflowRun(runId: string) {
 }
 
 export function forceWaitWorkflowRun(runId: string) {
-  return sendRunAction(runId, { action: 'force_wait_run' });
+  return sendRunAction(runId, { action: 'cancel_run' });
 }
 
 export function selectWorkflowStep(runId: string, stepId: string) {
@@ -701,11 +701,18 @@ export function runCurrentWorkflowStep(
   });
 }
 
-export function resolveWorkflowDispositionReview(runId: string, disposition: string) {
+export function resolveWorkflowOperatorCheckpoint(runId: string, disposition: string, selectedStepId?: string | null) {
   return sendRunAction(runId, {
-    action: 'resolve_disposition_review',
-    payload: { disposition }
+    action: 'resolve_operator_checkpoint',
+    payload: {
+      disposition,
+      ...(selectedStepId ? { selected_step_id: selectedStepId } : {})
+    }
   });
+}
+
+export function resolveWorkflowDispositionReview(runId: string, disposition: string, selectedStepId?: string | null) {
+  return resolveWorkflowOperatorCheckpoint(runId, disposition, selectedStepId);
 }
 
 export function nextWorkflowStep(runId: string) {

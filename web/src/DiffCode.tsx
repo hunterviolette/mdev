@@ -571,8 +571,8 @@ function applyCollapsedRows(rows: RenderRow[], collapsedPaths?: Record<string, b
   return next;
 }
 
-function VirtualizedDiffRows(props: { rows: RenderRow[]; diffStyle: DiffCodeStyle; collapsedPaths?: Record<string, boolean>; onToggleFile?: (path: string) => void }) {
-  const { rows, diffStyle, collapsedPaths, onToggleFile } = props;
+function VirtualizedDiffRows(props: { rows: RenderRow[]; diffStyle: DiffCodeStyle; collapsedPaths?: Record<string, boolean>; onToggleFile?: (path: string) => void; onActiveFileChange?: (path: string | null) => void }) {
+  const { rows, diffStyle, collapsedPaths, onToggleFile, onActiveFileChange } = props;
   const visibleInputRows = useMemo(() => applyCollapsedRows(rows, collapsedPaths), [rows, collapsedPaths]);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -626,6 +626,10 @@ function VirtualizedDiffRows(props: { rows: RenderRow[]; diffStyle: DiffCodeStyl
   const stickyActiveFileInfo = activeFileInfo && !activeFileInfo.row.collapsed ? activeFileInfo : null;
   const hiddenDuplicateFilePath = stickyActiveFileInfo?.row.path ?? null;
 
+  useEffect(() => {
+    onActiveFileChange?.(activeFileInfo?.row.path ?? null);
+  }, [activeFileInfo?.row.path, onActiveFileChange]);
+
   return (
     <Box
       ref={viewportRef}
@@ -661,7 +665,7 @@ function VirtualizedDiffRows(props: { rows: RenderRow[]; diffStyle: DiffCodeStyl
   );
 }
 
-export function DiffCode(props: { patch: string; diffStyle: DiffCodeStyle; collapsedPaths?: Record<string, boolean>; onToggleFile?: (path: string) => void }) {
+export function DiffCode(props: { patch: string; diffStyle: DiffCodeStyle; collapsedPaths?: Record<string, boolean>; onToggleFile?: (path: string) => void; onActiveFileChange?: (path: string | null) => void }) {
   const files = useMemo(() => parseUnifiedPatch(props.patch), [props.patch]);
   const [rows, setRows] = useState<RenderRow[]>([]);
   const [preparedFiles, setPreparedFiles] = useState(0);
@@ -732,7 +736,7 @@ export function DiffCode(props: { patch: string; diffStyle: DiffCodeStyle; colla
           <Progress value={progressValue} size={2} animated />
         </Box>
       ) : null}
-      <VirtualizedDiffRows rows={rows} diffStyle={props.diffStyle} collapsedPaths={props.collapsedPaths} onToggleFile={props.onToggleFile} />
+      <VirtualizedDiffRows rows={rows} diffStyle={props.diffStyle} collapsedPaths={props.collapsedPaths} onToggleFile={props.onToggleFile} onActiveFileChange={props.onActiveFileChange} />
     </Box>
   );
 }

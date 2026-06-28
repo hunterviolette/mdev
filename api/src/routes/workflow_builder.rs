@@ -648,9 +648,11 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
         capabilities: Vec::<WorkflowCapabilityBinding>::new(),
         execution_logic: json!({
             "automation": {
-                "disposition_review": {
+                "user_checkpoint": {
                     "enabled": false,
-                    "available_dispositions": ["move_next", "pause"]
+                    "kind": "operator_checkpoint",
+                    "recommended_disposition": "continue_auto",
+                    "available_dispositions": ["continue_auto", "pause_error", "select_stage"]
                 }
             }
         }),
@@ -688,9 +690,11 @@ fn design_descriptor() -> WorkflowStageDescriptor {
         },
         "automation": {
             "empty_user_input_default": "",
-            "disposition_review": {
+            "user_checkpoint": {
                 "enabled": true,
-                "available_dispositions": ["move_next", "pause"]
+                "kind": "operator_checkpoint",
+                "recommended_disposition": "continue_manual",
+                "available_dispositions": ["continue_auto", "continue_manual", "pause_error"]
             }
         },
         "structured_output": {

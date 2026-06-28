@@ -294,9 +294,11 @@ function FileTreeRow(props: {
   scope: ReviewDiffScope;
   scopeActive: boolean;
   selectedPath: string | null;
+  selectedDirectoryPath: string | null;
   actionBusy: boolean;
   collapsedDirs: Record<string, boolean>;
   onToggleDir: (path: string) => void;
+  onSelectDirectory: (path: string) => void;
   onSelectFile: (path: string) => void;
   onStage: (path: string) => Promise<void>;
   onUnstage: (path: string) => Promise<void>;
@@ -308,9 +310,11 @@ function FileTreeRow(props: {
     scope,
     scopeActive,
     selectedPath,
+    selectedDirectoryPath,
     actionBusy,
     collapsedDirs,
     onToggleDir,
+    onSelectDirectory,
     onSelectFile,
     onStage,
     onUnstage,
@@ -321,25 +325,48 @@ function FileTreeRow(props: {
 
   if (node.kind === 'dir') {
     const collapsed = Boolean(collapsedDirs[node.path]);
+    const directoryActive = selectedDirectoryPath === node.path;
+    const directoryContainsActiveFile = selectedPath ? selectedPath.startsWith(`${node.path}/`) : false;
     return (
       <>
         <Box
-          onClick={() => onToggleDir(node.path)}
+          onClick={() => onSelectDirectory(node.path)}
+          title={`Select ${node.path}/`}
           style={{
             cursor: 'pointer',
             height: 24,
             display: 'grid',
-            gridTemplateColumns: 'minmax(0, 1fr) auto auto auto',
+            gridTemplateColumns: '22px minmax(0, 1fr) auto auto auto',
             gap: 6,
             alignItems: 'center',
             paddingLeft: 6 + indent,
             paddingRight: 6,
             borderRadius: 5,
-            color: 'var(--mantine-color-dimmed)',
+            color: directoryActive || directoryContainsActiveFile ? 'var(--mantine-color-yellow-1)' : 'var(--mantine-color-dimmed)',
+            background: directoryActive ? 'rgba(34, 139, 230, 0.28)' : 'transparent',
+            border: directoryActive ? '1px solid rgba(74, 171, 247, 0.88)' : '1px solid transparent',
+            boxShadow: directoryActive ? 'inset 3px 0 0 rgba(116, 192, 252, 0.95), 0 0 0 1px rgba(74, 171, 247, 0.18)' : undefined,
           }}
         >
-          <Text size="xs" fw={700} truncate title={node.path}>
-            {collapsed ? '▸' : '▾'} {node.name}/
+          <ActionIcon
+            size="xs"
+            variant="subtle"
+            aria-label={collapsed ? 'Expand directory' : 'Collapse directory'}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleDir(node.path);
+            }}
+          >
+            {collapsed ? '▸' : '▾'}
+          </ActionIcon>
+          <Text
+            size="xs"
+            fw={directoryActive ? 900 : directoryContainsActiveFile ? 800 : 700}
+            c={directoryActive ? undefined : directoryContainsActiveFile ? 'yellow.0' : undefined}
+            truncate
+            title={node.path}
+          >
+            {node.name}/
           </Text>
           <Badge size="xs" variant="light">{node.fileCount}</Badge>
           <Badge size="xs" color="green" variant="light">+{node.additions}</Badge>
@@ -353,9 +380,11 @@ function FileTreeRow(props: {
             scope={scope}
             scopeActive={scopeActive}
             selectedPath={selectedPath}
+            selectedDirectoryPath={selectedDirectoryPath}
             actionBusy={actionBusy}
             collapsedDirs={collapsedDirs}
             onToggleDir={onToggleDir}
+            onSelectDirectory={onSelectDirectory}
             onSelectFile={onSelectFile}
             onStage={onStage}
             onUnstage={onUnstage}
@@ -367,6 +396,7 @@ function FileTreeRow(props: {
   }
 
   const active = selectedPath === node.path;
+  const directorySelected = selectedDirectoryPath ? node.path.startsWith(`${selectedDirectoryPath}/`) : false;
   const file = node.file;
   return (
     <Box
@@ -382,13 +412,13 @@ function FileTreeRow(props: {
         paddingLeft: 6 + indent,
         paddingRight: 6,
         borderRadius: 5,
-        background: active ? 'rgba(34, 139, 230, 0.34)' : scopeActive ? 'rgba(34, 139, 230, 0.045)' : 'transparent',
-        border: active ? '1px solid rgba(74, 171, 247, 0.92)' : scopeActive ? '1px solid rgba(74, 171, 247, 0.08)' : '1px solid transparent',
-        boxShadow: active ? 'inset 3px 0 0 rgba(116, 192, 252, 0.95)' : undefined,
+        background: active ? 'rgba(245, 159, 0, 0.30)' : scopeActive ? 'rgba(34, 139, 230, 0.045)' : 'transparent',
+        border: active ? '1px solid rgba(255, 212, 59, 0.88)' : scopeActive ? '1px solid rgba(74, 171, 247, 0.08)' : '1px solid transparent',
+        boxShadow: active ? 'inset 3px 0 0 rgba(255, 212, 59, 0.95)' : undefined,
       }}
     >
       <Badge size="xs" variant="outline" style={{ minWidth: 24 }}>{statusCode(file)}</Badge>
-      <Text size="xs" fw={active ? 900 : scopeActive ? 700 : 600} c={active ? 'blue.0' : undefined} truncate>{node.name}</Text>
+      <Text size="xs" fw={active ? 900 : scopeActive ? 700 : 600} c={active ? 'yellow.0' : undefined} truncate>{node.name}</Text>
       <Text size="xs" c="green" fw={700}>+{node.additions}</Text>
       <Text size="xs" c="red" fw={700}>-{node.deletions}</Text>
       {scope === 'unstaged' ? (
@@ -453,9 +483,11 @@ function FileTree(props: {
   scope: ReviewDiffScope;
   scopeActive: boolean;
   selectedPath: string | null;
+  selectedDirectoryPath: string | null;
   actionBusy: boolean;
   collapsedDirs: Record<string, boolean>;
   onToggleDir: (path: string) => void;
+  onSelectDirectory: (path: string) => void;
   onSelectFile: (path: string) => void;
   onStage: (path: string) => Promise<void>;
   onUnstage: (path: string) => Promise<void>;
@@ -494,6 +526,9 @@ export function DiffPanel(props: DiffPanelProps) {
   const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
   const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
   const [collapsedTreeDirs, setCollapsedTreeDirs] = useState<Record<string, boolean>>({});
+  const [activeScrollPath, setActiveScrollPath] = useState<string | null>(null);
+  const [selectedDirectoryPath, setSelectedDirectoryPath] = useState<string | null>(null);
+  const selectedDirectoryPathRef = useRef<string | null>(null);
   const [discardTarget, setDiscardTarget] = useState<{ path: string | null; label: string; paths: string[] } | null>(null);
   const [unstageAllTarget, setUnstageAllTarget] = useState<{ label: string; paths: string[] } | null>(null);
   const viewerGridRef = useRef<HTMLDivElement | null>(null);
@@ -554,23 +589,28 @@ export function DiffPanel(props: DiffPanelProps) {
     }));
   }, [diffManifest, filePatchByPath, selectedScopeCountsByPath]);
 
+  const visibleScopeDiffRows = useMemo(() => {
+    if (!selectedDirectoryPath) return scopeDiffRows;
+    return scopeDiffRows.filter(({ file }) => file.path.startsWith(`${selectedDirectoryPath}/`));
+  }, [scopeDiffRows, selectedDirectoryPath]);
+
   const groupedScopePatch = useMemo(() => {
-    return scopeDiffRows
+    return visibleScopeDiffRows
       .filter(({ patch }) => patch.trim())
       .map(({ patch }) => patch.trimEnd())
       .join('\n');
-  }, [scopeDiffRows]);
+  }, [visibleScopeDiffRows]);
 
   const groupedScopePatchLoading = useMemo(() => {
-    return scopeDiffRows.some(({ file }) => Boolean(filePatchBusyByPath[file.path]));
-  }, [scopeDiffRows, filePatchBusyByPath]);
+    return visibleScopeDiffRows.some(({ file }) => Boolean(filePatchBusyByPath[file.path]));
+  }, [visibleScopeDiffRows, filePatchBusyByPath]);
 
-  const hasScopeDiffRows = scopeDiffRows.length > 0;
-  const allScopeRowsCollapsed = hasScopeDiffRows && scopeDiffRows.every(({ file }) => collapsedByPath[file.path] !== false);
+  const hasScopeDiffRows = visibleScopeDiffRows.length > 0;
+  const allScopeRowsCollapsed = hasScopeDiffRows && visibleScopeDiffRows.every(({ file }) => collapsedByPath[file.path] !== false);
 
   function setAllScopeRowsCollapsed(collapsed: boolean) {
     setCollapsedByPath(
-      Object.fromEntries(scopeDiffRows.map(({ file }) => [file.path, collapsed]))
+      Object.fromEntries(visibleScopeDiffRows.map(({ file }) => [file.path, collapsed]))
     );
   }
 
@@ -586,6 +626,27 @@ export function DiffPanel(props: DiffPanelProps) {
       ...current,
       [path]: !current[path],
     }));
+  }
+
+  function selectScopeFile(scope: ReviewDiffScope, path: string) {
+    selectedDirectoryPathRef.current = null;
+    setSelectedDirectoryPath(null);
+    setActiveScrollPath(path);
+    void patchState({ selected_scope: scope, selected_path: path });
+  }
+
+  function selectScopeDirectory(scope: ReviewDiffScope, path: string) {
+    selectedDirectoryPathRef.current = path;
+    setSelectedDirectoryPath(path);
+    setActiveScrollPath(null);
+    void patchState({ selected_scope: scope, selected_path: null });
+  }
+
+  function selectWholeScope(scope: ReviewDiffScope) {
+    selectedDirectoryPathRef.current = null;
+    setSelectedDirectoryPath(null);
+    setActiveScrollPath(null);
+    void patchState({ selected_scope: scope, selected_path: null });
   }
 
   const singleFileRenderedLineCount = useMemo(() => {
@@ -686,7 +747,14 @@ export function DiffPanel(props: DiffPanelProps) {
       if (refreshDiffRequestIdRef.current !== requestId) {
         return;
       }
-      setDiffManifest(manifest);
+      const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
+      const visibleManifest = directoryPath
+        ? {
+          ...manifest,
+          files: manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`)),
+        }
+        : manifest;
+      setDiffManifest(visibleManifest);
 
       if (nextState.selected_path) {
         const json = await getReviewDiff({
@@ -709,7 +777,7 @@ export function DiffPanel(props: DiffPanelProps) {
       if (refreshDiffRequestIdRef.current === requestId) {
         setDiffBusy(false);
       }
-      await refreshScopeFilePatches(nextState, manifest.files, requestId);
+      await refreshScopeFilePatches(nextState, visibleManifest.files, requestId);
       return;
     } catch (err) {
       if (refreshDiffRequestIdRef.current !== requestId) {
@@ -888,6 +956,8 @@ export function DiffPanel(props: DiffPanelProps) {
   const effectiveSidebarWidth = clampSidebarWidth(sidebarWidth);
   const showSidebar = !sidebarHidden;
   const compactCounts = effectiveSidebarWidth < 340;
+  const highlightedTreePath = state.selected_path ?? activeScrollPath;
+  const highlightedDirectoryPath = state.selected_path === null ? selectedDirectoryPath : null;
 
   useEffect(() => {
     if (forceViewerOpen && !viewerOpen) {
@@ -1024,6 +1094,11 @@ export function DiffPanel(props: DiffPanelProps) {
                       diffStyle={state.diff_style}
                       collapsedPaths={collapsedByPath}
                       onToggleFile={toggleScopeRowCollapsed}
+                      onActiveFileChange={(path) => {
+                        if (state.selected_path === null) {
+                          setActiveScrollPath(path);
+                        }
+                      }}
                     />
                   </Box>
                 ) : groupedScopePatchLoading ? (
@@ -1118,7 +1193,7 @@ export function DiffPanel(props: DiffPanelProps) {
                   <Stack gap={4}>
                     <ScopeHeader
                       title="Staged"
-                      active={state.selected_scope === 'staged' && state.selected_path === null}
+                      active={state.selected_scope === 'staged' && state.selected_path === null && selectedDirectoryPath === null}
                       fileCount={stagedFiles.length}
                       additions={stagedTotals.additions}
                       deletions={stagedTotals.deletions}
@@ -1126,19 +1201,21 @@ export function DiffPanel(props: DiffPanelProps) {
                       buttonLabel="−"
                       buttonTooltip="Unstage all"
                       actionBusy={actionBusy}
-                      onSelect={() => void patchState({ selected_scope: 'staged', selected_path: null })}
+                      onSelect={() => selectWholeScope('staged')}
                       onAction={async () => requestUnstageAll()}
                     />
                     {stagedFiles.length > 0 ? (
                       <FileTree
                         nodes={stagedTree}
                         scope="staged"
-                        scopeActive={state.selected_scope === 'staged' && state.selected_path === null}
-                        selectedPath={state.selected_scope === 'staged' ? state.selected_path : null}
+                        scopeActive={state.selected_scope === 'staged' && state.selected_path === null && selectedDirectoryPath === null}
+                        selectedPath={state.selected_scope === 'staged' ? highlightedTreePath : null}
+                        selectedDirectoryPath={state.selected_scope === 'staged' ? highlightedDirectoryPath : null}
                         actionBusy={actionBusy}
                         collapsedDirs={collapsedTreeDirs}
                         onToggleDir={toggleTreeDir}
-                        onSelectFile={(path) => void patchState({ selected_scope: 'staged', selected_path: path })}
+                        onSelectDirectory={(path) => selectScopeDirectory('staged', path)}
+                        onSelectFile={(path) => selectScopeFile('staged', path)}
                         onStage={(path) => runStageAction('stage', 'staged', path)}
                         onUnstage={(path) => runStageAction('unstage', 'staged', path)}
                         onDiscard={requestDiscard}
@@ -1153,7 +1230,7 @@ export function DiffPanel(props: DiffPanelProps) {
                   <Stack gap={4}>
                     <ScopeHeader
                       title="Unstaged"
-                      active={state.selected_scope === 'unstaged' && state.selected_path === null}
+                      active={state.selected_scope === 'unstaged' && state.selected_path === null && selectedDirectoryPath === null}
                       fileCount={unstagedFiles.length}
                       additions={unstagedTotals.additions}
                       deletions={unstagedTotals.deletions}
@@ -1176,7 +1253,7 @@ export function DiffPanel(props: DiffPanelProps) {
                           </ActionIcon>
                         </Tooltip>
                       ) : null}
-                      onSelect={() => void patchState({ selected_scope: 'unstaged', selected_path: null })}
+                      onSelect={() => selectWholeScope('unstaged')}
                       onAction={() => runStageAction('stage', 'unstaged', null)}
                     />
 
@@ -1184,12 +1261,14 @@ export function DiffPanel(props: DiffPanelProps) {
                       <FileTree
                         nodes={unstagedTree}
                         scope="unstaged"
-                        scopeActive={state.selected_scope === 'unstaged' && state.selected_path === null}
-                        selectedPath={state.selected_scope === 'unstaged' ? state.selected_path : null}
+                        scopeActive={state.selected_scope === 'unstaged' && state.selected_path === null && selectedDirectoryPath === null}
+                        selectedPath={state.selected_scope === 'unstaged' ? highlightedTreePath : null}
+                        selectedDirectoryPath={state.selected_scope === 'unstaged' ? highlightedDirectoryPath : null}
                         actionBusy={actionBusy}
                         collapsedDirs={collapsedTreeDirs}
                         onToggleDir={toggleTreeDir}
-                        onSelectFile={(path) => void patchState({ selected_scope: 'unstaged', selected_path: path })}
+                        onSelectDirectory={(path) => selectScopeDirectory('unstaged', path)}
+                        onSelectFile={(path) => selectScopeFile('unstaged', path)}
                         onStage={(path) => runStageAction('stage', 'unstaged', path)}
                         onUnstage={(path) => runStageAction('unstage', 'unstaged', path)}
                         onDiscard={requestDiscard}

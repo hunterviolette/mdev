@@ -16,7 +16,7 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resume_run, run_step, start_run};
+pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resolve_operator_checkpoint, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {

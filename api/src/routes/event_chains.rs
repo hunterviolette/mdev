@@ -228,6 +228,35 @@ fn capability_result_payload(result: &Value) -> Value {
         .unwrap_or_else(|| strip_runtime_context_from_capability_payload(result))
 }
 
+fn payload_indicates_user_wait(payload: &Value) -> bool {
+    payload
+        .get("waiting_for_user")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || payload
+            .get("needs_user_response")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || payload
+            .get("result")
+            .map(payload_indicates_user_wait)
+            .unwrap_or(false)
+}
+
+fn event_indicates_operator_checkpoint_wait(event: &StageChainEvent) -> bool {
+    event.kind == "operator_checkpoint_waiting"
+        || event.kind == "stage_execution_waiting_for_operator_checkpoint"
+        || event.kind == "workflow_waiting_for_operator_checkpoint"
+        || event.kind.ends_with("_waiting")
+        || event
+            .payload
+            .get("capability")
+            .and_then(Value::as_str)
+            .map(|capability| capability == "operator_checkpoint")
+            .unwrap_or(false)
+            && payload_indicates_user_wait(&event.payload)
+}
+
 fn capability_result_key(result: &Value) -> Option<String> {
     result
         .get("key")
@@ -355,7 +384,10 @@ async fn build_event_chain_summary(
                         .copied();
                     let status_event = completed.unwrap_or(latest_capability);
                     let capability_name = capability_name_from_event(first);
-                    let status_color = if status_event.level == "error" {
+                    let waiting_for_user = event_indicates_operator_checkpoint_wait(status_event);
+                    let status_color = if waiting_for_user {
+                        "yellow"
+                    } else if status_event.level == "error" {
                         "red"
                     } else if completed.is_some() {
                         "green"
@@ -363,7 +395,9 @@ async fn build_event_chain_summary(
                         "blue"
                     }
                     .to_string();
-                    let status_label = if status_event.level == "error" {
+                    let status_label = if waiting_for_user {
+                        "WAITING"
+                    } else if status_event.level == "error" {
                         "ERROR"
                     } else if completed.is_some() {
                         "SUCCESS"
@@ -409,6 +443,7 @@ async fn build_event_chain_summary(
                 .find(|event| {
                     event.capability_invocation_id.is_none()
                         && (event.kind == "stage_execution_completed"
+                            || event.kind == "stage_execution_waiting_for_operator_checkpoint"
                             || event.kind == "stage_execution_waiting_for_disposition_review"
                             || event.kind == "stage_executed"
                             || event.payload
@@ -439,32 +474,38 @@ async fn build_event_chain_summary(
                     .unwrap_or(&result_key)
                     .to_string();
 
+                let result_waiting_for_user = result_key == "operator_checkpoint" && payload_indicates_user_wait(&result_payload);
+
                 if let Some(existing) = capabilities.iter_mut().find(|capability| {
                     normalized_capability_key(&capability.name) == normalized_result_key
                         || normalized_capability_key(&capability.capability_id) == normalized_result_key
                 }) {
-                    existing.status_color = if ok { "green" } else { "red" }.to_string();
-                    existing.status_label = if ok { "SUCCESS" } else { "ERROR" }.to_string();
-                    existing.is_active = false;
-                    existing.latest_level = if ok { "info" } else { "error" }.to_string();
+                    existing.status_color = if result_waiting_for_user { "yellow" } else if ok { "green" } else { "red" }.to_string();
+                    existing.status_label = if result_waiting_for_user { "WAITING" } else if ok { "SUCCESS" } else { "ERROR" }.to_string();
+                    existing.is_active = result_waiting_for_user;
+                    existing.latest_level = if result_waiting_for_user { "warn" } else if ok { "info" } else { "error" }.to_string();
                     existing.message = result_message;
-                    if existing.end_payload.is_null() {
-                        existing.end_payload = result_payload.clone();
-                    }
-                    if existing.latest_payload.is_null() {
+                    if result_waiting_for_user {
                         existing.latest_payload = result_payload.clone();
-                    }
-                    if existing.completed_at.is_none() {
-                        if let Some(stage_event) = result_stage_event {
-                            existing.completed_at = Some(stage_event.created_at.clone());
-                            existing.latest_created_at = stage_event.created_at.clone();
-                            existing.latest_kind = stage_event.kind.clone();
-                            existing.end_event_id = Some(stage_event.id.clone());
-                            existing.duration_ms = stage_event
-                                .payload
-                                .get("duration_ms")
-                                .and_then(Value::as_i64)
-                                .or(existing.duration_ms);
+                    } else {
+                        if existing.end_payload.is_null() {
+                            existing.end_payload = result_payload.clone();
+                        }
+                        if existing.latest_payload.is_null() {
+                            existing.latest_payload = result_payload.clone();
+                        }
+                        if existing.completed_at.is_none() {
+                            if let Some(stage_event) = result_stage_event {
+                                existing.completed_at = Some(stage_event.created_at.clone());
+                                existing.latest_created_at = stage_event.created_at.clone();
+                                existing.latest_kind = stage_event.kind.clone();
+                                existing.end_event_id = Some(stage_event.id.clone());
+                                existing.duration_ms = stage_event
+                                    .payload
+                                    .get("duration_ms")
+                                    .and_then(Value::as_i64)
+                                    .or(existing.duration_ms);
+                            }
                         }
                     }
                     continue;
@@ -487,41 +528,43 @@ async fn build_event_chain_summary(
                     key: format!("{}-result-{}", stage_execution_id, result_key),
                     capability_id: format!("{}:result:{}", stage_execution_id, result_key),
                     name: result_name,
-                    status_color: if ok { "green" } else { "red" }.to_string(),
-                    status_label: if ok { "SUCCESS" } else { "ERROR" }.to_string(),
+                    status_color: if result_waiting_for_user { "yellow" } else if ok { "green" } else { "red" }.to_string(),
+                    status_label: if result_waiting_for_user { "WAITING" } else if ok { "SUCCESS" } else { "ERROR" }.to_string(),
                     message: result_message,
                     started_at: stage_event.map(|event| event.created_at.clone()),
-                    completed_at: stage_event.map(|event| event.created_at.clone()),
+                    completed_at: if result_waiting_for_user { None } else { stage_event.map(|event| event.created_at.clone()) },
                     duration_ms: None,
                     latest_created_at: stage_event.map(|event| event.created_at.clone()).unwrap_or_else(|| latest.created_at.clone()),
                     latest_kind: stage_event.map(|event| event.kind.clone()).unwrap_or_else(|| "capability_result".to_string()),
-                    latest_level: if ok { "info" } else { "error" }.to_string(),
-                    is_active: false,
+                    latest_level: if result_waiting_for_user { "warn" } else if ok { "info" } else { "error" }.to_string(),
+                    is_active: result_waiting_for_user,
                     event_count: 1 + idx,
                     start_event_id: stage_event.map(|event| event.id.clone()),
-                    end_event_id: stage_event.map(|event| event.id.clone()),
+                    end_event_id: if result_waiting_for_user { None } else { stage_event.map(|event| event.id.clone()) },
                     start_payload: Value::Null,
-                    end_payload: result_payload.clone(),
+                    end_payload: if result_waiting_for_user { Value::Null } else { result_payload.clone() },
                     latest_payload: result_payload,
                 });
             }
 
             if let Some(stage_event) = result_stage_event {
-                for capability in &mut capabilities {
-                    if !capability.is_active {
-                        continue;
+                if !event_indicates_operator_checkpoint_wait(stage_event) {
+                    for capability in &mut capabilities {
+                        if !capability.is_active {
+                            continue;
+                        }
+                        capability.is_active = false;
+                        capability.status_color = if capability.status_color == "red" { "red" } else { "green" }.to_string();
+                        capability.status_label = if capability.status_label == "ERROR" || capability.status_label == "FAILED" {
+                            capability.status_label.clone()
+                        } else {
+                            "SUCCESS".to_string()
+                        };
+                        capability.completed_at = Some(stage_event.created_at.clone());
+                        capability.latest_created_at = stage_event.created_at.clone();
+                        capability.latest_kind = stage_event.kind.clone();
+                        capability.latest_level = if capability.status_color == "red" { "error" } else { "info" }.to_string();
                     }
-                    capability.is_active = false;
-                    capability.status_color = if capability.status_color == "red" { "red" } else { "green" }.to_string();
-                    capability.status_label = if capability.status_label == "ERROR" || capability.status_label == "FAILED" {
-                        capability.status_label.clone()
-                    } else {
-                        "SUCCESS".to_string()
-                    };
-                    capability.completed_at = Some(stage_event.created_at.clone());
-                    capability.latest_created_at = stage_event.created_at.clone();
-                    capability.latest_kind = stage_event.kind.clone();
-                    capability.latest_level = if capability.status_color == "red" { "error" } else { "info" }.to_string();
                 }
             }
 
