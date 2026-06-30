@@ -77,6 +77,12 @@ function stripGitPrefix(path: string): string {
   return path.replace(/^a\//, '').replace(/^b\//, '');
 }
 
+function basenameForPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
 function pathFromDiffGit(line: string): { oldPath: string; newPath: string; path: string } {
   const match = line.match(/^diff --git\s+a\/(.*?)\s+b\/(.*)$/);
   const oldPath = match?.[1] ?? '';
@@ -478,19 +484,21 @@ function FileHeaderRow(props: {
   sticky?: boolean;
 }) {
   const { row, onToggleFile, sticky = false } = props;
+  const basename = basenameForPath(row.path);
 
   return (
     <Box
-      px={6}
+      px={10}
       style={{
-        height: ROW_HEIGHT,
-        display: 'flex',
+        height: Math.max(30, ROW_HEIGHT),
+        display: 'grid',
+        gridTemplateColumns: onToggleFile ? '28px minmax(0, 1fr) auto auto' : 'minmax(0, 1fr) auto auto',
         alignItems: 'center',
         gap: 8,
-        background: sticky ? 'rgba(32, 32, 32, 0.98)' : 'rgba(255,255,255,0.055)',
-        borderTop: sticky ? '0' : '1px solid rgba(255,255,255,0.08)',
-        borderBottom: '1px solid rgba(255,255,255,0.12)',
-        boxShadow: sticky ? '0 1px 6px rgba(0,0,0,0.35)' : undefined,
+        background: sticky ? 'rgba(20, 24, 30, 0.98)' : 'linear-gradient(90deg, rgba(34, 139, 230, 0.22), rgba(255,255,255,0.075))',
+        borderTop: sticky ? '0' : '1px solid rgba(116, 192, 252, 0.28)',
+        borderBottom: '1px solid rgba(116, 192, 252, 0.35)',
+        boxShadow: sticky ? '0 1px 10px rgba(0,0,0,0.45)' : 'inset 3px 0 0 rgba(116, 192, 252, 0.85)',
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
         fontSize: 12,
         overflow: 'hidden',
@@ -499,16 +507,24 @@ function FileHeaderRow(props: {
       {onToggleFile ? (
         <Button
           size="compact-xs"
-          variant="subtle"
+          variant={row.collapsed ? 'light' : 'subtle'}
           onClick={() => onToggleFile(row.path)}
-          style={{ height: 16, minHeight: 16, paddingInline: 4 }}
+          aria-label={row.collapsed ? `Expand ${row.path}` : `Collapse ${row.path}`}
+          style={{ height: 22, minHeight: 22, width: 26, paddingInline: 0, fontSize: 15, fontWeight: 900 }}
         >
-          {row.collapsed ? 'Expand' : 'Collapse'}
+          {row.collapsed ? '▸' : '▾'}
         </Button>
       ) : null}
-      <Text size="xs" fw={700} truncate style={{ flex: 1 }}>{row.path}</Text>
-      <Text size="xs" c="green">+{row.additions}</Text>
-      <Text size="xs" c="red">-{row.deletions}</Text>
+      <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+        <Text size="sm" fw={900} truncate style={{ maxWidth: '42%', color: 'var(--mantine-color-blue-1)', letterSpacing: 0.2 }}>
+          {basename}
+        </Text>
+        <Text size="sm" c="dimmed" fw={700} truncate style={{ flex: 1 }}>
+          {row.path}
+        </Text>
+      </Group>
+      <Badge size="xs" color="green" variant="light">+{row.additions}</Badge>
+      <Badge size="xs" color="red" variant="light">-{row.deletions}</Badge>
     </Box>
   );
 }

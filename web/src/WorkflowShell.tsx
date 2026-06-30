@@ -2383,7 +2383,12 @@ export function WorkflowShell(props: {
       ? `Workflow · ${runTitle}`
       : `Workflow · ${tabTitle} · ${runTitle}`;
   }, [monitorView, selectedRun, activeWorkspaceTab]);
-  const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting' || selectedRun?.status === 'draft' || selectedRun?.status === 'success';
+  const isInteractiveMode = selectedRun?.status === 'paused'
+    || selectedRun?.status === 'waiting'
+    || selectedRun?.status === 'draft'
+    || selectedRun?.status === 'success'
+    || selectedRun?.status === 'error'
+    || selectedRun?.status === 'cancelled';
   const isManualMode = isInteractiveMode;
   const isBackendRunLocked = Boolean(
     busy
@@ -3705,13 +3710,12 @@ export function WorkflowShell(props: {
     return event.kind === 'operator_checkpoint_waiting'
       || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
       || event.kind === 'workflow_waiting_for_operator_checkpoint'
-      || event.kind.endsWith('_waiting')
       || (capability === 'operator_checkpoint' && payloadIndicatesUserWait(event.payload));
   }
 
   function deriveCapabilityStatusLabel(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
-    if (eventIndicatesOperatorCheckpointWait(event)) return 'WAITING';
+    if (eventIndicatesOperatorCheckpointWait(event)) return 'USER INPUT';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'FAILED';
     if (event.kind.endsWith('_completed')) return 'COMPLETE';
     if (event.kind.endsWith('_started')) return 'RUNNING';
@@ -3976,7 +3980,7 @@ export function WorkflowShell(props: {
       if (existing) {
         const resultClosesCapability = existing.outputPayload == null && !resultWaitingForUser;
         existing.statusColor = resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red';
-        existing.statusLabel = resultWaitingForUser ? 'WAITING' : ok ? 'SUCCESS' : 'ERROR';
+        existing.statusLabel = resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR';
         existing.isActive = resultWaitingForUser;
         existing.outputPayload = resultWaitingForUser ? existing.outputPayload : existing.outputPayload ?? resultPayload;
         existing.latestPayload = resultPayload ?? existing.latestPayload;
@@ -3996,7 +4000,7 @@ export function WorkflowShell(props: {
         capabilityId,
         name: resultLabel,
         statusColor: resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red',
-        statusLabel: resultWaitingForUser ? 'WAITING' : ok ? 'SUCCESS' : 'ERROR',
+        statusLabel: resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR',
         message: capabilityDisplayMessageFromPayload(resultPayload, resultLabel),
         startedAtText: resultStageEvent ? formatTimestamp(resultStageEvent.created_at) : '—',
         startedAtRaw: resultStageEvent?.created_at ?? null,

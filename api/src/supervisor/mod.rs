@@ -18,15 +18,19 @@ use crate::{
         extract_inference_text, normalize_refined_feature_plan_item, ExecutionPlanItem,
         FeaturePlanItem, FeaturePlanItemStatus,
     },
-    models::{RunStatus, WorkflowRun},
+    models::{RunStatus, SprintEventStreamItem, WorkflowRun},
 };
-use models::{CreateSupervisorRunRequest, EnsureSupervisorPlannerRequest, EnsureSupervisorPlannerResponse, SupervisorActionRequest, SupervisorChildRun, SupervisorExecutionStrategy, SupervisorRun, SupervisorStatus};
+use models::{CreateSupervisorRunRequest, EnsureSupervisorPlannerRequest, EnsureSupervisorPlannerResponse, SupervisorActionRequest, SupervisorExecutionStrategy, SupervisorFeatureWorkflow, SupervisorRun, SupervisorStatus};
 
 pub async fn list_supervisor_runs(state: &AppState) -> Result<Vec<SupervisorRun>> {
     let rows = sqlx::query("SELECT * FROM supervisor_runs ORDER BY updated_at DESC")
         .fetch_all(&state.db)
         .await?;
-    rows.into_iter().map(row_to_supervisor_run).collect()
+    let mut runs = rows.into_iter().map(row_to_supervisor_run).collect::<Result<Vec<_>>>()?;
+    for run in &mut runs {
+        hydrate_supervisor_feature_workflows(state, run).await?;
+    }
+    Ok(runs)
 }
 
 pub async fn load_supervisor_run(state: &AppState, id: Uuid) -> Result<SupervisorRun> {
@@ -34,26 +38,16 @@ pub async fn load_supervisor_run(state: &AppState, id: Uuid) -> Result<Superviso
         .bind(id.to_string())
         .fetch_one(&state.db)
         .await?;
-    row_to_supervisor_run(row)
+    let mut run = row_to_supervisor_run(row)?;
+    hydrate_supervisor_feature_workflows(state, &mut run).await?;
+    Ok(run)
 }
 
 pub async fn load_supervisor_run_reconciled(state: &AppState, id: Uuid) -> Result<SupervisorRun> {
-    let run = load_supervisor_run(state, id).await?;
-    if matches!(run.status, SupervisorStatus::RunningChildren | SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating) {
-        let _ = tick_supervisor_run(state, id).await?;
-        load_supervisor_run(state, id).await
-    } else {
-        Ok(run)
-    }
+    load_supervisor_run(state, id).await
 }
 
 pub async fn list_supervisor_runs_reconciled(state: &AppState) -> Result<Vec<SupervisorRun>> {
-    let runs = list_supervisor_runs(state).await?;
-    for run in &runs {
-        if matches!(run.status, SupervisorStatus::RunningChildren | SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating) {
-            let _ = tick_supervisor_run(state, run.id).await;
-        }
-    }
     list_supervisor_runs(state).await
 }
 
@@ -83,7 +77,7 @@ pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunReq
         integration_path: None,
         feature_plan_items: req.feature_plan_items,
         execution_plan_items,
-        child_runs: Vec::new(),
+        feature_workflows: Vec::new(),
         integration_run_id: None,
         final_patch_path: None,
         merge_report: json!({}),
@@ -165,7 +159,7 @@ fn is_repo_planner_run(run: &SupervisorRun) -> bool {
         .get("planner_kind")
         .and_then(Value::as_str)
         .map(|value| value == "repo_root")
-        .unwrap_or_else(|| run.child_runs.is_empty() && run.integration_run_id.is_none() && run.final_patch_path.is_none())
+        .unwrap_or_else(|| run.integration_run_id.is_none() && run.final_patch_path.is_none())
 }
 
 fn planner_repo_key(root: &str) -> String {
@@ -227,12 +221,8 @@ async fn load_repo_feature_plan_items(state: &AppState, root: &str) -> Result<Ve
 async fn save_repo_feature_plan_items(state: &AppState, root: &str, items: &[FeaturePlanItem]) -> Result<()> {
     let repo_id = ensure_planner_repo_id(state, root).await?;
     let now = Utc::now().to_rfc3339();
-    sqlx::query("DELETE FROM planner_features WHERE repo_id = ?")
-        .bind(&repo_id)
-        .execute(&state.db)
-        .await?;
     for (index, item) in items.iter().enumerate() {
-        sqlx::query("INSERT INTO planner_features (id, repo_id, title, status, sort_order, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO planner_features (id, repo_id, title, status, sort_order, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, sort_order = excluded.sort_order, payload_json = excluded.payload_json, updated_at = excluded.updated_at")
             .bind(&item.id)
             .bind(&repo_id)
             .bind(&item.title)
@@ -244,6 +234,11 @@ async fn save_repo_feature_plan_items(state: &AppState, root: &str, items: &[Fea
             .execute(&state.db)
             .await?;
     }
+    sqlx::query("DELETE FROM planner_features WHERE repo_id = ? AND id NOT IN (SELECT value FROM json_each(?))")
+        .bind(&repo_id)
+        .bind(serde_json::to_string(&items.iter().map(|item| item.id.clone()).collect::<Vec<_>>())?)
+        .execute(&state.db)
+        .await?;
     sqlx::query("UPDATE planner_repos SET updated_at = ? WHERE id = ?")
         .bind(&now)
         .bind(&repo_id)
@@ -285,7 +280,7 @@ async fn upsert_sprint_record(state: &AppState, run: &SupervisorRun, sprint_id: 
             "integration_path": run.integration_path,
             "integration_run_id": run.integration_run_id,
             "final_patch_path": run.final_patch_path,
-            "child_runs": run.child_runs
+            "execution_source": "sprint_features"
         }))?)
         .execute(&state.db)
         .await?;
@@ -295,52 +290,126 @@ async fn upsert_sprint_record(state: &AppState, run: &SupervisorRun, sprint_id: 
 async fn save_sprint_features(state: &AppState, run: &SupervisorRun, sprint_id: &str, completed_at: Option<&str>) -> Result<()> {
     save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
     let now = Utc::now().to_rfc3339();
-    sqlx::query("DELETE FROM sprint_features WHERE sprint_id = ?")
-        .bind(sprint_id)
-        .execute(&state.db)
-        .await?;
+    let scheduled_feature_ids = run
+        .execution_plan_items
+        .iter()
+        .map(|item| item.feature_plan_item_id.clone())
+        .collect::<Vec<_>>();
+
     for (index, execution_item) in run.execution_plan_items.iter().enumerate() {
-        let status = run
+        let planned_status = run
             .feature_plan_items
             .iter()
             .find(|item| item.id == execution_item.feature_plan_item_id)
-            .map(|item| serde_json::to_value(&item.status).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_else(|| "planned".to_string()))
-            .unwrap_or_else(|| "planned".to_string());
-        sqlx::query("INSERT INTO sprint_features (id, sprint_id, feature_id, status, completed_at, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .map(|item| serde_json::to_value(&item.status).ok().and_then(|value| value.as_str().map(str::to_string)).unwrap_or_else(|| "scheduled".to_string()))
+            .unwrap_or_else(|| "scheduled".to_string());
+
+        sqlx::query("INSERT INTO sprint_features (id, sprint_id, feature_id, supervisor_run_id, status, completed_at, sort_order, development_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sprint_id, feature_id) DO UPDATE SET supervisor_run_id = excluded.supervisor_run_id, sort_order = excluded.sort_order, status = CASE WHEN sprint_features.status IN ('development_queued', 'development_running', 'completed', 'integrated', 'applied', 'error', 'cancelled') THEN sprint_features.status ELSE excluded.status END, development_state = CASE WHEN sprint_features.development_state IN ('development_queued', 'development_running', 'development_succeeded', 'development_failed', 'integration_running', 'integrated', 'applied') THEN sprint_features.development_state ELSE excluded.development_state END, completed_at = COALESCE(sprint_features.completed_at, excluded.completed_at), updated_at = excluded.updated_at")
             .bind(Uuid::new_v4().to_string())
             .bind(sprint_id)
             .bind(&execution_item.feature_plan_item_id)
-            .bind(status)
+            .bind(run.id.to_string())
+            .bind(planned_status)
             .bind(completed_at)
             .bind(index as i64)
+            .bind("scheduled")
             .bind(&now)
             .bind(&now)
             .execute(&state.db)
             .await?;
     }
+
+    sqlx::query("UPDATE sprint_features SET status = 'unscheduled', development_state = CASE WHEN development_state IN ('development_queued', 'development_running', 'development_succeeded', 'integration_running', 'integrated', 'applied') THEN development_state ELSE 'unscheduled' END, updated_at = ? WHERE sprint_id = ? AND feature_id NOT IN (SELECT value FROM json_each(?))")
+        .bind(&now)
+        .bind(sprint_id)
+        .bind(serde_json::to_string(&scheduled_feature_ids)?)
+        .execute(&state.db)
+        .await?;
+
     Ok(())
 }
 
-async fn append_sprint_event(state: &AppState, sprint_id: &str, event_type: &str, event_time: &str, feature_id: Option<&str>, message: &str, payload: Value) -> Result<()> {
-    let sequence_no = sqlx::query("SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_sequence_no FROM sprint_events WHERE sprint_id = ?")
-        .bind(sprint_id)
-        .fetch_one(&state.db)
-        .await?
-        .get::<i64, _>("next_sequence_no");
-    sqlx::query("INSERT INTO sprint_events (id, sprint_id, sequence_no, event_type, event_time, feature_id, actor, message, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(Uuid::new_v4().to_string())
-        .bind(sprint_id)
-        .bind(sequence_no)
-        .bind(event_type)
-        .bind(event_time)
+async fn clear_planner_feature_development_for_restart(state: &AppState, root: &str, feature_id: &str) -> Result<()> {
+    let repo_id = ensure_planner_repo_id(state, root).await?;
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE planner_features SET current_sprint_id = NULL, current_supervisor_run_id = NULL, current_workflow_run_id = NULL, current_patch_id = NULL, development_state = 'deleted_for_restart', unscheduled_at = ?, restarted_at = ?, updated_at = ? WHERE repo_id = ? AND id = ?")
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&repo_id)
         .bind(feature_id)
-        .bind("system")
-        .bind(message)
-        .bind(serde_json::to_string(&payload)?)
-        .bind(Utc::now().to_rfc3339())
         .execute(&state.db)
         .await?;
     Ok(())
+}
+
+async fn mark_planner_feature_preserved(state: &AppState, root: &str, feature_id: &str) -> Result<()> {
+    let repo_id = ensure_planner_repo_id(state, root).await?;
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE planner_features SET development_state = CASE WHEN current_workflow_run_id IS NULL THEN 'unscheduled' ELSE 'preserved' END, unscheduled_at = ?, updated_at = ? WHERE repo_id = ? AND id = ?")
+        .bind(&now)
+        .bind(&now)
+        .bind(&repo_id)
+        .bind(feature_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+async fn append_sprint_event(state: &AppState, sprint_id: &str, event_type: &str, event_time: &str, feature_id: Option<&str>, message: &str, payload: Value) -> Result<SprintEventStreamItem> {
+    let payload_json = serde_json::to_string(&payload)?;
+    let mut last_error = None;
+
+    for _ in 0..16 {
+        let sequence_no = sqlx::query("SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_sequence_no FROM sprint_events WHERE sprint_id = ?")
+            .bind(sprint_id)
+            .fetch_one(&state.db)
+            .await?
+            .get::<i64, _>("next_sequence_no");
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+
+        let inserted = sqlx::query("INSERT INTO sprint_events (id, sprint_id, sequence_no, event_type, event_time, feature_id, actor, message, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&id)
+            .bind(sprint_id)
+            .bind(sequence_no)
+            .bind(event_type)
+            .bind(event_time)
+            .bind(feature_id)
+            .bind("system")
+            .bind(message)
+            .bind(&payload_json)
+            .bind(&created_at)
+            .execute(&state.db)
+            .await;
+
+        match inserted {
+            Ok(_) => {
+                let event = SprintEventStreamItem {
+                    id,
+                    sprint_id: sprint_id.to_string(),
+                    sequence_no,
+                    event_type: event_type.to_string(),
+                    event_time: event_time.to_string(),
+                    feature_id: feature_id.map(str::to_string),
+                    actor: "system".to_string(),
+                    message: message.to_string(),
+                    payload,
+                    created_at,
+                };
+                state.publish_sprint_event(event.clone());
+                return Ok(event);
+            }
+            Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("2067") => {
+                last_error = Some(sqlx::Error::Database(err));
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| sqlx::Error::RowNotFound).into())
 }
 
 fn import_string(value: Option<&Value>) -> String {
@@ -746,8 +815,107 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
     }
     run.feature_plan_items = planner_items;
     run.execution_plan_items = sprint_items;
+    save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
+    if let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string) {
+        save_sprint_features(state, &run, &sprint_id, None).await?;
+    }
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
+
+pub async fn unschedule_supervisor_feature(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    let feature_id = payload
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("feature_id is required"))?
+        .to_string();
+    let mode = payload
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("preserve_development");
+
+    let feature_index = run
+        .feature_plan_items
+        .iter()
+        .position(|item| item.id == feature_id)
+        .ok_or_else(|| anyhow!("feature {} is not present in the planner log", feature_id))?;
+
+    if mode == "delete_development" && matches!(run.feature_plan_items[feature_index].status, FeaturePlanItemStatus::Applied) {
+        return Err(anyhow!("applied features cannot delete development without a revert flow"));
+    }
+
+    run.execution_plan_items = run
+        .execution_plan_items
+        .into_iter()
+        .filter(|item| item.feature_plan_item_id != feature_id)
+        .enumerate()
+        .map(|(index, mut item)| {
+            item.order_index = Some(index as i64);
+            item
+        })
+        .collect();
+
+    let sprint_id = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string);
+    let mut had_child = false;
+
+    match mode {
+        "preserve_development" => {}
+        "delete_development" => {
+            if let Some(sprint_id) = sprint_id.as_deref() {
+                if let Some(row) = sqlx::query("SELECT current_workflow_run_id, shard_path FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+                    .bind(sprint_id)
+                    .bind(&feature_id)
+                    .fetch_optional(&state.db)
+                    .await?
+                {
+                    had_child = true;
+                    if let Ok(workflow_run_id_text) = row.try_get::<String, _>("current_workflow_run_id") {
+                        if let Ok(workflow_run_id) = Uuid::parse_str(&workflow_run_id_text) {
+                            delete_supervisor_workflow_run_records(state, workflow_run_id).await?;
+                        }
+                    }
+                    if let Ok(shard_path) = row.try_get::<String, _>("shard_path") {
+                        let path = PathBuf::from(shard_path);
+                        if path.exists() {
+                            if path.is_dir() {
+                                fs::remove_dir_all(&path).with_context(|| format!("failed to delete stale shard {}", path.display()))?;
+                            } else {
+                                fs::remove_file(&path).with_context(|| format!("failed to delete stale shard file {}", path.display()))?;
+                            }
+                        }
+                    }
+                    invalidate_supervisor_integration(state, &mut run).await?;
+                }
+            }
+        }
+        other => return Err(anyhow!("unsupported unschedule mode {}", other)),
+    }
+
+    if let Some(feature) = run.feature_plan_items.get_mut(feature_index) {
+        if mode == "delete_development" {
+            feature.status = FeaturePlanItemStatus::Fine;
+        } else if matches!(feature.status, FeaturePlanItemStatus::Scheduled) {
+            feature.status = FeaturePlanItemStatus::Fine;
+        }
+    }
+
+    if let Some(obj) = run.context.as_object_mut() {
+        obj.insert("last_unscheduled_feature_id".to_string(), Value::String(feature_id.clone()));
+        obj.insert("last_unschedule_mode".to_string(), Value::String(mode.to_string()));
+        obj.insert("last_unschedule_had_child_workflow".to_string(), Value::Bool(had_child));
+        obj.insert("last_unscheduled_at".to_string(), Value::String(Utc::now().to_rfc3339()));
+    }
+
     reconcile_development_runtime(state, &mut run).await?;
     save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
+    match mode {
+        "preserve_development" => mark_planner_feature_preserved(state, &run.root_repo_path, &feature_id).await?,
+        "delete_development" => clear_planner_feature_development_for_restart(state, &run.root_repo_path, &feature_id).await?,
+        _ => {}
+    }
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
@@ -918,10 +1086,12 @@ pub async fn restart_current_supervisor_sprint(state: &AppState, id: Uuid) -> Re
         return Err(anyhow!("applied sprints cannot be restarted; start the next sprint instead"));
     }
 
-    let mut workflow_run_ids = run.child_runs
-        .iter()
-        .filter_map(|child| child.workflow_run_id)
-        .collect::<Vec<_>>();
+    let sprint_id = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string);
+    let mut workflow_run_ids = if let Some(sprint_id) = sprint_id.as_deref() {
+        sprint_feature_workflow_ids(state, sprint_id).await?
+    } else {
+        Vec::new()
+    };
     if let Some(integration_run_id) = run.integration_run_id {
         workflow_run_ids.push(integration_run_id);
     }
@@ -938,7 +1108,6 @@ pub async fn restart_current_supervisor_sprint(state: &AppState, id: Uuid) -> Re
         }
     }
 
-    run.child_runs.clear();
     run.integration_run_id = None;
     run.final_patch_path = None;
     run.merge_report = json!({});
@@ -963,7 +1132,6 @@ pub async fn start_next_supervisor_sprint(state: &AppState, id: Uuid) -> Result<
         return Err(anyhow!("current sprint must be completed, ready, failed, or cancelled before starting another sprint"));
     }
     run.execution_plan_items.clear();
-    run.child_runs.clear();
     run.integration_run_id = None;
     run.final_patch_path = None;
     run.merge_report = json!({});
@@ -1007,7 +1175,7 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
 
     if supervisor_start_is_idempotent(&run.status) {
         if matches!(run.status, SupervisorStatus::RunningChildren | SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating) {
-            let _ = tick_supervisor_run(state, id).await?;
+            let _ = advance_supervisor_run(state, id).await?;
         }
         let run = load_supervisor_run(state, id).await?;
         return Ok(json!({
@@ -1042,8 +1210,18 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
     upsert_sprint_record(state, &run, &sprint_id, &sprint_key, &format!("Sprint {}", sprint_key), "running", Some(&sprint_started_at), None).await?;
     save_sprint_features(state, &run, &sprint_id, None).await?;
     append_sprint_event(state, &sprint_id, "sprint_started", &sprint_started_at, None, "sprint started", json!({ "sprint_key": sprint_key })).await?;
-    let workspace = repo_snapshot::create_workspace(&run.root_repo_path, run.id, &scheduled_items)?;
-    patches::create_baseline(&workspace.snapshot)?;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+
+    let workspace = match repo_snapshot::create_workspace(&run.root_repo_path, run.id, &scheduled_items) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            run.status = SupervisorStatus::Failed;
+            run.updated_at = Utc::now();
+            update_supervisor_run(state, &run).await?;
+            return Err(err);
+        }
+    };
     patches::create_baseline(&workspace.integration)?;
     let workflow_template_id = context_uuid(&run.context, "workflow_template_id");
     let integration_template_id = match run.strategy {
@@ -1051,7 +1229,6 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
         SupervisorExecutionStrategy::Series => None,
     };
 
-    let mut children = Vec::new();
     for item in &scheduled_items {
         let shard = repo_snapshot::shard_path(&workspace, &item.id);
         patches::create_baseline(&shard)?;
@@ -1061,24 +1238,23 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
             .find(|execution_item| execution_item.feature_plan_item_id == item.id)
             .and_then(|execution_item| execution_item.workflow_template_id)
             .or(workflow_template_id);
-        let child_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
+        let workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
             state,
             item,
             &shard_path,
             template_id,
             supervisor_context(&run, &workspace),
         ).await?;
-        let child_status = "draft".to_string();
-        children.push(SupervisorChildRun {
-            execution_item_id: item.id.clone(),
-            title: item.title.clone(),
-            shard_path,
-            workflow_run_id: Some(child_run_id),
-            status: child_status,
-            patch_path: None,
-        });
+        sqlx::query("UPDATE sprint_features SET supervisor_run_id = ?, current_workflow_run_id = ?, shard_path = ?, status = 'scheduled', development_state = 'scheduled', updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
+            .bind(run.id.to_string())
+            .bind(workflow_run_id.to_string())
+            .bind(&shard_path)
+            .bind(Utc::now().to_rfc3339())
+            .bind(&sprint_id)
+            .bind(&item.id)
+            .execute(&state.db)
+            .await?;
     }
-    run.child_runs = children;
     run.status = SupervisorStatus::RunningChildren;
 
     if matches!(run.strategy, SupervisorExecutionStrategy::Parallel) {
@@ -1089,7 +1265,7 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
         }
     }
 
-    run.snapshot_path = Some(workspace.snapshot.to_string_lossy().to_string());
+    run.snapshot_path = None;
     run.integration_path = Some(workspace.integration.to_string_lossy().to_string());
     save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
     run.updated_at = Utc::now();
@@ -1128,14 +1304,6 @@ fn workflow_terminal_event_message(status: &RunStatus) -> &'static str {
     }
 }
 
-fn supervisor_child_success(child: &SupervisorChildRun) -> bool {
-    child.status == "success"
-}
-
-fn supervisor_child_terminal_failure(child: &SupervisorChildRun) -> bool {
-    child.status == "error" || child.status == "cancelled"
-}
-
 pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: Uuid, status: RunStatus, current_step_id: Option<&str>) -> Result<()> {
     let workflow_run = engine::load_run(state, workflow_run_id).await?;
     let supervisor_context = workflow_run.context.get("supervisor").cloned().unwrap_or_else(|| json!({}));
@@ -1167,32 +1335,27 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
         let sprint_id = supervisor_context_string(&supervisor_context, "sprint_id")
             .or_else(|| run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string));
         let feature_id = supervisor_context_string(&supervisor_context, "feature_id");
-        let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-
-        if let Some(child) = run.child_runs.iter_mut().find(|child| child.workflow_run_id == Some(workflow_run_id)) {
-            child.status = status_str(&status).to_string();
-            if matches!(status, RunStatus::Success) && child.patch_path.is_none() {
-                let patch_path = patches::patch_path(&workspace.patches, &child.execution_item_id);
-                patches::generate_patch(&PathBuf::from(&child.shard_path), &patch_path)?;
-                child.patch_path = Some(patch_path.to_string_lossy().to_string());
-            }
-        }
-
-        if matches!(status, RunStatus::Success) {
-            if let Some(feature_id) = feature_id.as_deref() {
-                if let Some(item) = run.feature_plan_items.iter_mut().find(|item| item.id == feature_id) {
-                    item.status = FeaturePlanItemStatus::Completed;
+        if let Some(feature_id) = feature_id.as_deref() {
+            match status {
+                RunStatus::Success => {
+                    if let Some(item) = run.feature_plan_items.iter_mut().find(|item| item.id == feature_id) {
+                        item.status = FeaturePlanItemStatus::Completed;
+                    }
+                    if let Some(sprint_id) = sprint_id.as_deref() {
+                        update_sprint_feature_workflow_state(state, sprint_id, feature_id, Some(workflow_run_id), "completed", "development_succeeded", current_step_id, None).await?;
+                    }
                 }
-                if let Some(sprint_id) = sprint_id.as_deref() {
-                    sqlx::query("UPDATE sprint_features SET status = ?, completed_at = ?, updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
-                        .bind("completed")
-                        .bind(&now)
-                        .bind(&now)
-                        .bind(sprint_id)
-                        .bind(feature_id)
-                        .execute(&state.db)
-                        .await?;
+                RunStatus::Error => {
+                    if let Some(sprint_id) = sprint_id.as_deref() {
+                        update_sprint_feature_workflow_state(state, sprint_id, feature_id, Some(workflow_run_id), "error", "development_failed", current_step_id, Some("workflow failed")).await?;
+                    }
                 }
+                RunStatus::Cancelled => {
+                    if let Some(sprint_id) = sprint_id.as_deref() {
+                        update_sprint_feature_workflow_state(state, sprint_id, feature_id, Some(workflow_run_id), "cancelled", "development_failed", current_step_id, Some("workflow cancelled")).await?;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1212,11 +1375,12 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
             ).await?;
         }
 
-        if run.child_runs.iter().any(supervisor_child_terminal_failure) {
-            run.status = SupervisorStatus::Failed;
-        } else if !run.child_runs.is_empty() && run.child_runs.iter().all(supervisor_child_success) {
-            run.status = SupervisorStatus::DevelopmentComplete;
-            if let Some(sprint_id) = sprint_id.as_deref() {
+        if let Some(sprint_id) = sprint_id.as_deref() {
+            let (total, succeeded, failed) = sprint_development_terminal_counts(state, sprint_id).await?;
+            if failed > 0 {
+                run.status = SupervisorStatus::Failed;
+            } else if total > 0 && succeeded >= total {
+                run.status = SupervisorStatus::DevelopmentComplete;
                 sqlx::query("UPDATE sprints SET status = ?, development_completed_at = COALESCE(development_completed_at, ?), updated_at = ? WHERE id = ?")
                     .bind("development_complete")
                     .bind(&now)
@@ -1233,20 +1397,21 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
                     "all feature workflows completed",
                     json!({
                         "supervisor_run_id": run.id,
-                        "child_runs": run.child_runs,
+                        "execution_source": "sprint_features",
                         "integration_policy": supervisor_integration_policy(&run)
                     }),
                 ).await?;
+                if supervisor_integration_policy(&run) == "auto" {
+                    spawn_live_integration_workflow(state, &mut run).await?;
+                }
+            } else {
+                start_next_series_child(state, &mut run).await?;
             }
-            if supervisor_integration_policy(&run) == "auto" {
-                spawn_live_integration_workflow(state, &mut run).await?;
-            }
-        } else {
-            start_next_series_child(state, &mut run).await?;
         }
 
         run.updated_at = Utc::now();
         update_supervisor_run(state, &run).await?;
+        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow terminal event processed").await?;
         return Ok(());
     }
 
@@ -1280,48 +1445,167 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
         }
         run.updated_at = Utc::now();
         update_supervisor_run(state, &run).await?;
+        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow terminal event processed").await?;
     }
 
     Ok(())
 }
 
+fn payload_feature_id(payload: &Value) -> Result<String> {
+    payload
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("feature_id is required"))
+}
+
+async fn supervisor_child_workflow_row(
+    state: &AppState,
+    sprint_id: &str,
+    feature_id: &str,
+) -> Result<(String, Uuid, String)> {
+    let row = sqlx::query(
+        "SELECT feature_id, current_workflow_run_id, development_state
+         FROM sprint_features
+         WHERE sprint_id = ? AND feature_id = ?",
+    )
+    .bind(sprint_id)
+    .bind(feature_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("feature workflow is missing"))?;
+
+    let feature_id: String = row.get("feature_id");
+    let workflow_run_id_text: String = row
+        .try_get::<Option<String>, _>("current_workflow_run_id")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("feature workflow run is missing"))?;
+    let development_state: String = row.get("development_state");
+    let workflow_run_id = Uuid::parse_str(&workflow_run_id_text)?;
+
+    Ok((feature_id, workflow_run_id, development_state))
+}
+
+pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    let feature_id = payload_feature_id(&payload)?;
+    let sprint_id = current_sprint_id(&run).await?;
+
+    refresh_supervisor_child_run_statuses(state, &mut run).await?;
+    let (feature_id, workflow_run_id, _development_state) = supervisor_child_workflow_row(state, &sprint_id, &feature_id).await?;
+    let child_run = engine::load_run(state, workflow_run_id).await?;
+
+    if matches!(child_run.status, RunStatus::Queued | RunStatus::Running | RunStatus::Waiting) {
+        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow already running").await?;
+        return Ok(json!({
+            "ok": true,
+            "started": false,
+            "reason": "already_running",
+            "workflow_run_id": workflow_run_id,
+            "supervisor_run": run
+        }));
+    }
+
+    sqlx::query(
+        "UPDATE sprint_features
+         SET status = 'scheduled',
+             development_state = 'scheduled',
+             last_error = NULL,
+             updated_at = ?
+         WHERE sprint_id = ?
+           AND feature_id = ?
+           AND development_state NOT IN ('development_succeeded', 'integrated', 'applied')",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&sprint_id)
+    .bind(&feature_id)
+    .execute(&state.db)
+    .await?;
+
+    run.status = SupervisorStatus::RunningChildren;
+    start_next_series_child(state, &mut run).await?;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow start requested").await?;
+
+    Ok(json!({
+        "ok": true,
+        "workflow_run_id": workflow_run_id,
+        "supervisor_run": run
+    }))
+}
+
+pub async fn pause_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let run = load_supervisor_run(state, id).await?;
+    let feature_id = payload_feature_id(&payload)?;
+    let sprint_id = current_sprint_id(&run).await?;
+    let (feature_id, workflow_run_id, _development_state) = supervisor_child_workflow_row(state, &sprint_id, &feature_id).await?;
+
+    let result = engine::pause_run(state, workflow_run_id).await?;
+    update_sprint_feature_workflow_state(
+        state,
+        &sprint_id,
+        &feature_id,
+        Some(workflow_run_id),
+        "scheduled",
+        "scheduled",
+        None,
+        None,
+    )
+    .await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow pause requested").await?;
+
+    Ok(json!({
+        "ok": true,
+        "workflow_run_id": workflow_run_id,
+        "pause_result": result,
+        "supervisor_run": run
+    }))
+}
+
 pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
-    let execution_item_id = payload
-        .get("execution_item_id")
+    let feature_id = payload
+        .get("feature_id")
         .and_then(Value::as_str)
-        .map(str::to_string);
-    let workflow_run_id = payload
-        .get("workflow_run_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("feature_id is required"))?;
+    let sprint_id = current_sprint_id(&run).await?;
 
-    let child_index = run
-        .child_runs
-        .iter()
-        .position(|child| {
-            execution_item_id
-                .as_deref()
-                .map(|value| child.execution_item_id == value)
-                .unwrap_or(false)
-                || workflow_run_id
-                    .map(|value| child.workflow_run_id == Some(value))
-                    .unwrap_or(false)
-        })
-        .ok_or_else(|| anyhow!("child workflow is missing"))?;
+    let row = sqlx::query("SELECT feature_id, current_workflow_run_id, shard_path FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+        .bind(&sprint_id)
+        .bind(&feature_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| anyhow!("feature workflow is missing"))?;
 
-    let execution_item_id = run.child_runs[child_index].execution_item_id.clone();
-    let old_workflow_run_id = run.child_runs[child_index].workflow_run_id;
-    let old_patch_path = run.child_runs[child_index].patch_path.clone();
-    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-
-    if let Some(old_workflow_run_id) = old_workflow_run_id {
-        delete_supervisor_workflow_run_records(state, old_workflow_run_id).await?;
+    let execution_item_id: String = row.get("feature_id");
+    let workflow_run_id_text = row
+        .try_get::<Option<String>, _>("current_workflow_run_id")
+        .ok()
+        .flatten();
+    if let Some(workflow_run_id_text) = workflow_run_id_text {
+        if let Ok(workflow_run_id) = Uuid::parse_str(&workflow_run_id_text) {
+            delete_supervisor_workflow_run_records(state, workflow_run_id).await?;
+        }
     }
-    if let Some(old_patch_path) = old_patch_path {
-        let path = PathBuf::from(old_patch_path);
+
+    let old_shard_path = row
+        .try_get::<Option<String>, _>("shard_path")
+        .ok()
+        .flatten();
+    if let Some(old_shard_path) = old_shard_path {
+        let path = PathBuf::from(old_shard_path);
         if path.exists() {
-            let _ = fs::remove_file(path);
+            if path.is_dir() {
+                fs::remove_dir_all(&path).with_context(|| format!("failed to delete stale shard {}", path.display()))?;
+            } else {
+                fs::remove_file(&path).with_context(|| format!("failed to delete stale shard file {}", path.display()))?;
+            }
         }
     }
 
@@ -1333,6 +1617,7 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
     run.merge_report = json!({});
     run.validation_report = json!({});
 
+    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
     let feature = run
         .feature_plan_items
         .iter()
@@ -1345,11 +1630,9 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         .find(|item| item.feature_plan_item_id == execution_item_id)
         .and_then(|item| item.workflow_template_id)
         .or_else(|| context_uuid(&run.context, "workflow_template_id"));
-    let shard_path = if run.child_runs[child_index].shard_path.trim().is_empty() {
-        repo_snapshot::shard_path(&workspace, &execution_item_id).to_string_lossy().to_string()
-    } else {
-        run.child_runs[child_index].shard_path.clone()
-    };
+    let shard = repo_snapshot::refresh_shard_from_worktree(&run.root_repo_path, run.id, &execution_item_id)?;
+    patches::create_baseline(&shard)?;
+    let shard_path = shard.to_string_lossy().to_string();
 
     let new_workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
         state,
@@ -1359,45 +1642,39 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         supervisor_context(&run, &workspace),
     ).await?;
 
+    sqlx::query("UPDATE sprint_features SET current_workflow_run_id = ?, shard_path = ?, status = 'scheduled', development_state = 'scheduled', current_patch_id = NULL, last_error = NULL, development_started_at = NULL, development_completed_at = NULL, completed_at = NULL, updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
+        .bind(new_workflow_run_id.to_string())
+        .bind(&shard_path)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&sprint_id)
+        .bind(&execution_item_id)
+        .execute(&state.db)
+        .await?;
+
     if let Some(feature_item) = run.feature_plan_items.iter_mut().find(|item| item.id == execution_item_id) {
         if !matches!(feature_item.status, FeaturePlanItemStatus::Applied) {
             feature_item.status = FeaturePlanItemStatus::Scheduled;
         }
     }
 
-    run.child_runs[child_index].workflow_run_id = Some(new_workflow_run_id);
-    run.child_runs[child_index].status = "queued".to_string();
-    run.child_runs[child_index].patch_path = None;
-    run.child_runs[child_index].shard_path = shard_path;
     run.status = SupervisorStatus::RunningChildren;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
 
-    let supervisor_run_id = run.id;
-    let state_for_task = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(async move {
-            if let Err(err) = engine::start_run(&state_for_task, new_workflow_run_id, None).await {
-                tracing::error!(
-                    supervisor_run_id = %supervisor_run_id,
-                    workflow_run_id = %new_workflow_run_id,
-                    error = %format!("{:#}", err),
-                    "supervisor replacement child workflow start failed"
-                );
-            }
-        });
-    });
+    start_next_series_child(state, &mut run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow reset").await?;
 
-    Ok(json!({
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow reset").await?;
+    return Ok(json!({
         "ok": true,
         "supervisor_run": run,
         "workflow_run_id": new_workflow_run_id,
         "invalidated_integration": true
-    }))
+    }));
+
 }
 
-pub async fn tick_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
+pub async fn advance_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
     match run.status {
         SupervisorStatus::RunningChildren | SupervisorStatus::DevelopmentComplete => reconcile_development_runtime(state, &mut run).await?,
@@ -1406,6 +1683,7 @@ pub async fn tick_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
     }
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "supervisor advanced").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -1477,12 +1755,40 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
         "integration_run_id": run.integration_run_id,
         "final_patch_path": run.final_patch_path,
         "features": completed_features,
-        "child_runs": run.child_runs
+        "execution_source": "sprint_features"
     });
 
     save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
     upsert_sprint_record(state, &run, &sprint_id, &sprint_key, &sprint_title, "applied", None, Some(&completed_at_text)).await?;
     save_sprint_features(state, &run, &sprint_id, Some(&completed_at_text)).await?;
+    let repo_id = ensure_planner_repo_id(state, &run.root_repo_path).await?;
+    for feature_id in &scheduled_feature_ids {
+        let row = sqlx::query("SELECT current_workflow_run_id, current_patch_id FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+            .bind(&sprint_id)
+            .bind(feature_id)
+            .fetch_optional(&state.db)
+            .await?;
+        let workflow_run_id = row.as_ref().and_then(|row| row.try_get::<String, _>("current_workflow_run_id").ok()).filter(|value| !value.trim().is_empty());
+        let patch_id = row.as_ref().and_then(|row| row.try_get::<String, _>("current_patch_id").ok()).filter(|value| !value.trim().is_empty());
+        sqlx::query("UPDATE planner_features SET current_sprint_id = ?, current_supervisor_run_id = ?, current_workflow_run_id = ?, current_patch_id = ?, development_state = 'applied', integration_completed_at = COALESCE(integration_completed_at, ?), applied_at = COALESCE(applied_at, ?), updated_at = ? WHERE repo_id = ? AND id = ?")
+            .bind(&sprint_id)
+            .bind(run.id.to_string())
+            .bind(workflow_run_id)
+            .bind(patch_id)
+            .bind(&completed_at_text)
+            .bind(&completed_at_text)
+            .bind(&completed_at_text)
+            .bind(&repo_id)
+            .bind(feature_id)
+            .execute(&state.db)
+            .await?;
+    }
+    sqlx::query("UPDATE sprint_features SET status = 'applied', development_state = 'applied', completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE sprint_id = ?")
+        .bind(&completed_at_text)
+        .bind(&completed_at_text)
+        .bind(&sprint_id)
+        .execute(&state.db)
+        .await?;
     append_sprint_event(state, &sprint_id, "sprint_completed", &completed_at_text, None, "sprint completed", json!({ "sprint_key": sprint_key, "features": completed_features })).await?;
 
     if !run.context.is_object() {
@@ -1506,12 +1812,19 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
 }
 
 fn supervisor_patch_paths(run: &SupervisorRun) -> Vec<Value> {
-    run.child_runs.iter().filter_map(|child| {
-        child.patch_path.as_ref().map(|patch_path| json!({
-            "execution_item_id": child.execution_item_id,
-            "title": child.title,
-            "patch_path": patch_path,
-            "workflow_run_id": child.workflow_run_id
+    let Ok(workspace) = repo_snapshot::workspace_for(&run.root_repo_path, run.id) else {
+        return Vec::new();
+    };
+    run.execution_plan_items.iter().filter_map(|item| {
+        let feature = run.feature_plan_items.iter().find(|feature| feature.id == item.feature_plan_item_id)?;
+        let shard_path = repo_snapshot::shard_path(&workspace, &feature.id).to_string_lossy().to_string();
+        Some(json!({
+            "execution_item_id": feature.id,
+            "title": feature.title,
+            "patch_path": null,
+            "patch_id": null,
+            "shard_path": shard_path,
+            "workflow_run_id": null
         }))
     }).collect::<Vec<_>>()
 }
@@ -1529,6 +1842,7 @@ async fn spawn_live_integration_workflow(state: &AppState, run: &mut SupervisorR
         context_uuid(&run.context, "integration_template_id"),
         json!({
             "supervisor_run_id": run.id,
+            "sprint_id": run.context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
             "strategy": run.strategy,
             "root_repo_path": run.root_repo_path,
             "snapshot_path": run.snapshot_path,
@@ -1561,8 +1875,10 @@ pub async fn reopen_supervisor_development(state: &AppState, id: Uuid) -> Result
 
 pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
-    if run.child_runs.is_empty() {
-        return Err(anyhow!("development has not produced any feature workflow runs"));
+    let sprint_id = current_sprint_id(&run).await?;
+    let (total, succeeded, failed) = sprint_development_terminal_counts(state, &sprint_id).await?;
+    if failed > 0 || total == 0 || succeeded < total {
+        return Err(anyhow!("development must complete successfully before integration can start"));
     }
     if let Some(integration_run_id) = run.integration_run_id {
         delete_supervisor_workflow_run_records(state, integration_run_id).await?;
@@ -1579,6 +1895,7 @@ pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid)
     run.final_patch_path = None;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow restarted").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -1593,8 +1910,10 @@ pub async fn start_supervisor_integration_workflow(state: &AppState, id: Uuid) -
     if !matches!(run.status, SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::ReadyToApply | SupervisorStatus::Failed) {
         return Err(anyhow!("development must complete before integration can start"));
     }
-    if run.child_runs.is_empty() {
-        return Err(anyhow!("development has not produced any feature workflow runs"));
+    let sprint_id = current_sprint_id(&run).await?;
+    let (total, succeeded, failed) = sprint_development_terminal_counts(state, &sprint_id).await?;
+    if failed > 0 || total == 0 || succeeded < total {
+        return Err(anyhow!("development must complete successfully before integration can start"));
     }
     if matches!(run.status, SupervisorStatus::RunningIntegration | SupervisorStatus::ReadyToApply) && run.integration_run_id.is_some() {
         return Ok(json!({ "ok": true, "idempotent": true, "supervisor_run": run }));
@@ -1602,6 +1921,7 @@ pub async fn start_supervisor_integration_workflow(state: &AppState, id: Uuid) -
     spawn_live_integration_workflow(state, &mut run).await?;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow started").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -1663,40 +1983,173 @@ async fn invalidate_supervisor_integration(state: &AppState, run: &mut Superviso
     Ok(())
 }
 
-async fn ensure_scheduled_development_children(state: &AppState, run: &mut SupervisorRun) -> Result<bool> {
-    let mut changed = false;
-    let mut workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-    if !workspace.snapshot.is_dir() {
-        let scheduled_items = scheduled_feature_plan_items(run)?;
-        workspace = repo_snapshot::create_workspace(&run.root_repo_path, run.id, &scheduled_items)?;
-        patches::create_baseline(&workspace.snapshot)?;
-        patches::create_baseline(&workspace.integration)?;
-        run.snapshot_path = Some(workspace.snapshot.to_string_lossy().to_string());
-        run.integration_path = Some(workspace.integration.to_string_lossy().to_string());
+async fn current_sprint_id(run: &SupervisorRun) -> Result<String> {
+    run.context
+        .get("current_sprint_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("current sprint id is missing"))
+}
+
+async fn sprint_development_active_count(state: &AppState, sprint_id: &str) -> Result<usize> {
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM sprint_features WHERE sprint_id = ? AND development_state IN ('development_queued', 'development_running')")
+        .bind(sprint_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(row.get::<i64, _>("count").max(0) as usize)
+}
+
+async fn sprint_development_terminal_counts(state: &AppState, sprint_id: &str) -> Result<(usize, usize, usize)> {
+    let rows = sqlx::query("SELECT development_state, COUNT(*) AS count FROM sprint_features WHERE sprint_id = ? AND status != 'unscheduled' GROUP BY development_state")
+        .bind(sprint_id)
+        .fetch_all(&state.db)
+        .await?;
+    let mut total = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for row in rows {
+        let state_value: String = row.get("development_state");
+        let count = row.get::<i64, _>("count").max(0) as usize;
+        total += count;
+        if matches!(state_value.as_str(), "development_succeeded" | "integrated" | "applied") {
+            succeeded += count;
+        }
+        if state_value == "development_failed" {
+            failed += count;
+        }
+    }
+    Ok((total, succeeded, failed))
+}
+
+async fn update_sprint_feature_workflow_state(
+    state: &AppState,
+    sprint_id: &str,
+    feature_id: &str,
+    workflow_run_id: Option<Uuid>,
+    status: &str,
+    development_state: &str,
+    current_step_id: Option<&str>,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let previous = sqlx::query("SELECT status, development_state, current_workflow_run_id, current_step_id, last_error FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+        .bind(sprint_id)
+        .bind(feature_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+    let previous_status = previous.as_ref().and_then(|row| row.try_get::<String, _>("status").ok());
+    let previous_development_state = previous.as_ref().and_then(|row| row.try_get::<String, _>("development_state").ok());
+    let previous_workflow_run_id = previous.as_ref().and_then(|row| row.try_get::<Option<String>, _>("current_workflow_run_id").ok()).flatten();
+    let previous_step_id = previous.as_ref().and_then(|row| row.try_get::<Option<String>, _>("current_step_id").ok()).flatten();
+    let previous_last_error = previous.as_ref().and_then(|row| row.try_get::<Option<String>, _>("last_error").ok()).flatten();
+    let next_workflow_run_id = workflow_run_id.map(|id| id.to_string()).or(previous_workflow_run_id.clone());
+    let now = Utc::now().to_rfc3339();
+
+    let update = sqlx::query("UPDATE sprint_features SET current_workflow_run_id = COALESCE(?, current_workflow_run_id), status = ?, development_state = ?, current_step_id = ?, last_error = ?, development_completed_at = CASE WHEN ? IN ('development_succeeded', 'development_failed') THEN COALESCE(development_completed_at, ?) ELSE development_completed_at END, completed_at = CASE WHEN ? = 'completed' THEN COALESCE(completed_at, ?) ELSE completed_at END, updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
+        .bind(next_workflow_run_id.clone())
+        .bind(status)
+        .bind(development_state)
+        .bind(current_step_id)
+        .bind(last_error)
+        .bind(development_state)
+        .bind(&now)
+        .bind(status)
+        .bind(&now)
+        .bind(&now)
+        .bind(sprint_id)
+        .bind(feature_id)
+        .execute(&state.db)
+        .await?;
+
+    if update.rows_affected() > 0
+        && (previous_status.as_deref() != Some(status)
+            || previous_development_state.as_deref() != Some(development_state)
+            || previous_workflow_run_id != next_workflow_run_id
+            || previous_step_id.as_deref() != current_step_id
+            || previous_last_error.as_deref() != last_error)
+    {
+        append_sprint_event(
+            state,
+            sprint_id,
+            "feature_status_changed",
+            &now,
+            Some(feature_id),
+            "feature status changed",
+            json!({
+                "feature_id": feature_id,
+                "workflow_run_id": next_workflow_run_id,
+                "status": status,
+                "development_state": development_state,
+                "current_step_id": current_step_id,
+                "last_error": last_error,
+                "previous_status": previous_status,
+                "previous_development_state": previous_development_state
+            }),
+        )
+        .await?;
     }
 
-    let mut child_ids = run
-        .child_runs
-        .iter()
-        .map(|child| child.execution_item_id.clone())
-        .collect::<HashSet<_>>();
+    Ok(())
+}
+
+async fn sprint_feature_workflow_ids(state: &AppState, sprint_id: &str) -> Result<Vec<Uuid>> {
+    let rows = sqlx::query("SELECT current_workflow_run_id FROM sprint_features WHERE sprint_id = ? AND TRIM(COALESCE(current_workflow_run_id, '')) != ''")
+        .bind(sprint_id)
+        .fetch_all(&state.db)
+        .await?;
+    rows.into_iter()
+        .filter_map(|row| Uuid::parse_str(row.get::<String, _>("current_workflow_run_id").as_str()).ok())
+        .collect::<Vec<_>>()
+        .pipe(Ok)
+}
+
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T { f(self) }
+}
+impl<T> Pipe for T {}
+
+async fn ensure_scheduled_development_children(state: &AppState, run: &mut SupervisorRun) -> Result<bool> {
+    let sprint_id = current_sprint_id(run).await?;
+    let mut changed = false;
+
+    if run.execution_plan_items.is_empty() {
+        return Ok(false);
+    }
+
+    let scheduled_items = scheduled_feature_plan_items(run)?;
+    let workspace = if !repo_snapshot::workspace_for(&run.root_repo_path, run.id)?.integration.is_dir() {
+        let workspace = repo_snapshot::create_workspace(&run.root_repo_path, run.id, &scheduled_items)?;
+        patches::create_baseline(&workspace.integration)?;
+        run.snapshot_path = None;
+        run.integration_path = Some(workspace.integration.to_string_lossy().to_string());
+        workspace
+    } else {
+        repo_snapshot::workspace_for(&run.root_repo_path, run.id)?
+    };
+
     let mut sprint_items = run.execution_plan_items.clone();
     sprint_items.sort_by_key(|item| item.order_index.unwrap_or(i64::MAX));
 
     for sprint_item in sprint_items {
-        if child_ids.contains(&sprint_item.feature_plan_item_id) {
+        let feature_id = sprint_item.feature_plan_item_id.clone();
+        let existing = sqlx::query("SELECT current_workflow_run_id FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+            .bind(&sprint_id)
+            .bind(&feature_id)
+            .fetch_optional(&state.db)
+            .await?;
+        if existing
+            .as_ref()
+            .and_then(|row| row.try_get::<String, _>("current_workflow_run_id").ok())
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        {
             continue;
         }
 
-        let Some(feature) = run
-            .feature_plan_items
-            .iter()
-            .find(|item| item.id == sprint_item.feature_plan_item_id)
-            .cloned()
-        else {
+        let Some(feature) = run.feature_plan_items.iter().find(|item| item.id == feature_id).cloned() else {
             continue;
         };
-
         if development_feature_done(&feature) {
             continue;
         }
@@ -1712,19 +2165,19 @@ async fn ensure_scheduled_development_children(state: &AppState, run: &mut Super
             supervisor_context(run, &workspace),
         ).await?;
 
+        sqlx::query("UPDATE sprint_features SET supervisor_run_id = ?, current_workflow_run_id = ?, shard_path = ?, status = 'scheduled', development_state = 'scheduled', updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
+            .bind(run.id.to_string())
+            .bind(workflow_run_id.to_string())
+            .bind(&shard_path)
+            .bind(Utc::now().to_rfc3339())
+            .bind(&sprint_id)
+            .bind(&feature.id)
+            .execute(&state.db)
+            .await?;
+
         if let Some(item) = run.feature_plan_items.iter_mut().find(|item| item.id == feature.id) {
             item.status = FeaturePlanItemStatus::Scheduled;
         }
-
-        run.child_runs.push(SupervisorChildRun {
-            execution_item_id: feature.id.clone(),
-            title: feature.title.clone(),
-            shard_path,
-            workflow_run_id: Some(workflow_run_id),
-            status: "draft".to_string(),
-            patch_path: None,
-        });
-        child_ids.insert(feature.id);
         changed = true;
     }
 
@@ -1746,7 +2199,9 @@ async fn reconcile_development_runtime(state: &AppState, run: &mut SupervisorRun
 
     refresh_supervisor_child_run_statuses(state, run).await?;
     let spawned = ensure_scheduled_development_children(state, run).await?;
-    let remaining = development_has_remaining_work(run);
+    let sprint_id = current_sprint_id(run).await?;
+    let (total, succeeded, failed) = sprint_development_terminal_counts(state, &sprint_id).await?;
+    let remaining = total == 0 || succeeded < total;
 
     if spawned || remaining {
         if matches!(run.status, SupervisorStatus::DevelopmentComplete | SupervisorStatus::RunningIntegration | SupervisorStatus::Validating | SupervisorStatus::ReadyToApply | SupervisorStatus::Failed) {
@@ -1755,13 +2210,10 @@ async fn reconcile_development_runtime(state: &AppState, run: &mut SupervisorRun
         run.status = SupervisorStatus::RunningChildren;
         tick_children(state, run).await?;
         start_next_series_child(state, run).await?;
-    } else {
-        let (completed, total) = development_progress_counts(run);
-        if total > 0 && completed >= total {
-            run.status = SupervisorStatus::DevelopmentComplete;
-        } else if total > 0 {
-            run.status = SupervisorStatus::RunningChildren;
-        }
+    } else if failed > 0 {
+        run.status = SupervisorStatus::Failed;
+    } else if total > 0 && succeeded >= total {
+        run.status = SupervisorStatus::DevelopmentComplete;
     }
 
     if let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string) {
@@ -1772,22 +2224,37 @@ async fn reconcile_development_runtime(state: &AppState, run: &mut SupervisorRun
 }
 
 async fn refresh_supervisor_child_run_statuses(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
-    for child in &mut run.child_runs {
-        let Some(child_run_id) = child.workflow_run_id else {
+    let sprint_id = match current_sprint_id(run).await {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let rows = sqlx::query("SELECT feature_id, current_workflow_run_id FROM sprint_features WHERE sprint_id = ? AND TRIM(COALESCE(current_workflow_run_id, '')) != ''")
+        .bind(&sprint_id)
+        .fetch_all(&state.db)
+        .await?;
+    for row in rows {
+        let feature_id: String = row.get("feature_id");
+        let workflow_run_id_text: String = row.get("current_workflow_run_id");
+        let Ok(workflow_run_id) = Uuid::parse_str(&workflow_run_id_text) else {
             continue;
         };
-        match engine::load_run(state, child_run_id).await {
+        match engine::load_run(state, workflow_run_id).await {
             Ok(child_run) => {
-                child.status = status_str(&child_run.status).to_string();
+                match child_run.status {
+                    RunStatus::Success => update_sprint_feature_workflow_state(state, &sprint_id, &feature_id, Some(workflow_run_id), "completed", "development_succeeded", child_run.current_step_id.as_deref(), None).await?,
+                    RunStatus::Error => update_sprint_feature_workflow_state(state, &sprint_id, &feature_id, Some(workflow_run_id), "error", "development_failed", child_run.current_step_id.as_deref(), Some("workflow failed")).await?,
+                    RunStatus::Cancelled => update_sprint_feature_workflow_state(state, &sprint_id, &feature_id, Some(workflow_run_id), "cancelled", "development_failed", child_run.current_step_id.as_deref(), Some("workflow cancelled")).await?,
+                    RunStatus::Queued | RunStatus::Waiting | RunStatus::Paused | RunStatus::Draft => {}
+                    RunStatus::Running => update_sprint_feature_workflow_state(state, &sprint_id, &feature_id, Some(workflow_run_id), "development_running", "development_running", child_run.current_step_id.as_deref(), None).await?,
+                }
             }
             Err(err) => {
                 tracing::warn!(
                     supervisor_run_id = %run.id,
-                    workflow_run_id = %child_run_id,
+                    workflow_run_id = %workflow_run_id,
                     error = %format!("{:#}", err),
-                    "supervisor could not refresh child workflow status"
+                    "supervisor could not refresh feature workflow status"
                 );
-                child.status = "missing".to_string();
             }
         }
     }
@@ -1796,62 +2263,92 @@ async fn refresh_supervisor_child_run_statuses(state: &AppState, run: &mut Super
 
 async fn start_next_series_child(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
     refresh_supervisor_child_run_statuses(state, run).await?;
-
+    let sprint_id = current_sprint_id(run).await?;
     let feature_concurrency = supervisor_feature_concurrency(run);
-    let mut active_count = run
-        .child_runs
-        .iter()
-        .filter(|child| matches!(child.status.as_str(), "queued" | "running"))
-        .count();
+    let mut active_count = sprint_development_active_count(state, &sprint_id).await?;
+    if active_count >= feature_concurrency {
+        return Ok(());
+    }
 
-    for child in &mut run.child_runs {
+    let rows = sqlx::query("SELECT feature_id, current_workflow_run_id FROM sprint_features WHERE sprint_id = ? AND development_state = 'scheduled' AND TRIM(COALESCE(current_workflow_run_id, '')) != '' ORDER BY sort_order ASC, created_at ASC")
+        .bind(&sprint_id)
+        .fetch_all(&state.db)
+        .await?;
+
+    for row in rows {
         if active_count >= feature_concurrency {
             break;
         }
-        if supervisor_child_terminal(child.status.as_str()) || matches!(child.status.as_str(), "queued" | "running" | "paused" | "missing") {
+        let feature_id: String = row.get("feature_id");
+        let workflow_run_id_text: String = row.get("current_workflow_run_id");
+        let child_run_id = Uuid::parse_str(&workflow_run_id_text)?;
+        let now = Utc::now().to_rfc3339();
+        let claim = sqlx::query("UPDATE sprint_features SET status = 'development_queued', development_state = 'development_queued', development_started_at = COALESCE(development_started_at, ?), updated_at = ? WHERE sprint_id = ? AND feature_id = ? AND development_state = 'scheduled'")
+            .bind(&now)
+            .bind(&now)
+            .bind(&sprint_id)
+            .bind(&feature_id)
+            .execute(&state.db)
+            .await?;
+        if claim.rows_affected() != 1 {
             continue;
         }
-        let Some(child_run_id) = child.workflow_run_id else {
-            continue;
-        };
+
+        append_sprint_event(
+            state,
+            &sprint_id,
+            "feature_status_changed",
+            &now,
+            Some(&feature_id),
+            "feature development queued",
+            json!({
+                "feature_id": feature_id,
+                "workflow_run_id": workflow_run_id_text,
+                "status": "development_queued",
+                "development_state": "development_queued",
+                "previous_status": "scheduled",
+                "previous_development_state": "scheduled"
+            }),
+        )
+        .await?;
 
         let supervisor_run_id = run.id;
-        let execution_item_id = child.execution_item_id.clone();
-        let previous_child_status = child.status.clone();
         let state_for_task = state.clone();
+        let sprint_id_for_task = sprint_id.clone();
+        let feature_id_for_task = feature_id.clone();
+        active_count += 1;
 
         tracing::info!(
             supervisor_run_id = %supervisor_run_id,
             workflow_run_id = %child_run_id,
-            execution_item_id = %execution_item_id,
-            child_status = %previous_child_status,
+            execution_item_id = %feature_id,
             feature_concurrency = feature_concurrency,
-            "supervisor requested autonomous workflow progression"
+            "supervisor claimed feature workflow development slot"
         );
-
-        child.status = "queued".to_string();
-        active_count += 1;
 
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
+                let _ = update_sprint_feature_workflow_state(&state_for_task, &sprint_id_for_task, &feature_id_for_task, Some(child_run_id), "development_running", "development_running", None, None).await;
                 match engine::start_run(&state_for_task, child_run_id, None).await {
                     Ok(start_result) => {
                         if start_result.get("blocked_on").and_then(Value::as_str) == Some("pause_after_stage") {
                             tracing::warn!(
                                 supervisor_run_id = %supervisor_run_id,
                                 workflow_run_id = %child_run_id,
-                                execution_item_id = %execution_item_id,
-                                "supervisor autonomous progression blocked by workflow pause-after-stage user-control checkpoint"
+                                execution_item_id = %feature_id_for_task,
+                                "supervisor autonomous progression blocked by workflow pause-after-stage checkpoint"
                             );
                         }
                     }
                     Err(err) => {
+                        let error_text = format!("{:#}", err);
+                        let _ = update_sprint_feature_workflow_state(&state_for_task, &sprint_id_for_task, &feature_id_for_task, Some(child_run_id), "error", "development_failed", None, Some(&error_text)).await;
                         tracing::error!(
                             supervisor_run_id = %supervisor_run_id,
                             workflow_run_id = %child_run_id,
-                            execution_item_id = %execution_item_id,
-                            error = %format!("{:#}", err),
+                            execution_item_id = %feature_id_for_task,
+                            error = %error_text,
                             "supervisor autonomous workflow progression task failed"
                         );
                     }
@@ -1864,51 +2361,22 @@ async fn start_next_series_child(state: &AppState, run: &mut SupervisorRun) -> R
 }
 
 async fn tick_children(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
-    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-    let mut all_done = true;
-    for child in &mut run.child_runs {
-        let Some(child_run_id) = child.workflow_run_id else {
-            all_done = false;
-            continue;
-        };
-        let child_run = match crate::engine::load_run(state, child_run_id).await {
-            Ok(child_run) => child_run,
-            Err(err) => {
-                tracing::warn!(
-                    supervisor_run_id = %run.id,
-                    workflow_run_id = %child_run_id,
-                    execution_item_id = %child.execution_item_id,
-                    error = %format!("{:#}", err),
-                    "supervisor tick could not load child workflow run"
-                );
-                child.status = "missing".to_string();
-                all_done = false;
-                continue;
-            }
-        };
-        child.status = status_str(&child_run.status).to_string();
-        match child_run.status {
-            RunStatus::Success => {
-                if child.patch_path.is_none() {
-                    let patch_path = patches::patch_path(&workspace.patches, &child.execution_item_id);
-                    patches::generate_patch(&PathBuf::from(&child.shard_path), &patch_path)?;
-                    child.patch_path = Some(patch_path.to_string_lossy().to_string());
-                }
-            }
-            RunStatus::Error | RunStatus::Cancelled => {
-                run.status = SupervisorStatus::Failed;
-                all_done = false;
-            }
-            _ => all_done = false,
-        }
+    refresh_supervisor_child_run_statuses(state, run).await?;
+    let sprint_id = current_sprint_id(run).await?;
+    let (total, succeeded, failed) = sprint_development_terminal_counts(state, &sprint_id).await?;
+
+    if failed > 0 {
+        run.status = SupervisorStatus::Failed;
+        return Ok(());
     }
 
-    if all_done && !matches!(run.status, SupervisorStatus::Failed) {
+    if total > 0 && succeeded >= total {
         run.status = SupervisorStatus::DevelopmentComplete;
         if supervisor_integration_policy(run) == "auto" {
             spawn_live_integration_workflow(state, run).await?;
         }
-    } else if !matches!(run.status, SupervisorStatus::Failed) {
+    } else {
+        run.status = SupervisorStatus::RunningChildren;
         start_next_series_child(state, run).await?;
     }
     Ok(())
@@ -1994,7 +2462,7 @@ async fn insert_supervisor_run(state: &AppState, run: &SupervisorRun) -> Result<
         .bind(&run.snapshot_path)
         .bind(&run.integration_path)
         .bind(serde_json::to_string(&stored_plan)?)
-        .bind(serde_json::to_string(&run.child_runs)?)
+        .bind("[]")
         .bind(run.integration_run_id.map(|id| id.to_string()))
         .bind(&run.final_patch_path)
         .bind(serde_json::to_string(&run.merge_report)?)
@@ -2020,7 +2488,7 @@ pub(crate) async fn update_supervisor_run(state: &AppState, run: &SupervisorRun)
         .bind(&run.snapshot_path)
         .bind(&run.integration_path)
         .bind(serde_json::to_string(&stored_plan)?)
-        .bind(serde_json::to_string(&run.child_runs)?)
+        .bind("[]")
         .bind(run.integration_run_id.map(|id| id.to_string()))
         .bind(&run.final_patch_path)
         .bind(serde_json::to_string(&run.merge_report)?)
@@ -2033,6 +2501,28 @@ pub(crate) async fn update_supervisor_run(state: &AppState, run: &SupervisorRun)
     Ok(())
 }
 
+async fn publish_supervisor_snapshot(state: &AppState, run: &SupervisorRun, event_type: &str, message: &str) -> Result<()> {
+    let Some(sprint_id) = run
+        .context
+        .get("current_sprint_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+
+    let mut snapshot = run.clone();
+    hydrate_supervisor_feature_workflows(state, &mut snapshot).await?;
+    let event_time = Utc::now().to_rfc3339();
+    let payload = json!({
+        "supervisor_run_id": run.id,
+        "supervisor_run": snapshot,
+        "snapshot": true
+    });
+    append_sprint_event(state, sprint_id, event_type, &event_time, None, message, payload).await?;
+    Ok(())
+}
+
 async fn update_status(state: &AppState, id: Uuid, status: SupervisorStatus) -> Result<()> {
     sqlx::query("UPDATE supervisor_runs SET status = ?, updated_at = ? WHERE id = ?")
         .bind(status_supervisor_str(&status))
@@ -2040,6 +2530,41 @@ async fn update_status(state: &AppState, id: Uuid, status: SupervisorStatus) -> 
         .bind(id.to_string())
         .execute(&state.db)
         .await?;
+    Ok(())
+}
+
+async fn hydrate_supervisor_feature_workflows(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
+    run.feature_workflows.clear();
+    let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).map(str::to_string) else {
+        return Ok(());
+    };
+
+    let rows = sqlx::query("SELECT sf.feature_id, COALESCE(pf.title, sf.feature_id) AS title, sf.shard_path, sf.current_workflow_run_id, sf.status, sf.development_state, sf.current_step_id, sf.current_patch_id, sf.last_error FROM sprint_features sf LEFT JOIN planner_features pf ON pf.id = sf.feature_id WHERE sf.sprint_id = ? AND sf.status != 'unscheduled' ORDER BY sf.sort_order ASC, sf.created_at ASC")
+        .bind(&sprint_id)
+        .fetch_all(&state.db)
+        .await?;
+
+    run.feature_workflows = rows
+        .into_iter()
+        .map(|row| {
+            let workflow_run_id = row
+                .try_get::<Option<String>, _>("current_workflow_run_id")
+                .ok()
+                .flatten()
+                .and_then(|value| Uuid::parse_str(value.as_str()).ok());
+            SupervisorFeatureWorkflow {
+                feature_id: row.get("feature_id"),
+                title: row.get("title"),
+                shard_path: row.try_get("shard_path").ok(),
+                workflow_run_id,
+                status: row.try_get::<String, _>("status").unwrap_or_else(|_| "scheduled".to_string()),
+                development_state: row.try_get::<String, _>("development_state").unwrap_or_else(|_| "scheduled".to_string()),
+                current_step_id: row.try_get("current_step_id").ok(),
+                current_patch_id: row.try_get("current_patch_id").ok(),
+                last_error: row.try_get("last_error").ok(),
+            }
+        })
+        .collect();
     Ok(())
 }
 
@@ -2070,7 +2595,7 @@ fn row_to_supervisor_run(row: sqlx::sqlite::SqliteRow) -> Result<SupervisorRun> 
         integration_path: row.get("integration_path"),
         feature_plan_items,
         execution_plan_items,
-        child_runs: serde_json::from_str(row.get::<String, _>("child_runs_json").as_str())?,
+        feature_workflows: Vec::new(),
         integration_run_id: row.get::<Option<String>, _>("integration_run_id").map(|value| Uuid::parse_str(value.as_str())).transpose()?,
         final_patch_path: row.get("final_patch_path"),
         merge_report: serde_json::from_str(row.get::<String, _>("merge_report_json").as_str())?,

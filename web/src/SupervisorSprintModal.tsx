@@ -1,7 +1,7 @@
 import { Alert, Anchor, Badge, Button, Card, Group, Modal, NumberInput, Progress, Select, Stack, Table, Text } from '@mantine/core';
-import { useEffect, useMemo, useState } from 'react';
-import { getRun, pauseWorkflowRun, resumeWorkflowRun, startWorkflowRun, type WorkflowRun, type WorkflowTemplate } from './api';
-import { runSupervisorAction, updateSupervisorPlan, type SupervisorChildRun, type SupervisorExecutionStrategy, type SupervisorRun } from './supervisor_api';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { getRun, getRuntimeProjection, openRuntimeEventStream, type WorkflowRun, type WorkflowTemplate } from './api';
+import { runSupervisorAction, updateSupervisorPlan, type SupervisorExecutionStrategy, type SupervisorFeatureWorkflow, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   opened: boolean;
@@ -25,6 +25,21 @@ type WorkflowProjection = {
   } | null;
   latest_message?: string | null;
   summary?: string | null;
+  stages?: Array<{
+    label?: string;
+    latest_kind?: string;
+    latest_message?: string;
+    latest_created_at?: string;
+    is_current?: boolean;
+    is_active?: boolean;
+    capabilities?: Array<{
+      name?: string;
+      message?: string;
+      status_label?: string;
+      latest_created_at?: string;
+      is_active?: boolean;
+    }>;
+  }>;
 };
 
 function sprintTitle(run: SupervisorRun | null | undefined, featurePlanItemId: string): string {
@@ -39,7 +54,7 @@ function canApply(run: SupervisorRun): boolean {
 
 function canStartIntegration(run: SupervisorRun, integrationTemplateId: string | null, progress?: { completed: number; total: number }): boolean {
   const developmentComplete = progress ? progress.total > 0 && progress.completed >= progress.total : run.status === 'development_complete';
-  return Boolean(integrationTemplateId) && developmentComplete && ['development_complete', 'running_integration', 'ready_to_apply', 'failed'].includes(run.status) && run.child_runs.length > 0;
+  return Boolean(integrationTemplateId) && developmentComplete && ['development_complete', 'running_integration', 'ready_to_apply', 'failed'].includes(run.status) && (run.feature_workflows ?? []).length > 0;
 }
 
 function canCancel(status: string): boolean {
@@ -48,11 +63,15 @@ function canCancel(status: string): boolean {
 
 function canRestartIntegration(run: SupervisorRun, integrationTemplateId: string | null): boolean {
   const hasIntegrationTarget = Boolean(integrationTemplateId) || Boolean(run.integration_run_id) || typeof run.context?.integration_template_id === 'string';
-  return hasIntegrationTarget && run.child_runs.length > 0 && ['running_integration', 'validating', 'ready_to_apply', 'failed'].includes(run.status);
+  return hasIntegrationTarget && (run.feature_workflows ?? []).length > 0 && ['running_integration', 'validating', 'ready_to_apply', 'failed'].includes(run.status);
 }
 
 function canStart(status: string): boolean {
   return ['created', 'cancelled', 'failed'].includes(status);
+}
+
+function canContinueSupervisor(status: string): boolean {
+  return ['snapshotting', 'running_children', 'development_complete', 'running_integration', 'validating'].includes(status);
 }
 
 function canStartNextSprint(status: string): boolean {
@@ -64,11 +83,11 @@ function canRestartSprint(status: string): boolean {
 }
 
 function statusBadgeColor(status: string): string {
-  if (['success', 'development_complete', 'ready_to_apply', 'applied', 'completed'].includes(status)) return 'green';
+  if (['success', 'development_complete', 'ready_to_apply', 'applied', 'completed', 'complete'].includes(status)) return 'green';
   if (['error', 'failed'].includes(status)) return 'red';
   if (status === 'cancelled') return 'gray';
-  if (['snapshotting', 'running', 'running_children', 'running_integration', 'validating', 'queued'].includes(status)) return 'blue';
-  if (['waiting', 'paused'].includes(status)) return 'yellow';
+  if (['snapshotting', 'running', 'running_children', 'running_integration', 'validating', 'queued', 'run', 'active'].includes(status)) return 'blue';
+  if (['waiting', 'paused', 'user_input', 'scheduled'].includes(status)) return 'yellow';
   return 'gray';
 }
 
@@ -99,28 +118,110 @@ function currentWorkflowStage(run: WorkflowRun | undefined): string {
   if (!run?.current_step_id) return '—';
   const step = run.definition.steps.find((item) => item.id === run.current_step_id);
   if (!step) return shortId(run.current_step_id);
-  return step.name || step.label || step.step_type || shortId(step.id);
+  const label = 'label' in step && typeof step.label === 'string' ? step.label : undefined;
+  return step.name || label || step.step_type || shortId(step.id);
 }
 
-function workflowAutomationLabel(status: string): string {
-  if (status === 'paused') return 'Resume automation';
-  if (status === 'waiting') return 'Run autonomous';
-  if (status === 'draft') return 'Run autonomous';
+function workflowAutomationActionForStatus(status: string): 'start' | 'pause' {
+  if (['queued', 'running', 'development_running', 'user_input'].includes(status)) return 'pause';
+  return 'start';
+}
+
+function workflowAutomationLabelForAction(action: 'start' | 'pause'): string {
+  if (action === 'pause') return 'Pause';
   return 'Run autonomous';
+}
+
+function workflowAutomationColorForAction(action: 'start' | 'pause'): string | undefined {
+  if (action === 'pause') return 'yellow';
+  return undefined;
 }
 
 function workflowIsComplete(status: string): boolean {
   return ['success', 'completed'].includes(status);
 }
 
+function workflowRunWaitingForUser(run: WorkflowRun | undefined): boolean {
+  const workflowEngine = run?.context?.workflow_engine as Record<string, unknown> | undefined;
+  const runState = workflowEngine?.run_state as Record<string, unknown> | undefined;
+  const blockedOn = runState?.blocked_on as Record<string, unknown> | undefined;
+  const kind = typeof blockedOn?.kind === 'string' ? blockedOn.kind : '';
+  return kind === 'operator_checkpoint' || kind === 'disposition_review';
+}
+
+function projectionRuntimeStatus(projection: WorkflowProjection | undefined): string | null {
+  if (!projection) return null;
+  const status = String(projection.status ?? '').toLowerCase();
+  if (['success', 'completed', 'error', 'failed', 'cancelled'].includes(status)) return status;
+
+  const stage = activeProjectionStage(projection);
+  const capability = activeProjectionCapability(stage);
+  const capabilityStatus = String(capability?.status_label ?? '').toLowerCase().replace(/\s+/g, '_');
+  const message = String(capability?.message ?? stage?.latest_message ?? projection.latest_event?.message ?? projection.latest_message ?? '').toLowerCase();
+
+  if (capabilityStatus === 'user_input') return 'user_input';
+  if (capabilityStatus === 'error') return 'error';
+  if (projection.status && projection.status !== 'waiting') return projection.status;
+  if (capability?.is_active || stage?.is_active || message.includes('started')) return 'running';
+  return null;
+}
+
+function workflowRuntimeStatus(child: SupervisorFeatureWorkflow | undefined, run: WorkflowRun | undefined, projection?: WorkflowProjection): string {
+  if (!child?.workflow_run_id) return 'not_started';
+  const projectionStatus = projectionRuntimeStatus(projection);
+  if (projectionStatus) return projectionStatus;
+  if (workflowRunWaitingForUser(run)) return 'user_input';
+  return run?.status ?? child.status ?? 'unknown';
+}
+
+function featureSprintStatus(run: SupervisorRun, featureId: string, workflow: SupervisorFeatureWorkflow | undefined, workflowStatus: string): string {
+  if (developmentItemDone(run, featureId, workflow)) return 'complete';
+  if (workflow && isFeatureWorkflowFailed(workflow)) return 'failed';
+  if (['error', 'failed', 'cancelled'].includes(workflowStatus)) return 'failed';
+  if (['running', 'user_input', 'paused'].includes(workflowStatus)) return 'active';
+  return 'scheduled';
+}
+
+function workflowStatusLabel(status: string): string {
+  if (status === 'user_input') return 'User Input';
+  if (status === 'not_started') return '—';
+  return status;
+}
+
+function featureStatusLabel(status: string): string {
+  if (status === 'scheduled') return 'Scheduled';
+  if (status === 'active') return 'Active';
+  if (status === 'complete') return 'Complete';
+  if (status === 'failed') return 'Failed';
+  return status;
+}
+
+function activeProjectionStage(projection: WorkflowProjection | undefined): NonNullable<WorkflowProjection['stages']>[number] | undefined {
+  const stages = projection?.stages ?? [];
+  return stages.find((stage) => stage.is_current || stage.is_active)
+    ?? stages.slice().sort((a, b) => String(b.latest_created_at ?? '').localeCompare(String(a.latest_created_at ?? '')))[0];
+}
+
+function activeProjectionCapability(stage: ReturnType<typeof activeProjectionStage>) {
+  const capabilities = stage?.capabilities ?? [];
+  return capabilities.find((capability) => capability.is_active)
+    ?? capabilities.slice().sort((a, b) => String(b.latest_created_at ?? '').localeCompare(String(a.latest_created_at ?? '')))[0];
+}
+
 function projectionStage(projection: WorkflowProjection | undefined, workflowRun: WorkflowRun | undefined): string {
+  const stage = activeProjectionStage(projection);
   return projection?.current_stage_name
     ?? projection?.current_stage
+    ?? stage?.label
     ?? currentWorkflowStage(workflowRun);
 }
 
 function projectionMessage(projection: WorkflowProjection | undefined): string {
-  return projection?.latest_event?.message
+  const stage = activeProjectionStage(projection);
+  const capability = activeProjectionCapability(stage);
+  return capability?.message
+    ?? stage?.latest_message
+    ?? projection?.latest_event?.message
     ?? projection?.latest_message
     ?? projection?.summary
     ?? '—';
@@ -159,24 +260,17 @@ function sprintStageLabel(state: 'active' | 'complete' | 'up_next' | 'blocked'):
   return 'UP NEXT';
 }
 
-function isChildDone(child: SupervisorChildRun): boolean {
-  return ['success', 'completed'].includes(child.status);
+function isFeatureWorkflowDone(workflow: SupervisorFeatureWorkflow): boolean {
+  return ['success', 'completed', 'development_succeeded'].includes(workflow.status) || workflow.development_state === 'development_succeeded';
 }
 
-function isChildFailed(child: SupervisorChildRun): boolean {
-  return ['error', 'cancelled'].includes(child.status);
+function isFeatureWorkflowFailed(workflow: SupervisorFeatureWorkflow): boolean {
+  return ['error', 'cancelled', 'development_failed'].includes(workflow.status) || workflow.development_state === 'development_failed';
 }
 
-function developmentItemDone(run: SupervisorRun, featureId: string, child?: SupervisorChildRun): boolean {
+function developmentItemDone(run: SupervisorRun, featureId: string, workflow?: SupervisorFeatureWorkflow): boolean {
   const feature = run.feature_plan_items.find((item) => item.id === featureId);
-  return ['completed', 'applied'].includes(String(feature?.status ?? '')) || Boolean(child && isChildDone(child));
-}
-
-function developmentItemStatus(run: SupervisorRun, featureId: string, child: SupervisorChildRun | undefined, liveStatus: string): string {
-  if (developmentItemDone(run, featureId, child)) return 'complete';
-  if (child) return liveStatus;
-  if (run.status === 'running_children') return 'queued';
-  return 'scheduled';
+  return ['completed', 'applied'].includes(String(feature?.status ?? '')) || Boolean(workflow && isFeatureWorkflowDone(workflow));
 }
 
 export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenPlanner, onChanged }: Props) {
@@ -188,6 +282,19 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
   const [integrationPolicy, setIntegrationPolicy] = useState<'auto' | 'manual'>('manual');
   const [workflowRunsById, setWorkflowRunsById] = useState<Record<string, WorkflowRun>>({});
   const [workflowProjectionsById, setWorkflowProjectionsById] = useState<Record<string, WorkflowProjection>>({});
+  const onChangedRef = useRef(onChanged);
+  const workflowRunIdKey = useMemo(
+    () => (run?.feature_workflows ?? [])
+      .map((workflow) => workflow.workflow_run_id)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .join('|'),
+    [run?.feature_workflows]
+  );
+
+  useEffect(() => {
+    onChangedRef.current = onChanged;
+  }, [onChanged]);
 
   const templateOptions = useMemo(() => templates.map((template) => ({ value: template.id, label: template.name })), [templates]);
 
@@ -204,24 +311,66 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
 
   useEffect(() => {
     if (!opened || !run) return;
-    if (!['snapshotting', 'running_children', 'development_complete', 'running_integration', 'validating'].includes(run.status)) return;
-    const timer = window.setInterval(() => {
-      void onChanged();
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [opened, run?.id, run?.status, onChanged]);
-
-  useEffect(() => {
-    if (!opened || !run) return;
     void refreshWorkflowRunDetails();
     void refreshWorkflowProjections();
-    if (run.child_runs.length === 0) return;
-    const timer = window.setInterval(() => {
-      void refreshWorkflowRunDetails();
-      void refreshWorkflowProjections();
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [opened, run?.id, run?.child_runs.length]);
+  }, [opened, run?.id, workflowRunIdKey]);
+
+  useEffect(() => {
+    if (!opened || !run?.id) return;
+
+    const workflowRunIds = Array.from(new Set(
+      (run.feature_workflows ?? [])
+        .map((workflow) => workflow.workflow_run_id)
+        .filter((value): value is string => Boolean(value))
+    ));
+
+    const handleProjection = (raw: Event) => {
+      try {
+        const projection = JSON.parse((raw as MessageEvent<string>).data) as WorkflowProjection;
+        if (!projection.run_id) return;
+        setWorkflowProjectionsById((current) => ({
+          ...current,
+          [projection.run_id as string]: projection
+        }));
+      } catch {
+      }
+    };
+
+    const handleSupervisorSnapshot = (raw: Event) => {
+      try {
+        const envelope = JSON.parse((raw as MessageEvent<string>).data) as {
+          event?: { payload?: { synthetic?: boolean } };
+        };
+        if (envelope.event?.payload?.synthetic) return;
+      } catch {
+      }
+      void onChangedRef.current();
+    };
+
+    const handleSprintEvent = () => {
+      void onChangedRef.current();
+    };
+
+    const sources = [
+      openRuntimeEventStream({ supervisor_run_id: run.id }),
+      ...workflowRunIds.map((runId) => openRuntimeEventStream({ run_id: runId }))
+    ];
+
+    for (const source of sources) {
+      source.addEventListener('runtime_projection', handleProjection);
+    }
+    sources[0]?.addEventListener('supervisor_snapshot', handleSupervisorSnapshot);
+    sources[0]?.addEventListener('sprint_event', handleSprintEvent);
+
+    void refreshWorkflowRunDetails();
+    void refreshWorkflowProjections();
+
+    return () => {
+      for (const source of sources) {
+        source.close();
+      }
+    };
+  }, [opened, run?.id, workflowRunIdKey]);
 
   const scheduledItemsForStart = useMemo(() => {
     if (!run) return [];
@@ -236,12 +385,12 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
     if (!run) return { completed: 0, failed: 0, total: 0, percent: 0 };
     const total = scheduledItemsForStart.length;
     const completed = scheduledItemsForStart.filter((item) => {
-      const child = run.child_runs.find((entry) => entry.execution_item_id === item.feature_plan_item_id);
+      const child = (run.feature_workflows ?? []).find((entry) => entry.feature_id === item.feature_plan_item_id);
       return developmentItemDone(run, item.feature_plan_item_id, child);
     }).length;
     const failed = scheduledItemsForStart.filter((item) => {
-      const child = run.child_runs.find((entry) => entry.execution_item_id === item.feature_plan_item_id);
-      return Boolean(child && isChildFailed(child));
+      const child = (run.feature_workflows ?? []).find((entry) => entry.feature_id === item.feature_plan_item_id);
+      return Boolean(child && isFeatureWorkflowFailed(child));
     }).length;
     return {
       completed,
@@ -251,27 +400,16 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
     };
   }, [run, scheduledItemsForStart]);
 
-  useEffect(() => {
-    if (!opened || !run) return;
-    if (progress.total === 0 || progress.completed >= progress.total) return;
-    const missingChild = scheduledItemsForStart.some((item) => !run.child_runs.some((child) => child.execution_item_id === item.feature_plan_item_id));
-    if (!missingChild && run.status === 'running_children') return;
-    const timer = window.setTimeout(() => {
-      void action('tick');
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [opened, run?.id, run?.status, progress.completed, progress.total, scheduledItemsForStart, run?.child_runs.length]);
-
   async function refreshWorkflowRunDetails() {
-    const childRunIds = (run?.child_runs ?? [])
-      .map((child) => child.workflow_run_id)
+    const workflowRunIds = (run?.feature_workflows ?? [])
+      .map((workflow) => workflow.workflow_run_id)
       .filter((value): value is string => Boolean(value));
-    if (childRunIds.length === 0) {
+    if (workflowRunIds.length === 0) {
       setWorkflowRunsById({});
       return;
     }
     const pairs = await Promise.all(
-      childRunIds.map(async (runId) => {
+      workflowRunIds.map(async (runId) => {
         try {
           return [runId, await getRun(runId)] as const;
         } catch {
@@ -283,25 +421,44 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
   }
 
   async function refreshWorkflowProjections() {
-    const childRunIds = (run?.child_runs ?? [])
-      .map((child) => child.workflow_run_id)
+    const workflowRunIds = (run?.feature_workflows ?? [])
+      .map((workflow) => workflow.workflow_run_id)
       .filter((value): value is string => Boolean(value));
-    if (childRunIds.length === 0) {
+    if (workflowRunIds.length === 0) {
       setWorkflowProjectionsById({});
       return;
     }
+
     const pairs = await Promise.all(
-      childRunIds.map(async (runId) => {
+      workflowRunIds.map(async (runId) => {
         try {
-          const response = await fetch(`/api/events/projection?run_id=${encodeURIComponent(runId)}`);
-          if (!response.ok) return null;
-          return [runId, await response.json() as WorkflowProjection] as const;
+          const response = await getRuntimeProjection({ run_id: runId });
+          const projection = response.runs.find((item) => item.run_id === runId) ?? response.runs[0];
+          return projection ? [runId, projection as WorkflowProjection] as const : null;
         } catch {
           return null;
         }
       })
     );
-    setWorkflowProjectionsById(Object.fromEntries(pairs.filter((item): item is readonly [string, WorkflowProjection] => Boolean(item))));
+
+    const next = Object.fromEntries(pairs.filter((item): item is readonly [string, WorkflowProjection] => Boolean(item)));
+    setWorkflowProjectionsById((current) => {
+      const retained = Object.fromEntries(Object.entries(current).filter(([runId]) => workflowRunIds.includes(runId)));
+      return { ...retained, ...next };
+    });
+  }
+
+  async function saveSprintSettings(refresh = true) {
+    if (!run) return;
+    setError(null);
+    await updateSupervisorPlan(run.id, run.feature_plan_items, scheduledItemsForStart, {
+      sprint_strategy: strategy,
+      workflow_template_id: workflowTemplateId,
+      integration_template_id: integrationTemplateId,
+      feature_concurrency: featureConcurrency,
+      integration_policy: integrationPolicy
+    });
+    if (refresh) await onChanged();
   }
 
   async function startSprint() {
@@ -321,7 +478,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
         setError('No planner features are scheduled for this sprint.');
         return;
       }
-      await saveSprintSettings();
+      await saveSprintSettings(false);
       await runSupervisorAction(run.id, 'start');
       await onChanged();
     } catch (err) {
@@ -329,7 +486,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
     }
   }
 
-  async function action(actionName: 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint') {
+  async function action(actionName: 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint') {
     if (!run) return;
     setError(null);
     try {
@@ -346,7 +503,7 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
           integration_policy: integrationPolicy
         });
       }
-      if (actionName === 'restart_integration' && integrationTemplateId) {
+      if ((actionName === 'restart_integration' || actionName === 'restart_sprint') && integrationTemplateId) {
         await updateSupervisorPlan(run.id, run.feature_plan_items, scheduledItemsForStart, {
           sprint_strategy: strategy,
           workflow_template_id: workflowTemplateId,
@@ -362,33 +519,31 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
     }
   }
 
-  async function workflowAutomationAction(child: SupervisorChildRun, actionName: 'start' | 'pause' | 'resume') {
-    if (!child.workflow_run_id) return;
+  async function workflowAutomationAction(child: SupervisorFeatureWorkflow, actionName: 'start' | 'pause') {
+    if (!run || !child.workflow_run_id) return;
     setError(null);
     try {
-      if (actionName === 'pause') {
-        await pauseWorkflowRun(child.workflow_run_id);
-      } else if (actionName === 'resume') {
-        await resumeWorkflowRun(child.workflow_run_id);
-      } else {
-        await startWorkflowRun(child.workflow_run_id);
-      }
+      await runSupervisorAction(
+        run.id,
+        actionName === 'pause' ? 'pause_child_workflow' : 'start_child_workflow',
+        { feature_id: child.feature_id }
+      );
       await onChanged();
       await refreshWorkflowRunDetails();
+      await refreshWorkflowProjections();
     } catch (err) {
       setError(String(err));
     }
   }
 
-  async function removeChildWorkflow(child: SupervisorChildRun) {
+  async function removeChildWorkflow(child: SupervisorFeatureWorkflow) {
     if (!run) return;
-    const confirmed = window.confirm(`Delete workflow for ${child.title}? This will invalidate any integration workflow for this sprint.`);
+    const confirmed = window.confirm(`Reset development workflow for ${child.title}? This will delete the shard and workflow, invalidate integration, rebuild the shard, and start over on this feature.`);
     if (!confirmed) return;
     setError(null);
     try {
       await runSupervisorAction(run.id, 'remove_child_workflow', {
-        execution_item_id: child.execution_item_id,
-        workflow_run_id: child.workflow_run_id
+        feature_id: child.feature_id
       } as any);
       await onChanged();
       await refreshWorkflowRunDetails();
@@ -399,8 +554,8 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
   }
 
   function allLiveChildWorkflowsSuccessful(): boolean {
-    if (!run || run.child_runs.length === 0) return false;
-    return run.child_runs.every((child) => {
+    if (!run || (run.feature_workflows ?? []).length === 0) return false;
+    return (run.feature_workflows ?? []).every((child) => {
       const workflowRun = child.workflow_run_id ? workflowRunsById[child.workflow_run_id] : undefined;
       const projection = child.workflow_run_id ? workflowProjectionsById[child.workflow_run_id] : undefined;
       const liveStatus = projection?.status ?? workflowRun?.status ?? child.status;
@@ -497,6 +652,9 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                         {canStart(run.status) ? (
                           <Button size="xs" onClick={() => void startSprint()}>Start sprint</Button>
                         ) : null}
+                        {canCancel(run.status) ? (
+                          <Button size="xs" color="red" variant="subtle" onClick={() => void action('cancel')}>Cancel sprint</Button>
+                        ) : null}
                         {allLiveChildWorkflowsSuccessful() && !run.integration_run_id ? (
                           <Button size="xs" disabled={!canStartIntegration(run, integrationTemplateId, progress)} onClick={() => void action('start_integration')}>Start integration</Button>
                         ) : null}
@@ -577,7 +735,8 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                         <Table.Th>Phase</Table.Th>
                         <Table.Th>Item</Table.Th>
                         <Table.Th>Workflow template</Table.Th>
-                        <Table.Th>Status</Table.Th>
+                        <Table.Th>Feature status</Table.Th>
+                        <Table.Th>Workflow status</Table.Th>
                         <Table.Th>Stage</Table.Th>
                         <Table.Th>Live projection</Table.Th>
                         <Table.Th>Controls</Table.Th>
@@ -585,14 +744,13 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                     </Table.Thead>
                     <Table.Tbody>
                       {scheduledItemsForStart.map((item, index) => {
-                        const child = run.child_runs.find((entry) => entry.execution_item_id === item.feature_plan_item_id);
+                        const child = (run.feature_workflows ?? []).find((entry) => entry.feature_id === item.feature_plan_item_id);
                         const workflowRun = child?.workflow_run_id ? workflowRunsById[child.workflow_run_id] : undefined;
                         const projection = child?.workflow_run_id ? workflowProjectionsById[child.workflow_run_id] : undefined;
-                        const rawLiveStatus = projection?.status ?? workflowRun?.status ?? child?.status ?? 'scheduled';
-                        const liveStatus = developmentItemStatus(run, item.feature_plan_item_id, child, rawLiveStatus);
-                        const canPauseWorkflow = Boolean(child) && ['queued', 'running', 'waiting'].includes(liveStatus);
-                        const canResumeWorkflow = Boolean(child) && liveStatus === 'paused';
-                        const canStartWorkflow = Boolean(child) && ['draft', 'waiting'].includes(liveStatus);
+                        const liveStatus = workflowRuntimeStatus(child, workflowRun, projection);
+                        const featureStatus = featureSprintStatus(run, item.feature_plan_item_id, child, liveStatus);
+                        const automationAction = workflowAutomationActionForStatus(liveStatus);
+                        const canRunAutomationAction = Boolean(child?.workflow_run_id);
                         return (
                           <Table.Tr key={`${item.feature_plan_item_id}-${index}`}>
                             <Table.Td>Development</Table.Td>
@@ -604,7 +762,8 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                               )}
                             </Table.Td>
                             <Table.Td>{workflowName(templates, item.workflow_template_id ?? workflowTemplateId)}</Table.Td>
-                            <Table.Td><Badge color={statusBadgeColor(liveStatus)}>{liveStatus}</Badge></Table.Td>
+                            <Table.Td><Badge color={statusBadgeColor(featureStatus)}>{featureStatusLabel(featureStatus)}</Badge></Table.Td>
+                            <Table.Td>{liveStatus === 'not_started' ? '—' : <Badge color={statusBadgeColor(liveStatus)}>{workflowStatusLabel(liveStatus)}</Badge>}</Table.Td>
                             <Table.Td>{projectionStage(projection, workflowRun)}</Table.Td>
                             <Table.Td>
                               <Text size="xs" lineClamp={3}>{projectionMessage(projection)}</Text>
@@ -612,21 +771,23 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                             <Table.Td>
                               {workflowIsComplete(liveStatus) && child ? (
                                 <Button size="xs" color="red" variant="subtle" onClick={() => void removeChildWorkflow(child)}>Delete</Button>
-                              ) : child ? (
-                                <Group gap="xs" wrap="nowrap">
-                                  {canPauseWorkflow ? (
-                                    <Button size="xs" variant="light" color="yellow" onClick={() => void workflowAutomationAction(child, 'pause')}>Pause after stage</Button>
-                                  ) : null}
-                                  {canResumeWorkflow ? (
-                                    <Button size="xs" onClick={() => void workflowAutomationAction(child, 'resume')}>Resume automation</Button>
-                                  ) : null}
-                                  {canStartWorkflow ? (
-                                    <Button size="xs" variant="light" onClick={() => void workflowAutomationAction(child, 'start')}>{workflowAutomationLabel(liveStatus)}</Button>
-                                  ) : null}
-                                  <Button size="xs" color="red" variant="subtle" onClick={() => void removeChildWorkflow(child)}>Delete</Button>
-                                </Group>
                               ) : (
-                                <Text size="xs" c="dimmed">Queued for supervisor</Text>
+                                <Group gap="xs" wrap="nowrap">
+                                  {child && automationAction ? (
+                                    <Button
+                                      size="xs"
+                                      variant="light"
+                                      color={workflowAutomationColorForAction(automationAction)}
+                                      disabled={!canRunAutomationAction}
+                                      onClick={() => void workflowAutomationAction(child, automationAction)}
+                                    >
+                                      {workflowAutomationLabelForAction(automationAction)}
+                                    </Button>
+                                  ) : null}
+                                  {child ? (
+                                    <Button size="xs" color="red" variant="subtle" onClick={() => void removeChildWorkflow(child)}>Delete</Button>
+                                  ) : null}
+                                </Group>
                               )}
                             </Table.Td>
                           </Table.Tr>
@@ -642,7 +803,8 @@ export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenP
                           )}
                         </Table.Td>
                         <Table.Td>{workflowName(templates, integrationTemplateId)}</Table.Td>
-                        <Table.Td><Badge color={statusBadgeColor(run.integration_run_id ? run.status : 'scheduled')}>{run.integration_run_id ? run.status : 'scheduled'}</Badge></Table.Td>
+                        <Table.Td><Badge color={statusBadgeColor(run.integration_run_id ? 'active' : 'scheduled')}>{run.integration_run_id ? 'Active' : 'Scheduled'}</Badge></Table.Td>
+                        <Table.Td>{run.integration_run_id ? <Badge color={statusBadgeColor(run.status)}>{workflowStatusLabel(run.status)}</Badge> : '—'}</Table.Td>
                         <Table.Td>{run.integration_run_id ? 'Integration' : '—'}</Table.Td>
                         <Table.Td>
                           <Text size="xs" lineClamp={3}>{run.integration_run_id ? 'Integration workflow is being orchestrated by the supervisor.' : 'Waiting for development completion.'}</Text>

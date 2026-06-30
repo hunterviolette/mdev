@@ -38,14 +38,11 @@ pub fn create_workspace(root_repo_path: &str, supervisor_id: Uuid, items: &[Feat
     }
     fs::create_dir_all(&workspace.root)?;
     fs::create_dir_all(&workspace.shards)?;
-    fs::create_dir_all(&workspace.patches)?;
-    fs::create_dir_all(&workspace.logs)?;
-    copy_repo_tree(Path::new(root_repo_path), &workspace.snapshot, Some(&workspace.root))?;
-    copy_tree(&workspace.snapshot, &workspace.integration)?;
+    copy_repo_tree(Path::new(root_repo_path), &workspace.integration, Some(&workspace.root))?;
     for item in items {
-        copy_tree(&workspace.snapshot, &workspace.shards.join(sanitize_path_segment(&item.id)))?;
+        copy_repo_tree(Path::new(root_repo_path), &workspace.shards.join(sanitize_path_segment(&item.id)), Some(&workspace.root))?;
     }
-    tracing::info!(supervisor_id = %supervisor_id, snapshot = %workspace.snapshot.display(), integration = %workspace.integration.display(), "created supervisor workspace");
+    tracing::info!(supervisor_id = %supervisor_id, integration = %workspace.integration.display(), shards = %workspace.shards.display(), "created supervisor workspace from current worktree");
     Ok(workspace)
 }
 
@@ -53,21 +50,39 @@ pub fn refresh_integration_from_worktree(root_repo_path: &str, supervisor_id: Uu
     let workspace = workspace_for(root_repo_path, supervisor_id)?;
     fs::create_dir_all(&workspace.root)?;
     fs::create_dir_all(&workspace.shards)?;
-    fs::create_dir_all(&workspace.patches)?;
-    fs::create_dir_all(&workspace.logs)?;
     copy_repo_tree(Path::new(root_repo_path), &workspace.integration, Some(&workspace.root))?;
     tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, integration = %workspace.integration.display(), "refreshed supervisor integration shard from current worktree");
     Ok(workspace)
 }
 
+pub fn reset_integration_from_snapshot(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
+    refresh_integration_from_worktree(root_repo_path, supervisor_id)
+}
+
 
 pub fn create_shard_from_snapshot(workspace: &SupervisorWorkspace, execution_item_id: &str) -> Result<PathBuf> {
-    if !workspace.snapshot.is_dir() {
-        return Err(anyhow!("supervisor snapshot is missing at {}", workspace.snapshot.display()));
+    if !workspace.integration.is_dir() {
+        return Err(anyhow!("supervisor integration workspace is missing at {}", workspace.integration.display()));
     }
     fs::create_dir_all(&workspace.shards)?;
     let shard = shard_path(workspace, execution_item_id);
-    copy_tree(&workspace.snapshot, &shard)?;
+    copy_tree(&workspace.integration, &shard)?;
+    Ok(shard)
+}
+
+pub fn refresh_shard_from_worktree(root_repo_path: &str, supervisor_id: Uuid, execution_item_id: &str) -> Result<PathBuf> {
+    let workspace = workspace_for(root_repo_path, supervisor_id)?;
+    fs::create_dir_all(&workspace.root)?;
+    fs::create_dir_all(&workspace.shards)?;
+    let shard = shard_path(&workspace, execution_item_id);
+    copy_repo_tree(Path::new(root_repo_path), &shard, Some(&workspace.root))?;
+    tracing::info!(
+        supervisor_id = %supervisor_id,
+        root_repo_path = %root_repo_path,
+        execution_item_id = %execution_item_id,
+        shard = %shard.display(),
+        "refreshed supervisor child shard from current worktree"
+    );
     Ok(shard)
 }
 

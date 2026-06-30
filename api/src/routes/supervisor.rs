@@ -1,4 +1,4 @@
-use axum::{extract::{Path, State}, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, State}, http::StatusCode, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -58,7 +58,6 @@ async fn supervisor_action(
 
     let response = match action.as_str() {
         "start" => supervisor::start_supervisor_run(&state, supervisor_id).await,
-        "tick" => supervisor::tick_supervisor_run(&state, supervisor_id).await,
         "start_integration" => supervisor::start_supervisor_integration_workflow(&state, supervisor_id).await,
         "apply" => supervisor::apply_supervisor_final_patch(&state, supervisor_id).await,
         "cancel" => supervisor::cancel_supervisor_run(&state, supervisor_id).await,
@@ -66,9 +65,12 @@ async fn supervisor_action(
         "restart_integration" => supervisor::restart_supervisor_integration_workflow(&state, supervisor_id).await,
         "restart_sprint" => supervisor::restart_current_supervisor_sprint(&state, supervisor_id).await,
         "update_plan" => supervisor::update_supervisor_plan(&state, supervisor_id, req.payload).await,
+        "unschedule_feature" => supervisor::unschedule_supervisor_feature(&state, supervisor_id, req.payload).await,
         "preview_planner_import" => supervisor::preview_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "apply_planner_import" => supervisor::apply_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "refine_feature" => supervisor::refine_supervisor_feature(&state, supervisor_id, req.payload).await,
+        "start_child_workflow" => supervisor::start_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
+        "pause_child_workflow" => supervisor::pause_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
         "remove_child_workflow" => supervisor::remove_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
         "new_sprint" => supervisor::start_next_supervisor_sprint(&state, supervisor_id).await,
         other => Err(anyhow::anyhow!("unsupported supervisor action {}", other)),
@@ -86,7 +88,12 @@ async fn supervisor_action(
     }
 }
 
-fn internal(err: impl std::fmt::Display) -> (axum::http::StatusCode, String) {
-    tracing::error!(error = %err, "supervisor route error");
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {
+    let message = err.to_string();
+    if message.contains("no rows returned by a query that expected to return at least one row") {
+        tracing::warn!(error = %message, "supervisor route referenced a missing or stale row");
+        return (StatusCode::NOT_FOUND, "not found".to_string());
+    }
+    tracing::error!(error = %message, "supervisor route error");
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }

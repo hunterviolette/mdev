@@ -188,23 +188,190 @@ async fn list_run_events(
     Ok(Json(events))
 }
 
+fn push_unique_string(values: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = value.map(|item| item.trim().to_string()).filter(|item| !item.is_empty()) else {
+        return;
+    };
+    if !values.iter().any(|item| item == &value) {
+        values.push(value);
+    }
+}
+
+async fn clear_workflow_run_references(
+    state: &AppState,
+    run_id: Uuid,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    let run_id_text = run_id.to_string();
+    let now = Utc::now().to_rfc3339();
+    let mut affected_supervisor_run_ids = Vec::<String>::new();
+
+    let sprint_owner_rows = sqlx::query(
+        "SELECT DISTINCT COALESCE(sf.supervisor_run_id, s.supervisor_run_id) AS supervisor_run_id FROM sprint_features sf LEFT JOIN sprints s ON s.id = sf.sprint_id WHERE sf.current_workflow_run_id = ?",
+    )
+    .bind(&run_id_text)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+    for row in sprint_owner_rows {
+        push_unique_string(&mut affected_supervisor_run_ids, row.try_get::<Option<String>, _>("supervisor_run_id").ok().flatten());
+    }
+
+    let integration_owner_rows = sqlx::query("SELECT id FROM supervisor_runs WHERE integration_run_id = ?")
+        .bind(&run_id_text)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
+    for row in integration_owner_rows {
+        push_unique_string(&mut affected_supervisor_run_ids, row.try_get::<String, _>("id").ok());
+    }
+
+    let supervisor_rows = sqlx::query(
+        "SELECT id, child_runs_json FROM supervisor_runs WHERE child_runs_json LIKE ?",
+    )
+    .bind(format!("%{}%", run_id_text))
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+
+    let affected_sprint_features = sqlx::query(
+        "UPDATE sprint_features SET current_workflow_run_id = NULL, current_step_id = NULL, current_patch_id = NULL, status = 'scheduled', development_state = 'scheduled', last_error = NULL, development_started_at = NULL, development_completed_at = NULL, completed_at = NULL, updated_at = ? WHERE current_workflow_run_id = ? AND development_state NOT IN ('development_succeeded', 'integrated', 'applied')",
+    )
+    .bind(&now)
+    .bind(&run_id_text)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+
+    let affected_planner_features = sqlx::query(
+        "UPDATE planner_features SET current_workflow_run_id = NULL, current_patch_id = NULL, development_state = 'scheduled', scheduled_at = NULL, development_started_at = NULL, development_completed_at = NULL, updated_at = ? WHERE current_workflow_run_id = ? AND development_state NOT IN ('development_succeeded', 'integrated', 'applied')",
+    )
+    .bind(&now)
+    .bind(&run_id_text)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+
+    let affected_supervisor_integrations = sqlx::query(
+        "UPDATE supervisor_runs SET integration_run_id = NULL, updated_at = ? WHERE integration_run_id = ?",
+    )
+    .bind(&now)
+    .bind(&run_id_text)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+
+    let mut affected_supervisor_child_runs = 0u64;
+    for row in supervisor_rows {
+        let supervisor_id: String = row.get("id");
+        let child_runs_json: String = row.get("child_runs_json");
+        let mut child_runs = serde_json::from_str::<Value>(&child_runs_json).unwrap_or_else(|_| json!([]));
+        let mut changed = false;
+
+        if let Some(children) = child_runs.as_array_mut() {
+            for child in children {
+                if child.get("workflow_run_id").and_then(Value::as_str) == Some(run_id_text.as_str()) {
+                    if let Some(obj) = child.as_object_mut() {
+                        obj.insert("workflow_run_id".to_string(), Value::Null);
+                        obj.insert("status".to_string(), Value::String("scheduled".to_string()));
+                        obj.remove("patch_path");
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if changed {
+            push_unique_string(&mut affected_supervisor_run_ids, Some(supervisor_id.clone()));
+            sqlx::query("UPDATE supervisor_runs SET child_runs_json = ?, updated_at = ? WHERE id = ?")
+                .bind(serde_json::to_string(&child_runs).map_err(internal)?)
+                .bind(&now)
+                .bind(&supervisor_id)
+                .execute(&state.db)
+                .await
+                .map_err(internal)?;
+            affected_supervisor_child_runs += 1;
+        }
+    }
+
+    Ok(json!({
+        "sprint_features": affected_sprint_features,
+        "planner_features": affected_planner_features,
+        "supervisor_integrations": affected_supervisor_integrations,
+        "supervisor_child_runs": affected_supervisor_child_runs,
+        "supervisor_run_ids": affected_supervisor_run_ids
+    }))
+}
+
 async fn delete_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let cleared_references = clear_workflow_run_references(&state, run_id).await?;
+    let supervisor_run_ids = cleared_references
+        .get("supervisor_run_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let run_id_text = run_id.to_string();
+
     sqlx::query("DELETE FROM workflow_events WHERE run_id = ?")
-        .bind(run_id.to_string())
+        .bind(&run_id_text)
         .execute(&state.db)
         .await
         .map_err(internal)?;
 
-    sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
-        .bind(run_id.to_string())
+    sqlx::query("DELETE FROM changeset_file_effects WHERE attempt_id IN (SELECT id FROM changeset_attempts WHERE run_id = ?)")
+        .bind(&run_id_text)
         .execute(&state.db)
         .await
         .map_err(internal)?;
 
-    Ok(Json(json!({ "ok": true })))
+    sqlx::query("DELETE FROM changeset_attempts WHERE run_id = ?")
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+
+    let deleted = sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+
+    let mut supervisor_reconciliations = Vec::<Value>::new();
+    for supervisor_run_id in supervisor_run_ids.iter().filter_map(Value::as_str).filter_map(|value| Uuid::parse_str(value).ok()) {
+        match crate::supervisor::advance_supervisor_run(&state, supervisor_run_id).await {
+            Ok(value) => supervisor_reconciliations.push(json!({
+                "supervisor_run_id": supervisor_run_id,
+                "ok": true,
+                "result": value
+            })),
+            Err(err) => {
+                tracing::warn!(
+                    supervisor_run_id = %supervisor_run_id,
+                    deleted_workflow_run_id = %run_id,
+                    error = %format!("{:#}", err),
+                    "failed to reconcile supervisor after workflow deletion"
+                );
+                supervisor_reconciliations.push(json!({
+                    "supervisor_run_id": supervisor_run_id,
+                    "ok": false,
+                    "error": format!("{:#}", err)
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "deleted": deleted,
+        "cleared_references": cleared_references,
+        "supervisor_reconciliations": supervisor_reconciliations
+    })))
 }
 
 async fn run_action(

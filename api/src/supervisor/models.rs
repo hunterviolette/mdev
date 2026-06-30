@@ -28,13 +28,16 @@ pub enum SupervisorStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorChildRun {
-    pub execution_item_id: String,
+pub struct SupervisorFeatureWorkflow {
+    pub feature_id: String,
     pub title: String,
-    pub shard_path: String,
+    pub shard_path: Option<String>,
     pub workflow_run_id: Option<Uuid>,
     pub status: String,
-    pub patch_path: Option<String>,
+    pub development_state: String,
+    pub current_step_id: Option<String>,
+    pub current_patch_id: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +51,8 @@ pub struct SupervisorRun {
     pub integration_path: Option<String>,
     pub feature_plan_items: Vec<FeaturePlanItem>,
     pub execution_plan_items: Vec<ExecutionPlanItem>,
-    pub child_runs: Vec<SupervisorChildRun>,
+    #[serde(default)]
+    pub feature_workflows: Vec<SupervisorFeatureWorkflow>,
     pub integration_run_id: Option<Uuid>,
     pub final_patch_path: Option<String>,
     pub merge_report: Value,

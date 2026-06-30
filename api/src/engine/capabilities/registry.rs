@@ -137,6 +137,25 @@ pub(crate) async fn execute_capability_chain(
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
 
+        if invocation.capability == "operator_checkpoint" && previous_capability_failed(&results) {
+            append_engine_event(
+                ctx.state,
+                ctx.run_id,
+                Some(ctx.step.id.as_str()),
+                "info",
+                "operator_checkpoint_skipped",
+                "Operator checkpoint skipped because the previous capability failed",
+                json!({
+                    "capability": invocation.capability,
+                    "reason": "previous_capability_failed",
+                    "previous_capability": results.last().map(|item| item.capability.clone()),
+                    "event_meta": event_meta(stage_execution_id.as_deref(), None, None, false)
+                }),
+            )
+            .await?;
+            continue;
+        }
+
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let before_decisions = governance::before_capability(
             ctx.state,
@@ -355,6 +374,10 @@ pub(crate) async fn execute_capability_chain(
     }
 
     Ok(results)
+}
+
+fn previous_capability_failed(results: &[CapabilityResult]) -> bool {
+    results.last().map(|item| !item.ok).unwrap_or(false)
 }
 
 fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation> {

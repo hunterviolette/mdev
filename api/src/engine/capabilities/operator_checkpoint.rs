@@ -56,6 +56,25 @@ pub async fn execute(
     let latest_result = prior_results.last();
     let latest_payload = latest_result.map(|result| result.payload.clone()).unwrap_or_else(|| json!({}));
 
+    if latest_result.map(|result| !result.ok).unwrap_or(false) {
+        return Ok(CapabilityResult {
+            ok: false,
+            capability: "operator_checkpoint".to_string(),
+            payload: json!({
+                "ok": false,
+                "mode": "operator_checkpoint",
+                "status": "skipped",
+                "needs_user_response": false,
+                "summary": "Operator checkpoint skipped because the previous capability failed.",
+                "message": "Operator checkpoint skipped because the previous capability failed.",
+                "stage_id": ctx.step.id,
+                "stage_type": ctx.step.step_type,
+                "prior_result": latest_payload
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        });
+    }
+
     let configured_options = config
         .get("available_dispositions")
         .or_else(|| config.get("options"));

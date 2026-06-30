@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Badge, Button, Card, Checkbox, Group, Modal, Select, Stack, Table, Text, Textarea, TextInput } from '@mantine/core';
 import type { WorkflowTemplate } from './api';
-import { applyPlannerImport, previewPlannerImport, refineSupervisorFeature, updateSupervisorPlan, type FeaturePlanItem, type PlannerImportAction, type PlannerImportPreviewResponse, type SupervisorRun } from './supervisor_api';
+import { applyPlannerImport, previewPlannerImport, refineSupervisorFeature, unscheduleSupervisorFeature, updateSupervisorPlan, type FeaturePlanItem, type PlannerImportAction, type PlannerImportPreviewResponse, type SupervisorRun, type UnscheduleSupervisorFeatureMode } from './supervisor_api';
 
 type Props = {
   opened: boolean;
@@ -52,7 +52,7 @@ function importStringArray(value: unknown): string[] {
 function importFeature(value: unknown, index: number): FeaturePlanItem {
   const item = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const status = importString(item.status);
-  const normalizedStatus: FeaturePlanItem['status'] = status === 'fine' || status === 'scheduled' || status === 'completed' ? status : 'rough';
+  const normalizedStatus: FeaturePlanItem['status'] = status === 'fine' || status === 'scheduled' || status === 'completed' || status === 'applied' ? status : 'rough';
   return {
     id: importString(item.id).trim() || crypto.randomUUID(),
     title: importString(item.title).trim() || `Feature ${index + 1}`,
@@ -79,6 +79,7 @@ function exportedPlannerFilename(run: SupervisorRun | null | undefined): string 
 }
 
 function definitionLabel(status: FeaturePlanItem['status']): string {
+  if (status === 'applied') return 'Applied';
   if (status === 'completed') return 'Completed';
   if (status === 'scheduled') return 'Scheduled';
   if (status === 'fine') return 'Fine';
@@ -86,6 +87,7 @@ function definitionLabel(status: FeaturePlanItem['status']): string {
 }
 
 function definitionBadgeColor(status: FeaturePlanItem['status']): string {
+  if (status === 'applied') return 'violet';
   if (status === 'completed') return 'green';
   if (status === 'scheduled') return 'blue';
   if (status === 'fine') return 'yellow';
@@ -95,6 +97,75 @@ function definitionBadgeColor(status: FeaturePlanItem['status']): string {
 function contextString(run: SupervisorRun, key: string): string | null {
   const value = run.context?.[key];
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+type PlannerDevelopmentInfo = {
+  scheduled: boolean;
+  sprintLabel: string;
+  workflowRunId: string | null;
+  workflowStatus: string;
+  patchPath: string | null;
+  featureCreatedAt: string | null;
+  featureRefinedAt: string | null;
+  developmentCompletedAt: string | null;
+  integrationCompletedAt: string | null;
+  appliedAt: string | null;
+};
+
+function shortValue(value: string | null | undefined): string {
+  if (!value) return '—';
+  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
+}
+
+function objectString(value: unknown, key: string): string | null {
+  if (!value || typeof value !== 'object') return null;
+  const objectValue = value as Record<string, unknown>;
+  const raw = objectValue[key];
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw : null;
+}
+
+function featureString(item: FeaturePlanItem, key: string): string | null {
+  const raw = (item as unknown as Record<string, unknown>)[key];
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw : null;
+}
+
+function contextRecord(run: SupervisorRun | null | undefined, key: string): Record<string, unknown> | null {
+  const raw = run?.context?.[key];
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+}
+
+function contextRecordString(run: SupervisorRun | null | undefined, recordKey: string, itemKey: string): string | null {
+  const record = contextRecord(run, recordKey);
+  if (!record) return null;
+  const raw = record[itemKey];
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw : null;
+}
+
+function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function developmentLabel(info: PlannerDevelopmentInfo, featureStatus: FeaturePlanItem['status']): string {
+  if (featureStatus === 'applied') return 'Applied';
+  if (featureStatus === 'completed') return 'Completed';
+  if (info.workflowStatus && info.workflowStatus !== '—') return info.workflowStatus;
+  if (info.scheduled) return 'Scheduled';
+  return 'Not scheduled';
+}
+
+function developmentBadgeColor(label: string): string {
+  if (['Applied', 'Completed', 'success', 'completed'].includes(label)) return 'green';
+  if (['error', 'failed'].includes(label)) return 'red';
+  if (['running', 'queued', 'Scheduled'].includes(label)) return 'blue';
+  if (['paused', 'waiting'].includes(label)) return 'yellow';
+  return 'gray';
+}
+
+function patchLabel(value: string | null | undefined): string {
+  return value ? 'Available' : '—';
 }
 
 const DEFAULT_REFINEMENT_TEMPLATE_NAME = 'Default refinement workflow';
@@ -121,6 +192,8 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
   const [expandedFeatureId, setExpandedFeatureId] = useState<string | null>(null);
   const [refinementTemplateId, setRefinementTemplateId] = useState<string | null>(null);
   const [featureFilter, setFeatureFilter] = useState<string>('all');
+  const [featureSearch, setFeatureSearch] = useState<string>('');
+  const [unscheduleTargetFeatureId, setUnscheduleTargetFeatureId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exportFeatureIds, setExportFeatureIds] = useState<Set<string>>(new Set());
   const [exportMode, setExportMode] = useState<'all' | 'selected'>('all');
@@ -132,13 +205,42 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
   const scheduledFeatureIds = useMemo(() => new Set((run?.execution_plan_items ?? []).map((item) => item.feature_plan_item_id)), [run?.execution_plan_items]);
   const visibleFeatures = useMemo(() => features.map((item, index) => ({ item, index })).filter(({ item }) => {
     const scheduled = scheduledFeatureIds.has(item.id);
+    const normalizedSearch = featureSearch.trim().toLowerCase();
+    const searchable = [item.id, item.title, item.summary, item.rough_summary ?? '', ...item.requirements, ...item.acceptance_criteria, ...item.implementation_notes, ...item.review_expectations, ...item.target_files_or_areas].join('\n').toLowerCase();
+    if (normalizedSearch && !searchable.includes(normalizedSearch)) return false;
     if (featureFilter === 'rough') return item.status === 'rough';
     if (featureFilter === 'fine') return item.status === 'fine';
     if (featureFilter === 'scheduled') return item.status === 'scheduled' || scheduled;
     if (featureFilter === 'completed') return item.status === 'completed';
-    if (featureFilter === 'unscheduled') return !scheduled && item.status !== 'completed';
+    if (featureFilter === 'applied') return item.status === 'applied';
+    if (featureFilter === 'has_workflow') return (run?.child_runs ?? []).some((child) => child.execution_item_id === item.id);
+    if (featureFilter === 'unscheduled') return !scheduled && item.status !== 'completed' && item.status !== 'applied';
     return true;
-  }), [features, featureFilter, scheduledFeatureIds]);
+  }), [features, featureFilter, featureSearch, scheduledFeatureIds, run?.child_runs]);
+  const expandedFeature = useMemo(() => features.find((item) => item.id === expandedFeatureId) ?? null, [features, expandedFeatureId]);
+  const expandedFeatureIndex = useMemo(() => expandedFeature ? features.findIndex((item) => item.id === expandedFeature.id) : -1, [features, expandedFeature]);
+  const unscheduleTargetFeature = useMemo(() => features.find((item) => item.id === unscheduleTargetFeatureId) ?? null, [features, unscheduleTargetFeatureId]);
+  const unscheduleTargetChild = useMemo(() => run?.child_runs.find((child) => child.execution_item_id === unscheduleTargetFeatureId) ?? null, [run?.child_runs, unscheduleTargetFeatureId]);
+  const developmentInfoByFeatureId = useMemo(() => {
+    const map = new Map<string, PlannerDevelopmentInfo>();
+    for (const item of features) {
+      const sprintItem = run?.execution_plan_items.find((entry) => entry.feature_plan_item_id === item.id) ?? null;
+      const child = run?.child_runs.find((entry) => entry.execution_item_id === item.id) ?? null;
+      map.set(item.id, {
+        scheduled: Boolean(sprintItem),
+        sprintLabel: sprintItem ? run?.title ?? 'Current sprint' : '—',
+        workflowRunId: child?.workflow_run_id ?? null,
+        workflowStatus: child?.status ?? '—',
+        patchPath: child?.patch_path ?? null,
+        featureCreatedAt: featureString(item, 'created_at') ?? contextRecordString(run, 'feature_created_at_by_id', item.id),
+        featureRefinedAt: featureString(item, 'refined_at') ?? contextRecordString(run, 'feature_refined_at_by_id', item.id) ?? (item.refinement_workflow_run_id ? contextRecordString(run, 'workflow_completed_at_by_id', item.refinement_workflow_run_id) : null),
+        developmentCompletedAt: featureString(item, 'development_completed_at') ?? objectString(child, 'completed_at') ?? (child?.workflow_run_id ? contextRecordString(run, 'workflow_completed_at_by_id', child.workflow_run_id) : null),
+        integrationCompletedAt: featureString(item, 'integration_completed_at') ?? (run ? contextString(run, 'integration_completed_at') : null) ?? (run ? contextRecordString(run, 'feature_integration_completed_at_by_id', item.id) : null),
+        appliedAt: featureString(item, 'applied_at') ?? (run ? contextRecordString(run, 'feature_applied_at_by_id', item.id) : null) ?? (item.status === 'applied' && run ? contextString(run, 'applied_at') : null)
+      });
+    }
+    return map;
+  }, [features, run?.execution_plan_items, run?.child_runs, run?.title]);
   const defaultRefinementTemplate = useMemo(() => templates.find((template) => template.name === DEFAULT_REFINEMENT_TEMPLATE_NAME) ?? null, [templates]);
   const effectiveRefinementTemplateId = refinementTemplateId ?? defaultRefinementTemplate?.id ?? null;
 
@@ -146,7 +248,9 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     if (!opened || !run) return;
     const nextFeatures = run.feature_plan_items ?? [];
     setFeatures(nextFeatures);
-    setExpandedFeatureId(nextFeatures[0]?.id ?? null);
+    setExpandedFeatureId(null);
+    setUnscheduleTargetFeatureId(null);
+    setFeatureSearch('');
     setRefinementTemplateId(contextString(run, 'planner_refinement_template_id') ?? contextString(run, 'workflow_template_id') ?? defaultRefinementTemplate?.id ?? null);
     setError(null);
     setImportPayload(null);
@@ -332,23 +436,30 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     }
   }
 
-  async function unscheduleFeature(featureId: string) {
+  async function unscheduleFeature(featureId: string, mode: UnscheduleSupervisorFeatureMode = 'preserve_development') {
     if (!run) return;
     setError(null);
     try {
-      const nextSprintItems = (run.execution_plan_items ?? [])
-        .filter((item) => item.feature_plan_item_id !== featureId)
-        .map((item, index) => ({ ...item, order_index: index }));
-      await updateSupervisorPlan(run.id, run.feature_plan_items ?? [], nextSprintItems, {
-        sprint_strategy: run.strategy,
-        workflow_template_id: contextString(run, 'workflow_template_id'),
-        integration_template_id: contextString(run, 'integration_template_id'),
-        planner_refinement_template_id: effectiveRefinementTemplateId
-      } as any);
+      const response = await unscheduleSupervisorFeature(run.id, featureId, mode);
+      setFeatures(response.supervisor_run.feature_plan_items ?? []);
+      setUnscheduleTargetFeatureId(null);
+      if (expandedFeatureId === featureId && mode === 'delete_development') {
+        setExpandedFeatureId(null);
+      }
       await onSaved();
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  function requestUnscheduleFeature(featureId: string) {
+    if (!run) return;
+    const child = run.child_runs.find((entry) => entry.execution_item_id === featureId);
+    if (child) {
+      setUnscheduleTargetFeatureId(featureId);
+      return;
+    }
+    void unscheduleFeature(featureId, 'preserve_development');
   }
 
   async function refineFeature(index: number) {
@@ -364,6 +475,12 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  async function openWorkflowRun(workflowRunId: string | null | undefined) {
+    if (!workflowRunId) return;
+    onClose();
+    await onWorkflowRunCreated?.(workflowRunId);
   }
 
   return (
@@ -384,6 +501,39 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
     >
       <Stack gap="md">
         {error ? <Alert color="red">{error}</Alert> : null}
+        <Modal opened={Boolean(unscheduleTargetFeatureId)} onClose={() => setUnscheduleTargetFeatureId(null)} title="Unschedule feature" centered>
+          <Stack gap="sm">
+            <Text size="sm">This feature already has a development workflow. Choose how to handle the existing work.</Text>
+            {unscheduleTargetFeature ? (
+              <Card withBorder>
+                <Stack gap={4}>
+                  <Text fw={700}>{unscheduleTargetFeature.title}</Text>
+                  <Text size="xs" c="dimmed">{unscheduleTargetFeature.id}</Text>
+                  <Badge w="fit-content" color={definitionBadgeColor(unscheduleTargetFeature.status)}>{definitionLabel(unscheduleTargetFeature.status)}</Badge>
+                  {unscheduleTargetChild?.workflow_run_id ? <Text size="xs" c="dimmed">Workflow: {unscheduleTargetChild.workflow_run_id}</Text> : null}
+                </Stack>
+              </Card>
+            ) : null}
+            <Card withBorder>
+              <Stack gap={4}>
+                <Text fw={700}>Preserve workflow</Text>
+                <Text size="sm" c="dimmed">Remove the feature from this sprint, but keep the workflow, implementation history, patch records, and planner relationship.</Text>
+              </Stack>
+            </Card>
+            <Card withBorder>
+              <Stack gap={4}>
+                <Text fw={700}>Delete workflow and restart later</Text>
+                <Text size="sm" c="dimmed">Remove the feature from this sprint and delete the development workflow so the feature can be scheduled again from scratch.</Text>
+              </Stack>
+            </Card>
+            {unscheduleTargetFeature?.status === 'applied' ? <Alert color="orange">Applied features cannot delete development until a revert flow exists.</Alert> : null}
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setUnscheduleTargetFeatureId(null)}>Cancel</Button>
+              <Button variant="light" onClick={() => unscheduleTargetFeatureId ? void unscheduleFeature(unscheduleTargetFeatureId, 'preserve_development') : undefined}>Preserve workflow</Button>
+              <Button color="red" disabled={unscheduleTargetFeature?.status === 'applied'} onClick={() => unscheduleTargetFeatureId ? void unscheduleFeature(unscheduleTargetFeatureId, 'delete_development') : undefined}>Delete workflow and restart</Button>
+            </Group>
+          </Stack>
+        </Modal>
         <Group justify="space-between">
           <Text size="sm" c="dimmed">{selectionMode ? 'Open, add, edit, save, or select a planner feature for this workflow.' : 'Create rough features as a single prompt. Refinement is handled by a design workflow that emits structured output back into this planner.'}</Text>
           <Group>
@@ -482,6 +632,13 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
             </Group>
             {features.length === 0 ? <Text size="sm" c="dimmed">No features yet.</Text> : null}
             <Group justify="space-between" align="flex-end">
+              <TextInput
+                label="Search features"
+                value={featureSearch}
+                onChange={(event) => setFeatureSearch(event.currentTarget.value)}
+                placeholder="Search name, id, summary, requirements"
+                w={360}
+              />
               <Select
                 label="Feature filter"
                 value={featureFilter}
@@ -492,6 +649,8 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
                   { value: 'fine', label: 'Fine' },
                   { value: 'scheduled', label: 'Scheduled' },
                   { value: 'completed', label: 'Completed' },
+                  { value: 'applied', label: 'Applied' },
+                  { value: 'has_workflow', label: 'Has workflow' },
                   { value: 'unscheduled', label: 'Unscheduled' }
                 ]}
                 allowDeselect={false}
@@ -512,9 +671,13 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
                   {exportMode === 'selected' ? <Table.Th>Download</Table.Th> : null}
                   <Table.Th>Feature</Table.Th>
                   <Table.Th>Definition</Table.Th>
+                  <Table.Th>Sprint</Table.Th>
+                  <Table.Th>Workflow</Table.Th>
+                  <Table.Th>Development</Table.Th>
+                  <Table.Th>Patch</Table.Th>
                   <Table.Th>Requirements</Table.Th>
                   <Table.Th>Acceptance criteria</Table.Th>
-                  <Table.Th />
+                  <Table.Th style={{ width: 300, textAlign: 'right' }}>Actions</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -535,22 +698,36 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
                       </Stack>
                     </Table.Td>
                     <Table.Td><Badge color={definitionBadgeColor(item.status)}>{definitionLabel(item.status)}</Badge></Table.Td>
+                    <Table.Td>{developmentInfoByFeatureId.get(item.id)?.sprintLabel ?? '—'}</Table.Td>
+                    <Table.Td>
+                      {developmentInfoByFeatureId.get(item.id)?.workflowRunId ? (
+                        <Button size="compact-xs" variant="subtle" onClick={() => void openWorkflowRun(developmentInfoByFeatureId.get(item.id)?.workflowRunId)}>{shortValue(developmentInfoByFeatureId.get(item.id)?.workflowRunId)}</Button>
+                      ) : '—'}
+                    </Table.Td>
+                    <Table.Td>
+                      {(() => {
+                        const info = developmentInfoByFeatureId.get(item.id) ?? { scheduled: false, sprintLabel: '—', workflowRunId: null, workflowStatus: '—', patchPath: null, featureCreatedAt: null, featureRefinedAt: null, developmentCompletedAt: null, integrationCompletedAt: null, appliedAt: null };
+                        const label = developmentLabel(info, item.status);
+                        return <Badge color={developmentBadgeColor(label)}>{label}</Badge>;
+                      })()}
+                    </Table.Td>
+                    <Table.Td>{patchLabel(developmentInfoByFeatureId.get(item.id)?.patchPath)}</Table.Td>
                     <Table.Td>{item.requirements.length}</Table.Td>
                     <Table.Td>{item.acceptance_criteria.length}</Table.Td>
-                    <Table.Td>
-                      <Group justify="flex-end" gap="xs">
-                        <Button size="xs" variant="light" onClick={() => setExpandedFeatureId(expandedFeatureId === item.id ? null : item.id)}>{expandedFeatureId === item.id ? 'Close' : 'Open'}</Button>
+                    <Table.Td style={{ width: 300 }}>
+                      <Group justify="flex-end" gap={6} wrap="nowrap">
+                        <Button size="compact-xs" variant="light" miw={58} onClick={() => setExpandedFeatureId(expandedFeatureId === item.id ? null : item.id)}>{expandedFeatureId === item.id ? 'Close' : 'Open'}</Button>
                         {selectionMode ? (
-                          <Button size="xs" variant={selectedFeatureId === item.id ? 'filled' : 'light'} onClick={() => onSelectFeature?.(item)}>{selectedFeatureId === item.id ? 'Selected' : 'Select'}</Button>
+                          <Button size="compact-xs" miw={68} variant={selectedFeatureId === item.id ? 'filled' : 'light'} onClick={() => onSelectFeature?.(item)}>{selectedFeatureId === item.id ? 'Selected' : 'Select'}</Button>
                         ) : (
                           <>
-                            <Button size="xs" variant="light" onClick={() => refineFeature(index)}>Refine</Button>
+                            <Button size="compact-xs" miw={62} variant="light" onClick={() => refineFeature(index)}>Refine</Button>
                             {scheduledFeatureIds.has(item.id) ? (
-                              <Button size="xs" variant="subtle" color="orange" onClick={() => unscheduleFeature(item.id)}>Unschedule</Button>
+                              <Button size="compact-xs" miw={86} variant="subtle" color="orange" onClick={() => requestUnscheduleFeature(item.id)}>Unschedule</Button>
                             ) : (
-                              <Button size="xs" variant="subtle" onClick={() => scheduleFeature(index)} disabled={item.status !== 'fine'}>Schedule</Button>
+                              <Button size="compact-xs" miw={76} variant="subtle" onClick={() => scheduleFeature(index)} disabled={item.status !== 'fine'}>Schedule</Button>
                             )}
-                            <Button size="xs" color="red" variant="subtle" onClick={() => removeFeature(index)}>Remove</Button>
+                            <Button size="compact-xs" miw={66} color="red" variant="subtle" onClick={() => removeFeature(index)}>Remove</Button>
                           </>
                         )}
                       </Group>
@@ -561,7 +738,12 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
             </Table>
           </Stack>
         </Card>
-        {features.map((item, index) => expandedFeatureId === item.id ? (
+        {expandedFeature && expandedFeatureIndex >= 0 ? (() => {
+          const item = expandedFeature;
+          const index = expandedFeatureIndex;
+          const developmentInfo = developmentInfoByFeatureId.get(item.id) ?? { scheduled: false, sprintLabel: '—', workflowRunId: null, workflowStatus: '—', patchPath: null, featureCreatedAt: null, featureRefinedAt: null, developmentCompletedAt: null, integrationCompletedAt: null, appliedAt: null };
+          const developmentStatusLabel = developmentLabel(developmentInfo, item.status);
+          return (
           <Card key={`detail-${item.id}-${index}`} withBorder>
             <Stack gap="xs">
               <Group justify="space-between">
@@ -571,8 +753,68 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               <Group grow>
                 <TextInput label="Feature id" value={item.id} onChange={(event) => updateFeature(index, { id: event.currentTarget.value })} />
                 <TextInput label="Title" value={item.title} onChange={(event) => updateFeature(index, { title: event.currentTarget.value })} />
-                <Select label="Feature status" value={item.status} onChange={(value) => updateFeature(index, { status: (value as FeaturePlanItem['status']) ?? 'rough' })} data={[{ value: 'rough', label: 'Rough' }, { value: 'fine', label: 'Fine' }, { value: 'scheduled', label: 'Scheduled' }, { value: 'completed', label: 'Completed' }]} />
+                <Select label="Feature status" value={item.status} onChange={(value) => updateFeature(index, { status: (value as FeaturePlanItem['status']) ?? 'rough' })} data={[{ value: 'rough', label: 'Rough' }, { value: 'fine', label: 'Fine' }, { value: 'scheduled', label: 'Scheduled' }, { value: 'completed', label: 'Completed' }, { value: 'applied', label: 'Applied' }]} />
               </Group>
+              <Card withBorder>
+                <Stack gap="xs">
+                  <Group justify="space-between">
+                    <Text fw={700}>Sprint development</Text>
+                    <Badge color={developmentBadgeColor(developmentStatusLabel)}>{developmentStatusLabel}</Badge>
+                  </Group>
+                  <Table withTableBorder withColumnBorders>
+                    <Table.Tbody>
+                      <Table.Tr>
+                        <Table.Th>Sprint</Table.Th>
+                        <Table.Td>{developmentInfo.sprintLabel}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Scheduled</Table.Th>
+                        <Table.Td>{developmentInfo.scheduled ? 'Yes' : 'No'}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Workflow run</Table.Th>
+                        <Table.Td>
+                          {developmentInfo.workflowRunId ? (
+                            <Button size="compact-xs" variant="subtle" onClick={() => void openWorkflowRun(developmentInfo.workflowRunId)}>{developmentInfo.workflowRunId}</Button>
+                          ) : '—'}
+                        </Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Workflow status</Table.Th>
+                        <Table.Td>{developmentInfo.workflowStatus}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Patch</Table.Th>
+                        <Table.Td>{patchLabel(developmentInfo.patchPath)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Patch source</Table.Th>
+                        <Table.Td>{developmentInfo.patchPath ?? '—'}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Feature created</Table.Th>
+                        <Table.Td>{formatDateTime(developmentInfo.featureCreatedAt)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Feature refined</Table.Th>
+                        <Table.Td>{formatDateTime(developmentInfo.featureRefinedAt)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Development completed</Table.Th>
+                        <Table.Td>{formatDateTime(developmentInfo.developmentCompletedAt)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Integration completed</Table.Th>
+                        <Table.Td>{formatDateTime(developmentInfo.integrationCompletedAt)}</Table.Td>
+                      </Table.Tr>
+                      <Table.Tr>
+                        <Table.Th>Applied</Table.Th>
+                        <Table.Td>{formatDateTime(developmentInfo.appliedAt)}</Table.Td>
+                      </Table.Tr>
+                    </Table.Tbody>
+                  </Table>
+                </Stack>
+              </Card>
               {item.status === 'rough' ? (
                 <Textarea label="Rough feature prompt" value={item.summary} onChange={(event) => updateFeature(index, { summary: event.currentTarget.value, rough_summary: event.currentTarget.value })} minRows={6} autosize />
               ) : (
@@ -601,7 +843,8 @@ export function SupervisorPlannerModal({ opened, run, templates, onClose, onSave
               </Group>
             </Stack>
           </Card>
-        ) : null)}
+          );
+        })() : null}
           </>
         )}
       </Stack>

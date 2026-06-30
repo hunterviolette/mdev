@@ -5,12 +5,10 @@ import {
   Box,
   Button,
   Card,
-  Checkbox,
   Divider,
   Group,
   Loader,
   Modal,
-  NumberInput,
   ScrollArea,
   Select,
   SegmentedControl,
@@ -18,15 +16,12 @@ import {
   Text,
   TextInput,
 } from '@mantine/core';
-import { DiffCode, inspectUnifiedPatch } from './DiffCode';
-import { DiffTree, type DiffTreeFile } from './DiffTree';
+import { DiffPanel, type DiffPanelState } from './DiffPanel';
 import {
-  getReviewCommitDiff,
   getReviewCommitDiffManifest,
   getReviewCommitReport,
   getReviewCommitOptions,
   type ReviewCommitDiffManifestResponse,
-  type ReviewCommitDiffResponse,
   type ReviewCommitSummary,
   type ReviewDiffManifestFileEntry,
   type ReviewCommitReportResponse,
@@ -35,7 +30,6 @@ import {
 
 const COMMIT_PAGE_SIZE = 75;
 const DEFAULT_COMMIT_ROW_HEIGHT = 44;
-const LARGE_SINGLE_FILE_RENDER_LINE_LIMIT = 8000;
 
 type DiffStyle = 'unified' | 'split';
 type CommitReportType = 'commits' | 'analytics';
@@ -98,17 +92,12 @@ type CommitSummaryPanelProps = {
   repoRef: string;
 };
 
-type CommitReviewState = {
-  selected_path: string | null;
-  diff_style: DiffStyle;
-  only_changes: boolean;
-  context_lines: number;
-  whole_file: boolean;
-};
+type CommitReviewState = DiffPanelState;
 
 const DEFAULT_REVIEW_STATE: CommitReviewState = {
+  selected_scope: 'staged',
   selected_path: null,
-  diff_style: 'unified',
+  diff_style: 'split',
   only_changes: true,
   context_lines: 4,
   whole_file: false,
@@ -125,22 +114,7 @@ function statusCode(file: ReviewDiffManifestFileEntry): string {
   return `${file.index_status}${file.worktree_status}`.replace(/\./g, '').trim() || 'M';
 }
 
-function clampContextLines(value: number | string | null | undefined): number {
-  const numeric = typeof value === 'number' ? value : Number(value ?? 4);
-  if (!Number.isFinite(numeric)) return 4;
-  return Math.max(0, Math.min(1000, Math.round(numeric)));
-}
 
-function sumCounts(files: ReviewDiffManifestFileEntry[]) {
-  return files.reduce(
-    (acc, file) => {
-      acc.additions += file.additions;
-      acc.deletions += file.deletions;
-      return acc;
-    },
-    { additions: 0, deletions: 0 }
-  );
-}
 
 
 function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null; mode: CommitAnalyticsMode }) {
@@ -470,21 +444,13 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [expandedSha, setExpandedSha] = useState<string | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<ReviewCommitSummary | null>(null);
   const [manifestBySha, setManifestBySha] = useState<Record<string, ReviewCommitDiffManifestResponse>>({});
-  const [diffManifest, setDiffManifest] = useState<ReviewCommitDiffManifestResponse | null>(null);
-  const [diff, setDiff] = useState<ReviewCommitDiffResponse | null>(null);
-  const [filePatchByPath, setFilePatchByPath] = useState<Record<string, string>>({});
-  const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
-  const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
-  const [collapsedTreeDirs, setCollapsedTreeDirs] = useState<Record<string, boolean>>({});
   const [reviewState, setReviewState] = useState<CommitReviewState>(DEFAULT_REVIEW_STATE);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [diffBusy, setDiffBusy] = useState(false);
   const [manifestBusySha, setManifestBusySha] = useState<string | null>(null);
   const [nextCommitOffset, setNextCommitOffset] = useState<number | null>(0);
   const [loadingMoreCommits, setLoadingMoreCommits] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const refreshDiffRequestIdRef = useRef(0);
   const commitScrollViewportRef = useRef<HTMLDivElement | null>(null);
   const commitItemNodeByShaRef = useRef<Record<string, HTMLDivElement | null>>({});
   const commitItemResizeObserverByShaRef = useRef<Record<string, ResizeObserver | undefined>>({});
@@ -650,45 +616,6 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     return commitItemMeasureRefByShaRef.current[sha];
   }, [updateCommitItemHeight]);
 
-  const selectedFilePatch = useMemo(() => {
-    if (!reviewState.selected_path || !diff?.patch?.trim()) return '';
-    return diff.patch;
-  }, [reviewState.selected_path, diff?.patch]);
-
-  const selectedFilePayloadInfo = useMemo(() => {
-    if (!reviewState.selected_path || !diff?.patch?.trim()) {
-      return { fileCount: 0, containsSelectedFile: false, isExactSelectedFilePayload: false, selectedUnifiedLineCount: 0 };
-    }
-    return inspectUnifiedPatch(diff.patch, reviewState.selected_path);
-  }, [reviewState.selected_path, diff?.patch]);
-
-  const commitDiffRows = useMemo(() => {
-    return (diffManifest?.files ?? []).map((file) => ({
-      file,
-      patch: filePatchByPath[file.path] ?? '',
-    }));
-  }, [diffManifest, filePatchByPath]);
-
-  const manifestFiles = diffManifest?.files ?? [];
-  const manifestTotals = useMemo(() => sumCounts(manifestFiles), [manifestFiles]);
-  const commitBrowserFiles = useMemo<DiffTreeFile[]>(() => manifestFiles.map((file) => ({
-    path: file.path,
-    status: statusCode(file),
-    additions: file.additions,
-    deletions: file.deletions,
-  })), [manifestFiles]);
-  const hasCommitDiffRows = commitDiffRows.length > 0;
-  const groupedCommitPatch = useMemo(() => {
-    return commitDiffRows
-      .filter(({ patch }) => patch.trim())
-      .map(({ patch }) => patch.trimEnd())
-      .join('\n');
-  }, [commitDiffRows]);
-  const groupedCommitPatchLoading = useMemo(() => {
-    return commitDiffRows.some(({ file }) => Boolean(filePatchBusyByPath[file.path]));
-  }, [commitDiffRows, filePatchBusyByPath]);
-  const allCommitRowsCollapsed = hasCommitDiffRows && commitDiffRows.every(({ file }) => collapsedByPath[file.path] !== false);
-
   function exportCommitAnalyticsCsv() {
     if (!commitReport) return;
     const buckets = commitReport.months ?? [];
@@ -796,84 +723,15 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     }
   }
 
-  async function refreshCommitDiff(commit: ReviewCommitSummary, nextState: CommitReviewState) {
-    if (!repoRef.trim()) return;
-    const requestId = ++refreshDiffRequestIdRef.current;
-
-    try {
-      setDiffBusy(true);
-      setError(null);
-      const manifest = await ensureManifest(commit);
-      if (refreshDiffRequestIdRef.current !== requestId) return;
-      setDiffManifest(manifest);
-      setSelectedCommit(commit);
-
-      if (nextState.selected_path) {
-        const json = await getReviewCommitDiff({
-          repo_ref: repoRef,
-          commit: commit.sha,
-          path: nextState.selected_path,
-          context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-          whole_file: nextState.whole_file,
-        });
-        if (refreshDiffRequestIdRef.current !== requestId) return;
-        setDiff(json);
-        setFilePatchByPath({});
-        setFilePatchBusyByPath({});
-        setCollapsedByPath({});
-        return;
-      }
-
-      setDiff(null);
-      setFilePatchByPath({});
-      setFilePatchBusyByPath(Object.fromEntries(manifest.files.map((file) => [file.path, true])));
-      setCollapsedByPath(Object.fromEntries(manifest.files.map((file) => [file.path, false])));
-      setCollapsedTreeDirs({});
-
-      const patchEntries = await Promise.all(
-        manifest.files.map(async (file) => {
-          try {
-            const json = await getReviewCommitDiff({
-              repo_ref: repoRef,
-              commit: commit.sha,
-              path: file.path,
-              context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-              whole_file: nextState.whole_file,
-            });
-            return [file.path, json.patch] as const;
-          } catch {
-            return [file.path, ''] as const;
-          }
-        })
-      );
-
-      if (refreshDiffRequestIdRef.current !== requestId) return;
-      setFilePatchByPath(Object.fromEntries(patchEntries));
-      setFilePatchBusyByPath({});
-    } catch (err) {
-      if (refreshDiffRequestIdRef.current !== requestId) return;
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      if (refreshDiffRequestIdRef.current === requestId) setDiffBusy(false);
-    }
-  }
-
   async function openCommitReview(commit: ReviewCommitSummary, selectedPath: string | null) {
-    const nextState = { ...reviewState, selected_path: selectedPath };
+    const nextState: CommitReviewState = {
+      ...reviewState,
+      selected_scope: 'staged',
+      selected_path: selectedPath,
+    };
     setSelectedCommit(commit);
     setReviewState(nextState);
     setReviewOpen(true);
-    await refreshCommitDiff(commit, nextState);
-  }
-
-  async function patchReviewState(patch: Partial<CommitReviewState>) {
-    const nextState: CommitReviewState = {
-      ...reviewState,
-      ...patch,
-      context_lines: patch.context_lines === undefined ? reviewState.context_lines : clampContextLines(patch.context_lines),
-    };
-    setReviewState(nextState);
-    if (selectedCommit && reviewOpen) await refreshCommitDiff(selectedCommit, nextState);
   }
 
   async function toggleExpanded(commit: ReviewCommitSummary) {
@@ -886,21 +744,6 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
         setError(err instanceof Error ? err.message : String(err));
       }
     }
-  }
-
-  function setAllCommitRowsCollapsed(collapsed: boolean) {
-    setCollapsedByPath(Object.fromEntries(commitDiffRows.map(({ file }) => [file.path, collapsed])));
-  }
-
-  function toggleCommitRowCollapsed(path: string) {
-    setCollapsedByPath((current) => ({ ...current, [path]: !(current[path] ?? false) }));
-  }
-
-  function toggleCommitTreeDir(path: string) {
-    setCollapsedTreeDirs((current) => ({
-      ...current,
-      [path]: !current[path],
-    }));
   }
 
   useEffect(() => {
@@ -973,199 +816,18 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   }, [maxCommitScrollTop]);
 
   const reviewContent = selectedCommit ? (
-    <Box style={{ height: '100%', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', gap: 12, minHeight: 0 }}>
-      <Card withBorder p="sm" style={{ minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <Group justify="space-between" align="center" mb="sm">
-          <Stack gap={2} style={{ minWidth: 0 }}>
-            <Group gap="xs" wrap="nowrap">
-              <Badge variant="outline">{selectedCommit.short_sha}</Badge>
-              {diffManifest ? <Badge variant="light">{diffManifest.from_ref.slice(0, 8)} → {diffManifest.to_ref.slice(0, 8)}</Badge> : null}
-            </Group>
-            <Text fw={700} style={{ wordBreak: 'break-word' }}>{reviewState.selected_path ?? selectedCommit.subject}</Text>
-          </Stack>
-          <Group gap="xs">
-            {!reviewState.selected_path && hasCommitDiffRows ? (
-              <Button size="xs" variant="default" onClick={() => setAllCommitRowsCollapsed(!allCommitRowsCollapsed)}>
-                {allCommitRowsCollapsed ? 'Expand all' : 'Collapse all'}
-              </Button>
-            ) : null}
-            <Button size="xs" variant="default" onClick={() => setReviewOpen(false)}>Close</Button>
-          </Group>
-        </Group>
-        <Divider mb="sm" />
-        <Box style={{ flex: 1, minHeight: 0 }}>
-          {diffBusy ? (
-            <Group justify="center" py="xl"><Loader /></Group>
-          ) : error ? (
-            <Alert color="red">{error}</Alert>
-          ) : reviewState.selected_path ? (
-            !selectedFilePayloadInfo.containsSelectedFile ? (
-              <Alert color="yellow" title="Selected file diff unavailable">
-                <Stack gap="sm">
-                  <Text size="sm">The selected file was not found in the current diff payload.</Text>
-                  <Group><Button size="xs" variant="filled" onClick={() => void patchReviewState({ selected_path: null })}>Open whole commit</Button></Group>
-                </Stack>
-              </Alert>
-            ) : !selectedFilePayloadInfo.isExactSelectedFilePayload ? (
-              <Alert color="yellow" title="Selected file diff is stale">
-                <Stack gap="sm">
-                  <Text size="sm">The current payload contains {selectedFilePayloadInfo.fileCount} file diffs, so it is not safe to render in selected-file mode.</Text>
-                  <Group><Button size="xs" variant="filled" onClick={() => void patchReviewState({ selected_path: null })}>Open whole commit</Button></Group>
-                </Stack>
-              </Alert>
-            ) : selectedFilePayloadInfo.selectedUnifiedLineCount > LARGE_SINGLE_FILE_RENDER_LINE_LIMIT ? (
-              <Alert color="yellow" title="Large single-file diff">
-                <Stack gap="sm">
-                  <Text size="sm">This patch is too large for the non-virtualized single-file renderer.</Text>
-                  <Group>
-                    <Button size="xs" variant="filled" onClick={() => void patchReviewState({ selected_path: null })}>Open whole commit</Button>
-                    <Button size="xs" variant="default" onClick={() => void patchReviewState({ whole_file: false })}>Reduce context</Button>
-                  </Group>
-                </Stack>
-              </Alert>
-            ) : selectedFilePatch ? (
-              <ScrollArea h="100%" type="auto">
-                <Box p={0} style={{ overflow: 'hidden' }}>
-                  <DiffCode patch={selectedFilePatch} diffStyle={reviewState.diff_style} />
-                </Box>
-              </ScrollArea>
-            ) : (
-              <Text size="sm" c="dimmed">No diff available for this commit selection.</Text>
-            )
-          ) : hasCommitDiffRows ? (
-            <Box style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {groupedCommitPatch.trim() ? (
-                <Box style={{ flex: 1, minHeight: 0 }}>
-                  <DiffCode
-                    patch={groupedCommitPatch}
-                    diffStyle={reviewState.diff_style}
-                    collapsedPaths={collapsedByPath}
-                    onToggleFile={toggleCommitRowCollapsed}
-                  />
-                </Box>
-              ) : groupedCommitPatchLoading ? (
-                <Group justify="center" py="xl"><Loader size="sm" /></Group>
-              ) : (
-                <Text size="sm" c="dimmed">No expanded file diffs available.</Text>
-              )}
-            </Box>
-          ) : (
-            <Text size="sm" c="dimmed">No diff available for this commit selection.</Text>
-          )}
-        </Box>
-      </Card>
-
-      <Card withBorder p="sm" style={{ minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <Stack gap="sm" style={{ minHeight: 0 }}>
-          <Group justify="space-between" align="center">
-            <Text fw={700}>Diff browser</Text>
-            <Button size="xs" variant="subtle" onClick={() => setReviewOpen(false)}>Hide</Button>
-          </Group>
-          <SegmentedControl
-            value={reviewState.diff_style}
-            onChange={(value) => void patchReviewState({ diff_style: value as DiffStyle })}
-            data={[{ label: 'Unified', value: 'unified' }, { label: 'Split', value: 'split' }]}
-            fullWidth
-          />
-          <Group>
-            <Checkbox
-              checked={reviewState.only_changes && !reviewState.whole_file}
-              onChange={(event) => void patchReviewState({
-                only_changes: event.currentTarget.checked,
-                whole_file: event.currentTarget.checked ? false : reviewState.whole_file,
-              })}
-              label="Only show changes"
-            />
-            <Checkbox
-              checked={reviewState.whole_file}
-              onChange={(event) => void patchReviewState({
-                whole_file: event.currentTarget.checked,
-                only_changes: event.currentTarget.checked ? false : reviewState.only_changes,
-              })}
-              label="Whole file"
-            />
-          </Group>
-          <NumberInput
-            label="Context lines"
-            min={0}
-            max={1000}
-            step={1}
-            value={reviewState.context_lines}
-            disabled={reviewState.whole_file}
-            onChange={(value) => void patchReviewState({ context_lines: clampContextLines(value) })}
-          />
-        </Stack>
-
-        <Card withBorder p={6} mt="sm" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-          <Box
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) auto',
-              gap: 6,
-              alignItems: 'center',
-              padding: 4,
-              borderRadius: 7,
-              background: reviewState.selected_path === null ? 'rgba(34, 139, 230, 0.14)' : 'rgba(255,255,255,0.025)',
-              border: reviewState.selected_path === null ? '1px solid rgba(34, 139, 230, 0.34)' : '1px solid rgba(255,255,255,0.07)',
-            }}
-          >
-            <Box
-              onClick={() => void patchReviewState({ selected_path: null })}
-              style={{
-                minWidth: 0,
-                height: 24,
-                cursor: 'pointer',
-                display: 'grid',
-                gridTemplateColumns: 'minmax(0, 1fr) auto auto auto',
-                gap: 6,
-                alignItems: 'center',
-                paddingInline: 6,
-                borderRadius: 5,
-              }}
-            >
-              <Text size="sm" fw={800} truncate>Commit</Text>
-              <Badge size="xs" variant={reviewState.selected_path === null ? 'filled' : 'light'}>{manifestFiles.length}</Badge>
-              <Badge size="xs" color="green" variant="light">+{manifestTotals.additions}</Badge>
-              <Badge size="xs" color="red" variant="light">-{manifestTotals.deletions}</Badge>
-            </Box>
-            <Button
-              size="compact-xs"
-              variant={reviewState.selected_path === null ? 'filled' : 'subtle'}
-              onClick={() => void patchReviewState({ selected_path: null })}
-              style={{ height: 24, minHeight: 24 }}
-            >
-              {reviewState.selected_path === null ? 'Viewing' : 'View all'}
-            </Button>
-          </Box>
-
-          {!reviewState.selected_path && hasCommitDiffRows ? (
-            <Group gap={6} mt={6} mb={4} wrap="nowrap">
-              <Button size="compact-xs" variant="default" onClick={() => setAllCommitRowsCollapsed(false)}>Expand all</Button>
-              <Button size="compact-xs" variant="default" onClick={() => setAllCommitRowsCollapsed(true)}>Collapse all</Button>
-              <Badge size="xs" variant="light">{commitDiffRows.filter(({ file }) => collapsedByPath[file.path] === false).length}/{commitDiffRows.length} files expanded</Badge>
-              {groupedCommitPatchLoading ? <Badge size="xs" variant="light">Loading patches…</Badge> : null}
-            </Group>
-          ) : null}
-
-          <Box style={{ flex: 1, minHeight: 0 }}>
-            <ScrollArea h="100%" type="auto">
-              <Box pr="xs">
-                <DiffTree
-                  files={commitBrowserFiles}
-                  selectedPath={reviewState.selected_path}
-                  collapsedDirs={collapsedTreeDirs}
-                  actionLabel="View"
-                  activeActionLabel="Viewing"
-                  onToggleDir={toggleCommitTreeDir}
-                  onSelectFile={(path) => void patchReviewState({ selected_path: path })}
-                  onFileAction={(path) => void patchReviewState({ selected_path: path })}
-                />
-              </Box>
-            </ScrollArea>
-          </Box>
-        </Card>
-      </Card>
-    </Box>
+    <DiffPanel
+      runId={null}
+      repoRef={repoRef}
+      state={reviewState}
+      onPersistState={async (nextState) => setReviewState(nextState)}
+      forceViewerOpen
+      mode="commit"
+      commitSha={selectedCommit.sha}
+      commitTitle={selectedCommit.subject}
+      commitSubtitle={selectedCommit.short_sha}
+      onClose={() => setReviewOpen(false)}
+    />
   ) : null;
 
   return (

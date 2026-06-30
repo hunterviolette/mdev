@@ -204,6 +204,7 @@ pub async fn spawn_integration_workflow(
             }
             if let Some(obj) = step.config.as_object_mut() {
                 obj.insert("patches".to_string(), Value::Array(patch_paths.clone()));
+                obj.insert("supervisor_run_id".to_string(), supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -213,7 +214,8 @@ pub async fn spawn_integration_workflow(
         "workflow_engine": {
             "global_state": {
                 "supervisor": {
-                    "patches": patch_paths
+                    "patches": patch_paths,
+                    "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
                 }
             }
         }

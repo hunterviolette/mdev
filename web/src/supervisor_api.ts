@@ -35,6 +35,18 @@ export type SupervisorChildRun = {
   patch_path?: string | null;
 };
 
+export type SupervisorFeatureWorkflow = {
+  feature_id: string;
+  title: string;
+  shard_path?: string | null;
+  workflow_run_id?: string | null;
+  status: string;
+  development_state?: string | null;
+  current_step_id?: string | null;
+  current_patch_id?: string | null;
+  last_error?: string | null;
+};
+
 export type SupervisorRun = {
   id: string;
   strategy: SupervisorExecutionStrategy;
@@ -46,6 +58,7 @@ export type SupervisorRun = {
   feature_plan_items: FeaturePlanItem[];
   execution_plan_items: ExecutionPlanItem[];
   child_runs: SupervisorChildRun[];
+  feature_workflows: SupervisorFeatureWorkflow[];
   integration_run_id?: string | null;
   final_patch_path?: string | null;
   merge_report: Record<string, unknown>;
@@ -139,18 +152,28 @@ function completedFeatureIds(run: SupervisorRun): Set<string> {
 }
 
 function normalizeSupervisorRun(run: SupervisorRun): SupervisorRun {
-  const scheduledIds = new Set((run.execution_plan_items ?? []).map((item) => item.feature_plan_item_id));
+  const executionPlanItems = Array.isArray(run.execution_plan_items) ? run.execution_plan_items : [];
+  const featurePlanItems = Array.isArray(run.feature_plan_items) ? run.feature_plan_items : [];
+  const childRuns = Array.isArray(run.child_runs) ? run.child_runs : [];
+  const featureWorkflows = Array.isArray(run.feature_workflows) ? run.feature_workflows : [];
+  const scheduledIds = new Set(executionPlanItems.map((item) => item.feature_plan_item_id));
   const completedIds = completedFeatureIds(run);
   return {
     ...run,
-    feature_plan_items: (run.feature_plan_items ?? []).map((item) => {
+    feature_plan_items: featurePlanItems.map((item) => {
       const status = canonicalFeatureStatus(item.status);
       return {
         ...item,
         status: completedIds.has(item.id) ? 'completed' : scheduledIds.has(item.id) ? 'scheduled' : status,
         dependencies: []
       };
-    })
+    }),
+    execution_plan_items: executionPlanItems,
+    child_runs: childRuns,
+    feature_workflows: featureWorkflows,
+    merge_report: run.merge_report ?? {},
+    validation_report: run.validation_report ?? {},
+    context: run.context ?? {}
   };
 }
 
@@ -252,6 +275,24 @@ export type RefineSupervisorFeatureResponse = {
   workflow_run_id: string;
 };
 
+export type UnscheduleSupervisorFeatureMode = 'preserve_development' | 'delete_development';
+
+export type UnscheduleSupervisorFeatureResponse = {
+  ok: boolean;
+  supervisor_run: SupervisorRun;
+};
+
+export async function unscheduleSupervisorFeature(id: string, featureId: string, mode: UnscheduleSupervisorFeatureMode): Promise<UnscheduleSupervisorFeatureResponse> {
+  const response = await runSupervisorAction(id, 'unschedule_feature', {
+    feature_id: featureId,
+    mode
+  });
+  return {
+    ...response,
+    supervisor_run: normalizeSupervisorRun(response.supervisor_run as SupervisorRun)
+  } as UnscheduleSupervisorFeatureResponse;
+}
+
 export async function refineSupervisorFeature(id: string, featureId: string, workflowTemplateId?: string | null): Promise<RefineSupervisorFeatureResponse> {
   return runSupervisorAction(id, 'refine_feature', {
     feature_id: featureId,
@@ -259,12 +300,19 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'remove_child_workflow', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'unschedule_feature' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'remove_child_workflow', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, payload })
   });
   if (!response.ok) throw new Error(await response.text());
-  return response.json();
+  const result = await response.json();
+  if (result && typeof result === 'object' && result.supervisor_run) {
+    return {
+      ...result,
+      supervisor_run: normalizeSupervisorRun(result.supervisor_run as SupervisorRun)
+    };
+  }
+  return result;
 }

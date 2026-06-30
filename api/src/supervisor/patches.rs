@@ -1,4 +1,4 @@
-use std::{fs, path::{Path, PathBuf}, process::Command};
+use std::{collections::hash_map::DefaultHasher, fs, hash::{Hash, Hasher}, path::{Path, PathBuf}, process::{Command, Stdio}, io::Write};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -11,7 +11,7 @@ pub fn create_baseline(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn generate_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
+pub fn generate_patch_text(repo_path: &Path) -> Result<String> {
     run(repo_path, "git", &["add", "-A", "--", ".", ":(exclude).mdev", ":(exclude).mdev/**"])?;
 
     let output = Command::new("git")
@@ -26,58 +26,88 @@ pub fn generate_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
     let unstage_result = run(repo_path, "git", &["reset", "-q", "HEAD", "--", "."]);
 
     if !output.status.success() {
+        let _ = unstage_result;
         return Err(anyhow!(String::from_utf8_lossy(&output.stderr).to_string()));
     }
 
     unstage_result?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
 
+pub fn generate_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
+    let patch_text = generate_patch_text(repo_path)?;
     if let Some(parent) = patch_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    fs::write(patch_path, output.stdout)?;
+    fs::write(patch_path, patch_text)?;
     Ok(())
 }
 
-pub fn apply_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
-    let git_dir_output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
-        .current_dir(repo_path)
-        .output()
-        .with_context(|| format!("failed to resolve git dir for {}", repo_path.display()))?;
-    if !git_dir_output.status.success() {
-        return Err(anyhow!(String::from_utf8_lossy(&git_dir_output.stderr).to_string()));
+pub fn current_head(repo_path: &Path) -> Result<Option<String>> {
+    match run(repo_path, "git", &["rev-parse", "HEAD"]) {
+        Ok(value) => Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty())),
+        Err(_) => Ok(None),
+    }
+}
+
+pub fn patch_content_hash(contents: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub fn apply_patch_text(repo_path: &Path, patch_text: &str) -> Result<()> {
+    if patch_text.trim().is_empty() {
+        return Ok(());
     }
 
-    let git_dir_text = String::from_utf8_lossy(&git_dir_output.stdout).trim().to_string();
-    let git_dir_path = PathBuf::from(git_dir_text.as_str());
-    let index_path = if git_dir_path.is_absolute() {
-        git_dir_path
-    } else {
-        repo_path.join(git_dir_path)
-    }.join("index");
-    let backup_path = std::env::temp_dir().join(format!("workflow-index-{}.backup", uuid::Uuid::new_v4()));
-    std::fs::copy(&index_path, &backup_path)
-        .with_context(|| format!("failed to snapshot git index for {}", repo_path.display()))?;
+    run_git_apply_stdin(repo_path, patch_text, &["apply", "--check", "--whitespace=nowarn", "-"])
+        .with_context(|| format!("patch check failed in {}", repo_path.display()))?;
 
-    let output = Command::new("git")
-        .arg("apply")
-        .arg("--3way")
-        .arg(patch_path)
+    run_git_apply_stdin(repo_path, patch_text, &["apply", "--whitespace=nowarn", "-"])
+        .with_context(|| format!("patch apply failed in {}", repo_path.display()))?;
+
+    Ok(())
+}
+
+fn run_git_apply_stdin(repo_path: &Path, patch_text: &str, args: &[&str]) -> Result<()> {
+    let mut child = Command::new("git")
+        .args(args)
         .current_dir(repo_path)
-        .output()
-        .with_context(|| format!("failed to apply {}", patch_path.display()))?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start git {} in {}", args.join(" "), repo_path.display()))?;
 
-    let restore_result = std::fs::copy(&backup_path, &index_path);
-    let _ = std::fs::remove_file(&backup_path);
-    restore_result.with_context(|| format!("failed to restore git index after applying patch {}", patch_path.display()))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(patch_text.as_bytes())?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to run git {} in {}", args.join(" "), repo_path.display()))?;
 
     if output.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(String::from_utf8_lossy(&output.stderr).to_string()))
+        return Ok(());
     }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("git {} failed", args.join(" ")),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{}\n{}", stdout, stderr),
+    };
+    Err(anyhow!(message))
+}
+
+pub fn apply_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
+    let patch_text = fs::read_to_string(patch_path)
+        .with_context(|| format!("failed to read patch {}", patch_path.display()))?;
+    apply_patch_text(repo_path, &patch_text)
+        .with_context(|| format!("failed to apply patch {}", patch_path.display()))
 }
 
 pub fn apply_final_patch_to_root(root_repo_path: &Path, final_patch_path: &Path) -> Result<()> {

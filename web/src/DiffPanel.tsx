@@ -24,6 +24,8 @@ import {
   getReviewDiff,
   getReviewDiffManifest,
   getReviewFilePatch,
+  getReviewCommitDiff,
+  getReviewCommitDiffManifest,
   discardWorkflowReviewDiff,
   getReviewStatus,
   stageReviewDiff,
@@ -31,6 +33,8 @@ import {
   type ReviewDiffManifestFileEntry,
   type ReviewDiffManifestResponse,
   type ReviewDiffResponse,
+  type ReviewCommitDiffManifestResponse,
+  type ReviewCommitDiffResponse,
   type ReviewDiffScope,
   type ReviewStatusFileEntry,
 } from './api';
@@ -50,6 +54,11 @@ type DiffPanelProps = {
   state: DiffPanelState;
   onPersistState: (next: DiffPanelState) => Promise<void>;
   forceViewerOpen?: boolean;
+  mode?: 'worktree' | 'commit';
+  commitSha?: string | null;
+  commitTitle?: string;
+  commitSubtitle?: string;
+  onClose?: () => void;
 };
 
 const MIN_SIDEBAR_WIDTH = 280;
@@ -73,7 +82,7 @@ function clampSidebarWidth(value: number | null | undefined): number {
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.round(numeric)));
 }
 
-function sumCounts(files: ReviewStatusFileEntry[]) {
+function sumCounts(files: Array<{ additions: number; deletions: number }>) {
   return files.reduce(
     (acc, file) => {
       acc.additions += file.additions;
@@ -99,8 +108,8 @@ function ScopeHeader(props: {
   additions: number;
   deletions: number;
   compactCounts: boolean;
-  buttonLabel: string;
-  buttonTooltip: string;
+  buttonLabel?: string;
+  buttonTooltip?: string;
   actionBusy: boolean;
   extraAction?: JSX.Element | null;
   onSelect: () => void;
@@ -141,19 +150,21 @@ function ScopeHeader(props: {
         {!compactCounts ? <Badge size="xs" color="green" variant="light">+{additions}</Badge> : null}
         {!compactCounts ? <Badge size="xs" color="red" variant="light">-{deletions}</Badge> : null}
       </Box>
-      <Tooltip label={buttonTooltip} withArrow>
-        <ActionIcon
-          size="sm"
-          variant="outline"
-          color="blue"
-          loading={actionBusy}
-          aria-label={buttonTooltip}
-          onClick={() => void onAction()}
-          style={{ width: 28, height: 24, minWidth: 28 }}
-        >
-          <Text size="xs" fw={800}>{buttonLabel}</Text>
-        </ActionIcon>
-      </Tooltip>
+      {buttonLabel && buttonTooltip ? (
+        <Tooltip label={buttonTooltip} withArrow>
+          <ActionIcon
+            size="sm"
+            variant="outline"
+            color="blue"
+            loading={actionBusy}
+            aria-label={buttonTooltip}
+            onClick={() => void onAction()}
+            style={{ width: 28, height: 24, minWidth: 28 }}
+          >
+            <Text size="xs" fw={800}>{buttonLabel}</Text>
+          </ActionIcon>
+        </Tooltip>
+      ) : null}
       {extraAction ?? null}
     </Box>
   );
@@ -303,6 +314,7 @@ function FileTreeRow(props: {
   onStage: (path: string) => Promise<void>;
   onUnstage: (path: string) => Promise<void>;
   onDiscard: (path: string) => void;
+  readOnly?: boolean;
 }) {
   const {
     node,
@@ -319,6 +331,7 @@ function FileTreeRow(props: {
     onStage,
     onUnstage,
     onDiscard,
+    readOnly = false,
   } = props;
 
   const indent = depth * 13;
@@ -389,6 +402,7 @@ function FileTreeRow(props: {
             onStage={onStage}
             onUnstage={onUnstage}
             onDiscard={onDiscard}
+            readOnly={readOnly}
           />
         )) : null}
       </>
@@ -396,7 +410,6 @@ function FileTreeRow(props: {
   }
 
   const active = selectedPath === node.path;
-  const directorySelected = selectedDirectoryPath ? node.path.startsWith(`${selectedDirectoryPath}/`) : false;
   const file = node.file;
   return (
     <Box
@@ -421,7 +434,7 @@ function FileTreeRow(props: {
       <Text size="xs" fw={active ? 900 : scopeActive ? 700 : 600} c={active ? 'yellow.0' : undefined} truncate>{node.name}</Text>
       <Text size="xs" c="green" fw={700}>+{node.additions}</Text>
       <Text size="xs" c="red" fw={700}>-{node.deletions}</Text>
-      {scope === 'unstaged' ? (
+      {readOnly ? null : scope === 'unstaged' ? (
         <Group gap={2} wrap="nowrap">
           <Tooltip label="Stage file" withArrow>
             <ActionIcon
@@ -492,6 +505,7 @@ function FileTree(props: {
   onStage: (path: string) => Promise<void>;
   onUnstage: (path: string) => Promise<void>;
   onDiscard: (path: string) => void;
+  readOnly?: boolean;
 }) {
   const { nodes, ...rest } = props;
   return (
@@ -504,7 +518,8 @@ function FileTree(props: {
 }
 
 export function DiffPanel(props: DiffPanelProps) {
-  const { runId, repoRef, state, onPersistState, forceViewerOpen = false } = props;
+  const { runId, repoRef, state, onPersistState, forceViewerOpen = false, mode = 'worktree' } = props;
+  const commitMode = mode === 'commit';
   const [statusBusy, setStatusBusy] = useState(false);
   const [diffBusy, setDiffBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
@@ -513,7 +528,7 @@ export function DiffPanel(props: DiffPanelProps) {
   const [stagedFiles, setStagedFiles] = useState<ReviewStatusFileEntry[]>([]);
   const [unstagedFiles, setUnstagedFiles] = useState<ReviewStatusFileEntry[]>([]);
   const [branchSummary, setBranchSummary] = useState<string>('');
-  const [diff, setDiff] = useState<ReviewDiffResponse | null>(null);
+  const [diff, setDiff] = useState<ReviewDiffResponse | ReviewCommitDiffResponse | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [sidebarHidden, setSidebarHidden] = useState(false);
@@ -521,7 +536,7 @@ export function DiffPanel(props: DiffPanelProps) {
   const [sidebarWidthDraft, setSidebarWidthDraft] = useState<number | null>(null);
   const resizeFrame = useRef<number | null>(null);
   const refreshDiffRequestIdRef = useRef(0);
-  const [diffManifest, setDiffManifest] = useState<ReviewDiffManifestResponse | null>(null);
+  const [diffManifest, setDiffManifest] = useState<ReviewDiffManifestResponse | ReviewCommitDiffManifestResponse | null>(null);
   const [filePatchByPath, setFilePatchByPath] = useState<Record<string, string>>({});
   const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
   const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
@@ -546,12 +561,15 @@ export function DiffPanel(props: DiffPanelProps) {
   const selectedFile = state.selected_path
     ? selectedScopeFiles.find((file) => file.path === state.selected_path) ?? null
     : null;
-  const selectedTitle = selectedFile?.path ?? (state.selected_scope === 'staged' ? 'Staged diff' : 'Unstaged diff');
+  const selectedTitle = selectedFile?.path ?? (commitMode ? props.commitTitle || 'Commit diff' : state.selected_scope === 'staged' ? 'Staged diff' : 'Unstaged diff');
+  const selectedScopeTotals = useMemo(() => sumCounts(selectedScopeFiles), [selectedScopeFiles]);
   const selectedTotals = selectedFile
     ? { additions: selectedFile.additions, deletions: selectedFile.deletions }
-    : state.selected_scope === 'staged'
-      ? stagedTotals
-      : unstagedTotals;
+    : commitMode
+      ? selectedScopeTotals
+      : state.selected_scope === 'staged'
+        ? stagedTotals
+        : unstagedTotals;
   const renderedDiffFileKeys = useMemo(
     () => selectedScopeFiles.map((file) => file.path),
     [selectedScopeFiles]
@@ -608,6 +626,14 @@ export function DiffPanel(props: DiffPanelProps) {
   const hasScopeDiffRows = visibleScopeDiffRows.length > 0;
   const allScopeRowsCollapsed = hasScopeDiffRows && visibleScopeDiffRows.every(({ file }) => collapsedByPath[file.path] !== false);
 
+  useEffect(() => {
+    if (state.selected_path !== null) return;
+    const firstVisiblePath = visibleScopeDiffRows.find(({ patch }) => patch.trim())?.file.path ?? visibleScopeDiffRows[0]?.file.path ?? null;
+    if (activeScrollPath === firstVisiblePath) return;
+    if (activeScrollPath && visibleScopeDiffRows.some(({ file }) => file.path === activeScrollPath)) return;
+    setActiveScrollPath(firstVisiblePath);
+  }, [state.selected_path, visibleScopeDiffRows, activeScrollPath]);
+
   function setAllScopeRowsCollapsed(collapsed: boolean) {
     setCollapsedByPath(
       Object.fromEntries(visibleScopeDiffRows.map(({ file }) => [file.path, collapsed]))
@@ -654,6 +680,7 @@ export function DiffPanel(props: DiffPanelProps) {
   }, [selectedFilePayloadInfo]);
 
   async function refreshStatus() {
+    if (commitMode) return;
     if (!repoRef.trim()) return;
     try {
       setStatusBusy(true);
@@ -731,6 +758,64 @@ export function DiffPanel(props: DiffPanelProps) {
     setFilePatchBusyByPath({});
   }
 
+  async function refreshCommitFilePatches(
+    nextState: DiffPanelState,
+    files: ReviewDiffManifestFileEntry[],
+    requestId: number
+  ) {
+    const commitSha = props.commitSha?.trim() ?? '';
+    if (!repoRef.trim() || !commitSha || nextState.selected_path || files.length === 0) {
+      if (refreshDiffRequestIdRef.current !== requestId) {
+        return;
+      }
+      setFilePatchByPath({});
+      setFilePatchBusyByPath({});
+      setCollapsedByPath({});
+      return;
+    }
+
+    const busy: Record<string, boolean> = {};
+    const collapsed: Record<string, boolean> = {};
+    for (const file of files) {
+      busy[file.path] = true;
+      collapsed[file.path] = false;
+    }
+    if (refreshDiffRequestIdRef.current !== requestId) {
+      return;
+    }
+    setFilePatchByPath({});
+    setFilePatchBusyByPath(busy);
+    setCollapsedByPath(collapsed);
+
+    const patchEntries = await Promise.all(
+      files.map(async (file) => {
+        try {
+          const json = await getReviewCommitDiff({
+            repo_ref: repoRef,
+            commit: commitSha,
+            path: file.path,
+            context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
+            whole_file: nextState.whole_file,
+          });
+          return [file.path, json.patch] as const;
+        } catch {
+          return [file.path, ''] as const;
+        }
+      })
+    );
+
+    if (refreshDiffRequestIdRef.current !== requestId) {
+      return;
+    }
+
+    const nextPatchByPath: Record<string, string> = {};
+    for (const [path, patch] of patchEntries) {
+      nextPatchByPath[path] = patch;
+    }
+    setFilePatchByPath(nextPatchByPath);
+    setFilePatchBusyByPath({});
+  }
+
   async function refreshDiff(nextState: DiffPanelState) {
     if (!repoRef.trim() || !viewerOpen) return;
 
@@ -740,6 +825,61 @@ export function DiffPanel(props: DiffPanelProps) {
       setDiffBusy(true);
       setDiffError(null);
 
+      if (commitMode) {
+        const commitSha = props.commitSha?.trim() ?? '';
+        if (!commitSha) {
+          setDiffManifest(null);
+          setDiff(null);
+          setFilePatchByPath({});
+          setFilePatchBusyByPath({});
+          setCollapsedByPath({});
+          setStagedFiles([]);
+          setUnstagedFiles([]);
+          setDiffError('Commit SHA is required.');
+          return;
+        }
+
+        const manifest = await getReviewCommitDiffManifest({
+          repo_ref: repoRef,
+          commit: commitSha,
+        });
+        if (refreshDiffRequestIdRef.current !== requestId) {
+          return;
+        }
+        const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
+        const visibleFiles = directoryPath
+          ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
+          : manifest.files;
+        setDiffManifest(manifest);
+        setStagedFiles(manifest.files);
+        setUnstagedFiles([]);
+        setBranchSummary('');
+
+        if (nextState.selected_path) {
+          const json = await getReviewCommitDiff({
+            repo_ref: repoRef,
+            commit: commitSha,
+            path: nextState.selected_path,
+            context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
+            whole_file: nextState.whole_file,
+          });
+          if (refreshDiffRequestIdRef.current !== requestId) {
+            return;
+          }
+          setDiff(json);
+          setFilePatchByPath({});
+          setFilePatchBusyByPath({});
+          return;
+        }
+
+        setDiff(null);
+        if (refreshDiffRequestIdRef.current === requestId) {
+          setDiffBusy(false);
+        }
+        await refreshCommitFilePatches(nextState, visibleFiles, requestId);
+        return;
+      }
+
       const manifest = await getReviewDiffManifest({
         repo_ref: repoRef,
         scope: nextState.selected_scope,
@@ -748,13 +888,10 @@ export function DiffPanel(props: DiffPanelProps) {
         return;
       }
       const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
-      const visibleManifest = directoryPath
-        ? {
-          ...manifest,
-          files: manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`)),
-        }
-        : manifest;
-      setDiffManifest(visibleManifest);
+      const visibleFiles = directoryPath
+        ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
+        : manifest.files;
+      setDiffManifest(manifest);
 
       if (nextState.selected_path) {
         const json = await getReviewDiff({
@@ -777,7 +914,7 @@ export function DiffPanel(props: DiffPanelProps) {
       if (refreshDiffRequestIdRef.current === requestId) {
         setDiffBusy(false);
       }
-      await refreshScopeFilePatches(nextState, visibleManifest.files, requestId);
+      await refreshScopeFilePatches(nextState, visibleFiles, requestId);
       return;
     } catch (err) {
       if (refreshDiffRequestIdRef.current !== requestId) {
@@ -900,7 +1037,7 @@ export function DiffPanel(props: DiffPanelProps) {
     if (viewerOpen) {
       void refreshDiff(state);
     }
-  }, [repoRef, viewerOpen, state.selected_scope, state.selected_path, state.context_lines, state.whole_file]);
+  }, [repoRef, viewerOpen, state.selected_scope, state.selected_path, state.context_lines, state.whole_file, mode, props.commitSha]);
 
 
   useEffect(() => {
@@ -979,11 +1116,12 @@ export function DiffPanel(props: DiffPanelProps) {
         <Card withBorder p={6} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <Group justify="space-between" align="center" mb={4} wrap="nowrap">
             <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-              <Button size="xs" variant="default" onClick={() => void refreshStatus()} loading={statusBusy}>Refresh</Button>
+              <Button size="xs" variant="default" onClick={() => commitMode ? void refreshDiff(state) : void refreshStatus()} loading={commitMode ? diffBusy : statusBusy}>Refresh</Button>
               <Button size="xs" variant="default" onClick={() => setSidebarHidden((value) => !value)}>
-                {showSidebar ? 'Hide source control' : 'Show source control'}
+                {showSidebar ? 'Hide diff browser' : 'Show diff browser'}
               </Button>
               <Text fw={600} size="sm" truncate>{selectedTitle}</Text>
+              {commitMode && props.commitSubtitle ? <Badge size="xs" variant="outline">{props.commitSubtitle}</Badge> : null}
               {!state.selected_path && scopeDiffRows.length > 0 ? (
                 <Group gap={6} wrap="nowrap">
                   <Text size="xs" c="dimmed">Virtualized multi-file patch diff</Text>
@@ -1007,7 +1145,7 @@ export function DiffPanel(props: DiffPanelProps) {
                 <Badge variant="light">{diffManifest.from_ref} → {diffManifest.to_ref}</Badge>
               ) : null}
               {branchSummary ? <Badge variant="light">{branchSummary}</Badge> : null}
-              <Badge variant="light">{state.selected_scope === 'staged' ? 'Staged' : 'Unstaged'}</Badge>
+              <Badge variant="light">{commitMode ? 'Commit' : state.selected_scope === 'staged' ? 'Staged' : 'Unstaged'}</Badge>
               <Badge color="green" variant="light">+{selectedTotals.additions}</Badge>
               <Badge color="red" variant="light">-{selectedTotals.deletions}</Badge>
             </Group>
@@ -1192,17 +1330,17 @@ export function DiffPanel(props: DiffPanelProps) {
                 <Card withBorder p={6}>
                   <Stack gap={4}>
                     <ScopeHeader
-                      title="Staged"
+                      title={commitMode ? 'Commit' : 'Staged'}
                       active={state.selected_scope === 'staged' && state.selected_path === null && selectedDirectoryPath === null}
                       fileCount={stagedFiles.length}
                       additions={stagedTotals.additions}
                       deletions={stagedTotals.deletions}
                       compactCounts={compactCounts}
-                      buttonLabel="−"
-                      buttonTooltip="Unstage all"
+                      buttonLabel={commitMode ? undefined : '−'}
+                      buttonTooltip={commitMode ? undefined : 'Unstage all'}
                       actionBusy={actionBusy}
                       onSelect={() => selectWholeScope('staged')}
-                      onAction={async () => requestUnstageAll()}
+                      onAction={commitMode ? async () => undefined : async () => requestUnstageAll()}
                     />
                     {stagedFiles.length > 0 ? (
                       <FileTree
@@ -1219,6 +1357,7 @@ export function DiffPanel(props: DiffPanelProps) {
                         onStage={(path) => runStageAction('stage', 'staged', path)}
                         onUnstage={(path) => runStageAction('unstage', 'staged', path)}
                         onDiscard={requestDiscard}
+                        readOnly={commitMode}
                       />
                     ) : (
                       <Text c="dimmed" size="xs" px="xs" py={4}>No staged files.</Text>
@@ -1226,6 +1365,7 @@ export function DiffPanel(props: DiffPanelProps) {
                   </Stack>
                 </Card>
 
+                {!commitMode ? (
                 <Card withBorder p={6}>
                   <Stack gap={4}>
                     <ScopeHeader
@@ -1272,12 +1412,14 @@ export function DiffPanel(props: DiffPanelProps) {
                         onStage={(path) => runStageAction('stage', 'unstaged', path)}
                         onUnstage={(path) => runStageAction('unstage', 'unstaged', path)}
                         onDiscard={requestDiscard}
+                        readOnly={commitMode}
                       />
                     ) : (
                       <Text c="dimmed" size="xs" px="xs" py={4}>No unstaged files.</Text>
                     )}
                   </Stack>
                 </Card>
+                ) : null}
               </Stack>
             </ScrollArea>
           </Box>

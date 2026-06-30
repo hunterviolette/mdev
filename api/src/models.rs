@@ -165,7 +165,6 @@ pub use crate::engine::capabilities::planner::{
 pub use crate::supervisor::models::{
     CreateSupervisorRunRequest,
     SupervisorActionRequest,
-    SupervisorChildRun,
     SupervisorExecutionStrategy,
     SupervisorRun,
     SupervisorStatus,
@@ -384,6 +383,21 @@ pub struct WorkflowEventStreamItem {
     pub sequence_no: i64,
     pub level: String,
     pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SprintEventStreamItem {
+    pub id: String,
+    pub sprint_id: String,
+    pub sequence_no: i64,
+    pub event_type: String,
+    pub event_time: String,
+    pub feature_id: Option<String>,
+    pub actor: String,
     pub message: String,
     #[serde(default)]
     pub payload: Value,
