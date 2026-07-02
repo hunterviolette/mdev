@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
+use chrono::{Datelike, NaiveDate};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +24,9 @@ use crate::{
 use super::workflow_scope::resolve_workflow_scope;
 
 const WHOLE_FILE_CONTEXT_LINES: u32 = i32::MAX as u32;
+
+const REVIEW_DIFF_SESSION_TTL: Duration = Duration::from_secs(20 * 60);
+const REVIEW_DIFF_SESSION_LIMIT: usize = 12;
 
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +64,41 @@ pub struct ReviewFilePatchRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReviewDiffSessionRequest {
+    pub repo_ref: String,
+    pub scope: String,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+    #[serde(default)]
+    pub whole_file: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewDiffSessionWindowRequest {
+    pub session_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub line_count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewCommitDiffSessionRequest {
+    pub repo_ref: String,
+    pub commit: String,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+    #[serde(default)]
+    pub whole_file: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewDiffSessionCloseRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ReviewMultiFileContentsRequest {
     pub repo_ref: String,
     pub scope: String,
@@ -84,9 +125,23 @@ pub struct ReviewCommitListRequest {
     #[serde(default)]
     pub offset: Option<u32>,
     #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    #[serde(default)]
+    pub include_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_regex: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_regex: Option<Vec<String>>,
 }
@@ -120,6 +175,8 @@ pub struct ReviewCommitReportRequest {
     pub ref_name: Option<String>,
     #[serde(default)]
     pub aggregation_window: Option<String>,
+    #[serde(default)]
+    pub aggregation_days: Option<u32>,
     #[serde(default)]
     pub color_by: Option<String>,
     #[serde(default)]
@@ -187,10 +244,33 @@ pub struct ReviewCommitReportResponse {
     pub months: Vec<ReviewCommitReportMonthBucket>,
     pub buckets: Vec<ReviewCommitReportBucket>,
     pub aggregation_window: String,
+    pub aggregation_days: u32,
     pub color_by: String,
     pub exclude_regex: Vec<String>,
     pub next_offset: Option<u32>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewCommitAnalyticsTotals {
+    pub commits: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub files_changed: u64,
+    pub net: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewCommitAnalyticsResponse {
+    pub ok: bool,
+    pub status: String,
+    pub months: Vec<ReviewCommitReportMonthBucket>,
+    pub buckets: Vec<ReviewCommitReportBucket>,
+    pub totals: ReviewCommitAnalyticsTotals,
+    pub aggregation_window: String,
+    pub aggregation_days: u32,
+    pub color_by: String,
+    pub exclude_regex: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,9 +338,23 @@ pub struct WorkflowCommitListRequest {
     #[serde(default)]
     pub offset: Option<u32>,
     #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    #[serde(default)]
+    pub include_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_regex: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_regex: Option<Vec<String>>,
 }
@@ -325,6 +419,59 @@ pub struct ReviewFilePatchResponse {
     pub patch: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReviewDiffSessionResponse {
+    pub ok: bool,
+    pub session_id: String,
+    pub scope: String,
+    pub from_ref: String,
+    pub to_ref: String,
+    pub files: Vec<ReviewDiffManifestFileEntry>,
+    pub file_count: usize,
+    pub byte_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewDiffSessionWindowResponse {
+    pub ok: bool,
+    pub session_id: String,
+    pub path: String,
+    pub start_line: usize,
+    pub line_count: usize,
+    pub total_lines: usize,
+    pub has_more: bool,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewDiffSessionCloseResponse {
+    pub ok: bool,
+    pub session_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewDiffSessionFileIndex {
+    path: String,
+    byte_start: usize,
+    byte_end: usize,
+    total_lines: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewDiffSessionRecord {
+    id: String,
+    repo_ref: String,
+    scope: String,
+    from_ref: String,
+    to_ref: String,
+    patch: Arc<String>,
+    files: Vec<ReviewDiffManifestFileEntry>,
+    indexes: HashMap<String, ReviewDiffSessionFileIndex>,
+    created_at: Instant,
+    last_accessed_at: Instant,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ReviewMultiFileContentsEntry {
     pub path: String,
@@ -368,6 +515,7 @@ pub struct ReviewCommitSummary {
     pub files_changed: Option<u64>,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+    pub files: Vec<ReviewCommitFileStat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -375,6 +523,7 @@ pub struct ReviewCommitListResponse {
     pub ok: bool,
     pub commits: Vec<ReviewCommitSummary>,
     pub next_offset: Option<u32>,
+    pub next_cursor: Option<String>,
     pub has_more: bool,
 }
 
@@ -397,11 +546,11 @@ pub struct ReviewCommitDiffResponse {
     pub patch: String,
 }
 
-#[derive(Debug, Clone)]
-struct ReviewCommitFileStat {
-    path: String,
-    additions: u64,
-    deletions: u64,
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewCommitFileStat {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -424,9 +573,15 @@ pub fn router() -> Router<AppState> {
         .route("/api/review/diff", post(review_diff))
         .route("/api/review/diff/manifest", post(review_diff_manifest))
         .route("/api/review/diff/file", post(review_file_patch))
+        .route("/api/review/diff/session", post(review_diff_session))
+        .route("/api/review/diff/session/window", post(review_diff_session_window))
+        .route("/api/review/diff/session/commit", post(review_commit_diff_session))
+        .route("/api/review/diff/session/close", post(review_diff_session_close))
         .route("/api/review/diff/multifile", post(review_multifile_contents))
         .route("/api/review/git-patch", post(review_git_patch))
         .route("/api/review/commits", post(review_commits))
+        .route("/api/review/commits/query", post(review_commits))
+        .route("/api/review/commits/analytics", post(review_commit_analytics))
         .route("/api/review/commit-report", post(review_commit_report))
         .route("/api/review/commit-dataset", post(review_commit_report))
         .route("/api/review/commit-options", post(review_commit_options))
@@ -528,8 +683,15 @@ async fn workflow_review_commits_get(
         repo_ref: scope.repo_ref,
         limit: query.limit,
         offset: query.offset,
+        cursor: None,
+        ref_name: None,
         since: query.since,
         until: query.until,
+        include_paths: None,
+        exclude_paths: None,
+        include_extensions: None,
+        exclude_extensions: None,
+        include_regex: None,
         exclude_regex: None,
     })).await
 }
@@ -544,8 +706,15 @@ async fn workflow_review_commits_post(
         repo_ref: scope.repo_ref,
         limit: req.limit,
         offset: req.offset,
+        cursor: req.cursor,
+        ref_name: req.ref_name,
         since: req.since,
         until: req.until,
+        include_paths: req.include_paths,
+        exclude_paths: req.exclude_paths,
+        include_extensions: req.include_extensions,
+        exclude_extensions: req.exclude_extensions,
+        include_regex: req.include_regex,
         exclude_regex: req.exclude_regex,
     })).await
 }
@@ -649,7 +818,22 @@ fn review_month_for_authored_at(value: &str) -> String {
     value.get(0..7).unwrap_or(value).to_string()
 }
 
-fn review_period_for_authored_at(value: &str, aggregation_window: &str) -> String {
+fn review_period_for_authored_at(value: &str, aggregation_window: &str, aggregation_days: u32, anchor_date: Option<NaiveDate>) -> String {
+    let day = value
+        .get(0..10)
+        .and_then(|text| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok());
+
+    if aggregation_days > 1 {
+        if let Some(day) = day {
+            let anchor = anchor_date.unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch date"));
+            let offset = day.signed_duration_since(anchor).num_days().max(0);
+            let bucket_offset = (offset / aggregation_days as i64) * aggregation_days as i64;
+            let start = anchor + chrono::Duration::days(bucket_offset);
+            let end = start + chrono::Duration::days(aggregation_days.saturating_sub(1) as i64);
+            return format!("{}..{}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
+        }
+    }
+
     match aggregation_window {
         "daily" => value.get(0..10).unwrap_or(value).to_string(),
         "yearly" => value.get(0..4).unwrap_or(value).to_string(),
@@ -663,6 +847,10 @@ fn normalize_review_aggregation_window(value: Option<String>) -> String {
         Some("yearly") => "yearly".to_string(),
         _ => "monthly".to_string(),
     }
+}
+
+fn normalize_review_aggregation_days(value: Option<u32>) -> u32 {
+    value.unwrap_or(1).clamp(1, 365)
 }
 
 fn normalize_review_color_by(value: Option<String>) -> String {
@@ -791,6 +979,10 @@ fn collect_review_commit_history(
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let raw = String::from_utf8(run_git(repo, &arg_refs).map_err(internal)?).map_err(internal)?;
 
+    let offset_value = filters.offset.unwrap_or(0) as usize;
+    let limit_value = filters.limit.map(|value| value.clamp(1, 500) as usize);
+    let target_row_count = limit_value.map(|limit| offset_value.saturating_add(limit).saturating_add(1));
+
     let mut rows = Vec::new();
     for record in raw.split('\x1e') {
         let record = record.trim_matches('\n');
@@ -859,15 +1051,20 @@ fn collect_review_commit_history(
                 files_changed: Some(files_changed),
                 additions: Some(additions),
                 deletions: Some(deletions),
+                files: files.clone(),
             },
             files,
         });
+
+        if let Some(target_row_count) = target_row_count {
+            if rows.len() >= target_row_count {
+                break;
+            }
+        }
     }
 
-    let offset_value = filters.offset.unwrap_or(0) as usize;
     let total_rows = rows.len();
-    let (paged_rows, next_offset) = if let Some(limit) = filters.limit {
-        let limit_value = limit.clamp(1, 500) as usize;
+    let (paged_rows, next_offset) = if let Some(limit_value) = limit_value {
         let paged_rows = rows
             .into_iter()
             .skip(offset_value)
@@ -913,38 +1110,80 @@ fn collect_full_review_commit_history(
     )
 }
 
+fn repo_path_for_commit_history(repo_ref: &str) -> PathBuf {
+    let normalized = repo_ref.trim().replace('\\', "/");
+    let marker = "/.mdev/supervisors/";
+    if let Some(index) = normalized.find(marker) {
+        let root = normalized[..index].trim();
+        if !root.is_empty() {
+            return PathBuf::from(root);
+        }
+    }
+    PathBuf::from(repo_ref)
+}
+
+fn review_cursor_to_offset(cursor: Option<String>, fallback_offset: Option<u32>) -> Option<u32> {
+    cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u32>().ok())
+        .or(fallback_offset)
+}
+
+fn review_offset_to_cursor(offset: Option<u32>) -> Option<String> {
+    offset.map(|value| value.to_string())
+}
+
 async fn review_commits(
     Json(req): Json<ReviewCommitListRequest>,
 ) -> Result<Json<ReviewCommitListResponse>, (axum::http::StatusCode, String)> {
-    let report = review_commit_report(Json(ReviewCommitReportRequest {
-        repo_ref: req.repo_ref,
-        limit: Some(req.limit.unwrap_or(50).clamp(1, 200)),
-        offset: req.offset,
-        ref_name: None,
-        aggregation_window: None,
-        color_by: None,
-        since: req.since,
-        until: req.until,
-        include_paths: None,
-        exclude_paths: None,
-        include_extensions: None,
-        exclude_extensions: None,
-        include_regex: None,
-        exclude_regex: req.exclude_regex,
-    })).await?.0;
+    let repo = repo_path_for_commit_history(&req.repo_ref);
+    let offset = review_cursor_to_offset(req.cursor.clone(), req.offset);
+    let limit = Some(req.limit.unwrap_or(50).clamp(1, 200));
+
+    let result = collect_review_commit_history(
+        &repo,
+        ReviewCommitHistoryFilters {
+            limit,
+            offset,
+            ref_name: req.ref_name,
+            since: req.since,
+            until: req.until,
+            include_paths: clean_review_filter_values(req.include_paths),
+            exclude_paths: clean_review_filter_values(req.exclude_paths),
+            include_extensions: clean_review_filter_values(req.include_extensions)
+                .into_iter()
+                .map(|value| normalize_review_extension(&value))
+                .collect(),
+            exclude_extensions: clean_review_filter_values(req.exclude_extensions)
+                .into_iter()
+                .map(|value| normalize_review_extension(&value))
+                .collect(),
+            include_regex: clean_review_filter_values(req.include_regex),
+            exclude_regex: effective_review_exclude_regex(req.exclude_regex),
+        },
+    )?;
+
+    let commits = result
+        .rows
+        .into_iter()
+        .map(|row| row.summary)
+        .collect::<Vec<_>>();
 
     Ok(Json(ReviewCommitListResponse {
         ok: true,
-        commits: report.commits,
-        next_offset: report.next_offset,
-        has_more: report.has_more,
+        commits,
+        next_offset: result.next_offset,
+        next_cursor: review_offset_to_cursor(result.next_offset),
+        has_more: result.has_more,
     }))
 }
 
 async fn review_commit_options(
     Json(req): Json<ReviewRepoRequest>,
 ) -> Result<Json<ReviewCommitOptionsResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&req.repo_ref);
+    let repo = repo_path_for_commit_history(&req.repo_ref);
     let mut refs = Vec::new();
 
     let raw_refs = String::from_utf8(
@@ -1003,8 +1242,16 @@ async fn review_commit_options(
 async fn review_commit_report(
     Json(req): Json<ReviewCommitReportRequest>,
 ) -> Result<Json<ReviewCommitReportResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&req.repo_ref);
+    // Kept for compatibility with the old combined endpoint. New UI code should call
+    // /api/review/commits/query for the scrolling timeline and
+    // /api/review/commits/analytics for chart aggregates.
+    let repo = repo_path_for_commit_history(&req.repo_ref);
     let aggregation_window = normalize_review_aggregation_window(req.aggregation_window.clone());
+    let aggregation_days = normalize_review_aggregation_days(req.aggregation_days);
+    let anchor_date = req
+        .since
+        .as_deref()
+        .and_then(|value| NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok());
     let color_by = normalize_review_color_by(req.color_by.clone());
     let result = collect_full_review_commit_history(&repo, &req)?;
     let mut group_rows: BTreeMap<String, BTreeMap<String, ReviewCommitReportGroupBucket>> = BTreeMap::new();
@@ -1012,7 +1259,7 @@ async fn review_commit_report(
     let mut totals: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
 
     for row in &result.rows {
-        let period = review_period_for_authored_at(&row.summary.authored_at, &aggregation_window);
+        let period = review_period_for_authored_at(&row.summary.authored_at, &aggregation_window, aggregation_days, anchor_date);
         let total = totals.entry(period.clone()).or_insert((0, 0, 0, 0));
         total.3 = total.3.saturating_add(1);
 
@@ -1119,6 +1366,7 @@ async fn review_commit_report(
         months,
         buckets,
         aggregation_window,
+        aggregation_days,
         color_by,
         exclude_regex: result.exclude_regex,
         next_offset,
@@ -1126,10 +1374,47 @@ async fn review_commit_report(
     }))
 }
 
+async fn review_commit_analytics(
+    Json(mut req): Json<ReviewCommitReportRequest>,
+) -> Result<Json<ReviewCommitAnalyticsResponse>, (axum::http::StatusCode, String)> {
+    req.limit = Some(1);
+    req.offset = Some(0);
+
+    let Json(report) = review_commit_report(Json(req)).await?;
+
+    let mut totals = ReviewCommitAnalyticsTotals {
+        commits: 0,
+        additions: 0,
+        deletions: 0,
+        files_changed: 0,
+        net: 0,
+    };
+
+    for bucket in &report.buckets {
+        totals.commits = totals.commits.saturating_add(bucket.commits);
+        totals.additions = totals.additions.saturating_add(bucket.additions);
+        totals.deletions = totals.deletions.saturating_add(bucket.deletions);
+        totals.files_changed = totals.files_changed.saturating_add(bucket.files_changed);
+    }
+    totals.net = totals.additions as i64 - totals.deletions as i64;
+
+    Ok(Json(ReviewCommitAnalyticsResponse {
+        ok: true,
+        status: "complete".to_string(),
+        months: report.months,
+        buckets: report.buckets,
+        totals,
+        aggregation_window: report.aggregation_window,
+        aggregation_days: report.aggregation_days,
+        color_by: report.color_by,
+        exclude_regex: report.exclude_regex,
+    }))
+}
+
 async fn review_commit_diff_manifest(
     Json(req): Json<ReviewCommitRequest>,
 ) -> Result<Json<ReviewCommitDiffManifestResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&req.repo_ref);
+    let repo = repo_path_for_commit_history(&req.repo_ref);
     let (from_ref, to_ref, files) = commit_diff_entries(&repo, &req.commit)?;
     Ok(Json(ReviewCommitDiffManifestResponse {
         ok: true,
@@ -1143,7 +1428,7 @@ async fn review_commit_diff_manifest(
 async fn review_commit_diff(
     Json(req): Json<ReviewCommitDiffRequest>,
 ) -> Result<Json<ReviewCommitDiffResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&req.repo_ref);
+    let repo = repo_path_for_commit_history(&req.repo_ref);
     let from_ref = commit_parent_ref(&repo, &req.commit)?;
     let to_ref = req.commit.clone();
     let effective_context = if req.whole_file { WHOLE_FILE_CONTEXT_LINES } else { req.context_lines.unwrap_or(4).min(1000) };
@@ -1525,6 +1810,275 @@ async fn review_file_patch(
         from_ref,
         to_ref,
         patch,
+    }))
+}
+
+fn review_diff_sessions() -> &'static RwLock<HashMap<String, ReviewDiffSessionRecord>> {
+    static SESSIONS: OnceLock<RwLock<HashMap<String, ReviewDiffSessionRecord>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn clean_review_diff_sessions(sessions: &mut HashMap<String, ReviewDiffSessionRecord>) {
+    let now = Instant::now();
+    sessions.retain(|_, session| now.duration_since(session.last_accessed_at) <= REVIEW_DIFF_SESSION_TTL);
+
+    if sessions.len() <= REVIEW_DIFF_SESSION_LIMIT {
+        return;
+    }
+
+    let mut ranked = sessions
+        .iter()
+        .map(|(id, session)| (id.clone(), session.last_accessed_at))
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+
+    let remove_count = sessions.len().saturating_sub(REVIEW_DIFF_SESSION_LIMIT);
+    for (id, _) in ranked.into_iter().take(remove_count) {
+        sessions.remove(&id);
+    }
+}
+
+fn strip_review_git_prefix(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .strip_prefix("a/")
+        .or_else(|| path.trim().trim_matches('"').strip_prefix("b/"))
+        .unwrap_or_else(|| path.trim().trim_matches('"'))
+        .replace('\\', "/")
+}
+
+fn review_path_from_diff_git(line: &str) -> String {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    parts
+        .get(3)
+        .map(|path| strip_review_git_prefix(path))
+        .filter(|path| !path.is_empty() && path != "/dev/null")
+        .or_else(|| {
+            parts
+                .get(2)
+                .map(|path| strip_review_git_prefix(path))
+                .filter(|path| !path.is_empty() && path != "/dev/null")
+        })
+        .unwrap_or_else(|| "(patch)".to_string())
+}
+
+fn review_patch_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
+}
+
+fn index_review_patch_by_file(patch: &str) -> HashMap<String, ReviewDiffSessionFileIndex> {
+    let mut indexes = HashMap::new();
+    let mut offset = 0usize;
+    let mut current_path = String::new();
+    let mut current_start = None::<usize>;
+
+    for raw_line in patch.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+
+        if line.starts_with("diff --git ") {
+            if let Some(start) = current_start.take() {
+                if offset > start {
+                    let text = &patch[start..offset];
+                    indexes.insert(current_path.clone(), ReviewDiffSessionFileIndex {
+                        path: current_path.clone(),
+                        byte_start: start,
+                        byte_end: offset,
+                        total_lines: review_patch_line_count(text),
+                    });
+                }
+            }
+            current_start = Some(offset);
+            current_path = review_path_from_diff_git(line);
+        } else if line.starts_with("+++ ") && current_start.is_some() {
+            let next_path = strip_review_git_prefix(line.trim_start_matches("+++ ").trim());
+            if !next_path.is_empty() && next_path != "/dev/null" {
+                current_path = next_path;
+            }
+        }
+
+        offset += raw_line.len();
+    }
+
+    if let Some(start) = current_start {
+        if patch.len() > start {
+            let text = &patch[start..];
+            indexes.insert(current_path.clone(), ReviewDiffSessionFileIndex {
+                path: current_path.clone(),
+                byte_start: start,
+                byte_end: patch.len(),
+                total_lines: review_patch_line_count(text),
+            });
+        }
+    } else if !patch.trim().is_empty() {
+        indexes.insert("(patch)".to_string(), ReviewDiffSessionFileIndex {
+            path: "(patch)".to_string(),
+            byte_start: 0,
+            byte_end: patch.len(),
+            total_lines: review_patch_line_count(patch),
+        });
+    }
+
+    indexes
+}
+
+async fn review_diff_session(
+    Json(req): Json<ReviewDiffSessionRequest>,
+) -> Result<Json<ReviewDiffSessionResponse>, (axum::http::StatusCode, String)> {
+    let repo = PathBuf::from(&req.repo_ref);
+    let Json(diff) = review_diff(Json(ReviewDiffRequest {
+        repo_ref: req.repo_ref.clone(),
+        scope: req.scope.clone(),
+        path: None,
+        context_lines: req.context_lines,
+        whole_file: req.whole_file,
+    })).await?;
+    let (_, _, files) = review_scope_entries(&repo, &req.scope)?;
+    let indexes = index_review_patch_by_file(&diff.patch);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let now = Instant::now();
+    let byte_count = diff.patch.len();
+
+    let session = ReviewDiffSessionRecord {
+        id: session_id.clone(),
+        repo_ref: req.repo_ref,
+        scope: req.scope,
+        from_ref: diff.from_ref.clone(),
+        to_ref: diff.to_ref.clone(),
+        patch: Arc::new(diff.patch),
+        files: files.clone(),
+        indexes,
+        created_at: now,
+        last_accessed_at: now,
+    };
+
+    let mut sessions = review_diff_sessions()
+        .write()
+        .map_err(|_| internal("review diff session lock poisoned"))?;
+    clean_review_diff_sessions(&mut sessions);
+    sessions.insert(session_id.clone(), session);
+
+    Ok(Json(ReviewDiffSessionResponse {
+        ok: true,
+        session_id,
+        scope: diff.scope,
+        from_ref: diff.from_ref,
+        to_ref: diff.to_ref,
+        file_count: files.len(),
+        byte_count,
+        files,
+    }))
+}
+
+async fn review_commit_diff_session(
+    Json(req): Json<ReviewCommitDiffSessionRequest>,
+) -> Result<Json<ReviewDiffSessionResponse>, (axum::http::StatusCode, String)> {
+    let repo = repo_path_for_commit_history(&req.repo_ref);
+    let Json(diff) = review_commit_diff(Json(ReviewCommitDiffRequest {
+        repo_ref: req.repo_ref.clone(),
+        commit: req.commit.clone(),
+        path: None,
+        context_lines: req.context_lines,
+        whole_file: req.whole_file,
+    })).await?;
+    let Json(manifest) = review_commit_diff_manifest(Json(ReviewCommitRequest {
+        repo_ref: req.repo_ref.clone(),
+        commit: req.commit.clone(),
+    })).await?;
+    let indexes = index_review_patch_by_file(&diff.patch);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let now = Instant::now();
+    let byte_count = diff.patch.len();
+    let scope = format!("commit:{}", req.commit);
+
+    let session = ReviewDiffSessionRecord {
+        id: session_id.clone(),
+        repo_ref: repo.to_string_lossy().to_string(),
+        scope: scope.clone(),
+        from_ref: diff.from_ref.clone(),
+        to_ref: diff.to_ref.clone(),
+        patch: Arc::new(diff.patch),
+        files: manifest.files.clone(),
+        indexes,
+        created_at: now,
+        last_accessed_at: now,
+    };
+
+    let mut sessions = review_diff_sessions()
+        .write()
+        .map_err(|_| internal("review diff session lock poisoned"))?;
+    clean_review_diff_sessions(&mut sessions);
+    sessions.insert(session_id.clone(), session);
+
+    Ok(Json(ReviewDiffSessionResponse {
+        ok: true,
+        session_id,
+        scope,
+        from_ref: diff.from_ref,
+        to_ref: diff.to_ref,
+        file_count: manifest.files.len(),
+        byte_count,
+        files: manifest.files,
+    }))
+}
+
+async fn review_diff_session_close(
+    Json(req): Json<ReviewDiffSessionCloseRequest>,
+) -> Result<Json<ReviewDiffSessionCloseResponse>, (axum::http::StatusCode, String)> {
+    let mut sessions = review_diff_sessions()
+        .write()
+        .map_err(|_| internal("review diff session lock poisoned"))?;
+    let removed = sessions.remove(&req.session_id).is_some();
+    Ok(Json(ReviewDiffSessionCloseResponse {
+        ok: true,
+        session_id: req.session_id,
+        removed,
+    }))
+}
+
+async fn review_diff_session_window(
+    Json(req): Json<ReviewDiffSessionWindowRequest>,
+) -> Result<Json<ReviewDiffSessionWindowResponse>, (axum::http::StatusCode, String)> {
+    let mut sessions = review_diff_sessions()
+        .write()
+        .map_err(|_| internal("review diff session lock poisoned"))?;
+    clean_review_diff_sessions(&mut sessions);
+
+    let session = sessions
+        .get_mut(&req.session_id)
+        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "review diff session expired or not found".to_string()))?;
+    session.last_accessed_at = Instant::now();
+
+    let normalized_path = req.path.replace('\\', "/");
+    let index = session
+        .indexes
+        .get(&normalized_path)
+        .or_else(|| session.indexes.get(&req.path))
+        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, format!("diff file not found in session: {}", req.path)))?;
+
+    let file_patch = &session.patch[index.byte_start..index.byte_end];
+    let start_line = req.start_line.min(index.total_lines);
+    let requested = req.line_count.unwrap_or(300).clamp(1, 1000);
+    let lines = file_patch
+        .lines()
+        .skip(start_line)
+        .take(requested)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let next_line = start_line.saturating_add(lines.len());
+
+    Ok(Json(ReviewDiffSessionWindowResponse {
+        ok: true,
+        session_id: session.id.clone(),
+        path: index.path.clone(),
+        start_line,
+        line_count: lines.len(),
+        total_lines: index.total_lines,
+        has_more: next_line < index.total_lines,
+        lines,
     }))
 }
 

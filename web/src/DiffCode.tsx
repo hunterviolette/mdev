@@ -13,10 +13,13 @@ type PatchLine = {
   newLine?: number;
 };
 
+type FileMutation = 'M' | 'A' | 'D' | 'R';
+
 type ParsedPatchFile = {
   path: string;
   oldPath: string;
   newPath: string;
+  mutation: FileMutation;
   additions: number;
   deletions: number;
   unifiedLineCount: number;
@@ -40,6 +43,7 @@ type RenderRow =
   | {
       kind: 'file';
       path: string;
+      mutation: FileMutation;
       additions: number;
       deletions: number;
       collapsed?: boolean;
@@ -77,6 +81,11 @@ function stripGitPrefix(path: string): string {
   return path.replace(/^a\//, '').replace(/^b\//, '');
 }
 
+function normalizePatchPath(path: string): string {
+  const stripped = stripGitPrefix(path.trim());
+  return stripped === '/dev/null' || stripped === 'dev/null' ? '' : stripped;
+}
+
 function basenameForPath(path: string): string {
   const normalized = path.replace(/\\/g, '/');
   const parts = normalized.split('/').filter(Boolean);
@@ -85,8 +94,8 @@ function basenameForPath(path: string): string {
 
 function pathFromDiffGit(line: string): { oldPath: string; newPath: string; path: string } {
   const match = line.match(/^diff --git\s+a\/(.*?)\s+b\/(.*)$/);
-  const oldPath = match?.[1] ?? '';
-  const newPath = match?.[2] ?? oldPath;
+  const oldPath = normalizePatchPath(match?.[1] ?? '');
+  const newPath = normalizePatchPath(match?.[2] ?? oldPath);
   return { oldPath, newPath, path: newPath || oldPath };
 }
 
@@ -130,6 +139,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatchFile[] {
         path: info.path,
         oldPath: info.oldPath,
         newPath: info.newPath,
+        mutation: 'M',
         additions: 0,
         deletions: 0,
         unifiedLineCount: 0,
@@ -147,6 +157,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatchFile[] {
         path: '(patch)',
         oldPath: '(patch)',
         newPath: '(patch)',
+        mutation: 'M',
         additions: 0,
         deletions: 0,
         unifiedLineCount: 0,
@@ -155,15 +166,45 @@ export function parseUnifiedPatch(patch: string): ParsedPatchFile[] {
       files.push(current);
     }
 
+    if (rawLine.startsWith('new file mode ')) {
+      current.mutation = 'A';
+      continue;
+    }
+
+    if (rawLine.startsWith('deleted file mode ')) {
+      current.mutation = 'D';
+      continue;
+    }
+
+    if (rawLine.startsWith('similarity index ')) {
+      current.mutation = 'R';
+      continue;
+    }
+
+    if (rawLine.startsWith('rename from ')) {
+      current.mutation = 'R';
+      current.oldPath = normalizePatchPath(rawLine.slice('rename from '.length));
+      current.path = current.newPath || current.oldPath || current.path;
+      continue;
+    }
+
+    if (rawLine.startsWith('rename to ')) {
+      current.mutation = 'R';
+      current.newPath = normalizePatchPath(rawLine.slice('rename to '.length));
+      current.path = current.newPath || current.oldPath || current.path;
+      continue;
+    }
+
     if (isPatchMetadataLine(rawLine)) continue;
 
     if (rawLine.startsWith('--- ')) {
-      current.oldPath = stripGitPrefix(rawLine.slice(4).trim());
+      current.oldPath = normalizePatchPath(rawLine.slice(4));
+      current.path = current.newPath || current.oldPath || current.path;
       continue;
     }
 
     if (rawLine.startsWith('+++ ')) {
-      current.newPath = stripGitPrefix(rawLine.slice(4).trim());
+      current.newPath = normalizePatchPath(rawLine.slice(4));
       current.path = current.newPath || current.oldPath || current.path;
       continue;
     }
@@ -399,7 +440,7 @@ async function prepareRows(
     if (cancelled()) return;
 
     appendRows([
-      { kind: 'file', path: file.path, additions: file.additions, deletions: file.deletions, collapsed: false },
+      { kind: 'file', path: file.path, mutation: file.mutation, additions: file.additions, deletions: file.deletions, collapsed: false },
       ...(diffStyle === 'split'
         ? buildSplitPreparedRows(file, highlightedByIndex)
         : buildUnifiedPreparedRows(file, highlightedByIndex)),
@@ -516,6 +557,7 @@ function FileHeaderRow(props: {
         </Button>
       ) : null}
       <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+        <Badge size="xs" variant="outline" style={{ minWidth: 24 }}>{row.mutation}</Badge>
         <Text size="sm" fw={900} truncate style={{ maxWidth: '42%', color: 'var(--mantine-color-blue-1)', letterSpacing: 0.2 }}>
           {basename}
         </Text>

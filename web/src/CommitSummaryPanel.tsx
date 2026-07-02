@@ -9,6 +9,7 @@ import {
   Group,
   Loader,
   Modal,
+  NumberInput,
   ScrollArea,
   Select,
   SegmentedControl,
@@ -19,12 +20,13 @@ import {
 import { DiffPanel, type DiffPanelState } from './DiffPanel';
 import {
   getReviewCommitDiffManifest,
-  getReviewCommitReport,
+  getReviewCommits,
+  getReviewCommitAnalytics,
   getReviewCommitOptions,
   type ReviewCommitDiffManifestResponse,
   type ReviewCommitSummary,
   type ReviewDiffManifestFileEntry,
-  type ReviewCommitReportResponse,
+  type ReviewCommitAnalyticsResponse,
   type ReviewCommitRefOption,
 } from './api';
 
@@ -34,7 +36,9 @@ const DEFAULT_COMMIT_ROW_HEIGHT = 44;
 type DiffStyle = 'unified' | 'split';
 type CommitReportType = 'commits' | 'analytics';
 type CommitAnalyticsMode = 'activity' | 'net';
+type CommitChartDisplayMode = 'fit' | 'scroll';
 type CommitAggregationWindow = 'daily' | 'monthly' | 'yearly';
+type CommitAggregationPreset = CommitAggregationWindow | 'custom_days';
 type CommitAnalyticsColorBy = 'extension' | 'author';
 
 type CommitAnalyticsGroupBucket = {
@@ -45,8 +49,12 @@ type CommitAnalyticsGroupBucket = {
   net: number;
 };
 
-function commitAnalyticsGroups(month: ReviewCommitReportResponse['months'][number]): CommitAnalyticsGroupBucket[] {
-  return month.groups ?? month.extensions.map((extension) => ({
+function commitAnalyticsGroups(month: ReviewCommitAnalyticsResponse['months'][number]): CommitAnalyticsGroupBucket[] {
+  if (Array.isArray(month.groups) && month.groups.length > 0) {
+    return month.groups;
+  }
+
+  return (month.extensions ?? []).map((extension) => ({
     key: extension.extension,
     label: extension.extension,
     additions: extension.additions,
@@ -67,6 +75,21 @@ function todayDateInputValue() {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function dateFromInputValue(value: string): Date | null {
+  if (!value.trim()) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day);
+}
+
+function inputValueFromDate(value: Date | null): string {
+  if (!value) return '';
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -117,13 +140,14 @@ function statusCode(file: ReviewDiffManifestFileEntry): string {
 
 
 
-function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null; mode: CommitAnalyticsMode }) {
-  const { report, mode } = props;
+function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | null; mode: CommitAnalyticsMode; displayMode: CommitChartDisplayMode; aggregationPreset: CommitAggregationPreset; aggregationDays: number; onFullscreen?: () => void; onExportCsv?: () => void }) {
+  const { report, mode, displayMode, aggregationPreset, aggregationDays, onFullscreen, onExportCsv } = props;
   const months = report?.months ?? [];
   const [hoveredMonth, setHoveredMonth] = useState<string | null>(null);
   const [tooltipPosition, setTooltipPosition] = useState({ x: 0, y: 0 });
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const [chartContainerWidth, setChartContainerWidth] = useState(0);
+  const [chartContainerHeight, setChartContainerHeight] = useState(0);
 
   const chart = useMemo(() => {
     const extensions = new Map<string, number>();
@@ -215,7 +239,9 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
     if (!node) return;
 
     const updateWidth = () => {
-      setChartContainerWidth(Math.floor(node.getBoundingClientRect().width));
+      const rect = node.getBoundingClientRect();
+      setChartContainerWidth(Math.floor(rect.width));
+      setChartContainerHeight(Math.floor(rect.height));
     };
 
     updateWidth();
@@ -234,31 +260,80 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
     return <Text size="sm" c="dimmed">No commit analytics available for the selected filters.</Text>;
   }
 
-  const availableWidth = Math.max(1280, chartContainerWidth - 8);
-  const width = Math.max(availableWidth, months.length * 190 + 160);
-  const height = Math.max(660, Math.min(820, Math.round(width * 0.38)));
-  const margin = { top: 34, right: 36, bottom: 92, left: 92 };
+  const bucketLabel = aggregationPreset === 'daily'
+    ? 'days'
+    : aggregationPreset === 'monthly'
+      ? 'months'
+      : aggregationPreset === 'yearly'
+        ? 'years'
+        : `${Math.max(1, Math.min(9999, Math.round(aggregationDays || 1)))}-day periods`;
+
+  const totalCommits = report?.totals?.commits ?? months.reduce((sum, month) => sum + month.commits, 0);
+
+  const availableWidth = Math.max(420, chartContainerWidth - 8);
+  const naturalWidth = Math.max(1280, months.length * 190 + 160);
+  const width = displayMode === 'fit' ? availableWidth : naturalWidth;
+  const fallbackHeight = displayMode === 'fit'
+    ? Math.max(500, Math.min(720, Math.round(availableWidth * 0.4)))
+    : Math.max(620, Math.min(820, Math.round(width * 0.36)));
+  const height = displayMode === 'fit'
+    ? Math.max(500, chartContainerHeight || fallbackHeight)
+    : fallbackHeight;
+  const margin = {
+    top: 28,
+    right: 36,
+    bottom: displayMode === 'fit' ? 112 : 88,
+    left: 92,
+  };
+  const compactFitLabels = displayMode === 'fit' && months.length > 14;
+  const xLabelEvery = compactFitLabels
+    ? Math.max(1, Math.ceil(months.length / 10))
+    : 1;
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
   const domainSpan = Math.max(1, chart.domainMax - chart.domainMin);
   const yScale = (value: number) => margin.top + ((chart.domainMax - value) / domainSpan) * plotHeight;
   const zeroY = yScale(0);
   const barBand = plotWidth / Math.max(1, months.length);
-  const barWidth = Math.max(72, Math.min(180, barBand * 0.58));
+  const barWidth = displayMode === 'fit'
+    ? Math.max(18, Math.min(barBand * 0.82, 150))
+    : Math.max(72, Math.min(180, barBand * 0.58));
 
   return (
     <Stack gap="sm" style={{ height: '100%', minHeight: 0 }}>
-      <Group gap="xs">
-        <Badge variant="light">{report?.commits.length ?? 0} commits shown</Badge>
-        <Badge color="green" variant="light">+{months.reduce((sum, month) => sum + month.additions, 0)}</Badge>
-        <Badge color="red" variant="light">-{months.reduce((sum, month) => sum + month.deletions, 0)}</Badge>
-        <Badge variant="light">{months.length} months</Badge>
-        <Badge variant="light">{mode === 'net' ? 'Net LOC' : 'Additions / deletions'}</Badge>
+      <Group justify="space-between" align="center" gap="xs">
+        <Group gap="xs">
+          <Badge variant="light">{totalCommits} commits</Badge>
+          <Badge color="green" variant="light">+{months.reduce((sum, month) => sum + month.additions, 0)}</Badge>
+          <Badge color="red" variant="light">-{months.reduce((sum, month) => sum + month.deletions, 0)}</Badge>
+          <Badge variant="light">{months.length} {bucketLabel}</Badge>
+          <Badge variant="light">{mode === 'net' ? 'Net change' : 'Total change'}</Badge>
+        </Group>
+        <Group gap="xs">
+          {onExportCsv ? (
+            <Button
+              size="compact-xs"
+              variant="subtle"
+              onClick={onExportCsv}
+            >
+              Export CSV
+            </Button>
+          ) : null}
+          {onFullscreen ? (
+            <Button
+              size="compact-xs"
+              variant="subtle"
+              onClick={onFullscreen}
+            >
+              Fullscreen
+            </Button>
+          ) : null}
+        </Group>
       </Group>
 
-      <Box ref={chartContainerRef} style={{ position: 'relative', flex: 1, minHeight: 620, width: '100%', alignSelf: 'stretch' }}>
-        <ScrollArea type="auto" style={{ height: '100%', minHeight: 620, width: '100%' }}>
-          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Monthly LOC by file extension" preserveAspectRatio="none" style={{ display: 'block' }}>
+      <Box ref={chartContainerRef} style={{ position: 'relative', flex: 1, minHeight: 500, width: '100%', alignSelf: 'stretch' }}>
+        <ScrollArea type="auto" style={{ height: '100%', minHeight: 500, width: '100%' }}>
+          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Commit LOC analytics" preserveAspectRatio="none" style={{ display: 'block', minWidth: displayMode === 'fit' ? '100%' : undefined }}>
             <rect x={margin.left} y={margin.top} width={plotWidth} height={plotHeight} fill="rgba(255,255,255,0.015)" />
             <line x1={margin.left} y1={zeroY} x2={width - margin.right} y2={zeroY} stroke="rgba(255,255,255,0.5)" strokeWidth="1.4" />
             <line x1={margin.left} y1={margin.top} x2={margin.left} y2={height - margin.bottom} stroke="rgba(255,255,255,0.32)" strokeWidth="1.2" />
@@ -357,8 +432,19 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
                       </g>
                     );
                   })}
-                  <text x={x + barWidth / 2} y={height - margin.bottom + 28} textAnchor="middle" fontSize="13" fill="rgba(255,255,255,0.78)">{month.month}</text>
-                  <text x={x + barWidth / 2} y={height - margin.bottom + 50} textAnchor="middle" fontSize="12" fontWeight={700} fill={month.net >= 0 ? 'rgba(105,219,124,0.98)' : 'rgba(255,135,135,0.98)'}>{month.net >= 0 ? '+' : ''}{month.net}</text>
+                  {monthIndex % xLabelEvery === 0 ? (
+                    displayMode === 'fit' ? (
+                      <g transform={`translate(${x + barWidth / 2} ${height - margin.bottom + 34}) rotate(-35)`}>
+                        <text textAnchor="end" fontSize="11" fill="rgba(255,255,255,0.78)">{month.month}</text>
+                        <text y="17" textAnchor="end" fontSize="10" fontWeight={700} fill={month.net >= 0 ? 'rgba(105,219,124,0.98)' : 'rgba(255,135,135,0.98)'}>{month.net >= 0 ? '+' : ''}{month.net}</text>
+                      </g>
+                    ) : (
+                      <>
+                        <text x={x + barWidth / 2} y={height - margin.bottom + 26} textAnchor="middle" fontSize="12" fill="rgba(255,255,255,0.78)">{month.month}</text>
+                        <text x={x + barWidth / 2} y={height - margin.bottom + 44} textAnchor="middle" fontSize="11" fontWeight={700} fill={month.net >= 0 ? 'rgba(105,219,124,0.98)' : 'rgba(255,135,135,0.98)'}>{month.net >= 0 ? '+' : ''}{month.net}</text>
+                      </>
+                    )
+                  ) : null}
                 </g>
               );
             })}
@@ -413,7 +499,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
         ) : null}
       </Box>
 
-      <Group gap={6}>
+      <Group gap={6} mt={2} style={{ flex: '0 0 auto' }}>
         {chart.orderedExtensions.slice(0, 20).map((extension) => (
           <Badge key={extension} size="xs" variant="outline" style={{ borderColor: colorForExtension(extension), color: colorForExtension(extension) }}>{extension}</Badge>
         ))}
@@ -422,14 +508,150 @@ function CommitAnalyticsChart(props: { report: ReviewCommitReportResponse | null
   );
 }
 
+type CommitFileLike = {
+  path: string;
+  additions?: number;
+  deletions?: number;
+  status?: string;
+};
+
+type CommitFileTreeNode = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  additions: number;
+  deletions: number;
+  children: CommitFileTreeNode[];
+  file?: CommitFileLike;
+};
+
+function buildCommitFileTree(files: CommitFileLike[]): CommitFileTreeNode[] {
+  const root: CommitFileTreeNode[] = [];
+
+  for (const file of files) {
+    const parts = file.path.split("/").filter(Boolean);
+    let level = root;
+    let currentPath = "";
+
+    for (let index = 0; index < parts.length; index += 1) {
+      const name = parts[index];
+      const isFile = index === parts.length - 1;
+      currentPath = currentPath ? `${currentPath}/${name}` : name;
+
+      let node = level.find((child) => child.name === name && child.type === (isFile ? "file" : "directory"));
+
+      if (!node) {
+        node = {
+          name,
+          path: currentPath,
+          type: isFile ? "file" : "directory",
+          additions: 0,
+          deletions: 0,
+          children: [],
+          file: isFile ? file : undefined,
+        };
+        level.push(node);
+      }
+
+      node.additions += file.additions ?? 0;
+      node.deletions += file.deletions ?? 0;
+
+      if (!isFile) {
+        level = node.children;
+      }
+    }
+  }
+
+  return root.sort(sortCommitFileTreeNodes);
+}
+
+function sortCommitFileTreeNodes(a: CommitFileTreeNode, b: CommitFileTreeNode) {
+  if (a.type !== b.type) {
+    return a.type === "directory" ? -1 : 1;
+  }
+
+  return a.name.localeCompare(b.name);
+}
+
+function CommitFileTree(props: {
+  nodes: CommitFileTreeNode[];
+  depth?: number;
+  commitSha: string;
+  selectedPath: string | null;
+  onOpenFile: (path: string) => void;
+  collapsedPaths?: Set<string>;
+  onToggleDirectory?: (path: string) => void;
+}) {
+  const { nodes, depth = 0, commitSha, selectedPath, onOpenFile, collapsedPaths, onToggleDirectory } = props;
+
+  return (
+    <Stack gap={3}>
+      {nodes.map((node) => {
+        const selected = node.type === 'file' && selectedPath === node.file?.path;
+        const changed = node.file;
+        const isDirectory = node.type === 'directory';
+        const collapsed = isDirectory && collapsedPaths?.has(node.path);
+
+        return (
+          <Box key={`${commitSha}:${node.path}`}>
+            <Box
+              onClick={changed ? () => onOpenFile(changed.path) : isDirectory ? () => onToggleDirectory?.(node.path) : undefined}
+              style={{
+                cursor: changed || isDirectory ? 'pointer' : 'default',
+                padding: isDirectory ? '3px 4px' : '7px 8px',
+                paddingLeft: 8 + depth * 16,
+                borderRadius: isDirectory ? 0 : 8,
+                background: selected ? 'rgba(34, 139, 230, 0.16)' : isDirectory ? 'transparent' : 'rgba(255,255,255,0.025)',
+                border: isDirectory ? '0' : '1px solid rgba(255,255,255,0.06)'
+              }}
+            >
+              <Group justify={isDirectory ? 'flex-start' : 'space-between'} wrap="nowrap" gap="xs">
+                <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+                  {isDirectory ? (
+                    <Text size="xs" c="dimmed" style={{ width: 14, textAlign: 'center', lineHeight: 1 }}>{collapsed ? '▸' : '▾'}</Text>
+                  ) : (
+                    <Badge size="xs" variant="outline">{changed?.status || 'M'}</Badge>
+                  )}
+                  <Text size="xs" fw={isDirectory ? 800 : 700} c={isDirectory ? 'dimmed' : undefined} truncate title={changed?.path ?? node.path}>{node.name}</Text>
+                  {isDirectory ? (
+                    <Group gap={6} wrap="nowrap">
+                      <Text c="green" fw={700} style={{ fontSize: 10, lineHeight: 1.1 }}>+{node.additions}</Text>
+                      <Text c="red" fw={700} style={{ fontSize: 10, lineHeight: 1.1 }}>-{node.deletions}</Text>
+                    </Group>
+                  ) : null}
+                </Group>
+                {!isDirectory ? (
+                  <Group gap={4} wrap="nowrap">
+                    <Badge size="xs" color="green" variant="light">+{node.additions}</Badge>
+                    <Badge size="xs" color="red" variant="light">-{node.deletions}</Badge>
+                  </Group>
+                ) : null}
+              </Group>
+            </Box>
+            {node.children.length > 0 && !collapsed ? (
+              <Box mt={isDirectory ? 2 : 4}>
+                <CommitFileTree nodes={node.children} depth={depth + 1} commitSha={commitSha} selectedPath={selectedPath} onOpenFile={onOpenFile} collapsedPaths={collapsedPaths} onToggleDirectory={onToggleDirectory} />
+              </Box>
+            ) : null}
+          </Box>
+        );
+      })}
+    </Stack>
+  );
+}
+
 export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const { repoRef } = props;
   const [commits, setCommits] = useState<ReviewCommitSummary[]>([]);
   const [commitReportType, setCommitReportType] = useState<CommitReportType>('commits');
-  const [commitReport, setCommitReport] = useState<ReviewCommitReportResponse | null>(null);
+  const [commitReport, setCommitReport] = useState<ReviewCommitAnalyticsResponse | null>(null);
   const [commitRefOptions, setCommitRefOptions] = useState<ReviewCommitRefOption[]>([]);
   const [commitAnalyticsMode, setCommitAnalyticsMode] = useState<CommitAnalyticsMode>('activity');
-  const [commitAggregationWindow, setCommitAggregationWindow] = useState<CommitAggregationWindow>('monthly');
+  const [commitChartDisplayMode, setCommitChartDisplayMode] = useState<CommitChartDisplayMode>('fit');
+  const [commitChartFullscreenOpen, setCommitChartFullscreenOpen] = useState(false);
+  const [commitAggregationPreset, setCommitAggregationPreset] = useState<CommitAggregationPreset>('monthly');
+  const [commitAggregationDays, setCommitAggregationDays] = useState<number>(10);
+  const [commitAggregationDaysText, setCommitAggregationDaysText] = useState('10');
   const [commitAnalyticsColorBy, setCommitAnalyticsColorBy] = useState<CommitAnalyticsColorBy>('extension');
   const [commitReportBusy, setCommitReportBusy] = useState(false);
   const [commitReportRefName, setCommitReportRefName] = useState('');
@@ -441,14 +663,20 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [commitReportExcludeExtensionsText, setCommitReportExcludeExtensionsText] = useState('');
   const [commitReportIncludeRegexText, setCommitReportIncludeRegexText] = useState('');
   const [commitReportExcludeRegexText, setCommitReportExcludeRegexText] = useState('(^|/)Cargo\\.lock$\n(^|/)package-lock\\.json$\n(^|/)pnpm-lock\\.yaml$\n(^|/)yarn\\.lock$');
+  const [advancedCommitFiltersOpen, setAdvancedCommitFiltersOpen] = useState(false);
+  const [commitDatePreset, setCommitDatePreset] = useState<'all' | '30d' | '90d' | '6m' | '1y' | 'custom'>('all');
   const [expandedSha, setExpandedSha] = useState<string | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<ReviewCommitSummary | null>(null);
+  const [hoveredCommit, setHoveredCommit] = useState<ReviewCommitSummary | null>(null);
+  const [collapsedCommitPreviewPaths, setCollapsedCommitPreviewPaths] = useState<Record<string, string[]>>({});
+  const commitPreviewClearTimeoutRef = useRef<number | null>(null);
+  const commitInspectorHoveredRef = useRef(false);
   const [manifestBySha, setManifestBySha] = useState<Record<string, ReviewCommitDiffManifestResponse>>({});
   const [reviewState, setReviewState] = useState<CommitReviewState>(DEFAULT_REVIEW_STATE);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [manifestBusySha, setManifestBusySha] = useState<string | null>(null);
-  const [nextCommitOffset, setNextCommitOffset] = useState<number | null>(0);
+  const [nextCommitCursor, setNextCommitCursor] = useState<string | null>(null);
   const [loadingMoreCommits, setLoadingMoreCommits] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const commitScrollViewportRef = useRef<HTMLDivElement | null>(null);
@@ -458,10 +686,37 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [commitListViewportHeight, setCommitListViewportHeight] = useState(0);
   const [commitListScrollTop, setCommitListScrollTop] = useState(0);
   const [commitItemHeightBySha, setCommitItemHeightBySha] = useState<Record<string, number>>({});
+  const appliedCommitDatasetFiltersRef = useRef<Record<string, unknown> | null>(null);
+  const [appliedCommitDatasetFiltersKey, setAppliedCommitDatasetFiltersKey] = useState('');
+
+  const sanitizeCommitAggregationDays = useCallback((value: string | number) => {
+    const digits = String(value).replace(/[^0-9]/g, '').slice(0, 4);
+    const raw = Number(digits);
+    if (!Number.isFinite(raw) || raw <= 0) return 1;
+    return Math.max(1, Math.min(9999, Math.round(raw)));
+  }, []);
+
+  const updateCommitAggregationDaysText = useCallback((value: string | number) => {
+    const digits = String(value).replace(/[^0-9]/g, '').slice(0, 4);
+    setCommitAggregationDaysText(digits);
+    if (digits.trim()) {
+      setCommitAggregationDays(sanitizeCommitAggregationDays(digits));
+    }
+  }, [sanitizeCommitAggregationDays]);
+
+  const commitCommitAggregationDaysText = useCallback(() => {
+    const next = sanitizeCommitAggregationDays(commitAggregationDaysText || commitAggregationDays);
+    setCommitAggregationDays(next);
+    setCommitAggregationDaysText(String(next));
+  }, [commitAggregationDays, commitAggregationDaysText, sanitizeCommitAggregationDays]);
+
+  const effectiveAggregationWindow: CommitAggregationWindow = commitAggregationPreset === 'custom_days' ? 'daily' : commitAggregationPreset;
+  const effectiveAggregationDays = commitAggregationPreset === 'custom_days' ? Math.max(1, Math.min(9999, Math.round(commitAggregationDays || 1))) : 1;
 
   const commitDatasetFilters = useMemo(() => ({
     ref_name: commitReportRefName.trim() || null,
-    aggregation_window: commitAggregationWindow,
+    aggregation_window: effectiveAggregationWindow,
+    aggregation_days: effectiveAggregationDays,
     color_by: commitAnalyticsColorBy,
     since: commitReportSince.trim() || null,
     until: commitReportUntil.trim() || null,
@@ -473,7 +728,8 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     exclude_regex: splitCommitFilterText(commitReportExcludeRegexText),
   }), [
     commitReportRefName,
-    commitAggregationWindow,
+    effectiveAggregationWindow,
+    effectiveAggregationDays,
     commitAnalyticsColorBy,
     commitReportSince,
     commitReportUntil,
@@ -484,6 +740,57 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     commitReportIncludeRegexText,
     commitReportExcludeRegexText,
   ]);
+
+  const commitDatasetFiltersKey = useMemo(() => JSON.stringify(commitDatasetFilters), [commitDatasetFilters]);
+  const commitDatasetFiltersDirty = Boolean(appliedCommitDatasetFiltersKey && appliedCommitDatasetFiltersKey !== commitDatasetFiltersKey);
+  const formatCommitDateInput = useCallback((date: Date) => {
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+    return local.toISOString().slice(0, 10);
+  }, []);
+
+  const applyCommitDatePreset = useCallback((preset: 'all' | '30d' | '90d' | '6m' | '1y' | 'custom') => {
+    setCommitDatePreset(preset);
+
+    if (preset === 'custom') return;
+
+    if (preset === 'all') {
+      setCommitReportSince('');
+      setCommitReportUntil('');
+      return;
+    }
+
+    const until = new Date();
+    const since = new Date(until);
+    if (preset === '30d') {
+      since.setDate(since.getDate() - 30);
+    } else if (preset === '90d') {
+      since.setDate(since.getDate() - 90);
+    } else if (preset === '6m') {
+      since.setMonth(since.getMonth() - 6);
+    } else if (preset === '1y') {
+      since.setFullYear(since.getFullYear() - 1);
+    }
+
+    setCommitReportSince(formatCommitDateInput(since));
+    setCommitReportUntil(formatCommitDateInput(until));
+  }, [formatCommitDateInput]);
+
+  const activeAdvancedCommitFilterCount = useMemo(() => [
+    commitReportIncludePathsText,
+    commitReportExcludePathsText,
+    commitReportIncludeExtensionsText,
+    commitReportExcludeExtensionsText,
+    commitReportIncludeRegexText,
+    commitReportExcludeRegexText,
+  ].filter((value) => value.trim()).length, [
+    commitReportIncludePathsText,
+    commitReportExcludePathsText,
+    commitReportIncludeExtensionsText,
+    commitReportExcludeExtensionsText,
+    commitReportIncludeRegexText,
+    commitReportExcludeRegexText,
+  ]);
+
 
   const orderedCommits = useMemo(() => {
     return commits.sort((a, b) => {
@@ -552,7 +859,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   }, [commitCumulativeTops, commitItemHeights, commitLinearHeight, commitListViewportHeight, findCommitIndexAtOffset, orderedCommits]);
 
   const maxCommitScrollTop = useMemo(() => {
-    return Math.max(0, commitLinearHeight - commitListViewportHeight * 2);
+    return Math.max(0, commitLinearHeight - commitListViewportHeight);
   }, [commitLinearHeight, commitListViewportHeight]);
 
   const effectiveCommitScrollTop = useMemo(() => {
@@ -643,7 +950,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
         rows.push([
           repoRef,
           commitReportRefName,
-          commitAggregationWindow,
+          commitAggregationPreset === 'custom_days' ? `${effectiveAggregationDays}_days` : effectiveAggregationWindow,
           commitAnalyticsColorBy,
           bucket.month,
           group.key,
@@ -662,52 +969,74 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
 
     const csv = rows.map((row) => row.map(csvCell).join(',')).join('\n') + '\n';
     const safeRef = (commitReportRefName || 'ref').replace(/[^a-z0-9_.-]+/gi, '_');
-    downloadTextFile(`commit-analytics-${safeRef}-${commitAggregationWindow}-${commitAnalyticsColorBy}.csv`, csv, 'text/csv;charset=utf-8');
+    const aggregationLabel = commitAggregationPreset === 'custom_days' ? `${effectiveAggregationDays}-days` : effectiveAggregationWindow;
+    downloadTextFile(`commit-analytics-${safeRef}-${aggregationLabel}-${commitAnalyticsColorBy}.csv`, csv, 'text/csv;charset=utf-8');
   }
 
-  async function loadCommitPage(offset: number, append: boolean) {
+  async function loadCommitPage(cursor: string | null, append: boolean) {
     if (!repoRef.trim()) return;
     try {
       if (append) setLoadingMoreCommits(true);
       else {
         setBusy(true);
-        setCommitReportBusy(true);
-        setNextCommitOffset(0);
+        setNextCommitCursor(null);
       }
       setError(null);
-      const json = await getReviewCommitReport({
+
+      const filters = appliedCommitDatasetFiltersRef.current ?? commitDatasetFilters;
+      const json = await getReviewCommits({
         repo_ref: repoRef,
         limit: COMMIT_PAGE_SIZE,
-        offset: append ? offset : 0,
-        ...commitDatasetFilters,
+        cursor: append ? cursor : null,
+        ...filters,
       });
-      setCommitReport(json);
+
       setCommits((current) => {
         if (!append) return json.commits;
         const seen = new Set(current.map((commit) => commit.sha));
         return [...current, ...json.commits.filter((commit) => !seen.has(commit.sha))];
       });
-      setNextCommitOffset(json.has_more ? json.next_offset ?? offset + json.commits.length : null);
+      const fallbackCursor = json.next_offset == null ? null : String(json.next_offset);
+      setNextCommitCursor(json.has_more ? (json.next_cursor ?? fallbackCursor) : null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
-      setCommitReportBusy(false);
       setLoadingMoreCommits(false);
     }
   }
 
   async function refreshCommits() {
-    await loadCommitPage(0, false);
+    await loadCommitPage(null, false);
   }
 
   async function loadMoreCommits() {
-    if (nextCommitOffset === null || busy || loadingMoreCommits) return;
-    await loadCommitPage(nextCommitOffset, true);
+    if (nextCommitCursor === null || busy || loadingMoreCommits) return;
+    await loadCommitPage(nextCommitCursor, true);
   }
 
-  async function refreshCommitReport() {
-    await loadCommitPage(0, false);
+  async function refreshCommitReport(nextFilters: Record<string, unknown> = commitDatasetFilters) {
+    if (!repoRef.trim()) return;
+    try {
+      setCommitReportBusy(true);
+      setError(null);
+      appliedCommitDatasetFiltersRef.current = nextFilters;
+      setAppliedCommitDatasetFiltersKey(JSON.stringify(nextFilters));
+      const json = await getReviewCommitAnalytics({
+        repo_ref: repoRef,
+        ...nextFilters,
+      });
+      setCommitReport(json);
+      await loadCommitPage(null, false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCommitReportBusy(false);
+    }
+  }
+
+  function applyCommitDatasetFilters() {
+    void refreshCommitReport(commitDatasetFilters);
   }
 
   async function ensureManifest(commit: ReviewCommitSummary) {
@@ -746,8 +1075,49 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     }
   }
 
+  function selectCommitForDetails(commit: ReviewCommitSummary) {
+    setCollapsedCommitPreviewPaths((current) => {
+      if (!current[commit.sha]) return current;
+      const next = { ...current };
+      delete next[commit.sha];
+      return next;
+    });
+    setSelectedCommit((current) => current?.sha === commit.sha ? null : commit);
+  }
+
+  function toggleCommitPreviewDirectory(commitSha: string, path: string) {
+    setCollapsedCommitPreviewPaths((current) => {
+      const paths = new Set(current[commitSha] ?? []);
+      if (paths.has(path)) paths.delete(path);
+      else paths.add(path);
+      return { ...current, [commitSha]: [...paths] };
+    });
+  }
+
+  function previewCommitDetails(commit: ReviewCommitSummary) {
+    if (commitPreviewClearTimeoutRef.current !== null) {
+      window.clearTimeout(commitPreviewClearTimeoutRef.current);
+      commitPreviewClearTimeoutRef.current = null;
+    }
+    setHoveredCommit(commit);
+  }
+
+  function clearCommitPreview(commit: ReviewCommitSummary) {
+    if (commitPreviewClearTimeoutRef.current !== null) {
+      window.clearTimeout(commitPreviewClearTimeoutRef.current);
+    }
+    commitPreviewClearTimeoutRef.current = window.setTimeout(() => {
+      commitPreviewClearTimeoutRef.current = null;
+      if (commitInspectorHoveredRef.current) return;
+      setHoveredCommit((current) => current?.sha === commit.sha ? null : current);
+    }, 140);
+  }
+
   useEffect(() => {
     if (!repoRef.trim()) return;
+    appliedCommitDatasetFiltersRef.current = null;
+    setAppliedCommitDatasetFiltersKey('');
+    setCommitReport(null);
     let cancelled = false;
     void getReviewCommitOptions({ repo_ref: repoRef }).then((json) => {
       if (cancelled) return;
@@ -763,6 +1133,14 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
       cancelled = true;
     };
   }, [repoRef]);
+
+  useEffect(() => {
+    if (!repoRef.trim() || !commitReportRefName.trim() || appliedCommitDatasetFiltersKey) return;
+    const timeout = window.setTimeout(() => {
+      void refreshCommitReport(commitDatasetFilters);
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [repoRef, commitReportRefName, appliedCommitDatasetFiltersKey]);
 
 
 
@@ -788,7 +1166,24 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   }, [busy, commits.length]);
 
   useEffect(() => {
+    const viewport = commitScrollViewportRef.current;
+    if (!viewport) return;
+    if (commitReportType !== 'commits') return;
+    if (busy || loadingMoreCommits || nextCommitCursor === null) return;
+
+    const remaining = maxCommitScrollTop - effectiveCommitScrollTop;
+    const threshold = Math.max(600, commitListViewportHeight * 0.75);
+    if (remaining <= threshold) {
+      void loadMoreCommits();
+    }
+  }, [commitReportType, busy, loadingMoreCommits, nextCommitCursor, maxCommitScrollTop, effectiveCommitScrollTop, commitListViewportHeight]);
+
+  useEffect(() => {
     return () => {
+      if (commitPreviewClearTimeoutRef.current !== null) {
+        window.clearTimeout(commitPreviewClearTimeoutRef.current);
+        commitPreviewClearTimeoutRef.current = null;
+      }
       Object.values(commitItemResizeObserverByShaRef.current).forEach((observer) => observer?.disconnect());
       commitItemResizeObserverByShaRef.current = {};
       commitItemMeasureRefByShaRef.current = {};
@@ -815,6 +1210,9 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     }
   }, [maxCommitScrollTop]);
 
+  const inspectorCommit = selectedCommit ?? hoveredCommit;
+  const collapsedInspectorPaths = useMemo(() => new Set(inspectorCommit ? collapsedCommitPreviewPaths[inspectorCommit.sha] ?? [] : []), [collapsedCommitPreviewPaths, inspectorCommit]);
+
   const reviewContent = selectedCommit ? (
     <DiffPanel
       runId={null}
@@ -832,41 +1230,108 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
 
   return (
     <>
+      <Modal
+        opened={advancedCommitFiltersOpen}
+        onClose={() => setAdvancedCommitFiltersOpen(false)}
+        title="Commit filters"
+        size="lg"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="xs" c="dimmed">
+            Narrow commit history by paths, extensions, or regex. Empty fields leave the default history intact.
+          </Text>
+          <Group grow align="flex-start">
+            <TextInput
+              size="xs"
+              label="Include paths"
+              placeholder="api/src, web/src"
+              value={commitReportIncludePathsText}
+              onChange={(event) => setCommitReportIncludePathsText(event.currentTarget.value)}
+            />
+            <TextInput
+              size="xs"
+              label="Exclude paths"
+              placeholder="target, node_modules"
+              value={commitReportExcludePathsText}
+              onChange={(event) => setCommitReportExcludePathsText(event.currentTarget.value)}
+            />
+          </Group>
+          <Group grow align="flex-start">
+            <TextInput
+              size="xs"
+              label="Include extensions"
+              placeholder="rs, ts, tsx"
+              value={commitReportIncludeExtensionsText}
+              onChange={(event) => setCommitReportIncludeExtensionsText(event.currentTarget.value)}
+            />
+            <TextInput
+              size="xs"
+              label="Exclude extensions"
+              placeholder="lock, map"
+              value={commitReportExcludeExtensionsText}
+              onChange={(event) => setCommitReportExcludeExtensionsText(event.currentTarget.value)}
+            />
+          </Group>
+          <TextInput
+            size="xs"
+            label="Include regex"
+            value={commitReportIncludeRegexText}
+            onChange={(event) => setCommitReportIncludeRegexText(event.currentTarget.value)}
+          />
+          <TextInput
+            size="xs"
+            label="Exclude regex"
+            value={commitReportExcludeRegexText}
+            onChange={(event) => setCommitReportExcludeRegexText(event.currentTarget.value)}
+          />
+          <Group justify="space-between">
+            <Button
+              size="xs"
+              variant="subtle"
+              color="red"
+              onClick={() => {
+                setCommitReportIncludePathsText('');
+                setCommitReportExcludePathsText('');
+                setCommitReportIncludeExtensionsText('');
+                setCommitReportExcludeExtensionsText('');
+                setCommitReportIncludeRegexText('');
+                setCommitReportExcludeRegexText('');
+              }}
+            >
+              Clear filters
+            </Button>
+            <Group gap="xs">
+              <Button size="xs" variant="default" onClick={() => setAdvancedCommitFiltersOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="xs"
+                onClick={() => {
+                  setAdvancedCommitFiltersOpen(false);
+                  void refreshCommitReport();
+                }}
+              >
+                Apply filters
+              </Button>
+            </Group>
+          </Group>
+        </Stack>
+      </Modal>
       <Box style={{ height: 'calc(100dvh - 96px)', minHeight: 0, overflow: 'hidden' }}>
         <Card withBorder p="sm" style={{ height: '100%', minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          <Group justify="space-between" align="flex-start" mb="sm">
+          <Group justify="space-between" align="flex-start" mb={6}>
             <Stack gap={6} style={{ flex: 1 }}>
-              <Stack gap={0}>
-                <Text fw={700}>Commit summary</Text>
-                <Text size="xs" c="dimmed">Compact history and monthly net LOC analytics</Text>
-              </Stack>
-              <Group gap="xs" align="end">
+              <Group gap="xs" align="center">
+                <Text fw={700} size="sm">Commit summary</Text>
+                <Text size="xs" c="dimmed">History and LOC analytics</Text>
+              </Group>
+              <Group gap="xs" align="end" wrap="wrap">
                 <SegmentedControl
                   size="xs"
                   value={commitReportType}
                   onChange={(value) => setCommitReportType(value as CommitReportType)}
                   data={[{ label: 'Commits', value: 'commits' }, { label: 'Analytics', value: 'analytics' }]}
-                />
-                <SegmentedControl
-                  size="xs"
-                  value={commitAnalyticsMode}
-                  onChange={(value) => setCommitAnalyticsMode(value as CommitAnalyticsMode)}
-                  data={[{ label: 'Activity', value: 'activity' }, { label: 'Net', value: 'net' }]}
-                  disabled={commitReportType !== 'analytics'}
-                />
-                <SegmentedControl
-                  size="xs"
-                  value={commitAggregationWindow}
-                  onChange={(value) => setCommitAggregationWindow(value as CommitAggregationWindow)}
-                  data={[{ label: 'Daily', value: 'daily' }, { label: 'Monthly', value: 'monthly' }, { label: 'Yearly', value: 'yearly' }]}
-                  disabled={commitReportType !== 'analytics'}
-                />
-                <SegmentedControl
-                  size="xs"
-                  value={commitAnalyticsColorBy}
-                  onChange={(value) => setCommitAnalyticsColorBy(value as CommitAnalyticsColorBy)}
-                  data={[{ label: 'Ext', value: 'extension' }, { label: 'Author', value: 'author' }]}
-                  disabled={commitReportType !== 'analytics'}
                 />
                 <Select
                   size="xs"
@@ -877,130 +1342,352 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
                   onChange={(value) => setCommitReportRefName(value || '')}
                   style={{ minWidth: 180 }}
                 />
-                <TextInput size="xs" label="Since" placeholder="2025-01-01" value={commitReportSince} onChange={(event) => setCommitReportSince(event.currentTarget.value)} />
-                <TextInput size="xs" label="Until" placeholder="2025-02-28" value={commitReportUntil} onChange={(event) => setCommitReportUntil(event.currentTarget.value)} />
-                <TextInput size="xs" label="Include paths" placeholder="api/src, web/src" value={commitReportIncludePathsText} onChange={(event) => setCommitReportIncludePathsText(event.currentTarget.value)} />
-                <TextInput size="xs" label="Exclude paths" placeholder="target, node_modules" value={commitReportExcludePathsText} onChange={(event) => setCommitReportExcludePathsText(event.currentTarget.value)} />
-                <TextInput size="xs" label="Include ext" placeholder="rs, ts, tsx" value={commitReportIncludeExtensionsText} onChange={(event) => setCommitReportIncludeExtensionsText(event.currentTarget.value)} />
-                <TextInput size="xs" label="Exclude ext" placeholder="lock, map" value={commitReportExcludeExtensionsText} onChange={(event) => setCommitReportExcludeExtensionsText(event.currentTarget.value)} />
-                <TextInput size="xs" label="Include regex" style={{ minWidth: 220 }} value={commitReportIncludeRegexText} onChange={(event) => setCommitReportIncludeRegexText(event.currentTarget.value)} />
-                <TextInput size="xs" label="Exclude regex" style={{ minWidth: 320 }} value={commitReportExcludeRegexText} onChange={(event) => setCommitReportExcludeRegexText(event.currentTarget.value)} />
+                <Select
+                  size="xs"
+                  label="Preset"
+                  value={commitDatePreset}
+                  onChange={(value) => applyCommitDatePreset((value || 'all') as 'all' | '30d' | '90d' | '6m' | '1y' | 'custom')}
+                  data={[
+                    { label: 'All time', value: 'all' },
+                    { label: 'Last 30 days', value: '30d' },
+                    { label: 'Last 90 days', value: '90d' },
+                    { label: 'Last 6 months', value: '6m' },
+                    { label: 'Last year', value: '1y' },
+                    { label: 'Custom', value: 'custom' },
+                  ]}
+                  style={{ width: 140 }}
+                />
+                <TextInput
+                  size="xs"
+                  type="date"
+                  label="Since"
+                  value={commitReportSince}
+                  onChange={(event) => {
+                    setCommitDatePreset('custom');
+                    setCommitReportSince(event.currentTarget.value);
+                  }}
+                  style={{ width: 132 }}
+                />
+                <TextInput
+                  size="xs"
+                  type="date"
+                  label="Until"
+                  value={commitReportUntil}
+                  onChange={(event) => {
+                    setCommitDatePreset('custom');
+                    setCommitReportUntil(event.currentTarget.value);
+                  }}
+                  style={{ width: 132 }}
+                />
+                <Button
+                  size="xs"
+                  variant={activeAdvancedCommitFilterCount > 0 ? 'light' : 'default'}
+                  onClick={() => setAdvancedCommitFiltersOpen(true)}
+                >
+                  Filters{activeAdvancedCommitFilterCount > 0 ? ` · ${activeAdvancedCommitFilterCount}` : ''}
+                </Button>
+                <Button
+                  size="xs"
+                  variant={commitDatasetFiltersDirty ? 'filled' : 'default'}
+                  color={commitDatasetFiltersDirty ? 'green' : undefined}
+                  loading={busy || commitReportBusy}
+                  onClick={applyCommitDatasetFilters}
+                >
+                  Apply
+                </Button>
 
               </Group>
+              {commitReportType === 'analytics' ? (
+                <Group gap="xs" align="end" wrap="wrap">
+                  <Select
+                    size="xs"
+                    label="Measure"
+                    value={commitAnalyticsMode}
+                    onChange={(value) => setCommitAnalyticsMode((value || 'activity') as CommitAnalyticsMode)}
+                    data={[
+                      { label: 'Total change', value: 'activity' },
+                      { label: 'Net change', value: 'net' },
+                    ]}
+                    style={{ width: 150 }}
+                  />
+                  <Box>
+                    <Text size="xs" fw={700} mb={4}>Aggregation</Text>
+                    <Group gap={0} wrap="nowrap">
+                      <Select
+                        size="xs"
+                        aria-label="Aggregation"
+                        value={commitAggregationPreset}
+                        onChange={(value) => setCommitAggregationPreset((value || 'monthly') as CommitAggregationPreset)}
+                        data={[
+                          { label: 'Day', value: 'daily' },
+                          { label: 'Month', value: 'monthly' },
+                          { label: 'Year', value: 'yearly' },
+                          { label: 'Custom', value: 'custom_days' },
+                        ]}
+                        style={{ width: commitAggregationPreset === 'custom_days' ? 112 : 140 }}
+                        styles={{
+                          input: commitAggregationPreset === 'custom_days' ? {
+                            borderTopRightRadius: 0,
+                            borderBottomRightRadius: 0,
+                          } : undefined,
+                        }}
+                      />
+                      {commitAggregationPreset === 'custom_days' ? (
+                        <TextInput
+                          size="xs"
+                          aria-label="Custom aggregation days"
+                          value={commitAggregationDaysText}
+                          onChange={(event) => updateCommitAggregationDaysText(event.currentTarget.value)}
+                          onBlur={commitCommitAggregationDaysText}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.currentTarget.blur();
+                            }
+                          }}
+                          inputMode="numeric"
+                          maxLength={4}
+                          rightSection="days"
+                          rightSectionWidth={32}
+                          style={{ width: 82, marginLeft: -1 }}
+                          styles={{
+                            input: {
+                              borderTopLeftRadius: 0,
+                              borderBottomLeftRadius: 0,
+                              paddingLeft: 8,
+                              paddingRight: 34,
+                              textAlign: 'right',
+                            },
+                            section: {
+                              color: 'var(--mantine-color-dimmed)',
+                              fontSize: 11,
+                              pointerEvents: 'none',
+                            },
+                          }}
+                        />
+                      ) : null}
+                    </Group>
+                  </Box>
+                  <Select
+                    size="xs"
+                    label="View"
+                    value={commitChartDisplayMode}
+                    onChange={(value) => setCommitChartDisplayMode((value || 'fit') as CommitChartDisplayMode)}
+                    data={[
+                      { label: 'Fit', value: 'fit' },
+                      { label: 'Scroll', value: 'scroll' },
+                    ]}
+                    style={{ width: 110 }}
+                  />
+
+                  <Select
+                    size="xs"
+                    label="Color"
+                    value={commitAnalyticsColorBy}
+                    onChange={(value) => setCommitAnalyticsColorBy((value || 'extension') as CommitAnalyticsColorBy)}
+                    data={[
+                      { label: 'File extension', value: 'extension' },
+                      { label: 'Author', value: 'author' },
+                    ]}
+                    style={{ width: 125 }}
+                  />
+
+                </Group>
+              ) : null}
             </Stack>
-            <Button
-              size="xs"
-              variant="default"
-              loading={busy || commitReportBusy}
-              onClick={() => void refreshCommitReport()}
-            >
-              Apply filters
-            </Button>
-            <Button
-              size="xs"
-              variant="default"
-              disabled={!commitReport}
-              onClick={exportCommitAnalyticsCsv}
-            >
-              Export CSV
-            </Button>
           </Group>
           {error && !reviewOpen ? <Alert color="red" mb="sm">{error}</Alert> : null}
-          <Divider mb="sm" />
+          <Divider mb={6} />
           {commitReportType === 'analytics' ? (
             (commitReportBusy || busy) && !commitReport ? (
               <Group justify="center" py="xl"><Loader /></Group>
             ) : (
               <Box style={{ flex: 1, minHeight: 0 }}>
-                <CommitAnalyticsChart report={commitReport} mode={commitAnalyticsMode} />
+                <CommitAnalyticsChart report={commitReport} mode={commitAnalyticsMode} displayMode={commitChartDisplayMode} aggregationPreset={commitAggregationPreset} aggregationDays={effectiveAggregationDays} onFullscreen={() => setCommitChartFullscreenOpen(true)} onExportCsv={exportCommitAnalyticsCsv} />
               </Box>
             )
           ) : busy && commits.length === 0 ? (
             <Group justify="center" py="xl"><Loader /></Group>
           ) : (
-            <ScrollArea style={{ flex: 1, minHeight: 0, width: '100%', overflow: 'hidden' }} type="auto" scrollbarSize={commitLinearHeight <= commitListViewportHeight * 2 ? 0 : undefined} viewportRef={commitScrollViewportRef}>
-              <Box style={{ position: 'relative', minHeight: commitVirtualHeight, width: '100%' }}>
-                <Box style={{ position: 'absolute', top: commitVisibleTop, left: 0, right: 0, display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, alignItems: 'start', width: '100%' }}>
-                  {[leftCommits, rightCommits].map((columnCommits, columnIndex) => (
-                    <Stack key={columnIndex} gap="xs" style={{ width: '100%' }}>
-                      {columnCommits.map((commit, rowIndex) => {
-                  const expanded = expandedSha === commit.sha;
-                  const manifest = manifestBySha[commit.sha];
-                  const fileCount = commit.files_changed;
-                  const additions = commit.additions;
-                  const deletions = commit.deletions;
-                  const hasStats = typeof fileCount === 'number' && typeof additions === 'number' && typeof deletions === 'number';
+            <Box style={{ flex: 1, minHeight: 0, display: 'grid', gridTemplateColumns: 'minmax(520px, 1fr) minmax(360px, 0.62fr)', gap: 10 }}>
+              <ScrollArea style={{ minHeight: 0, width: '100%' }} type="auto" viewportRef={commitScrollViewportRef}>
+                <Stack gap="xs" pr={4}>
+                  {orderedCommits.map((commit) => {
+                    const selected = selectedCommit?.sha === commit.sha;
+                    const previewed = hoveredCommit?.sha === commit.sha;
+                    const fileCount = commit.files_changed;
+                    const additions = commit.additions;
+                    const deletions = commit.deletions;
+                    const hasStats = typeof fileCount === 'number' && typeof additions === 'number' && typeof deletions === 'number';
+
+                    return (
+                      <Card
+                        ref={setCommitItemMeasureRef(commit.sha)}
+                        key={commit.sha}
+                        withBorder
+                        p={7}
+                        onMouseEnter={() => previewCommitDetails(commit)}
+                        onMouseLeave={() => clearCommitPreview(commit)}
+                        onFocus={() => previewCommitDetails(commit)}
+                        onBlur={() => clearCommitPreview(commit)}
+                        onClick={() => void selectCommitForDetails(commit)}
+                        style={{
+                          cursor: 'pointer',
+                          background: selected
+                            ? 'rgba(34, 139, 230, 0.14)'
+                            : previewed
+                              ? 'rgba(255,255,255,0.045)'
+                              : undefined,
+                          borderColor: selected
+                            ? 'rgba(74, 171, 247, 0.55)'
+                            : previewed
+                              ? 'rgba(255,255,255,0.18)'
+                              : undefined,
+                        }}
+                      >
+                        <Group justify="space-between" align="center" wrap="nowrap" gap="xs">
+                          <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+                            <Badge size="xs" variant="outline">{commit.short_sha}</Badge>
+                            <Badge size="xs" variant="light">{formatCommitDate(commit.authored_at)}</Badge>
+                            <Text size="sm" fw={700} truncate style={{ minWidth: 0, flex: 1 }} title={commit.subject}>{commit.subject}</Text>
+                            <Text size="xs" c="dimmed" truncate style={{ maxWidth: 140 }}>{commit.author_name}</Text>
+                          </Group>
+                          <Group gap={4} wrap="nowrap">
+                            {hasStats ? (
+                              <>
+                                <Badge size="xs" variant="light">{fileCount}f</Badge>
+                                <Badge size="xs" color="green" variant="light">+{additions}</Badge>
+                                <Badge size="xs" color="red" variant="light">-{deletions}</Badge>
+                              </>
+                            ) : (
+                              <Badge size="xs" variant="light">stats unavailable</Badge>
+                            )}
+                            <Button
+                              size="compact-xs"
+                              variant="filled"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void openCommitReview(commit, null);
+                              }}
+                            >
+                              Review
+                            </Button>
+                          </Group>
+                        </Group>
+
+                      </Card>
+                    );
+                  })}
+                  {loadingMoreCommits ? (
+                    <Group justify="center" py="sm"><Loader size="sm" /></Group>
+                  ) : commits.length > 0 && nextCommitCursor === null ? (
+                    <Text size="xs" c="dimmed" ta="center">End of commit history</Text>
+                  ) : null}
+                </Stack>
+              </ScrollArea>
+
+              <Card
+                withBorder
+                p="sm"
+                onMouseEnter={() => {
+                  commitInspectorHoveredRef.current = true;
+                  if (commitPreviewClearTimeoutRef.current !== null) {
+                    window.clearTimeout(commitPreviewClearTimeoutRef.current);
+                    commitPreviewClearTimeoutRef.current = null;
+                  }
+                }}
+                onMouseLeave={() => {
+                  commitInspectorHoveredRef.current = false;
+                  if (!selectedCommit) setHoveredCommit(null);
+                }}
+                style={{ minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+              >
+                {inspectorCommit ? (() => {
+                  const files = inspectorCommit.files ?? [];
+                  const pinned = selectedCommit?.sha === inspectorCommit.sha;
                   return (
-                    <Card ref={setCommitItemMeasureRef(commit.sha)} key={commit.sha} withBorder p={6} style={{ background: selectedCommit?.sha === commit.sha && reviewOpen ? 'rgba(34, 139, 230, 0.10)' : undefined }}>
-                      <Group justify="space-between" align="center" wrap="nowrap" gap="xs">
-                        <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-                          <Button size="compact-xs" variant="subtle" onClick={() => void toggleExpanded(commit)}>{expanded ? '▾' : '▸'}</Button>
-                          <Badge size="xs" variant="outline">{commit.short_sha}</Badge>
-                          <Badge size="xs" variant="light">{formatCommitDate(commit.authored_at)}</Badge>
-                          <Text size="sm" fw={600} truncate style={{ minWidth: 0, flex: 1 }} title={commit.subject}>{commit.subject}</Text>
-                          <Text size="xs" c="dimmed" truncate style={{ maxWidth: 120 }}>{commit.author_name}</Text>
+                    <Stack gap="sm" style={{ minHeight: 0, flex: 1 }}>
+                      <Stack gap={4}>
+                        <Group justify="space-between" wrap="nowrap" gap="xs">
+                          <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+                            <Badge size="xs" variant="outline">{inspectorCommit.short_sha}</Badge>
+                            <Text size="sm" fw={800} truncate title={inspectorCommit.subject}>{inspectorCommit.subject}</Text>
+                          </Group>
+                          <Group gap={6} wrap="nowrap">
+                            <Button size="compact-xs" variant={pinned ? 'light' : 'default'} onClick={() => selectCommitForDetails(inspectorCommit)}>{pinned ? 'Unpin' : 'Pin'}</Button>
+                            <Button size="compact-xs" onClick={() => void openCommitReview(inspectorCommit, null)}>Review all</Button>
+                          </Group>
                         </Group>
-                        <Group gap={4} wrap="nowrap">
-                          {hasStats ? (
-                            <>
-                              <Badge size="xs" variant="light">{fileCount}f</Badge>
-                              <Badge size="xs" color="green" variant="light">+{additions}</Badge>
-                              <Badge size="xs" color="red" variant="light">-{deletions}</Badge>
-                            </>
-                          ) : (
-                            <Badge size="xs" variant="light">stats unavailable</Badge>
-                          )}
-                          <Button size="compact-xs" variant="filled" onClick={() => void openCommitReview(commit, null)}>Review</Button>
+                        <Group gap={6}>
+                          <Badge size="xs" variant="light">{formatCommitDate(inspectorCommit.authored_at)}</Badge>
+                          <Badge size="xs" variant="light">{inspectorCommit.author_name}</Badge>
+                          {typeof inspectorCommit.files_changed === 'number' ? <Badge size="xs" variant="light">{inspectorCommit.files_changed} files</Badge> : null}
+                          {typeof inspectorCommit.additions === 'number' ? <Badge size="xs" color="green" variant="light">+{inspectorCommit.additions}</Badge> : null}
+                          {typeof inspectorCommit.deletions === 'number' ? <Badge size="xs" color="red" variant="light">-{inspectorCommit.deletions}</Badge> : null}
+                          <Badge size="xs" variant={pinned ? 'filled' : 'light'}>{pinned ? 'Pinned' : 'Preview'}</Badge>
                         </Group>
-                      </Group>
-                      {expanded ? (
-                        manifestBusySha === commit.sha && !manifest ? (
-                          <Group justify="center" py="sm"><Loader size="sm" /></Group>
-                        ) : manifest ? (
-                          <Stack gap={4} mt={6}>
-                            {manifest.files.map((file) => (
-                              <Box
-                                key={`${commit.sha}:${file.path}`}
-                                onClick={() => void openCommitReview(commit, file.path)}
-                                style={{
-                                  cursor: 'pointer',
-                                  padding: '4px 6px',
-                                  borderRadius: 6,
-                                  background: selectedCommit?.sha === commit.sha && reviewState.selected_path === file.path && reviewOpen ? 'rgba(34, 139, 230, 0.16)' : 'rgba(255,255,255,0.02)',
-                                  border: '1px solid rgba(255,255,255,0.05)'
-                                }}
-                              >
-                                <Group justify="space-between" wrap="nowrap">
-                                  <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-                                    <Badge size="xs" variant="outline">{statusCode(file)}</Badge>
-                                    <Text size="xs" truncate>{file.path}</Text>
-                                  </Group>
-                                  <Group gap={4} wrap="nowrap">
-                                    <Badge size="xs" color="green" variant="light">+{file.additions}</Badge>
-                                    <Badge size="xs" color="red" variant="light">-{file.deletions}</Badge>
-                                  </Group>
-                                </Group>
-                              </Box>
-                            ))}
-                          </Stack>
-                        ) : null
-                      ) : null}
-                    </Card>
-                  );
-                      })}
+                      </Stack>
+
+                      <Divider />
+
+                      {files.length > 0 ? (
+                        <ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto">
+                          <CommitFileTree
+                            nodes={buildCommitFileTree(files)}
+                            commitSha={inspectorCommit.sha}
+                            selectedPath={reviewOpen ? reviewState.selected_path : null}
+                            onOpenFile={(path) => void openCommitReview(inspectorCommit, path)}
+                            collapsedPaths={collapsedInspectorPaths}
+                            onToggleDirectory={(path) => toggleCommitPreviewDirectory(inspectorCommit.sha, path)}
+                          />
+                        </ScrollArea>
+                      ) : (
+                        <Text size="sm" c="dimmed">No per-file stats were returned for this commit.</Text>
+                      )}
                     </Stack>
-                  ))}
-                </Box>
-              </Box>
-              {nextCommitOffset !== null ? (
-                <Button size="xs" variant="default" loading={loadingMoreCommits} onClick={() => void loadMoreCommits()}>Load older commits</Button>
-              ) : commits.length > 0 ? (
-                <Text size="xs" c="dimmed" ta="center">End of commit history</Text>
-              ) : null}
-            </ScrollArea>
+                  );
+                })() : (
+                  <Stack gap={4} justify="center" align="center" style={{ flex: 1 }}>
+                    <Text size="sm" fw={800}>Hover a commit</Text>
+                    <Text size="xs" c="dimmed" ta="center">Changed files and per-file additions/deletions preview here. Click a commit to pin it.</Text>
+                  </Stack>
+                )}
+              </Card>
+            </Box>
           )}
         </Card>
       </Box>
+      <Modal
+        opened={commitChartFullscreenOpen}
+        onClose={() => setCommitChartFullscreenOpen(false)}
+        fullScreen
+        padding="md"
+        radius={0}
+        title={(
+          <Group gap="xs">
+            <Text fw={800}>Commit analytics</Text>
+            <SegmentedControl
+              size="xs"
+              value={commitAnalyticsMode}
+              onChange={(value) => setCommitAnalyticsMode(value as CommitAnalyticsMode)}
+              data={[{ label: 'Total change', value: 'activity' }, { label: 'Net change', value: 'net' }]}
+            />
+            <SegmentedControl
+              size="xs"
+              value={commitChartDisplayMode}
+              onChange={(value) => setCommitChartDisplayMode(value as CommitChartDisplayMode)}
+              data={[{ label: 'Fit', value: 'fit' }, { label: 'Scroll', value: 'scroll' }]}
+            />
+          </Group>
+        )}
+        styles={{
+          content: { display: 'flex', flexDirection: 'column' },
+          body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
+        }}
+      >
+        <Box style={{ flex: 1, minHeight: 0 }}>
+          <CommitAnalyticsChart report={commitReport} mode={commitAnalyticsMode} displayMode={commitChartDisplayMode} aggregationPreset={commitAggregationPreset} aggregationDays={effectiveAggregationDays} onExportCsv={exportCommitAnalyticsCsv} />
+        </Box>
+      </Modal>
       <Modal
         opened={reviewOpen}
         onClose={() => setReviewOpen(false)}

@@ -21,11 +21,10 @@ import {
 import { DiffCode, inspectUnifiedPatch } from './DiffCode';
 import { IconMinus, IconPlus, IconTrash } from '@tabler/icons-react';
 import {
-  getReviewDiff,
-  getReviewDiffManifest,
-  getReviewFilePatch,
-  getReviewCommitDiff,
-  getReviewCommitDiffManifest,
+  closeReviewDiffSession,
+  createReviewCommitDiffSession,
+  createReviewDiffSession,
+  getReviewDiffSessionWindow,
   discardWorkflowReviewDiff,
   getReviewStatus,
   stageReviewDiff,
@@ -33,6 +32,7 @@ import {
   type ReviewDiffManifestFileEntry,
   type ReviewDiffManifestResponse,
   type ReviewDiffResponse,
+  type ReviewDiffSessionResponse,
   type ReviewCommitDiffManifestResponse,
   type ReviewCommitDiffResponse,
   type ReviewDiffScope,
@@ -65,6 +65,8 @@ const MIN_SIDEBAR_WIDTH = 280;
 const MAX_SIDEBAR_WIDTH = 620;
 const DEFAULT_SIDEBAR_WIDTH = 360;
 const LARGE_SINGLE_FILE_RENDER_LINE_LIMIT = 8000;
+const SCOPE_DIFF_WINDOW_LINE_COUNT = 420;
+const SELECTED_FILE_DIFF_WINDOW_LINE_COUNT = 2400;
 
 function clampContextLines(value: number | string | null | undefined): number {
   const numeric = typeof value === 'number' ? value : Number(value ?? 4);
@@ -80,6 +82,39 @@ function clampSidebarWidth(value: number | null | undefined): number {
     return DEFAULT_SIDEBAR_WIDTH;
   }
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.round(numeric)));
+}
+
+function reviewDiffSessionKey(repoRef: string, state: DiffPanelState): string {
+  return [
+    repoRef.trim(),
+    state.selected_scope,
+    clampContextLines(state.context_lines),
+    state.whole_file ? 'whole' : 'context',
+  ].join('\u001f');
+}
+
+function reviewCommitDiffSessionKey(repoRef: string, commitSha: string, state: DiffPanelState): string {
+  return [
+    repoRef.trim(),
+    'commit',
+    commitSha.trim(),
+    clampContextLines(state.context_lines),
+    state.whole_file ? 'whole' : 'context',
+  ].join('\u001f');
+}
+
+function reviewSessionManifest(session: ReviewDiffSessionResponse): ReviewDiffManifestResponse {
+  return {
+    ok: session.ok,
+    scope: session.scope,
+    from_ref: session.from_ref,
+    to_ref: session.to_ref,
+    files: session.files,
+  };
+}
+
+function windowPatch(lines: string[]): string {
+  return lines.join('\n').trimEnd();
 }
 
 function sumCounts(files: Array<{ additions: number; deletions: number }>) {
@@ -539,6 +574,41 @@ export function DiffPanel(props: DiffPanelProps) {
   const [diffManifest, setDiffManifest] = useState<ReviewDiffManifestResponse | ReviewCommitDiffManifestResponse | null>(null);
   const [filePatchByPath, setFilePatchByPath] = useState<Record<string, string>>({});
   const [filePatchBusyByPath, setFilePatchBusyByPath] = useState<Record<string, boolean>>({});
+  const [, setDiffSession] = useState<ReviewDiffSessionResponse | null>(null);
+  const diffSessionRef = useRef<ReviewDiffSessionResponse | null>(null);
+  const diffSessionKeyRef = useRef<string>('');
+
+  async function closeActiveDiffSession() {
+    const session = diffSessionRef.current;
+    if (!session) {
+      return;
+    }
+    diffSessionRef.current = null;
+    diffSessionKeyRef.current = '';
+    setDiffSession(null);
+    try {
+      await closeReviewDiffSession({ session_id: session.session_id });
+    } catch {
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      const session = diffSessionRef.current;
+      if (!session) {
+        return;
+      }
+      diffSessionRef.current = null;
+      diffSessionKeyRef.current = '';
+      void closeReviewDiffSession({ session_id: session.session_id }).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!viewerOpen) {
+      void closeActiveDiffSession();
+    }
+  }, [viewerOpen]);
   const [collapsedByPath, setCollapsedByPath] = useState<Record<string, boolean>>({});
   const [collapsedTreeDirs, setCollapsedTreeDirs] = useState<Record<string, boolean>>({});
   const [activeScrollPath, setActiveScrollPath] = useState<string | null>(null);
@@ -580,14 +650,14 @@ export function DiffPanel(props: DiffPanelProps) {
   );
 
   const selectedFilePatch = useMemo(() => {
-    if (!state.selected_path || !diff?.patch?.trim()) {
+    if (!state.selected_path) {
       return '';
     }
-    return diff.patch;
-  }, [state.selected_path, diff?.patch]);
+    return filePatchByPath[state.selected_path] ?? '';
+  }, [state.selected_path, filePatchByPath]);
 
   const selectedFilePayloadInfo = useMemo(() => {
-    if (!state.selected_path || !diff?.patch?.trim()) {
+    if (!state.selected_path || !selectedFilePatch.trim()) {
       return {
         fileCount: 0,
         containsSelectedFile: false,
@@ -596,8 +666,8 @@ export function DiffPanel(props: DiffPanelProps) {
       };
     }
 
-    return inspectUnifiedPatch(diff.patch, state.selected_path);
-  }, [state.selected_path, diff?.patch]);
+    return inspectUnifiedPatch(selectedFilePatch, state.selected_path);
+  }, [state.selected_path, selectedFilePatch]);
 
   const scopeDiffRows = useMemo(() => {
     return (diffManifest?.files ?? []).map((file) => ({
@@ -703,43 +773,98 @@ export function DiffPanel(props: DiffPanelProps) {
 
   async function refreshScopeFilePatches(
     nextState: DiffPanelState,
-    files: ReviewDiffManifestFileEntry[],
+    _files: ReviewDiffManifestFileEntry[],
     requestId: number
   ) {
-    if (!repoRef.trim() || nextState.selected_path || files.length === 0) {
+    if (mode === 'commit') {
+      await closeActiveDiffSession();
+    }
+
+    if (!repoRef.trim()) {
       if (refreshDiffRequestIdRef.current !== requestId) {
         return;
       }
+      setDiffSession(null);
+      diffSessionRef.current = null;
+      diffSessionKeyRef.current = '';
+      setDiffManifest(null);
       setFilePatchByPath({});
       setFilePatchBusyByPath({});
       setCollapsedByPath({});
       return;
     }
 
-    const busy: Record<string, boolean> = {};
-    const collapsed: Record<string, boolean> = {};
-    for (const file of files) {
-      busy[file.path] = true;
-      collapsed[file.path] = false;
+    const sessionKey = reviewDiffSessionKey(repoRef, nextState);
+    let session = diffSessionKeyRef.current === sessionKey ? diffSessionRef.current : null;
+
+    if (!session) {
+      await closeActiveDiffSession();
+      session = await createReviewDiffSession({
+        repo_ref: repoRef,
+        scope: nextState.selected_scope,
+        context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
+        whole_file: nextState.whole_file,
+      });
+
+      if (refreshDiffRequestIdRef.current !== requestId) {
+        void closeReviewDiffSession({ session_id: session.session_id }).catch(() => undefined);
+        return;
+      }
+
+      diffSessionRef.current = session;
+      diffSessionKeyRef.current = sessionKey;
+      setDiffSession(session);
+      setFilePatchByPath({});
     }
+
+
+    const manifest = reviewSessionManifest(session);
+    const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
+    const files = nextState.selected_path
+      ? manifest.files.filter((file) => file.path === nextState.selected_path)
+      : directoryPath
+        ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
+        : manifest.files;
+
+    setDiffManifest(manifest);
+    setDiff(null);
+
+    if (files.length === 0) {
+      setFilePatchBusyByPath({});
+      setCollapsedByPath({});
+      return;
+    }
+
+    const collapsed: Record<string, boolean> = {};
+    const busy: Record<string, boolean> = {};
+    for (const file of files) {
+      collapsed[file.path] = false;
+      if (!filePatchByPath[file.path]) {
+        busy[file.path] = true;
+      }
+    }
+
     if (refreshDiffRequestIdRef.current !== requestId) {
       return;
     }
-    setFilePatchByPath({});
-    setFilePatchBusyByPath(busy);
-    setCollapsedByPath(collapsed);
 
+    setCollapsedByPath((current) => ({ ...collapsed, ...current }));
+    setFilePatchBusyByPath(busy);
+
+    const lineCount = nextState.selected_path ? SELECTED_FILE_DIFF_WINDOW_LINE_COUNT : SCOPE_DIFF_WINDOW_LINE_COUNT;
     const patchEntries = await Promise.all(
       files.map(async (file) => {
+        if (filePatchByPath[file.path]) {
+          return [file.path, filePatchByPath[file.path]] as const;
+        }
         try {
-          const json = await getReviewFilePatch({
-            repo_ref: repoRef,
-            scope: nextState.selected_scope,
+          const json = await getReviewDiffSessionWindow({
+            session_id: session.session_id,
             path: file.path,
-            context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-            whole_file: nextState.whole_file,
+            start_line: 0,
+            line_count: lineCount,
           });
-          return [file.path, json.patch] as const;
+          return [file.path, windowPatch(json.lines)] as const;
         } catch {
           return [file.path, ''] as const;
         }
@@ -750,12 +875,56 @@ export function DiffPanel(props: DiffPanelProps) {
       return;
     }
 
-    const nextPatchByPath: Record<string, string> = {};
-    for (const [path, patch] of patchEntries) {
-      nextPatchByPath[path] = patch;
-    }
-    setFilePatchByPath(nextPatchByPath);
+    setFilePatchByPath((current) => {
+      const nextPatchByPath = { ...current };
+      for (const [path, patch] of patchEntries) {
+        nextPatchByPath[path] = patch;
+      }
+      return nextPatchByPath;
+    });
     setFilePatchBusyByPath({});
+  }
+
+  async function ensureCommitDiffSession(
+    commitSha: string,
+    nextState: DiffPanelState,
+    requestId: number
+  ): Promise<ReviewDiffSessionResponse | null> {
+    if (!repoRef.trim() || !commitSha.trim()) {
+      await closeActiveDiffSession();
+      setDiffManifest(null);
+      setFilePatchByPath({});
+      setFilePatchBusyByPath({});
+      setCollapsedByPath({});
+      return null;
+    }
+
+    const sessionKey = reviewCommitDiffSessionKey(repoRef, commitSha, nextState);
+    let session = diffSessionKeyRef.current === sessionKey ? diffSessionRef.current : null;
+
+    if (!session) {
+      await closeActiveDiffSession();
+      session = await createReviewCommitDiffSession({
+        repo_ref: repoRef,
+        commit: commitSha,
+        context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
+        whole_file: nextState.whole_file,
+      });
+
+      if (refreshDiffRequestIdRef.current !== requestId) {
+        void closeReviewDiffSession({ session_id: session.session_id }).catch(() => undefined);
+        return null;
+      }
+
+      diffSessionRef.current = session;
+      diffSessionKeyRef.current = sessionKey;
+      setDiffSession(session);
+      setFilePatchByPath({});
+    }
+
+    setDiffManifest(reviewSessionManifest(session));
+    setDiff(null);
+    return session;
   }
 
   async function refreshCommitFilePatches(
@@ -764,40 +933,51 @@ export function DiffPanel(props: DiffPanelProps) {
     requestId: number
   ) {
     const commitSha = props.commitSha?.trim() ?? '';
-    if (!repoRef.trim() || !commitSha || nextState.selected_path || files.length === 0) {
-      if (refreshDiffRequestIdRef.current !== requestId) {
-        return;
-      }
-      setFilePatchByPath({});
+    const session = await ensureCommitDiffSession(commitSha, nextState, requestId);
+    if (!session || refreshDiffRequestIdRef.current !== requestId) {
+      return;
+    }
+
+    const manifest = reviewSessionManifest(session);
+    const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
+    const visibleFiles = nextState.selected_path
+      ? manifest.files.filter((file) => file.path === nextState.selected_path)
+      : directoryPath
+        ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
+        : files;
+
+    if (visibleFiles.length === 0) {
       setFilePatchBusyByPath({});
       setCollapsedByPath({});
       return;
     }
 
-    const busy: Record<string, boolean> = {};
     const collapsed: Record<string, boolean> = {};
-    for (const file of files) {
-      busy[file.path] = true;
+    const busy: Record<string, boolean> = {};
+    for (const file of visibleFiles) {
       collapsed[file.path] = false;
+      if (!filePatchByPath[file.path]) {
+        busy[file.path] = true;
+      }
     }
-    if (refreshDiffRequestIdRef.current !== requestId) {
-      return;
-    }
-    setFilePatchByPath({});
-    setFilePatchBusyByPath(busy);
-    setCollapsedByPath(collapsed);
 
+    setCollapsedByPath((current) => ({ ...collapsed, ...current }));
+    setFilePatchBusyByPath(busy);
+
+    const lineCount = nextState.selected_path ? SELECTED_FILE_DIFF_WINDOW_LINE_COUNT : SCOPE_DIFF_WINDOW_LINE_COUNT;
     const patchEntries = await Promise.all(
-      files.map(async (file) => {
+      visibleFiles.map(async (file) => {
+        if (filePatchByPath[file.path]) {
+          return [file.path, filePatchByPath[file.path]] as const;
+        }
         try {
-          const json = await getReviewCommitDiff({
-            repo_ref: repoRef,
-            commit: commitSha,
+          const json = await getReviewDiffSessionWindow({
+            session_id: session.session_id,
             path: file.path,
-            context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-            whole_file: nextState.whole_file,
+            start_line: 0,
+            line_count: lineCount,
           });
-          return [file.path, json.patch] as const;
+          return [file.path, windowPatch(json.lines)] as const;
         } catch {
           return [file.path, ''] as const;
         }
@@ -808,11 +988,13 @@ export function DiffPanel(props: DiffPanelProps) {
       return;
     }
 
-    const nextPatchByPath: Record<string, string> = {};
-    for (const [path, patch] of patchEntries) {
-      nextPatchByPath[path] = patch;
-    }
-    setFilePatchByPath(nextPatchByPath);
+    setFilePatchByPath((current) => {
+      const nextPatchByPath = { ...current };
+      for (const [path, patch] of patchEntries) {
+        nextPatchByPath[path] = patch;
+      }
+      return nextPatchByPath;
+    });
     setFilePatchBusyByPath({});
   }
 
@@ -839,82 +1021,25 @@ export function DiffPanel(props: DiffPanelProps) {
           return;
         }
 
-        const manifest = await getReviewCommitDiffManifest({
-          repo_ref: repoRef,
-          commit: commitSha,
-        });
-        if (refreshDiffRequestIdRef.current !== requestId) {
+        const session = await ensureCommitDiffSession(commitSha, nextState, requestId);
+        if (!session || refreshDiffRequestIdRef.current !== requestId) {
           return;
         }
-        const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
-        const visibleFiles = directoryPath
-          ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
-          : manifest.files;
-        setDiffManifest(manifest);
-        setStagedFiles(manifest.files);
+        setStagedFiles(session.files);
         setUnstagedFiles([]);
         setBranchSummary('');
-
-        if (nextState.selected_path) {
-          const json = await getReviewCommitDiff({
-            repo_ref: repoRef,
-            commit: commitSha,
-            path: nextState.selected_path,
-            context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-            whole_file: nextState.whole_file,
-          });
-          if (refreshDiffRequestIdRef.current !== requestId) {
-            return;
-          }
-          setDiff(json);
-          setFilePatchByPath({});
-          setFilePatchBusyByPath({});
-          return;
-        }
-
         setDiff(null);
         if (refreshDiffRequestIdRef.current === requestId) {
           setDiffBusy(false);
         }
-        await refreshCommitFilePatches(nextState, visibleFiles, requestId);
+        await refreshCommitFilePatches(nextState, session.files, requestId);
         return;
       }
 
-      const manifest = await getReviewDiffManifest({
-        repo_ref: repoRef,
-        scope: nextState.selected_scope,
-      });
-      if (refreshDiffRequestIdRef.current !== requestId) {
-        return;
-      }
-      const directoryPath = nextState.selected_path ? null : selectedDirectoryPathRef.current;
-      const visibleFiles = directoryPath
-        ? manifest.files.filter((file) => file.path.startsWith(`${directoryPath}/`))
-        : manifest.files;
-      setDiffManifest(manifest);
-
-      if (nextState.selected_path) {
-        const json = await getReviewDiff({
-          repo_ref: repoRef,
-          scope: nextState.selected_scope,
-          path: nextState.selected_path,
-          context_lines: nextState.whole_file ? 1000 : clampContextLines(nextState.context_lines),
-          whole_file: nextState.whole_file,
-        });
-        if (refreshDiffRequestIdRef.current !== requestId) {
-          return;
-        }
-        setDiff(json);
-        setFilePatchByPath({});
-        setFilePatchBusyByPath({});
-        return;
-      }
-
-      setDiff(null);
       if (refreshDiffRequestIdRef.current === requestId) {
         setDiffBusy(false);
       }
-      await refreshScopeFilePatches(nextState, visibleFiles, requestId);
+      await refreshScopeFilePatches(nextState, [], requestId);
       return;
     } catch (err) {
       if (refreshDiffRequestIdRef.current !== requestId) {

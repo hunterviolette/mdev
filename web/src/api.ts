@@ -881,6 +881,34 @@ export type ReviewDiffResponse = {
   patch: string;
 };
 
+export type ReviewDiffSessionResponse = {
+  ok: boolean;
+  session_id: string;
+  scope: ReviewDiffScope;
+  from_ref: string;
+  to_ref: string;
+  files: ReviewDiffManifestFileEntry[];
+  file_count: number;
+  byte_count: number;
+};
+
+export type ReviewDiffSessionWindowResponse = {
+  ok: boolean;
+  session_id: string;
+  path: string;
+  start_line: number;
+  line_count: number;
+  total_lines: number;
+  has_more: boolean;
+  lines: string[];
+};
+
+export type ReviewDiffSessionCloseResponse = {
+  ok: boolean;
+  session_id: string;
+  removed: boolean;
+};
+
 export type GitPatchResponse = {
   ok: boolean;
   scope: GitPatchScope;
@@ -905,6 +933,51 @@ export function getReviewDiff(body: {
   whole_file?: boolean;
 }) {
   return fetchJson<ReviewDiffResponse>('/api/review/diff', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function createReviewDiffSession(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewDiffSessionResponse>('/api/review/diff/session', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewDiffSessionWindow(body: {
+  session_id: string;
+  path: string;
+  start_line?: number;
+  line_count?: number;
+}) {
+  return fetchJson<ReviewDiffSessionWindowResponse>('/api/review/diff/session/window', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function createReviewCommitDiffSession(body: {
+  repo_ref: string;
+  commit: string;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewDiffSessionResponse>('/api/review/diff/session/commit', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function closeReviewDiffSession(body: {
+  session_id: string;
+}) {
+  return fetchJson<ReviewDiffSessionCloseResponse>('/api/review/diff/session/close', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -971,6 +1044,12 @@ export function getReviewFilePatch(body: {
   });
 }
 
+export type ReviewCommitFileStat = {
+  path: string;
+  additions: number;
+  deletions: number;
+};
+
 export type ReviewCommitSummary = {
   sha: string;
   short_sha: string;
@@ -981,12 +1060,14 @@ export type ReviewCommitSummary = {
   files_changed?: number | null;
   additions?: number | null;
   deletions?: number | null;
+  files?: ReviewCommitFileStat[];
 };
 
 export type ReviewCommitListResponse = {
   ok: boolean;
   commits: ReviewCommitSummary[];
   next_offset?: number | null;
+  next_cursor?: string | null;
   has_more: boolean;
 };
 
@@ -1032,10 +1113,29 @@ export type ReviewCommitReportResponse = {
   months: ReviewCommitReportMonthBucket[];
   buckets?: ReviewCommitReportBucket[];
   aggregation_window?: string;
+  aggregation_days?: number;
   color_by?: string;
   exclude_regex: string[];
   next_offset?: number | null;
   has_more: boolean;
+};
+
+export type ReviewCommitAnalyticsResponse = {
+  ok: boolean;
+  status: 'complete' | 'partial' | string;
+  months: ReviewCommitReportMonthBucket[];
+  buckets?: ReviewCommitReportBucket[];
+  totals: {
+    commits: number;
+    additions: number;
+    deletions: number;
+    files_changed: number;
+    net: number;
+  };
+  aggregation_window?: string;
+  aggregation_days?: number;
+  color_by?: string;
+  exclude_regex: string[];
 };
 
 export type ReviewCommitRefOption = {
@@ -1071,11 +1171,18 @@ export function getReviewCommits(body: {
   repo_ref: string;
   limit?: number;
   offset?: number;
+  cursor?: string | null;
+  ref_name?: string | null;
   since?: string | null;
   until?: string | null;
+  include_paths?: string[] | null;
+  exclude_paths?: string[] | null;
+  include_extensions?: string[] | null;
+  exclude_extensions?: string[] | null;
+  include_regex?: string[] | null;
   exclude_regex?: string[] | null;
 }) {
-  return fetchJson<ReviewCommitListResponse>('/api/review/commits', {
+  return fetchJson<ReviewCommitListResponse>('/api/review/commits/query', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -1087,6 +1194,7 @@ export function getReviewCommitReport(body: {
   offset?: number;
   ref_name?: string | null;
   aggregation_window?: string | null;
+  aggregation_days?: number | null;
   color_by?: string | null;
   since?: string | null;
   until?: string | null;
@@ -1098,6 +1206,27 @@ export function getReviewCommitReport(body: {
   exclude_regex?: string[] | null;
 }) {
   return fetchJson<ReviewCommitReportResponse>('/api/review/commit-dataset', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitAnalytics(body: {
+  repo_ref: string;
+  ref_name?: string | null;
+  aggregation_window?: string | null;
+  aggregation_days?: number | null;
+  color_by?: string | null;
+  since?: string | null;
+  until?: string | null;
+  include_paths?: string[] | null;
+  exclude_paths?: string[] | null;
+  include_extensions?: string[] | null;
+  exclude_extensions?: string[] | null;
+  include_regex?: string[] | null;
+  exclude_regex?: string[] | null;
+}) {
+  return fetchJson<ReviewCommitAnalyticsResponse>('/api/review/commits/analytics', {
     method: 'POST',
     body: JSON.stringify(body)
   });

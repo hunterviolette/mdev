@@ -223,7 +223,16 @@ export async function ensureSupervisorPlannerRun(request: EnsureSupervisorPlanne
   };
 }
 
+function supervisorRouteIsActive(): boolean {
+  if (typeof window === 'undefined') return true;
+  const path = window.location.pathname;
+  return path === '/supervisors' || path.startsWith('/supervisors/');
+}
+
 export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
+  if (!supervisorRouteIsActive()) {
+    throw new Error(`Refusing stale supervisor run fetch outside supervisor route: ${id}`);
+  }
   const response = await fetch(`/api/supervisor-runs/${id}`);
   if (!response.ok) throw new Error(await response.text());
   return normalizeSupervisorRun(await response.json());

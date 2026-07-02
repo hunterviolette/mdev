@@ -91,10 +91,9 @@ import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { DiffPanelState } from './DiffPanel';
-import { ensureSupervisorPlannerRun, getSupervisorRun, listSupervisorRuns, type FeaturePlanItem, type SupervisorRun } from './supervisor_api';
+import { PlannerModal } from './PlannerModal';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
-import { SupervisorPlannerModal } from './SupervisorPlannerModal';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
   emptyRuntimeEventStore,
@@ -163,7 +162,7 @@ type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
 type MonitorHomeView = 'workflows' | 'supervisors';
-type WorkspaceTabKey = 'workflows' | 'supervisor' | 'diff' | 'commits' | 'files' | 'capabilities';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -2317,12 +2316,6 @@ export function WorkflowShell(props: {
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [plannerFragmentConfigOpen, setPlannerFragmentConfigOpen] = useState(false);
   const [plannerSelectedFeatureIdDraft, setPlannerSelectedFeatureIdDraft] = useState<string | null>(null);
-  const [plannerFeatureSearch, setPlannerFeatureSearch] = useState('');
-  const [remotePlannerFeatureItems, setRemotePlannerFeatureItems] = useState<FeaturePlanItem[]>([]);
-  const [repoPlannerAvailable, setRepoPlannerAvailable] = useState(false);
-  const [plannerFeatureViewItem, setPlannerFeatureViewItem] = useState<Record<string, unknown> | null>(null);
-  const [supervisorPlannerOpen, setSupervisorPlannerOpen] = useState(false);
-  const [supervisorPlannerRun, setSupervisorPlannerRun] = useState<SupervisorRun | null>(null);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
@@ -2675,115 +2668,15 @@ export function WorkflowShell(props: {
     return ((selectedRun?.context as Record<string, unknown> | undefined)?.supervisor ?? null) as Record<string, unknown> | null;
   }, [selectedRun?.context]);
 
-  const plannerSupervisorRunId = useMemo(() => {
-    const fromPlanner = sharedPlannerFragmentState?.supervisor_run_id;
-    if (typeof fromPlanner === 'string' && fromPlanner.trim()) return fromPlanner;
-    const fromSupervisor = supervisorContext?.supervisor_run_id;
-    if (typeof fromSupervisor === 'string' && fromSupervisor.trim()) return fromSupervisor;
-    return null;
-  }, [sharedPlannerFragmentState, supervisorContext]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const selectedFeatureId = typeof sharedPlannerFragmentState?.selected_feature_id === 'string'
-      ? sharedPlannerFragmentState.selected_feature_id
-      : null;
-    const repoRef = typeof selectedRun?.repo_ref === 'string' ? selectedRun.repo_ref : '';
-
-    async function loadPlannerFeatures() {
-      if (plannerSupervisorRunId) {
-        const run = await getSupervisorRun(plannerSupervisorRunId);
-        if (!cancelled) setRepoPlannerAvailable(true);
-        return run.feature_plan_items ?? [];
-      }
-
-      if (!selectedFeatureId && !repoRef.trim()) {
-        return [];
-      }
-
-      const runs = await listSupervisorRuns();
-      const normalizedRepoRef = repoRef.replace(/\\/g, '/').toLowerCase();
-      const matchingRun = runs.find((run) => {
-        const normalizedRoot = run.root_repo_path.replace(/\\/g, '/').toLowerCase();
-        const hasSelectedFeature = selectedFeatureId
-          ? run.feature_plan_items.some((item) => item.id === selectedFeatureId)
-          : false;
-        const repoMatches = normalizedRepoRef && normalizedRoot && normalizedRepoRef.startsWith(normalizedRoot);
-        return hasSelectedFeature || repoMatches;
-      });
-      if (!cancelled) setRepoPlannerAvailable(Boolean(matchingRun));
-      return matchingRun?.feature_plan_items ?? [];
-    }
-
-    loadPlannerFeatures()
-      .then((items) => {
-        if (!cancelled) setRemotePlannerFeatureItems(items);
-      })
-      .catch(() => {
-        if (!cancelled) setRemotePlannerFeatureItems([]);
-      });
-    if (!plannerSupervisorRunId && !selectedRun?.repo_ref?.trim()) {
-      setRepoPlannerAvailable(false);
-    }
-
-    return () => {
-      cancelled = true;
-    };
-  }, [plannerSupervisorRunId, selectedRun?.repo_ref, sharedPlannerFragmentState]);
-
-  const plannerFeatureItems = useMemo(() => {
-    const remoteItems = remotePlannerFeatureItems;
-    const supervisorItems = Array.isArray(supervisorContext?.feature_plan_items)
-      ? supervisorContext.feature_plan_items
-      : [];
-    const items = remoteItems.length > 0
-      ? remoteItems
-      : supervisorItems;
-    const seen = new Set<string>();
-    return items.filter((item): item is Record<string, unknown> => {
-      if (!item || typeof item !== 'object') return false;
-      const id = typeof item.id === 'string' ? item.id : '';
-      if (!id) return true;
-      if (seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
-  }, [remotePlannerFeatureItems, sharedPlannerFragmentState, supervisorContext]);
-
-  const plannerFeatureOptions = useMemo(() => plannerFeatureItems
-    .map((item) => {
-      const id = typeof item.id === 'string' ? item.id : '';
-      const title = typeof item.title === 'string' && item.title.trim()
-        ? item.title.trim()
-        : typeof item.summary === 'string' && item.summary.trim()
-          ? item.summary.trim()
-          : id;
-      return id ? { value: id, label: title } : null;
-    })
-    .filter((item): item is { value: string; label: string } => item !== null), [plannerFeatureItems]);
-
   const selectedPlannerFeatureId = plannerSelectedFeatureIdDraft
-    ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null)
-    ?? (typeof supervisorContext?.feature_id === 'string' && supervisorContext.feature_id.trim() ? supervisorContext.feature_id : null);
+    ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null);
 
-  const selectedPlannerFeatureIds = selectedPlannerFeatureId ? [selectedPlannerFeatureId] : [];
   const selectedPlannerFeature = useMemo(() => {
-    if (!selectedPlannerFeatureId) return null;
-    return plannerFeatureItems.find((item) => item.id === selectedPlannerFeatureId) ?? null;
-  }, [plannerFeatureItems, selectedPlannerFeatureId]);
-
-  const filteredPlannerFeatureItems = useMemo(() => {
-    const needle = plannerFeatureSearch.trim().toLowerCase();
-    if (!needle) return plannerFeatureItems;
-    return plannerFeatureItems.filter((item) => {
-      const title = typeof item.title === 'string' ? item.title : '';
-      const summary = typeof item.summary === 'string' ? item.summary : '';
-      const status = typeof item.status === 'string' ? item.status : '';
-      return title.toLowerCase().includes(needle)
-        || summary.toLowerCase().includes(needle)
-        || status.toLowerCase().includes(needle);
-    });
-  }, [plannerFeatureItems, plannerFeatureSearch]);
+    const feature = sharedPlannerFragmentState?.selected_feature;
+    return feature && typeof feature === 'object' && !Array.isArray(feature)
+      ? feature as Record<string, unknown>
+      : null;
+  }, [sharedPlannerFragmentState]);
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const stageOverrides = (workflowEngine?.stage_overrides ?? {}) as Record<string, unknown>;
@@ -3366,7 +3259,8 @@ export function WorkflowShell(props: {
           schema_armed: Boolean(currentPlanner.schema_armed),
           auto_apply_armed: Boolean(currentPlanner.auto_apply_armed),
           selected_feature_id: currentPlanner.selected_feature_id ?? null,
-          supervisor_run_id: currentPlanner.supervisor_run_id ?? null,
+          planner_id: currentPlanner.planner_id ?? null,
+          supervisor_run_id: null,
           schema_id: 'supervisor_feature_plan_item_v1',
           preserve_rough_definition: true
         },
@@ -4632,7 +4526,8 @@ export function WorkflowShell(props: {
           ...patch,
           fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && normalizedSelectedFeatureId),
           selected_feature_id: normalizedSelectedFeatureId,
-          supervisor_run_id: patch.supervisor_run_id ?? currentPlanner.supervisor_run_id ?? plannerSupervisorRunId,
+          planner_id: patch.planner_id ?? currentPlanner.planner_id ?? null,
+          supervisor_run_id: null,
           schema_id: 'supervisor_feature_plan_item_v1',
           preserve_rough_definition: true
         }
@@ -4640,31 +4535,13 @@ export function WorkflowShell(props: {
     });
   }
 
-  async function openRepoSupervisorPlanner() {
+  function openRepoSupervisorPlanner() {
     const rootRepoPath = (selectedRun?.repo_ref ?? repoRef ?? '').trim();
     if (!rootRepoPath) {
       setError('Repo path is required before opening the planner.');
       return;
     }
-
-    try {
-      setError(null);
-      const rootParts = rootRepoPath.replace(/\\/g, '/').split('/').filter(Boolean);
-      const repoName = rootParts[rootParts.length - 1] ?? 'Repo';
-      const response = await ensureSupervisorPlannerRun({
-        root_repo_path: rootRepoPath,
-        title: `${repoName} Planner`
-      });
-      setSupervisorPlannerRun(response.supervisor_run);
-      setSupervisorPlannerOpen(true);
-      if (selectedRun?.id) {
-        await patchPlannerCapabilityState({
-          supervisor_run_id: response.supervisor_run.id
-        });
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    setPlannerFragmentConfigOpen(true);
   }
 
   function loadBuilderRepoContextConfig() {
@@ -5863,21 +5740,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
       fragment_armed: nextEnabled,
       selected_feature_id: selectedPlannerFeatureId ?? null,
       selected_feature: nextEnabled ? selectedPlannerFeature : null,
-      supervisor_run_id: plannerSupervisorRunId
+      planner_id: sharedPlannerFragmentState?.planner_id ?? null,
+      supervisor_run_id: null
     });
   }
 
-  async function savePlannerFragmentSelection(featureId: string | null) {
+  async function savePlannerFragmentSelection(selection: { planner: { id: string } | null; feature: Record<string, unknown> | null }) {
     if (!selectedRun?.id) return;
+    const featureId = typeof selection.feature?.id === 'string' ? selection.feature.id : null;
     setPlannerSelectedFeatureIdDraft(featureId);
-    const selectedFeature = featureId
-      ? plannerFeatureItems.find((item) => item.id === featureId) ?? null
-      : null;
     await patchPlannerCapabilityState({
       fragment_armed: Boolean(featureId),
       selected_feature_id: featureId,
-      selected_feature: selectedFeature,
-      supervisor_run_id: plannerSupervisorRunId
+      selected_feature: selection.feature,
+      planner_id: selection.planner?.id ?? sharedPlannerFragmentState?.planner_id ?? null,
+      supervisor_run_id: null
     });
     setPlannerFragmentConfigOpen(false);
   }
@@ -6285,33 +6162,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         <Stack>
           {error ? <Alert color="red">{error}</Alert> : null}
 
-          {supervisorPlannerRun ? (
-            <SupervisorPlannerModal
-              opened={supervisorPlannerOpen}
-              run={supervisorPlannerRun}
-              templates={templates}
-              onClose={() => setSupervisorPlannerOpen(false)}
-              onSaved={async () => {
-                const refreshed = await getSupervisorRun(supervisorPlannerRun.id);
-                setSupervisorPlannerRun(refreshed);
-                if (selectedRun?.id) await refreshRunDetails(selectedRun.id);
-              }}
-              selectionMode
-              selectedFeatureId={selectedPlannerFeatureId}
-              onSelectFeature={async (feature) => {
-                setPlannerSelectedFeatureIdDraft(feature.id);
-                await patchPlannerCapabilityState({
-                  fragment_armed: true,
-                  selected_feature_id: feature.id,
-                  selected_feature: feature,
-                  supervisor_run_id: supervisorPlannerRun.id
-                });
-                setSupervisorPlannerOpen(false);
-              }}
-              onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
-            />
-          ) : null}
-
           {view !== 'builder' && monitorView === 'workflow_detail' ? (
             <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
               <Tabs.List>
@@ -6447,7 +6297,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <GlobalCapabilitiesPanel
                 repoContextArmed={!!sharedInferenceState?.repo_context_armed}
                 changesetSchemaArmed={!!sharedInferenceState?.changeset_schema_armed}
-                plannerArmed={!!sharedPlannerFragmentState?.supervisor_run_id}
+                plannerArmed={Boolean(sharedPlannerFragmentState?.fragment_armed || sharedPlannerFragmentState?.planner_id)}
                 onOpenInference={() => {
                   openGlobalInferenceConfig();
                 }}
@@ -6812,7 +6662,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}
                                     sharedPlannerFragmentState={sharedPlannerFragmentState}
-                  plannerAvailableForRepo={repoPlannerAvailable || Boolean(plannerSupervisorRunId)}
+                  plannerAvailableForRepo={Boolean((selectedRun?.repo_ref ?? repoRef ?? '').trim())}
                   activePlannerFeatureTitle={selectedPlannerFeature
                     ? (typeof selectedPlannerFeature.title === 'string' && selectedPlannerFeature.title.trim()
                         ? selectedPlannerFeature.title.trim()
@@ -7080,176 +6930,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Stack>
         </Modal>
 
-        <Modal
+        <PlannerModal
           opened={plannerFragmentConfigOpen}
+          rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+          selectedPlannerId={typeof sharedPlannerFragmentState?.planner_id === 'string' ? sharedPlannerFragmentState.planner_id : null}
+          selectedFeatureId={selectedPlannerFeatureId}
+          selectionMode
           onClose={() => setPlannerFragmentConfigOpen(false)}
-          title="Planner Fragment"
-          size="calc(100vw - 96px)"
-          centered
-          zIndex={300}
-        >
-          <Stack gap="md">
-            <TextInput
-              label="Search planner features"
-              placeholder="Search by feature name, summary, or status"
-              value={plannerFeatureSearch}
-              onChange={(event) => setPlannerFeatureSearch(event.currentTarget.value)}
-            />
-            {plannerFeatureItems.length === 0 ? (
-              <Text c="dimmed" size="sm">No planner features available.</Text>
-            ) : filteredPlannerFeatureItems.length === 0 ? (
-              <Text c="dimmed" size="sm">No planner features match the current search.</Text>
-            ) : (
-              <ScrollArea h="calc(100vh - 330px)" type="auto">
-                <Table striped highlightOnHover withTableBorder>
-                  <Table.Thead>
-                    <Table.Tr>
-                      <Table.Th>Feature</Table.Th>
-                      <Table.Th>Status</Table.Th>
-                      <Table.Th>Last modified</Table.Th>
-                      <Table.Th>Actions</Table.Th>
-                    </Table.Tr>
-                  </Table.Thead>
-                  <Table.Tbody>
-                    {filteredPlannerFeatureItems.map((item) => {
-                      const id = typeof item.id === 'string' ? item.id : '';
-                      const title = typeof item.title === 'string' && item.title.trim()
-                        ? item.title.trim()
-                        : typeof item.summary === 'string' && item.summary.trim()
-                          ? item.summary.trim()
-                          : id;
-                      const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
-                      const status = typeof item.status === 'string' && item.status.trim() ? item.status.trim() : 'available';
-                      const modified = typeof item.updated_at === 'string' && item.updated_at.trim()
-                        ? item.updated_at.trim()
-                        : typeof item.updatedAt === 'string' && item.updatedAt.trim()
-                          ? item.updatedAt.trim()
-                          : typeof item.last_modified === 'string' && item.last_modified.trim()
-                            ? item.last_modified.trim()
-                            : typeof item.modified_at === 'string' && item.modified_at.trim()
-                              ? item.modified_at.trim()
-                              : '';
-                      const isSelected = selectedPlannerFeatureIds.includes(id);
-
-                      return (
-                        <Table.Tr key={id || title}>
-                          <Table.Td>
-                            <Stack gap={2}>
-                              <Group gap="xs" wrap="nowrap">
-                                <Text fw={600} size="sm">{title}</Text>
-                                {isSelected ? <Badge size="xs" color="green" variant="light">Selected</Badge> : null}
-                              </Group>
-                              {summary ? <Text size="xs" c="dimmed" lineClamp={2}>{summary}</Text> : null}
-                            </Stack>
-                          </Table.Td>
-                          <Table.Td><Badge variant="light">{status}</Badge></Table.Td>
-                          <Table.Td><Text size="sm" c={modified ? undefined : 'dimmed'}>{modified || '—'}</Text></Table.Td>
-                          <Table.Td>
-                            <Group gap="xs" wrap="nowrap">
-                              <Button size="xs" variant="light" onClick={() => setPlannerFeatureViewItem(item)}>View</Button>
-                              <Button size="xs" onClick={() => void savePlannerFragmentSelection(id)} disabled={!id || isSelected}>Select</Button>
-                            </Group>
-                          </Table.Td>
-                        </Table.Tr>
-                      );
-                    })}
-                  </Table.Tbody>
-                </Table>
-              </ScrollArea>
-            )}
-            <Group justify="space-between">
-              <Button size="xs" variant="light" color="red" onClick={() => void savePlannerFragmentSelection(null)} disabled={selectedPlannerFeatureIds.length === 0}>Clear selection</Button>
-              <Button size="xs" variant="default" onClick={() => setPlannerFragmentConfigOpen(false)}>Close</Button>
-            </Group>
-          </Stack>
-        </Modal>
-
-        <Modal
-          opened={plannerFeatureViewItem !== null}
-          onClose={() => setPlannerFeatureViewItem(null)}
-          title="Planner feature"
-          size="calc(100vw - 96px)"
-          centered
-          zIndex={310}
-        >
-          {plannerFeatureViewItem ? (
-            <Stack gap="md">
-              <Group justify="space-between" align="flex-start">
-                <Stack gap={4} style={{ minWidth: 0, flex: 1 }}>
-                  <Text fw={700} size="lg">{String(plannerFeatureViewItem.title ?? plannerFeatureViewItem.summary ?? plannerFeatureViewItem.id ?? '')}</Text>
-                  {typeof plannerFeatureViewItem.status === 'string' ? <Badge variant="light">{plannerFeatureViewItem.status}</Badge> : null}
-                </Stack>
-                <Button
-                  size="xs"
-                  onClick={() => {
-                    const id = typeof plannerFeatureViewItem.id === 'string' ? plannerFeatureViewItem.id : null;
-                    if (id) void savePlannerFragmentSelection(id);
-                  }}
-                  disabled={typeof plannerFeatureViewItem.id !== 'string' || selectedPlannerFeatureIds.includes(plannerFeatureViewItem.id)}
-                >
-                  Select
-                </Button>
-              </Group>
-              {typeof plannerFeatureViewItem.rough_summary === 'string' && plannerFeatureViewItem.rough_summary.trim() ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Original rough feature prompt</Text>
-                  <Text size="sm">{plannerFeatureViewItem.rough_summary}</Text>
-                </Stack>
-              ) : null}
-              {typeof plannerFeatureViewItem.summary === 'string' && plannerFeatureViewItem.summary.trim() ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Refined feature summary</Text>
-                  <Text size="sm">{plannerFeatureViewItem.summary}</Text>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.requirements) && plannerFeatureViewItem.requirements.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Detailed requirements</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.requirements.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.acceptance_criteria) && plannerFeatureViewItem.acceptance_criteria.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Acceptance criteria</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.acceptance_criteria.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.implementation_notes) && plannerFeatureViewItem.implementation_notes.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Implementation notes</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.implementation_notes.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.review_expectations) && plannerFeatureViewItem.review_expectations.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Review expectations</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.review_expectations.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.dependencies) && plannerFeatureViewItem.dependencies.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Dependencies</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.dependencies.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              {Array.isArray(plannerFeatureViewItem.target_files_or_areas) && plannerFeatureViewItem.target_files_or_areas.length > 0 ? (
-                <Stack gap="xs">
-                  <Text fw={600}>Target files or areas</Text>
-                  <Stack gap={4}>{plannerFeatureViewItem.target_files_or_areas.filter((item): item is string => typeof item === 'string').map((item) => <Text key={item} size="sm">• {item}</Text>)}</Stack>
-                </Stack>
-              ) : null}
-              <Divider />
-              <SimpleGrid cols={{ base: 1, md: 2 }}>
-                {typeof plannerFeatureViewItem.id === 'string' ? (
-                  <Text size="xs" c="dimmed">Feature id: {plannerFeatureViewItem.id}</Text>
-                ) : null}
-                {typeof plannerFeatureViewItem.refinement_workflow_run_id === 'string' ? (
-                  <Text size="xs" c="dimmed">Refinement workflow run: {plannerFeatureViewItem.refinement_workflow_run_id}</Text>
-                ) : null}
-              </SimpleGrid>
-            </Stack>
-          ) : null}
-        </Modal>
+          onError={setError}
+          onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
+          onSelectFeature={(selection) => void savePlannerFragmentSelection(selection)}
+        />
 
         <Modal
           opened={globalInferenceConfigOpen}

@@ -8,6 +8,7 @@ mod runs;
 mod sap;
 mod review;
 mod settings;
+mod planner;
 mod supervisor;
 mod templates;
 mod workflow_builder;
@@ -19,6 +20,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
     Router::new()
         .merge(health::router())
         .merge(settings::router())
+        .merge(planner::router())
         .merge(supervisor::router())
         .merge(repo_tree::router())
         .merge(templates::router())

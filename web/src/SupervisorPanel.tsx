@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Badge, Button, Card, Group, Modal, Stack, Table, Text, TextInput } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
-import { SupervisorPlannerModal } from './SupervisorPlannerModal';
-import { SupervisorSprintModal } from './SupervisorSprintModal';
-import { createSupervisorRun, deleteSupervisorRun, ensureSupervisorPlannerRun, listSupervisorRuns, type SupervisorRun } from './supervisor_api';
+import { PlannerModal } from './PlannerModal';
+import { SupervisorModal } from './SupervisorModal';
+import { createSupervisorRun, deleteSupervisorRun, listSupervisorRuns, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   onOpenWorkflowRun?: (workflowRunId: string) => Promise<void> | void;
@@ -141,21 +141,12 @@ export function SupervisorPanel(props: SupervisorPanelProps) {
     props.navigate?.(supervisorSprintPath(run.id));
   }
 
-  async function openPlanner(run: SupervisorRun) {
+  function openPlanner(run: SupervisorRun) {
     setError(null);
-    try {
-      const response = await ensureSupervisorPlannerRun({
-        root_repo_path: run.root_repo_path,
-        title: run.title
-      });
-      await refresh();
-      setSelectedId(response.supervisor_run.id);
-      setSprintOpen(false);
-      setPlannerOpen(true);
-      props.navigate?.(supervisorPlannerPath(response.supervisor_run.id));
-    } catch (err) {
-      setError(String(err));
-    }
+    setSelectedId(run.id);
+    setSprintOpen(false);
+    setPlannerOpen(true);
+    props.navigate?.(supervisorPlannerPath(run.id));
   }
 
   function openPlannerFromSprint() {
@@ -228,7 +219,7 @@ export function SupervisorPanel(props: SupervisorPanelProps) {
                       onClick={(event) => {
                         if (!shouldHandleLinkInApp(event)) return;
                         event.preventDefault();
-                        void openPlanner(run);
+                        openPlanner(run);
                       }}
                     >
                       Planner
@@ -266,16 +257,20 @@ export function SupervisorPanel(props: SupervisorPanelProps) {
         </Stack>
       </Modal>
 
-      <SupervisorPlannerModal
+      <PlannerModal
         opened={plannerOpen}
+        rootRepoPath={selected?.root_repo_path ?? ''}
         run={selected}
         templates={templates}
+        selectedPlannerId={null}
+        selectedFeatureId={null}
         onClose={closeSupervisorModal}
         onSaved={refresh}
         onWorkflowRunCreated={props.onOpenWorkflowRun}
+        onError={setError}
       />
 
-      <SupervisorSprintModal
+      <SupervisorModal
         opened={sprintOpen}
         run={selected}
         templates={templates}

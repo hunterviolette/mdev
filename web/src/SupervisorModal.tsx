@@ -273,7 +273,7 @@ function developmentItemDone(run: SupervisorRun, featureId: string, workflow?: S
   return ['completed', 'applied'].includes(String(feature?.status ?? '')) || Boolean(workflow && isFeatureWorkflowDone(workflow));
 }
 
-export function SupervisorSprintModal({ opened, run, templates, onClose, onOpenPlanner, onChanged }: Props) {
+export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [workflowTemplateId, setWorkflowTemplateId] = useState<string | null>(null);
   const [integrationTemplateId, setIntegrationTemplateId] = useState<string | null>(null);
