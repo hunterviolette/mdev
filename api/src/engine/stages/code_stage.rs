@@ -2,13 +2,21 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::capabilities::inference::stage_support::{
-        auto_apply_enabled,
-        prepare_inference_stage_state,
-        InferenceStageSettings,
+    engine::{
+        capabilities::inference::stage_support::{
+            auto_apply_enabled,
+            prepare_inference_stage_state_with_hooks,
+            InferenceStageHooks,
+            InferenceStageSettings,
+        },
+        stages::capability_contract::StageCapabilities,
     },
     models::WorkflowStepDefinition,
 };
+
+pub fn capabilities() -> StageCapabilities {
+    StageCapabilities::new(["inference", "changeset"])
+}
 
 pub fn prepare_stage_state(
     repo_ref: &str,
@@ -17,13 +25,18 @@ pub fn prepare_stage_state(
     local_state: Value,
 ) -> Result<Value> {
     let auto_apply = auto_apply_enabled(step, &local_state);
-    let mut state = prepare_inference_stage_state(
+    let mut state = prepare_inference_stage_state_with_hooks(
         repo_ref,
         global_state,
         step,
         local_state,
         InferenceStageSettings {
             include_changeset_schema: step.prompt.include_changeset_schema,
+        },
+        InferenceStageHooks {
+            empty_user_input_default: Some(
+                "please provide changeset in a codeblock with no comments to align coding".to_string(),
+            ),
         },
     )?;
 

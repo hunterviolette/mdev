@@ -1,7 +1,7 @@
 pub(crate) mod capabilities;
 pub(crate) mod governance;
 mod runtime;
-pub(crate) mod shared_capability_lifecycle;
+
 mod stages;
 mod transitions;
 
@@ -16,7 +16,7 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{force_wait_run, pause_run, resume_run, run_step, start_run};
+pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resolve_operator_checkpoint, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
@@ -30,7 +30,7 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let mut run = WorkflowRun {
         id: Uuid::parse_str(row.get::<String, _>("id").as_str())?,
         template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose()?,
-        definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str())?,
+        definition: parse_definition_json_for_load(row.get::<String, _>("id").as_str(), row.get::<String, _>("definition_json").as_str()),
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Draft,
             "queued" => RunStatus::Queued,
@@ -45,7 +45,7 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
         title: row.get("title"),
         repo_ref: row.get("repo_ref"),
         workflow_key: row.get("workflow_key"),
-        context: serde_json::from_str(row.get::<String, _>("context_json").as_str())?,
+        context: parse_context_json_for_load(row.get::<String, _>("id").as_str(), row.get::<String, _>("context_json").as_str()),
         created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())?.with_timezone(&chrono::Utc),
         updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())?.with_timezone(&chrono::Utc),
     };
@@ -59,6 +59,56 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
 
 pub async fn load_template_definition(_state: &AppState, run: &WorkflowRun) -> Result<Option<WorkflowTemplateDefinition>> {
     Ok(Some(run.definition.clone()))
+}
+
+fn json_preview_for_load_log(raw: &str) -> String {
+    raw.chars().take(512).collect::<String>()
+}
+
+fn parse_definition_json_for_load(run_id: &str, raw: &str) -> WorkflowTemplateDefinition {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<WorkflowTemplateDefinition>(trimmed) {
+        Ok(definition) => definition,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run_id,
+                definition_json_bytes = raw.len(),
+                definition_json_trimmed_bytes = trimmed.len(),
+                definition_json_preview = %json_preview_for_load_log(trimmed),
+                error = %err,
+                "workflow run definition_json is malformed; using empty readable definition"
+            );
+            WorkflowTemplateDefinition {
+                version: 1,
+                globals: Default::default(),
+                governance: json!({}),
+                steps: Vec::new(),
+            }
+        }
+    }
+}
+
+fn parse_context_json_for_load(run_id: &str, raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(run_id = %run_id, "workflow run context_json is empty; using empty context");
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                context_json_bytes = raw.len(),
+                context_json_trimmed_bytes = trimmed.len(),
+                context_json_preview = %json_preview_for_load_log(trimmed),
+                error = %err,
+                "workflow run context_json is malformed; using empty context"
+            );
+            json!({})
+        }
+    }
 }
 
 async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut WorkflowRun) -> Result<bool> {
@@ -210,8 +260,87 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-pub fn refresh_inference_arm_state(run: &mut WorkflowRun, _selected_step: Option<&WorkflowStepDefinition>) {
+pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
     normalize_inference_arm_state(run);
+
+    let Some(step) = selected_step else {
+        return;
+    };
+
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+    let inference = capabilities_obj
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    let inference_obj = ensure_value_object(inference);
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context")
+        && !inference_obj.contains_key("repo_context_armed")
+    {
+        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema")
+        && !inference_obj.contains_key("changeset_schema_armed")
+    {
+        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    }
+
+    inference_obj.remove("shared_inference_state");
+}
+
+pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
+    normalize_inference_arm_state(run);
+
+    let Some(step) = selected_step else {
+        return;
+    };
+
+    let root = ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let global_state_obj = ensure_value_object(global_state);
+    let capabilities = global_state_obj
+        .entry("capabilities".to_string())
+        .or_insert_with(|| json!({}));
+    let capabilities_obj = ensure_value_object(capabilities);
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context") {
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+        inference_obj.remove("shared_inference_state");
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema") {
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+        inference_obj.remove("shared_inference_state");
+    }
+
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment") {
+        let planner = capabilities_obj
+            .entry("planner".to_string())
+            .or_insert_with(|| json!({}));
+        let planner_obj = ensure_value_object(planner);
+        let has_selected_feature = planner_obj
+            .get("selected_feature_id")
+            .and_then(Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if has_selected_feature {
+            planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
+        }
+    }
 }
 
 fn normalize_inference_arm_state(run: &mut WorkflowRun) {
@@ -237,14 +366,14 @@ fn normalize_inference_arm_state(run: &mut WorkflowRun) {
         .and_then(Value::as_bool);
 
     if !inference_obj.contains_key("repo_context_armed") {
-        if let Some(value) = nested_repo_context_armed {
-            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(value));
+        if nested_repo_context_armed == Some(true) {
+            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
         }
     }
 
     if !inference_obj.contains_key("changeset_schema_armed") {
-        if let Some(value) = nested_changeset_schema_armed {
-            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(value));
+        if nested_changeset_schema_armed == Some(true) {
+            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
         }
     }
 
@@ -264,10 +393,6 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
 
     run.current_step_id = Some(step.id.clone());
     run.status = RunStatus::Waiting;
-
-    let decisions = governance::before_stage(state, run_id, &mut run, step).await?;
-    governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
-    refresh_inference_arm_state(&mut run, Some(step));
 
     update_run_context(&state.db, run_id, &run.context).await?;
     update_run_status(&state.db, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
@@ -298,6 +423,7 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
         let root = ensure_engine_root(&mut run.context);
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
         merge_json_values(global_state, &global_payload);
+        normalize_runtime_planner(global_state);
     }
 
     refresh_inference_arm_state(&mut run, selected_step.as_ref());
@@ -560,6 +686,36 @@ pub(crate) fn merge_json_values(base: &mut Value, patch: &Value) {
             *base_slot = patch_value.clone();
         }
     }
+}
+
+fn normalize_runtime_planner(global_state: &mut Value) {
+    let Some(capabilities) = global_state
+        .get_mut("capabilities")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    capabilities.remove("planner_fragment");
+
+    if let Some(inference) = capabilities
+        .get_mut("inference")
+        .and_then(Value::as_object_mut)
+    {
+        inference.remove("planner");
+    }
+
+    let Some(planner) = capabilities
+        .get_mut("planner")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    planner.remove("selected_feature");
+    planner.remove("feature_plan_items");
+    planner.remove("selected_feature_ids");
+    planner.remove("enabled");
 }
 
 async fn update_run_context(

@@ -84,6 +84,21 @@ async fn backfill_changeset_workflow_keys(db: &SqlitePool) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn ensure_column(db: &SqlitePool, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
+        .fetch_all(db)
+        .await?;
+    let exists = rows
+        .iter()
+        .any(|row| row.get::<String, _>("name") == column);
+    if !exists {
+        sqlx::query(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition))
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
@@ -220,6 +235,245 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         )
         "#,
     )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS supervisor_runs (
+            id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            title TEXT NOT NULL,
+            root_repo_path TEXT NOT NULL,
+            snapshot_path TEXT,
+            integration_path TEXT,
+            features_json TEXT NOT NULL DEFAULT '[]',
+            child_runs_json TEXT NOT NULL DEFAULT '[]',
+            integration_run_id TEXT,
+            final_patch_path TEXT,
+            merge_report_json TEXT NOT NULL DEFAULT '{}',
+            validation_report_json TEXT NOT NULL DEFAULT '{}',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_supervisor_runs_status_updated ON supervisor_runs (status, updated_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS planner_repos (
+            id TEXT PRIMARY KEY,
+            root_repo_path TEXT NOT NULL UNIQUE,
+            repo_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS planner_features (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            current_sprint_id TEXT,
+            current_supervisor_run_id TEXT,
+            current_workflow_run_id TEXT,
+            current_patch_id TEXT,
+            development_state TEXT NOT NULL DEFAULT 'none',
+            refined_at TEXT,
+            scheduled_at TEXT,
+            development_started_at TEXT,
+            development_completed_at TEXT,
+            integration_started_at TEXT,
+            integration_completed_at TEXT,
+            applied_at TEXT,
+            unscheduled_at TEXT,
+            restarted_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprints (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            sprint_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            workflow_run_id TEXT,
+            supervisor_run_id TEXT,
+            sprint_started_at TEXT,
+            development_started_at TEXT,
+            development_completed_at TEXT,
+            integration_started_at TEXT,
+            integration_completed_at TEXT,
+            sprint_completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}'
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprint_features (
+            id TEXT PRIMARY KEY,
+            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+            feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'planned',
+            completed_at TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (sprint_id, feature_id)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    ensure_column(db, "sprint_features", "supervisor_run_id", "TEXT").await?;
+    ensure_column(db, "sprint_features", "current_workflow_run_id", "TEXT").await?;
+    ensure_column(db, "sprint_features", "current_patch_id", "TEXT").await?;
+    ensure_column(db, "sprint_features", "shard_path", "TEXT").await?;
+    ensure_column(db, "sprint_features", "development_state", "TEXT NOT NULL DEFAULT 'scheduled'").await?;
+    ensure_column(db, "sprint_features", "development_started_at", "TEXT").await?;
+    ensure_column(db, "sprint_features", "development_completed_at", "TEXT").await?;
+    ensure_column(db, "sprint_features", "integration_started_at", "TEXT").await?;
+    ensure_column(db, "sprint_features", "integration_completed_at", "TEXT").await?;
+    ensure_column(db, "sprint_features", "current_step_id", "TEXT").await?;
+    ensure_column(db, "sprint_features", "last_error", "TEXT").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sprint_events (
+            id TEXT PRIMARY KEY,
+            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+            sequence_no INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            feature_id TEXT REFERENCES planner_features(id) ON DELETE SET NULL,
+            actor TEXT NOT NULL DEFAULT 'system',
+            message TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE (sprint_id, sequence_no)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS planner_feature_patches (
+            id TEXT PRIMARY KEY,
+            feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
+            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            sprint_id TEXT REFERENCES sprints(id) ON DELETE SET NULL,
+            supervisor_run_id TEXT,
+            workflow_run_id TEXT,
+            patch_kind TEXT NOT NULL DEFAULT 'development',
+            repo_ref TEXT NOT NULL,
+            base_commit TEXT,
+            head_commit TEXT,
+            patch_text TEXT NOT NULL,
+            patch_hash TEXT NOT NULL,
+            patch_path TEXT,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_order ON planner_features (repo_id, sort_order)")
+    .execute(db)
+    .await?;
+
+    ensure_column(db, "planner_features", "current_sprint_id", "TEXT").await?;
+    ensure_column(db, "planner_features", "current_supervisor_run_id", "TEXT").await?;
+    ensure_column(db, "planner_features", "current_workflow_run_id", "TEXT").await?;
+    ensure_column(db, "planner_features", "current_patch_id", "TEXT").await?;
+    ensure_column(db, "planner_features", "development_state", "TEXT NOT NULL DEFAULT 'none'").await?;
+    ensure_column(db, "planner_features", "refined_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "scheduled_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "development_started_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "development_completed_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "integration_started_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "integration_completed_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "applied_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "unscheduled_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "restarted_at", "TEXT").await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_status_updated ON planner_features (repo_id, status, updated_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_development_state ON planner_features (repo_id, development_state, updated_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_completed ON planner_features (repo_id, development_completed_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_applied ON planner_features (repo_id, applied_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_feature_patches_feature_created ON planner_feature_patches (feature_id, created_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_feature_patches_workflow ON planner_feature_patches (workflow_run_id)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprints_repo_key ON sprints (repo_id, sprint_key)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_sprint_order ON sprint_features (sprint_id, sort_order)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_sprint_state ON sprint_features (sprint_id, development_state, updated_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_workflow ON sprint_features (current_workflow_run_id)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_supervisor_state ON sprint_features (supervisor_run_id, development_state, updated_at)")
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_events_sprint_seq ON sprint_events (sprint_id, sequence_no)")
     .execute(db)
     .await?;
 

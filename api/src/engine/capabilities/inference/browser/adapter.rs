@@ -47,23 +47,118 @@ fn resolve_bridge_dir(_raw: &str) -> PathBuf {
 fn resolve_user_data_dir(raw: &str) -> PathBuf {
     let input = raw.trim();
     if !input.is_empty() {
-        return PathBuf::from(input);
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join(".data").join("browser-profile");
+        let candidate = PathBuf::from(input);
         let _ = std::fs::create_dir_all(&candidate);
         return candidate;
     }
 
-    std::env::temp_dir().join("workflow-api-browser-profile")
+    let candidate = mdev_data_dir().join("browser-profile");
+    let _ = std::fs::create_dir_all(&candidate);
+    candidate
+}
+
+fn app_root() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+}
+
+fn mdev_data_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("MDEV_DATA_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(value) = std::env::var("LOCALAPPDATA") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(value) = std::env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("Library").join("Application Support").join("mdev");
+            }
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Ok(value) = std::env::var("XDG_DATA_HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+        if let Ok(value) = std::env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join(".local").join("share").join("mdev");
+            }
+        }
+    }
+
+    std::env::temp_dir().join("mdev")
+}
+
+fn bundled_node() -> String {
+    if let Ok(value) = std::env::var("MDEV_NODE_EXECUTABLE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Some(root) = app_root() {
+        let candidate = if cfg!(target_os = "windows") {
+            root.join("runtime").join("node.exe")
+        } else {
+            root.join("runtime").join("node")
+        };
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "node".to_string()
+}
+
+fn bundled_chromium_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(root) = app_root() {
+        let browsers = root.join("browsers");
+        #[cfg(target_os = "windows")]
+        let relative = PathBuf::from("chrome-win").join("chrome.exe");
+        #[cfg(target_os = "macos")]
+        let relative = PathBuf::from("chrome-mac").join("Chromium.app").join("Contents").join("MacOS").join("Chromium");
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let relative = PathBuf::from("chrome-linux").join("chrome");
+
+        if let Ok(entries) = std::fs::read_dir(&browsers) {
+            for entry in entries.flatten() {
+                out.push(entry.path().join(&relative));
+            }
+        }
+
+        out.push(browsers.join(&relative));
+    }
+    out
 }
 
 fn bridge_entrypoint(bridge_root: &std::path::Path) -> Result<(String, Vec<String>)> {
     let dist_entry = bridge_root.join("dist").join("index.js");
     if dist_entry.exists() {
         return Ok((
-            "node".to_string(),
+            bundled_node(),
             vec![dist_entry.to_string_lossy().to_string()],
         ));
     }
@@ -154,7 +249,7 @@ struct BridgeClient {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
-    launched_browser: Option<Child>,
+    launched_browsers: Vec<Child>,
 }
 
 impl BridgeClient {
@@ -163,7 +258,7 @@ impl BridgeClient {
             child: None,
             stdin: None,
             stdout: None,
-            launched_browser: None,
+            launched_browsers: Vec::new(),
         }
     }
 
@@ -181,6 +276,7 @@ impl BridgeClient {
         let mut child = Command::new(&program)
             .args(&args)
             .current_dir(&bridge_root)
+            .env("MDEV_BROWSER_USER_DATA_DIR", resolve_user_data_dir("").to_string_lossy().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -233,7 +329,7 @@ impl BridgeClient {
             let _ = child.wait();
         }
 
-        if let Some(mut browser) = self.launched_browser.take() {
+        for mut browser in self.launched_browsers.drain(..) {
             let _ = browser.kill();
             let _ = browser.wait();
         }
@@ -253,14 +349,14 @@ pub fn shutdown_browser_bridge() {
 }
 
 fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
-    let executable = resolve_edge_executable(cfg);
+    let executable = resolve_browser_executable(cfg);
 
-    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
     let cdp_url = if cfg.cdp_url.trim().is_empty() {
         crate::runtime_env::default_browser_cdp_url()?
     } else {
         cfg.cdp_url.clone()
     };
+    let user_data_dir = resolve_user_data_dir(&cfg.user_data_dir);
     let host_port = cdp_url
         .trim()
         .strip_prefix("http://")
@@ -279,16 +375,17 @@ fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
         .context("browser CDP URL has invalid port")?;
     let launch_url = normalize_browser_url_for_launch(&cfg.target_url);
 
-    info!(executable = %executable, user_data_dir = %user_data_dir.display(), port, launch_url = %launch_url, "launching Edge with remote debugging");
+    info!(executable = %executable, user_data_dir = %user_data_dir.display(), port, launch_url = %launch_url, "launching mdev browser with remote debugging");
 
     let child = Command::new(&executable)
         .arg(format!("--remote-debugging-port={}", port))
         .arg(format!("--user-data-dir={}", user_data_dir.to_string_lossy()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--new-window")
         .arg(launch_url)
         .spawn()
-        .with_context(|| format!("failed to launch Edge via {}", executable))?;
+        .with_context(|| format!("failed to launch mdev browser via {}", executable))?;
 
     Ok(child)
 }
@@ -316,10 +413,23 @@ fn cdp_reachable(cdp_url: &str) -> bool {
     }
 }
 
-fn resolve_edge_executable(cfg: &BrowserConfig) -> String {
+fn resolve_browser_executable(cfg: &BrowserConfig) -> String {
     let configured = cfg.edge_executable.trim();
     if !configured.is_empty() {
         return configured.to_string();
+    }
+
+    if let Ok(value) = std::env::var("MDEV_BROWSER_EXECUTABLE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    for candidate in bundled_chromium_candidates() {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -398,7 +508,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
             info!(cdp_url = %cfg.cdp_url, "attempting to launch edge with remote debugging");
             let child = launch_edge(cfg)?;
             if let Ok(mut client) = bridge_client().lock() {
-                client.launched_browser = Some(child);
+                client.launched_browsers.push(child);
             }
         }
     }
@@ -412,6 +522,10 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         std::thread::sleep(Duration::from_millis(250));
     }
 
+    if !cdp_reachable(&cfg.cdp_url) {
+        return Err(anyhow!("CDP endpoint did not become reachable after browser launch: {}", cfg.cdp_url));
+    }
+
     let mut last_err: Option<anyhow::Error> = None;
     for attempt_index in 0..20 {
         let attempt = (|| -> Result<String> {
@@ -420,6 +534,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
             client.ensure_started()?;
             let mut payload = bridge_cmd("connect_over_cdp");
             payload["cdp_url"] = Value::String(cfg.cdp_url.clone());
+            payload["url"] = Value::String(normalize_browser_url_for_launch(&cfg.target_url));
             payload["profile"] = Value::String(if cfg.profile.is_empty() { "auto".to_string() } else { cfg.profile.clone() });
             let page_url_contains = if !cfg.page_url_contains.trim().is_empty() {
                 cfg.page_url_contains.trim().to_string()
@@ -519,7 +634,7 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    if ok && (ready || uploaded.is_some()) {
+    if ok && ready {
         return Ok(());
     }
 
@@ -634,6 +749,14 @@ pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<S
 }
 
 pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<InferenceResult> {
+    send_chat_and_wait_with_pasted_context(cfg, text, None)
+}
+
+pub fn send_chat_and_wait_with_pasted_context(
+    cfg: &mut BrowserConfig,
+    text: &str,
+    pasted_context_text: Option<&str>,
+) -> Result<InferenceResult> {
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before send_chat"))?;
 
     let probe = probe(cfg)?;
@@ -653,6 +776,9 @@ pub fn send_chat_and_wait(cfg: &mut BrowserConfig, text: &str) -> Result<Inferen
     let mut send_payload = bridge_cmd("send_chat");
     send_payload["session_id"] = Value::String(session_id.clone());
     send_payload["text"] = Value::String(text.to_string());
+    if let Some(context_text) = pasted_context_text {
+        send_payload["pasted_context_text"] = Value::String(context_text.to_string());
+    }
     send_payload["timeout_ms"] = Value::Number(timeout_ms(cfg).into());
     let send_value = client.send_json(send_payload)?;
 

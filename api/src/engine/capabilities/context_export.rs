@@ -26,6 +26,8 @@ pub struct ContextExportPayload {
     pub exclude_regex: Vec<String>,
     #[serde(default)]
     pub save_path: String,
+    #[serde(default)]
+    pub inline_repo_context_in_prompt: bool,
 }
 
 fn default_git_ref() -> String {
@@ -101,6 +103,7 @@ pub fn normalize_context_export_payload(payload: Value, repo_resource: Option<Va
     obj.entry("skip_binary".to_string()).or_insert_with(|| Value::Bool(true));
     obj.entry("skip_gitignore".to_string()).or_insert_with(|| Value::Bool(true));
     obj.entry("save_path".to_string()).or_insert_with(|| Value::String("/tmp/repo_context.txt".to_string()));
+    obj.entry("inline_repo_context_in_prompt".to_string()).or_insert_with(|| Value::Bool(false));
     Value::Object(obj.clone())
 }
 
@@ -273,7 +276,7 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().any(|b| *b == 0)
 }
 
-fn is_gitignored(repo: &Path, rel: &str) -> Result<bool> {
+pub(crate) fn is_gitignored(repo: &Path, rel: &str) -> Result<bool> {
     let output = Command::new("git")
         .arg("check-ignore")
         .arg("--quiet")

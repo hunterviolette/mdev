@@ -2,6 +2,7 @@ import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from 'reac
 import {
   ActionIcon,
   Alert,
+  Anchor,
   AppShell,
   Badge,
   Box,
@@ -35,10 +36,11 @@ import {
   createTemplate,
   deleteRun,
   deleteTemplate,
-  getEventChainSummary,
   getWorkflowChangeset,
   getChangesetSchema,
   getRun,
+  getRuntimeProjection,
+  getRuntimeSnapshot,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -49,12 +51,13 @@ import {
   listRuns,
   listWorkflowChangesets,
   listTemplates,
-  openEventStream,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
   pauseWorkflowRun,
+  prepareWorkflowStage,
   forceWaitWorkflowRun,
   resumeWorkflowRun,
+  resolveWorkflowDispositionReview,
   sapScanExportCandidates,
   sapSearchObjects,
   runCurrentWorkflowStep,
@@ -64,9 +67,10 @@ import {
   type BrowserProbeResult,
   type ApplyChangesetResponse,
   type ChangesetAttemptSummary,
-  type EventChainSummaryItem,
-  type EventChainSummaryResponse,
   type InferenceTransport,
+  type EventChainSummaryResponse,
+  type RuntimeEventEnvelope,
+  type RuntimeProjectionResponse,
   type RepoTreeResponse,
   type SapExportScanItem,
   type SapSearchObject,
@@ -84,14 +88,24 @@ import {
   type WorkflowTransition
 } from './api';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
+import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
-import type { ReviewSourceControlState } from './ReviewDiffViewerPanel';
+import type { DiffPanelState } from './DiffPanel';
+import { PlannerModal } from './PlannerModal';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
+import { SupervisorPanel } from './SupervisorPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
+import {
+  emptyRuntimeEventStore,
+  reduceRuntimeEvent,
+  reduceRuntimeSnapshot,
+  subscribeRuntimeEventBus,
+  type RuntimeEventStore
+} from './runtime_events';
 
-const ReviewDiffViewerPanel = lazy(async () => {
-  const mod = await import('./ReviewDiffViewerPanel');
-  return { default: mod.ReviewDiffViewerPanel };
+const DiffPanel = lazy(async () => {
+  const mod = await import('./DiffPanel');
+  return { default: mod.DiffPanel };
 });
 
 const CommitSummaryPanel = lazy(async () => {
@@ -147,6 +161,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
+type MonitorHomeView = 'workflows' | 'supervisors';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -275,6 +290,995 @@ function extractCompileResultsFromPayload(payload: unknown): Array<Record<string
   return [];
 }
 
+
+type ModelIoDirection = 'input' | 'output' | 'error';
+
+type ModelIoContentBlock = {
+  index: number;
+  label: string;
+  capabilityKey: string;
+  contentFormat: string;
+  content: string;
+  role: string;
+  source: string;
+  enabled: boolean;
+  defaultCollapsed: boolean;
+  charCount: number;
+};
+
+type ModelIoTurn = {
+  id: string;
+  sequenceNo: number;
+  createdAt: string;
+  direction: ModelIoDirection;
+  role: string;
+  content: string;
+  provider: string;
+  model: string;
+  transport: string;
+  source: string;
+  stepId: string;
+  stageType: string;
+  blockLabel: string;
+  blocks: ModelIoContentBlock[];
+};
+
+type ModelIoSourceEvent = {
+  id: string;
+  kind: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  sequence_no?: number;
+  step_id?: string | null;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringFrom(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function formatModelIoContent(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return '';
+  if (/^```[\s\S]*```$/m.test(trimmed)) return trimmed;
+  return trimmed;
+}
+
+function findStructuredPayloadStart(content: string): number {
+  const lines = content.split('\n');
+  let offset = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '{' || trimmed === '[' || trimmed.startsWith('{"') || trimmed.startsWith('[{"')) {
+      return offset;
+    }
+    offset += line.length + 1;
+  }
+
+  return -1;
+}
+
+function tryPrettyJson(content: string): string {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content.trim();
+  }
+}
+
+function summarizeStructuredPayload(content: string): string {
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      const feature = asRecord(record.feature);
+      const title = stringFrom(feature?.title) || stringFrom(record.title) || stringFrom(record.name);
+      const keys = Object.keys(record).slice(0, 8).join(', ');
+      if (title && keys) return `${title} · keys: ${keys}`;
+      if (title) return title;
+      if (keys) return `keys: ${keys}`;
+    }
+    if (Array.isArray(parsed)) return `${parsed.length} items`;
+  } catch {
+  }
+
+  const firstLine = content.trim().split('\n').find((line) => line.trim().length > 0) ?? '';
+  return firstLine.length > 140 ? `${firstLine.slice(0, 140)}…` : firstLine;
+}
+
+function formatCollapsibleStructuredPayload(content: string, label: string): string {
+  const summary = summarizeStructuredPayload(content);
+  const pretty = tryPrettyJson(content);
+  return `${label}${summary ? ` — ${summary}` : ''}\n\n\`\`\`json\n${pretty}\n\`\`\``;
+}
+
+function formatReadableModelIoContent(content: string, direction: ModelIoDirection): string {
+  const trimmed = formatModelIoContent(content);
+  if (!trimmed) return '';
+
+  const structuredStart = findStructuredPayloadStart(trimmed);
+  if (structuredStart > 0) {
+    return trimmed;
+  }
+
+  if (structuredStart === 0 && trimmed.length > 1200) {
+    return trimmed;
+  }
+
+  if (trimmed.length > 6000) {
+    return `Large ${direction} payload — ${trimmed.length.toLocaleString()} chars\n\n\`\`\`text\n${trimmed}\n\`\`\``;
+  }
+
+  return trimmed;
+}
+
+function readModelIoContentBlocks(meta: Record<string, unknown>, direction: ModelIoDirection): ModelIoContentBlock[] {
+  const candidates = [
+    meta.blocks,
+    direction === 'input' ? meta.input_blocks : meta.output_blocks,
+    direction === 'input' ? meta.prompt_blocks : meta.response_blocks,
+    meta.content_blocks
+  ];
+
+  const rawBlocks = candidates.find((candidate) => Array.isArray(candidate)) as Array<Record<string, unknown>> | undefined;
+  if (!rawBlocks) return [];
+
+  return rawBlocks.map((block, index) => {
+    const capabilityKey = stringFrom(block.capability_key) || stringFrom(block.capability) || stringFrom(block.key);
+    const label = stringFrom(block.label) || stringFrom(block.title) || labelFromCapabilityKey(capabilityKey) || `Block ${index + 1}`;
+    const role = stringFrom(block.role);
+    const charCount = typeof block.char_count === 'number' ? block.char_count : stringFrom(block.content).length;
+    return {
+      index,
+      label,
+      capabilityKey,
+      contentFormat: stringFrom(block.content_format) || stringFrom(block.format),
+      content: stringFrom(block.content),
+      role,
+      source: stringFrom(block.source),
+      enabled: block.enabled !== false,
+      defaultCollapsed: typeof block.default_collapsed === 'boolean' ? block.default_collapsed : role !== 'user',
+      charCount
+    };
+  });
+}
+
+function blockLabelForCodeFence(turnBlocks: ModelIoContentBlock[], fenceIndex: number, fallback: string): string {
+  const block = turnBlocks[fenceIndex];
+  if (!block) return fallback;
+  return block.label;
+}
+
+function labelFromCapabilityKey(key: string): string {
+  const normalized = key.trim();
+  if (!normalized) return '';
+  return normalized
+    .replace(/[\/_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function modelIoBlockLabelFromMeta(meta: Record<string, unknown>, direction: ModelIoDirection, fallbackLanguage = ''): string {
+  const explicitLabel = stringFrom(meta.block_label) || stringFrom(meta.label) || stringFrom(meta.title);
+  if (explicitLabel) return explicitLabel;
+
+  const capabilityKey = stringFrom(meta.capability_key) || stringFrom(meta.capability) || stringFrom(meta.source_capability) || stringFrom(meta.key);
+  const capabilityLabel = labelFromCapabilityKey(capabilityKey);
+  if (capabilityLabel) return `${capabilityLabel} ${direction === 'input' ? 'input' : direction === 'error' ? 'error' : 'output'}`;
+
+  const source = asRecord(meta.source);
+  const sourceCapability = source ? labelFromCapabilityKey(stringFrom(source.capability) || stringFrom(source.key)) : '';
+  if (sourceCapability) return `${sourceCapability} ${direction === 'input' ? 'input' : direction === 'error' ? 'error' : 'output'}`;
+
+  const language = fallbackLanguage.trim();
+  if (language) return `${language} block`;
+
+  return direction === 'input' ? 'Model input block' : direction === 'error' ? 'Model error block' : 'Model output block';
+}
+
+function pushModelIoTurn(
+  turns: ModelIoTurn[],
+  seen: Set<string>,
+  event: ModelIoSourceEvent,
+  direction: ModelIoDirection,
+  role: string,
+  content: string,
+  meta: Record<string, unknown>,
+  ordinal: number
+) {
+  const normalizedContent = formatReadableModelIoContent(content, direction);
+  if (!normalizedContent) return;
+
+  const key = [
+    direction,
+    role,
+    event.created_at,
+    stringFrom(meta.provider),
+    stringFrom(meta.model),
+    stringFrom(meta.transport),
+    stringFrom(meta.step_id) || event.step_id || '',
+    normalizedContent.slice(0, 512)
+  ].join('|');
+
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  turns.push({
+    id: `${event.id}:${direction}:${ordinal}`,
+    sequenceNo: event.sequence_no ?? ordinal,
+    createdAt: event.created_at,
+    direction,
+    role,
+    content: normalizedContent,
+    provider: stringFrom(meta.provider),
+    model: stringFrom(meta.model),
+    transport: stringFrom(meta.transport),
+    source: event.kind || event.message || 'model',
+    stepId: stringFrom(meta.step_id) || event.step_id || '',
+    stageType: stringFrom(meta.stage_type),
+    blockLabel: modelIoBlockLabelFromMeta(meta, direction),
+    blocks: readModelIoContentBlocks(meta, direction)
+  });
+}
+
+function pushInferencePayloadTurns(
+  turns: ModelIoTurn[],
+  seen: Set<string>,
+  event: ModelIoSourceEvent,
+  inferencePayload: Record<string, unknown>,
+  ordinalBase: number
+) {
+  const modelIo = asRecord(inferencePayload.model_io);
+  if (modelIo) {
+    pushModelIoTurn(turns, seen, event, 'input', 'user', stringFrom(modelIo.input), modelIo, ordinalBase);
+    pushModelIoTurn(turns, seen, event, stringFrom(modelIo.status) === 'failed' ? 'error' : 'output', 'assistant', stringFrom(modelIo.output), modelIo, ordinalBase + 1);
+    return;
+  }
+
+  const result = asRecord(inferencePayload.result);
+  const prompt = stringFrom(inferencePayload.prompt);
+  const output = stringFrom(result?.text);
+  const meta = {
+    provider: stringFrom(inferencePayload.provider),
+    model: stringFrom(inferencePayload.model),
+    transport: stringFrom(result?.transport),
+    capability_key: 'inference'
+  };
+
+  pushModelIoTurn(turns, seen, event, 'input', 'user', prompt, meta, ordinalBase);
+  pushModelIoTurn(turns, seen, event, stringFrom(result?.message) ? 'error' : 'output', 'assistant', output, meta, ordinalBase + 1);
+}
+
+function collectModelIoTurns(events: ModelIoSourceEvent[]): ModelIoTurn[] {
+  const turns: ModelIoTurn[] = [];
+  const seen = new Set<string>();
+
+  events.forEach((event, eventIndex) => {
+    const payload = asRecord(event.payload) ?? {};
+    const directModelIo = asRecord(payload.model_io);
+
+    if (directModelIo && stringFrom(directModelIo.content)) {
+      const direction = stringFrom(directModelIo.direction) as ModelIoDirection;
+      pushModelIoTurn(
+        turns,
+        seen,
+        event,
+        direction === 'input' || direction === 'error' ? direction : 'output',
+        stringFrom(directModelIo.role) || (direction === 'input' ? 'user' : 'assistant'),
+        stringFrom(directModelIo.content),
+        directModelIo,
+        eventIndex * 10
+      );
+    }
+
+    if (payload.capability === 'inference') {
+      const resultPayload = asRecord(payload.result);
+      if (resultPayload) {
+        pushInferencePayloadTurns(turns, seen, event, resultPayload, eventIndex * 10 + 1);
+      }
+    }
+
+    const capabilityResults = Array.isArray(payload.capability_results)
+      ? payload.capability_results as Array<Record<string, unknown>>
+      : [];
+
+    capabilityResults.forEach((entry, entryIndex) => {
+      if (stringFrom(entry.key) !== 'inference') return;
+      const resultPayload = asRecord(entry.result);
+      if (resultPayload) {
+        pushInferencePayloadTurns(turns, seen, event, resultPayload, eventIndex * 10 + entryIndex + 1);
+      }
+    });
+  });
+
+  return turns
+    .filter((turn, index, allTurns) => {
+      const key = [
+        turn.direction,
+        turn.role,
+        turn.stageType,
+        turn.stepId,
+        turn.provider,
+        turn.model,
+        turn.transport,
+        normalizeModelHistoryContentForDedupe(turn.content)
+      ].join('|');
+
+      return allTurns.findIndex((candidate) => [
+        candidate.direction,
+        candidate.role,
+        candidate.stageType,
+        candidate.stepId,
+        candidate.provider,
+        candidate.model,
+        candidate.transport,
+        normalizeModelHistoryContentForDedupe(candidate.content)
+      ].join('|') === key) === index;
+    })
+    .sort((a, b) => a.sequenceNo - b.sequenceNo || a.id.localeCompare(b.id));
+}
+
+function formatModelIoTranscript(turns: ModelIoTurn[], fallbackInput: string, fallbackOutput: string): string {
+  if (turns.length > 0) return `${turns.length.toLocaleString()} model history turns`;
+
+  const fallbackCount = [fallbackInput, fallbackOutput].filter((item) => item.trim()).length;
+  if (fallbackCount > 0) return `${fallbackCount.toLocaleString()} fallback model history turns`;
+
+  return '';
+}
+
+type ModelIoExchange = {
+  id: string;
+  sequenceNo: number;
+  createdAt: string;
+  stageType: string;
+  stepId: string;
+  provider: string;
+  model: string;
+  transport: string;
+  input?: ModelIoTurn;
+  output?: ModelIoTurn;
+  error?: ModelIoTurn;
+};
+
+function normalizeModelHistoryContentForDedupe(value: string | undefined): string {
+  return (value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 2000);
+}
+
+function groupModelIoExchanges(turns: ModelIoTurn[]): ModelIoExchange[] {
+  const exchanges: ModelIoExchange[] = [];
+  let current: ModelIoExchange | null = null;
+  const seenExchanges = new Set<string>();
+
+  turns.forEach((turn) => {
+    if (turn.direction === 'input' || !current) {
+      current = {
+        id: turn.id,
+        sequenceNo: turn.sequenceNo,
+        createdAt: turn.createdAt,
+        stageType: turn.stageType,
+        stepId: turn.stepId,
+        provider: turn.provider,
+        model: turn.model,
+        transport: turn.transport,
+        input: turn.direction === 'input' ? turn : undefined,
+        output: turn.direction === 'output' ? turn : undefined,
+        error: turn.direction === 'error' ? turn : undefined
+      };
+      exchanges.push(current);
+      return;
+    }
+
+    if (turn.direction === 'output') {
+      current.output = turn;
+      return;
+    }
+
+    if (turn.direction === 'error') {
+      current.error = turn;
+    }
+  });
+
+  return exchanges.filter((exchange) => {
+    const key = [
+      exchange.stageType,
+      exchange.stepId,
+      exchange.provider,
+      exchange.model,
+      exchange.transport,
+      normalizeModelHistoryContentForDedupe(exchange.input?.content),
+      normalizeModelHistoryContentForDedupe(exchange.output?.content),
+      normalizeModelHistoryContentForDedupe(exchange.error?.content)
+    ].join('|');
+
+    if (seenExchanges.has(key)) return false;
+    seenExchanges.add(key);
+    return true;
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatCodeBlockContent(language: string, code: string): string {
+  const normalizedLanguage = language.trim().toLowerCase();
+  const trimmedCode = code.trim();
+
+  if (normalizedLanguage === 'json') {
+    try {
+      return JSON.stringify(JSON.parse(trimmedCode), null, 2);
+    } catch {
+      return trimmedCode;
+    }
+  }
+
+  return trimmedCode;
+}
+
+function summarizeModelHistoryCodeBlock(label: string, language: string, code: string): string {
+  const normalizedLanguage = language.trim().toLowerCase() || 'text';
+  const trimmed = code.trim();
+  const blockKind = label || `${normalizedLanguage} block`;
+
+  if (!trimmed) return blockKind;
+
+  if (normalizedLanguage === 'json') {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return `${blockKind} · ${parsed.length.toLocaleString()} items`;
+      if (parsed && typeof parsed === 'object') {
+        const keys = Object.keys(parsed as Record<string, unknown>).slice(0, 6).join(', ');
+        if (keys) return `${blockKind} · keys: ${keys}`;
+      }
+    } catch {
+    }
+  }
+
+  const lineCount = trimmed.split('\n').length;
+  return `${blockKind} · ${lineCount.toLocaleString()} line${lineCount === 1 ? '' : 's'} · ${trimmed.length.toLocaleString()} chars`;
+}
+
+function shouldCollapseModelHistoryCodeBlock(language: string, code: string): boolean {
+  const normalizedLanguage = language.trim().toLowerCase() || 'text';
+  const trimmed = code.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 500) return true;
+  if (trimmed.split('\n').length > 12) return true;
+  return normalizedLanguage === 'json' || normalizedLanguage === 'rust' || normalizedLanguage === 'rs' || normalizedLanguage === 'typescript' || normalizedLanguage === 'ts' || normalizedLanguage === 'javascript' || normalizedLanguage === 'js' || normalizedLanguage === 'text';
+}
+
+function capabilityBlockLanguage(block: ModelIoContentBlock): string {
+  const format = block.contentFormat.trim().toLowerCase();
+  if (format === 'json' || format === 'application/json') return 'json';
+  if (format === 'rust' || format === 'rs') return 'rust';
+  if (format === 'typescript' || format === 'ts') return 'typescript';
+  if (format === 'javascript' || format === 'js') return 'javascript';
+  if (format === 'markdown' || format === 'md') return 'markdown';
+  return 'text';
+}
+
+function CapabilityContentBlock(props: { block: ModelIoContentBlock }) {
+  const language = capabilityBlockLanguage(props.block);
+  const code = formatCodeBlockContent(language, props.block.content);
+  const summary = summarizeModelHistoryCodeBlock(props.block.label, language, code);
+
+  if (props.block.role === 'user') {
+    return (
+      <Box p="sm">
+        <Code
+          block
+          style={{
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
+            fontSize: 12,
+            lineHeight: 1.55,
+          }}
+        >
+          {code}
+        </Code>
+      </Box>
+    );
+  }
+
+  return (
+    <Box p="sm">
+      <details open={!props.block.defaultCollapsed} style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+        <summary style={{ cursor: 'pointer' }}>
+          <Group component="span" gap="xs" wrap="wrap" align="center">
+            <Text component="span" size="xs" fw={700} tt="uppercase" style={{ letterSpacing: '0.06em' }}>
+              {props.block.label}
+            </Text>
+            {props.block.role ? <Badge size="xs" variant="outline">{props.block.role}</Badge> : null}
+            {props.block.source ? <Badge size="xs" variant="outline">{props.block.source}</Badge> : null}
+            <Badge size="xs" variant="outline">{(props.block.charCount || code.length).toLocaleString()} chars</Badge>
+            <Text component="span" size="xs" c="dimmed" style={{ minWidth: 160, flex: '1 1 280px' }}>
+              {summary}
+            </Text>
+          </Group>
+        </summary>
+        <Box mt="xs">
+          <Code
+            block
+            style={{
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              wordBreak: 'break-word',
+              fontSize: 12,
+              lineHeight: 1.55,
+            }}
+          >
+            {code}
+          </Code>
+        </Box>
+      </details>
+    </Box>
+  );
+}
+
+function renderCapabilityBlocks(blocks: ModelIoContentBlock[]): JSX.Element[] {
+  return blocks
+    .filter((block) => block.content.trim())
+    .map((block) => <CapabilityContentBlock key={`${block.index}:${block.capabilityKey}:${block.label}`} block={block} />);
+}
+
+function describeJsonValue(value: unknown): string {
+  if (Array.isArray(value)) return `${value.length.toLocaleString()} item${value.length === 1 ? '' : 's'}`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return `${keys.length.toLocaleString()} key${keys.length === 1 ? '' : 's'}${keys.length > 0 ? `: ${keys.slice(0, 6).join(', ')}` : ''}`;
+  }
+  if (typeof value === 'string') return `${value.length.toLocaleString()} chars`;
+  if (value === null) return 'null';
+  return typeof value;
+}
+
+function jsonBlockTitle(key: string, value: unknown, fallback: string): string {
+  const normalizedKey = key.trim();
+  if (normalizedKey) return labelFromCapabilityKey(normalizedKey);
+  if (Array.isArray(value)) return `${fallback} array`;
+  if (value && typeof value === 'object') return `${fallback} object`;
+  return fallback;
+}
+
+function renderJsonModelHistoryContent(content: string, fallbackLabel: string): JSX.Element[] | null {
+  const trimmed = content.trim();
+  if (!trimmed || !(trimmed.startsWith('{') || trimmed.startsWith('['))) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const entries = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? Object.entries(parsed as Record<string, unknown>)
+    : [['', parsed]] as Array<[string, unknown]>;
+
+  return entries.map(([key, value], index) => {
+    const pretty = JSON.stringify(value, null, 2);
+    const title = jsonBlockTitle(key, value, fallbackLabel || 'JSON response');
+    const summary = describeJsonValue(value);
+
+    return (
+      <Box key={`json-response-${index}-${key || 'root'}`} p="sm">
+        <details style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+          <summary style={{ cursor: 'pointer' }}>
+            <Group component="span" gap="xs" wrap="wrap" align="center">
+              <Text component="span" size="xs" fw={700} tt="uppercase" style={{ letterSpacing: '0.06em' }}>
+                {title}
+              </Text>
+              <Badge size="xs" variant="outline">json</Badge>
+              <Badge size="xs" variant="outline">{pretty.length.toLocaleString()} chars</Badge>
+              <Text component="span" size="xs" c="dimmed" style={{ minWidth: 160, flex: '1 1 280px' }}>
+                {summary}
+              </Text>
+            </Group>
+          </summary>
+          <Box mt="xs">
+            <Code
+              block
+              style={{
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                wordBreak: 'break-word',
+                fontSize: 12,
+                lineHeight: 1.55,
+              }}
+            >
+              {pretty}
+            </Code>
+          </Box>
+        </details>
+      </Box>
+    );
+  });
+}
+
+function ModelHistoryMarkdownContent(props: { content: string; direction: ModelIoDirection; blockLabel: string; blocks: ModelIoContentBlock[] }) {
+  const nodes: JSX.Element[] = [];
+  const explicitCapabilityBlocks = renderCapabilityBlocks(props.blocks);
+  const structuredJsonNodes = explicitCapabilityBlocks.length === 0
+    ? renderJsonModelHistoryContent(props.content, props.blockLabel || modelIoBlockLabelFromMeta({}, props.direction, 'json'))
+    : null;
+  if (structuredJsonNodes) return <Stack gap={0}>{structuredJsonNodes}</Stack>;
+
+  const fencePattern = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let index = 0;
+
+  while ((match = fencePattern.exec(props.content)) !== null) {
+    const before = props.content.slice(cursor, match.index);
+    const language = (match[1] || 'text').trim() || 'text';
+    const code = formatCodeBlockContent(language, match[2] || '');
+
+    if (before.trim()) {
+      nodes.push(
+        <Text
+          key={`text-${index}`}
+          component="div"
+          size="sm"
+          p="sm"
+          style={{
+            whiteSpace: 'pre-wrap',
+            lineHeight: 1.65,
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
+          }}
+        >
+          {before.trim()}
+        </Text>
+      );
+    }
+
+    const blockLabel = blockLabelForCodeFence(props.blocks, index, modelIoBlockLabelFromMeta({}, props.direction, language));
+    const collapseCode = shouldCollapseModelHistoryCodeBlock(language, code);
+    const codeSummary = summarizeModelHistoryCodeBlock(blockLabel, language, code);
+
+    nodes.push(
+      <Box key={`code-${index}`} p="sm">
+        {collapseCode ? (
+          <details style={{ border: '1px solid rgba(139,148,158,0.24)', borderRadius: 8, background: 'rgba(0,0,0,0.16)', padding: 10 }}>
+            <summary style={{ cursor: 'pointer' }}>
+              <Group component="span" gap="xs" wrap="nowrap">
+                <Badge size="xs" variant="light">{blockLabel}</Badge>
+                <Text component="span" size="xs" c="dimmed" truncate>
+                  {codeSummary}
+                </Text>
+              </Group>
+            </summary>
+            <Box mt="xs">
+              <Code
+                block
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  wordBreak: 'break-word',
+                  fontSize: 12,
+                  lineHeight: 1.55,
+                }}
+              >
+                {code}
+              </Code>
+            </Box>
+          </details>
+        ) : (
+          <>
+            <Group justify="space-between" mb={6}>
+              <Badge size="xs" variant="light">{blockLabel}</Badge>
+              <Badge size="xs" variant="outline">{code.length.toLocaleString()} chars</Badge>
+            </Group>
+            <Code
+              block
+              style={{
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                wordBreak: 'break-word',
+                fontSize: 12,
+                lineHeight: 1.55,
+              }}
+            >
+              {code}
+            </Code>
+          </>
+        )}
+      </Box>
+    );
+
+    cursor = match.index + match[0].length;
+    index += 1;
+  }
+
+  const after = props.content.slice(cursor);
+  if (after.trim()) {
+    nodes.push(
+      <Text
+        key={`text-${index}`}
+        component="div"
+        size="sm"
+        p="sm"
+        style={{
+          whiteSpace: 'pre-wrap',
+          lineHeight: 1.65,
+          overflowWrap: 'anywhere',
+          wordBreak: 'break-word',
+        }}
+      >
+        {after.trim()}
+      </Text>
+    );
+  }
+
+  return <Stack gap={0}>{explicitCapabilityBlocks.length > 0 ? explicitCapabilityBlocks : nodes}</Stack>;
+}
+
+function ModelTurnCard(props: { label: string; turn?: ModelIoTurn; tone: 'input' | 'output' | 'error' }) {
+  if (!props.turn) return null;
+
+  const toneStyles = props.tone === 'input'
+    ? { border: 'rgba(88,166,255,0.45)', background: 'rgba(56,139,253,0.08)', badge: 'blue' }
+    : props.tone === 'error'
+      ? { border: 'rgba(248,81,73,0.55)', background: 'rgba(248,81,73,0.08)', badge: 'red' }
+      : { border: 'rgba(63,185,80,0.45)', background: 'rgba(46,160,67,0.08)', badge: 'green' };
+
+  return (
+    <Box
+      p="md"
+      mt="sm"
+      style={{
+        border: `1px solid ${toneStyles.border}`,
+        background: toneStyles.background,
+        borderRadius: 12,
+        minWidth: 0,
+      }}
+    >
+      <Group justify="space-between" align="center" mb="xs">
+        <Group gap="xs">
+          <Text size="xs" fw={800} tt="uppercase" style={{ letterSpacing: '0.08em' }}>
+            {props.label}
+          </Text>
+          <Badge size="xs" variant="outline">
+            {props.turn.content.length.toLocaleString()} chars
+          </Badge>
+        </Group>
+        <Badge size="xs" color={toneStyles.badge} variant="light">
+          {props.turn.role}
+        </Badge>
+      </Group>
+      <Box
+        style={{
+          border: '1px solid rgba(139,148,158,0.18)',
+          borderRadius: 8,
+          background: 'rgba(0,0,0,0.14)',
+          overflow: 'hidden',
+        }}
+      >
+        <ModelHistoryMarkdownContent content={props.turn.content} direction={props.turn.direction} blockLabel={props.turn.blockLabel} blocks={props.turn.blocks} />
+      </Box>
+    </Box>
+  );
+}
+
+function modelHistoryCopyText(turns: ModelIoTurn[]): string {
+  const exchanges = groupModelIoExchanges(turns);
+  return exchanges
+    .map((exchange, index) => {
+      const lines = [
+        `Exchange ${index + 1}`,
+        [
+          exchange.createdAt ? `Time: ${formatTimestamp(exchange.createdAt)}` : '',
+          exchange.stageType ? `Stage: ${exchange.stageType}` : '',
+          exchange.stepId ? `Step: ${exchange.stepId}` : '',
+          exchange.model ? `Model: ${exchange.model}` : '',
+          exchange.provider ? `Provider: ${exchange.provider}` : '',
+          exchange.transport ? `Transport: ${exchange.transport}` : ''
+        ].filter(Boolean).join(' · '),
+        exchange.input ? `\nPROMPT SENT TO MODEL\n${exchange.input.content}` : '',
+        exchange.output ? `\nMODEL RESPONSE\n${exchange.output.content}` : '',
+        exchange.error ? `\nMODEL ERROR\n${exchange.error.content}` : ''
+      ];
+      return lines.filter(Boolean).join('\n');
+    })
+    .join('\n\n---\n\n');
+}
+
+function ModelHistoryContent(props: { turns: ModelIoTurn[]; fallbackInput: string; fallbackOutput: string; emptyText: string }) {
+  let turns = props.turns;
+
+  if (turns.length === 0) {
+    const fallbackTurns: ModelIoTurn[] = [];
+    if (props.fallbackInput.trim()) {
+      fallbackTurns.push({
+        id: 'fallback:input',
+        sequenceNo: 0,
+        createdAt: '',
+        direction: 'input',
+        role: 'user',
+        content: formatReadableModelIoContent(props.fallbackInput, 'input'),
+        provider: '',
+        model: '',
+        transport: '',
+        source: 'fallback',
+        stepId: '',
+        stageType: '',
+        blockLabel: 'Fallback model input',
+        blocks: []
+      });
+    }
+    if (props.fallbackOutput.trim()) {
+      fallbackTurns.push({
+        id: 'fallback:output',
+        sequenceNo: 1,
+        createdAt: '',
+        direction: 'output',
+        role: 'assistant',
+        content: formatReadableModelIoContent(props.fallbackOutput, 'output'),
+        provider: '',
+        model: '',
+        transport: '',
+        source: 'fallback',
+        stepId: '',
+        stageType: '',
+        blockLabel: 'Fallback model output',
+        blocks: []
+      });
+    }
+    turns = fallbackTurns;
+  }
+
+  const exchanges = groupModelIoExchanges(turns);
+  const [selectedExchangeIndex, setSelectedExchangeIndex] = useState<number | null>(null);
+  const [showTimeline, setShowTimeline] = useState(false);
+
+  useEffect(() => {
+    setSelectedExchangeIndex((previous) => {
+      if (previous === null) return null;
+      return Math.min(previous, Math.max(0, exchanges.length - 1));
+    });
+  }, [exchanges.length]);
+
+  if (exchanges.length === 0) {
+    return <Text size="sm" c="dimmed">{props.emptyText}</Text>;
+  }
+
+  const activeExchangeIndex = selectedExchangeIndex ?? exchanges.length - 1;
+  const exchange = exchanges[activeExchangeIndex] ?? exchanges[exchanges.length - 1];
+  const status = exchange.error ? 'failed' : exchange.output ? 'completed' : 'pending';
+  const statusColor = exchange.error ? 'red' : exchange.output ? 'green' : 'yellow';
+  const meta = [
+    exchange.createdAt ? formatTimestamp(exchange.createdAt) : '',
+    exchange.stageType ? `Stage: ${exchange.stageType}` : '',
+    exchange.stepId ? `Step: ${exchange.stepId}` : '',
+    exchange.model ? `Model: ${exchange.model}` : '',
+    exchange.provider ? `Provider: ${exchange.provider}` : '',
+    exchange.transport ? `Transport: ${exchange.transport}` : ''
+  ].filter(Boolean);
+
+  return (
+    <Stack gap="md">
+      <Card
+        withBorder
+        radius="md"
+        p="sm"
+        style={{
+          position: 'sticky',
+          top: 0,
+          zIndex: 3,
+          background: 'rgba(31,31,31,0.96)',
+          borderColor: 'rgba(139,148,158,0.32)',
+          backdropFilter: 'blur(8px)'
+        }}
+      >
+        <Stack gap="xs">
+          <Group justify="space-between" align="center">
+            <Group gap="xs">
+              <Badge variant="light">{exchanges.length.toLocaleString()} exchanges</Badge>
+              <Badge color={statusColor} variant="light">Viewing {activeExchangeIndex + 1}</Badge>
+              <Text size="xs" c="dimmed">
+                {exchange.createdAt ? formatTimestamp(exchange.createdAt) : 'Latest exchange'}
+              </Text>
+            </Group>
+            <Group gap="xs">
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(0)} disabled={activeExchangeIndex === 0}>
+                First
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(Math.max(0, activeExchangeIndex - 1))} disabled={activeExchangeIndex === 0}>
+                Previous
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(Math.min(exchanges.length - 1, activeExchangeIndex + 1))} disabled={activeExchangeIndex >= exchanges.length - 1}>
+                Next
+              </Button>
+              <Button size="compact-xs" variant="subtle" onClick={() => setSelectedExchangeIndex(null)} disabled={activeExchangeIndex >= exchanges.length - 1 && selectedExchangeIndex === null}>
+                Latest
+              </Button>
+              <Button size="compact-xs" variant="light" onClick={() => setShowTimeline((value) => !value)}>
+                {showTimeline ? 'Hide history' : 'Show history'}
+              </Button>
+            </Group>
+          </Group>
+          {showTimeline ? (
+            <Group gap={6} wrap="wrap">
+              {exchanges.map((item, index) => (
+                <Button
+                  key={`jump-${item.id}`}
+                  size="compact-xs"
+                  variant={index === activeExchangeIndex ? 'filled' : 'light'}
+                  color={item.error ? 'red' : item.output ? 'green' : 'yellow'}
+                  onClick={() => setSelectedExchangeIndex(index)}
+                >
+                  {index + 1}{item.createdAt ? ` · ${formatTimestamp(item.createdAt)}` : ''}
+                </Button>
+              ))}
+            </Group>
+          ) : null}
+        </Stack>
+      </Card>
+
+      <Card
+        id={`model-exchange-${activeExchangeIndex + 1}`}
+        key={exchange.id}
+        withBorder
+        radius="lg"
+        p="md"
+        style={{
+          scrollMarginTop: 96,
+          background: 'linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.025))',
+          borderColor: 'rgba(139,148,158,0.32)',
+          minWidth: 0,
+          maxHeight: 'calc(100vh - 280px)',
+          overflow: 'hidden',
+        }}
+      >
+        <Stack gap="sm">
+          <Group justify="space-between" align="flex-start" gap="md">
+            <Stack gap={4} style={{ minWidth: 0 }}>
+              <Text fw={800}>Exchange {activeExchangeIndex + 1}</Text>
+              <Text size="xs" c="dimmed" style={{ lineHeight: 1.45 }}>
+                {meta.join(' · ')}
+              </Text>
+            </Stack>
+            <Badge color={statusColor} variant="light">
+              {status}
+            </Badge>
+          </Group>
+          <Divider />
+          <ScrollArea.Autosize
+            mah="calc(100vh - 420px)"
+            type="auto"
+            offsetScrollbars
+            style={{ minHeight: 0 }}
+          >
+            <Stack gap="sm" pr="xs">
+              <ModelTurnCard label="Prompt sent to model" turn={exchange.input} tone="input" />
+              <ModelTurnCard label="Model response" turn={exchange.output} tone="output" />
+              <ModelTurnCard label="Model error" turn={exchange.error} tone="error" />
+            </Stack>
+          </ScrollArea.Autosize>
+        </Stack>
+      </Card>
+    </Stack>
+  );
+}
+
 function formatCompileStageStream(commandResults: Array<Record<string, unknown>>): string {
   const parts: string[] = ['### COMPILE RESULTS'];
 
@@ -316,106 +1320,6 @@ function statusColor(status: WorkflowRunStatus) {
     default: return 'dark';
   }
 }
-
-const InferenceConnectionCard = memo(function InferenceConnectionCard(props: {
-  inferenceConnectionStatus: InferenceConnectionStatus;
-  inferenceReady: boolean;
-  inferenceSummaryText: string;
-  inferenceTransport: InferenceTransport;
-  browserTargetUrl: string;
-  browserCdpUrl: string;
-  inferenceBusy: boolean;
-  inferenceStatus: string | null;
-  hideInlineCard?: boolean;
-  onOpenConfig: () => void;
-  onTransportChange: (value: InferenceTransport) => void;
-  onBrowserTargetUrlChange: (value: string) => void;
-  onBrowserCdpUrlChange: (value: string) => void;
-  onSaveConfig: () => void;
-}) {
-  const {
-    inferenceConnectionStatus,
-    inferenceReady,
-    inferenceTransport,
-    browserTargetUrl,
-    browserCdpUrl,
-    inferenceBusy,
-    inferenceStatus,
-    hideInlineCard = false,
-    onOpenConfig,
-    onTransportChange,
-    onBrowserTargetUrlChange,
-    onBrowserCdpUrlChange,
-    onSaveConfig
-  } = props;
-
-  const showInlineConfig = !hideInlineCard && !inferenceReady;
-
-  return (
-    <>
-      {!hideInlineCard ? (
-        <Stack gap="md">
-          <Group justify="space-between" align="center" wrap="nowrap">
-            <Group gap="xs" wrap="nowrap">
-              <Text size="sm" fw={600}>Inference status</Text>
-              <Badge color={inferenceConnectionStatus.color} variant="light">
-                {inferenceTransport === 'browser' ? 'Browser' : 'API'}
-              </Badge>
-            </Group>
-            {!showInlineConfig ? <Button size="xs" variant="subtle" onClick={onOpenConfig}>Configure</Button> : null}
-          </Group>
-
-          {showInlineConfig ? (
-          <Stack gap="md">
-            <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <Select
-                label="Mode"
-                value={inferenceTransport}
-                onChange={(value) => onTransportChange((value as InferenceTransport) ?? 'api')}
-                data={[
-                  { value: 'api', label: 'API' },
-                  { value: 'browser', label: 'Browser' }
-                ]}
-                allowDeselect={false}
-              />
-              <TextInput
-                label="CDP URL"
-                value={browserCdpUrl}
-                onChange={(e) => onBrowserCdpUrlChange(e.currentTarget.value)}
-                placeholder="Backend default"
-                disabled={inferenceTransport !== 'browser'}
-              />
-            </SimpleGrid>
-
-            {inferenceTransport === 'browser' ? (
-              <Stack gap="md">
-                <TextInput
-                  label="Browser URL"
-                  value={browserTargetUrl}
-                  onChange={(e) => onBrowserTargetUrlChange(e.currentTarget.value)}
-                  placeholder="https://website.com/"
-                />
-                <Alert color="blue">Only transport and browser connection details are configured here.</Alert>
-                <Group>
-                  <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-                </Group>
-              </Stack>
-            ) : (
-              <Group>
-                <Button variant="default" onClick={onSaveConfig} loading={inferenceBusy}>Save config</Button>
-              </Group>
-            )}
-
-            {inferenceStatus ? <Alert color="blue">{inferenceStatus}</Alert> : null}
-          </Stack>
-          ) : null}
-        </Stack>
-      ) : null}
-
-
-    </>
-  );
-});
 
 function stepUsesCapability(step: WorkflowStepDefinition | null | undefined, capabilityKey: string): boolean {
   if (!step) return false;
@@ -487,14 +1391,20 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   stageApplyError: string;
   stageCompileError: string;
   stageCompileCommandsText: string;
+  stageUserInput: string;
   inferenceConnectionStatus: InferenceConnectionStatus;
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
+  sharedPlannerFragmentState: Record<string, unknown> | null;
+  plannerAvailableForRepo: boolean;
+  activePlannerFeatureTitle: string | null;
   stageIncludeRepoContext: boolean;
   stageIncludeChangesetSchema: boolean;
   disabled: boolean;
   onToggleSharedRepoContext: () => void;
   onToggleSharedChangesetSchema: () => void;
+  onTogglePlanningFragment: () => void;
+  onOpenPlanner: () => void;
   onPatchSelectedStepConfig: (key: string, value: unknown) => void;
   onOpenInferenceConfig: () => void;
   onOpenRepoConfig: () => void;
@@ -510,14 +1420,20 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     stageApplyError,
     stageCompileError,
     stageCompileCommandsText,
+    stageUserInput,
     inferenceConnectionStatus,
     inferenceTransport,
     sharedInferenceState,
+    sharedPlannerFragmentState,
+    plannerAvailableForRepo,
+    activePlannerFeatureTitle,
     stageIncludeRepoContext,
     stageIncludeChangesetSchema,
     disabled,
     onToggleSharedRepoContext,
     onToggleSharedChangesetSchema,
+    onTogglePlanningFragment,
+    onOpenPlanner,
     onPatchSelectedStepConfig,
     onOpenInferenceConfig,
     onOpenRepoConfig,
@@ -528,6 +1444,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   } = props;
 
   const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
+  const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
@@ -541,8 +1458,34 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     || !!selectedWorkflowStep.prompt?.include_changeset_schema
   );
   const usesCompileCommands = stepUsesCapability(selectedWorkflowStep, 'compile_commands');
+  const designModeDraftValue = fieldDrafts['config.design_mode'];
+  const designMode = typeof designModeDraftValue === 'string'
+    ? designModeDraftValue
+    : readStringValue(selectedWorkflowStep, 'config.design_mode', 'v1');
+  const plannerCapabilityState = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
+  const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
+  const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
+  const selectedPlannerFeatureId = typeof plannerCapabilityState.selected_feature_id === 'string' && plannerCapabilityState.selected_feature_id.trim()
+    ? plannerCapabilityState.selected_feature_id
+    : null;
+  const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed && selectedPlannerFeatureId);
+  const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed && selectedPlannerFeatureId);
+  const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
+  const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
+  const plannerSupportedStep = selectedWorkflowStep?.step_type === 'design' || selectedWorkflowStep?.step_type === 'code' || selectedWorkflowStep?.step_type === 'review';
+  const showPlannerControls = Boolean(hasBackendPlanningFragment || planningFragmentArmed || selectedPlannerFeatureId || (plannerAvailableForRepo && plannerSupportedStep));
+
+  useEffect(() => {
+    setPlannerSchemaArmedDraft(null);
+    setPlannerAutoApplyDraft(null);
+  }, [
+    selectedWorkflowStep?.id,
+    plannerCapabilityState.schema_armed,
+    plannerCapabilityState.auto_apply_armed
+  ]);
 
   const modifierActions = useMemo<StageModifierAction[]>(() => {
+
     const actions: StageModifierAction[] = [];
 
     if (usesRepoContext) {
@@ -570,6 +1513,51 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
         toggleColor: changesetSchemaArmed ? 'orange' : 'green',
         onToggle: onToggleSharedChangesetSchema,
         helperText: 'Shared global capability surfaced in this stage.'
+      });
+    }
+
+    if (showPlannerControls) {
+      actions.push({
+        key: 'planning_fragment',
+        label: 'Planner fragment',
+        buttonLabel: 'Open planner',
+        onOpen: onOpenPlanner,
+        toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
+        toggleColor: planningFragmentArmed ? 'orange' : 'green',
+        onToggle: onTogglePlanningFragment,
+        helperText: activePlannerFeatureTitle
+          ? `Selected feature: ${activePlannerFeatureTitle}`
+          : 'No planner feature selected.'
+      });
+    }
+
+    if (showPlannerControls && selectedWorkflowStep?.step_type === 'design') {
+      actions.push({
+        key: 'planner_schema',
+        label: 'Planner schema',
+        buttonLabel: '',
+        toggleLabel: fineFeatureFormatArmed ? 'Disarm' : 'Arm',
+        toggleColor: fineFeatureFormatArmed ? 'orange' : 'green',
+        onToggle: () => {
+          const next = !fineFeatureFormatArmed;
+          setPlannerSchemaArmedDraft(next);
+          onPatchSelectedStepConfig('capabilities.planner.schema_armed', next);
+        },
+        helperText: 'Inject planner schema into the next prompt.'
+      });
+
+      actions.push({
+        key: 'planner_auto_apply',
+        label: 'Planner apply',
+        buttonLabel: '',
+        toggleLabel: autoNormalizeAndApplyToPlanner ? 'Disarm' : 'Arm',
+        toggleColor: autoNormalizeAndApplyToPlanner ? 'orange' : 'green',
+        onToggle: () => {
+          const next = !autoNormalizeAndApplyToPlanner;
+          setPlannerAutoApplyDraft(next);
+          onPatchSelectedStepConfig('capabilities.planner.auto_apply_armed', next);
+        },
+        helperText: 'Apply valid design-stage planner output back to the selected planner feature.'
       });
     }
 
@@ -616,7 +1604,18 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     usesChangesetSchema,
     onOpenSchemaConfig,
     onToggleSharedChangesetSchema,
+    hasBackendPlanningFragment,
+    plannerAvailableForRepo,
+    showPlannerControls,
+    planningFragmentArmed,
+    onTogglePlanningFragment,
+    onOpenPlanner,
+    selectedPlannerFeatureId,
+    activePlannerFeatureTitle,
     usesInference,
+    designMode,
+    fineFeatureFormatArmed,
+    autoNormalizeAndApplyToPlanner,
     inferenceConnectionStatus,
     inferenceTransport,
     onOpenInferenceConfig,
@@ -627,6 +1626,10 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   ]);
 
   function valueForField(field: WorkflowStageField): unknown {
+    if (field.bind_to === 'prompt.user_input') {
+      return stageUserInput;
+    }
+
     if (field.bind_to === 'execution.compile_checks.commands_text') {
       return stageCompileCommandsText;
     }
@@ -642,15 +1645,13 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     return current ?? field.default;
   }
 
-  const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
-
   useEffect(() => {
     setFieldDrafts(
       Object.fromEntries(
         fields.map((field) => [field.key, valueForField(field)])
       )
     );
-  }, [fields, selectedWorkflowStep?.id, stageCompileCommandsText]);
+  }, [fields, selectedWorkflowStep?.id, stageCompileCommandsText, stageUserInput]);
 
   function updateField(field: WorkflowStageField, value: unknown) {
     setFieldDrafts((prev) => ({
@@ -658,6 +1659,24 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       [field.key]: value
     }));
     onPatchSelectedStepConfig(field.bind_to, value);
+  }
+
+  function valueAtPath(root: unknown, path: string): unknown {
+    return path.split('.').filter(Boolean).reduce<unknown>((cursor, part) => {
+      if (cursor && typeof cursor === 'object' && part in cursor) {
+        return (cursor as Record<string, unknown>)[part];
+      }
+      return undefined;
+    }, root);
+  }
+
+  function fieldVisible(field: WorkflowStageField) {
+    return (field.visible_when ?? []).every((condition) => {
+      const value = condition.path in fieldDrafts
+        ? fieldDrafts[condition.path]
+        : valueAtPath(selectedWorkflowStep, condition.path);
+      return value === condition.equals;
+    });
   }
 
   function renderField(field: WorkflowStageField) {
@@ -683,6 +1702,21 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           value={String(typeof value === 'number' ? value : Number(value ?? field.default ?? 0) || 0)}
           onChange={(event) => updateField(field, Number(event.currentTarget.value || '0'))}
           disabled={disabled}
+        />
+      );
+    }
+
+    if (field.ui?.control === 'select') {
+      return (
+        <Select
+          key={field.key}
+          label={field.label}
+          description={field.description}
+          data={(field.options ?? []).map((option) => ({ value: option.value, label: option.label }))}
+          value={typeof value === 'string' ? value : String(field.default ?? '')}
+          onChange={(nextValue) => updateField(field, nextValue ?? field.default ?? '')}
+          disabled={disabled}
+          clearable={!field.required}
         />
       );
     }
@@ -717,13 +1751,23 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   return (
     <Stack>
       <Title order={6}>{descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs</Title>
-      {!descriptor ? <Text c="dimmed" size="sm">No backend descriptor found for this stage type.</Text> : null}
+      {!descriptor ? (
+        <Textarea
+          label="User input"
+          value={stageUserInput}
+          onChange={(event) => onPatchSelectedStepConfig('prompt.user_input', event.currentTarget.value)}
+          disabled={disabled}
+          minRows={2}
+          autosize
+        />
+      ) : null}
       {descriptor?.editable_fields.map((group) => (
         <Stack key={group.key} gap="xs">
           {descriptor?.editable_fields.length > 1 ? <Text fw={600} size="sm">{group.label}</Text> : null}
-          {group.fields.map((field) => renderField(field))}
+          {group.fields.filter((field) => fieldVisible(field)).map((field) => renderField(field))}
         </Stack>
       ))}
+
       {selectedWorkflowStep?.step_type === 'review' ? (
         <Group>
           <Button variant="light" onClick={onOpenChanges} disabled={disabled}>
@@ -1086,10 +2130,22 @@ const workflowLiveBarKeyframes = `
 }
 `;
 
-export function WorkflowShell() {
+export function WorkflowShell(props: {
+  route?: {
+    path: string;
+    workflowRunId: string | null;
+    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
+    supervisorRunId: string | null;
+    supervisorView?: 'planner' | 'sprint' | null;
+  };
+  navigate?: (path: string) => void;
+}) {
   const [view, setView] = useState<ShellView>('monitor');
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
+  const [monitorHomeView, setMonitorHomeView] = useState<MonitorHomeView>('workflows');
+  const [supervisorCreateRequestToken, setSupervisorCreateRequestToken] = useState(0);
+  const [supervisorRefreshRequestToken, setSupervisorRefreshRequestToken] = useState(0);
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1104,10 +2160,12 @@ export function WorkflowShell() {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [workflowBuilderCatalog, setWorkflowBuilderCatalog] = useState<WorkflowBuilderCatalog | null>(null);
+  const [runtimeEvents, setRuntimeEvents] = useState<RuntimeEventStore>(emptyRuntimeEventStore);
+  const [runtimeProjectionsByRunId, setRuntimeProjectionsByRunId] = useState<Record<string, EventChainSummaryResponse>>({});
 
   const selectedRunIdRef = useRef<string | null>(null);
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
-  const runEventStreamsRef = useRef<Record<string, EventSource>>({});
+  const hydratedWorkflowEventRunsRef = useRef<Set<string>>(new Set());
   const runRefreshTimersRef = useRef<Record<string, number>>({});
 
 
@@ -1137,6 +2195,12 @@ export function WorkflowShell() {
           }
         }
       });
+    } else if (bindTo === 'capabilities.planner.schema_armed' || bindTo === 'capabilities.planner.auto_apply_armed') {
+      const plannerKey = bindTo === 'capabilities.planner.schema_armed' ? 'schema_armed' : 'auto_apply_armed';
+      void patchPlannerCapabilityState({
+        [plannerKey]: Boolean(value)
+      });
+      return;
     } else if (bindTo === 'execution_logic.automation.inject_context') {
       setStageIncludeRepoContext(Boolean(value));
     } else if (bindTo === 'execution_logic.automation.inject_changeset_schema') {
@@ -1210,14 +2274,13 @@ export function WorkflowShell() {
 
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [pendingStageSelectionId, setPendingStageSelectionId] = useState<string | null>(null);
+  const [pendingDispositionAutoRun, setPendingDispositionAutoRun] = useState<{ runId: string; stepId: string; runAutomatically: boolean } | null>(null);
+  const [pauseRequestBusy, setPauseRequestBusy] = useState(false);
   const [manualCapabilityStatus, setManualCapabilityStatus] = useState<string | null>(null);
   const [manualCapabilityBusy, setManualCapabilityBusy] = useState(false);
   const [manualCapabilityResponse, setManualCapabilityResponse] = useState('');
 
   const [inferenceTransport, setInferenceTransport] = useState<InferenceTransport>('api');
-  const [browserTargetUrl, setBrowserTargetUrl] = useState('https://website.com/');
-  const [browserCdpUrl, setBrowserCdpUrl] = useState('');
-  const [browserSessionId, setBrowserSessionId] = useState('');
   const [browserProbe, setBrowserProbe] = useState<BrowserProbeResult | null>(null);
   const [inferenceBusy, setInferenceBusy] = useState(false);
   const [inferenceStatus, setInferenceStatus] = useState<string | null>(null);
@@ -1234,6 +2297,7 @@ export function WorkflowShell() {
   const [stageRepoContextSkipGitignore, setStageRepoContextSkipGitignore] = useState(true);
   const [stageRepoContextIncludeStagedDiff, setStageRepoContextIncludeStagedDiff] = useState(false);
   const [stageRepoContextIncludeUnstagedDiff, setStageRepoContextIncludeUnstagedDiff] = useState(false);
+  const [stageRepoContextInlinePrompt, setStageRepoContextInlinePrompt] = useState(false);
   const [stageIncludeChangesetSchema, setStageIncludeChangesetSchema] = useState(true);
   const [stageChangesetSchemaText, setStageChangesetSchemaText] = useState('');
   const [stageApplyError, setStageApplyError] = useState('');
@@ -1250,6 +2314,8 @@ export function WorkflowShell() {
   const [globalInferenceConfigOpen, setGlobalInferenceConfigOpen] = useState(false);
   const [changesetSchemaBusy, setChangesetSchemaBusy] = useState(false);
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
+  const [plannerFragmentConfigOpen, setPlannerFragmentConfigOpen] = useState(false);
+  const [plannerSelectedFeatureIdDraft, setPlannerSelectedFeatureIdDraft] = useState<string | null>(null);
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
@@ -1300,7 +2366,22 @@ export function WorkflowShell() {
   }, []);
 
   const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) ?? null, [runs, selectedRunId]);
-  const isInteractiveMode = selectedRun?.status === 'paused' || selectedRun?.status === 'waiting' || selectedRun?.status === 'draft';
+
+  useEffect(() => {
+    if (monitorView !== 'workflow_detail') return;
+    if (!selectedRun) return;
+    const runTitle = selectedRun.title?.trim() || 'Untitled';
+    const tabTitle = workflowTabTitle(activeWorkspaceTab);
+    document.title = tabTitle === 'workflow'
+      ? `Workflow · ${runTitle}`
+      : `Workflow · ${tabTitle} · ${runTitle}`;
+  }, [monitorView, selectedRun, activeWorkspaceTab]);
+  const isInteractiveMode = selectedRun?.status === 'paused'
+    || selectedRun?.status === 'waiting'
+    || selectedRun?.status === 'draft'
+    || selectedRun?.status === 'success'
+    || selectedRun?.status === 'error'
+    || selectedRun?.status === 'cancelled';
   const isManualMode = isInteractiveMode;
   const isBackendRunLocked = Boolean(
     busy
@@ -1310,8 +2391,14 @@ export function WorkflowShell() {
   );
   const canRequestRunPause = Boolean(
     selectedRunId
-    && !manualCapabilityBusy
-    && (selectedRun?.status === 'queued' || selectedRun?.status === 'running')
+    && !pauseRequestBusy
+    && (
+      selectedRun?.status === 'queued'
+      || selectedRun?.status === 'running'
+      || selectedRun?.status === 'waiting'
+      || busy
+      || manualCapabilityBusy
+    )
   );
   const selectedRunTemplate = selectedRun?.template_id ? templates.find((template) => template.id === selectedRun.template_id) ?? null : null;
 
@@ -1319,11 +2406,64 @@ export function WorkflowShell() {
     return selectedRun?.definition ?? null;
   }, [selectedRun?.definition]);
 
+  function normalizeCheckpointDisposition(disposition: string) {
+    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous') return 'continue_auto';
+    if (disposition === 'select_stage' || disposition === 'select' || disposition === 'continue_manual' || disposition === 'manual') return 'select_stage';
+    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous' || disposition === 'move_next' || disposition === 'continue') return 'continue_auto';
+    if (disposition === 'pause_error' || disposition === 'pause' || disposition === 'paused') return 'pause_error';
+    return disposition;
+  }
+
+  function checkpointDispositionLabel(disposition: string) {
+    switch (normalizeCheckpointDisposition(disposition)) {
+      case 'continue_auto':
+        return 'Continue';
+      case 'select_stage':
+        return 'Select';
+      case 'pause_error':
+        return 'Pause';
+      default:
+        return disposition.replace(/_/g, ' ');
+    }
+  }
+
+  function checkpointDispositionColor(disposition: string) {
+    switch (normalizeCheckpointDisposition(disposition)) {
+      case 'continue_auto':
+        return 'green';
+      case 'select_stage':
+        return 'blue';
+      case 'pause_error':
+        return 'yellow';
+      default:
+        return undefined;
+    }
+  }
+
+  const pendingDispositionReview = useMemo(() => {
+    const workflowEngine = ((selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine ?? undefined) as Record<string, unknown> | undefined;
+    const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
+    const blockedOn = (runState.blocked_on ?? null) as Record<string, unknown> | null;
+    if (!blockedOn || (blockedOn.kind !== 'operator_checkpoint' && blockedOn.kind !== 'disposition_review')) return null;
+
+    return {
+      stageId: typeof blockedOn.stage_id === 'string' ? blockedOn.stage_id : selectedRun?.current_step_id ?? '',
+      stageType: typeof blockedOn.stage_type === 'string' ? blockedOn.stage_type : '',
+      recommendedDisposition: typeof blockedOn.recommended_disposition === 'string' ? blockedOn.recommended_disposition : '',
+      nextStepId: typeof blockedOn.next_step_id === 'string' ? blockedOn.next_step_id : '',
+      message: typeof blockedOn.message === 'string' ? blockedOn.message : '',
+      availableDispositions: ['continue_auto', 'pause_error', 'select_stage']
+    };
+  }, [selectedRun?.context, selectedRun?.current_step_id]);
+
+  const hasPendingDispositionReview = Boolean(pendingDispositionReview);
+
   const selectedRunStepId = selectedStepId ?? selectedRun?.current_step_id ?? selectedRunDefinition?.steps[0]?.id ?? null;
 
   const selectedWorkflowStep = useMemo(() => {
     return selectedRunDefinition?.steps.find((step) => step.id === selectedRunStepId) ?? null;
   }, [selectedRunDefinition, selectedRunStepId]);
+
 
   const [sapImportPackageName, setSapImportPackageName] = useState('');
   const [sapImportIncludeSubpackages, setSapImportIncludeSubpackages] = useState(true);
@@ -1484,10 +2624,11 @@ export function WorkflowShell() {
     [workflowBuilderCatalog]
   );
 
-  const selectedStageDescriptor = useMemo(
-    () => selectedWorkflowStep ? workflowStageDescriptors[selectedWorkflowStep.step_type] ?? null : null,
-    [selectedWorkflowStep, workflowStageDescriptors]
-  );
+  const selectedStageDescriptor = useMemo(() => {
+    if (!selectedWorkflowStep) return null;
+    const stepType = selectedWorkflowStep.step_type;
+    return workflowStageDescriptors[stepType] ?? workflowStageDescriptors[stepType.trim().toLowerCase()] ?? null;
+  }, [selectedWorkflowStep, workflowStageDescriptors]);
 
   const inferenceRequiredForSelectedStep = useMemo(
     () => stepUsesCapability(selectedWorkflowStep, 'inference'),
@@ -1502,8 +2643,40 @@ export function WorkflowShell() {
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
     const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
     const inference = (capabilities.inference ?? null) as Record<string, unknown> | null;
+    const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
+    const lastPreparedStage = (runState.last_prepared_stage ?? null) as Record<string, unknown> | null;
+    const preparedStepId = typeof lastPreparedStage?.step_id === 'string' ? lastPreparedStage.step_id : null;
+    const preparedInference = (lastPreparedStage?.inference ?? null) as Record<string, unknown> | null;
+
+    if (preparedStepId && preparedStepId === selectedRunStepId && preparedInference) {
+      return {
+        ...preparedInference,
+        ...(inference ?? {}),
+        last_prepared_stage: lastPreparedStage
+      };
+    }
+
     return inference;
+  }, [selectedRun?.context, selectedRunStepId]);
+  const sharedPlannerFragmentState = useMemo(() => {
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    return (capabilities.planner ?? null) as Record<string, unknown> | null;
   }, [selectedRun?.context]);
+  const supervisorContext = useMemo(() => {
+    return ((selectedRun?.context as Record<string, unknown> | undefined)?.supervisor ?? null) as Record<string, unknown> | null;
+  }, [selectedRun?.context]);
+
+  const selectedPlannerFeatureId = plannerSelectedFeatureIdDraft
+    ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null);
+
+  const selectedPlannerFeature = useMemo(() => {
+    const feature = sharedPlannerFragmentState?.selected_feature;
+    return feature && typeof feature === 'object' && !Array.isArray(feature)
+      ? feature as Record<string, unknown>
+      : null;
+  }, [sharedPlannerFragmentState]);
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const stageOverrides = (workflowEngine?.stage_overrides ?? {}) as Record<string, unknown>;
@@ -1522,7 +2695,31 @@ export function WorkflowShell() {
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
 
-  const persistedReviewSourceControlState = useMemo<ReviewSourceControlState>(() => {
+  useEffect(() => {
+    if (!pendingDispositionAutoRun) return;
+    if (!selectedRun || selectedRun.id !== pendingDispositionAutoRun.runId) return;
+    if (selectedRun.current_step_id !== pendingDispositionAutoRun.stepId) return;
+    if (selectedRunStepId !== pendingDispositionAutoRun.stepId) return;
+    if (!selectedWorkflowStep || selectedWorkflowStep.id !== pendingDispositionAutoRun.stepId) return;
+    if (hasPendingDispositionReview || isBackendRunLocked) return;
+
+    const pending = pendingDispositionAutoRun;
+    setPendingDispositionAutoRun(null);
+    window.setTimeout(() => {
+      const action = pending.runAutomatically
+        ? startWorkflowRun(pending.runId)
+        : runCurrentWorkflowStep(pending.runId, pending.stepId);
+      void action
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => {
+          void refreshRunDetails(pending.runId);
+        });
+    }, 0);
+  }, [pendingDispositionAutoRun, selectedRun?.id, selectedRun?.current_step_id, selectedRunStepId, selectedWorkflowStep?.id, hasPendingDispositionReview, isBackendRunLocked]);
+
+  const persistedDiffPanelState = useMemo<DiffPanelState>(() => {
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
     return {
@@ -1531,24 +2728,24 @@ export function WorkflowShell() {
         ? sourceControl.selected_path
         : null,
       diff_style: sourceControl.diff_style === 'split' ? 'split' : 'unified',
-      only_changes: sourceControl.only_changes !== false,
-      context_lines: typeof sourceControl.context_lines === 'number' ? sourceControl.context_lines : 10,
+      only_changes: Boolean(sourceControl.whole_file) ? false : sourceControl.only_changes !== false,
+      context_lines: typeof sourceControl.context_lines === 'number' ? sourceControl.context_lines : 4,
       whole_file: Boolean(sourceControl.whole_file)
     };
   }, [selectedStageState]);
-  const [localReviewSourceControlState, setLocalReviewSourceControlState] = useState<ReviewSourceControlState>({
+  const [localReviewSourceControlState, setLocalReviewSourceControlState] = useState<DiffPanelState>({
     selected_scope: 'unstaged',
     selected_path: null,
     diff_style: 'unified',
     only_changes: true,
-    context_lines: 10,
+    context_lines: 4,
     whole_file: false
   });
   useEffect(() => {
     if (selectedWorkflowStep?.step_type === 'review') {
-      setLocalReviewSourceControlState(persistedReviewSourceControlState);
+      setLocalReviewSourceControlState(persistedDiffPanelState);
     }
-  }, [persistedReviewSourceControlState, selectedWorkflowStep?.step_type]);
+  }, [persistedDiffPanelState, selectedWorkflowStep?.step_type]);
   const reviewSourceControlState = localReviewSourceControlState;
 
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
@@ -1625,15 +2822,87 @@ export function WorkflowShell() {
   }, [selectedRunId]);
 
   useEffect(() => {
+    const runId = selectedRunIdRef.current;
+    if (!runId) return;
+
+    const events = runtimeEvents.workflowEventsByRunId[runId] ?? [];
+    const latest = events[events.length - 1];
+    if (!latest) return;
+
+    const shouldHydrateSelectedRun = latest.kind === 'workflow_waiting_for_operator_checkpoint'
+      || latest.kind === 'stage_execution_waiting_for_operator_checkpoint'
+      || latest.kind === 'stage_execution_waiting_for_disposition_review'
+      || latest.kind === 'operator_checkpoint_resolved'
+      || latest.kind === 'stage_execution_completed'
+      || latest.kind === 'supervisor.workflow_terminal'
+      || latest.kind === 'run_started'
+      || latest.kind === 'run_status_changed';
+
+    if (!shouldHydrateSelectedRun) return;
+
+    let cancelled = false;
+    void getRun(runId)
+      .then((run) => {
+        if (cancelled) return;
+        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRunId, runtimeEvents.workflowEventsByRunId]);
+
+  useEffect(() => {
+    const routedRunId = props.route?.workflowRunId ?? null;
+    const routedSupervisorRunId = props.route?.supervisorRunId ?? null;
+    const routedPath = props.route?.path ?? window.location.pathname;
+
+    if (routedRunId) {
+      const routedWorkflowTab = workspaceTabFromRouteView(props.route?.workflowView ?? null);
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_detail' ? value : 'workflow_detail');
+      setActiveWorkspaceTab((value) => value === routedWorkflowTab ? value : routedWorkflowTab);
+      if (routedRunId !== selectedRunIdRef.current) {
+        setSelectedRunId(routedRunId);
+        void refreshRunDetailsOnOpen(routedRunId);
+      }
+      return;
+    }
+
+    if (routedSupervisorRunId || routedPath === '/supervisors') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'supervisors' ? value : 'supervisors');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+      return;
+    }
+
+    if (routedPath === '/workflows' || routedPath === '/') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'workflows' ? value : 'workflows');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+    }
+  }, [props.route?.path, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    if (monitorView !== 'workflow_detail') return;
+    if (props.route?.supervisorRunId) return;
+    const nextPath = workflowTabRoute(selectedRunId, activeWorkspaceTab);
+    if ((props.route?.path ?? window.location.pathname) === nextPath) return;
+    props.navigate?.(nextPath);
+  }, [selectedRunId, monitorView, activeWorkspaceTab, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId, props.navigate]);
+
+
+
+  useEffect(() => {
     allWorkflowEventsRef.current = allWorkflowEvents;
   }, [allWorkflowEvents]);
 
   useEffect(() => {
     return () => {
-      for (const source of Object.values(runEventStreamsRef.current)) {
-        source.close();
-      }
-      runEventStreamsRef.current = {};
       for (const timer of Object.values(runRefreshTimersRef.current)) {
         window.clearTimeout(timer);
       }
@@ -1642,7 +2911,69 @@ export function WorkflowShell() {
   }, []);
 
   useEffect(() => {
-    void refreshRunsAndTemplates();
+    let cancelled = false;
+
+    async function loadInitialGraph() {
+      try {
+        const snapshot = await getRuntimeSnapshot({ scope: 'all' });
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
+        hydrateRunsFromRuntimeSnapshot(snapshot.nodes);
+      } catch {
+      }
+    }
+
+    void loadInitialGraph();
+
+    const unsubscribe = subscribeRuntimeEventBus({
+      onOpen: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: true }));
+      },
+      onClose: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
+      },
+      onError: () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
+        const runId = selectedRunIdRef.current;
+        if (runId) {
+          void hydrateWorkflowEventsFromHistory(runId);
+          void hydrateRuntimeProjection(runId);
+        }
+      },
+      onSnapshot: (snapshot) => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
+        hydrateRunsFromRuntimeSnapshot(snapshot.nodes ?? []);
+      },
+      onProjection: (projection) => {
+        if (cancelled) return;
+        setRuntimeProjectionsByRunId((prev) => ({
+          ...prev,
+          [projection.run_id]: projection
+        }));
+      },
+      onEvent: (incoming) => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => reduceRuntimeEvent(prev, incoming));
+        applyIncomingWorkflowEvent(incoming.event.run_id, incoming.event);
+
+        if (incoming.event.run_id === selectedRunIdRef.current) {
+          void hydrateRuntimeProjection(incoming.event.run_id);
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    void refreshRunsAndTemplates(props.route?.workflowRunId ?? undefined);
   }, []);
 
   useEffect(() => {
@@ -1651,43 +2982,70 @@ export function WorkflowShell() {
       setLiveExecutionTrails([]);
       return;
     }
-    void refreshRunDetails(selectedRunId);
-  }, [selectedRunId]);
+
+    const storedEvents = runtimeEvents.workflowEventsByRunId[selectedRunId] ?? [];
+    const workflowEvents = storedEvents as WorkflowEvent[];
+    const projection = runtimeProjectionsByRunId[selectedRunId] ?? null;
+    setEvents(workflowEvents);
+    setAllWorkflowEvents((prev) => prev[selectedRunId] === workflowEvents ? prev : {
+      ...prev,
+      [selectedRunId]: workflowEvents
+    });
+    setLiveExecutionTrails(projection ? mapLiveExecutionTrailsFromProjection(projection) : []);
+
+    if (!hydratedWorkflowEventRunsRef.current.has(selectedRunId)) {
+      hydratedWorkflowEventRunsRef.current.add(selectedRunId);
+      void hydrateWorkflowEventsFromHistory(selectedRunId);
+      void hydrateRuntimeProjection(selectedRunId);
+    } else if (!projection) {
+      void hydrateRuntimeProjection(selectedRunId);
+    }
+  }, [selectedRunId, runtimeEvents.workflowEventsByRunId, runtimeProjectionsByRunId]);
 
   useEffect(() => {
-    if (!selectedRunId) {
-      setEventStreamConnected(false);
-      setEventStreamStatusText('Disconnected');
-      return;
+    setEventStreamConnected(runtimeEvents.connected);
+    setEventStreamStatusText(runtimeEvents.connected ? 'Runtime stream connected' : 'Runtime stream disconnected');
+  }, [runtimeEvents.connected]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    if (monitorView !== 'workflow_detail') return;
+
+    const selectedStatus = selectedRun?.status ?? '';
+    const shouldPollBackend = selectedStatus === 'queued'
+      || selectedStatus === 'running'
+      || selectedStatus === 'waiting'
+      || busy
+      || manualCapabilityBusy
+      || pauseRequestBusy;
+
+    if (!shouldPollBackend) return;
+
+    let cancelled = false;
+    const runId = selectedRunId;
+
+    async function refreshSelectedRunFromBackend() {
+      if (cancelled) return;
+      try {
+        await Promise.all([
+          refreshRunDetails(runId),
+          hydrateRuntimeProjection(runId)
+        ]);
+      } catch {
+      }
     }
 
-    connectRunEventStream(selectedRunId);
+    void refreshSelectedRunFromBackend();
+    const timer = window.setInterval(() => {
+      void refreshSelectedRunFromBackend();
+    }, 3500);
 
     return () => {
-      if (selectedRunIdRef.current !== selectedRunId) {
-        setEventStreamConnected(false);
-        setEventStreamStatusText('Disconnected');
-      }
+      cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [selectedRunId]);
+  }, [selectedRunId, selectedRun?.status, monitorView, busy, manualCapabilityBusy, pauseRequestBusy]);
 
-  useEffect(() => {
-    const desired = new Set<string>();
-
-    if (monitorView === 'workflow_detail' && selectedRunId) {
-      desired.add(selectedRunId);
-    }
-
-    for (const runId of Object.keys(runEventStreamsRef.current)) {
-      if (!desired.has(runId)) {
-        disconnectRunEventStream(runId);
-      }
-    }
-
-    for (const runId of desired) {
-      connectRunEventStream(runId);
-    }
-  }, [monitorView, selectedRunId]);
 
   useEffect(() => {
     setSelectedStepId(selectedRun?.current_step_id ?? null);
@@ -1699,19 +3057,14 @@ export function WorkflowShell() {
     const inference = (sharedInferenceState ?? null) as Record<string, unknown> | null;
     if (!inference) {
       setInferenceTransport('api');
-      setBrowserTargetUrl('https://website.com/');
-      setBrowserCdpUrl('');
-      setBrowserSessionId('');
       setBrowserProbe(null);
       return;
     }
 
-    setInferenceTransport((inference.transport as InferenceTransport) ?? 'api');
-
-    const browser = (inference.browser ?? {}) as Record<string, unknown>;
-    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : 'https://website.com/');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
-    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
+    const sessions = ((inference.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const defaultSessionName = typeof inference.default_session === 'string' ? inference.default_session : '';
+    const defaultSession = defaultSessionName ? ((sessions[defaultSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(defaultSession.transport === 'browser' ? 'browser' : 'api');
     setBrowserProbe(null);
   }, [sharedInferenceState, selectedRun?.id]);
 
@@ -1817,17 +3170,10 @@ export function WorkflowShell() {
         ? Boolean(selectedAutomation.auto_apply_changeset)
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
-    setInferenceTransport(inferenceConfig.transport === 'browser' ? 'browser' : 'api');
-    setBrowserTargetUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.target_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).target_url)
-        : 'https://website.com'
-    );
-    setBrowserCdpUrl(
-      typeof ((inferenceConfig.browser as Record<string, unknown> | undefined)?.cdp_url) === 'string'
-        ? String((inferenceConfig.browser as Record<string, unknown>).cdp_url)
-        : ''
-    );
+    const inferenceSessions = ((inferenceConfig.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const inferenceSessionName = typeof inferenceConfig.default_session === 'string' ? inferenceConfig.default_session : '';
+    const inferenceSession = inferenceSessionName ? ((inferenceSessions[inferenceSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(inferenceSession.transport === 'browser' ? 'browser' : 'api');
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
     setSelectedRepoPaths(includeFiles);
@@ -1846,6 +3192,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
+    setStageRepoContextInlinePrompt(Boolean(repoContext.inline_repo_context_in_prompt));
   }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
 
   function buildInteractiveGlobalStatePayload() {
@@ -1879,6 +3226,7 @@ export function WorkflowShell() {
     const currentCompileCommands = (currentCapabilities.compile_commands as Record<string, unknown> | undefined) ?? {};
     const currentChangesetSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
     const currentGatewayChangeset = (currentCapabilities['gateway_model/changeset'] as Record<string, unknown> | undefined) ?? {};
+    const currentPlanner = (currentCapabilities.planner as Record<string, unknown> | undefined) ?? {};
 
     return {
       ...currentGlobalState,
@@ -1903,11 +3251,18 @@ export function WorkflowShell() {
             ...promptFragmentEnabled
           },
           browser: {
-            ...currentInferenceBrowser,
-            ...(browserCdpUrl.trim() ? { cdp_url: browserCdpUrl.trim() } : {}),
-            target_url: browserTargetUrl,
-            session_id: browserSessionId.trim() || null
+            ...currentInferenceBrowser
           }
+        },
+        planner: {
+          fragment_armed: Boolean(currentPlanner.fragment_armed),
+          schema_armed: Boolean(currentPlanner.schema_armed),
+          auto_apply_armed: Boolean(currentPlanner.auto_apply_armed),
+          selected_feature_id: currentPlanner.selected_feature_id ?? null,
+          planner_id: currentPlanner.planner_id ?? null,
+          supervisor_run_id: null,
+          schema_id: 'supervisor_feature_plan_item_v1',
+          preserve_rough_definition: true
         },
         context_export: {
           ...currentContextExport,
@@ -1919,7 +3274,8 @@ export function WorkflowShell() {
           skip_binary: stageRepoContextSkipBinary,
           skip_gitignore: stageRepoContextSkipGitignore,
           include_staged_diff: stageRepoContextIncludeStagedDiff,
-          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff
+          include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+          inline_repo_context_in_prompt: stageRepoContextInlinePrompt
         },
         changeset_schema: {
           ...currentChangesetSchema,
@@ -1929,6 +3285,7 @@ export function WorkflowShell() {
         'gateway_model/changeset': {
           ...currentGatewayChangeset
         },
+
         compile_commands: {
           ...currentCompileCommands,
           commands: compileCommands
@@ -1965,27 +3322,6 @@ export function WorkflowShell() {
 
 
 
-  useEffect(() => {
-    const desired = new Set(
-      runs
-        .filter((run) => run.status === 'queued' || run.status === 'running' || run.status === 'waiting')
-        .map((run) => run.id)
-    );
-
-    if (selectedRunId) {
-      desired.add(selectedRunId);
-    }
-
-    for (const runId of Object.keys(runEventStreamsRef.current)) {
-      if (!desired.has(runId)) {
-        disconnectRunEventStream(runId);
-      }
-    }
-
-    for (const runId of desired) {
-      connectRunEventStream(runId);
-    }
-  }, [runs, selectedRunId]);
 
   useEffect(() => {
     const validTrailKeys = new Set(liveExecutionTrails.map((trail) => trail.key));
@@ -2036,14 +3372,6 @@ export function WorkflowShell() {
   }, [liveExecutionTrails, manuallyCollapsedLiveExecutionIds]);
 
   useEffect(() => {
-    for (const trail of liveExecutionTrails) {
-      if (isLiveExecutionExpanded(trail)) {
-        void ensureLiveExecutionChainLoaded(trail, trail.isActive || trail.isCurrent);
-      }
-    }
-  }, [liveExecutionTrails, selectedRunId, stickyCompletedLiveExecutionId]);
-
-  useEffect(() => {
     setLiveExecutionChains({});
     setExpandedLiveEventIds(new Set());
     setManuallyExpandedLiveExecutionIds(new Set());
@@ -2064,50 +3392,23 @@ export function WorkflowShell() {
 
 
   async function refreshRunsAndTemplates(nextSelectedRunId?: string | null) {
+    const explicitSelection = arguments.length > 0;
     const [runsRes, templatesRes] = await Promise.all([listRuns(), listTemplates()]);
     setRuns(runsRes);
     setTemplates(templatesRes);
-    const resolvedRunId = nextSelectedRunId ?? selectedRunId ?? runsRes[0]?.id ?? null;
-    setSelectedRunId(resolvedRunId);
-    if (!selectedTemplateId && templatesRes[0]) setSelectedTemplateId(templatesRes[0].id);
-  }
 
-  function mapLiveExecutionTrails(summary: EventChainSummaryResponse): LiveStageTrail[] {
-    return summary.stages
-      .map((stage: EventChainSummaryItem) => ({
-        key: stage.key,
-        stepId: stage.step_id,
-        label: stage.label,
-        stageExecutionId: stage.stage_execution_id,
-        latestCreatedAt: stage.latest_created_at,
-        durationMs: stage.duration_ms,
-        isActive: stage.is_active,
-        isCurrent: stage.is_current,
-        capabilities: stage.capabilities
-          .map((capability) => ({
-            key: capability.key,
-            capabilityId: capability.capability_id,
-            name: capability.name,
-            statusColor: capability.status_color,
-            statusLabel: capability.status_label,
-            message: capability.message,
-            startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
-            startedAtRaw: capability.started_at ?? null,
-            durationText: formatDurationMs(capability.duration_ms, capability.started_at, capability.is_active ? null : capability.latest_created_at),
-            durationMs: capability.duration_ms,
-            latestCreatedAt: capability.latest_created_at,
-            isActive: capability.is_active,
-            isNew: false,
-            eventCount: capability.event_count,
-            latestLevel: capability.status_color === 'red' ? 'error' : capability.status_color === 'yellow' ? 'warn' : 'info',
-            latestKind: '',
-            latestPayload: null,
-            inputPayload: null,
-            outputPayload: null
-          }))
-          .sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt))
-      }))
-      .sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt));
+    const routedRunId = props.route?.workflowRunId ?? null;
+    const currentSelectedRunId = selectedRunIdRef.current;
+    const resolvedRunId = explicitSelection
+      ? nextSelectedRunId ?? null
+      : routedRunId
+        ?? currentSelectedRunId
+        ?? (monitorView === 'workflow_detail' ? null : runsRes[0]?.id ?? null);
+
+    if (resolvedRunId !== selectedRunIdRef.current) {
+      setSelectedRunId(resolvedRunId);
+    }
+    if (!selectedTemplateId && templatesRes[0]) setSelectedTemplateId(templatesRes[0].id);
   }
 
   function isLiveExecutionExpanded(trail: LiveStageTrail): boolean {
@@ -2274,13 +3575,41 @@ export function WorkflowShell() {
       status: capability.statusLabel,
       latest_kind: capability.latestKind,
       latest_level: capability.latestLevel,
-      input: capability.inputPayload ?? null,
+      start_event_payload: capability.inputPayload ?? null,
+      end_event_payload: capability.outputPayload ?? null,
+      latest_payload: capability.latestPayload ?? null,
+      input_payload: capability.inputPayload ?? null,
+      output_payload: capability.outputPayload ?? null,
       output: capability.outputPayload ?? capability.latestPayload ?? null
     };
   }
 
+  function payloadIndicatesUserWait(payload: unknown): boolean {
+    const record = asRecord(payload) ?? {};
+    const result = asRecord(record.result) ?? {};
+    const nestedResult = asRecord(result.result) ?? {};
+
+    return record.waiting_for_user === true
+      || record.needs_user_response === true
+      || result.waiting_for_user === true
+      || result.needs_user_response === true
+      || nestedResult.waiting_for_user === true
+      || nestedResult.needs_user_response === true;
+  }
+
+  function eventIndicatesOperatorCheckpointWait(event: StageExecutionEvent | null): boolean {
+    if (!event) return false;
+    const payload = asRecord(event.payload) ?? {};
+    const capability = typeof payload.capability === 'string' ? payload.capability : '';
+    return event.kind === 'operator_checkpoint_waiting'
+      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
+      || event.kind === 'workflow_waiting_for_operator_checkpoint'
+      || (capability === 'operator_checkpoint' && payloadIndicatesUserWait(event.payload));
+  }
+
   function deriveCapabilityStatusLabel(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
+    if (eventIndicatesOperatorCheckpointWait(event)) return 'USER INPUT';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'FAILED';
     if (event.kind.endsWith('_completed')) return 'COMPLETE';
     if (event.kind.endsWith('_started')) return 'RUNNING';
@@ -2289,6 +3618,7 @@ export function WorkflowShell() {
 
   function deriveCapabilityStatusColor(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
+    if (eventIndicatesOperatorCheckpointWait(event)) return 'yellow';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'red';
     if (event.level === 'warn') return 'yellow';
     if (event.kind.endsWith('_started')) return 'blue';
@@ -2303,6 +3633,64 @@ export function WorkflowShell() {
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
     return objectPayload.output ?? objectPayload.result ?? objectPayload.response ?? objectPayload.error ?? objectPayload.payload ?? objectPayload;
+  }
+
+  function capabilityDisplayMessageFromPayload(payload: unknown, fallback?: string | null): string {
+    const record = asRecord(payload);
+    if (!record) return fallback ?? '';
+
+    const result = asRecord(record.result);
+    const nestedPayload = asRecord(record.payload);
+    const nestedOutput = asRecord(record.output);
+    const nestedResponse = asRecord(record.response);
+    const nestedError = asRecord(record.error);
+
+    const candidates = [
+      record.error_message,
+      record.error,
+      nestedError?.message,
+      nestedError?.summary,
+      result?.error_message,
+      result?.error,
+      result?.message,
+      result?.summary,
+      result?.status,
+      nestedOutput?.error_message,
+      nestedOutput?.error,
+      nestedOutput?.message,
+      nestedOutput?.summary,
+      nestedOutput?.status,
+      nestedResponse?.error_message,
+      nestedResponse?.error,
+      nestedResponse?.message,
+      nestedResponse?.summary,
+      nestedResponse?.status,
+      nestedPayload?.error_message,
+      nestedPayload?.error,
+      nestedPayload?.message,
+      nestedPayload?.summary,
+      nestedPayload?.status,
+      record.message,
+      record.summary,
+      record.status
+    ];
+
+    for (const candidate of candidates) {
+      const value = stringFrom(candidate);
+      if (value) return value;
+    }
+
+    const lines = record.lines ?? result?.lines ?? nestedPayload?.lines ?? nestedOutput?.lines ?? nestedResponse?.lines;
+    if (Array.isArray(lines)) {
+      const value = lines
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .slice(0, 3)
+        .join('\n')
+        .trim();
+      if (value) return value;
+    }
+
+    return fallback ?? '';
   }
 
   function capabilityNameFromKind(kind: string): string {
@@ -2335,71 +3723,324 @@ export function WorkflowShell() {
     return formatDurationMs(end - start, startedAt, endedAt);
   }
 
+  function stripRuntimeContextFromCapabilityPayload(payload: unknown): unknown {
+    const record = asRecord(payload);
+    if (!record) return payload ?? null;
+    const runtimeKeys = new Set([
+      'run_context',
+      'final_context',
+      'prepared_context',
+      'workflow_engine',
+      'global_state',
+      'local_state',
+      'stage_state',
+      'capability_results',
+      'available_transitions',
+      'blocked_on',
+      'next_step_id',
+      'current_step_id'
+    ]);
+    const entries = Object.entries(record).filter(([key]) => !runtimeKeys.has(key));
+    if (entries.length === 0) return null;
+    return Object.fromEntries(entries);
+  }
+
+  function capabilitySpecificPayload(event: StageExecutionEvent | null | undefined): unknown {
+    if (!event) return null;
+    if (!event.capability_invocation_id && isStageResultEvent(event)) return null;
+    return stripRuntimeContextFromCapabilityPayload(event.payload);
+  }
+
+  function capabilityResultSpecificPayload(result: Record<string, unknown>): unknown {
+    return stripRuntimeContextFromCapabilityPayload(result.result ?? result);
+  }
+
+  function normalizeCapabilityOrderKey(value: string): string {
+    return value.trim().toLowerCase().replace(/[\s\/_-]+/g, '');
+  }
+
+  function capabilityDefinitionOrderForStep(stepId: string): Map<string, number> {
+    const step = selectedRunDefinition?.steps.find((item) => item.id === stepId);
+    const order = new Map<string, number>();
+    let index = 0;
+    for (const node of step?.execution_plan ?? []) {
+      if (node.kind !== 'capability' || node.enabled === false) continue;
+      const rawKey = stringFrom((node as unknown as Record<string, unknown>).key);
+      if (!rawKey) continue;
+      order.set(normalizeCapabilityOrderKey(rawKey), index);
+      order.set(normalizeCapabilityOrderKey(formatCapabilityLabel(rawKey)), index);
+      index += 1;
+    }
+    return order;
+  }
+
   function buildLiveCapabilitiesFromEvents(trail: LiveStageTrail, rawEvents: StageExecutionEvent[]): LiveCapabilityTrail[] {
-    const eventsAsc = rawEvents.slice().sort((a, b) => a.sequence_no - b.sequence_no);
+    const eventsAsc = rawEvents.slice().sort((a, b) => a.sequence_no - b.sequence_no || a.created_at.localeCompare(b.created_at));
     const grouped = new Map<string, StageExecutionEvent[]>();
 
     for (const event of eventsAsc) {
-      const capabilityId = event.capability_invocation_id;
+      const eventPayload = asRecord(event.payload) ?? {};
+      const capabilityKey = stringFrom(eventPayload.capability)
+        || stringFrom(eventPayload.capability_key)
+        || stringFrom(eventPayload.key)
+        || stringFrom(eventPayload.name);
+      const capabilityId = event.capability_invocation_id
+        ?? (capabilityKey ? `${trail.stageExecutionId}:capability:${capabilityKey}` : null);
       if (!capabilityId) continue;
       const bucket = grouped.get(capabilityId) ?? [];
       bucket.push(event);
       grouped.set(capabilityId, bucket);
     }
 
-    const mapped = trail.capabilities.map((capability) => {
-      const capabilityEvents = grouped.get(capability.capabilityId) ?? [];
+    const mapped: LiveCapabilityTrail[] = [];
+
+    const firstSequenceByCapabilityId = new Map<string, number>();
+    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
+      const firstEvent = capabilityEvents[0] ?? null;
+      if (firstEvent) {
+        firstSequenceByCapabilityId.set(capabilityId, firstEvent.sequence_no);
+      }
+    }
+
+    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
       const firstEvent = capabilityEvents[0] ?? null;
       const lastEvent = capabilityEvents[capabilityEvents.length - 1] ?? null;
       const startedEvent = capabilityEvents.find((event) => event.kind.endsWith('_started')) ?? firstEvent;
-      const completedEvent = capabilityEvents.find((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) ?? lastEvent;
-      return {
-        ...capability,
-        statusColor: deriveCapabilityStatusColor(lastEvent, capability.statusColor),
-        statusLabel: deriveCapabilityStatusLabel(lastEvent, capability.statusLabel),
-        message: lastEvent?.message ?? capability.message,
-        latestCreatedAt: lastEvent?.created_at ?? capability.latestCreatedAt,
-        isActive: capabilityEvents.length > 0 ? !capabilityEvents.some((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) : capability.isActive,
-        isNew: capabilityEvents.some((event) => recentEventIds.has(event.id)),
-        eventCount: capabilityEvents.length > 0 ? capabilityEvents.length : capability.eventCount,
-        latestLevel: lastEvent?.level ?? capability.latestLevel,
-        latestKind: lastEvent?.kind ?? capability.latestKind,
-        latestPayload: lastEvent?.payload ?? capability.latestPayload,
-        startedAtRaw: startedEvent?.created_at ?? capability.startedAtRaw,
-        inputPayload: startedEvent ? deriveCapabilityPayload('input', startedEvent.payload) : capability.inputPayload,
-        outputPayload: completedEvent ? deriveCapabilityPayload('output', completedEvent.payload) : capability.outputPayload
-      };
-    });
-
-    for (const [capabilityId, capabilityEvents] of grouped.entries()) {
-      if (mapped.some((capability) => capability.capabilityId === capabilityId)) continue;
-      const firstEvent = capabilityEvents[0] ?? null;
-      const lastEvent = capabilityEvents[capabilityEvents.length - 1] ?? null;
-      const capabilityName = formatCapabilityLabel(capabilityNameFromKind(lastEvent?.kind ?? firstEvent?.kind ?? capabilityId));
+      const completedEvent = capabilityEvents.slice().reverse().find((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')) ?? null;
+      const statusEvent = completedEvent ?? lastEvent;
+      const startedPayload = asRecord(startedEvent?.payload) ?? {};
+      const lastPayload = asRecord(lastEvent?.payload) ?? {};
+      const capabilityName = formatCapabilityLabel(
+        stringFrom(startedPayload.capability)
+        || stringFrom(startedPayload.capability_key)
+        || stringFrom(startedPayload.key)
+        || stringFrom(startedPayload.name)
+        || stringFrom(lastPayload.capability)
+        || stringFrom(lastPayload.capability_key)
+        || stringFrom(lastPayload.key)
+        || stringFrom(lastPayload.name)
+        || capabilityNameFromKind(startedEvent?.kind ?? lastEvent?.kind ?? capabilityId)
+      );
       mapped.push({
         key: capabilityId,
         capabilityId,
         name: capabilityName,
-        statusColor: deriveCapabilityStatusColor(lastEvent, 'gray'),
-        statusLabel: deriveCapabilityStatusLabel(lastEvent, 'INFO'),
-        message: lastEvent?.message ?? capabilityName,
-        startedAtText: firstEvent ? formatTimestamp(firstEvent.created_at) : '—',
-        startedAtRaw: firstEvent?.created_at ?? null,
-        durationText: formatDuration(firstEvent?.created_at ?? null, lastEvent && (lastEvent.kind.endsWith('_completed') || lastEvent.kind.endsWith('_failed')) ? lastEvent.created_at : null),
+        statusColor: deriveCapabilityStatusColor(statusEvent, 'gray'),
+        statusLabel: deriveCapabilityStatusLabel(statusEvent, 'INFO'),
+        message: capabilityDisplayMessageFromPayload(
+          capabilitySpecificPayload(completedEvent) ?? capabilitySpecificPayload(statusEvent),
+          statusEvent?.message ?? capabilityName
+        ),
+        startedAtText: startedEvent ? formatTimestamp(startedEvent.created_at) : '—',
+        startedAtRaw: startedEvent?.created_at ?? null,
+        durationText: formatDuration(startedEvent?.created_at ?? null, completedEvent?.created_at ?? null),
         durationMs: null,
-        latestCreatedAt: lastEvent?.created_at ?? firstEvent?.created_at ?? '',
-        isActive: !capabilityEvents.some((event) => event.kind.endsWith('_completed') || event.kind.endsWith('_failed')),
+        latestCreatedAt: statusEvent?.created_at ?? firstEvent?.created_at ?? '',
+        isActive: completedEvent === null,
         isNew: capabilityEvents.some((event) => recentEventIds.has(event.id)),
         eventCount: capabilityEvents.length,
-        latestLevel: lastEvent?.level ?? 'info',
-        latestKind: lastEvent?.kind ?? '',
-        latestPayload: lastEvent?.payload ?? null,
-        inputPayload: firstEvent ? deriveCapabilityPayload('input', firstEvent.payload) : null,
-        outputPayload: lastEvent ? deriveCapabilityPayload('output', lastEvent.payload) : null
+        latestLevel: statusEvent?.level ?? 'info',
+        latestKind: statusEvent?.kind ?? '',
+        latestPayload: capabilitySpecificPayload(statusEvent),
+        inputPayload: capabilitySpecificPayload(startedEvent),
+        outputPayload: capabilitySpecificPayload(completedEvent)
       });
     }
 
-    return mapped.sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt));
+    const resultStageEvent = eventsAsc.slice().reverse().find((event) => isStageResultEvent(event)) ?? null;
+    const resultStagePayload = asRecord(resultStageEvent?.payload) ?? {};
+    const capabilityResults = Array.isArray(resultStagePayload.capability_results)
+      ? resultStagePayload.capability_results as Array<Record<string, unknown>>
+      : [];
+
+    const resultOrderByCapabilityName = new Map<string, number>();
+    capabilityResults.forEach((result, index) => {
+      const resultKey = stringFrom(result.key) || stringFrom(result.capability) || stringFrom(result.name);
+      if (resultKey) {
+        resultOrderByCapabilityName.set(normalizeCapabilityOrderKey(resultKey), index);
+        resultOrderByCapabilityName.set(normalizeCapabilityOrderKey(formatCapabilityLabel(resultKey)), index);
+      }
+    });
+
+    for (const result of capabilityResults) {
+      const resultKey = stringFrom(result.key) || stringFrom(result.capability) || stringFrom(result.name);
+      if (!resultKey) continue;
+      const resultLabel = formatCapabilityLabel(resultKey);
+      const existing = mapped.find((capability) => capability.name.toLowerCase() === resultLabel.toLowerCase());
+      const ok = result.ok !== false;
+      const resultPayload = capabilityResultSpecificPayload(result);
+      const resultRecord = asRecord(resultPayload) ?? {};
+      const resultWaitingForUser = resultKey === 'operator_checkpoint' && payloadIndicatesUserWait(resultPayload);
+      if (existing) {
+        const resultClosesCapability = existing.outputPayload == null && !resultWaitingForUser;
+        existing.statusColor = resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red';
+        existing.statusLabel = resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR';
+        existing.isActive = resultWaitingForUser;
+        existing.outputPayload = resultWaitingForUser ? existing.outputPayload : existing.outputPayload ?? resultPayload;
+        existing.latestPayload = resultPayload ?? existing.latestPayload;
+        if (resultClosesCapability && resultStageEvent) {
+          existing.latestCreatedAt = resultStageEvent.created_at;
+          existing.latestKind = resultStageEvent.kind;
+          existing.durationText = formatDuration(existing.startedAtRaw, resultStageEvent.created_at);
+        }
+        existing.latestLevel = ok ? 'info' : 'error';
+        existing.message = capabilityDisplayMessageFromPayload(resultPayload, existing.message);
+        continue;
+      }
+
+      const capabilityId = `${trail.stageExecutionId}:result:${resultKey}`;
+      mapped.push({
+        key: capabilityId,
+        capabilityId,
+        name: resultLabel,
+        statusColor: resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red',
+        statusLabel: resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR',
+        message: capabilityDisplayMessageFromPayload(resultPayload, resultLabel),
+        startedAtText: resultStageEvent ? formatTimestamp(resultStageEvent.created_at) : '—',
+        startedAtRaw: resultStageEvent?.created_at ?? null,
+        durationText: 'elapsed —',
+        durationMs: null,
+        latestCreatedAt: resultStageEvent?.created_at ?? '',
+        isActive: resultWaitingForUser,
+        isNew: resultStageEvent ? recentEventIds.has(resultStageEvent.id) : false,
+        eventCount: 1,
+        latestLevel: ok ? 'info' : 'error',
+        latestKind: resultStageEvent?.kind ?? 'capability_result',
+        latestPayload: resultPayload,
+        inputPayload: null,
+        outputPayload: resultWaitingForUser ? null : resultPayload
+      });
+    }
+
+    if (resultStageEvent && !eventIndicatesOperatorCheckpointWait(resultStageEvent)) {
+      for (const capability of mapped) {
+        if (!capability.isActive) continue;
+        capability.isActive = false;
+        capability.statusColor = capability.statusColor === 'red' ? 'red' : 'green';
+        capability.statusLabel = capability.statusLabel === 'FAILED' || capability.statusLabel === 'ERROR' ? capability.statusLabel : 'SUCCESS';
+        capability.latestCreatedAt = resultStageEvent.created_at;
+        capability.latestKind = resultStageEvent.kind;
+        capability.latestLevel = capability.statusColor === 'red' ? 'error' : 'info';
+        capability.durationText = formatDuration(capability.startedAtRaw, resultStageEvent.created_at);
+      }
+    }
+
+    return mapped.sort((a, b) => {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+
+      const latestCreatedAtOrder = b.latestCreatedAt.localeCompare(a.latestCreatedAt);
+      if (latestCreatedAtOrder !== 0) return latestCreatedAtOrder;
+
+      const aFirstSequence = firstSequenceByCapabilityId.get(a.capabilityId) ?? Number.MAX_SAFE_INTEGER;
+      const bFirstSequence = firstSequenceByCapabilityId.get(b.capabilityId) ?? Number.MAX_SAFE_INTEGER;
+      if (aFirstSequence !== bFirstSequence) return bFirstSequence - aFirstSequence;
+
+      const aNameKey = normalizeCapabilityOrderKey(a.name);
+      const bNameKey = normalizeCapabilityOrderKey(b.name);
+      const aResultOrder = resultOrderByCapabilityName.get(aNameKey) ?? Number.MAX_SAFE_INTEGER;
+      const bResultOrder = resultOrderByCapabilityName.get(bNameKey) ?? Number.MAX_SAFE_INTEGER;
+      if (aResultOrder !== bResultOrder) return bResultOrder - aResultOrder;
+
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  function isTerminalStageEvent(event: StageExecutionEvent): boolean {
+    if (event.capability_invocation_id) return false;
+    return event.kind === 'stage_execution_completed'
+      || event.kind === 'stage_executed'
+      || event.kind === 'capability_stage_completed'
+      || event.kind === 'capability_stage_failed';
+  }
+
+  function isStageResultEvent(event: StageExecutionEvent): boolean {
+    if (event.capability_invocation_id) return false;
+    const payload = asRecord(event.payload) ?? {};
+    const capabilityResults = payload.capability_results;
+    return isTerminalStageEvent(event)
+      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
+      || event.kind === 'stage_execution_waiting_for_disposition_review'
+      || (Array.isArray(capabilityResults) && capabilityResults.length > 0);
+  }
+
+  function mapLiveExecutionTrailsFromProjection(projection: EventChainSummaryResponse): LiveStageTrail[] {
+    return projection.stages.map((stage) => ({
+      key: stage.key,
+      stepId: stage.step_id,
+      label: stage.label,
+      stageExecutionId: stage.stage_execution_id,
+      latestCreatedAt: stage.latest_created_at,
+      durationMs: stage.duration_ms,
+      isActive: stage.is_active,
+      isCurrent: stage.is_current,
+      capabilities: stage.capabilities.map((capability) => ({
+        key: capability.key,
+        capabilityId: capability.capability_id,
+        name: capability.name,
+        statusColor: capability.status_color,
+        statusLabel: capability.status_label,
+        message: capability.message,
+        startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
+        startedAtRaw: capability.started_at ?? null,
+        durationText: formatDurationMs(capability.duration_ms ?? null, capability.started_at ?? null, capability.completed_at ?? null),
+        durationMs: capability.duration_ms ?? null,
+        latestCreatedAt: capability.latest_created_at,
+        isActive: capability.is_active,
+        isNew: Boolean(capability.start_event_id && recentEventIds.has(capability.start_event_id))
+          || Boolean(capability.end_event_id && recentEventIds.has(capability.end_event_id)),
+        eventCount: capability.event_count,
+        latestLevel: capability.latest_level ?? capability.status_label.toLowerCase(),
+        latestKind: capability.latest_kind ?? '',
+        latestPayload: capability.latest_payload ?? capability.end_payload ?? capability.start_payload ?? null,
+        inputPayload: capability.start_payload ?? null,
+        outputPayload: capability.end_payload ?? null
+      }))
+    }));
+  }
+
+  function mergeStageExecutionEvents(existing: StageExecutionEvent[], incoming: StageExecutionEvent[]): StageExecutionEvent[] {
+    const byId = new Map<string, StageExecutionEvent>();
+    for (const event of existing) {
+      byId.set(event.id, event);
+    }
+    for (const event of incoming) {
+      byId.set(event.id, event);
+    }
+    return Array.from(byId.values()).sort((a, b) => a.sequence_no - b.sequence_no || a.created_at.localeCompare(b.created_at));
+  }
+
+  function mergeWorkflowEventsIntoRuntimeStore(runId: string, incoming: Array<WorkflowEvent | StageExecutionEvent>) {
+    const stageEvents = incoming.map((event) => event as StageExecutionEvent);
+    setRuntimeEvents((prev) => {
+      const merged = mergeStageExecutionEvents(prev.workflowEventsByRunId[runId] ?? [], stageEvents);
+      const latestSequenceNo = merged.reduce((latest, event) => Math.max(latest, event.sequence_no), prev.latestSequenceNo);
+      return {
+        ...prev,
+        workflowEventsByRunId: {
+          ...prev.workflowEventsByRunId,
+          [runId]: merged
+        },
+        latestSequenceNo
+      };
+    });
+  }
+
+  async function hydrateWorkflowEventsFromHistory(runId: string) {
+    const runEvents = await listRunEvents(runId);
+    mergeWorkflowEventsIntoRuntimeStore(runId, runEvents);
+  }
+
+  async function hydrateRuntimeProjection(runId: string) {
+    try {
+      const response: RuntimeProjectionResponse = await getRuntimeProjection({ run_id: runId });
+      const projection = response.runs.find((item) => item.run_id === runId) ?? response.runs[0] ?? null;
+      if (!projection) return;
+      setRuntimeProjectionsByRunId((prev) => ({
+        ...prev,
+        [projection.run_id]: projection
+      }));
+    } catch {
+    }
   }
 
   function mergeWorkflowEvents(existing: WorkflowEvent[], incoming: WorkflowEvent & { sequence_no?: number }): WorkflowEvent[] {
@@ -2407,32 +4048,65 @@ export function WorkflowShell() {
     return [...deduped, incoming].sort((a, b) => a.created_at.localeCompare(b.created_at));
   }
 
-  function getAfterSequence(runId: string): number {
-    const currentEvents = allWorkflowEventsRef.current[runId] ?? [];
-    return currentEvents.reduce((max, event) => {
-      const candidate = event as WorkflowEvent & { sequence_no?: number };
-      const value = typeof candidate.sequence_no === 'number' ? candidate.sequence_no : 0;
-      return Math.max(max, value);
-    }, 0);
+  function mergeWorkflowEngineRunState(context: Record<string, unknown>, runStatePatch: Record<string, unknown>): Record<string, unknown> {
+    const workflowEngine = asRecord(context.workflow_engine) ?? {};
+    const runState = asRecord(workflowEngine.run_state) ?? {};
+    return {
+      ...context,
+      workflow_engine: {
+        ...workflowEngine,
+        run_state: {
+          ...runState,
+          ...runStatePatch
+        }
+      }
+    };
   }
 
-  async function refreshRunRecord(runId: string) {
-    const run = await getRun(runId);
-    setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-  }
-
-  function scheduleRunRefresh(runId: string) {
-    const existing = runRefreshTimersRef.current[runId];
-    if (typeof existing === 'number') {
-      window.clearTimeout(existing);
+  function projectRunStateFromRuntimeEvent(run: WorkflowRun, incoming: StageExecutionEvent): WorkflowRun {
+    const payload = asRecord(incoming.payload) ?? {};
+    if (incoming.kind === 'stage_execution_waiting_for_operator_checkpoint' || incoming.kind === 'stage_execution_waiting_for_disposition_review') {
+      const stepId = stringFrom(payload.step_id) || incoming.step_id || run.current_step_id || '';
+      const stepType = stringFrom(payload.step_type);
+      const disposition = stringFrom(payload.disposition) || 'move_next';
+      const message = stringFrom(payload.message) || incoming.message;
+      return {
+        ...run,
+        status: 'waiting',
+        current_step_id: stepId || run.current_step_id,
+        updated_at: incoming.created_at,
+        context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
+          blocked_on: {
+            kind: 'operator_checkpoint',
+            stage_id: stepId,
+            stage_type: stepType,
+            recommended_disposition: disposition === 'paused' || disposition === 'pause' || disposition === 'pause_error' ? 'pause_error' : 'continue_manual',
+            next_step_id: '',
+            message,
+            available_dispositions: ['continue_auto', 'continue_manual', 'pause_error']
+          }
+        })
+      };
     }
-    runRefreshTimersRef.current[runId] = window.setTimeout(() => {
-      delete runRefreshTimersRef.current[runId];
-      void refreshRunRecord(runId);
-    }, 150);
+
+    if (isTerminalStageEvent(incoming)) {
+      const workflowEngine = asRecord((run.context as Record<string, unknown>).workflow_engine) ?? {};
+      const runState = asRecord(workflowEngine.run_state) ?? {};
+      const blockedOn = asRecord(runState.blocked_on);
+      if (blockedOn?.kind === 'operator_checkpoint' || blockedOn?.kind === 'disposition_review') return run;
+      return {
+        ...run,
+        updated_at: incoming.created_at,
+        context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
+          blocked_on: null
+        })
+      };
+    }
+
+    return run;
   }
 
-  function applyIncomingWorkflowEvent(runId: string, incoming: WorkflowEvent & { sequence_no?: number }) {
+  function applyIncomingWorkflowEvent(runId: string, incoming: StageExecutionEvent) {
     setRecentEventIds((prev) => {
       const next = new Set(prev);
       next.add(incoming.id);
@@ -2445,114 +4119,153 @@ export function WorkflowShell() {
         return next;
       });
     }, 1800);
-    setAllWorkflowEvents((prev) => ({
-      ...prev,
-      [runId]: mergeWorkflowEvents(prev[runId] ?? [], incoming)
-    }));
-    if (selectedRunIdRef.current === runId) {
-      setEvents((prev) => mergeWorkflowEvents(prev, incoming));
+
+    setRuns((prev) => prev.map((run) => run.id === runId ? projectRunStateFromRuntimeEvent(run, incoming) : run));
+
+    const payload = incoming.payload as Record<string, unknown>;
+    const snapshotContext = payload.final_context ?? payload.run_context ?? payload.prepared_context;
+    if (incoming.kind !== 'stage_execution_waiting_for_operator_checkpoint' && incoming.kind !== 'stage_execution_waiting_for_disposition_review' && snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
+      const snapshotStatus = typeof payload.prepared_status === 'string'
+        ? payload.prepared_status as WorkflowRunStatus
+        : typeof payload.status === 'string'
+          ? payload.status as WorkflowRunStatus
+          : undefined;
+      const snapshotStepId = typeof payload.current_step_id === 'string'
+        ? payload.current_step_id
+        : incoming.step_id;
+      setRuns((prev) => prev.map((run) => run.id === runId ? {
+        ...run,
+        ...(snapshotStatus ? { status: snapshotStatus } : {}),
+        current_step_id: snapshotStepId ?? run.current_step_id,
+        context: snapshotContext as Record<string, unknown>,
+        updated_at: incoming.created_at
+      } : run));
     }
-    scheduleRunRefresh(runId);
   }
 
-  function connectRunEventStream(runId: string) {
-    if (runEventStreamsRef.current[runId]) {
-      return;
-    }
+  function hydrateRunsFromRuntimeSnapshot(nodes: Array<{ key: string; node_type: string; id: string; status: string; title: string; repo_ref: string; workflow_key?: string | null; current_step_id?: string | null; updated_at: string }>) {
+    const workflowNodes = nodes.filter((node) => node.node_type === 'workflow_run');
+    if (workflowNodes.length === 0) return;
 
-    const source = openEventStream(runId, getAfterSequence(runId));
-    runEventStreamsRef.current[runId] = source;
-
-    if (selectedRunIdRef.current === runId) {
-      setEventStreamConnected(false);
-      setEventStreamStatusText('Connecting');
-    }
-
-    source.onopen = () => {
-      if (selectedRunIdRef.current === runId) {
-        setEventStreamConnected(true);
-        setEventStreamStatusText('Live');
+    setRuns((prev) => {
+      const existingById = new Map(prev.map((run) => [run.id, run]));
+      for (const node of workflowNodes) {
+        const existing = existingById.get(node.id);
+        if (!existing) continue;
+        existingById.set(node.id, {
+          ...existing,
+          status: node.status as WorkflowRunStatus,
+          title: node.title,
+          repo_ref: node.repo_ref,
+          workflow_key: node.workflow_key ?? existing.workflow_key,
+          current_step_id: node.current_step_id ?? existing.current_step_id,
+          updated_at: node.updated_at
+        });
       }
-    };
-
-    source.addEventListener('workflow_event', (raw) => {
-      try {
-        const incoming = JSON.parse((raw as MessageEvent<string>).data) as WorkflowEvent & { sequence_no?: number };
-        applyIncomingWorkflowEvent(runId, incoming);
-        if (selectedRunIdRef.current === runId) {
-          setEventStreamConnected(true);
-          setEventStreamStatusText('Live');
-        }
-      } catch {
-      }
+      return Array.from(existingById.values()).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
     });
-
-    source.addEventListener('monitor_snapshot', (raw) => {
-      if (selectedRunIdRef.current !== runId) {
-        return;
-      }
-      try {
-        const summary = JSON.parse((raw as MessageEvent<string>).data) as EventChainSummaryResponse;
-        setLiveExecutionTrails(mapLiveExecutionTrails(summary));
-        setEventStreamConnected(true);
-        setEventStreamStatusText('Live');
-      } catch {
-      }
-    });
-
-    source.onerror = () => {
-      if (selectedRunIdRef.current === runId) {
-        setEventStreamConnected(false);
-        setEventStreamStatusText('Reconnecting');
-      }
-    };
-  }
-
-  function disconnectRunEventStream(runId: string) {
-    const source = runEventStreamsRef.current[runId];
-    if (source) {
-      source.close();
-      delete runEventStreamsRef.current[runId];
-    }
-    const timer = runRefreshTimersRef.current[runId];
-    if (typeof timer === 'number') {
-      window.clearTimeout(timer);
-      delete runRefreshTimersRef.current[runId];
-    }
   }
 
   async function refreshRunDetails(runId: string) {
     const [run, runEvents] = await Promise.all([getRun(runId), listRunEvents(runId)]);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    setEvents(runEvents);
-    setAllWorkflowEvents((prev) => ({ ...prev, [run.id]: runEvents }));
-    setSelectedRunId(run.id);
+    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
+    hydratedWorkflowEventRunsRef.current.add(run.id);
+    await hydrateRuntimeProjection(run.id);
+    if (selectedRunIdRef.current === run.id) {
+      setSelectedRunId(run.id);
+    }
   }
 
   async function refreshRunDetailsOnOpen(runId: string) {
     const [run, runEvents] = await Promise.all([openWorkflowRun(runId), listRunEvents(runId)]);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    setEvents(runEvents);
-    setAllWorkflowEvents((prev) => ({ ...prev, [run.id]: runEvents }));
+    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
+    hydratedWorkflowEventRunsRef.current.add(run.id);
+    await hydrateRuntimeProjection(run.id);
     setSelectedRunId(run.id);
   }
 
-  async function refreshLiveMonitor(runId: string) {
-    const summary = await getEventChainSummary(runId);
-    setLiveExecutionTrails(mapLiveExecutionTrails(summary));
+
+  function workflowRoute(runId: string) {
+    return `/workflows/${encodeURIComponent(runId)}`;
   }
 
+  function workflowTabRoute(runId: string, tab: WorkspaceTabKey) {
+    const base = workflowRoute(runId);
+    switch (tab) {
+      case 'diff':
+        return `${base}/changes`;
+      case 'commits':
+        return `${base}/commits`;
+      case 'files':
+        return `${base}/repository`;
+      case 'capabilities':
+        return `${base}/capabilities`;
+      default:
+        return base;
+    }
+  }
+
+  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null | undefined): WorkspaceTabKey {
+    switch (view) {
+      case 'changes':
+        return 'diff';
+      case 'commits':
+        return 'commits';
+      case 'repository':
+        return 'files';
+      case 'capabilities':
+        return 'capabilities';
+      default:
+        return 'workflows';
+    }
+  }
+
+  function workflowTabTitle(tab: WorkspaceTabKey): string {
+    switch (tab) {
+      case 'diff':
+        return 'changes';
+      case 'commits':
+        return 'commits';
+      case 'files':
+        return 'repository';
+      case 'capabilities':
+        return 'capabilities';
+      default:
+        return 'workflow';
+    }
+  }
+
+  function shouldUseBrowserNavigation(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) {
+    return event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+  }
+
+  function handleWorkflowLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }, runId: string) {
+    if (shouldUseBrowserNavigation(event)) return;
+    event.preventDefault();
+    void openWorkflow(runId);
+  }
 
   async function openWorkflow(runId: string) {
     setSelectedRunId(runId);
     setView('monitor');
     setMonitorView('workflow_detail');
+    setActiveWorkspaceTab('workflows');
+    props.navigate?.(workflowTabRoute(runId, 'workflows'));
     void refreshRunDetailsOnOpen(runId);
-    void refreshLiveMonitor(runId);
   }
 
   function backToWorkflowList() {
     setMonitorView('workflow_list');
+    setMonitorHomeView('workflows');
+    props.navigate?.('/workflows');
+  }
+
+  function handleWorkflowListLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }) {
+    if (shouldUseBrowserNavigation(event)) return;
+    event.preventDefault();
+    backToWorkflowList();
   }
 
   async function openBuilder() {
@@ -2706,16 +4419,27 @@ export function WorkflowShell() {
   async function handleStartRun() {
     if (!selectedRunId) return;
     const runId = selectedRunId;
-    setBusy(true);
-    setError(null);
-    void startWorkflowRun(runId)
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        void refreshRunDetails(runId);
-      });
-    window.setTimeout(() => setBusy(false), 250);
+    try {
+      setBusy(true);
+      setError(null);
+      const prepared = await prepareWorkflowStage(runId);
+      const preparedRun = prepared.run;
+      if (preparedRun) {
+        setRuns((prev) => [
+          preparedRun,
+          ...prev.filter((item) => item.id !== preparedRun.id)
+        ]);
+        setSelectedRunId(preparedRun.id);
+      } else {
+        await refreshRunDetails(runId);
+      }
+      await startWorkflowRun(runId);
+      await refreshRunDetails(runId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const currentAutonomousStep = selectedRunDefinition?.steps.find((step) => step.id === selectedRun?.current_step_id)
@@ -2743,15 +4467,20 @@ export function WorkflowShell() {
 
   async function handlePauseRun() {
     if (!selectedRunId) return;
+    if (hasPendingDispositionReview) {
+      await handleDispositionReview('pause');
+      return;
+    }
+    const runId = selectedRunId;
     try {
-      setBusy(true);
+      setPauseRequestBusy(true);
       setError(null);
-      await pauseWorkflowRun(selectedRunId);
-      await refreshRunDetails(selectedRunId);
+      await pauseWorkflowRun(runId);
+      await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setPauseRequestBusy(false);
     }
   }
 
@@ -2762,6 +4491,7 @@ export function WorkflowShell() {
       setError(null);
       await forceWaitWorkflowRun(selectedRunId);
       await refreshRunDetails(selectedRunId);
+      setManualCapabilityStatus('Workflow execution cancelled and returned to operator control.');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2777,6 +4507,41 @@ export function WorkflowShell() {
       ...fragment
     });
     await refreshRunDetails(selectedRun.id);
+  }
+
+  async function patchPlannerCapabilityState(patch: Record<string, unknown>) {
+    if (!selectedRun?.id) return;
+    const currentPlanner = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
+    const nextSelectedFeatureId = Object.prototype.hasOwnProperty.call(patch, 'selected_feature_id')
+      ? patch.selected_feature_id
+      : currentPlanner.selected_feature_id ?? selectedPlannerFeatureId ?? null;
+    const normalizedSelectedFeatureId = typeof nextSelectedFeatureId === 'string' && nextSelectedFeatureId.trim()
+      ? nextSelectedFeatureId
+      : null;
+
+    await patchGlobalCapabilityState({
+      capabilities: {
+        planner: {
+          ...currentPlanner,
+          ...patch,
+          fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && normalizedSelectedFeatureId),
+          selected_feature_id: normalizedSelectedFeatureId,
+          planner_id: patch.planner_id ?? currentPlanner.planner_id ?? null,
+          supervisor_run_id: null,
+          schema_id: 'supervisor_feature_plan_item_v1',
+          preserve_rough_definition: true
+        }
+      }
+    });
+  }
+
+  function openRepoSupervisorPlanner() {
+    const rootRepoPath = (selectedRun?.repo_ref ?? repoRef ?? '').trim();
+    if (!rootRepoPath) {
+      setError('Repo path is required before opening the planner.');
+      return;
+    }
+    setPlannerFragmentConfigOpen(true);
   }
 
   function loadBuilderRepoContextConfig() {
@@ -2807,6 +4572,7 @@ export function WorkflowShell() {
     setStageRepoContextSkipGitignore(typeof contextExport.skip_gitignore === 'boolean' ? contextExport.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(contextExport.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(contextExport.include_unstaged_diff));
+    setStageRepoContextInlinePrompt(Boolean(contextExport.inline_repo_context_in_prompt));
   }
 
   function loadBuilderChangesetSchemaConfig() {
@@ -3237,8 +5003,10 @@ export function WorkflowShell() {
       return next;
     });
     setPaths(descendantFiles, false);
-  }  const composedInferencePrompt = useMemo(() => {
-    if (selectedWorkflowStep?.id === 'compile') {
+  }
+
+  const composedInferencePrompt = useMemo(() => {
+    if (selectedWorkflowStep?.step_type === 'compile') {
       return stageCompileCommandsText.trim()
         ? `### COMPILE COMMANDS\n${stageCompileCommandsText.trim()}`
         : '';
@@ -3267,17 +5035,6 @@ export function WorkflowShell() {
 
   const selectedLiveExecutionState = selectedLiveStageTrail ? (liveExecutionChains[selectedLiveStageTrail.key] ?? null) : null;
 
-  useEffect(() => {
-    if (!selectedLiveStageTrail) return;
-    void ensureLiveExecutionChainLoaded(selectedLiveStageTrail, true);
-  }, [
-    selectedLiveStageTrail?.key,
-    selectedLiveStageTrail?.isActive,
-    selectedLiveStageTrail?.isCurrent,
-    selectedLiveStageTrail?.latestCreatedAt,
-    selectedRunId
-  ]);
-
   const inferenceResponse = useMemo(() => {
     const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
     for (let i = executionItems.length - 1; i >= 0; i -= 1) {
@@ -3304,11 +5061,13 @@ export function WorkflowShell() {
   }, [events, selectedStepId, selectedLiveExecutionState, selectedLiveStageTrail]);
 
   const stageStreamContent = useMemo(() => {
-    const parts: string[] = [];
-    if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
 
-    if (selectedWorkflowStep?.id === 'compile') {
-      const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    if (selectedWorkflowStep?.step_type === 'compile') {
+      const parts: string[] = [];
+      if (composedInferencePrompt.trim()) parts.push(`### INPUT\n${composedInferencePrompt}`);
+
       let compileResults: Array<Record<string, unknown>> = [];
 
       for (let i = executionItems.length - 1; i >= 0; i -= 1) {
@@ -3320,7 +5079,6 @@ export function WorkflowShell() {
       }
 
       if (compileResults.length === 0) {
-        const stageEvents = selectedStepId ? events.filter((event) => event.step_id === selectedStepId) : events;
         for (let i = stageEvents.length - 1; i >= 0; i -= 1) {
           const rows = extractCompileResultsFromPayload(stageEvents[i].payload);
           if (rows.length > 0) {
@@ -3341,9 +5099,28 @@ export function WorkflowShell() {
       return parts.join('\n\n');
     }
 
-    if (inferenceResponse.trim()) parts.push(`### OUTPUT\n${inferenceResponse}`);
-    return parts.join('\n\n');
-  }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.id]);
+    const sourceEvents = events.length > 0 ? events : executionItems;
+    const turns = collectModelIoTurns(sourceEvents);
+
+    if (turns.length > 0) return `${turns.length.toLocaleString()} model history turns`;
+    if (selectedLiveExecutionState?.loading) return '### MODEL I/O HISTORY\nLoading workflow model history…';
+    if (selectedLiveExecutionState?.error) return `### MODEL I/O HISTORY\nUnable to load workflow model history: ${selectedLiveExecutionState.error}`;
+    return '';
+  }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.step_type]);
+
+  const modelHistoryTurns = useMemo(() => {
+    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
+    const sourceEvents = events.length > 0 ? events : executionItems;
+    return collectModelIoTurns(sourceEvents);
+  }, [events, selectedLiveExecutionState]);
+
+  const modelHistoryText = useMemo(() => modelHistoryCopyText(modelHistoryTurns), [modelHistoryTurns]);
+
+  const previewViewerContent = previewViewerMode === 'stream'
+    ? (modelHistoryText || stageStreamContent)
+    : previewViewerMode === 'prompt'
+      ? composedInferencePrompt
+      : inferenceResponse;
 
   function getBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
@@ -3678,7 +5455,7 @@ function MarkdownPreviewContent(props: { content: string; emptyText: string }) {
   );
 }
 
-function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream') {
+function renderPreviewPanel(title: string, content: string, emptyText: string, mode: 'prompt' | 'response' | 'stream', body?: React.ReactNode) {
     return (
       <Stack gap="xs" h="100%">
         <Group justify="space-between" align="center">
@@ -3691,7 +5468,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Group>
         </Group>
         <Box p="md" h="100%" style={{ flex: 1, border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, minHeight: 220, overflow: 'auto', background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
-          <MarkdownPreviewContent content={content} emptyText={emptyText} />
+          {body ?? <MarkdownPreviewContent content={content} emptyText={emptyText} />}
         </Box>
       </Stack>
     );
@@ -3730,26 +5507,60 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     }
     if (selectedWorkflowStep?.step_type === 'review') {
       return (
-        <Suspense fallback={
-          <Stack gap="sm" p="md">
-            <Group gap="xs">
-              <Loader size="sm" />
-              <Text size="sm" c="dimmed">Loading diff viewer…</Text>
-            </Group>
-          </Stack>
-        }>
-          <ReviewDiffViewerPanel
-            repoRef={resolveRepoRefForRun(selectedRun)}
-            state={reviewSourceControlState}
-            onPersistState={persistReviewSourceControlState}
-          />
-        </Suspense>
+        <Tabs defaultValue="model_io" h="100%" style={{ display: 'flex', flexDirection: 'column' }}>
+          <Tabs.List>
+            <Tabs.Tab value="model_io">Model history</Tabs.Tab>
+            <Tabs.Tab value="diff">Diff</Tabs.Tab>
+          </Tabs.List>
+          <Tabs.Panel value="model_io" pt="sm" style={{ flex: 1, minHeight: 0 }}>
+            {renderPreviewPanel(
+              'Model history',
+              stageStreamContent,
+              emptyText,
+              'stream',
+              <ModelHistoryContent
+                turns={modelHistoryTurns}
+                fallbackInput={composedInferencePrompt}
+                fallbackOutput={inferenceResponse}
+                emptyText={emptyText}
+              />
+            )}
+          </Tabs.Panel>
+          <Tabs.Panel value="diff" pt="sm" style={{ flex: 1, minHeight: 0 }}>
+            <Suspense fallback={
+              <Stack gap="sm" p="md">
+                <Group gap="xs">
+                  <Loader size="sm" />
+                  <Text size="sm" c="dimmed">Loading diff viewer…</Text>
+                </Group>
+              </Stack>
+            }>
+              <DiffPanel
+                runId={selectedRunId}
+                repoRef={resolveRepoRefForRun(selectedRun)}
+                state={reviewSourceControlState}
+                onPersistState={persistReviewSourceControlState}
+              />
+            </Suspense>
+          </Tabs.Panel>
+        </Tabs>
       );
     }
     if (selectedWorkflowStep?.step_type === 'sap_export') {
       return <></>;
     }
-    return renderPreviewPanel('Stage stream', stageStreamContent, emptyText, 'stream');
+    return renderPreviewPanel(
+      'Model history',
+      stageStreamContent,
+      emptyText,
+      'stream',
+      <ModelHistoryContent
+        turns={modelHistoryTurns}
+        fallbackInput={composedInferencePrompt}
+        fallbackOutput={inferenceResponse}
+        emptyText={emptyText}
+      />
+    );
   }
 
   function buildInteractiveStagePayload() {
@@ -3782,8 +5593,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     };
 
     if (stepType === 'design') {
+      const designMode = readStringValue(step, 'config.design_mode', 'v1');
+      payload.config = {
+        design_mode: designMode
+      };
       payload.execution_logic = {
         kind: 'design_stage_policy',
+        mode: designMode,
         connection_bundles: ['design_code_inference_default'],
         connections: {
           inference: {
@@ -3834,12 +5650,30 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
   async function handleManualSelectStep(stepId: string | null) {
     if (!selectedRun || !stepId) return;
-    await runManualCapability(async () => {
-      const json = await selectWorkflowStep(selectedRun.id, stepId);
-      await refreshRunDetails(selectedRun.id);
-      return json as Record<string, unknown>;
-    }, `Selected stage ${stepId}.`);
-    setSelectedStepId(stepId);
+    const runId = selectedRun.id;
+    try {
+      setManualCapabilityBusy(true);
+      setManualCapabilityStatus(null);
+      const json = await selectWorkflowStep(runId, stepId);
+      setManualCapabilityResponse(JSON.stringify(json, null, 2));
+      setManualCapabilityStatus(`Selected stage ${stepId}.`);
+      setSelectedStepId(stepId);
+      setRuns((prev) => prev.map((run) => run.id === runId
+        ? {
+            ...run,
+            current_step_id: stepId,
+            status: 'waiting',
+            updated_at: new Date().toISOString()
+          }
+        : run
+      ));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setManualCapabilityStatus(message);
+      setManualCapabilityResponse('');
+    } finally {
+      setManualCapabilityBusy(false);
+    }
   }
 
   function handleStageCardClick(stepId: string) {
@@ -3895,7 +5729,37 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     });
   }
 
-  async function persistReviewSourceControlState(next: ReviewSourceControlState) {
+  async function onTogglePlanningFragment() {
+    if (!selectedRun?.id) return;
+    const nextEnabled = !Boolean(sharedPlannerFragmentState?.fragment_armed && selectedPlannerFeatureId);
+    if (nextEnabled && !selectedPlannerFeatureId) {
+      setPlannerFragmentConfigOpen(true);
+      return;
+    }
+    await patchPlannerCapabilityState({
+      fragment_armed: nextEnabled,
+      selected_feature_id: selectedPlannerFeatureId ?? null,
+      selected_feature: nextEnabled ? selectedPlannerFeature : null,
+      planner_id: sharedPlannerFragmentState?.planner_id ?? null,
+      supervisor_run_id: null
+    });
+  }
+
+  async function savePlannerFragmentSelection(selection: { planner: { id: string } | null; feature: Record<string, unknown> | null }) {
+    if (!selectedRun?.id) return;
+    const featureId = typeof selection.feature?.id === 'string' ? selection.feature.id : null;
+    setPlannerSelectedFeatureIdDraft(featureId);
+    await patchPlannerCapabilityState({
+      fragment_armed: Boolean(featureId),
+      selected_feature_id: featureId,
+      selected_feature: selection.feature,
+      planner_id: selection.planner?.id ?? sharedPlannerFragmentState?.planner_id ?? null,
+      supervisor_run_id: null
+    });
+    setPlannerFragmentConfigOpen(false);
+  }
+
+  async function persistReviewSourceControlState(next: DiffPanelState) {
     setLocalReviewSourceControlState(next);
     if (!selectedRun || !selectedWorkflowStep) return;
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
@@ -3908,6 +5772,25 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
       }
     });
     await refreshSelectedRunArtifacts();
+  }
+
+  async function handleDispositionReview(disposition: string, selectedStepId?: string | null) {
+    if (!selectedRun) return;
+    const runId = selectedRun.id;
+    const normalizedDisposition = normalizeCheckpointDisposition(disposition);
+    await runManualCapability(async () => {
+      const json = await resolveWorkflowDispositionReview(runId, normalizedDisposition, selectedStepId) as Record<string, unknown>;
+      await refreshSelectedRunArtifacts();
+
+      if (normalizedDisposition === 'continue_auto' || normalizedDisposition === 'select_stage') {
+        const nextStepId = typeof json.current_step_id === 'string' ? json.current_step_id : selectedStepId ?? null;
+        if (nextStepId) {
+          setSelectedStepId(nextStepId);
+        }
+      }
+
+      return json;
+    }, `Checkpoint selected: ${checkpointDispositionLabel(normalizedDisposition)}.`);
   }
 
   async function handleManualPatchStageState() {
@@ -3956,20 +5839,23 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     }
   }
 
-  function loadGlobalInferenceConfigFromGlobals(globals?: Record<string, unknown> | null) {
-    const capabilities = ((globals?.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const inference = ((capabilities.inference as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const browser = ((inference.browser as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    setInferenceTransport(((typeof inference.transport === 'string' ? inference.transport : 'api') as InferenceTransport) ?? 'api');
-    setBrowserTargetUrl(typeof browser.target_url === 'string' ? browser.target_url : '');
-    setBrowserCdpUrl(typeof browser.cdp_url === 'string' ? browser.cdp_url : '');
-    setBrowserSessionId(typeof browser.session_id === 'string' ? browser.session_id : '');
-  }
-
   function openGlobalInferenceConfig() {
-    loadGlobalInferenceConfigFromGlobals((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? null);
     setInferenceStatus(null);
     setGlobalInferenceConfigOpen(true);
+  }
+
+  function currentInferencePanelGlobals(): Record<string, unknown> | null {
+    if (view === 'builder') {
+      return (builderGlobals ?? compiledBuilderDefinition?.globals ?? loadedTemplateDefinition?.globals ?? null) as Record<string, unknown> | null;
+    }
+    return (((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? null) as Record<string, unknown> | null;
+  }
+
+  function currentInferencePanelDefinition(): WorkflowTemplateDefinition | null {
+    if (view === 'builder') {
+      return compiledBuilderDefinition ?? loadedTemplateDefinition ?? null;
+    }
+    return selectedRunDefinition;
   }
 
   function normalizeBuilderDefinition(definition?: WorkflowTemplateDefinition | null): WorkflowTemplateDefinition | null {
@@ -4117,6 +6003,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         skip_gitignore: stageRepoContextSkipGitignore,
         include_staged_diff: stageRepoContextIncludeStagedDiff,
         include_unstaged_diff: stageRepoContextIncludeUnstagedDiff,
+        inline_repo_context_in_prompt: stageRepoContextInlinePrompt,
       });
       syncRepoSelectionState(includeFiles);
       setRepoContextConfigOpen(false);
@@ -4129,44 +6016,27 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     setRepoContextConfigOpen(false);
   }
 
-  async function handleSaveGlobalInference() {
+  async function handleSaveInferenceSessionsPanel(inferencePatch: Record<string, unknown>) {
     try {
       setInferenceBusy(true);
       setInferenceStatus(null);
-      const browserPatch: Record<string, unknown> = {
-        target_url: browserTargetUrl.trim(),
-        session_id: browserSessionId.trim(),
-      };
-      if (browserCdpUrl.trim()) {
-        browserPatch.cdp_url = browserCdpUrl.trim();
-      }
-      const inferencePatch = {
-        transport: inferenceTransport,
-        browser: browserPatch,
-      };
       if (view === 'builder') {
         saveBuilderCapability('inference', inferencePatch);
-        setInferenceStatus('Global inference defaults saved.');
+        setInferenceStatus('Inference sessions saved.');
+        setGlobalInferenceConfigOpen(false);
         return;
       }
       if (!selectedRun) return;
       const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
       const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      const currentInference = (currentCapabilities.inference as Record<string, unknown> | undefined) ?? {};
       await patchWorkflowGlobalState(selectedRun.id, {
         capabilities: {
           ...currentCapabilities,
-          inference: {
-            ...currentInference,
-            ...inferencePatch,
-            browser: {
-              ...((currentInference.browser as Record<string, unknown> | undefined) ?? {}),
-              ...(inferencePatch.browser as Record<string, unknown>)
-            }
-          },
+          inference: inferencePatch,
         },
       });
-      setInferenceStatus('Global inference defaults saved.');
+      setInferenceStatus('Inference sessions saved.');
+      setGlobalInferenceConfigOpen(false);
       await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
@@ -4406,7 +6276,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Modal>
           ) : activeWorkspaceTab === 'diff' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading changes view…</Text></Group></Card>}>
-              <ReviewDiffViewerPanel
+              <DiffPanel
+                runId={selectedRunId}
                 repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
                 state={reviewSourceControlState}
                 onPersistState={persistReviewSourceControlState}
@@ -4426,6 +6297,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <GlobalCapabilitiesPanel
                 repoContextArmed={!!sharedInferenceState?.repo_context_armed}
                 changesetSchemaArmed={!!sharedInferenceState?.changeset_schema_armed}
+                plannerArmed={Boolean(sharedPlannerFragmentState?.fragment_armed || sharedPlannerFragmentState?.planner_id)}
                 onOpenInference={() => {
                   openGlobalInferenceConfig();
                 }}
@@ -4434,6 +6306,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 }}
                 onOpenChangesetSchema={() => {
                   setChangesetSchemaConfigOpen(true);
+                }}
+                onOpenPlanner={() => {
+                  void openRepoSupervisorPlanner();
                 }}
                 onOpenApplyChangeset={() => {
                   setGlobalApplyChangesetOpen(true);
@@ -4446,90 +6321,148 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : monitorView === 'workflow_list' ? (
             <Stack>
               <Card withBorder>
-                <Stack>
+                <Stack gap="sm">
                   <Group justify="space-between" align="center" wrap="wrap">
-                    <Title order={4}>Workflow list</Title>
+                    <Stack gap={2}>
+                      <Title order={4}>Workspace monitor</Title>
+                    </Stack>
                     <Group>
-                      <Button size="xs" onClick={() => void openBuilder()} loading={busy}>
-                        New workflow
+                      <Button
+                        size="xs"
+                        onClick={() => {
+                          if (monitorHomeView === 'workflows') {
+                            void openBuilder();
+                          } else {
+                            setSupervisorCreateRequestToken((value) => value + 1);
+                          }
+                        }}
+                        loading={monitorHomeView === 'workflows' ? busy : false}
+                      >
+                        {monitorHomeView === 'workflows' ? 'New workflow' : 'New supervisor'}
                       </Button>
                       <Button
                         size="xs"
                         variant="default"
                         leftSection={<IconRefresh size={16} />}
-                        onClick={() => void refreshRunsAndTemplates()}
+                        onClick={() => {
+                          if (monitorHomeView === 'workflows') {
+                            void refreshRunsAndTemplates();
+                          } else {
+                            setSupervisorRefreshRequestToken((value) => value + 1);
+                          }
+                        }}
                       >
                         Refresh
                       </Button>
                     </Group>
                   </Group>
-                  <Table striped highlightOnHover>
-                    <Table.Thead>
-                      <Table.Tr>
-                        <Table.Th>Workflow</Table.Th>
-                        <Table.Th>Status</Table.Th>
-                        <Table.Th>Current step</Table.Th>
-                        <Table.Th>Repo</Table.Th>
-                        <Table.Th>Updated</Table.Th>
-                        <Table.Th>Actions</Table.Th>
-                      </Table.Tr>
-                    </Table.Thead>
-                    <Table.Tbody>
-                      {runs.map((run) => (
-                        <Table.Tr key={run.id} onClick={() => void openWorkflow(run.id)} style={{ cursor: 'pointer' }}>
-                          <Table.Td>{run.title}</Table.Td>
-                          <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
-                          <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
-                          <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
-                          <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
-                          <Table.Td>
-                            <Group gap="xs">
-                              <Button size="xs" variant="light" onClick={(e) => { e.stopPropagation(); void openWorkflow(run.id); }}>Open</Button>
-                              <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
-                            </Group>
-                          </Table.Td>
-                        </Table.Tr>
-                      ))}
-                    </Table.Tbody>
-                  </Table>
+                  <Tabs
+                    value={monitorHomeView}
+                    onChange={(value) => {
+                      const next = (value as MonitorHomeView) ?? 'workflows';
+                      setMonitorHomeView((current) => current === next ? current : next);
+                      props.navigate?.(next === 'supervisors' ? '/supervisors' : '/workflows');
+                    }}
+                  >
+                    <Tabs.List>
+                      <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
+                      <Tabs.Tab value="supervisors">Supervisors</Tabs.Tab>
+                    </Tabs.List>
+                  </Tabs>
                 </Stack>
               </Card>
 
-              <Card withBorder>
-                <Stack>
-                  <Group justify="space-between">
-                    <Title order={4}>Global summary</Title>
-                    <Button variant="light" size="xs" onClick={() => void refreshRunsAndTemplates()}>Refresh summary</Button>
-                  </Group>
-                  {Object.keys(allWorkflowEvents).length === 0 ? (
-                    <Text c="dimmed">No active workflow summaries yet.</Text>
-                  ) : (
+              {monitorHomeView === 'supervisors' ? (
+                <SupervisorPanel
+                  supervisorRunId={props.route?.supervisorRunId ?? null}
+                  supervisorView={props.route?.supervisorView ?? null}
+                  navigate={props.navigate}
+                  createRequestedToken={supervisorCreateRequestToken}
+                  refreshRequestedToken={supervisorRefreshRequestToken}
+                  onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)}
+                />
+              ) : (
+                <>
+                  <Card withBorder>
                     <Stack>
-                      {runs.filter((run) => allWorkflowEvents[run.id]?.length).map((run) => {
-                        const latestEvent = allWorkflowEvents[run.id][allWorkflowEvents[run.id].length - 1] ?? null;
-                        return (
-                          <Card key={run.id} withBorder>
-                            <Group justify="space-between" align="flex-start">
-                              <Stack gap={4}>
-                                <Text fw={600}>{run.title}</Text>
-                                <Text size="sm" c="dimmed">{run.repo_ref}</Text>
+                      <Group justify="space-between" align="center" wrap="wrap">
+                        <Title order={4}>Workflow list</Title>
+                      </Group>
+                      <Table striped highlightOnHover>
+                        <Table.Thead>
+                          <Table.Tr>
+                            <Table.Th>Workflow</Table.Th>
+                            <Table.Th>Status</Table.Th>
+                            <Table.Th>Current step</Table.Th>
+                            <Table.Th>Repo</Table.Th>
+                            <Table.Th>Updated</Table.Th>
+                            <Table.Th>Actions</Table.Th>
+                          </Table.Tr>
+                        </Table.Thead>
+                        <Table.Tbody>
+                          {runs.map((run) => (
+                            <Table.Tr key={run.id}>
+                              <Table.Td>
+                                <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)}>
+                                  {run.title}
+                                </Anchor>
+                              </Table.Td>
+                              <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
+                              <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
+                              <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
+                              <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
+                              <Table.Td>
                                 <Group gap="xs">
-                                  <Badge color={statusColor(run.status)}>{run.status}</Badge>
-                                  <Code>{run.current_step_id ?? '-'}</Code>
+                                  <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)} size="sm">
+                                    Open
+                                  </Anchor>
+                                  <ActionIcon color="red" variant="subtle" onClick={(e) => { e.stopPropagation(); void handleDeleteRun(run.id); }}><IconTrash size={16} /></ActionIcon>
                                 </Group>
-                              </Stack>
-                              <Stack gap={4} align="flex-end">
-                                <Text size="xs" c="dimmed">{latestEvent ? formatTimestamp(latestEvent.created_at) : '-'}</Text>
-                                <Text size="sm">{latestEvent ? summarizeEvent(latestEvent) : 'No events'}</Text>
-                              </Stack>
-                            </Group>
-                          </Card>
-                        );
-                      })}
+                              </Table.Td>
+                            </Table.Tr>
+                          ))}
+                        </Table.Tbody>
+                      </Table>
                     </Stack>
-                  )}
-                </Stack>
-              </Card>
+                  </Card>
+
+                  <Card withBorder>
+                    <Stack>
+                      <Group justify="space-between">
+                        <Title order={4}>Global summary</Title>
+                        <Button variant="light" size="xs" onClick={() => void refreshRunsAndTemplates()}>Refresh summary</Button>
+                      </Group>
+                      {Object.keys(allWorkflowEvents).length === 0 ? (
+                        <Text c="dimmed">No active workflow summaries yet.</Text>
+                      ) : (
+                        <Stack>
+                          {runs.filter((run) => allWorkflowEvents[run.id]?.length).map((run) => {
+                            const latestEvent = allWorkflowEvents[run.id][allWorkflowEvents[run.id].length - 1] ?? null;
+                            return (
+                              <Card key={run.id} withBorder>
+                                <Group justify="space-between" align="flex-start">
+                                  <Stack gap={4}>
+                                    <Text fw={600}>{run.title}</Text>
+                                    <Text size="sm" c="dimmed">{run.repo_ref}</Text>
+                                    <Group gap="xs">
+                                      <Badge color={statusColor(run.status)}>{run.status}</Badge>
+                                      <Code>{run.current_step_id ?? '-'}</Code>
+                                    </Group>
+                                  </Stack>
+                                  <Stack gap={4} align="flex-end">
+                                    <Text size="xs" c="dimmed">{latestEvent ? formatTimestamp(latestEvent.created_at) : '-'}</Text>
+                                    <Text size="sm">{latestEvent ? summarizeEvent(latestEvent) : 'No events'}</Text>
+                                  </Stack>
+                                </Group>
+                              </Card>
+                            );
+                          })}
+                        </Stack>
+                      )}
+                    </Stack>
+                  </Card>
+                </>
+              )}
             </Stack>
           ) : (
             <Grid align="start">
@@ -4540,7 +6473,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       <Stack>
                         <Group justify="space-between">
                           <Group>
-                            <Button variant="light" onClick={backToWorkflowList}>Back to workflows</Button>
+                            <Button variant="light" component="a"
+              href="/workflows"
+              onClick={handleWorkflowListLinkClick}>Back to workflows</Button>
                             <div>
                               <Title order={4}>{selectedRun.title}</Title>
                               <Text c="dimmed">{selectedRun.repo_ref}</Text>
@@ -4551,10 +6486,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Stack gap="md">
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
-                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !canRunCurrentStageAutomatically || isBackendRunLocked}>Run autonomously</Button>
-                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={busy && canRequestRunPause} disabled={!canRequestRunPause}>Pause after stage</Button>
+                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || (!canRunCurrentStageAutomatically && selectedRun?.status !== 'success') || isBackendRunLocked}>Run autonomously</Button>
+                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
-                              <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Force unlock</Button>
+                              <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Cancel run</Button>
                             </Group>
                             <Stack gap={2} align="flex-end">
                               <Text size="xs" c="dimmed">Created: {formatTimestamp(selectedRun.created_at)}</Text>
@@ -4567,8 +6502,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 <Title order={6}>Workflow controls</Title>
                               </Group>
                               <Group>
-                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked}>Save stage inputs</Button>
-                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked} loading={manualCapabilityBusy}>Run stage</Button>
+                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview}>Save stage inputs</Button>
+                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview} loading={manualCapabilityBusy}>Run stage</Button>
                                 <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
                               </Group>
                             </Stack>
@@ -4641,6 +6576,50 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Stack>
                             {!inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
                               <>
+                                {pendingDispositionReview ? (
+                                  <Card withBorder>
+                                    <Stack gap="sm">
+                                      <Alert color="yellow" title="User input required">
+                                        <Text size="sm">Choose how the workflow should continue.</Text>
+                                      </Alert>
+                                      <Group gap="xs" wrap="wrap">
+                                        {pendingDispositionReview.availableDispositions.map((disposition) => {
+                                          const normalizedDisposition = normalizeCheckpointDisposition(disposition);
+                                          if (normalizedDisposition === 'select_stage') {
+                                            return (
+                                              <Select
+                                                key={normalizedDisposition}
+                                                size="xs"
+                                                placeholder="Select stage"
+                                                data={(selectedRun?.definition?.steps ?? []).map((step, index) => ({
+                                                  value: step.id,
+                                                  label: `${index + 1}. ${step.name || step.id}`
+                                                }))}
+                                                disabled={busy || manualCapabilityBusy}
+                                                onChange={(stepId) => {
+                                                  if (stepId) void handleDispositionReview('select_stage', stepId);
+                                                }}
+                                                w={150}
+                                              />
+                                            );
+                                          }
+                                          return (
+                                            <Button
+                                              key={normalizedDisposition}
+                                              variant={normalizedDisposition === 'continue_auto' ? 'filled' : 'light'}
+                                              color={checkpointDispositionColor(normalizedDisposition)}
+                                              loading={manualCapabilityBusy}
+                                              disabled={busy || manualCapabilityBusy}
+                                              onClick={() => void handleDispositionReview(normalizedDisposition)}
+                                            >
+                                              {checkpointDispositionLabel(normalizedDisposition)}
+                                            </Button>
+                                          );
+                                        })}
+                                      </Group>
+                                    </Stack>
+                                  </Card>
+                                ) : null}
                                 {selectedWorkflowStep?.step_type === 'sap_import' ? (
                                   <SapImportStageControlsPanel
                                     status={sapImportStatus}
@@ -4678,14 +6657,26 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     stageApplyError={stageApplyError}
                                     stageCompileError={stageCompileError}
                                     stageCompileCommandsText={stageCompileCommandsText}
+                                    stageUserInput={stageUserInput}
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}
+                                    sharedPlannerFragmentState={sharedPlannerFragmentState}
+                  plannerAvailableForRepo={Boolean((selectedRun?.repo_ref ?? repoRef ?? '').trim())}
+                  activePlannerFeatureTitle={selectedPlannerFeature
+                    ? (typeof selectedPlannerFeature.title === 'string' && selectedPlannerFeature.title.trim()
+                        ? selectedPlannerFeature.title.trim()
+                        : typeof selectedPlannerFeature.summary === 'string' && selectedPlannerFeature.summary.trim()
+                          ? selectedPlannerFeature.summary.trim()
+                          : null)
+                    : null}
                                     stageIncludeRepoContext={stageIncludeRepoContext}
                                     stageIncludeChangesetSchema={stageIncludeChangesetSchema}
                                     disabled={isBackendRunLocked}
                                     onToggleSharedRepoContext={onToggleSharedRepoContext}
                                     onToggleSharedChangesetSchema={onToggleSharedChangesetSchema}
+                                    onTogglePlanningFragment={onTogglePlanningFragment}
+                                    onOpenPlanner={openRepoSupervisorPlanner}
                                     onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
                                     onOpenInferenceConfig={openGlobalInferenceConfig}
                                     onOpenRepoConfig={() => setRepoContextConfigOpen(true)}
@@ -4695,23 +6686,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     onOpenChanges={() => setActiveWorkspaceTab('diff')}
                                   />
                                 )}
-                                <InferenceConnectionCard
-                                  inferenceConnectionStatus={inferenceConnectionStatus}
-                                  inferenceReady={inferenceReady}
-                                  inferenceSummaryText={inferenceSummaryText}
-                                  inferenceTransport={inferenceTransport}
-                                  browserTargetUrl={browserTargetUrl}
-                                  browserCdpUrl={browserCdpUrl}
-                                  inferenceBusy={inferenceBusy}
-                                  inferenceStatus={inferenceStatus}
 
-                                  hideInlineCard
-                                  onOpenConfig={openGlobalInferenceConfig}
-                                  onTransportChange={(value) => setInferenceTransport(value)}
-                                  onBrowserTargetUrlChange={setBrowserTargetUrl}
-                                  onBrowserCdpUrlChange={setBrowserCdpUrl}
-                                  onSaveConfig={() => void handleSaveGlobalInference()}
-                                />
                               </>
                             ) : null}
                           </Stack>
@@ -4738,14 +6713,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Title order={5}>Live workflow events</Title>
                           <Badge color={eventStreamStatus.color} variant="light">Stream {eventStreamStatus.label}</Badge>
                         </Group>
-                        <Button variant="light" size="xs" onClick={() => selectedRunId && void refreshLiveMonitor(selectedRunId)}>Refresh events</Button>
+                        <Button variant="light" size="xs" onClick={() => selectedRunId && void Promise.all([hydrateWorkflowEventsFromHistory(selectedRunId), hydrateRuntimeProjection(selectedRunId)])}>Refresh events</Button>
                       </Group>
                       {liveExecutionTrails.length > 0 ? (
                         <Stack gap="xs">
                           {liveExecutionTrails.map((trail, index) => {
                             const trailExpanded = isLiveExecutionExpanded(trail);
-                            const executionState = liveExecutionChains[trail.key] ?? { loading: false, error: null, chain: null, latestCreatedAt: null };
-                            const rawEvents = (executionState.chain?.items ?? []).slice().sort((a, b) => b.sequence_no - a.sequence_no);
                             return (
                               <Box
                                 key={trail.key}
@@ -4796,16 +6769,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                   <Stack gap="xs" mt="sm">
                                     <Divider label="Capabilities" labelPosition="left" />
 
-                                    {executionState.loading ? <Loader size="sm" /> : null}
-                                    {executionState.error ? <Alert color="red">{executionState.error}</Alert> : null}
-                                    {!executionState.loading && !executionState.error && rawEvents.length === 0 ? (
-                                      <Text size="sm" c="dimmed">No execution events loaded.</Text>
-                                    ) : null}
-
                                     {(() => {
-                                      const capabilityCards = buildLiveCapabilitiesFromEvents(trail, rawEvents);
-                                      if (!executionState.loading && !executionState.error && capabilityCards.length === 0) {
-                                        return <Text size="sm" c="dimmed">No capability executions found.</Text>;
+                                      const capabilityCards = trail.capabilities;
+                                      if (capabilityCards.length === 0) {
+                                        return <Text size="sm" c="dimmed">No capability events in runtime store.</Text>;
                                       }
                                       return capabilityCards.map((capability) => {
                                         const eventExpanded = expandedLiveEventIds.has(capability.key);
@@ -4896,6 +6863,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(e) => setStageRepoContextSkipGitignore(e.currentTarget.checked)} />
               <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(e) => setStageRepoContextIncludeStagedDiff(e.currentTarget.checked)} />
               <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(e) => setStageRepoContextIncludeUnstagedDiff(e.currentTarget.checked)} />
+              <Switch label="Inline repo context in prompt instead of uploading attachment" checked={stageRepoContextInlinePrompt} onChange={(e) => setStageRepoContextInlinePrompt(e.currentTarget.checked)} />
             </SimpleGrid>
             <Group justify="space-between">
               <Group>
@@ -4962,6 +6930,18 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Stack>
         </Modal>
 
+        <PlannerModal
+          opened={plannerFragmentConfigOpen}
+          rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+          selectedPlannerId={typeof sharedPlannerFragmentState?.planner_id === 'string' ? sharedPlannerFragmentState.planner_id : null}
+          selectedFeatureId={selectedPlannerFeatureId}
+          selectionMode
+          onClose={() => setPlannerFragmentConfigOpen(false)}
+          onError={setError}
+          onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
+          onSelectFeature={(selection) => void savePlannerFragmentSelection(selection)}
+        />
+
         <Modal
           opened={globalInferenceConfigOpen}
           onClose={() => setGlobalInferenceConfigOpen(false)}
@@ -4976,56 +6956,15 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
           }}
         >
-          <Stack gap="md">
-            <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <Select
-                label="Mode"
-                value={inferenceTransport}
-                onChange={(value) => setInferenceTransport((value as InferenceTransport) ?? 'api')}
-                data={[
-                  { value: 'api', label: 'API' },
-                  { value: 'browser', label: 'Browser' }
-                ]}
-                allowDeselect={false}
-              />
-              <TextInput
-                label="Session ID"
-                value={browserSessionId}
-                onChange={(e) => setBrowserSessionId(e.currentTarget.value)}
-                disabled={inferenceTransport !== 'browser'}
-                placeholder="Optional existing browser session"
-              />
-            </SimpleGrid>
-
-            {inferenceTransport === 'browser' ? (
-              <Stack gap="md">
-                <SimpleGrid cols={{ base: 1, md: 2 }}>
-                  <TextInput
-                    label="Browser URL"
-                    value={browserTargetUrl}
-                    onChange={(e) => setBrowserTargetUrl(e.currentTarget.value)}
-                    placeholder="https://website.com/"
-                  />
-                  <TextInput
-                    label="CDP URL"
-                    value={browserCdpUrl}
-                    onChange={(e) => setBrowserCdpUrl(e.currentTarget.value)}
-                    placeholder="Backend default"
-                  />
-                </SimpleGrid>
-                <Alert color="blue">Only backend-owned inference fields are persisted here. Browser defaults and runtime session behavior stay on the backend.</Alert>
-              </Stack>
-            ) : (
-              <Alert color="blue">API mode only persists the transport choice. Model, max tokens, temperature, provider, and system prompt are not stored in workflow global state.</Alert>
-            )}
-
-            {inferenceStatus ? <Alert color={inferenceStatus.toLowerCase().includes('saved') ? 'green' : 'red'}>{inferenceStatus}</Alert> : null}
-
-            <Group justify="flex-end">
-              <Button size="xs" variant="default" onClick={() => setGlobalInferenceConfigOpen(false)}>Cancel</Button>
-              <Button size="xs" onClick={() => void handleSaveGlobalInference()} loading={inferenceBusy}>Save</Button>
-            </Group>
-          </Stack>
+          <InferenceSessionsPanel
+            opened={globalInferenceConfigOpen}
+            globals={currentInferencePanelGlobals()}
+            definition={currentInferencePanelDefinition()}
+            busy={inferenceBusy}
+            status={inferenceStatus}
+            onCancel={() => setGlobalInferenceConfigOpen(false)}
+            onSave={handleSaveInferenceSessionsPanel}
+          />
         </Modal>
 
         <Modal
@@ -5325,20 +7264,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           <Stack gap="md">
             <Group justify="space-between" align="center">
               <Group gap="xs">
-                <Badge variant="light">{(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse) ? `${(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).length.toLocaleString()} chars` : 'empty'}</Badge>
+                <Badge variant="light">{previewViewerMode === 'stream' && modelHistoryTurns.length > 0 ? `${groupModelIoExchanges(modelHistoryTurns).length.toLocaleString()} exchanges` : previewViewerContent ? `${previewViewerContent.length.toLocaleString()} chars` : 'empty'}</Badge>
                 <Text size="sm" c="dimmed">Wrapped and formatted for review</Text>
               </Group>
-              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse); }} disabled={!(previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse).trim()}>
+              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerContent); }} disabled={!previewViewerContent.trim()}>
                 {previewViewerMode === 'stream' ? 'Copy stream' : previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
               </Button>
             </Group>
             <Box p="lg" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
               <ScrollArea h="82vh" offsetScrollbars>
                 <Box maw={920} mx="auto">
-                  <MarkdownPreviewContent
-                    content={previewViewerMode === 'stream' ? stageStreamContent : previewViewerMode === 'prompt' ? composedInferencePrompt : inferenceResponse}
-                    emptyText={previewViewerMode === 'stream' ? 'No stage stream yet.' : previewViewerMode === 'prompt' ? 'No prompt fragments enabled yet.' : 'No inference response yet.'}
-                  />
+                  {previewViewerMode === 'stream' ? (
+                    <ModelHistoryContent
+                      turns={modelHistoryTurns}
+                      fallbackInput={composedInferencePrompt}
+                      fallbackOutput={inferenceResponse}
+                      emptyText="No stage stream yet."
+                    />
+                  ) : (
+                    <MarkdownPreviewContent
+                      content={previewViewerContent}
+                      emptyText={previewViewerMode === 'prompt' ? 'No prompt fragments enabled yet.' : 'No inference response yet.'}
+                    />
+                  )}
                 </Box>
               </ScrollArea>
             </Box>

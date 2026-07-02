@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod ports;
 
 use std::path::PathBuf;
 
@@ -6,9 +7,9 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use super::{ensure_object_slot, persist_inference_config, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
+use super::{ensure_object_slot, persist_inference_config, session, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
 use super::super::registry::{find_result, CapabilityContext, CapabilityResult};
-use crate::engine::capabilities::binding_specs;
+use crate::engine::capabilities::{binding_specs, context_export};
 
 fn is_stale_session_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err).to_ascii_lowercase();
@@ -30,37 +31,60 @@ pub async fn mark_session_rearm_needed_if_browser_session_is_stale(
     let root = crate::engine::ensure_engine_root(&mut run.context);
     let global_state = ensure_object_slot(root, "global_state");
     let capabilities = ensure_object_slot(global_state, "capabilities");
-    let inference_value = capabilities
-        .get("inference")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let inference = capabilities
+        .get_mut("inference")
+        .and_then(Value::as_object_mut);
 
-    let mut inference_cfg: InferenceConfig = serde_json::from_value(inference_value).unwrap_or_else(|_| InferenceConfig {
-        browser: BrowserConfig::default(),
-        ..InferenceConfig::default()
-    });
-
-    if !matches!(inference_cfg.transport, InferenceTransport::Browser) {
+    let Some(inference) = inference else {
         return Ok(false);
-    }
-
-    let existing = inference_cfg.browser.session_id.clone().unwrap_or_default();
-    if existing.trim().is_empty() {
-        crate::engine::on_browser_session_changed(state, run_id, "missing", "").await?;
-        return Ok(true);
-    }
-
-    let stale = match adapter::probe(&mut inference_cfg.browser) {
-        Ok(probe) => !probe.page_open || (!probe.ready && probe.url.trim().is_empty()),
-        Err(err) if is_stale_session_error(&err) => true,
-        Err(err) => return Err(err),
     };
 
-    if stale {
-        crate::engine::on_browser_session_changed(state, run_id, &existing, "").await?;
+    let sessions = inference
+        .get_mut("sessions")
+        .and_then(Value::as_object_mut);
+
+    let Some(sessions) = sessions else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    for session_value in sessions.values_mut() {
+        let mut inference_cfg: InferenceConfig = serde_json::from_value(session_value.clone()).unwrap_or_else(|_| InferenceConfig {
+            browser: BrowserConfig::default(),
+            ..InferenceConfig::default()
+        });
+
+        if !matches!(inference_cfg.transport, InferenceTransport::Browser) {
+            continue;
+        }
+
+        let existing = inference_cfg.browser.session_id.clone().unwrap_or_default();
+        if existing.trim().is_empty() {
+            inference_cfg.browser.session_id = None;
+            *session_value = serde_json::to_value(&inference_cfg)?;
+            changed = true;
+            continue;
+        }
+
+        let stale = match adapter::probe(&mut inference_cfg.browser) {
+            Ok(probe) => !probe.page_open || (!probe.ready && probe.url.trim().is_empty()),
+            Err(err) if is_stale_session_error(&err) => true,
+            Err(err) => return Err(err),
+        };
+
+        if stale {
+            inference_cfg.browser.session_id = None;
+            session::set_runtime_string(&mut inference_cfg, "browser_session_id", None);
+            *session_value = serde_json::to_value(&inference_cfg)?;
+            changed = true;
+        }
     }
 
-    Ok(stale)
+    if changed {
+        crate::engine::persist_context(state, run_id, &run.context).await?;
+    }
+
+    Ok(changed)
 }
 
 fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
@@ -98,20 +122,68 @@ fn ensure_live_browser_session(browser: &mut BrowserConfig) -> Result<String> {
     Ok(session_id)
 }
 
+fn browser_probe_url_matches(probe_url: &str, target_url: &str) -> bool {
+    let expected = target_url.trim().trim_end_matches('/');
+    if expected.is_empty() {
+        return true;
+    }
+    let actual = probe_url.trim().trim_end_matches('/');
+    actual == expected
+}
+
+fn wait_for_browser_chat_ready(browser: &mut BrowserConfig, target_url: &str) -> Result<BrowserProbeResult> {
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(browser.response_timeout_ms.max(15_000));
+    let poll = std::time::Duration::from_millis(browser.dom_poll_ms.clamp(250, 2_000));
+    let mut last_probe: Option<BrowserProbeResult> = None;
+
+    loop {
+        match adapter::probe(browser) {
+            Ok(probe) => {
+                if probe.ready && browser_probe_url_matches(&probe.url, target_url) {
+                    return Ok(probe);
+                }
+                last_probe = Some(probe);
+            }
+            Err(err) if is_stale_session_error(&err) => return Err(err),
+            Err(err) => {
+                if started.elapsed() >= timeout {
+                    return Err(err);
+                }
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            if let Some(probe) = last_probe {
+                return Ok(probe);
+            }
+            return adapter::probe(browser);
+        }
+
+        std::thread::sleep(poll);
+    }
+}
+
 async fn clear_session_scoped_inference_runtime_on_new_browser_session(
     ctx: &CapabilityContext<'_>,
+    inference_session_name: &str,
+    inference_cfg: &mut InferenceConfig,
     previous_session_id: &str,
     next_session_id: &str,
 ) -> Result<()> {
-    crate::engine::on_browser_session_changed(ctx.state, ctx.run_id, previous_session_id, next_session_id).await
+    if previous_session_id.trim() != next_session_id.trim() {
+        session::set_runtime_string(inference_cfg, "browser_session_id", Some(next_session_id.to_string()));
+        session::set_runtime_string(inference_cfg, "process_session_id", Some(ctx.state.process_session_id().to_string()));
+        persist_inference_config(ctx, inference_session_name, inference_cfg).await?;
+    }
+    Ok(())
 }
 
 async fn reset_session_scoped_shared_capability_lifecycle_on_new_browser_session(
     ctx: &CapabilityContext<'_>,
 ) -> Result<()> {
     let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    crate::engine::shared_capability_lifecycle::reset_session_scoped_shared_capability_lifecycle(&mut run);
-    crate::engine::refresh_inference_arm_state(&mut run, Some(ctx.step));
+    crate::engine::rearm_inference_input_fragments_for_stage(&mut run, Some(ctx.step));
     crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
 }
 
@@ -143,6 +215,46 @@ fn dependency_upload_paths(ctx: &CapabilityContext<'_>, prior_results: &[Capabil
 
     Ok(uploads)
 }
+
+fn repo_context_inline_prompt_enabled(ctx: &CapabilityContext<'_>) -> bool {
+    if !repo_context_upload_enabled(ctx) {
+        return false;
+    }
+
+    ctx.local_state
+        .get("repo_context")
+        .and_then(|v| v.get("inline_repo_context_in_prompt"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            ctx.local_state
+                .get("capabilities")
+                .and_then(|v| v.get("context_export"))
+                .and_then(|v| v.get("inline_repo_context_in_prompt"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn repo_context_payload(ctx: &CapabilityContext<'_>) -> Option<Value> {
+    ctx.local_state.get("repo_context").cloned().or_else(|| {
+        ctx.local_state
+            .get("capabilities")
+            .and_then(|v| v.get("context_export"))
+            .cloned()
+    })
+}
+
+fn append_repo_context_prompt(prompt: &mut String, context_text: &str) {
+    prompt.push_str("\n\n### REPO CONTEXT\n");
+    prompt.push_str("Repository context is included inline below.\n\n");
+    prompt.push_str("```text\n");
+    prompt.push_str(context_text);
+    if !context_text.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("```");
+}
+
 
 async fn load_app_settings_value(ctx: &CapabilityContext<'_>) -> Result<Value> {
     let row = sqlx::query("SELECT settings_json FROM app_settings WHERE id = ?")
@@ -208,25 +320,26 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         .unwrap_or("")
         .to_string();
 
-    let mut inference_cfg: InferenceConfig = ctx
-        .local_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_else(|| InferenceConfig {
-            browser: BrowserConfig::default(),
-            ..InferenceConfig::default()
-        });
+    let resolved_session = session::resolve_inference_session(ctx).await?;
+    let mut inference_cfg = resolved_session.config;
 
     let app_settings = load_app_settings_value(ctx).await.unwrap_or_else(|_| json!({}));
     apply_app_browser_defaults(&mut inference_cfg, &app_settings);
+    if inference_cfg.browser.profile.trim().is_empty() || inference_cfg.browser.profile.trim() == "default" || inference_cfg.browser.profile.trim() == "auto" {
+        inference_cfg.browser.profile = format!("inference-{}", resolved_session.name);
+    }
+    inference_cfg.browser.cdp_url = ports::allocate_cdp_url_for_session(ctx, &resolved_session.name, &inference_cfg.browser.cdp_url).await?;
+    let cdp_url = inference_cfg.browser.cdp_url.clone();
+    let debug_port = cdp_url.rsplit(':').next().map(str::to_string);
+    session::set_runtime_string(&mut inference_cfg, "debug_port", debug_port);
+    session::set_runtime_string(&mut inference_cfg, "cdp_url", Some(cdp_url));
+    session::set_runtime_string(&mut inference_cfg, "process_session_id", Some(ctx.state.process_session_id().to_string()));
 
     let target_url = inference_cfg.browser.target_url.trim().to_string();
     let previous_session_id = inference_cfg.browser.session_id.clone().unwrap_or_default();
     let session_id = ensure_live_browser_session(&mut inference_cfg.browser)?;
-    persist_inference_config(ctx, &inference_cfg).await?;
-    clear_session_scoped_inference_runtime_on_new_browser_session(ctx, &previous_session_id, &session_id).await?;
+    persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
+    clear_session_scoped_inference_runtime_on_new_browser_session(ctx, &resolved_session.name, &mut inference_cfg, &previous_session_id, &session_id).await?;
     if previous_session_id.trim() != session_id.trim() {
         reset_session_scoped_shared_capability_lifecycle_on_new_browser_session(ctx).await?;
     }
@@ -245,30 +358,46 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         adapter::open_url(&mut inference_cfg.browser, &target_url)?;
     }
 
-    let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
-    if let Some(probe) = current_probe.as_ref() {
-        if !probe.ready {
-            persist_inference_config(ctx, &inference_cfg).await?;
-            return Ok(json!({
-                "transport": "browser",
-                "text": "",
-                "conversation_id": Value::Null,
-                "browser_session_id": inference_cfg.browser.session_id,
-                "probe": probe,
-                "ok": false,
-                "message": format!(
-                    "Browser page is not chat-ready; send was skipped (page_open={}, chat_input_found={}, chat_input_visible={}, url={})",
-                    probe.page_open,
-                    probe.chat_input_found,
-                    probe.chat_input_visible,
-                    probe.url
-                )
-            }));
-        }
+    let readiness_target_url = inference_cfg.browser.target_url.trim().to_string();
+    let readiness_probe = wait_for_browser_chat_ready(&mut inference_cfg.browser, &readiness_target_url)?;
+    if !readiness_probe.ready || !browser_probe_url_matches(&readiness_probe.url, &readiness_target_url) {
+        persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
+        return Ok(json!({
+            "transport": "browser",
+            "text": "",
+            "conversation_id": Value::Null,
+            "browser_session_id": inference_cfg.browser.session_id,
+            "probe": readiness_probe,
+            "ok": false,
+            "message": format!(
+                "Browser page is not chat-ready on the expected target URL after readiness wait; send was skipped (page_open={}, chat_input_found={}, chat_input_visible={}, url={}, expected_url={})",
+                readiness_probe.page_open,
+                readiness_probe.chat_input_found,
+                readiness_probe.chat_input_visible,
+                readiness_probe.url,
+                readiness_target_url
+            )
+        }));
     }
 
-    let upload_paths = dependency_upload_paths(ctx, prior_results)?;
+    let inline_repo_context = repo_context_inline_prompt_enabled(ctx);
+    let pasted_context_text = if inline_repo_context {
+        match repo_context_payload(ctx) {
+            Some(payload) => Some(context_export::render_context_export_text(payload)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let pasted_context_enabled = pasted_context_text.is_some();
+
+    let upload_paths = if pasted_context_enabled {
+        Vec::new()
+    } else {
+        dependency_upload_paths(ctx, prior_results)?
+    };
     let mut uploaded_files = Vec::new();
+
     for upload_path in upload_paths.iter() {
         if upload_path.exists() {
             adapter::upload_file(&mut inference_cfg.browser, upload_path.as_path())?;
@@ -276,8 +405,12 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         }
     }
 
-    let result = adapter::send_chat_and_wait(&mut inference_cfg.browser, &prompt)?;
-    persist_inference_config(ctx, &inference_cfg).await?;
+    let result = adapter::send_chat_and_wait_with_pasted_context(
+        &mut inference_cfg.browser,
+        &prompt,
+        pasted_context_text.as_deref(),
+    )?;
+    persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
 
     let probe = match adapter::probe(&mut inference_cfg.browser) {
         Ok(probe) => probe,
@@ -317,6 +450,7 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         "browser_session_id": result.browser_session_id,
         "probe": probe,
         "uploaded_files": uploaded_files,
+        "repo_context_inline_prompt": inline_repo_context,
         "send": bridge_result.get("send").cloned().unwrap_or(Value::Null),
         "read": bridge_result.get("read").cloned().unwrap_or(Value::Null)
     }))

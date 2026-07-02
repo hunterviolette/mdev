@@ -9,6 +9,13 @@ type ResponseSnapshot = {
   lastText: string;
 };
 
+type PageReadySnapshot = {
+  ready: boolean;
+  stopCount: number;
+  busyCount: number;
+  composerCount: number;
+};
+
 export type SessionState = {
   sessionId: string;
   browser?: Browser;
@@ -26,6 +33,7 @@ export type SessionState = {
   responsePollMs: number;
   domPollMs: number;
   pendingUploads: string[];
+  lastResponseBaseline?: ResponseSnapshot;
 };
 
 export class SessionManager {
@@ -129,10 +137,10 @@ export class SessionManager {
         throw new Error(`No existing tab matched page_url_contains: ${pageUrlContains}`);
       }
     } else {
-      const pages = context.pages();
-      page = pages[0];
-      if (!page) {
-        throw new Error('No existing page available in persistent browser context');
+      page = await context.newPage();
+      const targetUrl = cmd.url?.trim();
+      if (targetUrl) {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout });
       }
     }
 
@@ -281,9 +289,8 @@ export class SessionManager {
       preferredSelector,
       'button[data-testid="send-button"]',
       'button[aria-label*="send" i]',
-      'button[type="submit"]',
-      'form button',
-      'button'
+      'button[title*="send" i]',
+      'button[type="submit"]'
     ].filter((selector): selector is string => Boolean(selector));
 
     let best: { locator: Locator; score: number } | null = null;
@@ -445,7 +452,7 @@ export class SessionManager {
       isContentEditable: (el as HTMLElement).isContentEditable
     }));
 
-    await composer.click({ timeout: 5000 });
+    await composer.click({ timeout: 20000 });
 
     if (info.isContentEditable) {
       await composer.evaluate((el) => {
@@ -468,6 +475,21 @@ export class SessionManager {
     await page.keyboard.insertText(text);
   }
 
+  private async appendChatComposerText(page: Page, composer: Locator, text: string): Promise<void> {
+    await composer.click({ timeout: 20000 });
+    const spacer = text.startsWith('\n') ? '' : '\n\n';
+    await page.keyboard.insertText(spacer + text);
+  }
+
+  private async pasteLargeContextAsClipboardText(page: Page, composer: Locator, text: string): Promise<void> {
+    await composer.click({ timeout: 20000 });
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+    await page.evaluate(async (value) => {
+      await navigator.clipboard.writeText(value);
+    }, text);
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V');
+  }
+
   async sendChat(cmd: SendChatCommand) {
     const state = this.getSession(cmd.session_id);
     state.responseTimeoutMs = undefined;
@@ -478,16 +500,29 @@ export class SessionManager {
     if (state.pendingUploads.length > 0) {
       const uploadReady = await this.waitForPendingUploads(state, Math.min(timeout, 45000));
       if (!uploadReady) {
-        throw new Error(`Upload did not finish before send_chat for session ${state.sessionId}: ${state.pendingUploads.join(', ')}`);
+        const blockedUploads = state.pendingUploads.join(', ');
+        state.pendingUploads = [];
+        throw new Error(`Upload did not finish before send_chat for session ${state.sessionId}: ${blockedUploads}`);
       }
     }
 
-    const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
+    state.lastResponseBaseline = await this.readResponseSnapshot(state.page, state.responseSelector)
+      .catch(() => ({ texts: [], count: 0, lastText: '' }));
 
-    await this.writeChatComposerText(state.page, composer, cmd.text);
+    const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
+    const pastedContext = Boolean(cmd.pasted_context_text?.trim());
+
+    if (pastedContext) {
+      await this.pasteLargeContextAsClipboardText(state.page, composer, cmd.pasted_context_text ?? '');
+      await state.page.waitForTimeout(15000);
+      await this.appendChatComposerText(state.page, composer, cmd.text);
+    } else {
+      await this.writeChatComposerText(state.page, composer, cmd.text);
+    }
 
     const beforeSendText = await this.readComposerText(composer);
-    if (beforeSendText.length === 0) {
+    if (beforeSendText.length === 0 && !pastedContext) {
+      state.lastResponseBaseline = undefined;
       return {
         session_id: state.sessionId,
         sent: false,
@@ -498,6 +533,7 @@ export class SessionManager {
 
     const sendResult = await this.trySendUntilDeadline(state.page, composer, submitSelector, timeout);
     if (!sendResult.sent) {
+      state.lastResponseBaseline = undefined;
       throw new Error(`Chat submit did not clear composer within ${timeout}ms after ${sendResult.attempts} attempts for session ${state.sessionId}`);
     }
 
@@ -562,16 +598,16 @@ export class SessionManager {
         break;
       }
 
-      const submit = await this.waitForSendReady(page, composer, submitSelector, Math.min(remainingMs, 5000));
+      const submit = await this.waitForSendReady(page, composer, submitSelector, Math.min(remainingMs, 20000));
       if (!submit) {
         await page.waitForTimeout(500).catch(() => {});
         continue;
       }
 
       attempts += 1;
-      await submit.click({ timeout: Math.min(remainingMs, 5000) });
+      await submit.click({ timeout: Math.min(remainingMs, 20000) });
 
-      const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 5000));
+      const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 20000));
       if (postClick === 'cleared' || postClick === 'changed' || postClick === 'busy') {
         return { sent: true, method: 'click', attempts };
       }
@@ -638,19 +674,29 @@ export class SessionManager {
 
   private async readResponseSnapshot(page: Page, selector: string): Promise<ResponseSnapshot> {
     const snap = await page.locator(selector).evaluateAll((nodes) => {
-      const visibleNodes = nodes.filter((node) => {
-        const el = node as HTMLElement;
+      const isVisible = (el: HTMLElement) => {
         const style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') {
           return false;
         }
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
+      };
+
+      const isUsefulText = (text: string) => text.length > 0 && !/^[\s\d:AMPamp]+$/.test(text);
+
+      const visibleNodes = nodes.filter((node) => {
+        const el = node as HTMLElement;
+        if (el.closest('[data-testid="user-message"], [data-testid^="action-bar-"]')) {
+          return false;
+        }
+        const text = (el.textContent ?? '').trim();
+        return isUsefulText(text) && isVisible(el);
       });
 
       const texts = visibleNodes
         .map((node) => (node.textContent ?? '').trim())
-        .filter((text) => text.length > 0);
+        .filter(isUsefulText);
 
       return {
         texts,
@@ -659,7 +705,94 @@ export class SessionManager {
       };
     }).catch(() => ({ texts: [], count: 0, lastText: '' }));
 
-    return snap;
+    if (snap.count > 0) {
+      return snap;
+    }
+
+    const fallback = await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const clean = (value: string) => value.trim().replace(/\s+/g, ' ');
+      const isUsefulText = (text: string) => text.length > 0 && !/^[\s\d:AMPamp]+$/.test(text);
+
+      const actionButtons = Array.from(document.querySelectorAll('[data-testid="action-bar-copy"]')).filter(isVisible);
+      const texts: string[] = [];
+
+      for (const button of actionButtons) {
+        let el = button.parentElement;
+        for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
+          if (el.querySelector('[data-testid="user-message"]')) {
+            continue;
+          }
+
+          const rawText = clean(el.innerText || el.textContent || '');
+          if (!isUsefulText(rawText) || rawText.length < 40) {
+            continue;
+          }
+
+          const actionText = clean(Array.from(el.querySelectorAll('[data-testid^="action-bar-"]'))
+            .map((node) => node.textContent ?? '')
+            .join(' '));
+          const withoutActions = clean(actionText ? rawText.replace(actionText, '') : rawText);
+
+          if (isUsefulText(withoutActions) && withoutActions.length >= 40) {
+            texts.push(withoutActions);
+            break;
+          }
+        }
+      }
+
+      return {
+        texts,
+        count: texts.length,
+        lastText: texts.length ? texts[texts.length - 1] : ''
+      };
+    }).catch(() => ({ texts: [], count: 0, lastText: '' }));
+
+    return fallback;
+  }
+
+  private async readPageReadySnapshot(page: Page): Promise<PageReadySnapshot> {
+    return await page.evaluate(() => {
+      const visible = (el: Element) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      };
+
+      const count = (selector: string) => Array.from(document.querySelectorAll(selector)).filter(visible).length;
+
+      const stopSelector = [
+        'button[aria-label*="stop" i]',
+        'button[title*="stop" i]',
+        '[aria-label*="stop" i]',
+        '[title*="stop" i]'
+      ].join(', ');
+
+      const busySelector = [
+        '[aria-busy="true"]'
+      ].join(', ');
+
+      const composerSelector = 'div[contenteditable="true"], textarea, [role="textbox"]';
+
+      const stopCount = count(stopSelector);
+      const busyCount = count(busySelector);
+      const composerCount = count(composerSelector);
+
+      return {
+        ready: stopCount === 0 && busyCount === 0 && composerCount > 0,
+        stopCount,
+        busyCount,
+        composerCount
+      };
+    }).catch(() => ({ ready: false, stopCount: 0, busyCount: 0, composerCount: 0 }));
   }
 
   private async waitForCompletedResponse(
@@ -669,23 +802,25 @@ export class SessionManager {
   ): Promise<ResponseSnapshot> {
     const start = Date.now();
     const effectiveTimeoutMs = Math.max(timeoutMs, 1000);
+    const baseline = state.lastResponseBaseline;
 
     while (true) {
       if (Date.now() - start >= effectiveTimeoutMs) {
         throw new Error(`Timed out waiting for completed response after ${effectiveTimeoutMs} ms`);
       }
 
-      const ready = await state.page.evaluate(() => ({
-        ready: !document.querySelector('button[aria-label*="Stop" i]') &&
-               !!document.querySelector('div[contenteditable="true"], textarea, [role="textbox"]')
-      })).catch(() => ({ ready: false }));
-
+      const ready = await this.readPageReadySnapshot(state.page);
       const snap = await this.readResponseSnapshot(state.page, selector).catch(() => ({ texts: [], count: 0, lastText: '' }));
       const hasResponse = snap.count > 0 && snap.lastText.length > 0;
-      const done = hasResponse && ready.ready;
+      const hasNewResponse = !baseline
+        || snap.count > baseline.count
+        || snap.lastText !== baseline.lastText;
+      const done = hasResponse && hasNewResponse && ready.ready;
+
 
       if (done) {
         state.responseTimeoutMs = undefined;
+        state.lastResponseBaseline = undefined;
         return snap;
       }
 

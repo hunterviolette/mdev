@@ -83,6 +83,32 @@ export type WorkflowTemplateDefinition = {
   steps: WorkflowStepDefinition[];
 };
 
+export type InferenceConfigPanelSession = {
+  name: string;
+  transport: 'api' | 'browser' | string;
+  provider?: string | null;
+  model?: string | null;
+  endpoint?: string | null;
+  browser_url?: string | null;
+  is_default: boolean;
+};
+
+export type InferenceConfigPanelStageMapping = {
+  stage_type: string;
+  session: string;
+};
+
+export type InferenceConfigPanel = {
+  sessions: InferenceConfigPanelSession[];
+  stage_mappings: InferenceConfigPanelStageMapping[];
+};
+
+export type InferenceConfigPanelResponse = {
+  ok: boolean;
+  panel: InferenceConfigPanel;
+  inference: Record<string, unknown>;
+};
+
 export type WorkflowStageFieldOption = {
   value: string;
   label: string;
@@ -95,6 +121,11 @@ export type WorkflowStageFieldUi = {
   format?: string;
 };
 
+export type WorkflowStageFieldVisibility = {
+  path: string;
+  equals: unknown;
+};
+
 export type WorkflowStageField = {
   key: string;
   label: string;
@@ -104,6 +135,7 @@ export type WorkflowStageField = {
   description?: string;
   required?: boolean;
   options?: WorkflowStageFieldOption[];
+  visible_when?: WorkflowStageFieldVisibility[];
   ui?: WorkflowStageFieldUi;
 };
 
@@ -258,10 +290,18 @@ export type EventChainCapabilitySummaryItem = {
   status_label: string;
   message: string;
   started_at: string | null;
+  completed_at?: string | null;
   duration_ms: number | null;
   latest_created_at: string;
+  latest_kind?: string;
+  latest_level?: string;
   is_active: boolean;
   event_count: number;
+  start_event_id?: string | null;
+  end_event_id?: string | null;
+  start_payload?: Record<string, unknown> | null;
+  end_payload?: Record<string, unknown> | null;
+  latest_payload?: Record<string, unknown> | null;
 };
 
 export type EventChainSummaryItem = {
@@ -307,13 +347,68 @@ export type StageExecutionChain = {
   items: StageExecutionEvent[];
 };
 
+export type RuntimeNode = {
+  key: string;
+  node_type: string;
+  id: string;
+  status: string;
+  title: string;
+  repo_ref: string;
+  workflow_key?: string | null;
+  current_step_id?: string | null;
+  updated_at: string;
+  payload: Record<string, unknown>;
+};
+
+export type RuntimeEdge = {
+  key: string;
+  parent_key: string;
+  child_key: string;
+  edge_type: string;
+  label: string;
+  sort_order: number;
+  payload: Record<string, unknown>;
+};
+
+export type RuntimeSnapshotResponse = {
+  nodes: RuntimeNode[];
+  edges: RuntimeEdge[];
+  latest_sequence_no: number;
+  server_time: string;
+};
+
+export type RuntimeEventEnvelope = {
+  scope: string;
+  node_key: string;
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  event: StageExecutionEvent;
+};
+
+export type RuntimeProjectionResponse = {
+  runs: EventChainSummaryResponse[];
+};
+
+export type RuntimeEventQuery = {
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  scope?: string | null;
+  after_sequence?: number | null;
+};
+
 export type WorkflowRunActionResult = {
   ok: boolean;
   status?: string;
   step_id?: string;
+  current_step_id?: string;
   next_step_id?: string;
   step_type?: string;
-  message?: string;
+  message?: string | null;
+  run?: WorkflowRun;
   local_state?: Record<string, unknown>;
   execution_plan?: Array<Record<string, unknown>>;
   capability_results?: Array<Record<string, unknown>>;
@@ -377,6 +472,17 @@ export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument
   return fetchJson<CompileWorkflowBuilderResponse>('/api/workflow-builder/compile', {
     method: 'POST',
     body: JSON.stringify({ document })
+  });
+}
+
+export function buildWorkflowBuilderInferencePanel(body: {
+  definition: WorkflowTemplateDefinition;
+  globals: WorkflowGlobalConfig;
+  panel?: InferenceConfigPanel;
+}) {
+  return fetchJson<InferenceConfigPanelResponse>('/api/workflow-builder/inference-panel', {
+    method: 'POST',
+    body: JSON.stringify(body)
   });
 }
 
@@ -528,6 +634,30 @@ export function openEventStream(runId: string, afterSequence = 0): EventSource {
   return new EventSource(`/api/workflow-runs/${runId}/events/stream?after_sequence=${afterSequence}`);
 }
 
+function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
+  const params = new URLSearchParams();
+  if (query.run_id) params.set('run_id', query.run_id);
+  if (query.supervisor_run_id) params.set('supervisor_run_id', query.supervisor_run_id);
+  if (query.workflow_key) params.set('workflow_key', query.workflow_key);
+  if (query.repo_ref) params.set('repo_ref', query.repo_ref);
+  if (query.scope) params.set('scope', query.scope);
+  if (typeof query.after_sequence === 'number') params.set('after_sequence', String(query.after_sequence));
+  const value = params.toString();
+  return value ? `?${value}` : '';
+}
+
+export function getRuntimeSnapshot(query: RuntimeEventQuery = {}) {
+  return fetchJson<RuntimeSnapshotResponse>(`/api/events/snapshot${runtimeEventQueryString(query)}`);
+}
+
+export function getRuntimeProjection(query: RuntimeEventQuery = {}) {
+  return fetchJson<RuntimeProjectionResponse>(`/api/events/projection${runtimeEventQueryString(query)}`);
+}
+
+export function openRuntimeEventStream(query: RuntimeEventQuery = {}): EventSource {
+  return new EventSource(`/api/events/stream${runtimeEventQueryString(query)}`);
+}
+
 export function sendRunAction(runId: string, body: { action: string; step_id?: string | null; payload?: Record<string, unknown> }) {
   return fetchJson<WorkflowRunActionResult>(`/api/workflow-runs/${runId}/actions`, {
     method: 'POST',
@@ -539,6 +669,10 @@ export function startWorkflowRun(runId: string) {
   return sendRunAction(runId, { action: 'start_run' });
 }
 
+export function prepareWorkflowStage(runId: string, stepId?: string | null) {
+  return sendRunAction(runId, { action: 'prepare_stage', step_id: stepId ?? undefined });
+}
+
 export function resumeWorkflowRun(runId: string) {
   return sendRunAction(runId, { action: 'resume_run' });
 }
@@ -548,7 +682,7 @@ export function pauseWorkflowRun(runId: string) {
 }
 
 export function forceWaitWorkflowRun(runId: string) {
-  return sendRunAction(runId, { action: 'force_wait_run' });
+  return sendRunAction(runId, { action: 'cancel_run' });
 }
 
 export function selectWorkflowStep(runId: string, stepId: string) {
@@ -565,6 +699,20 @@ export function runCurrentWorkflowStep(
     step_id: stepId ?? undefined,
     payload
   });
+}
+
+export function resolveWorkflowOperatorCheckpoint(runId: string, disposition: string, selectedStepId?: string | null) {
+  return sendRunAction(runId, {
+    action: 'resolve_operator_checkpoint',
+    payload: {
+      disposition,
+      ...(selectedStepId ? { selected_step_id: selectedStepId } : {})
+    }
+  });
+}
+
+export function resolveWorkflowDispositionReview(runId: string, disposition: string, selectedStepId?: string | null) {
+  return resolveWorkflowOperatorCheckpoint(runId, disposition, selectedStepId);
 }
 
 export function nextWorkflowStep(runId: string) {
@@ -733,6 +881,34 @@ export type ReviewDiffResponse = {
   patch: string;
 };
 
+export type ReviewDiffSessionResponse = {
+  ok: boolean;
+  session_id: string;
+  scope: ReviewDiffScope;
+  from_ref: string;
+  to_ref: string;
+  files: ReviewDiffManifestFileEntry[];
+  file_count: number;
+  byte_count: number;
+};
+
+export type ReviewDiffSessionWindowResponse = {
+  ok: boolean;
+  session_id: string;
+  path: string;
+  start_line: number;
+  line_count: number;
+  total_lines: number;
+  has_more: boolean;
+  lines: string[];
+};
+
+export type ReviewDiffSessionCloseResponse = {
+  ok: boolean;
+  session_id: string;
+  removed: boolean;
+};
+
 export type GitPatchResponse = {
   ok: boolean;
   scope: GitPatchScope;
@@ -757,6 +933,51 @@ export function getReviewDiff(body: {
   whole_file?: boolean;
 }) {
   return fetchJson<ReviewDiffResponse>('/api/review/diff', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function createReviewDiffSession(body: {
+  repo_ref: string;
+  scope: ReviewDiffScope;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewDiffSessionResponse>('/api/review/diff/session', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewDiffSessionWindow(body: {
+  session_id: string;
+  path: string;
+  start_line?: number;
+  line_count?: number;
+}) {
+  return fetchJson<ReviewDiffSessionWindowResponse>('/api/review/diff/session/window', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function createReviewCommitDiffSession(body: {
+  repo_ref: string;
+  commit: string;
+  context_lines?: number;
+  whole_file?: boolean;
+}) {
+  return fetchJson<ReviewDiffSessionResponse>('/api/review/diff/session/commit', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function closeReviewDiffSession(body: {
+  session_id: string;
+}) {
+  return fetchJson<ReviewDiffSessionCloseResponse>('/api/review/diff/session/close', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -823,6 +1044,12 @@ export function getReviewFilePatch(body: {
   });
 }
 
+export type ReviewCommitFileStat = {
+  path: string;
+  additions: number;
+  deletions: number;
+};
+
 export type ReviewCommitSummary = {
   sha: string;
   short_sha: string;
@@ -833,12 +1060,14 @@ export type ReviewCommitSummary = {
   files_changed?: number | null;
   additions?: number | null;
   deletions?: number | null;
+  files?: ReviewCommitFileStat[];
 };
 
 export type ReviewCommitListResponse = {
   ok: boolean;
   commits: ReviewCommitSummary[];
   next_offset?: number | null;
+  next_cursor?: string | null;
   has_more: boolean;
 };
 
@@ -884,10 +1113,29 @@ export type ReviewCommitReportResponse = {
   months: ReviewCommitReportMonthBucket[];
   buckets?: ReviewCommitReportBucket[];
   aggregation_window?: string;
+  aggregation_days?: number;
   color_by?: string;
   exclude_regex: string[];
   next_offset?: number | null;
   has_more: boolean;
+};
+
+export type ReviewCommitAnalyticsResponse = {
+  ok: boolean;
+  status: 'complete' | 'partial' | string;
+  months: ReviewCommitReportMonthBucket[];
+  buckets?: ReviewCommitReportBucket[];
+  totals: {
+    commits: number;
+    additions: number;
+    deletions: number;
+    files_changed: number;
+    net: number;
+  };
+  aggregation_window?: string;
+  aggregation_days?: number;
+  color_by?: string;
+  exclude_regex: string[];
 };
 
 export type ReviewCommitRefOption = {
@@ -923,11 +1171,18 @@ export function getReviewCommits(body: {
   repo_ref: string;
   limit?: number;
   offset?: number;
+  cursor?: string | null;
+  ref_name?: string | null;
   since?: string | null;
   until?: string | null;
+  include_paths?: string[] | null;
+  exclude_paths?: string[] | null;
+  include_extensions?: string[] | null;
+  exclude_extensions?: string[] | null;
+  include_regex?: string[] | null;
   exclude_regex?: string[] | null;
 }) {
-  return fetchJson<ReviewCommitListResponse>('/api/review/commits', {
+  return fetchJson<ReviewCommitListResponse>('/api/review/commits/query', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -939,6 +1194,7 @@ export function getReviewCommitReport(body: {
   offset?: number;
   ref_name?: string | null;
   aggregation_window?: string | null;
+  aggregation_days?: number | null;
   color_by?: string | null;
   since?: string | null;
   until?: string | null;
@@ -950,6 +1206,27 @@ export function getReviewCommitReport(body: {
   exclude_regex?: string[] | null;
 }) {
   return fetchJson<ReviewCommitReportResponse>('/api/review/commit-dataset', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function getReviewCommitAnalytics(body: {
+  repo_ref: string;
+  ref_name?: string | null;
+  aggregation_window?: string | null;
+  aggregation_days?: number | null;
+  color_by?: string | null;
+  since?: string | null;
+  until?: string | null;
+  include_paths?: string[] | null;
+  exclude_paths?: string[] | null;
+  include_extensions?: string[] | null;
+  exclude_extensions?: string[] | null;
+  include_regex?: string[] | null;
+  exclude_regex?: string[] | null;
+}) {
+  return fetchJson<ReviewCommitAnalyticsResponse>('/api/review/commits/analytics', {
     method: 'POST',
     body: JSON.stringify(body)
   });
@@ -1002,6 +1279,16 @@ export function unstageReviewDiff(body: {
   path?: string | null;
 }) {
   return fetchJson<{ ok: boolean }>('/api/review/unstage', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function discardWorkflowReviewDiff(runId: string, body: {
+  scope: ReviewDiffScope;
+  path?: string | null;
+}) {
+  return fetchJson<{ ok: boolean }>(`/api/workflow-runs/${encodeURIComponent(runId)}/review/discard`, {
     method: 'POST',
     body: JSON.stringify(body)
   });

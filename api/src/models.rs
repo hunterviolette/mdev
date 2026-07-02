@@ -155,6 +155,21 @@ pub struct WorkflowTemplateDefinition {
     pub steps: Vec<WorkflowStepDefinition>,
 }
 
+
+pub use crate::engine::capabilities::planner::{
+    ExecutionPlanItem,
+    FeaturePlanItem,
+    FeaturePlanItemStatus,
+};
+
+pub use crate::supervisor::models::{
+    CreateSupervisorRunRequest,
+    SupervisorActionRequest,
+    SupervisorExecutionStrategy,
+    SupervisorRun,
+    SupervisorStatus,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowBuilderCatalog {
     pub version: u32,
@@ -224,7 +239,16 @@ pub struct WorkflowStageField {
     #[serde(default)]
     pub options: Vec<WorkflowStageFieldOption>,
     #[serde(default)]
+    pub visible_when: Vec<WorkflowStageFieldVisibility>,
+    #[serde(default)]
     pub ui: WorkflowStageFieldUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldVisibility {
+    pub path: String,
+    #[serde(default)]
+    pub equals: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,6 +383,21 @@ pub struct WorkflowEventStreamItem {
     pub sequence_no: i64,
     pub level: String,
     pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SprintEventStreamItem {
+    pub id: String,
+    pub sprint_id: String,
+    pub sequence_no: i64,
+    pub event_type: String,
+    pub event_time: String,
+    pub feature_id: Option<String>,
+    pub actor: String,
     pub message: String,
     #[serde(default)]
     pub payload: Value,

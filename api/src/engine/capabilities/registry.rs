@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset, compile_commands, context_export, git_patch_payload, inference, sap};
+use super::{changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, review_validation, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -90,6 +90,10 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
+    if capability == "supervisor_planner_item" || capability == "operator_checkpoint" {
+        return Ok(());
+    }
+
     if capability == policy.entrypoint || policy.allowed_invocations.iter().any(|item| item == capability) {
         return Ok(());
     }
@@ -132,6 +136,25 @@ pub(crate) async fn execute_capability_chain(
     while let Some(invocation) = queue.first().cloned() {
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
+
+        if invocation.capability == "operator_checkpoint" && previous_capability_failed(&results) {
+            append_engine_event(
+                ctx.state,
+                ctx.run_id,
+                Some(ctx.step.id.as_str()),
+                "info",
+                "operator_checkpoint_skipped",
+                "Operator checkpoint skipped because the previous capability failed",
+                json!({
+                    "capability": invocation.capability,
+                    "reason": "previous_capability_failed",
+                    "previous_capability": results.last().map(|item| item.capability.clone()),
+                    "event_meta": event_meta(stage_execution_id.as_deref(), None, None, false)
+                }),
+            )
+            .await?;
+            continue;
+        }
 
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let before_decisions = governance::before_capability(
@@ -187,7 +210,7 @@ pub(crate) async fn execute_capability_chain(
         )
         .await?;
 
-        let result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
+        let mut result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
             Ok(result) => {
                 tracing::info!(
                     run_id = %ctx.run_id,
@@ -242,6 +265,11 @@ pub(crate) async fn execute_capability_chain(
             }
         };
 
+        if let Some(obj) = result.payload.as_object_mut() {
+            obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone().unwrap_or_default()));
+            obj.insert("_capability_invocation_id".to_string(), Value::String(capability_invocation_id.clone()));
+        }
+
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let after_decisions = governance::after_capability(
             ctx.state,
@@ -269,16 +297,30 @@ pub(crate) async fn execute_capability_chain(
             governance::injected_capabilities(&after_decisions)
         };
 
+        let capability_waiting_for_user = result.capability == "operator_checkpoint"
+            && result.payload.get("needs_user_response").and_then(Value::as_bool) == Some(true);
+        let capability_event_kind = if capability_waiting_for_user {
+            format!("{}_waiting", result.capability)
+        } else {
+            format!("{}_completed", result.capability)
+        };
+        let capability_event_message = if capability_waiting_for_user {
+            "Operator checkpoint is waiting for user input.".to_string()
+        } else {
+            format!("{} completed", result.capability.replace('_', " "))
+        };
+
         append_engine_event(
             ctx.state,
             ctx.run_id,
             Some(ctx.step.id.as_str()),
             if result.ok { "info" } else { "error" },
-            &format!("{}_completed", result.capability),
-            &format!("{} completed", result.capability.replace('_', " ")),
+            capability_event_kind.as_str(),
+            capability_event_message.as_str(),
             json!({
                 "capability": result.capability,
                 "ok": result.ok,
+                "waiting_for_user": capability_waiting_for_user,
                 "duration_ms": i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
                 "result": result.payload,
                 "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
@@ -296,17 +338,33 @@ pub(crate) async fn execute_capability_chain(
             "capability result recorded"
         );
 
+        if capability_waiting_for_user {
+            results.push(result);
+            break;
+        }
+
         let existing_capabilities: std::collections::HashSet<String> = queue
             .iter()
             .map(|item| item.capability.clone())
             .chain(results.iter().map(|item| item.capability.clone()))
             .collect();
 
-        let follow_ups = follow_up_vec(&result.follow_ups)
+        let mut follow_ups = follow_up_vec(&result.follow_ups)
             .into_iter()
             .chain(governance_follow_ups.into_iter())
             .filter(|item| !existing_capabilities.contains(&item.capability))
             .collect::<Vec<_>>();
+
+        if result.capability == "inference"
+            && supervisor_planner_item_auto_apply_enabled(&ctx)
+            && !existing_capabilities.contains("supervisor_planner_item")
+            && !queue.iter().any(|item| item.capability == "supervisor_planner_item")
+        {
+            follow_ups.push(CapabilityInvocation {
+                capability: "supervisor_planner_item".to_string(),
+                config: json!({}),
+            });
+        }
 
         queue.extend(follow_ups);
         results.push(result);
@@ -318,12 +376,36 @@ pub(crate) async fn execute_capability_chain(
     Ok(results)
 }
 
+fn previous_capability_failed(results: &[CapabilityResult]) -> bool {
+    results.last().map(|item| !item.ok).unwrap_or(false)
+}
+
 fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation> {
     match req {
         CapabilityInvocationRequest::None => Vec::new(),
         CapabilityInvocationRequest::One(item) => vec![item.clone()],
         CapabilityInvocationRequest::Many(items) => items.clone(),
     }
+}
+
+fn supervisor_planner_item_auto_apply_enabled(ctx: &CapabilityContext<'_>) -> bool {
+    let planner = ctx
+        .local_state
+        .get("capabilities")
+        .and_then(|value| value.get("planner"));
+
+    let has_selected_feature_id = planner
+        .and_then(|value| value.get("selected_feature_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    let auto_apply_enabled = planner
+        .and_then(|value| value.get("auto_apply_armed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    has_selected_feature_id && auto_apply_enabled
 }
 
 async fn dispatch(
@@ -336,9 +418,12 @@ async fn dispatch(
         "inference" => inference::execute(ctx, prior_results, invocation.config).await,
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
-        "gateway_model/changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
+        "changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
+        "supervisor_planner_item" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
+        "review_validation" => review_validation::execute(ctx, prior_results, invocation.config).await,
+        "operator_checkpoint" => operator_checkpoint::execute(ctx, prior_results, invocation.config).await,
         "sap/import" => sap::import::execute(ctx, prior_results, invocation.config).await,
         "sap/export" => sap::export::execute(ctx, prior_results, invocation.config).await,
         other => Err(anyhow!("unknown capability '{}'", other)),

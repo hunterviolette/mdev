@@ -13,7 +13,143 @@ pub fn router() -> Router<AppState> {
         .route("/api/workflow-builder-contract", get(get_workflow_builder_contract))
 }
 
+const DEFAULT_REFINEMENT_TEMPLATE_NAME: &str = "Default refinement workflow";
+
+async fn ensure_default_refinement_template(state: &AppState) -> Result<(), (axum::http::StatusCode, String)> {
+    let now = Utc::now();
+    let definition = serde_json::to_string_pretty(&default_refinement_definition()).map_err(internal)?;
+    let existing = sqlx::query("SELECT id, created_at FROM workflow_templates WHERE name = ?")
+        .bind(DEFAULT_REFINEMENT_TEMPLATE_NAME)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal)?;
+
+    if let Some(row) = existing {
+        sqlx::query("UPDATE workflow_templates SET description = ?, repo_ref = ?, definition_json = ?, updated_at = ? WHERE id = ?")
+            .bind("Design v2 workflow used by supervisor planner feature refinement.")
+            .bind("")
+            .bind(definition)
+            .bind(now.to_rfc3339())
+            .bind(row.get::<String, _>("id"))
+            .execute(&state.db)
+            .await
+            .map_err(internal)?;
+    } else {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workflow_templates (id, name, description, repo_ref, definition_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(id.to_string())
+            .bind(DEFAULT_REFINEMENT_TEMPLATE_NAME)
+            .bind("Design v2 workflow used by supervisor planner feature refinement.")
+            .bind("")
+            .bind(definition)
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(&state.db)
+            .await
+            .map_err(internal)?;
+    }
+
+    Ok(())
+}
+
+fn default_refinement_definition() -> WorkflowTemplateDefinition {
+    serde_json::from_value(json!({
+        "version": 1,
+        "globals": {
+            "resources": {
+                "repo": {
+                    "repo_ref": "",
+                    "git_ref": "WORKTREE"
+                }
+            },
+            "capabilities": {
+                "inference": {},
+                "context_export": {
+                    "enabled": true,
+                    "save_path": "/tmp/repo_context.txt"
+                },
+                "changeset_schema": {},
+                "gateway_model/changeset": {},
+                "compile_commands": {},
+                "sap/import": {},
+                "sap/export": {}
+            },
+            "automation": {}
+        },
+        "governance": {},
+        "steps": [
+            {
+                "id": "design",
+                "name": "Design",
+                "step_type": "design",
+                "automation_mode": "manual",
+                "execution": {
+                    "changeset_apply": {},
+                    "compile_checks": {}
+                },
+                "prompt": {
+                    "include_repo_context": true,
+                    "include_changeset_schema": false,
+                    "include_user_context": true
+                },
+                "config": {
+                    "design_mode": "v2"
+                },
+                "capabilities": [],
+                "execution_logic": {
+                    "kind": "design_stage_policy",
+                    "mode": "v2",
+                    "connection_bundles": ["design_code_inference_default"],
+                    "connections": {
+                        "inference": {
+                            "repo_context": {}
+                        }
+                    },
+                    "structured_output": {
+                        "fine_feature_format_armed": false,
+                        "auto_normalize_and_apply_to_planner": false,
+                        "preserve_rough_definition": true,
+                        "schema_id": "supervisor_feature_plan_item_v1",
+                        "apply_handler": "supervisor_planner_item"
+                    }
+                },
+                "execution_plan": [
+                    {
+                        "kind": "capability",
+                        "key": "context_export",
+                        "enabled": true,
+                        "config": {},
+                        "input_mapping": {},
+                        "output_mapping": {},
+                        "run_after": [],
+                        "condition": null
+                    },
+                    {
+                        "kind": "capability",
+                        "key": "inference",
+                        "enabled": true,
+                        "config": {},
+                        "input_mapping": {},
+                        "output_mapping": {},
+                        "run_after": ["context_export"],
+                        "condition": null
+                    }
+                ],
+                "transitions": [],
+                "advancement": {
+                    "mode": "manual",
+                    "auto_run_on_enter": false,
+                    "auto_advance_on_success": false,
+                    "auto_advance_on_error": false,
+                    "auto_advance_on_paused": false
+                }
+            }
+        ]
+    })).expect("default refinement workflow definition must be valid")
+}
+
 async fn list_templates(State(state): State<AppState>) -> Result<Json<Vec<WorkflowTemplate>>, (axum::http::StatusCode, String)> {
+    ensure_default_refinement_template(&state).await?;
     let rows = sqlx::query(
         "SELECT id, name, description, repo_ref, definition_json, created_at, updated_at FROM workflow_templates ORDER BY updated_at DESC"
     )
@@ -105,6 +241,19 @@ async fn delete_template(
     State(state): State<AppState>,
     Path(template_id): Path<Uuid>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let protected = sqlx::query("SELECT name FROM workflow_templates WHERE id = ?")
+        .bind(template_id.to_string())
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal)?
+        .and_then(|row| row.try_get::<String, _>("name").ok())
+        .map(|name| name == DEFAULT_REFINEMENT_TEMPLATE_NAME)
+        .unwrap_or(false);
+
+    if protected {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Default refinement workflow cannot be deleted".to_string()));
+    }
+
     let result = sqlx::query("DELETE FROM workflow_templates WHERE id = ?")
         .bind(template_id.to_string())
         .execute(&state.db)
