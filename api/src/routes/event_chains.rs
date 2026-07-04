@@ -9,7 +9,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
@@ -85,6 +85,42 @@ struct RuntimeProjectionResponse {
 struct StreamQuery {
     #[serde(default)]
     after_sequence: Option<i64>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    stage_execution_id: Option<String>,
+    #[serde(default)]
+    capability_invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct EventHistoryQuery {
+    #[serde(default)]
+    before_sequence: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    stage_execution_id: Option<String>,
+    #[serde(default)]
+    capability_invocation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventHistoryResponse {
+    run_id: String,
+    items: Vec<StageChainEvent>,
+    next_before_sequence: Option<i64>,
+    has_more: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -164,6 +200,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/events/projection", get(get_runtime_projection))
         .route("/api/events/stream", get(stream_runtime_events))
         .route("/api/workflow-runs/:run_id/event-chain", get(get_event_chain_summary))
+        .route("/api/workflow-runs/:run_id/event-history", get(get_event_history))
         .route("/api/workflow-runs/:run_id/stages/:step_id/executions/:stage_execution_id", get(get_stage_execution_chain))
         .route("/api/workflow-runs/:run_id/events/stream", get(stream_events))
 }
@@ -647,6 +684,133 @@ async fn build_event_chain_summary(
     })
 }
 
+fn non_empty_filter(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+}
+
+fn event_matches_history_query(event: &StageChainEvent, query: &StreamQuery) -> bool {
+    if let Some(stage_execution_id) = non_empty_filter(&query.stage_execution_id) {
+        if event.stage_execution_id.as_deref() != Some(stage_execution_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(capability_invocation_id) = non_empty_filter(&query.capability_invocation_id) {
+        if event.capability_invocation_id.as_deref() != Some(capability_invocation_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(stage) = non_empty_filter(&query.stage) {
+        if event.step_id.as_deref() != Some(stage.as_str()) {
+            return false;
+        }
+    }
+    if let Some(capability) = non_empty_filter(&query.capability) {
+        let needle = capability.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {} {}",
+            event.capability_invocation_id.as_deref().unwrap_or_default(),
+            event.kind,
+            event.message,
+            event.payload.get("capability").and_then(Value::as_str).unwrap_or_default(),
+            event.payload.get("capability_key").and_then(Value::as_str).unwrap_or_default()
+        ).to_lowercase();
+        if !haystack.contains(&needle) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn get_event_history(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Query(query): Query<EventHistoryQuery>,
+) -> Result<Json<EventHistoryResponse>, (axum::http::StatusCode, String)> {
+    let limit = query.limit.unwrap_or(100).clamp(25, 500);
+    eprintln!(
+        "[event_history] request run_id={} limit={} before_sequence={:?} start={:?} end={:?} stage={:?} capability={:?} stage_execution_id={:?} capability_invocation_id={:?}",
+        run_id,
+        limit,
+        query.before_sequence,
+        query.start,
+        query.end,
+        query.stage,
+        query.capability,
+        query.stage_execution_id,
+        query.capability_invocation_id
+    );
+    let mut builder = QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = "
+    );
+    builder.push_bind(run_id.to_string());
+
+    if let Some(before_sequence) = query.before_sequence {
+        builder.push(" AND sequence_no < ");
+        builder.push_bind(before_sequence);
+    }
+    if let Some(start) = non_empty_filter(&query.start) {
+        builder.push(" AND created_at >= ");
+        builder.push_bind(start);
+    }
+    if let Some(end) = non_empty_filter(&query.end) {
+        builder.push(" AND created_at <= ");
+        builder.push_bind(end);
+    }
+    if let Some(stage) = non_empty_filter(&query.stage) {
+        builder.push(" AND step_id = ");
+        builder.push_bind(stage);
+    }
+    if let Some(stage_execution_id) = non_empty_filter(&query.stage_execution_id) {
+        builder.push(" AND stage_execution_id = ");
+        builder.push_bind(stage_execution_id);
+    }
+    if let Some(capability_invocation_id) = non_empty_filter(&query.capability_invocation_id) {
+        builder.push(" AND capability_invocation_id = ");
+        builder.push_bind(capability_invocation_id);
+    }
+    if let Some(capability) = non_empty_filter(&query.capability) {
+        let like = format!("%{}%", capability);
+        builder.push(" AND (capability_invocation_id = ");
+        builder.push_bind(capability.clone());
+        builder.push(" OR kind LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR message LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR payload_json LIKE ");
+        builder.push_bind(like);
+        builder.push(")");
+    }
+
+    builder.push(" ORDER BY sequence_no DESC LIMIT ");
+    builder.push_bind(limit + 1);
+
+    let mut rows = builder.build().fetch_all(&state.db).await.map_err(internal)?;
+    eprintln!("[event_history] db rows run_id={} count={} requested_limit={}", run_id, rows.len(), limit);
+    let has_more = rows.len() as i64 > limit;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+
+    let mut items = rows.into_iter().map(row_to_stage_chain_event).collect::<Result<Vec<_>, _>>()?;
+    items.reverse();
+    let next_before_sequence = items.first().map(|item| item.sequence_no);
+
+    eprintln!(
+        "[event_history] response run_id={} items={} has_more={} next_before_sequence={:?}",
+        run_id,
+        items.len(),
+        has_more,
+        next_before_sequence
+    );
+
+    Ok(Json(EventHistoryResponse {
+        run_id: run_id.to_string(),
+        items,
+        next_before_sequence,
+        has_more,
+    }))
+}
+
 async fn get_stage_execution_chain(
     State(state): State<AppState>,
     Path((run_id, step_id, stage_execution_id)): Path<(Uuid, String, String)>,
@@ -702,6 +866,10 @@ async fn stream_events(
         let mut sent_snapshot = false;
         for row in rows {
             if let Ok(item) = row_to_stage_chain_event(row) {
+                if !event_matches_history_query(&item, &query) {
+                    last_sequence = last_sequence.max(item.sequence_no);
+                    continue;
+                }
                 last_sequence = last_sequence.max(item.sequence_no);
                 if let Some(event) = workflow_event_sse(&item) {
                     if tx.send(Ok(event)).is_err() {
@@ -723,7 +891,7 @@ async fn stream_events(
         loop {
             match live_rx.recv().await {
                 Ok(item) => {
-                    if item.run_id != run_id_str || item.sequence_no <= last_sequence {
+                    if item.run_id != run_id_str || item.sequence_no <= last_sequence || !event_matches_history_query(&item, &query) {
                         continue;
                     }
                     last_sequence = item.sequence_no;
@@ -754,6 +922,10 @@ async fn stream_events(
                     let mut saw_rows = false;
                     for row in rows {
                         if let Ok(item) = row_to_stage_chain_event(row) {
+                            if !event_matches_history_query(&item, &query) {
+                                last_sequence = last_sequence.max(item.sequence_no);
+                                continue;
+                            }
                             saw_rows = true;
                             last_sequence = last_sequence.max(item.sequence_no);
                             if let Some(event) = workflow_event_sse(&item) {

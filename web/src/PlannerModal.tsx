@@ -1,12 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Badge, Button, Group, Modal, ScrollArea, Select, Stack, Table, Text, TextInput, Textarea } from '@mantine/core';
-import { listTemplates, type WorkflowTemplate } from './api';
+import { Badge, Button, ComboboxItem, Group, Modal, ScrollArea, Select, Stack, Table, Text, TextInput, Textarea } from '@mantine/core';
+import type { WorkflowTemplate } from './api';
+import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, setDefaultPlanner, updatePlannerFeatures, type PlannerWorkspace } from './planner_api';
 import {
   applyPlannerImport,
-  ensureSupervisorPlannerRun,
   previewPlannerImport,
-  refineSupervisorFeature,
-  updateSupervisorPlan,
   type FeaturePlanItem,
   type FeaturePlanItemStatus,
   type PlannerImportAction,
@@ -25,10 +23,13 @@ type Props = {
   rootRepoPath: string;
   run?: SupervisorRun | null;
   templates?: WorkflowTemplate[];
+  plannerOptions?: PlannerWorkspace[];
   selectedFeatureId?: string | null;
   selectedPlannerId?: string | null;
   selectionMode?: boolean;
+  createFeatureOnOpen?: boolean;
   onSelectFeature?: (selection: PlannerSelection) => void | Promise<void>;
+  onFeatureCreated?: (selection: PlannerSelection) => void | Promise<void>;
   onClose: () => void;
   onSaved?: () => Promise<void> | void;
   onWorkflowRunCreated?: (workflowRunId: string) => Promise<void> | void;
@@ -44,6 +45,16 @@ function normalizePlannerRoot(value: string): string {
   const supervisorIndex = normalized.indexOf(supervisorShardMarker);
   if (supervisorIndex > 0) return normalized.slice(0, supervisorIndex);
   return normalized.replace(/\/+$/g, '');
+}
+
+function plannerRootKey(value: string): string {
+  return normalizePlannerRoot(value).toLowerCase();
+}
+
+function plannerRootMatches(candidate: string, root: string): boolean {
+  const candidateKey = plannerRootKey(candidate);
+  const rootKey = plannerRootKey(root);
+  return !rootKey || candidateKey === rootKey || rootKey.startsWith(`${candidateKey}/`);
 }
 
 function repoPlannerTitle(rootRepoPath: string): string {
@@ -71,10 +82,6 @@ function titleCaseStatus(status: string): string {
 
 function featureTitle(item: FeaturePlanItem): string {
   return item.title?.trim() || item.summary?.trim() || item.id;
-}
-
-function templateOptions(templates: WorkflowTemplate[]) {
-  return templates.map((template) => ({ value: template.id, label: template.name }));
 }
 
 function importActionOptions() {
@@ -139,13 +146,84 @@ function normalizePlannerImportPayload(payload: unknown): unknown {
   return payload;
 }
 
+function plannerImportFeatures(payload: unknown): FeaturePlanItem[] {
+  const normalized = normalizePlannerImportPayload(payload);
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return [];
+  const features = (normalized as Record<string, unknown>).features;
+  if (!Array.isArray(features)) return [];
+  return features.filter((item): item is FeaturePlanItem => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const record = item as Record<string, unknown>;
+    return typeof record.id === 'string' && typeof record.title === 'string';
+  });
+}
+
+function mergePlannerFeatures(current: FeaturePlanItem[], incoming: FeaturePlanItem[]): FeaturePlanItem[] {
+  const merged = [...current];
+  for (const item of incoming) {
+    const index = merged.findIndex((existing) => existing.id === item.id);
+    if (index >= 0) {
+      merged[index] = item;
+    } else {
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
+function newFeatureId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return `feature-${crypto.randomUUID()}`;
+  return `feature-${Date.now().toString(36)}`;
+}
+
+function newFeatureDraft(index: number): FeaturePlanItem {
+  return {
+    id: newFeatureId(),
+    title: `New feature ${index}`,
+    status: 'rough',
+    summary: '',
+    rough_summary: '',
+    requirements: [],
+    acceptance_criteria: [],
+    implementation_notes: [],
+    review_expectations: [],
+    target_files_or_areas: [],
+    dependencies: [],
+  };
+}
+
+function plannerFeatureCountLabel(count: number): string {
+  return `${count} ${count === 1 ? 'feature' : 'features'}`;
+}
+
+function plannerOptionLabel(option: PlannerWorkspace, appliedPlannerId: string | null): string {
+  const parts = [option.title, plannerFeatureCountLabel(option.feature_plan_items?.length ?? 0)];
+  if (option.id === appliedPlannerId) parts.push('current');
+  if (option.is_default) parts.push('default');
+  return parts.join(' · ');
+}
+
+function mergePlannerWorkspaceRows(apiRows: PlannerWorkspace[], propRows: PlannerWorkspace[] | undefined): PlannerWorkspace[] {
+  const byId = new Map<string, PlannerWorkspace>();
+  for (const item of propRows ?? []) byId.set(item.id, item);
+  for (const item of apiRows) byId.set(item.id, item);
+  return Array.from(byId.values());
+}
+
 export function PlannerModal(props: Props) {
   const rootRepoPath = normalizePlannerRoot(props.rootRepoPath || props.run?.root_repo_path || '');
   const [run, setRun] = useState<SupervisorRun | null>(props.run ?? null);
-  const [templates, setTemplates] = useState<WorkflowTemplate[]>(props.templates ?? []);
   const [featureSearch, setFeatureSearch] = useState('');
-  const [refinementTemplateId, setRefinementTemplateId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [plannerOptionsOpen, setPlannerOptionsOpen] = useState(false);
+  const [createPlannerOpen, setCreatePlannerOpen] = useState(false);
+  const [createFeatureOpen, setCreateFeatureOpen] = useState(false);
+  const [createFeatureTitle, setCreateFeatureTitle] = useState('');
+  const [createFeatureSummary, setCreateFeatureSummary] = useState('');
+  const [plannerSelectionId, setPlannerSelectionId] = useState<string | null>(props.selectedPlannerId ?? null);
+  const [appliedPlannerId, setAppliedPlannerId] = useState<string | null>(props.selectedPlannerId ?? null);
+  const [newPlannerTitle, setNewPlannerTitle] = useState(repoPlannerTitle(rootRepoPath));
+  const [plannerWorkspaces, setPlannerWorkspaces] = useState<PlannerWorkspace[]>(props.plannerOptions ?? []);
   const [busyFeatureId, setBusyFeatureId] = useState<string | null>(null);
   const [viewFeature, setViewFeature] = useState<FeaturePlanItem | null>(null);
   const [featureDraft, setFeatureDraft] = useState<FeaturePlanItem | null>(null);
@@ -156,11 +234,19 @@ export function PlannerModal(props: Props) {
   const [importReviewOpen, setImportReviewOpen] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  const effectiveTemplates = props.templates ?? templates;
-  const refinementTemplateOptions = useMemo(() => templateOptions(effectiveTemplates), [effectiveTemplates]);
   const statusOptions = useMemo(() => FEATURE_STATUSES.map((status) => ({ value: status, label: titleCaseStatus(status) })), []);
   const importActions = useMemo(() => importActionOptions(), []);
-  const features = run?.feature_plan_items ?? [];
+  const plannerOptions = useMemo(() => {
+    return plannerWorkspaces.filter((option) => plannerRootMatches(option.root_repo_path, rootRepoPath));
+  }, [plannerWorkspaces, rootRepoPath]);
+  const selectedPlannerWorkspace = useMemo(() => {
+    return plannerOptions.find((option) => option.id === appliedPlannerId) ?? plannerOptions.find((option) => option.is_default) ?? plannerOptions[0] ?? null;
+  }, [plannerOptions, appliedPlannerId]);
+  const features = selectedPlannerWorkspace?.feature_plan_items ?? [];
+  const plannerSelectOptions = useMemo(() => plannerOptions.map((option) => ({
+    value: option.id,
+    label: plannerOptionLabel(option, appliedPlannerId),
+  })), [plannerOptions, appliedPlannerId]);
 
   const filteredFeatures = useMemo(() => {
     const needle = featureSearch.trim().toLowerCase();
@@ -183,21 +269,54 @@ export function PlannerModal(props: Props) {
   }, [props.run?.id]);
 
   useEffect(() => {
+    if (!props.plannerOptions || props.plannerOptions.length === 0) return;
+    setPlannerWorkspaces((current) => {
+      const byId = new Map(current.map((item) => [item.id, item]));
+      for (const item of props.plannerOptions ?? []) byId.set(item.id, item);
+      return Array.from(byId.values());
+    });
+  }, [props.plannerOptions]);
+
+  useEffect(() => {
+    if (!props.selectedPlannerId) return;
+    setPlannerSelectionId(props.selectedPlannerId);
+    setAppliedPlannerId(props.selectedPlannerId);
+  }, [props.selectedPlannerId]);
+
+  useEffect(() => {
+    setNewPlannerTitle((current) => current.trim() || repoPlannerTitle(rootRepoPath));
+  }, [rootRepoPath]);
+
+  useEffect(() => {
+    const fallbackId = plannerOptions.find((option) => option.is_default)?.id ?? plannerOptions[0]?.id ?? null;
+    setAppliedPlannerId((current) => current && plannerOptions.some((option) => option.id === current) ? current : fallbackId);
+    setPlannerSelectionId((current) => current && plannerOptions.some((option) => option.id === current) ? current : fallbackId);
+  }, [plannerOptions]);
+
+  useEffect(() => {
     if (!props.opened) return;
     let cancelled = false;
+
+    if (props.selectionMode) {
+      setCreateFeatureOpen(false);
+      setCreateFeatureTitle('');
+      setCreateFeatureSummary('');
+    }
+
+    if (props.createFeatureOnOpen) {
+      setCreateFeatureTitle(`New feature ${features.length + 1}`);
+      setCreateFeatureSummary('');
+      setCreateFeatureOpen(true);
+    }
 
     async function load() {
       if (!rootRepoPath) return;
       try {
         setBusy(true);
-        const [templateRows, plannerResponse] = await Promise.all([
-          props.templates ? Promise.resolve(props.templates) : listTemplates(),
-          ensureSupervisorPlannerRun({ root_repo_path: rootRepoPath, title: repoPlannerTitle(rootRepoPath) }),
-        ]);
+        const plannerRows = await listPlannersForRepo(rootRepoPath);
         if (cancelled) return;
-        setTemplates(templateRows);
-        setRun(plannerResponse.supervisor_run);
-        setRefinementTemplateId((current) => current ?? (templateRows.find((template) => template.name.toLowerCase().includes('refinement')) ?? templateRows[0] ?? null)?.id ?? null);
+        setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
+        setRun(props.run ?? null);
       } catch (err) {
         if (!cancelled) props.onError?.(err instanceof Error ? err.message : String(err));
       } finally {
@@ -212,20 +331,86 @@ export function PlannerModal(props: Props) {
   }, [props.opened, rootRepoPath]);
 
   async function reload() {
-    if (!rootRepoPath) return;
-    const response = await ensureSupervisorPlannerRun({ root_repo_path: rootRepoPath, title: repoPlannerTitle(rootRepoPath) });
-    setRun(response.supervisor_run);
+    if (rootRepoPath) {
+      const plannerRows = await listPlannersForRepo(rootRepoPath);
+      setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
+    }
+    setRun(props.run ?? run);
     await props.onSaved?.();
   }
 
-  async function createPlanner() {
+  async function applyPlannerSelection() {
+    if (!plannerSelectionId) return;
+    const selected = plannerOptions.find((option) => option.id === plannerSelectionId);
+    if (!selected) return;
+
+    try {
+      setBusy(true);
+      await setDefaultPlanner(selected.id);
+      const plannerRows = rootRepoPath ? await listPlannersForRepo(rootRepoPath) : [];
+      setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
+      setAppliedPlannerId(selected.id);
+      setPlannerSelectionId(selected.id);
+      setPlannerOptionsOpen(false);
+      await props.onSaved?.();
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteSelectedPlanner() {
+    if (!plannerSelectionId) return;
+    const selected = plannerOptions.find((option) => option.id === plannerSelectionId);
+    if (!selected) return;
+    const confirmed = window.confirm(`Delete planner "${selected.title}"? This removes the planner feature log and cannot be undone.`);
+    if (!confirmed) return;
+
+    try {
+      setBusy(true);
+      await deletePlannerForRepo(selected.id);
+      const plannerRows = rootRepoPath ? await listPlannersForRepo(rootRepoPath) : [];
+      setPlannerWorkspaces(() => {
+        const byId = new Map(plannerRows.map((item) => [item.id, item]));
+        for (const item of props.plannerOptions ?? []) {
+          if (item.id !== selected.id) byId.set(item.id, item);
+        }
+        return Array.from(byId.values());
+      });
+      const fallback = plannerRows.find((item) => item.is_default)?.id ?? plannerRows[0]?.id ?? null;
+      setAppliedPlannerId((current) => current === selected.id ? fallback : current);
+      setPlannerSelectionId(fallback);
+      await props.onSaved?.();
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function requestCreatePlanner() {
     if (!rootRepoPath) {
       props.onError?.('Repo root is required before creating a planner.');
       return;
     }
+
     try {
       setBusy(true);
-      await reload();
+      const planner = await createPlannerForRepo({
+        root_repo_path: rootRepoPath,
+        title: newPlannerTitle.trim() || repoPlannerTitle(rootRepoPath),
+        make_default: plannerOptions.length === 0,
+        feature_plan_items: [],
+      });
+      await setDefaultPlanner(planner.id);
+      const plannerRows = await listPlannersForRepo(rootRepoPath);
+      setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows.some((item) => item.id === planner.id) ? plannerRows : [planner, ...plannerRows], props.plannerOptions));
+      setAppliedPlannerId(planner.id);
+      setPlannerSelectionId(planner.id);
+      setPlannerOptionsOpen(false);
+      setCreatePlannerOpen(false);
+      await props.onSaved?.();
     } catch (err) {
       props.onError?.(err instanceof Error ? err.message : String(err));
     } finally {
@@ -234,24 +419,24 @@ export function PlannerModal(props: Props) {
   }
 
   function downloadPlanner() {
-    if (!run) return;
+    if (!selectedPlannerWorkspace) return;
     const payload = {
       version: 1,
       kind: 'planner_features',
-      root_repo_path: run.root_repo_path,
+      root_repo_path: selectedPlannerWorkspace.root_repo_path,
       planner: {
-        id: run.id,
-        title: run.title,
-        root_repo_path: run.root_repo_path,
+        id: selectedPlannerWorkspace.id,
+        title: selectedPlannerWorkspace.title,
+        root_repo_path: selectedPlannerWorkspace.root_repo_path,
       },
-      features: run.feature_plan_items ?? [],
-      feature_plan_items: run.feature_plan_items ?? [],
+      features: selectedPlannerWorkspace.feature_plan_items ?? [],
+      feature_plan_items: selectedPlannerWorkspace.feature_plan_items ?? [],
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${repoPlannerTitle(run.root_repo_path).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'planner'}-features.json`;
+    link.download = `${repoPlannerTitle(selectedPlannerWorkspace.root_repo_path).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'planner'}-features.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -260,29 +445,25 @@ export function PlannerModal(props: Props) {
 
   async function importPlannerFile(file: File | null | undefined) {
     if (!file) return;
-    if (!run) {
-      props.onError?.('Planner must be loaded before importing features.');
+    if (!selectedPlannerWorkspace) {
+      props.onError?.('Planner feature log must be selected before importing features.');
       return;
     }
 
     try {
       setBusy(true);
-      const payload = normalizePlannerImportPayload(JSON.parse(await file.text()) as unknown);
-      const preview = await previewPlannerImport(run.id, payload);
-      const decisions = Object.fromEntries(preview.items.map((item) => [
-        item.import_index,
-        {
-          import_index: item.import_index,
-          action: item.default_action,
-          existing_feature_id: item.existing_feature_id ?? null,
-        } satisfies PlannerImportDecision,
-      ]));
-      setImportPayload(payload);
-      setImportPreview(preview);
-      setImportDecisions(decisions);
-      setImportReviewOpen(true);
+      const payload = JSON.parse(await file.text()) as unknown;
+      const importedFeatures = plannerImportFeatures(payload);
+      if (importedFeatures.length === 0) {
+        props.onError?.('Planner import did not contain any valid features.');
+        return;
+      }
+      const planner = await updatePlannerFeatures(selectedPlannerWorkspace.id, mergePlannerFeatures(features, importedFeatures));
+      setPlannerWorkspaces((current) => current.map((item) => item.id === planner.id ? planner : item));
+      setPlannerSelectionId(planner.id);
+      await props.onSaved?.();
     } catch (err) {
-      props.onError?.(`Planner import preview failed: ${err instanceof Error ? err.message : String(err)}`);
+      props.onError?.(`Planner import failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setBusy(false);
       if (importInputRef.current) importInputRef.current.value = '';
@@ -322,26 +503,61 @@ export function PlannerModal(props: Props) {
   async function selectFeature(feature: FeaturePlanItem | null) {
     if (!props.onSelectFeature) return;
     await props.onSelectFeature({
-      planner: run ? { id: run.id, root_repo_path: run.root_repo_path, title: run.title } : null,
+      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title } : null,
       feature,
     });
     props.onClose();
   }
 
   async function persistFeatures(nextFeatures: FeaturePlanItem[]) {
-    if (!run) return;
-    await updateSupervisorPlan(run.id, nextFeatures, run.execution_plan_items, {
-      sprint_strategy: run.strategy,
-      planner_refinement_template_id: refinementTemplateId,
-    });
-    await reload();
+    if (!selectedPlannerWorkspace) return;
+    const planner = await updatePlannerFeatures(selectedPlannerWorkspace.id, nextFeatures);
+    setPlannerWorkspaces((current) => current.map((item) => item.id === planner.id ? planner : item));
+    await props.onSaved?.();
+  }
+
+  function openCreateFeature() {
+    setCreateFeatureTitle(`New feature ${features.length + 1}`);
+    setCreateFeatureSummary('');
+    setCreateFeatureOpen(true);
+  }
+
+  async function saveCreatedFeature() {
+    if (!selectedPlannerWorkspace) return;
+    const title = createFeatureTitle.trim();
+    if (!title) {
+      props.onError?.('Feature title is required.');
+      return;
+    }
+
+    try {
+      const draft = {
+        ...newFeatureDraft(features.length + 1),
+        title,
+        summary: createFeatureSummary.trim(),
+        rough_summary: createFeatureSummary.trim(),
+      };
+      setBusyFeatureId(draft.id);
+      const planner = await updatePlannerFeatures(selectedPlannerWorkspace.id, [draft, ...features]);
+      setPlannerWorkspaces((current) => current.map((item) => item.id === planner.id ? planner : item));
+      setCreateFeatureOpen(false);
+      await props.onFeatureCreated?.({
+        planner: { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title },
+        feature: draft,
+      });
+      await props.onSaved?.();
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyFeatureId(null);
+    }
   }
 
   async function saveFeatureDraft() {
-    if (!run || !featureDraft) return;
+    if (!selectedPlannerWorkspace || !featureDraft) return;
     try {
       setBusyFeatureId(featureDraft.id);
-      const nextFeatures = run.feature_plan_items.map((item) => item.id === featureDraft.id ? featureDraft : item);
+      const nextFeatures = features.map((item) => item.id === featureDraft.id ? featureDraft : item);
       await persistFeatures(nextFeatures);
       setViewFeature(featureDraft);
       setFeatureDraft(defaultFeatureDraft(featureDraft));
@@ -354,11 +570,11 @@ export function PlannerModal(props: Props) {
   }
 
   async function setFeatureStatus(feature: FeaturePlanItem, status: FeaturePlanItemStatus) {
-    if (!run) return;
+    if (!selectedPlannerWorkspace) return;
     try {
       setBusyFeatureId(feature.id);
       const nextFeature = { ...feature, status };
-      const nextFeatures = run.feature_plan_items.map((item) => item.id === feature.id ? nextFeature : item);
+      const nextFeatures = features.map((item) => item.id === feature.id ? nextFeature : item);
       await persistFeatures(nextFeatures);
       if (viewFeature?.id === feature.id) {
         setViewFeature(nextFeature);
@@ -371,15 +587,20 @@ export function PlannerModal(props: Props) {
     }
   }
 
-  async function refineFeature(feature: FeaturePlanItem) {
-    if (!run) return;
+  async function deleteFeature(feature: FeaturePlanItem) {
+    if (!selectedPlannerWorkspace) return;
+    const confirmed = window.confirm(`Delete planner feature "${featureTitle(feature)}"? This removes it from the planner feature log.`);
+    if (!confirmed) return;
     try {
       setBusyFeatureId(feature.id);
-      const response = await refineSupervisorFeature(run.id, feature.id, refinementTemplateId);
-      await reload();
-      if (response.workflow_run_id) {
-        await props.onWorkflowRunCreated?.(response.workflow_run_id);
+      const nextFeatures = features.filter((item) => item.id !== feature.id);
+      await persistFeatures(nextFeatures);
+      if (viewFeature?.id === feature.id) {
+        setViewFeature(null);
+        setFeatureDraft(null);
+        setFeatureEditMode(false);
       }
+      await reload();
     } catch (err) {
       props.onError?.(err instanceof Error ? err.message : String(err));
     } finally {
@@ -399,6 +620,35 @@ export function PlannerModal(props: Props) {
     setFeatureEditMode(true);
   }
 
+  function renderPlannerOption(item: ComboboxItem) {
+    const option = plannerOptions.find((planner) => planner.id === item.value);
+    if (!option) return item.label;
+    const isApplied = option.id === appliedPlannerId;
+    const isPending = option.id === plannerSelectionId && option.id !== appliedPlannerId;
+
+    return (
+      <Group
+        justify="space-between"
+        wrap="nowrap"
+        style={{
+          borderRadius: 6,
+          padding: '4px 6px',
+          background: isApplied ? 'var(--mantine-color-blue-light)' : undefined,
+        }}
+      >
+        <Stack gap={1} style={{ minWidth: 0 }}>
+          <Group gap="xs" wrap="nowrap">
+            <Text size="sm" fw={isApplied ? 700 : 500} truncate>{option.title}</Text>
+            {isApplied ? <Badge size="xs" color="blue" variant="filled">Current</Badge> : null}
+            {isPending ? <Badge size="xs" color="yellow" variant="light">Pending</Badge> : null}
+            {option.is_default ? <Badge size="xs" color="gray" variant="light">Default</Badge> : null}
+          </Group>
+          <Text size="xs" c="dimmed">{option.id.slice(0, 8)} · {plannerFeatureCountLabel(option.feature_plan_items?.length ?? 0)}</Text>
+        </Stack>
+      </Group>
+    );
+  }
+
   return (
     <Modal opened={props.opened} onClose={props.onClose} title="Planner" size="calc(100vw - 96px)" centered zIndex={300}>
       <Stack gap="md">
@@ -406,15 +656,25 @@ export function PlannerModal(props: Props) {
           <Select
             label="Planner"
             placeholder="Planner"
-            value={run?.id ?? null}
-            data={run ? [{ value: run.id, label: run.title }] : []}
+            value={selectedPlannerWorkspace?.id ?? null}
+            data={selectedPlannerWorkspace ? [{ value: selectedPlannerWorkspace.id, label: selectedPlannerWorkspace.title }] : []}
             disabled
             style={{ minWidth: 280 }}
           />
-          <Button size="xs" onClick={() => void createPlanner()} loading={busy}>Create planner</Button>
+          <Button
+            size="xs"
+            variant="light"
+            onClick={() => {
+              setPlannerSelectionId(selectedPlannerWorkspace?.id ?? null);
+              setPlannerOptionsOpen(true);
+            }}
+          >
+            Planner options
+          </Button>
           <Button size="xs" variant="light" onClick={() => void reload()} loading={busy} disabled={!rootRepoPath}>Refresh planner</Button>
-          <Button size="xs" variant="light" onClick={downloadPlanner} disabled={!run}>Download</Button>
-          <Button size="xs" variant="light" onClick={() => importInputRef.current?.click()} loading={busy} disabled={!run}>Upload</Button>
+          <Button size="xs" variant="light" onClick={downloadPlanner} disabled={!selectedPlannerWorkspace}>Download</Button>
+          <Button size="xs" variant="light" onClick={() => importInputRef.current?.click()} loading={busy} disabled={!selectedPlannerWorkspace}>Upload</Button>
+          <Button size="xs" variant="light" onClick={openCreateFeature} loading={busyFeatureId?.startsWith('feature-')} disabled={!selectedPlannerWorkspace}>Create feature</Button>
           <input
             ref={importInputRef}
             type="file"
@@ -422,26 +682,18 @@ export function PlannerModal(props: Props) {
             style={{ display: 'none' }}
             onChange={(event) => void importPlannerFile(event.currentTarget.files?.[0])}
           />
-          <Select
-            label="Refinement template"
-            placeholder="Refinement template"
-            value={refinementTemplateId}
-            data={refinementTemplateOptions}
-            onChange={setRefinementTemplateId}
-            searchable
-            clearable
-            style={{ minWidth: 300 }}
-          />
+
         </Group>
 
-        {run ? (
+        {selectedPlannerWorkspace ? (
           <Group gap="xs">
-            <Badge variant="light">{run.title}</Badge>
+            <Badge variant="light">{selectedPlannerWorkspace.title}</Badge>
             <Badge variant="light" color="green">Planner</Badge>
-            <Text size="xs" c="dimmed">{run.root_repo_path}</Text>
+            {selectedPlannerWorkspace.is_default ? <Badge variant="light" color="blue">Default</Badge> : null}
+            <Text size="xs" c="dimmed">{selectedPlannerWorkspace.root_repo_path}</Text>
           </Group>
         ) : (
-          <Text c="dimmed" size="sm">No planner selected.</Text>
+          <Text c="dimmed" size="sm">No planner feature log selected.</Text>
         )}
 
         <TextInput
@@ -462,7 +714,7 @@ export function PlannerModal(props: Props) {
                 <Table.Tr>
                   <Table.Th>Feature</Table.Th>
                   <Table.Th style={{ width: 140 }}>Planner status</Table.Th>
-                  <Table.Th style={{ width: 320 }}>Actions</Table.Th>
+                  <Table.Th style={{ width: 400 }}>Actions</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -477,6 +729,7 @@ export function PlannerModal(props: Props) {
                       <Table.Td>
                         <Stack gap={2}>
                           <Group gap="xs" wrap="nowrap">
+                            {props.selectionMode ? <Button size="compact-xs" onClick={() => void selectFeature(item)} disabled={!item.id || isSelected}>Select</Button> : null}
                             <Text fw={600} size="sm">{featureTitle(item)}</Text>
                             {isSelected ? <Badge size="xs" color="green" variant="light">Selected</Badge> : null}
                           </Group>
@@ -491,13 +744,12 @@ export function PlannerModal(props: Props) {
                       <Table.Td>
                         <Group gap="xs" wrap="nowrap">
                           <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
-                          {props.selectionMode ? <Button size="xs" onClick={() => void selectFeature(item)} disabled={!item.id || isSelected}>Select</Button> : null}
-                          <Button size="xs" variant="light" onClick={() => void refineFeature(item)} loading={busyForFeature} disabled={!run || !refinementTemplateId}>Refine</Button>
                           {isScheduled ? (
-                            <Button size="xs" variant="light" color="orange" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!run}>Unschedule</Button>
+                            <Button size="xs" variant="light" color="orange" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Unschedule</Button>
                           ) : (
-                            <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'scheduled')} loading={busyForFeature} disabled={!run}>Schedule</Button>
+                            <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'scheduled')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Schedule</Button>
                           )}
+                          <Button size="xs" variant="light" color="red" onClick={() => void deleteFeature(item)} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Delete</Button>
                         </Group>
                       </Table.Td>
                     </Table.Tr>
@@ -515,6 +767,37 @@ export function PlannerModal(props: Props) {
           <Button size="xs" variant="default" onClick={props.onClose}>Close</Button>
         </Group>
       </Stack>
+
+      <Modal
+        opened={createFeatureOpen}
+        onClose={() => setCreateFeatureOpen(false)}
+        title="New feature"
+        centered
+        size="lg"
+        zIndex={315}
+      >
+        <Stack gap="sm">
+          <TextInput
+            label="Title"
+            placeholder="Feature title"
+            value={createFeatureTitle}
+            onChange={(event) => setCreateFeatureTitle(event.currentTarget.value)}
+            data-autofocus
+          />
+          <Textarea
+            label="Summary"
+            placeholder="Brief summary"
+            value={createFeatureSummary}
+            onChange={(event) => setCreateFeatureSummary(event.currentTarget.value)}
+            autosize
+            minRows={4}
+          />
+          <Group justify="flex-end" gap="xs" wrap="nowrap">
+            <Button size="xs" variant="default" onClick={() => setCreateFeatureOpen(false)}>Cancel</Button>
+            <Button size="xs" onClick={() => void saveCreatedFeature()} loading={Boolean(busyFeatureId?.startsWith('feature-'))} disabled={!selectedPlannerWorkspace || !createFeatureTitle.trim()}>Save</Button>
+          </Group>
+        </Stack>
+      </Modal>
 
       <Modal opened={viewFeature !== null} onClose={() => { setViewFeature(null); setFeatureDraft(null); setFeatureEditMode(false); }} title="Planner feature" size="calc(100vw - 96px)" centered zIndex={310}>
         {viewFeature && featureDraft ? (
@@ -543,7 +826,7 @@ export function PlannerModal(props: Props) {
                 >
                   {featureEditMode ? 'Read' : 'Edit'}
                 </Button>
-                <Button size="xs" variant="light" onClick={() => void refineFeature(featureDraft)} disabled={!run || !refinementTemplateId}>Refine</Button>
+                <Button size="xs" variant="light" color="red" onClick={() => void deleteFeature(featureDraft)} disabled={!selectedPlannerWorkspace} loading={busyFeatureId === featureDraft.id}>Delete</Button>
               </Group>
             </Group>
 
@@ -574,6 +857,70 @@ export function PlannerModal(props: Props) {
             )}
           </Stack>
         ) : null}
+      </Modal>
+
+      <Modal
+        opened={plannerOptionsOpen}
+        onClose={() => setPlannerOptionsOpen(false)}
+        title="Planner options"
+        centered
+        size="lg"
+        zIndex={330}
+      >
+        <Stack gap="sm">
+          <Text size="sm" c="dimmed">
+            Planner mapping selects the planner feature log for this repo. Supervisors orchestrate workflows separately.
+          </Text>
+          <Select
+            label="Mapped planner feature log"
+            placeholder="Select planner feature log"
+            value={plannerSelectionId}
+            data={plannerSelectOptions}
+            onChange={setPlannerSelectionId}
+            searchable
+            comboboxProps={{ withinPortal: true, zIndex: 500 }}
+            renderOption={({ option }) => renderPlannerOption(option)}
+          />
+          <Group justify="space-between" align="center" wrap="nowrap">
+            <Button size="xs" variant="light" color="red" onClick={() => void deleteSelectedPlanner()} loading={busy} disabled={!plannerSelectionId}>
+              Delete planner
+            </Button>
+            <Group gap="xs" wrap="nowrap">
+              <Button size="xs" variant="light" onClick={() => {
+                setNewPlannerTitle(repoPlannerTitle(rootRepoPath));
+                setCreatePlannerOpen(true);
+              }} disabled={!rootRepoPath}>
+                Create planner
+              </Button>
+              <Button size="xs" onClick={() => void applyPlannerSelection()} loading={busy} disabled={!plannerSelectionId || plannerSelectionId === appliedPlannerId}>
+                Apply
+              </Button>
+            </Group>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={createPlannerOpen}
+        onClose={() => setCreatePlannerOpen(false)}
+        title="Create planner"
+        centered
+        size="md"
+        zIndex={340}
+      >
+        <Stack gap="sm">
+          <TextInput
+            label="Planner name"
+            placeholder={repoPlannerTitle(rootRepoPath)}
+            value={newPlannerTitle}
+            onChange={(event) => setNewPlannerTitle(event.currentTarget.value)}
+            data-autofocus
+          />
+          <Group justify="flex-end" gap="xs" wrap="nowrap">
+            <Button size="xs" variant="default" onClick={() => setCreatePlannerOpen(false)}>Cancel</Button>
+            <Button size="xs" onClick={() => void requestCreatePlanner()} loading={busy} disabled={!rootRepoPath || !newPlannerTitle.trim()}>Create planner</Button>
+          </Group>
+        </Stack>
       </Modal>
 
       <Modal

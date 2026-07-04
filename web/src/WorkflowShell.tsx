@@ -94,6 +94,7 @@ import type { DiffPanelState } from './DiffPanel';
 import { PlannerModal } from './PlannerModal';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
 import { SupervisorPanel } from './SupervisorPanel';
+import { FlightDeckPanel } from './FlightDeckPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
   emptyRuntimeEventStore,
@@ -161,7 +162,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'supervisors';
+type MonitorHomeView = 'workflows' | 'supervisors' | 'flight_deck';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -2149,6 +2150,7 @@ export function WorkflowShell(props: {
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [overlayPlanner, setOverlayPlanner] = useState<{ supervisorId: string; title: string; rootRepoPath: string } | null>(null);
 
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
@@ -2870,6 +2872,14 @@ export function WorkflowShell(props: {
       return;
     }
 
+    if (routedPath === '/flight-deck') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'flight_deck' ? value : 'flight_deck');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+      return;
+    }
+
     if (routedSupervisorRunId || routedPath === '/supervisors') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
@@ -2884,7 +2894,7 @@ export function WorkflowShell(props: {
       setMonitorHomeView((value) => value === 'workflows' ? value : 'workflows');
       setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
     }
-  }, [props.route?.path, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId]);
+  }, [props.route?.path, props.route?.workflowRunId, props.route?.workflowView, props.route?.supervisorRunId, props.route?.supervisorView]);
 
   useEffect(() => {
     if (!selectedRunId) return;
@@ -6332,13 +6342,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         onClick={() => {
                           if (monitorHomeView === 'workflows') {
                             void openBuilder();
-                          } else {
+                          } else if (monitorHomeView === 'supervisors') {
                             setSupervisorCreateRequestToken((value) => value + 1);
                           }
                         }}
                         loading={monitorHomeView === 'workflows' ? busy : false}
                       >
-                        {monitorHomeView === 'workflows' ? 'New workflow' : 'New supervisor'}
+                        {monitorHomeView === 'workflows' ? 'New workflow' : monitorHomeView === 'supervisors' ? 'New supervisor' : 'Flight Deck'}
                       </Button>
                       <Button
                         size="xs"
@@ -6347,7 +6357,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         onClick={() => {
                           if (monitorHomeView === 'workflows') {
                             void refreshRunsAndTemplates();
-                          } else {
+                          } else if (monitorHomeView === 'supervisors') {
                             setSupervisorRefreshRequestToken((value) => value + 1);
                           }
                         }}
@@ -6359,20 +6369,32 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   <Tabs
                     value={monitorHomeView}
                     onChange={(value) => {
-                      const next = (value as MonitorHomeView) ?? 'workflows';
+                      const next = (value as MonitorHomeView | null) ?? 'workflows';
                       setMonitorHomeView((current) => current === next ? current : next);
-                      props.navigate?.(next === 'supervisors' ? '/supervisors' : '/workflows');
+                      if (next === 'flight_deck') props.navigate?.('/flight-deck');
+                      else if (next === 'supervisors') props.navigate?.('/supervisors');
+                      else props.navigate?.('/workflows');
                     }}
                   >
                     <Tabs.List>
                       <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
                       <Tabs.Tab value="supervisors">Supervisors</Tabs.Tab>
+                      <Tabs.Tab value="flight_deck">Flight Deck</Tabs.Tab>
                     </Tabs.List>
                   </Tabs>
                 </Stack>
               </Card>
 
-              {monitorHomeView === 'supervisors' ? (
+              {monitorHomeView === 'flight_deck' ? (
+                <FlightDeckPanel
+                  navigate={props.navigate}
+                  onOpenPlanner={(supervisor) => setOverlayPlanner({
+                    supervisorId: supervisor.id,
+                    title: supervisor.title,
+                    rootRepoPath: supervisor.root_repo_path,
+                  })}
+                />
+              ) : monitorHomeView === 'supervisors' ? (
                 <SupervisorPanel
                   supervisorRunId={props.route?.supervisorRunId ?? null}
                   supervisorView={props.route?.supervisorView ?? null}
@@ -6929,6 +6951,15 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Group>
           </Stack>
         </Modal>
+
+        <PlannerModal
+          opened={Boolean(overlayPlanner)}
+          rootRepoPath={overlayPlanner?.rootRepoPath ?? ''}
+          onClose={() => setOverlayPlanner(null)}
+          onSaved={() => setSupervisorRefreshRequestToken((value) => value + 1)}
+          onError={setError}
+          onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
+        />
 
         <PlannerModal
           opened={plannerFragmentConfigOpen}

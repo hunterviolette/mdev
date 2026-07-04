@@ -1,6 +1,7 @@
 use axum::{extract::{Path, Query, State}, routing::{get, post, put}, Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -8,6 +9,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine::capabilities::planner::FeaturePlanItem,
+    supervisor::workflow_spawn,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,12 +58,36 @@ pub struct SetDefaultPlannerResponse {
     pub planner: PlannerWorkspace,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePlannerResponse {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefinePlannerFeatureRequest {
+    #[serde(default)]
+    pub supervisor_id: Option<Uuid>,
+    #[serde(default)]
+    pub workflow_template_id: Option<Uuid>,
+    #[serde(default)]
+    pub template_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefinePlannerFeatureResponse {
+    pub ok: bool,
+    pub workflow_run_id: Uuid,
+    pub reused: bool,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/planners", get(list_planners).post(create_planner))
+        .route("/api/planners/create", post(create_planner))
         .route("/api/planners/ensure", post(ensure_planner))
-        .route("/api/planners/:planner_id", get(get_planner).put(update_planner_features))
+        .route("/api/planners/:planner_id", get(get_planner).put(update_planner_features).delete(delete_planner))
         .route("/api/planners/:planner_id/default", post(set_default_planner))
+        .route("/api/planners/:planner_id/features/:feature_id/refine", post(refine_planner_feature))
 }
 
 fn normalize_repo_root(value: &str) -> String {
@@ -125,7 +151,11 @@ async fn ensure_planner_tables(state: &AppState) -> anyhow::Result<()> {
 
 fn row_to_planner(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<PlannerWorkspace> {
     let features_json: String = row.get("features_json");
-    let feature_plan_items = serde_json::from_str::<Vec<FeaturePlanItem>>(&features_json).unwrap_or_default();
+    let feature_plan_items = serde_json::from_str::<Vec<FeaturePlanItem>>(&features_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.id.starts_with("manual-"))
+        .collect::<Vec<_>>();
     let is_default = row.try_get::<i64, _>("is_default").unwrap_or(0) != 0;
     Ok(PlannerWorkspace {
         id: row.get("id"),
@@ -154,7 +184,7 @@ async fn load_repo_feature_plan_items(state: &AppState, root_repo_path: &str) ->
 
     if let Some(repo_row) = repo_row {
         let repo_id: String = repo_row.get("id");
-        let rows = sqlx::query("SELECT id, title, status, payload_json, created_at, updated_at FROM planner_features WHERE repo_id = ? ORDER BY sort_order ASC, created_at ASC")
+        let rows = sqlx::query("SELECT id, title, status, payload_json, created_at, updated_at FROM planner_features WHERE repo_id = ? AND id NOT LIKE 'manual-%' ORDER BY sort_order ASC, created_at ASC")
             .bind(repo_id)
             .fetch_all(&state.db)
             .await?;
@@ -201,27 +231,7 @@ async fn load_repo_feature_plan_items(state: &AppState, root_repo_path: &str) ->
     Ok(Vec::new())
 }
 
-async fn hydrate_planner_features(state: &AppState, mut planner: PlannerWorkspace) -> anyhow::Result<PlannerWorkspace> {
-    if !planner.feature_plan_items.is_empty() {
-        return Ok(planner);
-    }
-
-    let items = load_repo_feature_plan_items(state, &planner.root_repo_path).await?;
-    if items.is_empty() {
-        return Ok(planner);
-    }
-
-    let now = Utc::now().to_rfc3339();
-    let features_json = serde_json::to_string(&items)?;
-    sqlx::query("UPDATE planner_workspaces SET features_json = ?, updated_at = ? WHERE id = ? AND features_json = '[]'")
-        .bind(&features_json)
-        .bind(&now)
-        .bind(&planner.id)
-        .execute(&state.db)
-        .await?;
-
-    planner.feature_plan_items = items;
-    planner.updated_at = now;
+async fn hydrate_planner_features(_state: &AppState, planner: PlannerWorkspace) -> anyhow::Result<PlannerWorkspace> {
     Ok(planner)
 }
 
@@ -247,8 +257,7 @@ async fn list_planners(
 
     let mut planners = Vec::new();
     for row in rows {
-        let planner = row_to_planner(row).map_err(internal)?;
-        planners.push(hydrate_planner_features(&state, planner).await.map_err(internal)?);
+        planners.push(row_to_planner(row).map_err(internal)?);
     }
     Ok(Json(planners))
 }
@@ -273,7 +282,12 @@ async fn create_planner(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let title = req.title.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| planner_title(&root));
-    let features_json = serde_json::to_string(&req.feature_plan_items).map_err(internal)?;
+    let features_json = serde_json::to_string(
+        &req.feature_plan_items
+            .into_iter()
+            .filter(|item| !item.id.starts_with("manual-"))
+            .collect::<Vec<_>>()
+    ).map_err(internal)?;
 
     if is_default {
         sqlx::query("UPDATE planner_workspaces SET is_default = 0, updated_at = ? WHERE root_repo_path = ?")
@@ -317,7 +331,6 @@ async fn ensure_planner(
         .map_err(internal)?
     {
         let planner = row_to_planner(row).map_err(internal)?;
-        let planner = hydrate_planner_features(&state, planner).await.map_err(internal)?;
         return Ok(Json(EnsurePlannerWorkspaceResponse {
             created: false,
             planner,
@@ -349,7 +362,6 @@ async fn get_planner(
         .map_err(internal)?
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "planner not found".to_string()))?;
     let planner = row_to_planner(row).map_err(internal)?;
-    let planner = hydrate_planner_features(&state, planner).await.map_err(internal)?;
     Ok(Json(planner))
 }
 
@@ -360,7 +372,12 @@ async fn update_planner_features(
 ) -> Result<Json<PlannerWorkspace>, (axum::http::StatusCode, String)> {
     ensure_planner_tables(&state).await.map_err(internal)?;
     let now = Utc::now().to_rfc3339();
-    let features_json = serde_json::to_string(&req.feature_plan_items).map_err(internal)?;
+    let features_json = serde_json::to_string(
+        &req.feature_plan_items
+            .into_iter()
+            .filter(|item| !item.id.starts_with("manual-"))
+            .collect::<Vec<_>>()
+    ).map_err(internal)?;
     let result = sqlx::query("UPDATE planner_workspaces SET features_json = ?, updated_at = ? WHERE id = ?")
         .bind(features_json)
         .bind(now)
@@ -374,6 +391,129 @@ async fn update_planner_features(
     }
 
     get_planner(State(state), Path(planner_id)).await
+}
+
+async fn delete_planner(
+    State(state): State<AppState>,
+    Path(planner_id): Path<String>,
+) -> Result<Json<DeletePlannerResponse>, (axum::http::StatusCode, String)> {
+    ensure_planner_tables(&state).await.map_err(internal)?;
+    let result = sqlx::query("DELETE FROM planner_workspaces WHERE id = ?")
+        .bind(planner_id)
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+
+    if result.rows_affected() == 0 {
+        return Err((axum::http::StatusCode::NOT_FOUND, "planner not found".to_string()));
+    }
+
+    Ok(Json(DeletePlannerResponse { ok: true }))
+}
+
+const DEFAULT_REFINEMENT_TEMPLATE_NAME: &str = "Default refinement workflow";
+
+async fn default_refinement_workflow_template_id(state: &AppState) -> anyhow::Result<Option<Uuid>> {
+    let row = sqlx::query("SELECT id FROM workflow_templates WHERE name = ?")
+        .bind(DEFAULT_REFINEMENT_TEMPLATE_NAME)
+        .fetch_optional(&state.db)
+        .await?;
+    row.map(|row| Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(Into::into))
+        .transpose()
+}
+
+async fn refine_planner_feature(
+    State(state): State<AppState>,
+    Path((planner_id, feature_id)): Path<(String, String)>,
+    Json(req): Json<RefinePlannerFeatureRequest>,
+) -> Result<Json<RefinePlannerFeatureResponse>, (axum::http::StatusCode, String)> {
+    ensure_planner_tables(&state).await.map_err(internal)?;
+    let planner = get_planner(State(state.clone()), Path(planner_id.clone())).await?.0;
+    let feature = planner
+        .feature_plan_items
+        .iter()
+        .find(|item| item.id == feature_id)
+        .cloned()
+        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, format!("planner feature {} not found", feature_id)))?;
+
+    let workflow_template_id = req.workflow_template_id
+        .or(req.template_id)
+        .or(default_refinement_workflow_template_id(&state).await.map_err(internal)?)
+        .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "workflow_template_id is required for planner feature refinement".to_string()))?;
+
+    let workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
+        &state,
+        &feature,
+        &planner.root_repo_path,
+        Some(workflow_template_id),
+        json!({
+            "supervisor_run_id": req.supervisor_id.map(|value| value.to_string()),
+            "planner_workspace_id": planner.id,
+            "planner_title": planner.title,
+            "feature_id": feature.id,
+            "input_source": "planner_workspace_feature",
+            "structured_output": {
+                "enabled": true,
+                "schema_armed": true,
+                "schema_id": "supervisor_feature_plan_item_v1",
+                "auto_apply_armed": true,
+                "preserve_rough_definition": true,
+                "apply_handler": "planner_workspace_item",
+                "rough_definition": feature.rough_summary.clone().unwrap_or_else(|| feature.summary.clone())
+            }
+        }),
+    ).await.map_err(internal)?;
+
+    if let Some(supervisor_id) = req.supervisor_id {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO supervisor_work_units (
+                id, supervisor_run_id, repo_id, feature_id, workflow_run_id, patch_id,
+                kind, title, state, root_repo_path, shard_path, integration_path,
+                priority, queue_position, blocked_reason, waiting_user_input_json, context_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, NULL, ?, ?, NULL, 'refine', ?, 'queued', ?, ?, NULL, 0, NULL, NULL, '{}', ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                workflow_run_id = excluded.workflow_run_id,
+                title = excluded.title,
+                state = excluded.state,
+                root_repo_path = excluded.root_repo_path,
+                shard_path = excluded.shard_path,
+                context_json = excluded.context_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(format!("{}:refine:{}", supervisor_id, feature.id))
+        .bind(supervisor_id.to_string())
+        .bind(feature.id.as_str())
+        .bind(workflow_run_id.to_string())
+        .bind(feature.title.as_str())
+        .bind(planner.root_repo_path.as_str())
+        .bind(planner.root_repo_path.as_str())
+        .bind(serde_json::to_string(&json!({
+            "source": "planner_workspace_refine",
+            "workflow_type": "refine",
+            "pool_key": "refine",
+            "planner_workspace_id": planner.id,
+            "planner_title": planner.title,
+            "feature_id": feature.id,
+            "template_id": workflow_template_id,
+            "workflow_run_id": workflow_run_id
+        })).map_err(internal)?)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+    }
+
+    Ok(Json(RefinePlannerFeatureResponse {
+        ok: true,
+        workflow_run_id,
+        reused: false,
+    }))
 }
 
 async fn set_default_planner(

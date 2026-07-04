@@ -18,7 +18,7 @@ use crate::{
         extract_inference_text, normalize_refined_feature_plan_item, ExecutionPlanItem,
         FeaturePlanItem, FeaturePlanItemStatus,
     },
-    models::{RunStatus, SprintEventStreamItem, WorkflowRun},
+    models::{RunStatus, SprintEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
 };
 use models::{CreateSupervisorRunRequest, EnsureSupervisorPlannerRequest, EnsureSupervisorPlannerResponse, SupervisorActionRequest, SupervisorExecutionStrategy, SupervisorFeatureWorkflow, SupervisorRun, SupervisorStatus};
 
@@ -805,6 +805,11 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
         .iter()
         .map(|item| item.feature_plan_item_id.clone())
         .collect::<Vec<_>>();
+    let previously_scheduled_feature_ids = run
+        .execution_plan_items
+        .iter()
+        .map(|item| item.feature_plan_item_id.clone())
+        .collect::<Vec<_>>();
     for item in &mut planner_items {
         let is_scheduled = scheduled_feature_ids.iter().any(|id| id == &item.id);
         if is_scheduled && !matches!(item.status, FeaturePlanItemStatus::Completed | FeaturePlanItemStatus::Applied) {
@@ -816,9 +821,33 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
     run.feature_plan_items = planner_items;
     run.execution_plan_items = sprint_items;
     save_repo_feature_plan_items(state, &run.root_repo_path, &run.feature_plan_items).await?;
+    if scheduled_feature_ids != previously_scheduled_feature_ids {
+        invalidate_supervisor_integration(state, &mut run).await?;
+    }
     if let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string) {
         save_sprint_features(state, &run, &sprint_id, None).await?;
     }
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
+
+pub async fn update_supervisor_flight_deck_settings(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    if !run.context.is_object() {
+        run.context = json!({});
+    }
+
+    let settings = payload
+        .get("flight_deck_settings")
+        .or_else(|| payload.get("settings"))
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+
+    if let Some(obj) = run.context.as_object_mut() {
+        obj.insert("flight_deck_settings".to_string(), settings);
+    }
+
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
@@ -1058,6 +1087,20 @@ pub async fn apply_refined_feature_output_from_workflow(state: &AppState, workfl
 
 async fn delete_supervisor_workflow_run_records(state: &AppState, run_id: Uuid) -> Result<()> {
     let run_id_text = run_id.to_string();
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query("UPDATE supervisor_work_units SET workflow_run_id = NULL, updated_at = ? WHERE workflow_run_id = ?")
+        .bind(&now)
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("UPDATE supervisor_runs SET integration_run_id = NULL, updated_at = ? WHERE integration_run_id = ?")
+        .bind(&now)
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await?;
+
     sqlx::query("DELETE FROM workflow_events WHERE run_id = ?")
         .bind(&run_id_text)
         .execute(&state.db)
@@ -1070,11 +1113,37 @@ async fn delete_supervisor_workflow_run_records(state: &AppState, run_id: Uuid) 
         .bind(&run_id_text)
         .execute(&state.db)
         .await?;
+    sqlx::query("UPDATE planner_feature_patches SET workflow_run_id = NULL WHERE workflow_run_id = ?")
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("UPDATE planner_features SET current_workflow_run_id = NULL WHERE current_workflow_run_id = ?")
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("UPDATE sprint_features SET current_workflow_run_id = NULL WHERE current_workflow_run_id = ?")
+        .bind(&run_id_text)
+        .execute(&state.db)
+        .await?;
+
+    tracing::info!(workflow_run_id = %run_id_text, "supervisor deleting workflow run records");
     sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
         .bind(&run_id_text)
         .execute(&state.db)
         .await?;
     Ok(())
+}
+
+async fn workflow_run_definition_snapshot(state: &AppState, run_id: &str) -> Result<Option<WorkflowTemplateDefinition>> {
+    let row = sqlx::query("SELECT definition_json FROM workflow_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+    row.map(|row| serde_json::from_str::<WorkflowTemplateDefinition>(row.get::<String, _>("definition_json").as_str()).map_err(Into::into))
+        .transpose()
 }
 
 pub async fn restart_current_supervisor_sprint(state: &AppState, id: Uuid) -> Result<Value> {
@@ -1489,22 +1558,206 @@ async fn supervisor_child_workflow_row(
     Ok((feature_id, workflow_run_id, development_state))
 }
 
+async fn resolve_manual_shard_template_id(state: &AppState, run: &SupervisorRun, payload: &Value) -> Result<Uuid> {
+    let candidates = ["workflow_template_id", "template_id", "template"];
+    for key in candidates {
+        let Some(raw) = payload.get(key).and_then(Value::as_str).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        if let Ok(uuid) = Uuid::parse_str(raw) {
+            return Ok(uuid);
+        }
+        if let Some(row) = sqlx::query("SELECT id FROM workflow_templates WHERE id = ? OR name = ? LIMIT 1")
+            .bind(raw)
+            .bind(raw)
+            .fetch_optional(&state.db)
+            .await?
+        {
+            let id_text: String = row.get("id");
+            return Ok(Uuid::parse_str(&id_text)?);
+        }
+    }
+
+    context_uuid(&run.context, "workflow_template_id")
+        .ok_or_else(|| anyhow!("manual shard workflow template is required"))
+}
+
+pub async fn create_supervisor_manual_shard(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    let sprint_id = current_sprint_id(&run).await?;
+    let template_id = resolve_manual_shard_template_id(state, &run, &payload).await?;
+    let now = Utc::now().to_rfc3339();
+    let manual_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard'",
+    )
+    .bind(id.to_string())
+    .fetch_one(&state.db)
+    .await?
+    .max(0);
+    let manual_id = format!("manual-{}", Uuid::new_v4());
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Manual shard {}", manual_count + 1));
+
+    let mut item = FeaturePlanItem {
+        id: manual_id.clone(),
+        title: title.clone(),
+        status: FeaturePlanItemStatus::Scheduled,
+        summary: "Operator-created manual shard.".to_string(),
+        rough_summary: None,
+        refinement_workflow_run_id: None,
+        applied_sprint_id: None,
+        applied_sprint_title: None,
+        applied_at: None,
+        requirements: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        implementation_notes: vec!["Manual shard created from flight deck.".to_string()],
+        review_expectations: Vec::new(),
+        target_files_or_areas: Vec::new(),
+        dependencies: Vec::new(),
+    };
+
+    if let Some(summary) = payload.get("summary").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) {
+        item.summary = summary.to_string();
+    }
+
+    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
+    let shard = repo_snapshot::refresh_shard_from_worktree(&run.root_repo_path, run.id, &manual_id)?;
+    patches::create_baseline(&shard)?;
+    let shard_path = shard.to_string_lossy().to_string();
+
+    let mut supervisor_ctx = supervisor_context(&run, &workspace);
+    if let Some(obj) = supervisor_ctx.as_object_mut() {
+        obj.insert("input_source".to_string(), Value::String("supervisor_manual_shard".to_string()));
+        obj.insert("manual_shard_id".to_string(), Value::String(manual_id.clone()));
+        obj.insert("manual_shard".to_string(), Value::Bool(true));
+    }
+
+    let workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
+        state,
+        &item,
+        &shard_path,
+        Some(template_id),
+        supervisor_ctx,
+    ).await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO supervisor_work_units (
+            id, supervisor_run_id, repo_id, feature_id, workflow_run_id, patch_id,
+            kind, title, state, root_repo_path, shard_path, integration_path,
+            priority, queue_position, blocked_reason, waiting_user_input_json, context_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, NULL, ?, ?, NULL, 'manual_shard', ?, 'draft', ?, ?, ?, 0, NULL, NULL, '{}', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            feature_id = excluded.feature_id,
+            workflow_run_id = excluded.workflow_run_id,
+            title = excluded.title,
+            state = excluded.state,
+            root_repo_path = excluded.root_repo_path,
+            shard_path = excluded.shard_path,
+            integration_path = excluded.integration_path,
+            context_json = excluded.context_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(format!("{}:manual:{}", run.id, manual_id))
+    .bind(run.id.to_string())
+    .bind(&manual_id)
+    .bind(workflow_run_id.to_string())
+    .bind(&title)
+    .bind(&run.root_repo_path)
+    .bind(&shard_path)
+    .bind(run.integration_path.clone())
+    .bind(serde_json::to_string(&json!({
+        "sprint_id": sprint_id,
+        "source": "manual_shard",
+        "workflow_type": "manual_shard",
+        "pool_key": "manual_shard",
+        "template_id": template_id,
+        "manual_shard_id": manual_id
+    }))?)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    sqlx::query("DELETE FROM sprint_features WHERE supervisor_run_id = ? AND feature_id = ?")
+        .bind(run.id.to_string())
+        .bind(&manual_id)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'feature_development' AND feature_id = ?")
+        .bind(run.id.to_string())
+        .bind(&manual_id)
+        .execute(&state.db)
+        .await?;
+
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "manual shard workflow created").await?;
+
+    Ok(json!({
+        "ok": true,
+        "manual_shard_id": manual_id,
+        "workflow_run_id": workflow_run_id,
+        "supervisor_run": run
+    }))
+}
+
 pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
     let feature_id = payload_feature_id(&payload)?;
     let sprint_id = current_sprint_id(&run).await?;
 
     refresh_supervisor_child_run_statuses(state, &mut run).await?;
+    let spawned_missing = ensure_scheduled_development_children(state, &mut run).await?;
+    if spawned_missing {
+        run.updated_at = Utc::now();
+        update_supervisor_run(state, &run).await?;
+        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "missing scheduled feature workflows created").await?;
+    }
     let (feature_id, workflow_run_id, _development_state) = supervisor_child_workflow_row(state, &sprint_id, &feature_id).await?;
     let child_run = engine::load_run(state, workflow_run_id).await?;
 
-    if matches!(child_run.status, RunStatus::Queued | RunStatus::Running | RunStatus::Waiting) {
+    if matches!(child_run.status, RunStatus::Queued | RunStatus::Running) {
         publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow already running").await?;
         return Ok(json!({
             "ok": true,
             "started": false,
             "reason": "already_running",
             "workflow_run_id": workflow_run_id,
+            "supervisor_run": run
+        }));
+    }
+
+    if matches!(child_run.status, RunStatus::Waiting | RunStatus::Paused) {
+        let resume_result = engine::resume_run(state, workflow_run_id).await?;
+        update_sprint_feature_workflow_state(
+            state,
+            &sprint_id,
+            &feature_id,
+            Some(workflow_run_id),
+            "development_running",
+            "development_running",
+            child_run.current_step_id.as_deref(),
+            None,
+        ).await?;
+        run.status = SupervisorStatus::RunningChildren;
+        run.updated_at = Utc::now();
+        update_supervisor_run(state, &run).await?;
+        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow resumed autonomously").await?;
+        return Ok(json!({
+            "ok": true,
+            "started": true,
+            "resumed": true,
+            "workflow_run_id": workflow_run_id,
+            "resume_result": resume_result,
             "supervisor_run": run
         }));
     }
@@ -1538,8 +1791,37 @@ pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload
     }))
 }
 
+pub async fn pause_supervisor_feature_pool(state: &AppState, id: Uuid, _payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    run.status = SupervisorStatus::Paused;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature pool paused; active child workflows were not interrupted").await?;
+
+    Ok(json!({
+        "ok": true,
+        "paused": true,
+        "interrupts_children": false,
+        "supervisor_run": run
+    }))
+}
+
+pub async fn resume_supervisor_feature_pool(state: &AppState, id: Uuid, _payload: Value) -> Result<Value> {
+    let mut run = load_supervisor_run(state, id).await?;
+    run.status = SupervisorStatus::RunningChildren;
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature pool resumed").await?;
+
+    Ok(json!({
+        "ok": true,
+        "paused": false,
+        "supervisor_run": run
+    }))
+}
+
 pub async fn pause_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
-    let run = load_supervisor_run(state, id).await?;
+    let mut run = load_supervisor_run(state, id).await?;
     let feature_id = payload_feature_id(&payload)?;
     let sprint_id = current_sprint_id(&run).await?;
     let (feature_id, workflow_run_id, _development_state) = supervisor_child_workflow_row(state, &sprint_id, &feature_id).await?;
@@ -1550,8 +1832,8 @@ pub async fn pause_supervisor_child_workflow(state: &AppState, id: Uuid, payload
         &sprint_id,
         &feature_id,
         Some(workflow_run_id),
-        "scheduled",
-        "scheduled",
+        "waiting_user",
+        "waiting_user",
         None,
         None,
     )
@@ -1566,6 +1848,380 @@ pub async fn pause_supervisor_child_workflow(state: &AppState, id: Uuid, payload
     }))
 }
 
+pub async fn regenerate_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let feature_id = payload
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("feature_id is required"))?
+        .to_string();
+
+    let reset = remove_supervisor_child_workflow(state, id, json!({ "feature_id": feature_id })).await?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "regenerate_child_workflow",
+        "feature_id": feature_id,
+        "reset": reset,
+        "started": reset.get("pool_was_running").and_then(Value::as_bool).unwrap_or(false)
+    }))
+}
+
+fn manual_shard_has_staged_changes(shard_path: &str) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .current_dir(shard_path)
+        .output()?;
+
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(anyhow!(
+            "failed to validate staged manual shard changes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+async fn set_feature_integration_skipped(state: &AppState, id: Uuid, payload: Value, skipped: bool) -> Result<Value> {
+    let feature_id = payload
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let manual_shard_id = payload
+        .get("manual_shard_id")
+        .or_else(|| payload.get("feature_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+
+    let now = Utc::now().to_rfc3339();
+
+    if let Some(feature_id) = feature_id {
+        let changed = sqlx::query(
+            "UPDATE sprint_features
+             SET integration_skipped = ?, updated_at = ?
+             WHERE supervisor_run_id = ?
+               AND feature_id = ?
+               AND status != 'unscheduled'",
+        )
+        .bind(if skipped { 1 } else { 0 })
+        .bind(&now)
+        .bind(id.to_string())
+        .bind(&feature_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+
+        if changed == 0 {
+            return Err(anyhow!("scheduled feature integration input not found"));
+        }
+
+        let run = load_supervisor_run(state, id).await?;
+        publish_supervisor_snapshot(
+            state,
+            &run,
+            "supervisor_snapshot",
+            if skipped { "integration input skipped" } else { "integration input unskipped" },
+        ).await?;
+
+        return Ok(json!({
+            "ok": true,
+            "kind": "feature_development",
+            "feature_id": feature_id,
+            "integration_skipped": skipped,
+            "planner_status_unchanged": true
+        }));
+    }
+
+    let manual_shard_id = manual_shard_id.ok_or_else(|| anyhow!("feature_id or manual_shard_id is required"))?;
+    let row = sqlx::query(
+        "SELECT id, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&manual_shard_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("manual shard integration input not found"))?;
+
+    let work_unit_id: String = row.get("id");
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("integration_input".to_string(), Value::Bool(true));
+        obj.insert("staged_to_integration".to_string(), Value::Bool(true));
+        obj.insert("integration_skipped".to_string(), Value::Bool(skipped));
+        obj.insert(
+            if skipped { "skipped_for_integration_at" } else { "unskipped_for_integration_at" }.to_string(),
+            Value::String(now.clone()),
+        );
+    }
+
+    sqlx::query("UPDATE supervisor_work_units SET context_json = ?, updated_at = ? WHERE id = ?")
+        .bind(serde_json::to_string(&context)?)
+        .bind(&now)
+        .bind(&work_unit_id)
+        .execute(&state.db)
+        .await?;
+
+    let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(
+        state,
+        &run,
+        "supervisor_snapshot",
+        if skipped { "manual integration input skipped" } else { "manual integration input unskipped" },
+    ).await?;
+
+    Ok(json!({
+        "ok": true,
+        "kind": "manual_shard",
+        "manual_shard_id": manual_shard_id,
+        "work_unit_id": work_unit_id,
+        "integration_skipped": skipped,
+        "planner_status_unchanged": true
+    }))
+}
+
+pub async fn skip_supervisor_integration_input(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    set_feature_integration_skipped(state, id, payload, true).await
+}
+
+pub async fn unskip_supervisor_integration_input(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    set_feature_integration_skipped(state, id, payload, false).await
+}
+
+pub async fn stage_supervisor_manual_shard(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let manual_shard_id = payload
+        .get("manual_shard_id")
+        .or_else(|| payload.get("feature_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("manual_shard_id is required"))?
+        .to_string();
+
+    let row = sqlx::query(
+        "SELECT id, title, shard_path, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&manual_shard_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("manual shard not found"))?;
+
+    let work_unit_id: String = row.get("id");
+    let title: String = row.get("title");
+    let shard_path: String = row
+        .get::<Option<String>, _>("shard_path")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("manual shard has no shard_path"))?;
+
+    if !manual_shard_has_staged_changes(&shard_path)? {
+        return Err(anyhow!("manual shard '{}' cannot be staged to integration because it has no staged git changes", title));
+    }
+
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("integration_input".to_string(), Value::Bool(true));
+        obj.insert("staged_to_integration".to_string(), Value::Bool(true));
+        obj.insert("staged_to_integration_at".to_string(), Value::String(Utc::now().to_rfc3339()));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE supervisor_work_units SET state = 'ready_for_integration', context_json = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&context)?)
+    .bind(&now)
+    .bind(&work_unit_id)
+    .execute(&state.db)
+    .await?;
+
+    let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "manual shard staged for integration").await?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "stage_manual_shard",
+        "manual_shard_id": manual_shard_id,
+        "work_unit_id": work_unit_id,
+        "state": "ready_for_integration"
+    }))
+}
+
+pub async fn unstage_supervisor_manual_shard(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let manual_shard_id = payload
+        .get("manual_shard_id")
+        .or_else(|| payload.get("feature_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("manual_shard_id is required"))?
+        .to_string();
+
+    let row = sqlx::query(
+        "SELECT id, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&manual_shard_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("manual shard not found"))?;
+
+    let work_unit_id: String = row.get("id");
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("integration_input".to_string(), Value::Bool(false));
+        obj.insert("staged_to_integration".to_string(), Value::Bool(false));
+        obj.insert("unstaged_from_integration_at".to_string(), Value::String(Utc::now().to_rfc3339()));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE supervisor_work_units SET state = 'draft', context_json = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&context)?)
+    .bind(&now)
+    .bind(&work_unit_id)
+    .execute(&state.db)
+    .await?;
+
+    let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "manual shard unstaged from integration").await?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "unstage_manual_shard",
+        "manual_shard_id": manual_shard_id,
+        "work_unit_id": work_unit_id,
+        "state": "draft"
+    }))
+}
+
+pub async fn delete_supervisor_manual_shard(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let manual_shard_id = payload
+        .get("manual_shard_id")
+        .or_else(|| payload.get("feature_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("manual_shard_id is required"))?
+        .to_string();
+
+    let row = sqlx::query(
+        "SELECT workflow_run_id, shard_path FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&manual_shard_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(row) = row {
+        let workflow_run_id: Option<String> = row.get("workflow_run_id");
+        let shard_path: Option<String> = row.get("shard_path");
+
+        if let Some(workflow_run_id) = workflow_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
+            sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
+                .bind(workflow_run_id)
+                .execute(&state.db)
+                .await?;
+        }
+
+        if let Some(shard_path) = shard_path.as_deref().filter(|value| !value.trim().is_empty()) {
+            let path = std::path::PathBuf::from(shard_path);
+            if path.exists() {
+                std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path))?;
+            }
+        }
+    }
+
+    sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ?")
+        .bind(id.to_string())
+        .bind(&manual_shard_id)
+        .execute(&state.db)
+        .await?;
+
+    sqlx::query("DELETE FROM sprint_features WHERE supervisor_run_id = ? AND feature_id = ?")
+        .bind(id.to_string())
+        .bind(&manual_shard_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "delete_manual_shard",
+        "manual_shard_id": manual_shard_id
+    }))
+}
+
+pub async fn delete_supervisor_refine_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+    let feature_id = payload
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("feature_id is required"))?
+        .to_string();
+
+    let row = sqlx::query(
+        "SELECT workflow_run_id, shard_path FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'refine' AND feature_id = ? LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&feature_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(row) = row {
+        let workflow_run_id: Option<String> = row.get("workflow_run_id");
+        let shard_path: Option<String> = row.get("shard_path");
+
+        if let Some(workflow_run_id) = workflow_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
+            sqlx::query("DELETE FROM workflow_events WHERE run_id = ?")
+                .bind(workflow_run_id)
+                .execute(&state.db)
+                .await?;
+            sqlx::query("DELETE FROM changeset_file_effects WHERE attempt_id IN (SELECT id FROM changeset_attempts WHERE run_id = ?)")
+                .bind(workflow_run_id)
+                .execute(&state.db)
+                .await?;
+            sqlx::query("DELETE FROM changeset_attempts WHERE run_id = ?")
+                .bind(workflow_run_id)
+                .execute(&state.db)
+                .await?;
+            sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
+                .bind(workflow_run_id)
+                .execute(&state.db)
+                .await?;
+        }
+
+        if let Some(shard_path) = shard_path.as_deref().filter(|value| !value.trim().is_empty()) {
+            let path = std::path::PathBuf::from(shard_path);
+            if path.exists() {
+                std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path))?;
+            }
+        }
+    }
+
+    sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'refine' AND feature_id = ?")
+        .bind(id.to_string())
+        .bind(&feature_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "delete_refine_workflow",
+        "feature_id": feature_id
+    }))
+}
+
 pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
     let feature_id = payload
@@ -1576,7 +2232,10 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         .ok_or_else(|| anyhow!("feature_id is required"))?;
     let sprint_id = current_sprint_id(&run).await?;
 
+    let pool_was_running = matches!(run.status, SupervisorStatus::RunningChildren);
+
     let row = sqlx::query("SELECT feature_id, current_workflow_run_id, shard_path FROM sprint_features WHERE sprint_id = ? AND feature_id = ?")
+
         .bind(&sprint_id)
         .bind(&feature_id)
         .fetch_optional(&state.db)
@@ -1588,8 +2247,12 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         .try_get::<Option<String>, _>("current_workflow_run_id")
         .ok()
         .flatten();
-    if let Some(workflow_run_id_text) = workflow_run_id_text {
-        if let Ok(workflow_run_id) = Uuid::parse_str(&workflow_run_id_text) {
+    let replacement_definition = match workflow_run_id_text.as_deref() {
+        Some(workflow_run_id_text) => workflow_run_definition_snapshot(state, workflow_run_id_text).await?,
+        None => None,
+    };
+    if let Some(workflow_run_id_text) = workflow_run_id_text.as_deref() {
+        if let Ok(workflow_run_id) = Uuid::parse_str(workflow_run_id_text) {
             delete_supervisor_workflow_run_records(state, workflow_run_id).await?;
         }
     }
@@ -1609,10 +2272,32 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         }
     }
 
+    let old_integration_path = run.integration_path.clone();
     if let Some(integration_run_id) = run.integration_run_id {
+        tracing::info!(supervisor_run_id = %run.id, workflow_run_id = %integration_run_id, "restart_integration deleting old integration work unit and workflow");
+        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration'")
+            .bind(run.id.to_string())
+            .execute(&state.db)
+            .await?;
         delete_supervisor_workflow_run_records(state, integration_run_id).await?;
+    } else {
+        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration'")
+            .bind(run.id.to_string())
+            .execute(&state.db)
+            .await?;
     }
     run.integration_run_id = None;
+    run.integration_path = None;
+    if let Some(path_text) = old_integration_path.filter(|value| !value.trim().is_empty()) {
+        let path = PathBuf::from(path_text);
+        if path.exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(&path).with_context(|| format!("failed to delete stale integration shard {}", path.display()))?;
+            } else {
+                fs::remove_file(&path).with_context(|| format!("failed to delete stale integration shard file {}", path.display()))?;
+            }
+        }
+    }
     run.final_patch_path = None;
     run.merge_report = json!({});
     run.validation_report = json!({});
@@ -1634,11 +2319,12 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
     patches::create_baseline(&shard)?;
     let shard_path = shard.to_string_lossy().to_string();
 
-    let new_workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
+    let new_workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow_with_definition(
         state,
         &feature,
         &shard_path,
         template_id,
+        replacement_definition,
         supervisor_context(&run, &workspace),
     ).await?;
 
@@ -1651,24 +2337,35 @@ pub async fn remove_supervisor_child_workflow(state: &AppState, id: Uuid, payloa
         .execute(&state.db)
         .await?;
 
+    upsert_supervisor_work_unit_for_feature(state, run.id, &sprint_id, &execution_item_id).await?;
+
     if let Some(feature_item) = run.feature_plan_items.iter_mut().find(|item| item.id == execution_item_id) {
         if !matches!(feature_item.status, FeaturePlanItemStatus::Applied) {
             feature_item.status = FeaturePlanItemStatus::Scheduled;
         }
     }
 
-    run.status = SupervisorStatus::RunningChildren;
+    if pool_was_running {
+        run.status = SupervisorStatus::RunningChildren;
+        start_next_series_child(state, &mut run).await?;
+    } else {
+        run.status = SupervisorStatus::Paused;
+    }
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
 
-    start_next_series_child(state, &mut run).await?;
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow reset").await?;
-
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow reset").await?;
+    publish_supervisor_snapshot(
+        state,
+        &run,
+        "supervisor_snapshot",
+        if pool_was_running { "feature workflow reset and queued" } else { "feature workflow reset without starting" },
+    ).await?;
     return Ok(json!({
         "ok": true,
         "supervisor_run": run,
         "workflow_run_id": new_workflow_run_id,
+        "pool_was_running": pool_was_running,
+        "started": pool_was_running,
         "invalidated_integration": true
     }));
 
@@ -1811,35 +2508,176 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
     Ok(json!({ "ok": true, "status": "applied", "sprint_completed_at": completed_at_text }))
 }
 
-fn supervisor_patch_paths(run: &SupervisorRun) -> Vec<Value> {
-    let Ok(workspace) = repo_snapshot::workspace_for(&run.root_repo_path, run.id) else {
-        return Vec::new();
-    };
-    run.execution_plan_items.iter().filter_map(|item| {
-        let feature = run.feature_plan_items.iter().find(|feature| feature.id == item.feature_plan_item_id)?;
-        let shard_path = repo_snapshot::shard_path(&workspace, &feature.id).to_string_lossy().to_string();
-        Some(json!({
-            "execution_item_id": feature.id,
-            "title": feature.title,
+async fn log_sqlite_foreign_key_check(state: &AppState, label: &str) {
+    match sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&state.db)
+        .await
+    {
+        Ok(rows) if rows.is_empty() => {
+            tracing::info!(label, "sqlite foreign_key_check passed");
+        }
+        Ok(rows) => {
+            for row in rows {
+                let table_name = row.try_get::<String, _>("table").unwrap_or_else(|_| "<unknown>".to_string());
+                let rowid = row.try_get::<i64, _>("rowid").unwrap_or(-1);
+                let parent = row.try_get::<String, _>("parent").unwrap_or_else(|_| "<unknown>".to_string());
+                let fkid = row.try_get::<i64, _>("fkid").unwrap_or(-1);
+                tracing::error!(label, table = %table_name, rowid, parent = %parent, fkid, "sqlite foreign_key_check violation");
+            }
+        }
+        Err(err) => {
+            tracing::error!(label, error = %format!("{:#}", err), "sqlite foreign_key_check failed to run");
+        }
+    }
+}
+
+async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result<Vec<Value>> {
+    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
+    let sprint_id = current_sprint_id(run).await?;
+    let mut inputs = Vec::new();
+
+    let feature_rows = sqlx::query(
+        r#"
+        SELECT sf.feature_id,
+               COALESCE(pf.title, sf.feature_id) AS title,
+               sf.current_patch_id,
+               sf.current_workflow_run_id,
+               sf.shard_path
+        FROM sprint_features sf
+        LEFT JOIN planner_features pf ON pf.id = sf.feature_id
+        WHERE sf.supervisor_run_id = ?
+          AND sf.sprint_id = ?
+          AND sf.status != 'unscheduled'
+          AND sf.development_state IN ('development_succeeded', 'integrated', 'applied')
+          AND COALESCE(sf.integration_skipped, 0) = 0
+        ORDER BY sf.sort_order ASC, sf.updated_at ASC
+        "#,
+    )
+    .bind(run.id.to_string())
+    .bind(&sprint_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    for row in feature_rows {
+        let feature_id: String = row.get("feature_id");
+        let shard_path = row
+            .get::<Option<String>, _>("shard_path")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| repo_snapshot::shard_path(&workspace, &feature_id).to_string_lossy().to_string());
+        inputs.push(json!({
+            "execution_item_id": feature_id,
+            "title": row.get::<String, _>("title"),
             "patch_path": null,
-            "patch_id": null,
+            "patch_id": row.get::<Option<String>, _>("current_patch_id"),
             "shard_path": shard_path,
-            "workflow_run_id": null
-        }))
-    }).collect::<Vec<_>>()
+            "workflow_run_id": row.get::<Option<String>, _>("current_workflow_run_id"),
+            "workflow_type": "feature_development"
+        }));
+    }
+
+    let manual_rows = sqlx::query(
+        r#"
+        SELECT feature_id, title, workflow_run_id, patch_id, shard_path
+        FROM supervisor_work_units
+        WHERE supervisor_run_id = ?
+          AND kind = 'manual_shard'
+          AND state IN ('ready_for_integration', 'integrating', 'integrated')
+          AND COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 0
+        ORDER BY updated_at ASC
+        "#,
+    )
+    .bind(run.id.to_string())
+    .fetch_all(&state.db)
+    .await?;
+
+    for row in manual_rows {
+        let manual_id = row
+            .get::<Option<String>, _>("feature_id")
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        inputs.push(json!({
+            "execution_item_id": manual_id,
+            "manual_shard_id": manual_id,
+            "feature_id": Value::Null,
+            "title": row.get::<String, _>("title"),
+            "patch_path": null,
+            "patch_id": row.get::<Option<String>, _>("patch_id"),
+            "shard_path": row.get::<Option<String>, _>("shard_path"),
+            "workflow_run_id": row.get::<Option<String>, _>("workflow_run_id"),
+            "workflow_type": "manual_shard",
+            "patch_owner": "supervisor_manual_shard",
+            "planner_feature_backed": false
+        }));
+    }
+
+    Ok(inputs)
+}
+
+async fn upsert_supervisor_work_unit_for_integration(
+    state: &AppState,
+    run: &SupervisorRun,
+    integration_run_id: Uuid,
+    integration_path: &str,
+    patch_paths: &[Value],
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let work_unit_id = format!("{}:integration", run.id);
+    sqlx::query(
+        r#"
+        INSERT INTO supervisor_work_units (
+            id, supervisor_run_id, repo_id, feature_id, workflow_run_id, patch_id,
+            kind, title, state, root_repo_path, shard_path, integration_path,
+            priority, queue_position, blocked_reason, waiting_user_input_json, context_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, NULL, NULL, ?, NULL, 'integration', 'Integration', 'integrating', ?, NULL, ?, 0, NULL, NULL, '{}', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            workflow_run_id = excluded.workflow_run_id,
+            title = excluded.title,
+            state = excluded.state,
+            root_repo_path = excluded.root_repo_path,
+            integration_path = excluded.integration_path,
+            context_json = excluded.context_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(work_unit_id)
+    .bind(run.id.to_string())
+    .bind(integration_run_id.to_string())
+    .bind(&run.root_repo_path)
+    .bind(integration_path)
+    .bind(serde_json::to_string(&json!({
+        "workflow_type": "integration",
+        "pool_key": "integration",
+        "source": "supervisor_runtime",
+        "sprint_id": run.context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
+        "workflow_template_id": run.context.get("integration_template_id").cloned().unwrap_or(Value::Null),
+        "integration_template_id": run.context.get("integration_template_id").cloned().unwrap_or(Value::Null),
+        "input_count": patch_paths.len(),
+        "inputs": patch_paths
+    }))?)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+    Ok(())
 }
 
 async fn spawn_live_integration_workflow(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
     let workspace = repo_snapshot::refresh_integration_from_worktree(&run.root_repo_path, run.id)?;
     patches::create_baseline(&workspace.integration)?;
     let integration_path = workspace.integration.to_string_lossy().to_string();
-    let patch_paths = supervisor_patch_paths(run);
+    let patch_paths = supervisor_patch_paths(state, run).await?;
+    if patch_paths.is_empty() {
+        return Err(anyhow!("integration has no unskipped completed feature or staged manual inputs"));
+    }
+
+    let integration_template_id = context_uuid(&run.context, "integration_template_id");
     let integration_run_id = workflow_spawn::spawn_integration_workflow(
         state,
         &format!("{} merge integration", run.title),
         &integration_path,
-        patch_paths,
-        context_uuid(&run.context, "integration_template_id"),
+        patch_paths.clone(),
+        integration_template_id,
         json!({
             "supervisor_run_id": run.id,
             "sprint_id": run.context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
@@ -1851,11 +2689,26 @@ async fn spawn_live_integration_workflow(state: &AppState, run: &mut SupervisorR
             "integration_source": "current_worktree_copy"
         }),
     ).await?;
-    let _ = Box::pin(engine::start_run(state, integration_run_id, None)).await?;
-    run.integration_path = Some(integration_path);
+    run.integration_path = Some(integration_path.clone());
     run.integration_run_id = Some(integration_run_id);
     run.final_patch_path = None;
     run.status = SupervisorStatus::RunningIntegration;
+    run.updated_at = Utc::now();
+    upsert_supervisor_work_unit_for_integration(state, run, integration_run_id, &integration_path, &patch_paths).await?;
+    update_supervisor_run(state, run).await?;
+
+    if let Err(err) = Box::pin(engine::start_run(state, integration_run_id, None)).await {
+        tracing::error!(
+            supervisor_run_id = %run.id,
+            integration_run_id = %integration_run_id,
+            input_count = patch_paths.len(),
+            inputs = %serde_json::to_string(&patch_paths).unwrap_or_default(),
+            error = %format!("{:#}", err),
+            "integration workflow start failed"
+        );
+        log_sqlite_foreign_key_check(state, "integration_start_failed").await;
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -1881,6 +2734,11 @@ pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid)
         return Err(anyhow!("development must complete successfully before integration can start"));
     }
     if let Some(integration_run_id) = run.integration_run_id {
+        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration' AND workflow_run_id = ?")
+            .bind(run.id.to_string())
+            .bind(integration_run_id.to_string())
+            .execute(&state.db)
+            .await?;
         delete_supervisor_workflow_run_records(state, integration_run_id).await?;
     }
     run.integration_run_id = None;
@@ -1915,13 +2773,27 @@ pub async fn start_supervisor_integration_workflow(state: &AppState, id: Uuid) -
     if failed > 0 || total == 0 || succeeded < total {
         return Err(anyhow!("development must complete successfully before integration can start"));
     }
-    if matches!(run.status, SupervisorStatus::RunningIntegration | SupervisorStatus::ReadyToApply) && run.integration_run_id.is_some() {
-        return Ok(json!({ "ok": true, "idempotent": true, "supervisor_run": run }));
+
+    if let Some(integration_run_id) = run.integration_run_id.take() {
+        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration' AND workflow_run_id = ?")
+            .bind(run.id.to_string())
+            .bind(integration_run_id.to_string())
+            .execute(&state.db)
+            .await?;
+        delete_supervisor_workflow_run_records(state, integration_run_id).await?;
     }
+    sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration'")
+        .bind(run.id.to_string())
+        .execute(&state.db)
+        .await?;
+    run.final_patch_path = None;
+    run.merge_report = json!({});
+    run.validation_report = json!({});
+
     spawn_live_integration_workflow(state, &mut run).await?;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow started").await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow started with current unskipped inputs").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -2001,10 +2873,17 @@ async fn sprint_development_active_count(state: &AppState, sprint_id: &str) -> R
 }
 
 async fn sprint_development_terminal_counts(state: &AppState, sprint_id: &str) -> Result<(usize, usize, usize)> {
-    let rows = sqlx::query("SELECT development_state, COUNT(*) AS count FROM sprint_features WHERE sprint_id = ? AND status != 'unscheduled' GROUP BY development_state")
-        .bind(sprint_id)
-        .fetch_all(&state.db)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT development_state, COUNT(*) AS count
+         FROM sprint_features
+         WHERE sprint_id = ?
+           AND status != 'unscheduled'
+           AND COALESCE(integration_skipped, 0) = 0
+         GROUP BY development_state",
+    )
+    .bind(sprint_id)
+    .fetch_all(&state.db)
+    .await?;
     let mut total = 0usize;
     let mut succeeded = 0usize;
     let mut failed = 0usize;
@@ -2020,6 +2899,129 @@ async fn sprint_development_terminal_counts(state: &AppState, sprint_id: &str) -
         }
     }
     Ok((total, succeeded, failed))
+}
+
+async fn upsert_supervisor_work_unit_for_feature(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+    sprint_id: &str,
+    feature_id: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        r#"
+        SELECT sf.feature_id,
+               COALESCE(pf.title, sf.feature_id) AS title,
+               pf.repo_id,
+               sf.current_workflow_run_id,
+               sf.current_patch_id,
+               sf.shard_path,
+               sf.status,
+               sf.development_state,
+               sf.last_error,
+               sf.created_at,
+               sf.updated_at,
+               sr.root_repo_path,
+               sr.integration_path
+        FROM sprint_features sf
+        LEFT JOIN planner_features pf ON pf.id = sf.feature_id
+        LEFT JOIN supervisor_runs sr ON sr.id = sf.supervisor_run_id
+        WHERE sf.sprint_id = ?
+          AND sf.feature_id = ?
+          AND sf.supervisor_run_id = ?
+          AND sf.status != 'unscheduled'
+        LIMIT 1
+        "#,
+    )
+    .bind(sprint_id)
+    .bind(feature_id)
+    .bind(supervisor_run_id.to_string())
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(());
+    };
+
+    let now = Utc::now().to_rfc3339();
+    let status = row.try_get::<String, _>("status").unwrap_or_else(|_| "scheduled".to_string());
+    let development_state = row.try_get::<String, _>("development_state").unwrap_or_else(|_| "scheduled".to_string());
+    let last_error = row.try_get::<Option<String>, _>("last_error").ok().flatten();
+    let work_unit_state = supervisor_work_unit_state(status.as_str(), development_state.as_str(), last_error.as_deref());
+    let work_unit_id = format!("{}:{}", supervisor_run_id, feature_id);
+
+    sqlx::query(
+        r#"
+        INSERT INTO supervisor_work_units (
+            id, supervisor_run_id, repo_id, feature_id, workflow_run_id, patch_id,
+            kind, title, state, root_repo_path, shard_path, integration_path,
+            priority, queue_position, blocked_reason, waiting_user_input_json, context_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'feature_development', ?, ?, ?, ?, ?, 0, NULL, ?, '{}', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            repo_id = excluded.repo_id,
+            workflow_run_id = excluded.workflow_run_id,
+            patch_id = excluded.patch_id,
+            title = excluded.title,
+            state = excluded.state,
+            root_repo_path = excluded.root_repo_path,
+            shard_path = excluded.shard_path,
+            integration_path = excluded.integration_path,
+            blocked_reason = excluded.blocked_reason,
+            context_json = excluded.context_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(work_unit_id)
+    .bind(supervisor_run_id.to_string())
+    .bind(row.try_get::<Option<String>, _>("repo_id").ok().flatten())
+    .bind(row.get::<String, _>("feature_id"))
+    .bind(row.try_get::<Option<String>, _>("current_workflow_run_id").ok().flatten())
+    .bind(row.try_get::<Option<String>, _>("current_patch_id").ok().flatten())
+    .bind(row.get::<String, _>("title"))
+    .bind(work_unit_state)
+    .bind(row.get::<String, _>("root_repo_path"))
+    .bind(row.try_get::<Option<String>, _>("shard_path").ok().flatten())
+    .bind(row.try_get::<Option<String>, _>("integration_path").ok().flatten())
+    .bind(last_error.clone())
+    .bind(serde_json::to_string(&json!({
+        "sprint_id": sprint_id,
+        "source": "supervisor_runtime",
+        "status": status,
+        "development_state": development_state,
+        "last_error": last_error
+    }))?)
+    .bind(row.try_get::<String, _>("created_at").unwrap_or_else(|_| now.clone()))
+    .bind(now)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+fn supervisor_work_unit_state(status: &str, development_state: &str, last_error: Option<&str>) -> String {
+    if last_error.is_some_and(|value| !value.trim().is_empty()) {
+        return "failed".to_string();
+    }
+
+    match development_state {
+        "development_running" | "running" | "active" => "running".to_string(),
+        "waiting" | "waiting_user" | "paused" => "waiting_user".to_string(),
+        "development_failed" | "failed" | "blocked" => "failed".to_string(),
+        "development_succeeded" => "ready_for_integration".to_string(),
+        "integrating" | "integration_running" => "integrating".to_string(),
+        "integrated" | "applied" => "integrated".to_string(),
+        "patch_ready" => "patch_ready".to_string(),
+        "deleted_for_restart" | "unscheduled" => "deleted".to_string(),
+        _ => match status {
+            "active" | "running" => "running".to_string(),
+            "waiting" | "paused" => "waiting_user".to_string(),
+            "failed" | "blocked" => "failed".to_string(),
+            "completed" => "ready_for_integration".to_string(),
+            "scheduled" => "queued".to_string(),
+            _ => "queued".to_string(),
+        },
+    }
 }
 
 async fn update_sprint_feature_workflow_state(
@@ -2617,6 +3619,7 @@ fn parse_status(value: &str) -> SupervisorStatus {
     match value {
         "snapshotting" => SupervisorStatus::Snapshotting,
         "running_children" => SupervisorStatus::RunningChildren,
+        "paused" => SupervisorStatus::Paused,
         "development_complete" => SupervisorStatus::DevelopmentComplete,
         "running_integration" => SupervisorStatus::RunningIntegration,
         "validating" => SupervisorStatus::Validating,
@@ -2640,6 +3643,7 @@ fn status_supervisor_str(value: &SupervisorStatus) -> &'static str {
         SupervisorStatus::Created => "created",
         SupervisorStatus::Snapshotting => "snapshotting",
         SupervisorStatus::RunningChildren => "running_children",
+        SupervisorStatus::Paused => "paused",
         SupervisorStatus::DevelopmentComplete => "development_complete",
         SupervisorStatus::RunningIntegration => "running_integration",
         SupervisorStatus::Validating => "validating",

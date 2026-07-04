@@ -18,6 +18,7 @@ pub enum SupervisorStatus {
     Created,
     Snapshotting,
     RunningChildren,
+    Paused,
     DevelopmentComplete,
     RunningIntegration,
     Validating,

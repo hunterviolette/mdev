@@ -663,55 +663,9 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
                         ) : null}
                       </Group>
                     </Group>
-                    <Group grow align="flex-end">
-                      <Select
-                        label="Workflow template"
-                        placeholder="Select workflow template"
-                        value={workflowTemplateId}
-                        onChange={setWorkflowTemplateId}
-                        data={templateOptions}
-                        searchable
-                      />
-                      <Select
-                        label="Execution mode"
-                        value={strategy}
-                        onChange={(value) => setStrategy((value as SupervisorExecutionStrategy) ?? 'series')}
-                        data={[
-                          { value: 'series', label: 'Series' },
-                          { value: 'parallel', label: 'Parallel' }
-                        ]}
-                        allowDeselect={false}
-                      />
-                      <NumberInput
-                        label="Feature concurrency"
-                        min={1}
-                        max={64}
-                        value={featureConcurrency}
-                        onChange={(value) => {
-                          const next = typeof value === 'number' ? value : Number(value);
-                          setFeatureConcurrency(Number.isFinite(next) ? Math.max(1, Math.floor(next)) : 1);
-                        }}
-                      />
-                      <Select
-                        label="Integration"
-                        value={integrationPolicy}
-                        onChange={(value) => setIntegrationPolicy(value === 'auto' ? 'auto' : 'manual')}
-                        data={[
-                          { value: 'manual', label: 'Manual start after development' },
-                          { value: 'auto', label: 'Auto-run after development' }
-                        ]}
-                        allowDeselect={false}
-                      />
-                    </Group>
-
-                    <Select
-                      label="Integration workflow"
-                      placeholder="Select integration workflow"
-                      value={integrationTemplateId}
-                      onChange={setIntegrationTemplateId}
-                      data={templateOptions}
-                      searchable
-                    />
+                    <Text size="xs" c="dimmed">
+                      Pool orchestration controls now live with their supervisor pools in Flight Deck.
+                    </Text>
                   </Stack>
                 ) : null}
               </Stack>

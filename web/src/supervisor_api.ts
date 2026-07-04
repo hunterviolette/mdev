@@ -79,16 +79,6 @@ export type CreateSupervisorRunRequest = {
   context?: Record<string, unknown>;
 };
 
-export type EnsureSupervisorPlannerRequest = {
-  root_repo_path: string;
-  title?: string | null;
-};
-
-export type EnsureSupervisorPlannerResponse = {
-  created: boolean;
-  supervisor_run: SupervisorRun;
-};
-
 export type PlannerImportStatus = 'accepted' | 'duplicate' | 'conflict' | 'invalid';
 export type PlannerImportAction = 'create' | 'create_copy' | 'replace_existing' | 'skip' | 'reject';
 
@@ -209,20 +199,6 @@ export async function createSupervisorRun(request: CreateSupervisorRunRequest): 
   return normalizeSupervisorRun(await response.json());
 }
 
-export async function ensureSupervisorPlannerRun(request: EnsureSupervisorPlannerRequest): Promise<EnsureSupervisorPlannerResponse> {
-  const response = await fetch('/api/supervisor-runs/ensure-planner', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request)
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const payload = await response.json();
-  return {
-    created: Boolean(payload.created),
-    supervisor_run: normalizeSupervisorRun(payload.supervisor_run)
-  };
-}
-
 function supervisorRouteIsActive(): boolean {
   if (typeof window === 'undefined') return true;
   const path = window.location.pathname;
@@ -236,6 +212,159 @@ export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
   const response = await fetch(`/api/supervisor-runs/${id}`);
   if (!response.ok) throw new Error(await response.text());
   return normalizeSupervisorRun(await response.json());
+}
+
+export type FlightDeckAlert = {
+  id: string;
+  supervisor_id: string;
+  work_unit_id?: string | null;
+  workflow_run_id?: string | null;
+  level: string;
+  kind: string;
+  message: string;
+  created_at?: string | null;
+};
+
+export type FlightDeckWorkUnit = {
+  id: string;
+  supervisor_id: string;
+  repo_id?: string | null;
+  feature_id?: string | null;
+  workflow_run_id?: string | null;
+  patch_id?: string | null;
+  kind: string;
+  workflow_type?: string | null;
+  title: string;
+  state: string;
+  root_repo_path: string;
+  shard_path?: string | null;
+  integration_path?: string | null;
+  telemetry: Record<string, unknown>;
+  alerts: FlightDeckAlert[];
+  created_at?: string | null;
+  updated_at?: string | null;
+  workflow_deleted: boolean;
+};
+
+export type FlightDeckTopologyNode = {
+  id: string;
+  parent_id?: string | null;
+  kind: string;
+  label: string;
+  state: string;
+  work_unit_id?: string | null;
+  workflow_run_id?: string | null;
+};
+
+export type FlightDeckSupervisor = {
+  id: string;
+  mode: string;
+  status: string;
+  title: string;
+  root_repo_path: string;
+  snapshot_path?: string | null;
+  integration_path?: string | null;
+  integration_run_id?: string | null;
+  topology: FlightDeckTopologyNode[];
+  work_units: FlightDeckWorkUnit[];
+  alerts: FlightDeckAlert[];
+  integration: Record<string, unknown>;
+  context: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type FlightDeckResponse = {
+  supervisors: FlightDeckSupervisor[];
+  alerts: FlightDeckAlert[];
+  totals: {
+    supervisors: number;
+    work_units: number;
+    running: number;
+    waiting_user: number;
+    failed: number;
+    ready_for_integration: number;
+    integrating: number;
+  };
+};
+
+export type FlightDeckFilters = {
+  supervisor_id?: string | null;
+  root_repo_path?: string | null;
+  state?: string | null;
+  kind?: string | null;
+  include_deleted?: boolean;
+};
+
+export type WorkflowEventHistoryItem = {
+  id: string;
+  run_id: string;
+  step_id?: string | null;
+  stage_execution_id?: string | null;
+  capability_invocation_id?: string | null;
+  parent_invocation_id?: string | null;
+  sequence_no: number;
+  level: string;
+  kind: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type WorkflowEventHistoryQuery = {
+  before_sequence?: number | null;
+  after_sequence?: number | null;
+  limit?: number | null;
+  start?: string | null;
+  end?: string | null;
+  stage?: string | null;
+  capability?: string | null;
+  stage_execution_id?: string | null;
+  capability_invocation_id?: string | null;
+};
+
+export type WorkflowEventHistoryResponse = {
+  run_id: string;
+  items: WorkflowEventHistoryItem[];
+  next_before_sequence?: number | null;
+  has_more: boolean;
+};
+
+function workflowEventHistoryParams(query: WorkflowEventHistoryQuery = {}): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== null && value !== undefined && `${value}`.trim() !== '') params.set(key, `${value}`);
+  }
+  return params;
+}
+
+export function workflowEventHistoryStreamUrl(runId: string, query: WorkflowEventHistoryQuery = {}): string {
+  const params = workflowEventHistoryParams(query);
+  const queryText = params.toString();
+  return `/api/workflow-runs/${encodeURIComponent(runId)}/events/stream${queryText ? `?${queryText}` : ''}`;
+}
+
+export async function getWorkflowEventHistory(runId: string, query: WorkflowEventHistoryQuery = {}): Promise<WorkflowEventHistoryResponse> {
+  const params = workflowEventHistoryParams(query);
+  const queryText = params.toString();
+  const response = await fetch(`/api/workflow-runs/${encodeURIComponent(runId)}/event-history${queryText ? `?${queryText}` : ''}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<FlightDeckResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (typeof value === 'boolean') {
+      if (value) params.set(key, 'true');
+    } else if (value) {
+      params.set(key, value);
+    }
+  }
+  const query = params.toString();
+  const response = await fetch(`/api/flight-deck${query ? `?${query}` : ''}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
 }
 
 export async function deleteSupervisorRun(id: string): Promise<{ ok: boolean }> {
@@ -309,7 +438,7 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'unschedule_feature' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'remove_child_workflow', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'update_flight_deck_settings' | 'unschedule_feature' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'pause_feature_pool' | 'resume_feature_pool' | 'remove_child_workflow' | 'create_manual_shard' | 'regenerate_child_workflow' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'skip_integration_input' | 'unskip_integration_input', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

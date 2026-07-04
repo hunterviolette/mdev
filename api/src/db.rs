@@ -147,13 +147,9 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
-    sqlx::query("DROP TABLE IF EXISTS workflow_events")
-    .execute(db)
-    .await?;
-
     sqlx::query(
         r#"
-        CREATE TABLE workflow_events (
+        CREATE TABLE IF NOT EXISTS workflow_events (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
             step_id TEXT,
@@ -269,6 +265,50 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS supervisor_work_units (
+            id TEXT PRIMARY KEY,
+            supervisor_run_id TEXT NOT NULL,
+            repo_id TEXT,
+            feature_id TEXT,
+            workflow_run_id TEXT,
+            patch_id TEXT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            state TEXT NOT NULL,
+            root_repo_path TEXT NOT NULL,
+            shard_path TEXT,
+            integration_path TEXT,
+            priority INTEGER NOT NULL DEFAULT 0,
+            queue_position INTEGER,
+            blocked_reason TEXT,
+            waiting_user_input_json TEXT NOT NULL DEFAULT '{}',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_supervisor_state ON supervisor_work_units (supervisor_run_id, state, updated_at)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_repo_state ON supervisor_work_units (root_repo_path, state, updated_at)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_workflow ON supervisor_work_units (workflow_run_id)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_feature ON supervisor_work_units (feature_id)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS planner_repos (
             id TEXT PRIMARY KEY,
             root_repo_path TEXT NOT NULL UNIQUE,
@@ -366,6 +406,23 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     ensure_column(db, "sprint_features", "integration_completed_at", "TEXT").await?;
     ensure_column(db, "sprint_features", "current_step_id", "TEXT").await?;
     ensure_column(db, "sprint_features", "last_error", "TEXT").await?;
+    ensure_column(db, "sprint_features", "integration_skipped", "INTEGER DEFAULT 0").await?;
+
+    sqlx::query("UPDATE sprint_features SET integration_skipped = 0 WHERE integration_skipped IS NULL")
+        .execute(db)
+        .await?;
+
+    sqlx::query("DELETE FROM sprint_features WHERE feature_id LIKE 'manual-%'")
+        .execute(db)
+        .await?;
+
+    sqlx::query("DELETE FROM supervisor_work_units WHERE kind = 'feature_development' AND feature_id LIKE 'manual-%'")
+        .execute(db)
+        .await?;
+
+    sqlx::query("UPDATE planner_features SET current_sprint_id = NULL, current_supervisor_run_id = NULL, current_workflow_run_id = NULL, current_patch_id = NULL, status = 'deleted', updated_at = datetime('now') WHERE id LIKE 'manual-%'")
+        .execute(db)
+        .await?;
 
     sqlx::query(
         r#"

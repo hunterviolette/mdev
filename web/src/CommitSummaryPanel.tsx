@@ -649,7 +649,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [commitAnalyticsMode, setCommitAnalyticsMode] = useState<CommitAnalyticsMode>('activity');
   const [commitChartDisplayMode, setCommitChartDisplayMode] = useState<CommitChartDisplayMode>('fit');
   const [commitChartFullscreenOpen, setCommitChartFullscreenOpen] = useState(false);
-  const [commitAggregationPreset, setCommitAggregationPreset] = useState<CommitAggregationPreset>('monthly');
+  const [commitAggregationPreset, setCommitAggregationPreset] = useState<CommitAggregationPreset>('daily');
   const [commitAggregationDays, setCommitAggregationDays] = useState<number>(10);
   const [commitAggregationDaysText, setCommitAggregationDaysText] = useState('10');
   const [commitAnalyticsColorBy, setCommitAnalyticsColorBy] = useState<CommitAnalyticsColorBy>('extension');
@@ -664,7 +664,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
   const [commitReportIncludeRegexText, setCommitReportIncludeRegexText] = useState('');
   const [commitReportExcludeRegexText, setCommitReportExcludeRegexText] = useState('(^|/)Cargo\\.lock$\n(^|/)package-lock\\.json$\n(^|/)pnpm-lock\\.yaml$\n(^|/)yarn\\.lock$');
   const [advancedCommitFiltersOpen, setAdvancedCommitFiltersOpen] = useState(false);
-  const [commitDatePreset, setCommitDatePreset] = useState<'all' | '30d' | '90d' | '6m' | '1y' | 'custom'>('all');
+  const [commitDatePreset, setCommitDatePreset] = useState<'all' | '30d' | '90d' | '6m' | '1y' | 'custom'>('30d');
   const [expandedSha, setExpandedSha] = useState<string | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<ReviewCommitSummary | null>(null);
   const [hoveredCommit, setHoveredCommit] = useState<ReviewCommitSummary | null>(null);
@@ -747,6 +747,12 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
     const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
     return local.toISOString().slice(0, 10);
   }, []);
+
+  const defaultCommitSince = useMemo(() => {
+    const since = new Date();
+    since.setDate(since.getDate() - 30);
+    return formatCommitDateInput(since);
+  }, [formatCommitDateInput]);
 
   const applyCommitDatePreset = useCallback((preset: 'all' | '30d' | '90d' | '6m' | '1y' | 'custom') => {
     setCommitDatePreset(preset);
@@ -1124,15 +1130,15 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
       const refs = json.refs.filter((item) => item.value !== '__WORKTREE__');
       setCommitRefOptions(refs);
       setCommitReportRefName((current) => current || json.default_ref || refs[0]?.value || '');
-      setCommitReportSince((current) => current || '');
-      setCommitReportUntil((current) => current || '');
+      setCommitReportSince((current) => current || defaultCommitSince);
+      setCommitReportUntil((current) => current || todayDateInputValue());
     }).catch((err) => {
       if (!cancelled) setError(err instanceof Error ? err.message : String(err));
     });
     return () => {
       cancelled = true;
     };
-  }, [repoRef]);
+  }, [repoRef, defaultCommitSince]);
 
   useEffect(() => {
     if (!repoRef.trim() || !commitReportRefName.trim() || appliedCommitDatasetFiltersKey) return;

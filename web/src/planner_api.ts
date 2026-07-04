@@ -38,6 +38,12 @@ export type SetDefaultPlannerResponse = {
   planner: PlannerWorkspace;
 };
 
+export type RefinePlannerFeatureResponse = {
+  ok: boolean;
+  workflow_run_id: string;
+  reused?: boolean;
+};
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
@@ -53,7 +59,7 @@ export function listPlannersForRepo(rootRepoPath: string): Promise<PlannerWorksp
 }
 
 export function createPlannerForRepo(body: { root_repo_path: string; title?: string | null; make_default?: boolean; feature_plan_items?: FeaturePlanItem[] }): Promise<PlannerWorkspace> {
-  return fetchJson<PlannerWorkspace>('/api/planners', {
+  return fetchJson<PlannerWorkspace>('/api/planners/create', {
     method: 'POST',
     body: JSON.stringify(body),
   });
@@ -77,9 +83,22 @@ export function updatePlannerFeatures(id: string, featurePlanItems: FeaturePlanI
   });
 }
 
+export function deletePlannerForRepo(id: string): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>(`/api/planners/${id}`, {
+    method: 'DELETE',
+  });
+}
+
 export function setDefaultPlanner(id: string): Promise<SetDefaultPlannerResponse> {
   return fetchJson<SetDefaultPlannerResponse>(`/api/planners/${id}/default`, {
     method: 'POST',
     body: JSON.stringify({}),
+  });
+}
+
+export function refinePlannerFeature(plannerId: string, featureId: string, body: { supervisor_id?: string | null; workflow_template_id?: string | null }): Promise<RefinePlannerFeatureResponse> {
+  return fetchJson<RefinePlannerFeatureResponse>(`/api/planners/${encodeURIComponent(plannerId)}/features/${encodeURIComponent(featureId)}/refine`, {
+    method: 'POST',
+    body: JSON.stringify(body),
   });
 }

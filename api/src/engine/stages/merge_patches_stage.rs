@@ -53,7 +53,26 @@ pub async fn execute_stage(
         .map(str::to_string)
         .ok_or_else(|| anyhow!("merge_patches requires supervisor.sprint_id in workflow context"))?;
 
-    let patch_items = resolve_sprint_feature_patches(state, &sprint_id).await?;
+    let configured_patch_items = step
+        .config
+        .get("patches")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| {
+            run.context
+                .get("workflow_engine")
+                .and_then(|value| value.get("global_state"))
+                .and_then(|value| value.get("supervisor"))
+                .and_then(|value| value.get("patches"))
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    let patch_items = if configured_patch_items.is_empty() {
+        resolve_sprint_feature_patches(state, &sprint_id).await?
+    } else {
+        configured_patch_items
+    };
     let mut applied = Vec::new();
     let mut failed = Vec::new();
     let mut capability_results = Vec::new();
@@ -67,22 +86,27 @@ pub async fn execute_stage(
 
     for patch in patch_items {
         let shard_path = patch.get("shard_path").and_then(Value::as_str).unwrap_or_default().trim().to_string();
-        let feature_id = patch.get("execution_item_id").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        let workflow_type = patch.get("workflow_type").and_then(Value::as_str).unwrap_or("feature_development");
+        let execution_item_id = patch.get("execution_item_id").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        let feature_id = if workflow_type == "manual_shard" { String::new() } else { execution_item_id.clone() };
         let workflow_run_id = patch.get("workflow_run_id").and_then(Value::as_str).map(str::to_string);
         let capability_invocation_id = Uuid::new_v4().to_string();
+        let patch_source = if workflow_type == "manual_shard" { "supervisor_manual_shards" } else { "sprint_features" };
         let capability_config = json!({
             "mode": "generate_apply_persist_patch_text",
-            "source": "sprint_features",
+            "source": patch_source,
             "sprint_id": sprint_id,
-            "feature_id": feature_id,
+            "execution_item_id": execution_item_id,
+            "feature_id": if feature_id.is_empty() { Value::Null } else { Value::String(feature_id.clone()) },
+            "workflow_type": workflow_type,
             "shard_path": shard_path,
             "target_repo_ref": repo_ref
         });
 
-        if shard_path.is_empty() || feature_id.is_empty() {
+        if shard_path.is_empty() || (workflow_type != "manual_shard" && feature_id.is_empty()) || (workflow_type == "manual_shard" && execution_item_id.is_empty()) {
             failed.push(json!({
                 "patch": patch,
-                "error": "sprint_features patch source requires feature_id and shard_path"
+                "error": "integration patch source requires shard_path and either feature_id or manual_shard_id"
             }));
             break;
         }
@@ -177,16 +201,27 @@ pub async fn execute_stage(
 
         match patches::apply_patch_text(Path::new(repo_ref), &patch_text) {
             Ok(()) => {
-                let patch_id = persist_integrated_feature_patch(
-                    state,
-                    &root_repo_path,
-                    supervisor_run_id.as_deref(),
-                    Some(&sprint_id),
-                    &feature_id,
-                    workflow_run_id.as_deref(),
-                    &shard_path,
-                    &patch_text,
-                ).await?;
+                let patch_id = if workflow_type == "manual_shard" {
+                    persist_integrated_manual_patch(
+                        state,
+                        supervisor_run_id.as_deref(),
+                        &execution_item_id,
+                        workflow_run_id.as_deref(),
+                        &shard_path,
+                        &patch_text,
+                    ).await?
+                } else {
+                    persist_integrated_feature_patch(
+                        state,
+                        &root_repo_path,
+                        supervisor_run_id.as_deref(),
+                        Some(&sprint_id),
+                        &feature_id,
+                        workflow_run_id.as_deref(),
+                        &shard_path,
+                        &patch_text,
+                    ).await?
+                };
                 let result = json!({
                     "ok": true,
                     "mode": "generate_apply_persist_patch_text",
@@ -366,7 +401,120 @@ async fn persist_integrated_feature_patch(
     Ok(patch_id)
 }
 
+async fn persist_integrated_manual_patch(
+    state: &AppState,
+    supervisor_run_id: Option<&str>,
+    manual_shard_id: &str,
+    workflow_run_id: Option<&str>,
+    shard_path: &str,
+    patch_text: &str,
+) -> Result<String> {
+    let supervisor_run_id = supervisor_run_id.ok_or_else(|| anyhow!("manual integration patch requires supervisor_run_id"))?;
+    let patch_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let patch_hash = patches::patch_content_hash(patch_text);
+
+    let row = sqlx::query("SELECT id, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1")
+        .bind(supervisor_run_id)
+        .bind(manual_shard_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| anyhow!("manual shard work unit {} is missing", manual_shard_id))?;
+
+    let work_unit_id: String = row.get("id");
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("integration_input".to_string(), Value::Bool(true));
+        obj.insert("staged_to_integration".to_string(), Value::Bool(true));
+        obj.insert("integrated_patch_id".to_string(), Value::String(patch_id.clone()));
+        obj.insert("integrated_patch_hash".to_string(), Value::String(patch_hash));
+        obj.insert("integrated_patch_bytes".to_string(), Value::Number((patch_text.len() as u64).into()));
+        obj.insert("integrated_at".to_string(), Value::String(now.clone()));
+    }
+
+    sqlx::query("UPDATE supervisor_work_units SET patch_id = ?, state = 'integrated', context_json = ?, updated_at = ? WHERE id = ?")
+        .bind(&patch_id)
+        .bind(serde_json::to_string(&context)?)
+        .bind(&now)
+        .bind(&work_unit_id)
+        .execute(&state.db)
+        .await?;
+
+    if let Some(workflow_run_id) = workflow_run_id.filter(|value| !value.trim().is_empty()) {
+        tracing::info!(
+            supervisor_run_id,
+            manual_shard_id,
+            workflow_run_id,
+            patch_id = %patch_id,
+            shard_path,
+            "persisted supervisor-owned manual integration patch without planner_feature FK"
+        );
+    }
+
+    Ok(patch_id)
+}
+
 async fn ensure_planner_repo_id(state: &AppState, root_repo_path: &str) -> Result<String> {
+async fn persist_integrated_manual_patch(
+    state: &AppState,
+    supervisor_run_id: Option<&str>,
+    manual_shard_id: &str,
+    workflow_run_id: Option<&str>,
+    shard_path: &str,
+    patch_text: &str,
+) -> Result<String> {
+    let supervisor_run_id = supervisor_run_id.ok_or_else(|| anyhow!("manual integration patch requires supervisor_run_id"))?;
+    let patch_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let patch_hash = patches::patch_content_hash(patch_text);
+
+    let row = sqlx::query("SELECT id, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1")
+        .bind(supervisor_run_id)
+        .bind(manual_shard_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| anyhow!("manual shard work unit {} is missing", manual_shard_id))?;
+
+    let work_unit_id: String = row.get("id");
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
+        obj.insert("integration_input".to_string(), Value::Bool(true));
+        obj.insert("staged_to_integration".to_string(), Value::Bool(true));
+        obj.insert("integrated_patch_id".to_string(), Value::String(patch_id.clone()));
+        obj.insert("integrated_patch_hash".to_string(), Value::String(patch_hash));
+        obj.insert("integrated_patch_bytes".to_string(), Value::Number((patch_text.len() as u64).into()));
+        obj.insert("integrated_at".to_string(), Value::String(now.clone()));
+    }
+
+    sqlx::query("UPDATE supervisor_work_units SET patch_id = ?, state = 'integrated', context_json = ?, updated_at = ? WHERE id = ?")
+        .bind(&patch_id)
+        .bind(serde_json::to_string(&context)?)
+        .bind(&now)
+        .bind(&work_unit_id)
+        .execute(&state.db)
+        .await?;
+
+    if let Some(workflow_run_id) = workflow_run_id.filter(|value| !value.trim().is_empty()) {
+        tracing::info!(
+            supervisor_run_id,
+            manual_shard_id,
+            workflow_run_id,
+            patch_id = %patch_id,
+            shard_path,
+            "persisted supervisor-owned manual integration patch without planner_feature FK"
+        );
+    }
+
+    Ok(patch_id)
+}
+
+
     if let Some(row) = sqlx::query("SELECT id FROM planner_repos WHERE root_repo_path = ?")
         .bind(root_repo_path)
         .fetch_optional(&state.db)
@@ -409,7 +557,7 @@ fn repo_key_for(root_repo_path: &str) -> String {
 }
 
 async fn resolve_sprint_feature_patches(state: &AppState, sprint_id: &str) -> Result<Vec<Value>> {
-    let rows = sqlx::query("SELECT sf.feature_id, COALESCE(pf.title, sf.feature_id) AS title, sf.shard_path, sf.current_workflow_run_id, sf.current_patch_id FROM sprint_features sf LEFT JOIN planner_features pf ON pf.id = sf.feature_id WHERE sf.sprint_id = ? AND sf.development_state IN ('development_succeeded', 'integrated', 'applied') AND TRIM(COALESCE(sf.shard_path, '')) != '' ORDER BY sf.sort_order ASC, sf.created_at ASC")
+    let rows = sqlx::query("SELECT sf.feature_id, COALESCE(pf.title, sf.feature_id) AS title, sf.shard_path, sf.current_workflow_run_id, sf.current_patch_id FROM sprint_features sf LEFT JOIN planner_features pf ON pf.id = sf.feature_id WHERE sf.sprint_id = ? AND sf.development_state IN ('development_succeeded', 'integrated', 'applied') AND COALESCE(sf.integration_skipped, 0) = 0 AND TRIM(COALESCE(sf.shard_path, '')) != '' ORDER BY sf.sort_order ASC, sf.created_at ASC")
         .bind(sprint_id)
         .fetch_all(&state.db)
         .await?;

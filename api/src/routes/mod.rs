@@ -1,6 +1,7 @@
 mod capabilities;
 mod changesets;
 mod event_chains;
+mod flight_deck;
 mod filesystem;
 mod health;
 mod repo_tree;
@@ -30,6 +31,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(sap::router())
         .merge(filesystem::router())
         .merge(event_chains::router())
+        .merge(flight_deck::router())
         .merge(capabilities::router())
         .merge(changesets::router())
 }

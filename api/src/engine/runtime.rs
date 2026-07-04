@@ -356,6 +356,12 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         None => latest_stage_execution_id_for_step(state, run_id, stage_id.as_str()).await?,
     };
 
+    let capability_invocation_id = blocked_on
+        .get("capability_invocation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+
 
     let normalized_disposition = match disposition {
         "continue_auto" | "auto" | "autonomous" | "move_next" | "continue" => "continue_auto",
@@ -378,6 +384,34 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         run_state_obj.remove("blocked_on");
     }
     persist_context(state, run_id, &run.context).await?;
+
+    let checkpoint_ok = normalized_disposition != "pause_error";
+    let checkpoint_status = if checkpoint_ok { "success" } else { "paused" };
+    append_engine_event(
+        state,
+        run_id,
+        Some(stage_id.as_str()),
+        if checkpoint_ok { "info" } else { "warn" },
+        "operator_checkpoint_completed",
+        if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
+        json!({
+            "capability": "operator_checkpoint",
+            "ok": checkpoint_ok,
+            "waiting_for_user": false,
+            "disposition": normalized_disposition,
+            "result": {
+                "ok": checkpoint_ok,
+                "mode": "operator_checkpoint",
+                "status": checkpoint_status,
+                "needs_user_response": false,
+                "summary": if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
+                "message": if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
+                "stage_id": stage_id,
+                "disposition": normalized_disposition
+            },
+            "event_meta": event_meta(stage_execution_id.as_deref(), capability_invocation_id.as_deref(), None, true)
+        }),
+    ).await?;
 
     match normalized_disposition {
         "pause_error" => {
