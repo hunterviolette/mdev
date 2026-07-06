@@ -18,6 +18,12 @@ type PlannerSelection = {
   feature: FeaturePlanItem | null;
 };
 
+type PlannerMultiSelection = {
+  planner: { id: string; root_repo_path: string; title: string } | null;
+  featureIds: string[];
+  features: FeaturePlanItem[];
+};
+
 type Props = {
   opened: boolean;
   rootRepoPath: string;
@@ -25,10 +31,12 @@ type Props = {
   templates?: WorkflowTemplate[];
   plannerOptions?: PlannerWorkspace[];
   selectedFeatureId?: string | null;
+  selectedFeatureIds?: string[];
   selectedPlannerId?: string | null;
   selectionMode?: boolean;
   createFeatureOnOpen?: boolean;
   onSelectFeature?: (selection: PlannerSelection) => void | Promise<void>;
+  onSelectFeatures?: (selection: PlannerMultiSelection) => void | Promise<void>;
   onFeatureCreated?: (selection: PlannerSelection) => void | Promise<void>;
   onClose: () => void;
   onSaved?: () => Promise<void> | void;
@@ -36,7 +44,7 @@ type Props = {
   onError?: (message: string) => void;
 };
 
-const FEATURE_STATUSES: FeaturePlanItemStatus[] = ['rough', 'fine', 'scheduled', 'completed', 'applied'];
+const FEATURE_STATUSES: FeaturePlanItemStatus[] = ['rough', 'fine', 'completed', 'applied'];
 const IMPORT_ACTIONS: PlannerImportAction[] = ['create', 'create_copy', 'replace_existing', 'skip', 'reject'];
 
 function normalizePlannerRoot(value: string): string {
@@ -121,7 +129,7 @@ function defaultFeatureDraft(feature: FeaturePlanItem): FeaturePlanItem {
   return {
     ...feature,
     title: feature.title ?? '',
-    status: feature.status ?? 'rough',
+    status: feature.status === 'scheduled' ? 'fine' : feature.status ?? 'rough',
     summary: feature.summary ?? '',
     rough_summary: feature.rough_summary ?? '',
     requirements: feature.requirements ?? [],
@@ -225,6 +233,7 @@ export function PlannerModal(props: Props) {
   const [newPlannerTitle, setNewPlannerTitle] = useState(repoPlannerTitle(rootRepoPath));
   const [plannerWorkspaces, setPlannerWorkspaces] = useState<PlannerWorkspace[]>(props.plannerOptions ?? []);
   const [busyFeatureId, setBusyFeatureId] = useState<string | null>(null);
+  const [stagedFeatureIds, setStagedFeatureIds] = useState<string[]>(props.selectedFeatureIds ?? []);
   const [viewFeature, setViewFeature] = useState<FeaturePlanItem | null>(null);
   const [featureDraft, setFeatureDraft] = useState<FeaturePlanItem | null>(null);
   const [featureEditMode, setFeatureEditMode] = useState(false);
@@ -249,14 +258,19 @@ export function PlannerModal(props: Props) {
   })), [plannerOptions, appliedPlannerId]);
 
   const filteredFeatures = useMemo(() => {
+    const source = props.selectionMode
+      ? features.filter((item) => ['fine', 'scheduled'].includes(String(item.status ?? '')))
+      : features;
     const needle = featureSearch.trim().toLowerCase();
-    if (!needle) return features;
-    return features.filter((item) => {
+    if (!needle) return source;
+    return source.filter((item) => {
+      const plannerStatus = String(item.status ?? '').toLowerCase();
+      const displayStatus = plannerStatus === 'scheduled' ? 'fine' : plannerStatus;
       return featureTitle(item).toLowerCase().includes(needle)
         || (item.summary ?? '').toLowerCase().includes(needle)
-        || String(item.status ?? '').toLowerCase().includes(needle);
+        || displayStatus.includes(needle);
     });
-  }, [features, featureSearch]);
+  }, [features, featureSearch, props.selectionMode]);
 
   const importSummaryText = useMemo(() => {
     if (!importPreview) return '';
@@ -267,6 +281,11 @@ export function PlannerModal(props: Props) {
   useEffect(() => {
     setRun(props.run ?? null);
   }, [props.run?.id]);
+
+  useEffect(() => {
+    if (!props.opened) return;
+    setStagedFeatureIds(props.selectedFeatureIds ?? []);
+  }, [props.opened, props.selectedFeatureIds?.join('|')]);
 
   useEffect(() => {
     if (!props.plannerOptions || props.plannerOptions.length === 0) return;
@@ -501,11 +520,55 @@ export function PlannerModal(props: Props) {
   }
 
   async function selectFeature(feature: FeaturePlanItem | null) {
+    if (props.onSelectFeatures) {
+      if (!feature?.id) {
+        setStagedFeatureIds([]);
+        return;
+      }
+      setStagedFeatureIds((current) => current.includes(feature.id) ? current.filter((id) => id !== feature.id) : Array.from(new Set([...current, feature.id])));
+      return;
+    }
+
     if (!props.onSelectFeature) return;
     await props.onSelectFeature({
       planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title } : null,
       feature,
     });
+    props.onClose();
+  }
+
+  function normalizedFeatureIds(ids: string[]): string[] {
+    return Array.from(new Set(ids.filter(Boolean))).sort();
+  }
+
+  function stagedFeatureSelectionChanged(): boolean {
+    const initialIds = normalizedFeatureIds(props.selectedFeatureIds ?? []);
+    const selectedIds = normalizedFeatureIds(stagedFeatureIds);
+    if (initialIds.length !== selectedIds.length) return true;
+    return initialIds.some((id, index) => id !== selectedIds[index]);
+  }
+
+  async function commitStagedFeatureSelection() {
+    if (!props.onSelectFeatures) return;
+    const selectedIds = normalizedFeatureIds(stagedFeatureIds);
+    const selectedSet = new Set(selectedIds);
+    await props.onSelectFeatures({
+      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title } : null,
+      featureIds: selectedIds,
+      features: features.filter((item) => selectedSet.has(item.id)),
+    });
+    setStagedFeatureIds([]);
+  }
+
+  async function selectFeatures() {
+    await commitStagedFeatureSelection();
+    props.onClose();
+  }
+
+  async function closePlannerModal() {
+    if (props.selectionMode && props.onSelectFeatures && stagedFeatureSelectionChanged()) {
+      await commitStagedFeatureSelection();
+    }
     props.onClose();
   }
 
@@ -650,7 +713,7 @@ export function PlannerModal(props: Props) {
   }
 
   return (
-    <Modal opened={props.opened} onClose={props.onClose} title="Planner" size="calc(100vw - 96px)" centered zIndex={300}>
+    <Modal opened={props.opened} onClose={() => void closePlannerModal()} title="Planner" size="calc(100vw - 96px)" centered zIndex={300}>
       <Stack gap="md">
         <Group align="end" wrap="wrap">
           <Select
@@ -714,14 +777,15 @@ export function PlannerModal(props: Props) {
                 <Table.Tr>
                   <Table.Th>Feature</Table.Th>
                   <Table.Th style={{ width: 140 }}>Planner status</Table.Th>
-                  <Table.Th style={{ width: 400 }}>Actions</Table.Th>
+                  <Table.Th style={{ width: 560 }}>Actions</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
                 {filteredFeatures.map((item) => {
                   const planStatus = String(item.status ?? 'rough');
-                  const isScheduled = planStatus === 'scheduled';
-                  const isSelected = props.selectedFeatureId === item.id;
+                  const displayStatus = props.selectionMode && planStatus === 'scheduled' ? 'fine' : planStatus;
+                  const isReady = planStatus === 'fine' || planStatus === 'scheduled';
+                  const isSelected = props.selectedFeatureId === item.id || stagedFeatureIds.includes(item.id);
                   const busyForFeature = busyFeatureId === item.id;
 
                   return (
@@ -729,7 +793,6 @@ export function PlannerModal(props: Props) {
                       <Table.Td>
                         <Stack gap={2}>
                           <Group gap="xs" wrap="nowrap">
-                            {props.selectionMode ? <Button size="compact-xs" onClick={() => void selectFeature(item)} disabled={!item.id || isSelected}>Select</Button> : null}
                             <Text fw={600} size="sm">{featureTitle(item)}</Text>
                             {isSelected ? <Badge size="xs" color="green" variant="light">Selected</Badge> : null}
                           </Group>
@@ -737,19 +800,32 @@ export function PlannerModal(props: Props) {
                         </Stack>
                       </Table.Td>
                       <Table.Td style={{ minWidth: 140 }}>
-                        <Badge variant="light" color={statusBadgeColor(planStatus)} tt="none" style={{ maxWidth: 'none', overflow: 'visible' }}>
-                          {titleCaseStatus(planStatus)}
+                        <Badge variant="light" color={statusBadgeColor(displayStatus)} tt="none" style={{ maxWidth: 'none', overflow: 'visible' }}>
+                          {titleCaseStatus(displayStatus)}
                         </Badge>
                       </Table.Td>
                       <Table.Td>
                         <Group gap="xs" wrap="nowrap">
-                          <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
-                          {isScheduled ? (
-                            <Button size="xs" variant="light" color="orange" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Unschedule</Button>
+                          {props.selectionMode ? (
+                            <>
+                              <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
+                              {isReady ? (
+                                <Button size="xs" color={isSelected ? 'orange' : 'green'} variant={isSelected ? 'light' : 'filled'} onClick={() => void selectFeature(item)} disabled={!item.id}>{isSelected ? 'Remove selection' : 'Select for pool'}</Button>
+                              ) : (
+                                <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Mark ready</Button>
+                              )}
+                            </>
                           ) : (
-                            <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'scheduled')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Schedule</Button>
+                            <>
+                              <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
+                              {isReady ? (
+                                <Badge size="sm" variant="light" color="green">Available to supervisor</Badge>
+                              ) : (
+                                <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Mark ready</Button>
+                              )}
+                              <Button size="xs" variant="light" color="red" onClick={() => void deleteFeature(item)} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Delete</Button>
+                            </>
                           )}
-                          <Button size="xs" variant="light" color="red" onClick={() => void deleteFeature(item)} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Delete</Button>
                         </Group>
                       </Table.Td>
                     </Table.Tr>
@@ -761,10 +837,13 @@ export function PlannerModal(props: Props) {
         )}
 
         <Group justify="space-between">
-          {props.selectionMode ? (
-            <Button size="xs" variant="light" color="red" onClick={() => void selectFeature(null)} disabled={!props.selectedFeatureId}>Clear selection</Button>
+          {props.selectionMode && props.onSelectFeatures ? (
+            <Group gap="xs">
+              <Badge variant="light">{stagedFeatureIds.length} selected</Badge>
+              <Button size="xs" color="green" onClick={() => void selectFeatures()} disabled={stagedFeatureIds.length === 0}>Queue selected features</Button>
+            </Group>
           ) : <span />}
-          <Button size="xs" variant="default" onClick={props.onClose}>Close</Button>
+          <Button size="xs" variant="default" onClick={() => void closePlannerModal()}>Close</Button>
         </Group>
       </Stack>
 
@@ -810,7 +889,7 @@ export function PlannerModal(props: Props) {
                 </Badge>
               </Stack>
               <Group gap="xs">
-                {props.selectionMode ? <Button size="xs" onClick={() => void selectFeature(featureDraft)} disabled={props.selectedFeatureId === featureDraft.id}>Select</Button> : null}
+                {props.selectionMode ? <Button size="xs" onClick={() => void selectFeature(featureDraft)} disabled={props.selectedFeatureId === featureDraft.id}>{stagedFeatureIds.includes(featureDraft.id) ? 'Remove selection' : 'Select for pool'}</Button> : null}
                 {featureEditMode ? <Button size="xs" onClick={() => void saveFeatureDraft()} loading={busyFeatureId === featureDraft.id}>Save</Button> : null}
                 <Button
                   size="xs"
@@ -833,7 +912,7 @@ export function PlannerModal(props: Props) {
             {featureEditMode ? (
               <>
                 <TextInput label="Title" value={featureDraft.title} onChange={(event) => setFeatureDraft({ ...featureDraft, title: event.currentTarget.value })} />
-                <Select label="Status" value={featureDraft.status} data={statusOptions} onChange={(value) => setFeatureDraft({ ...featureDraft, status: (value as FeaturePlanItemStatus) ?? 'rough' })} allowDeselect={false} />
+                <Select label="Status" value={String(featureDraft.status ?? 'rough')} data={statusOptions} onChange={(value) => setFeatureDraft({ ...featureDraft, status: (value as FeaturePlanItemStatus) ?? 'rough' })} allowDeselect={false} comboboxProps={{ withinPortal: true, zIndex: 600 }} />
                 <Textarea label="Rough summary" value={featureDraft.rough_summary ?? ''} onChange={(event) => setFeatureDraft({ ...featureDraft, rough_summary: event.currentTarget.value })} autosize minRows={3} />
                 <Textarea label="Summary" value={featureDraft.summary} onChange={(event) => setFeatureDraft({ ...featureDraft, summary: event.currentTarget.value })} autosize minRows={3} />
                 <Textarea label="Requirements" value={stringListText(featureDraft.requirements)} onChange={(event) => setFeatureDraft({ ...featureDraft, requirements: emptyStringList(event.currentTarget.value) })} autosize minRows={3} />

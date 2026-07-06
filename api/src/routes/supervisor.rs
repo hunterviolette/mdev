@@ -1,4 +1,6 @@
-use axum::{extract::{Path, State}, http::StatusCode, routing::{get, post}, Json, Router};
+use std::collections::HashMap;
+
+use axum::{extract::{Path, Query, State}, http::StatusCode, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -13,6 +15,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/supervisor-runs", get(list_supervisor_runs).post(create_supervisor_run))
         .route("/api/supervisor-runs/ensure-planner", post(ensure_supervisor_planner_run))
         .route("/api/supervisor-runs/:supervisor_id", get(get_supervisor_run).delete(delete_supervisor_run))
+        .route("/api/supervisor-runs/:supervisor_id/queue", get(get_supervisor_queue).post(set_supervisor_queue))
+        .route("/api/supervisor-runs/:supervisor_id/queue/:feature_id", axum::routing::delete(dequeue_supervisor_feature))
+        .route("/api/supervisor-runs/:supervisor_id/queue/:feature_id/regenerate", post(regenerate_queue_feature))
         .route("/api/supervisor-runs/:supervisor_id/actions", post(supervisor_action))
 }
 
@@ -48,6 +53,43 @@ async fn delete_supervisor_run(
     supervisor::delete_supervisor_run(&state, supervisor_id).await.map(|_| Json(json!({ "ok": true }))).map_err(internal)
 }
 
+async fn get_supervisor_queue(
+    State(state): State<AppState>,
+    Path(supervisor_id): Path<Uuid>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    supervisor::supervisor_queue_projection(&state, supervisor_id, query.get("planner_id").cloned()).await.map(Json).map_err(internal)
+}
+
+async fn set_supervisor_queue(
+    State(state): State<AppState>,
+    Path(supervisor_id): Path<Uuid>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    supervisor::select_supervisor_feature_pool(&state, supervisor_id, payload).await.map(Json).map_err(internal)
+}
+
+async fn dequeue_supervisor_feature(
+    State(state): State<AppState>,
+    Path((supervisor_id, feature_id)): Path<(Uuid, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let mode = query.get("mode").map(String::as_str).unwrap_or("preserve_development");
+    supervisor::unschedule_supervisor_feature(&state, supervisor_id, json!({
+        "feature_id": feature_id,
+        "mode": mode
+    })).await.map(Json).map_err(internal)
+}
+
+async fn regenerate_queue_feature(
+    State(state): State<AppState>,
+    Path((supervisor_id, feature_id)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    supervisor::regenerate_supervisor_queue_feature(&state, supervisor_id, json!({
+        "feature_id": feature_id
+    })).await.map(Json).map_err(internal)
+}
+
 async fn supervisor_action(
     State(state): State<AppState>,
     Path(supervisor_id): Path<Uuid>,
@@ -66,7 +108,6 @@ async fn supervisor_action(
         "restart_sprint" => supervisor::restart_current_supervisor_sprint(&state, supervisor_id).await,
         "update_plan" => supervisor::update_supervisor_plan(&state, supervisor_id, req.payload).await,
         "update_flight_deck_settings" => supervisor::update_supervisor_flight_deck_settings(&state, supervisor_id, req.payload).await,
-        "unschedule_feature" => supervisor::unschedule_supervisor_feature(&state, supervisor_id, req.payload).await,
         "preview_planner_import" => supervisor::preview_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "apply_planner_import" => supervisor::apply_supervisor_planner_import(&state, supervisor_id, req.payload).await,
         "refine_feature" => supervisor::refine_supervisor_feature(&state, supervisor_id, req.payload).await,
@@ -75,8 +116,6 @@ async fn supervisor_action(
         "pause_child_workflow" => supervisor::pause_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
         "pause_feature_pool" => supervisor::pause_supervisor_feature_pool(&state, supervisor_id, req.payload).await,
         "resume_feature_pool" => supervisor::resume_supervisor_feature_pool(&state, supervisor_id, req.payload).await,
-        "regenerate_child_workflow" => supervisor::regenerate_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
-        "remove_child_workflow" => supervisor::remove_supervisor_child_workflow(&state, supervisor_id, req.payload).await,
         "skip_integration_input" => supervisor::skip_supervisor_integration_input(&state, supervisor_id, req.payload).await,
         "unskip_integration_input" => supervisor::unskip_supervisor_integration_input(&state, supervisor_id, req.payload).await,
         "stage_manual_shard" => supervisor::stage_supervisor_manual_shard(&state, supervisor_id, req.payload).await,

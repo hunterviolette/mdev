@@ -146,18 +146,13 @@ function normalizeSupervisorRun(run: SupervisorRun): SupervisorRun {
   const featurePlanItems = Array.isArray(run.feature_plan_items) ? run.feature_plan_items : [];
   const childRuns = Array.isArray(run.child_runs) ? run.child_runs : [];
   const featureWorkflows = Array.isArray(run.feature_workflows) ? run.feature_workflows : [];
-  const scheduledIds = new Set(executionPlanItems.map((item) => item.feature_plan_item_id));
-  const completedIds = completedFeatureIds(run);
   return {
     ...run,
-    feature_plan_items: featurePlanItems.map((item) => {
-      const status = canonicalFeatureStatus(item.status);
-      return {
-        ...item,
-        status: completedIds.has(item.id) ? 'completed' : scheduledIds.has(item.id) ? 'scheduled' : status,
-        dependencies: []
-      };
-    }),
+    feature_plan_items: featurePlanItems.map((item) => ({
+      ...item,
+      status: canonicalFeatureStatus(item.status === 'scheduled' ? 'fine' : item.status),
+      dependencies: []
+    })),
     execution_plan_items: executionPlanItems,
     child_runs: childRuns,
     feature_workflows: featureWorkflows,
@@ -214,6 +209,42 @@ export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
   return normalizeSupervisorRun(await response.json());
 }
 
+export type SupervisorQueueItem = {
+  feature_id: string;
+  planner_id?: string | null;
+  planner_title?: string | null;
+  is_current_planner?: boolean;
+  title: string;
+  summary?: string | null;
+  planner_status?: string | null;
+  queue_state: string;
+  queued: boolean;
+  can_queue: boolean;
+  can_dequeue: boolean;
+  dequeue_without_prompt?: boolean;
+  has_development_diff?: boolean;
+  locked_by_other: boolean;
+  lock_owner_supervisor_run_id?: string | null;
+  disabled_reason?: string | null;
+  current_sprint_id?: string | null;
+  current_workflow_run_id?: string | null;
+  current_patch_id?: string | null;
+  development_state?: string | null;
+  scheduled_at?: string | null;
+  development_started_at?: string | null;
+  development_completed_at?: string | null;
+  integration_completed_at?: string | null;
+  applied_at?: string | null;
+};
+
+export type SupervisorQueueProjection = {
+  ok: boolean;
+  supervisor_run_id: string;
+  root_repo_path: string;
+  feature_ids: string[];
+  items: SupervisorQueueItem[];
+};
+
 export type FlightDeckAlert = {
   id: string;
   supervisor_id: string;
@@ -239,6 +270,8 @@ export type FlightDeckWorkUnit = {
   root_repo_path: string;
   shard_path?: string | null;
   integration_path?: string | null;
+  queue_position?: number | null;
+  blocked_reason?: string | null;
   telemetry: Record<string, unknown>;
   alerts: FlightDeckAlert[];
   created_at?: string | null;
@@ -393,6 +426,57 @@ export async function updateSupervisorPlan(
   });
 }
 
+export async function getSupervisorQueue(id: string, plannerId?: string | null): Promise<SupervisorQueueProjection> {
+  const params = new URLSearchParams();
+  if (plannerId) params.set('planner_id', plannerId);
+  const query = params.toString();
+  const response = await fetch(`/api/supervisor-runs/${id}/queue${query ? `?${query}` : ''}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function setSupervisorQueue(
+  id: string,
+  selectedFeatureIds: string[],
+  config: {
+    workflow_template_id?: string | null;
+    integration_template_id?: string | null;
+    feature_concurrency?: number | null;
+    integration_policy?: 'auto' | 'manual' | null;
+    auto_start?: boolean;
+    planner_id?: string | null;
+  } = {}
+): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
+  const response = await fetch(`/api/supervisor-runs/${id}/queue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selected_feature_ids: selectedFeatureIds,
+      ...config
+    })
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  return {
+    ...payload,
+    supervisor_run: normalizeSupervisorRun(payload.supervisor_run as SupervisorRun)
+  } as { ok: boolean; supervisor_run: SupervisorRun };
+}
+
+export async function selectSupervisorFeaturePool(
+  id: string,
+  selectedFeatureIds: string[],
+  config: {
+    workflow_template_id?: string | null;
+    integration_template_id?: string | null;
+    feature_concurrency?: number | null;
+    integration_policy?: 'auto' | 'manual' | null;
+    auto_start?: boolean;
+  } = {}
+): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
+  return setSupervisorQueue(id, selectedFeatureIds, config);
+}
+
 export async function previewPlannerImport(id: string, payload: unknown): Promise<PlannerImportPreviewResponse> {
   return runSupervisorAction(id, 'preview_planner_import', payload as Record<string, unknown>) as Promise<PlannerImportPreviewResponse>;
 }
@@ -420,14 +504,29 @@ export type UnscheduleSupervisorFeatureResponse = {
   supervisor_run: SupervisorRun;
 };
 
-export async function unscheduleSupervisorFeature(id: string, featureId: string, mode: UnscheduleSupervisorFeatureMode): Promise<UnscheduleSupervisorFeatureResponse> {
-  const response = await runSupervisorAction(id, 'unschedule_feature', {
-    feature_id: featureId,
-    mode
+export async function regenerateSupervisorQueueFeature(id: string, featureId: string): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
+  const response = await fetch(`/api/supervisor-runs/${id}/queue/${encodeURIComponent(featureId)}/regenerate`, {
+    method: 'POST'
   });
+  if (!response.ok) throw new Error(await response.text());
+  const body = await response.json();
   return {
-    ...response,
-    supervisor_run: normalizeSupervisorRun(response.supervisor_run as SupervisorRun)
+    ...body,
+    supervisor_run: normalizeSupervisorRun(body.supervisor_run as SupervisorRun)
+  } as { ok: boolean; supervisor_run: SupervisorRun };
+}
+
+export async function unscheduleSupervisorFeature(id: string, featureId: string, mode: UnscheduleSupervisorFeatureMode): Promise<UnscheduleSupervisorFeatureResponse> {
+  const params = new URLSearchParams();
+  params.set('mode', mode);
+  const response = await fetch(`/api/supervisor-runs/${id}/queue/${encodeURIComponent(featureId)}?${params.toString()}`, {
+    method: 'DELETE'
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const body = await response.json();
+  return {
+    ...body,
+    supervisor_run: normalizeSupervisorRun(body.supervisor_run as SupervisorRun)
   } as UnscheduleSupervisorFeatureResponse;
 }
 
@@ -438,7 +537,7 @@ export async function refineSupervisorFeature(id: string, featureId: string, wor
   }) as Promise<RefineSupervisorFeatureResponse>;
 }
 
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'update_flight_deck_settings' | 'unschedule_feature' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'pause_feature_pool' | 'resume_feature_pool' | 'remove_child_workflow' | 'create_manual_shard' | 'regenerate_child_workflow' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'skip_integration_input' | 'unskip_integration_input', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'update_flight_deck_settings' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'pause_feature_pool' | 'resume_feature_pool' | 'remove_child_workflow' | 'create_manual_shard' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'skip_integration_input' | 'unskip_integration_input', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

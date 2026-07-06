@@ -236,7 +236,7 @@ pub async fn spawn_integration_workflow(
     state: &AppState,
     title: &str,
     integration_path: &str,
-    patch_paths: Vec<Value>,
+    _patch_paths: Vec<Value>,
     template_id: Option<Uuid>,
     supervisor_context: Value,
 ) -> Result<Uuid> {
@@ -251,21 +251,20 @@ pub async fn spawn_integration_workflow(
                 step.config = json!({});
             }
             if let Some(obj) = step.config.as_object_mut() {
-                obj.insert("patches".to_string(), Value::Array(patch_paths.clone()));
-                obj.insert("supervisor_run_id".to_string(), supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null));
+                obj.remove("patches");
+                obj.remove("supervisor_run_id");
             }
         }
     }
 
     insert_and_start_run(state, title, integration_path, template_id, definition, json!({
-        "supervisor": supervisor_context,
-        "workflow_engine": {
-            "global_state": {
-                "supervisor": {
-                    "patches": patch_paths,
-                    "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
-                }
-            }
+        "supervisor": {
+            "supervisor_id": supervisor_context
+                .get("supervisor_id")
+                .or_else(|| supervisor_context.get("supervisor_run_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "pool_type": supervisor_context.get("pool_type").cloned().unwrap_or_else(|| Value::String("integration".to_string()))
         }
     })).await
 }

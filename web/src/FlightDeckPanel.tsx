@@ -25,8 +25,8 @@ import {
 } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
-import { refinePlannerFeature } from './planner_api';
-import { getFlightDeck, getWorkflowEventHistory, runSupervisorAction, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
+import { getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, regenerateSupervisorQueueFeature, runSupervisorAction, setSupervisorQueue, unscheduleSupervisorFeature, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 
 type FlightDeckPanelProps = {
   navigate?: (path: string) => void;
@@ -696,13 +696,14 @@ function workflowCanPause(unit: FlightDeckWorkUnit): boolean {
 
 function workflowCanRegenerate(unit: FlightDeckWorkUnit): boolean {
   if (workflowType(unit) === 'integration') return !unit.workflow_deleted && Boolean(unit.workflow_run_id);
-  return workflowType(unit) === 'feature_development' && !unit.workflow_deleted && Boolean(unit.workflow_run_id && unit.feature_id);
+  return workflowType(unit) === 'feature_development' && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
 }
 
 function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
   const type = workflowType(unit);
   if (type === 'manual_shard') return !manualShardIsIntegrationInput(unit) && !unit.workflow_deleted && Boolean(unit.feature_id);
   if (type === 'refine') return !unit.workflow_deleted && Boolean(unit.feature_id);
+  if (type === 'feature_development') return !unit.workflow_deleted && Boolean(unit.feature_id);
   return false;
 }
 
@@ -777,6 +778,12 @@ function WorkflowProjectionCard(props: {
 
   const displayCapabilities = capabilities.length > 0 ? capabilities : historyHydration?.capabilities ?? [];
   const displayFallbackStages = recentStageExecutions.length > 0 ? [] : historyHydration?.stages ?? [];
+  const canApplyFinalPatch = workflowType(unit) === 'integration'
+    && !unit.workflow_deleted
+    && Boolean(unit.workflow_run_id)
+    && props.supervisor.integration_run_id === unit.workflow_run_id
+    && normalize(props.supervisor.status) === 'ready_to_apply';
+
 
   const title = unit.workflow_run_id ? (
     <Anchor
@@ -797,14 +804,27 @@ function WorkflowProjectionCard(props: {
     <Title order={5} lineClamp={1}>{unit.title}</Title>
   );
 
-  async function runWorkflowAction(action: 'start_child_workflow' | 'pause_child_workflow' | 'regenerate_child_workflow' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'start_integration' | 'restart_integration' | 'cancel') {
+  async function runWorkflowAction(action: 'start_child_workflow' | 'pause_child_workflow' | 'regenerate_queue_feature' | 'dequeue_feature' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'start_integration' | 'restart_integration' | 'apply' | 'cancel') {
     if (workflowType(unit) !== 'integration' && !unit.feature_id) return;
-    if (action === 'regenerate_child_workflow') {
-      const confirmed = window.confirm(`Delete and regenerate feature workflow shard for ${unit.title}?`);
+    if (action === 'regenerate_queue_feature') {
+      const confirmed = window.confirm(`Delete existing workflow/shard state for ${unit.title} and return it to queued draft state?`);
       if (!confirmed) return;
+      await regenerateSupervisorQueueFeature(props.supervisor.id, unit.feature_id!);
+      props.onActionComplete?.();
+      return;
+    }
+    if (action === 'dequeue_feature') {
+      const deleteWorkflow = window.confirm(`Remove ${unit.title} from the feature queue?\n\nOK: delete workflow/development state.\nCancel: keep workflow/development state and only dequeue.`);
+      await unscheduleSupervisorFeature(props.supervisor.id, unit.feature_id!, deleteWorkflow ? 'delete_development' : 'preserve_development');
+      props.onActionComplete?.();
+      return;
     }
     if (action === 'restart_integration') {
       const confirmed = window.confirm(`Delete and regenerate integration workflow for ${unit.title}?`);
+      if (!confirmed) return;
+    }
+    if (action === 'apply') {
+      const confirmed = window.confirm('Apply the final integration patch to the root repository?');
       if (!confirmed) return;
     }
     if (action === 'cancel') {
@@ -870,13 +890,13 @@ function WorkflowProjectionCard(props: {
                   <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'start_integration' : 'start_child_workflow')}>Run</Button>
                 ) : null}
                 {workflowCanRegenerate(unit) ? (
-                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'restart_integration' : 'regenerate_child_workflow')}>Regenerate</Button>
+                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'restart_integration' : 'regenerate_queue_feature')}>Regenerate</Button>
                 ) : null}
                 {workflowCanStageManual(unit) ? (
                   <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_manual_shard')}>Stage to integration</Button>
                 ) : null}
                 {workflowCanDelete(unit) ? (
-                  <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'refine' ? 'delete_refine_workflow' : 'delete_manual_shard')}>Delete</Button>
+                  <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'refine' ? 'delete_refine_workflow' : workflowType(unit) === 'feature_development' ? 'dequeue_feature' : 'delete_manual_shard')}>{workflowType(unit) === 'feature_development' ? 'Dequeue' : 'Delete'}</Button>
                 ) : null}
               </Group>
             </Group>
@@ -885,6 +905,19 @@ function WorkflowProjectionCard(props: {
               <Badge variant="light" size="xs">Progression</Badge>
             </Group>
             <StageRail stages={stages} />
+            {canApplyFinalPatch ? (
+              <Group justify="center" mt="sm">
+                <Button
+                  size="md"
+                  color="green"
+                  variant="filled"
+                  onClick={() => void runWorkflowAction('apply')}
+                  style={{ minWidth: 260 }}
+                >
+                  Apply final patch to root
+                </Button>
+              </Group>
+            ) : null}
           </Stack>
           <Stack gap={6} style={{ minWidth: 0 }}>
             <Group justify="space-between">
@@ -1361,9 +1394,9 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
         <Button
           size="xs"
           variant="light"
-          onClick={() => props.onOpenPlanner?.(props.supervisor)}
+          onClick={() => props.onOpenPlanner?.(props.supervisor, { selectFeature: true })}
         >
-          Planner
+          Manage queue
         </Button>
         <Button size="xs" variant="default" disabled={!running && !queued && !waiting && !poolPaused} onClick={() => void runFeaturePoolAction()}>
           {running ? 'Pause' : 'Run'}
@@ -1641,6 +1674,310 @@ const pageShellStyle: CSSProperties = {
   background: 'radial-gradient(circle at top left, rgba(34,184,207,0.16), transparent 32%), radial-gradient(circle at top right, rgba(121,80,242,0.14), transparent 30%)',
 };
 
+function DequeueFeatureModal(props: {
+  opened: boolean;
+  feature: { feature_id: string; title: string; current_workflow_run_id?: string | null; development_state?: string | null } | null;
+  onClose: () => void;
+  onConfirm: (mode: 'preserve_development' | 'delete_development') => Promise<void>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const hasWorkflow = Boolean(props.feature?.current_workflow_run_id);
+  const developmentState = props.feature?.development_state ?? 'queued';
+
+  async function confirm(mode: 'preserve_development' | 'delete_development') {
+    setSubmitting(true);
+    try {
+      await props.onConfirm(mode);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal opened={props.opened} onClose={props.onClose} title="Remove from queue" centered zIndex={340}>
+      <Stack gap="sm">
+        <Text size="sm">
+          Remove <Text span fw={800}>{props.feature?.title ?? 'this feature'}</Text> from this supervisor queue.
+        </Text>
+        {hasWorkflow ? (
+          <Alert color="yellow" title="Existing workflow found">
+            This feature already has a workflow. Choose whether to keep the workflow record and development artifacts, or delete them and reset the feature for later scheduling.
+          </Alert>
+        ) : (
+          <Text size="sm" c="dimmed">No workflow has been created yet. Delete will remove the queued development state and reset the feature for later scheduling.</Text>
+        )}
+        <Group gap="xs">
+          <Badge size="xs" color="gray">{titleCase(developmentState)}</Badge>
+          {props.feature?.current_workflow_run_id ? <Badge size="xs" color="blue">Workflow exists</Badge> : null}
+        </Group>
+        <Group justify="flex-end" gap="xs">
+          <Button size="xs" variant="default" onClick={props.onClose} disabled={submitting}>Cancel</Button>
+          <Button size="xs" variant="light" onClick={() => void confirm('preserve_development')} loading={submitting}>{hasWorkflow ? 'Keep workflow' : 'Dequeue only'}</Button>
+          <Button size="xs" color="red" onClick={() => void confirm('delete_development')} loading={submitting}>{hasWorkflow ? 'Delete workflow' : 'Delete queue state'}</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
+function FeatureQueueModal(props: {
+  opened: boolean;
+  supervisor: FlightDeckSupervisor | null;
+  onClose: () => void;
+  onApplied: () => Promise<void>;
+}) {
+  const supervisor = props.supervisor;
+  const supervisorId = supervisor?.id ?? null;
+  const [queue, setQueue] = useState<SupervisorQueueProjection | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [queueLoading, setQueueLoading] = useState(false);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [plannerOptions, setPlannerOptions] = useState<PlannerWorkspace[]>([]);
+  const [queuePlannerId, setQueuePlannerId] = useState<string | null>(null);
+  const [dequeueFeature, setDequeueFeature] = useState<SupervisorQueueProjection['items'][number] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!props.opened || !supervisor?.root_repo_path) {
+      setPlannerOptions([]);
+      setQueuePlannerId(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void listPlannersForRepo(supervisor.root_repo_path)
+      .then((rows) => {
+        if (cancelled) return;
+        setPlannerOptions(rows);
+        setQueuePlannerId((current) => current && rows.some((row) => row.id === current) ? current : rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
+      })
+      .catch((err) => {
+        if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.opened, supervisor?.root_repo_path]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!props.opened || !supervisorId) {
+      setQueue(null);
+      setSelectedIds([]);
+      setQueueError(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setQueueLoading(true);
+    setQueueError(null);
+    void getSupervisorQueue(supervisorId, queuePlannerId)
+      .then((next) => {
+        if (cancelled) return;
+        setQueue(next);
+        setSelectedIds(next.feature_ids ?? []);
+      })
+      .catch((err) => {
+        if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setQueueLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.opened, supervisorId, queuePlannerId]);
+
+  const selectedSet = new Set(selectedIds);
+  const rawItems = queue?.items ?? [];
+  const items = useMemo(() => {
+    const queueIndex = new Map(selectedIds.map((id, index) => [id, index]));
+    return [...rawItems].sort((left, right) => {
+      const leftQueued = queueIndex.has(left.feature_id);
+      const rightQueued = queueIndex.has(right.feature_id);
+      if (leftQueued && rightQueued) return (queueIndex.get(left.feature_id) ?? 0) - (queueIndex.get(right.feature_id) ?? 0);
+      if (leftQueued !== rightQueued) return leftQueued ? -1 : 1;
+      return 0;
+    });
+  }, [rawItems, selectedIds]);
+
+  function latestQueueItem(featureId: string) {
+    return items.find((item) => item.feature_id === featureId) ?? null;
+  }
+
+  async function autoDeleteDequeue(item: SupervisorQueueProjection['items'][number]) {
+    if (!supervisor) return;
+    await unscheduleSupervisorFeature(supervisor.id, item.feature_id, 'delete_development');
+    const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
+    setQueue(next);
+    setSelectedIds(next.feature_ids ?? []);
+    await props.onApplied();
+  }
+
+  async function persistQueueSelection(nextIds: string[]) {
+    if (!supervisor) return;
+    const featureSettings = poolSetting(supervisor, 'feature_development');
+    const integrationSettings = poolSetting(supervisor, 'integration');
+    const uniqueIds = Array.from(new Set(nextIds.filter(Boolean)));
+    setQueueLoading(true);
+    setQueueError(null);
+    try {
+      await setSupervisorQueue(supervisor.id, uniqueIds, {
+        workflow_template_id: featureSettings.template_id ?? null,
+        integration_template_id: integrationSettings.template_id ?? null,
+        feature_concurrency: featureSettings.concurrency ?? null,
+        integration_policy: integrationSettings.mode === 'auto' ? 'auto' : 'manual',
+        auto_start: false,
+        planner_id: queuePlannerId
+      });
+      const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
+      setQueue(next);
+      setSelectedIds(next.feature_ids ?? []);
+      await props.onApplied();
+    } catch (err) {
+      setQueueError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setQueueLoading(false);
+    }
+  }
+
+  function setFeatureChecked(featureId: string, checked: boolean) {
+    if (!checked) {
+      const item = latestQueueItem(featureId);
+      if (item && selectedSet.has(featureId)) {
+        if (item.dequeue_without_prompt) {
+          void autoDeleteDequeue(item);
+          return;
+        }
+        setDequeueFeature(item);
+        return;
+      }
+      void persistQueueSelection(selectedIds.filter((id) => id !== featureId));
+      return;
+    }
+
+    void persistQueueSelection([...selectedIds, featureId]);
+  }
+
+  function moveQueuedFeature(featureId: string, direction: -1 | 1) {
+    const index = selectedIds.indexOf(featureId);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= selectedIds.length) return;
+    const next = [...selectedIds];
+    const current = next[index];
+    next[index] = next[nextIndex];
+    next[nextIndex] = current;
+    setSelectedIds(next);
+    void persistQueueSelection(next);
+  }
+
+  async function confirmDequeue(mode: 'preserve_development' | 'delete_development') {
+    if (!supervisor || !dequeueFeature) return;
+    await unscheduleSupervisorFeature(supervisor.id, dequeueFeature.feature_id, mode);
+    const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
+    setQueue(next);
+    setSelectedIds(next.feature_ids ?? []);
+    setDequeueFeature(null);
+    await props.onApplied();
+  }
+
+  async function applyQueue() {
+    props.onClose();
+  }
+
+  return (
+    <>
+    <Modal opened={props.opened} onClose={props.onClose} title="Manage feature queue" size="calc(100vw - 160px)" centered zIndex={320}>
+      <Stack gap="sm">
+        <Text size="sm" c="dimmed">Queue and dequeue refined planner features for this supervisor. Planner remains the feature ledger; the supervisor owns queue execution.</Text>
+        <Select
+          label="Queueable planner"
+          description="Only this planner's unqueued features can be queued. Features already queued from other planners stay visible for dequeue."
+          data={plannerOptions.map((planner) => ({ value: planner.id, label: planner.title }))}
+          value={queuePlannerId}
+          onChange={setQueuePlannerId}
+          searchable
+          clearable={false}
+        />
+        <Group gap="xs">
+          <Badge color="blue" variant="light">{selectedIds.length} queued</Badge>
+          <Badge color="gray" variant="light">{items.length} supervisor-visible planner features</Badge>
+        </Group>
+        {queueError ? <Alert color="red" title="Queue load failed">{queueError}</Alert> : null}
+        {queueLoading ? <Group gap="xs"><Loader size="xs" /><Text size="sm" c="dimmed">Loading supervisor queue…</Text></Group> : null}
+        <ScrollArea h="60vh">
+          <Stack gap="xs">
+            {items.map((item) => {
+              const checked = selectedSet.has(item.feature_id);
+              const canToggle = checked ? !item.locked_by_other : item.can_queue;
+              const queueIndex = selectedIds.indexOf(item.feature_id);
+              const canMoveUp = checked && queueIndex > 0 && !queueLoading;
+              const canMoveDown = checked && queueIndex >= 0 && queueIndex < selectedIds.length - 1 && !queueLoading;
+              const active = ['running', 'development_running', 'ready_for_integration', 'integrating', 'integrated'].includes(normalize(item.development_state ?? item.queue_state));
+              const queueDetail = checked
+                ? titleCase(item.development_state ?? item.queue_state)
+                : active
+                  ? titleCase(item.development_state ?? item.queue_state)
+                  : titleCase(item.queue_state ?? 'available');
+              return (
+                <Paper key={item.feature_id} withBorder p="sm" radius="md">
+                  <Group justify="space-between" align="flex-start" wrap="nowrap">
+                    <Group align="flex-start" wrap="nowrap" style={{ minWidth: 0 }}>
+                      <Button
+                        size="compact-xs"
+                        variant={checked ? 'light' : 'filled'}
+                        color={checked ? 'red' : 'blue'}
+                        disabled={!canToggle}
+                        onClick={() => setFeatureChecked(item.feature_id, !checked)}
+                        style={{ width: 76, minWidth: 76, flexShrink: 0 }}
+                      >
+                        {checked ? 'Dequeue' : 'Queue'}
+                      </Button>
+                      {checked ? (
+                        <Group gap={4} wrap="nowrap" style={{ width: 58, minWidth: 58, flexShrink: 0 }}>
+                          <Button size="compact-xs" variant="default" disabled={!canMoveUp} onClick={() => moveQueuedFeature(item.feature_id, -1)} style={{ width: 26, minWidth: 26, padding: 0 }}>↑</Button>
+                          <Button size="compact-xs" variant="default" disabled={!canMoveDown} onClick={() => moveQueuedFeature(item.feature_id, 1)} style={{ width: 26, minWidth: 26, padding: 0 }}>↓</Button>
+                        </Group>
+                      ) : null}
+                      <Stack gap={2} style={{ minWidth: 0 }}>
+                        <Group gap="xs">
+                          <Text fw={800} size="sm">{item.title}</Text>
+                          <Badge size="xs" color={checked ? 'green' : 'gray'}>{checked ? 'Queued' : titleCase(item.queue_state)}</Badge>
+                          {item.planner_title ? <Badge size="xs" color={item.is_current_planner ? 'blue' : 'violet'} variant="light">{item.is_current_planner ? 'Current planner' : item.planner_title}</Badge> : null}
+                          {active ? <Badge size="xs" color="cyan">Active</Badge> : null}
+                          {item.locked_by_other ? <Badge size="xs" color="red">Locked elsewhere</Badge> : null}
+                        </Group>
+                        <Text size="xs" c="dimmed" lineClamp={2}>{item.summary || 'No summary.'}</Text>
+                        {!canToggle && !checked && item.disabled_reason ? <Text size="xs" c="orange">{item.disabled_reason}</Text> : null}
+                      </Stack>
+                    </Group>
+                    <Stack gap={2} align="flex-end" style={{ width: 120, minWidth: 120, flexShrink: 0 }}>
+                      <Badge size="xs" color={tone(item.planner_status)}>{titleCase(item.planner_status ?? 'unknown')}</Badge>
+                      <Text size="xs" c="dimmed" ta="right">{queueDetail}</Text>
+                    </Stack>
+                  </Group>
+                </Paper>
+              );
+            })}
+            {!queueLoading && items.length === 0 ? <Text c="dimmed" size="sm">No planner features are available for this supervisor.</Text> : null}
+          </Stack>
+        </ScrollArea>
+        <Group justify="flex-end" gap="xs">
+          <Button size="xs" variant="default" onClick={props.onClose}>Cancel</Button>
+          <Button size="xs" onClick={() => void applyQueue()} disabled={!supervisor || queueLoading}>Done</Button>
+        </Group>
+      </Stack>
+    </Modal>
+    <DequeueFeatureModal
+      opened={dequeueFeature !== null}
+      feature={dequeueFeature}
+      onClose={() => setDequeueFeature(null)}
+      onConfirm={confirmDequeue}
+    />
+    </>
+  );
+}
+
 export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [deck, setDeck] = useState<FlightDeckResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1654,6 +1991,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [plannerSupervisor, setPlannerSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [plannerCreateFeatureOnOpen, setPlannerCreateFeatureOnOpen] = useState(false);
   const [plannerSelectFeatureOnOpen, setPlannerSelectFeatureOnOpen] = useState(false);
+    const [queueSupervisor, setQueueSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [plannerRefinementTemplateId, setPlannerRefinementTemplateId] = useState<string | null>(null);
   const [creatingRefineFeatureId, setCreatingRefineFeatureId] = useState<string | null>(null);
@@ -1693,16 +2031,19 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }, [supervisorFilter, stateFilter, kindFilter, includeDeleted]);
 
   function openPlanner(supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) {
-    if (options?.refinementTemplateId && !options.createFeature && !options.selectFeature) {
+    if (options?.selectFeature) {
+      setQueueSupervisor(supervisor);
+      return;
+    }
+    if (options?.refinementTemplateId && !options.createFeature) {
       setNewFineChoiceSupervisor(supervisor);
       setPlannerRefinementTemplateId(options.refinementTemplateId);
       return;
     }
     setPlannerSupervisor(supervisor);
     setPlannerCreateFeatureOnOpen(Boolean(options?.createFeature));
-    setPlannerSelectFeatureOnOpen(Boolean(options?.selectFeature));
+    setPlannerSelectFeatureOnOpen(false);
     setPlannerRefinementTemplateId(options?.refinementTemplateId ?? null);
-    props.onOpenPlanner?.(supervisor, options);
   }
 
   async function createRefineWorkflowForFeature(plannerId: string, featureId: string) {
@@ -1781,7 +2122,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
               setPlannerSelectFeatureOnOpen(true);
               setPlannerSupervisor(supervisor);
               setPlannerRefinementTemplateId(templateId);
-              props.onOpenPlanner?.(supervisor, { selectFeature: true, refinementTemplateId: templateId });
+
             }}>Refine existing feature</Button>
             <Button size="xs" onClick={() => {
               if (!newFineChoiceSupervisor) return;
@@ -1792,11 +2133,17 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
               setPlannerSelectFeatureOnOpen(false);
               setPlannerSupervisor(supervisor);
               setPlannerRefinementTemplateId(templateId);
-              props.onOpenPlanner?.(supervisor, { createFeature: true, refinementTemplateId: templateId });
+
             }}>New feature</Button>
           </Group>
         </Stack>
       </Modal>
+      <FeatureQueueModal
+        opened={queueSupervisor !== null}
+        supervisor={queueSupervisor ? deck?.supervisors.find((item) => item.id === queueSupervisor.id) ?? queueSupervisor : null}
+        onClose={() => setQueueSupervisor(null)}
+        onApplied={refresh}
+      />
       <PlannerModal
         opened={plannerSupervisor !== null}
         rootRepoPath={plannerSupervisor?.root_repo_path ?? ''}
@@ -1815,11 +2162,15 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         }}
         onSelectFeature={async (selection) => {
           if (!selection.planner?.id || !selection.feature?.id) return;
-          await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+          if (plannerRefinementTemplateId) {
+            await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+          }
         }}
         onFeatureCreated={async (selection) => {
           if (!selection.planner?.id || !selection.feature?.id) return;
-          await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+          if (plannerRefinementTemplateId) {
+            await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+          }
         }}
         onSaved={refresh}
         onError={setError}

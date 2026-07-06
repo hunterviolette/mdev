@@ -1,7 +1,7 @@
-import { Alert, Anchor, Badge, Button, Card, Group, Modal, NumberInput, Progress, Select, Stack, Table, Text } from '@mantine/core';
+import { Alert, Anchor, Badge, Button, Card, Checkbox, Group, Modal, NumberInput, Progress, Select, Stack, Table, Text } from '@mantine/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getRun, getRuntimeProjection, openRuntimeEventStream, type WorkflowRun, type WorkflowTemplate } from './api';
-import { runSupervisorAction, updateSupervisorPlan, type SupervisorExecutionStrategy, type SupervisorFeatureWorkflow, type SupervisorRun } from './supervisor_api';
+import { runSupervisorAction, selectSupervisorFeaturePool, updateSupervisorPlan, type SupervisorExecutionStrategy, type SupervisorFeatureWorkflow, type SupervisorRun } from './supervisor_api';
 
 type Props = {
   opened: boolean;
@@ -280,6 +280,7 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
   const [strategy, setStrategy] = useState<SupervisorExecutionStrategy>('series');
   const [featureConcurrency, setFeatureConcurrency] = useState(1);
   const [integrationPolicy, setIntegrationPolicy] = useState<'auto' | 'manual'>('manual');
+  const [selectedPoolFeatureIds, setSelectedPoolFeatureIds] = useState<string[]>([]);
   const [workflowRunsById, setWorkflowRunsById] = useState<Record<string, WorkflowRun>>({});
   const [workflowProjectionsById, setWorkflowProjectionsById] = useState<Record<string, WorkflowProjection>>({});
   const onChangedRef = useRef(onChanged);
@@ -306,6 +307,8 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
     setIntegrationPolicy(run.context?.integration_policy === 'auto' ? 'auto' : 'manual');
     setWorkflowTemplateId(typeof run.context?.workflow_template_id === 'string' ? run.context.workflow_template_id : null);
     setIntegrationTemplateId(typeof run.context?.integration_template_id === 'string' ? run.context.integration_template_id : null);
+    const currentPoolIds = (run.execution_plan_items ?? []).map((item) => item.feature_plan_item_id);
+    setSelectedPoolFeatureIds(currentPoolIds.length > 0 ? currentPoolIds : (run.feature_plan_items ?? []).filter((item) => ['fine', 'scheduled'].includes(String(item.status ?? ''))).map((item) => item.id));
     setError(null);
   }, [opened, run?.id]);
 
@@ -372,14 +375,24 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
     };
   }, [opened, run?.id, workflowRunIdKey]);
 
+  const refinedFeatureItems = useMemo(() => {
+    if (!run) return [];
+    return (run.feature_plan_items ?? []).filter((item) => ['fine', 'scheduled'].includes(String(item.status ?? '')));
+  }, [run]);
+
   const scheduledItemsForStart = useMemo(() => {
     if (!run) return [];
-    return (run.execution_plan_items ?? []).map((item, index) => ({
-      ...item,
-      workflow_template_id: item.workflow_template_id ?? workflowTemplateId,
-      order_index: item.order_index ?? index
-    }));
-  }, [run, workflowTemplateId]);
+    return refinedFeatureItems
+      .filter((item) => selectedPoolFeatureIds.includes(item.id))
+      .map((item, index) => {
+        const existing = (run.execution_plan_items ?? []).find((entry) => entry.feature_plan_item_id === item.id);
+        return {
+          feature_plan_item_id: item.id,
+          workflow_template_id: existing?.workflow_template_id ?? workflowTemplateId,
+          order_index: existing?.order_index ?? index
+        };
+      });
+  }, [run, refinedFeatureItems, selectedPoolFeatureIds, workflowTemplateId]);
 
   const progress = useMemo(() => {
     if (!run) return { completed: 0, failed: 0, total: 0, percent: 0 };
@@ -448,15 +461,51 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
     });
   }
 
+  function togglePoolFeature(featureId: string, checked: boolean) {
+    setSelectedPoolFeatureIds((current) => {
+      const next = checked ? [...current, featureId] : current.filter((id) => id !== featureId);
+      return Array.from(new Set(next));
+    });
+  }
+
+  async function scheduleSelectedFeaturePool() {
+    if (!run) return;
+    setError(null);
+    try {
+      if (!workflowTemplateId) {
+        setError('Select a default feature workflow template before scheduling the feature pool.');
+        return;
+      }
+      if (!integrationTemplateId) {
+        setError('Select an integration workflow before scheduling the feature pool.');
+        return;
+      }
+      if (selectedPoolFeatureIds.length === 0) {
+        setError('Select at least one refined planner feature for the supervisor feature pool.');
+        return;
+      }
+      await selectSupervisorFeaturePool(run.id, selectedPoolFeatureIds, {
+        workflow_template_id: workflowTemplateId,
+        integration_template_id: integrationTemplateId,
+        feature_concurrency: featureConcurrency,
+        integration_policy: integrationPolicy,
+        auto_start: true
+      });
+      await onChanged();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   async function saveSprintSettings(refresh = true) {
     if (!run) return;
     setError(null);
-    await updateSupervisorPlan(run.id, run.feature_plan_items, scheduledItemsForStart, {
-      sprint_strategy: strategy,
+    await selectSupervisorFeaturePool(run.id, selectedPoolFeatureIds, {
       workflow_template_id: workflowTemplateId,
       integration_template_id: integrationTemplateId,
       feature_concurrency: featureConcurrency,
-      integration_policy: integrationPolicy
+      integration_policy: integrationPolicy,
+      auto_start: false
     });
     if (refresh) await onChanged();
   }
@@ -473,13 +522,17 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
         setError('Select an integration workflow before starting the sprint.');
         return;
       }
-      const sprintItems = scheduledItemsForStart;
-      if (sprintItems.length === 0) {
-        setError('No planner features are scheduled for this sprint.');
+      if (selectedPoolFeatureIds.length === 0) {
+        setError('Select at least one refined planner feature for the supervisor feature pool.');
         return;
       }
-      await saveSprintSettings(false);
-      await runSupervisorAction(run.id, 'start');
+      await selectSupervisorFeaturePool(run.id, selectedPoolFeatureIds, {
+        workflow_template_id: workflowTemplateId,
+        integration_template_id: integrationTemplateId,
+        feature_concurrency: featureConcurrency,
+        integration_policy: integrationPolicy,
+        auto_start: true
+      });
       await onChanged();
     } catch (err) {
       setError(String(err));
@@ -668,6 +721,53 @@ export function SupervisorModal({ opened, run, templates, onClose, onOpenPlanner
                     </Text>
                   </Stack>
                 ) : null}
+              </Stack>
+            </Card>
+
+            <Card withBorder>
+              <Stack gap="sm">
+                <Group justify="space-between">
+                  <Group gap="xs">
+                    <Text fw={700}>Supervisor feature pool</Text>
+                    <Badge variant="light">{selectedPoolFeatureIds.length}/{refinedFeatureItems.length}</Badge>
+                  </Group>
+                  <Group gap="xs">
+                    <Button size="xs" variant="subtle" onClick={() => setSelectedPoolFeatureIds(refinedFeatureItems.map((item) => item.id))} disabled={refinedFeatureItems.length === 0}>Select all</Button>
+                    <Button size="xs" variant="subtle" color="gray" onClick={() => setSelectedPoolFeatureIds([])} disabled={selectedPoolFeatureIds.length === 0}>Clear</Button>
+                    <Button size="xs" onClick={() => void scheduleSelectedFeaturePool()} disabled={selectedPoolFeatureIds.length === 0 || !workflowTemplateId || !integrationTemplateId}>Schedule selected</Button>
+                    <Button size="xs" variant="light" onClick={onOpenPlanner}>Open planner ledger</Button>
+                  </Group>
+                </Group>
+                <Text size="xs" c="dimmed">Select refined planner features here, then schedule them into the supervisor-owned feature pool.</Text>
+                {refinedFeatureItems.length > 0 ? (
+                  <Table striped withTableBorder>
+                    <Table.Thead>
+                      <Table.Tr>
+                        <Table.Th style={{ width: 80 }}>Pool</Table.Th>
+                        <Table.Th>Feature</Table.Th>
+                        <Table.Th style={{ width: 140 }}>Planner status</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {refinedFeatureItems.map((feature) => (
+                        <Table.Tr key={feature.id}>
+                          <Table.Td>
+                            <Checkbox checked={selectedPoolFeatureIds.includes(feature.id)} onChange={(event) => togglePoolFeature(feature.id, event.currentTarget.checked)} />
+                          </Table.Td>
+                          <Table.Td>
+                            <Stack gap={2}>
+                              <Text size="sm" fw={600}>{feature.title || feature.id}</Text>
+                              {feature.summary ? <Text size="xs" c="dimmed" lineClamp={2}>{feature.summary}</Text> : null}
+                            </Stack>
+                          </Table.Td>
+                          <Table.Td><Badge variant="light" color={statusBadgeColor(String(feature.status ?? 'fine'))}>{String(feature.status ?? 'fine')}</Badge></Table.Td>
+                        </Table.Tr>
+                      ))}
+                    </Table.Tbody>
+                  </Table>
+                ) : (
+                  <Text size="sm" c="dimmed">No refined planner features are available for this supervisor.</Text>
+                )}
               </Stack>
             </Card>
 

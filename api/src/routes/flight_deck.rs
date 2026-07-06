@@ -156,7 +156,6 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
     let include_deleted = query.include_deleted.unwrap_or(false);
 
     for supervisor in supervisors {
-        sync_supervisor_work_units(state, &supervisor).await?;
         let mut seeds = load_work_unit_seeds(state, &supervisor, include_deleted).await?;
 
         if let Some(kind) = query.kind.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -172,7 +171,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         for seed in seeds {
             let telemetry = match seed.workflow_run_id.as_deref() {
                 Some(workflow_run_id) if !seed.workflow_deleted => workflow_telemetry(state, workflow_run_id).await?,
-                _ => empty_telemetry(),
+                _ => draft_workflow_telemetry(state, &seed.context).await?,
             };
             let telemetry = enrich_projection_context_telemetry(telemetry, &seed.context);
             let telemetry = if seed.workflow_type == "manual_shard" {
@@ -250,7 +249,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
             .map(|value| value.trim().is_empty() || value == "draft")
             .unwrap_or(true);
         if wants_integration && wants_draft && !work_units.iter().any(|unit| unit.kind == "integration") {
-            work_units.push(integration_draft_work_unit(&supervisor));
+            work_units.push(integration_draft_work_unit(state, &supervisor).await?);
         }
 
         let topology = build_topology(&supervisor, &work_units);
@@ -375,6 +374,112 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
     .execute(&state.db)
     .await?;
 
+    sqlx::query(
+        r#"
+        WITH queued_ids AS (
+            SELECT DISTINCT value AS feature_id, CAST(key AS INTEGER) AS queue_position
+            FROM json_each((SELECT context_json FROM supervisor_runs WHERE id = ?), '$.queued_feature_ids')
+            WHERE type = 'text'
+            UNION
+            SELECT DISTINCT value AS feature_id, CAST(key AS INTEGER) AS queue_position
+            FROM json_each((SELECT context_json FROM supervisor_runs WHERE id = ?), '$.feature_pool_ids')
+            WHERE type = 'text'
+        )
+        INSERT INTO supervisor_work_units (
+            id,
+            supervisor_run_id,
+            repo_id,
+            feature_id,
+            workflow_run_id,
+            patch_id,
+            kind,
+            title,
+            state,
+            root_repo_path,
+            shard_path,
+            integration_path,
+            priority,
+            queue_position,
+            blocked_reason,
+            waiting_user_input_json,
+            context_json,
+            created_at,
+            updated_at
+        )
+        SELECT
+            sr.id || ':' || pf.id,
+            sr.id,
+            pf.repo_id,
+            pf.id,
+            pf.current_workflow_run_id,
+            pf.current_patch_id,
+            'feature_development',
+            pf.title,
+            CASE
+                WHEN pf.development_state IN ('development_running', 'running', 'active') THEN 'running'
+                WHEN pf.development_state IN ('waiting', 'waiting_user', 'paused') THEN 'waiting_user'
+                WHEN pf.development_state IN ('development_failed', 'failed', 'blocked') THEN 'failed'
+                WHEN pf.development_state IN ('development_succeeded', 'completed') THEN 'ready_for_integration'
+                WHEN pf.development_state IN ('integrating', 'integration_running') THEN 'integrating'
+                WHEN pf.development_state IN ('integrated', 'applied') THEN 'integrated'
+                WHEN pf.development_state = 'patch_ready' THEN 'patch_ready'
+                ELSE 'queued'
+            END,
+            sr.root_repo_path,
+            (
+                SELECT sf.shard_path
+                FROM sprint_features sf
+                WHERE sf.supervisor_run_id = sr.id
+                  AND sf.feature_id = pf.id
+                ORDER BY sf.updated_at DESC
+                LIMIT 1
+            ),
+            sr.integration_path,
+            0,
+            queued_ids.queue_position,
+            NULL,
+            '{}',
+            json_object(
+                'source', 'flight_deck_projection_sync',
+                'queue_source', 'supervisor_execution_queue',
+                'workflow_type', 'feature_development',
+                'pool_key', 'feature_development',
+                'planned_workflow', 1,
+                'planned_workflow_template_id', COALESCE(
+                    json_extract(sr.context_json, '$.flight_deck_settings.pools.feature_development.template_id'),
+                    json_extract(sr.context_json, '$.workflow_template_id')
+                ),
+                'development_state', pf.development_state,
+                'feature_status', pf.status
+            ),
+            COALESCE(pf.scheduled_at, pf.updated_at, sr.created_at),
+            sr.updated_at
+        FROM queued_ids
+        JOIN supervisor_runs sr ON sr.id = ?
+        JOIN planner_features pf ON pf.id = queued_ids.feature_id
+        WHERE pf.id NOT LIKE 'manual-%'
+          AND COALESCE(pf.status, '') != 'deleted'
+        ON CONFLICT(id) DO UPDATE SET
+            repo_id = excluded.repo_id,
+            workflow_run_id = excluded.workflow_run_id,
+            patch_id = excluded.patch_id,
+            title = excluded.title,
+            state = excluded.state,
+            root_repo_path = excluded.root_repo_path,
+            shard_path = excluded.shard_path,
+            integration_path = excluded.integration_path,
+            queue_position = excluded.queue_position,
+            blocked_reason = excluded.blocked_reason,
+            context_json = excluded.context_json,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(supervisor.id.as_str())
+    .bind(supervisor.id.as_str())
+    .bind(supervisor.id.as_str())
+    .execute(&state.db)
+    .await?;
+
     let Some(current_sprint_id) = current_sprint_id else {
         return Ok(());
     };
@@ -436,6 +541,13 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
             json_object(
                 'source', 'flight_deck_projection_sync',
                 'sprint_id', sf.sprint_id,
+                'workflow_type', 'feature_development',
+                'pool_key', 'feature_development',
+                'planned_workflow', CASE WHEN sf.current_workflow_run_id IS NULL THEN 1 ELSE 0 END,
+                'planned_workflow_template_id', COALESCE(
+                    json_extract(sr.context_json, '$.flight_deck_settings.pools.feature_development.template_id'),
+                    json_extract(sr.context_json, '$.workflow_template_id')
+                ),
                 'feature_status', sf.status,
                 'development_state', sf.development_state,
                 'integration_skipped', COALESCE(sf.integration_skipped, 0)
@@ -447,7 +559,8 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
         LEFT JOIN planner_features pf ON pf.id = sf.feature_id
         WHERE sf.supervisor_run_id = ?
           AND sf.sprint_id = ?
-          AND sf.status != 'unscheduled'
+          AND sf.status NOT IN ('unscheduled', 'archived', 'applied', 'deleted', 'removed', 'skipped')
+          AND sf.development_state NOT IN ('archived', 'applied', 'deleted', 'removed', 'skipped')
         ON CONFLICT(id) DO UPDATE SET
             repo_id = excluded.repo_id,
             workflow_run_id = excluded.workflow_run_id,
@@ -493,7 +606,11 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
     for row in rows {
         let workflow_run_id: Option<String> = row.get("workflow_run_id");
         let workflow_exists = row.get::<i64, _>("workflow_exists") == 1;
+        let state_text: String = if workflow_exists { row.get("state") } else { "deleted".to_string() };
         if workflow_run_id.is_some() && !workflow_exists && !include_deleted {
+            continue;
+        }
+        if !include_deleted && matches!(state_text.as_str(), "archived" | "applied" | "deleted" | "removed" | "skipped") {
             continue;
         }
         seeds.push(WorkUnitSeed {
@@ -506,7 +623,7 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
             kind: row.get("kind"),
             workflow_type: row.get("workflow_type"),
             title: row.get("title"),
-            state: if workflow_exists { row.get("state") } else { "deleted".to_string() },
+            state: state_text,
             workflow_status: row.get("workflow_status"),
             root_repo_path: row.get("root_repo_path"),
             shard_path: row.get("shard_path"),
@@ -735,6 +852,86 @@ fn enrich_projection_context_telemetry(mut telemetry: Value, context: &Value) ->
     telemetry
 }
 
+fn context_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn supervisor_pool_template_id(supervisor: &SupervisorRow, pool_key: &str, direct_key: &str) -> Option<String> {
+    supervisor
+        .context
+        .get("flight_deck_settings")
+        .and_then(|value| value.get("pools"))
+        .and_then(|value| value.get(pool_key))
+        .and_then(|value| value.get("template_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| context_string(&supervisor.context, direct_key))
+}
+
+async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::Result<Value> {
+    let template_id = context_string(context, "planned_workflow_template_id")
+        .or_else(|| context_string(context, "template_id"))
+        .or_else(|| context_string(context, "workflow_template_id"));
+    let pool_key = context_string(context, "pool_key").unwrap_or_else(|| "workflow".to_string());
+
+    let Some(template_id) = template_id else {
+        return Ok(json!({
+            "status": "draft",
+            "pool_key": pool_key,
+            "planned_workflow": true,
+            "planned_workflow_template_id": Value::Null,
+            "current_step_id": Value::Null,
+            "stage_template": [],
+            "stage_template_error": "No workflow template is configured for this supervisor pool.",
+            "recent_stage_executions": [],
+            "current_stage_recent_capabilities": []
+        }));
+    };
+
+    let row = sqlx::query("SELECT name, definition_json FROM workflow_templates WHERE id = ?")
+        .bind(template_id.as_str())
+        .fetch_optional(&state.db)
+        .await?;
+
+    let Some(row) = row else {
+        return Ok(json!({
+            "status": "draft",
+            "pool_key": pool_key,
+            "planned_workflow": true,
+            "planned_workflow_template_id": template_id,
+            "current_step_id": Value::Null,
+            "stage_template": [],
+            "stage_template_error": "Configured workflow template was not found.",
+            "recent_stage_executions": [],
+            "current_stage_recent_capabilities": []
+        }));
+    };
+
+    let template_name: String = row.get("name");
+    let definition_json: String = row.get("definition_json");
+    let (stage_template, stage_template_error) = workflow_stage_template(Some(definition_json.as_str()));
+
+    Ok(json!({
+        "status": "draft",
+        "pool_key": pool_key,
+        "planned_workflow": true,
+        "planned_workflow_template_id": template_id,
+        "planned_workflow_template_name": template_name,
+        "current_step_id": Value::Null,
+        "stage_template": stage_template,
+        "stage_template_error": stage_template_error,
+        "recent_stage_executions": [],
+        "current_stage_recent_capabilities": []
+    }))
+}
+
 fn empty_telemetry() -> Value {
     json!({
         "status": null,
@@ -744,8 +941,15 @@ fn empty_telemetry() -> Value {
     })
 }
 
-fn integration_draft_work_unit(supervisor: &SupervisorRow) -> FlightDeckWorkUnit {
-    FlightDeckWorkUnit {
+async fn integration_draft_work_unit(state: &AppState, supervisor: &SupervisorRow) -> anyhow::Result<FlightDeckWorkUnit> {
+    let context = json!({
+        "workflow_type": "integration",
+        "pool_key": "integration",
+        "planned_workflow": true,
+        "planned_workflow_template_id": supervisor_pool_template_id(supervisor, "integration", "integration_template_id")
+    });
+
+    Ok(FlightDeckWorkUnit {
         id: format!("{}:integration:draft", supervisor.id),
         supervisor_id: supervisor.id.clone(),
         repo_id: None,
@@ -759,21 +963,11 @@ fn integration_draft_work_unit(supervisor: &SupervisorRow) -> FlightDeckWorkUnit
         root_repo_path: supervisor.root_repo_path.clone(),
         shard_path: None,
         integration_path: supervisor.integration_path.clone(),
-        telemetry: integration_draft_telemetry(),
+        telemetry: draft_workflow_telemetry(state, &context).await?,
         alerts: Vec::new(),
         created_at: Some(supervisor.created_at.clone()),
         updated_at: Some(supervisor.updated_at.clone()),
         workflow_deleted: false,
-    }
-}
-
-fn integration_draft_telemetry() -> Value {
-    json!({
-        "status": "draft",
-        "pool_key": "integration",
-        "current_step_id": null,
-        "recent_stage_executions": [],
-        "current_stage_recent_capabilities": []
     })
 }
 

@@ -6388,11 +6388,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               {monitorHomeView === 'flight_deck' ? (
                 <FlightDeckPanel
                   navigate={props.navigate}
-                  onOpenPlanner={(supervisor) => setOverlayPlanner({
-                    supervisorId: supervisor.id,
-                    title: supervisor.title,
-                    rootRepoPath: supervisor.root_repo_path,
-                  })}
                 />
               ) : monitorHomeView === 'supervisors' ? (
                 <SupervisorPanel
