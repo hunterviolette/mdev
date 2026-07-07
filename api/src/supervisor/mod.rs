@@ -7,6 +7,7 @@ use std::{collections::{HashMap, HashSet}, fs, hash::{Hash, Hasher}, path::{Path
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -520,6 +521,64 @@ fn import_string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SupervisorQueuedFeatureRef {
+    feature_id: String,
+    planner_id: String,
+    planner_title: String,
+}
+
+fn import_queued_features(value: Option<&Value>) -> Vec<SupervisorQueuedFeatureRef> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<SupervisorQueuedFeatureRef>(item.clone()).ok())
+                .map(|mut item| {
+                    item.feature_id = item.feature_id.trim().to_string();
+                    item.planner_id = item.planner_id.trim().to_string();
+                    item.planner_title = item.planner_title.trim().to_string();
+                    item
+                })
+                .filter(|item| !item.feature_id.is_empty() && !item.feature_id.starts_with("manual-") && !item.planner_id.is_empty())
+                .fold(Vec::<SupervisorQueuedFeatureRef>::new(), |mut acc, item| {
+                    if !acc.iter().any(|existing| existing.feature_id == item.feature_id) {
+                        acc.push(item);
+                    }
+                    acc
+                })
+        })
+        .unwrap_or_default()
+}
+
+async fn queue_planner_features_by_id(state: &AppState, planner_id: &str) -> Result<Vec<FeaturePlanItem>> {
+    let row = sqlx::query("SELECT features_json FROM planner_workspaces WHERE id = ?")
+        .bind(planner_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
+
+    let features_json: String = row.get("features_json");
+    Ok(serde_json::from_str::<Vec<FeaturePlanItem>>(&features_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.id.starts_with("manual-"))
+        .collect())
+}
+
+async fn queue_planner_title_by_id(state: &AppState, planner_id: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT title FROM planner_workspaces WHERE id = ?")
+        .bind(planner_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+    Ok(row.map(|row| row.get::<String, _>("title")))
+}
+
 fn imported_feature_values(payload: &Value) -> Result<Vec<Value>> {
     if let Some(items) = payload.as_array() {
         return Ok(items.clone());
@@ -995,20 +1054,46 @@ async fn queue_planner_features(state: &AppState, root: &str, planner_id: Option
 
 pub async fn supervisor_queue_projection(state: &AppState, id: Uuid, planner_id: Option<String>) -> Result<Value> {
     let run = load_supervisor_run(state, id).await?;
-    let mut queued_feature_ids = run
-        .execution_plan_items
-        .iter()
-        .map(|item| item.feature_plan_item_id.clone())
-        .collect::<Vec<_>>();
-    queued_feature_ids.extend(import_string_array(run.context.get("feature_pool_ids")));
-    queued_feature_ids.extend(import_string_array(run.context.get("queued_feature_ids")));
-    let mut queued_seen = HashSet::<String>::new();
-    queued_feature_ids.retain(|feature_id| queued_seen.insert(feature_id.clone()));
+    let queued_features = import_queued_features(run.context.get("queued_features"));
+    let queued_feature_ids = queued_features.iter().map(|item| item.feature_id.clone()).collect::<Vec<_>>();
     let queued_set = queued_feature_ids.iter().cloned().collect::<HashSet<_>>();
+    let queued_by_feature_id = queued_features
+        .iter()
+        .map(|item| (item.feature_id.clone(), item.clone()))
+        .collect::<HashMap<_, _>>();
 
     let (current_planner_id, current_planner_title, current_planner_items) = queue_planner_features(state, &run.root_repo_path, planner_id.as_deref()).await?;
+    let mut planner_items_by_feature_id = HashMap::<String, (FeaturePlanItem, Option<String>, Option<String>)>::new();
+    for feature in current_planner_items.iter().cloned() {
+        planner_items_by_feature_id.insert(feature.id.clone(), (feature, current_planner_id.clone(), current_planner_title.clone()));
+    }
+
+    let mut queued_planner_ids = queued_features
+        .iter()
+        .map(|item| item.planner_id.clone())
+        .collect::<Vec<_>>();
+    queued_planner_ids.sort();
+    queued_planner_ids.dedup();
+
+    for queued_planner_id in queued_planner_ids {
+        let planner_title = queued_features
+            .iter()
+            .find(|item| item.planner_id == queued_planner_id && !item.planner_title.trim().is_empty())
+            .map(|item| item.planner_title.clone())
+            .or(queue_planner_title_by_id(state, &queued_planner_id).await?);
+        for feature in queue_planner_features_by_id(state, &queued_planner_id).await? {
+            planner_items_by_feature_id
+                .entry(feature.id.clone())
+                .or_insert_with(|| (feature, Some(queued_planner_id.clone()), planner_title.clone()));
+        }
+    }
+
     let current_planner_by_id = current_planner_items.iter().map(|item| (item.id.clone(), item.clone())).collect::<HashMap<_, _>>();
-    let mut visible_feature_ids = current_planner_items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let mut visible_feature_ids = current_planner_items
+        .iter()
+        .filter(|item| matches!(item.status, FeaturePlanItemStatus::Fine | FeaturePlanItemStatus::Scheduled))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
     for feature_id in &queued_feature_ids {
         if !visible_feature_ids.iter().any(|id| id == feature_id) {
             visible_feature_ids.push(feature_id.clone());
@@ -1035,58 +1120,45 @@ pub async fn supervisor_queue_projection(state: &AppState, id: Uuid, planner_id:
     .fetch_all(&state.db)
     .await?;
 
-    let items = if rows.is_empty() {
-        run.feature_plan_items
-            .iter()
-            .filter(|feature| !feature.id.starts_with("manual-"))
-            .map(|feature| {
-                let status = serde_json::to_value(&feature.status)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .unwrap_or_else(|| "fine".to_string());
-                let queued = queued_set.contains(&feature.id);
-                let terminal = matches!(status.as_str(), "completed" | "applied");
-                let can_queue = !queued && matches!(status.as_str(), "fine" | "refined" | "approved" | "scheduled") && !terminal;
-                let can_dequeue = queued && !terminal;
-                json!({
-                    "feature_id": feature.id,
-                    "title": feature.title,
-                    "summary": feature.summary,
-                    "planner_status": status,
-                    "queue_state": if queued { "queued" } else { "available" },
-                    "queued": queued,
-                    "can_queue": can_queue,
-                    "can_dequeue": can_dequeue,
-                    "locked_by_other": false,
-                    "lock_owner_supervisor_run_id": Value::Null,
-                    "current_sprint_id": Value::Null,
-                    "current_workflow_run_id": Value::Null,
-                    "current_patch_id": Value::Null,
-                    "development_state": if queued { "queued" } else { "unscheduled" },
-                    "scheduled_at": Value::Null,
-                    "development_started_at": Value::Null,
-                    "development_completed_at": Value::Null,
-                    "integration_completed_at": Value::Null,
-                    "applied_at": feature.applied_at
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        rows.into_iter()
-            .map(|row| {
-                let feature_id: String = row.get("id");
-                let current_planner_item = current_planner_by_id.get(&feature_id);
-                let status: String = current_planner_item
-                    .and_then(|item| serde_json::to_value(&item.status).ok().and_then(|value| value.as_str().map(str::to_string)))
-                    .unwrap_or_else(|| row.get("status"));
-                let payload = current_planner_item
-                    .and_then(|item| serde_json::to_value(item).ok())
-                    .unwrap_or_else(|| serde_json::from_str::<Value>(row.get::<String, _>("payload_json").as_str()).unwrap_or_else(|_| json!({})));
+    let state_by_feature_id = rows
+        .into_iter()
+        .map(|row| {
+            let feature_id: String = row.get("id");
+            (feature_id, row)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let items = visible_feature_ids
+        .iter()
+        .map(|feature_id| {
+            let planner_item = planner_items_by_feature_id.get(feature_id);
+            let feature_plan_item = run.feature_plan_items.iter().find(|feature| feature.id == *feature_id);
+            let queued = queued_set.contains(feature_id);
+            let queued_ref = queued_by_feature_id.get(feature_id);
+            let is_current_planner = current_planner_by_id.contains_key(feature_id);
+            let item_planner_id = queued_ref
+                .map(|item| item.planner_id.clone())
+                .or_else(|| planner_item.and_then(|(_, planner_id, _)| planner_id.clone()));
+            let item_planner_title = queued_ref
+                .map(|item| item.planner_title.clone())
+                .or_else(|| planner_item.and_then(|(_, _, planner_title)| planner_title.clone()));
+            let title = planner_item
+                .map(|(feature, _, _)| feature.title.clone())
+                .or_else(|| feature_plan_item.map(|feature| feature.title.clone()))
+                .unwrap_or_else(|| feature_id.clone());
+            let summary = planner_item
+                .map(|(feature, _, _)| feature.summary.clone())
+                .or_else(|| feature_plan_item.map(|feature| feature.summary.clone()))
+                .unwrap_or_default();
+            let status = planner_item
+                .and_then(|(feature, _, _)| serde_json::to_value(&feature.status).ok().and_then(|value| value.as_str().map(str::to_string)))
+                .or_else(|| feature_plan_item.and_then(|feature| serde_json::to_value(&feature.status).ok().and_then(|value| value.as_str().map(str::to_string))))
+                .unwrap_or_else(|| "fine".to_string());
+
+            if let Some(row) = state_by_feature_id.get(feature_id) {
                 let owner = row.get::<Option<String>, _>("current_supervisor_run_id");
                 let owner_trimmed = owner.as_deref().unwrap_or("").trim().to_string();
                 let locked_by_other = !owner_trimmed.is_empty() && owner_trimmed != run.id.to_string();
-                let queued = queued_set.contains(&feature_id);
-                let is_current_planner = current_planner_by_id.contains_key(&feature_id);
                 let current_workflow_run_id = row.get::<Option<String>, _>("current_workflow_run_id");
                 let shard_path = row.get::<Option<String>, _>("shard_path");
                 let has_development_diff = shard_has_development_diff(shard_path.as_deref());
@@ -1113,13 +1185,14 @@ pub async fn supervisor_queue_projection(state: &AppState, id: Uuid, planner_id:
                 } else {
                     None
                 };
+
                 json!({
                     "feature_id": feature_id,
-                    "planner_id": current_planner_id,
-                    "planner_title": current_planner_title,
+                    "planner_id": item_planner_id,
+                    "planner_title": item_planner_title,
                     "is_current_planner": is_current_planner,
-                    "title": row.get::<String, _>("title"),
-                    "summary": payload.get("summary").and_then(Value::as_str).unwrap_or(""),
+                    "title": title,
+                    "summary": summary,
                     "planner_status": status,
                     "queue_state": if queued { "queued" } else if locked_by_other { "locked" } else { "available" },
                     "queued": queued,
@@ -1140,14 +1213,57 @@ pub async fn supervisor_queue_projection(state: &AppState, id: Uuid, planner_id:
                     "integration_completed_at": row.get::<Option<String>, _>("integration_completed_at"),
                     "applied_at": row.get::<Option<String>, _>("applied_at")
                 })
-            })
-            .collect::<Vec<_>>()
-    };
+            } else {
+                let terminal = matches!(status.as_str(), "completed" | "applied");
+                let refined = matches!(status.as_str(), "fine" | "refined" | "approved" | "scheduled");
+                let can_queue = is_current_planner && !queued && refined && !terminal;
+                let can_dequeue = queued && !terminal;
+                let disabled_reason = if terminal {
+                    Some("feature is completed or applied")
+                } else if !is_current_planner && !queued {
+                    Some("feature belongs to another planner")
+                } else if !refined {
+                    Some("feature is not refined")
+                } else {
+                    None
+                };
+
+                json!({
+                    "feature_id": feature_id,
+                    "planner_id": item_planner_id,
+                    "planner_title": item_planner_title,
+                    "is_current_planner": is_current_planner,
+                    "title": title,
+                    "summary": summary,
+                    "planner_status": status,
+                    "queue_state": if queued { "queued" } else { "available" },
+                    "queued": queued,
+                    "can_queue": can_queue,
+                    "can_dequeue": can_dequeue,
+                    "dequeue_without_prompt": queued && can_dequeue,
+                    "has_development_diff": false,
+                    "locked_by_other": false,
+                    "lock_owner_supervisor_run_id": Value::Null,
+                    "disabled_reason": disabled_reason,
+                    "current_sprint_id": Value::Null,
+                    "current_workflow_run_id": Value::Null,
+                    "current_patch_id": Value::Null,
+                    "development_state": if queued { "queued" } else { "unscheduled" },
+                    "scheduled_at": Value::Null,
+                    "development_started_at": Value::Null,
+                    "development_completed_at": Value::Null,
+                    "integration_completed_at": Value::Null,
+                    "applied_at": feature_plan_item.and_then(|feature| feature.applied_at.clone())
+                })
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "ok": true,
         "supervisor_run_id": run.id,
         "root_repo_path": run.root_repo_path,
+        "queued_features": queued_features,
         "feature_ids": queued_feature_ids,
         "items": items
     }))
@@ -1174,11 +1290,39 @@ pub async fn update_supervisor_flight_deck_settings(state: &AppState, id: Uuid, 
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
+async fn resolve_feature_pool_template_id(
+    state: &AppState,
+    run: &SupervisorRun,
+) -> Result<Uuid> {
+    let candidate = run
+        .context
+        .get("flight_deck_settings")
+        .and_then(|value| value.get("pools"))
+        .and_then(|value| value.get("feature_development"))
+        .and_then(|value| value.get("template_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("feature pool template is not configured"))?;
+
+    if let Ok(id) = Uuid::parse_str(candidate) {
+        return Ok(id);
+    }
+
+    let row = sqlx::query("SELECT id FROM workflow_templates WHERE name = ? LIMIT 1")
+        .bind(candidate)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| anyhow!("feature pool template '{}' was not found", candidate))?;
+    let id_text: String = row.get("id");
+    Ok(Uuid::parse_str(id_text.as_str())?)
+}
+
 pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
     let pool_was_paused = matches!(run.status, SupervisorStatus::Paused);
     let requested_planner_id = payload.get("planner_id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).map(str::to_string);
-    let (queue_planner_id, queue_planner_title, persisted_features) = queue_planner_features(state, &run.root_repo_path, requested_planner_id.as_deref()).await?;
+    let (_queue_planner_id, _queue_planner_title, persisted_features) = queue_planner_features(state, &run.root_repo_path, requested_planner_id.as_deref()).await?;
     if !persisted_features.is_empty() {
         let mut merged = run.feature_plan_items.clone();
         for feature in persisted_features {
@@ -1191,21 +1335,50 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
         run.feature_plan_items = merged;
     }
 
-    let selected_value = payload
-        .get("selected_feature_ids")
-        .or_else(|| payload.get("feature_ids"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let mut selected_feature_ids = serde_json::from_value::<Vec<String>>(selected_value)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && !value.starts_with("manual-"))
-        .collect::<Vec<_>>();
+    let mut queued_features = import_queued_features(payload.get("queued_features"));
+    if queued_features.is_empty() {
+        return Err(anyhow!("queued_features is required"));
+    }
     let mut selected_seen = HashSet::<String>::new();
-    selected_feature_ids.retain(|feature_id| selected_seen.insert(feature_id.clone()));
+    queued_features.retain(|item| selected_seen.insert(item.feature_id.clone()));
+    let selected_feature_ids = queued_features.iter().map(|item| item.feature_id.clone()).collect::<Vec<_>>();
+
+    let mut queued_planner_ids = queued_features
+        .iter()
+        .map(|item| item.planner_id.clone())
+        .collect::<Vec<_>>();
+    queued_planner_ids.sort();
+    queued_planner_ids.dedup();
+
+    for queued_planner_id in queued_planner_ids {
+        let (_, _, queued_planner_features) = queue_planner_features(state, &run.root_repo_path, Some(queued_planner_id.as_str())).await?;
+        for feature in queued_planner_features {
+            if let Some(existing) = run.feature_plan_items.iter_mut().find(|item| item.id == feature.id) {
+                *existing = feature;
+            } else {
+                run.feature_plan_items.push(feature);
+            }
+        }
+    }
 
     let repo_id = ensure_planner_repo_id(state, &run.root_repo_path).await?;
+    let feature_cache_now = Utc::now().to_rfc3339();
+    for (index, feature_id) in selected_feature_ids.iter().enumerate() {
+        if let Some(feature) = run.feature_plan_items.iter().find(|item| item.id == *feature_id) {
+            let status = serde_json::to_value(&feature.status)?.as_str().unwrap_or("planned").to_string();
+            sqlx::query("INSERT INTO planner_features (id, repo_id, title, status, sort_order, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, sort_order = excluded.sort_order, payload_json = excluded.payload_json, updated_at = excluded.updated_at")
+                .bind(&feature.id)
+                .bind(&repo_id)
+                .bind(&feature.title)
+                .bind(status)
+                .bind(index as i64)
+                .bind(serde_json::to_string(feature)?)
+                .bind(&feature_cache_now)
+                .bind(&feature_cache_now)
+                .execute(&state.db)
+                .await?;
+        }
+    }
     if !selected_feature_ids.is_empty() {
         let locked_json = serde_json::to_string(&selected_feature_ids)?;
         let locked_rows = sqlx::query(
@@ -1247,8 +1420,7 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
             if requested_planner_id.is_none() {
                 return true;
             }
-            queue_planner_id.is_some()
-                && run.feature_plan_items.iter().any(|candidate| candidate.id == item.id)
+            run.feature_plan_items.iter().any(|candidate| candidate.id == item.id)
         })
         .map(|item| item.id.clone())
         .collect::<HashSet<_>>();
@@ -1264,20 +1436,13 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
     }
 
     let selected_set = selected_feature_ids.iter().cloned().collect::<HashSet<_>>();
-    let requested_template_id = payload
-        .get("workflow_template_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .or_else(|| context_uuid(&run.context, "workflow_template_id"));
+    let requested_template_id = resolve_feature_pool_template_id(state, &run).await?;
 
     if !run.context.is_object() {
         run.context = json!({});
     }
     if let Some(obj) = run.context.as_object_mut() {
-        if let Some(template_id) = requested_template_id {
-            obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
-        }
+        obj.insert("workflow_template_id".to_string(), Value::String(requested_template_id.to_string()));
         if let Some(template_id) = payload.get("integration_template_id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) {
             obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
         }
@@ -1292,16 +1457,10 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
     run.execution_plan_items = selected_feature_ids
         .iter()
         .enumerate()
-        .filter_map(|(index, feature_id)| {
-            if run.feature_plan_items.iter().any(|item| item.id == *feature_id) {
-                Some(ExecutionPlanItem {
-                    feature_plan_item_id: feature_id.clone(),
-                    workflow_template_id: requested_template_id,
-                    order_index: Some(index as i64),
-                })
-            } else {
-                None
-            }
+        .map(|(index, feature_id)| ExecutionPlanItem {
+            feature_plan_item_id: feature_id.clone(),
+            workflow_template_id: Some(requested_template_id),
+            order_index: Some(index as i64),
         })
         .collect();
 
@@ -1310,15 +1469,9 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
         .iter()
         .map(|item| item.feature_plan_item_id.clone())
         .collect::<Vec<_>>();
+    queued_features.retain(|item| next_feature_ids.iter().any(|feature_id| feature_id == &item.feature_id));
     if let Some(obj) = run.context.as_object_mut() {
-        obj.insert("feature_pool_ids".to_string(), serde_json::to_value(&next_feature_ids)?);
-        obj.insert("queued_feature_ids".to_string(), serde_json::to_value(&next_feature_ids)?);
-        if let Some(planner_id) = queue_planner_id.as_deref() {
-            obj.insert("feature_queue_planner_id".to_string(), Value::String(planner_id.to_string()));
-        }
-        if let Some(planner_title) = queue_planner_title.as_deref() {
-            obj.insert("feature_queue_planner_title".to_string(), Value::String(planner_title.to_string()));
-        }
+        obj.insert("queued_features".to_string(), serde_json::to_value(&queued_features)?);
     }
 
     let now = Utc::now().to_rfc3339();
@@ -1330,7 +1483,166 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
         .collect::<Vec<_>>();
 
     if !next_feature_ids.is_empty() {
+        let workspace = if !repo_snapshot::workspace_for(&run.root_repo_path, run.id)?.integration.is_dir() {
+            let workspace = repo_snapshot::refresh_integration_from_worktree(&run.root_repo_path, run.id)?;
+            patches::create_baseline(&workspace.integration)?;
+            run.integration_path = Some(workspace.integration.to_string_lossy().to_string());
+            workspace
+        } else {
+            repo_snapshot::workspace_for(&run.root_repo_path, run.id)?
+        };
+
+        let existing_rows = sqlx::query(
+            r#"
+            SELECT feature_id, shard_path
+            FROM supervisor_work_units
+            WHERE supervisor_run_id = ?
+              AND kind = 'feature_development'
+              AND feature_id IN (SELECT value FROM json_each(?))
+              AND state NOT IN ('deleted', 'archived')
+              AND TRIM(COALESCE(shard_path, '')) != ''
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(&next_json)
+        .fetch_all(&state.db)
+        .await?;
+
+        let existing_shard_by_feature_id = existing_rows
+            .into_iter()
+            .map(|row| (row.get::<String, _>("feature_id"), row.get::<String, _>("shard_path")))
+            .collect::<HashMap<_, _>>();
+
+        let mut materialized_feature_units = Vec::new();
+        for (index, feature_id) in next_feature_ids.iter().enumerate() {
+            if let Some(existing_shard_path) = existing_shard_by_feature_id.get(feature_id) {
+                materialized_feature_units.push(json!({
+                    "feature_id": feature_id,
+                    "queue_position": index,
+                    "shard_path": existing_shard_path
+                }));
+                continue;
+            }
+
+            let shard = repo_snapshot::create_shard_from_snapshot(&workspace, feature_id)
+                .with_context(|| format!("failed to create supervisor shard for queued feature {}", feature_id))?;
+            patches::create_baseline(&shard)?;
+            materialized_feature_units.push(json!({
+                "feature_id": feature_id,
+                "queue_position": index,
+                "shard_path": shard.to_string_lossy().to_string()
+            }));
+        }
+        let materialized_json = serde_json::to_string(&materialized_feature_units)?;
+
+        let requested_template_id_text = requested_template_id.to_string();
         sqlx::query(
+            r#"
+            INSERT INTO supervisor_work_units (
+                id,
+                supervisor_run_id,
+                repo_id,
+                feature_id,
+                workflow_run_id,
+                patch_id,
+                kind,
+                title,
+                state,
+                root_repo_path,
+                shard_path,
+                integration_path,
+                priority,
+                queue_position,
+                blocked_reason,
+                waiting_user_input_json,
+                context_json,
+                created_at,
+                updated_at
+            )
+            SELECT
+                ? || ':' || pf.id AS id,
+                ? AS supervisor_run_id,
+                pf.repo_id,
+                pf.id AS feature_id,
+                pf.current_workflow_run_id,
+                pf.current_patch_id,
+                'feature_development' AS kind,
+                pf.title,
+                'queued' AS state,
+                pr.root_repo_path,
+                json_extract(json_each.value, '$.shard_path') AS shard_path,
+                NULL AS integration_path,
+                0 AS priority,
+                CAST(json_extract(json_each.value, '$.queue_position') AS INTEGER) AS queue_position,
+                NULL AS blocked_reason,
+                '{}' AS waiting_user_input_json,
+                json_object(
+                    'source', 'supervisor_feature_queue',
+                    'status', pf.status,
+                    'development_state', pf.development_state,
+                    'planner_feature_id', pf.id,
+                    'template_id', ?,
+                    'planned_workflow_template_id', ?,
+                    'workflow_type', 'feature_development',
+                    'pool_key', 'feature_development',
+                    'planned_workflow', 1
+                ) AS context_json,
+                ? AS created_at,
+                ? AS updated_at
+            FROM json_each(?)
+            JOIN planner_features pf ON pf.id = json_extract(json_each.value, '$.feature_id')
+            JOIN planner_repos pr ON pr.id = pf.repo_id
+            WHERE pf.repo_id = ?
+              AND (TRIM(COALESCE(pf.current_supervisor_run_id, '')) = '' OR pf.current_supervisor_run_id = ?)
+            ON CONFLICT(id) DO UPDATE SET
+                repo_id = excluded.repo_id,
+                workflow_run_id = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.workflow_run_id
+                    ELSE excluded.workflow_run_id
+                END,
+                patch_id = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.patch_id
+                    ELSE excluded.patch_id
+                END,
+                title = excluded.title,
+                state = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.state
+                    ELSE excluded.state
+                END,
+                root_repo_path = excluded.root_repo_path,
+                shard_path = CASE
+                    WHEN TRIM(COALESCE(supervisor_work_units.shard_path, '')) != '' THEN supervisor_work_units.shard_path
+                    ELSE excluded.shard_path
+                END,
+                queue_position = excluded.queue_position,
+                blocked_reason = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.blocked_reason
+                    ELSE excluded.blocked_reason
+                END,
+                waiting_user_input_json = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.waiting_user_input_json
+                    ELSE excluded.waiting_user_input_json
+                END,
+                context_json = CASE
+                    WHEN supervisor_work_units.state IN ('development_running', 'running', 'waiting_user', 'patch_ready', 'ready_for_integration', 'development_succeeded', 'integrating', 'integrated') THEN supervisor_work_units.context_json
+                    ELSE excluded.context_json
+                END,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(run.id.to_string())
+        .bind(requested_template_id_text.as_str())
+        .bind(requested_template_id_text.as_str())
+        .bind(&now)
+        .bind(&now)
+        .bind(&materialized_json)
+        .bind(&repo_id)
+        .bind(run.id.to_string())
+        .execute(&state.db)
+        .await?;
+
+        let locked = sqlx::query(
             r#"
             UPDATE planner_features
             SET current_supervisor_run_id = ?,
@@ -1352,7 +1664,7 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
                 restarted_at = NULL,
                 updated_at = ?
             WHERE repo_id = ?
-              AND id IN (SELECT value FROM json_each(?))
+              AND id IN (SELECT json_extract(value, '$.feature_id') FROM json_each(?))
               AND (TRIM(COALESCE(current_supervisor_run_id, '')) = '' OR current_supervisor_run_id = ?)
             "#,
         )
@@ -1360,16 +1672,19 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
         .bind(&now)
         .bind(&now)
         .bind(&repo_id)
-        .bind(&next_json)
+        .bind(&materialized_json)
         .bind(run.id.to_string())
         .execute(&state.db)
         .await?;
 
-        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'feature_development' AND feature_id IN (SELECT value FROM json_each(?)) AND state NOT IN ('running', 'integrating')")
-            .bind(run.id.to_string())
-            .bind(&next_json)
-            .execute(&state.db)
-            .await?;
+        if locked.rows_affected() != next_feature_ids.len() as u64 {
+            sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'feature_development' AND feature_id IN (SELECT json_extract(value, '$.feature_id') FROM json_each(?)) AND state NOT IN ('running', 'integrating')")
+                .bind(run.id.to_string())
+                .bind(&materialized_json)
+                .execute(&state.db)
+                .await?;
+            return Err(anyhow!("failed to lock all queued planner features after creating supervisor work units"));
+        }
 
         sqlx::query("UPDATE sprint_features SET status = 'unscheduled', development_state = 'unscheduled', current_workflow_run_id = NULL, current_patch_id = NULL, shard_path = NULL, updated_at = ? WHERE supervisor_run_id = ? AND feature_id IN (SELECT value FROM json_each(?)) AND development_state NOT IN ('development_running', 'integration_running', 'integrated', 'applied')")
             .bind(&now)
@@ -1479,9 +1794,10 @@ pub async fn unschedule_supervisor_feature(state: &AppState, id: Uuid, payload: 
     if !run.context.is_object() {
         run.context = json!({});
     }
+    let mut queued_features = import_queued_features(run.context.get("queued_features"));
+    queued_features.retain(|item| next_feature_ids.iter().any(|feature_id| feature_id == &item.feature_id));
     if let Some(obj) = run.context.as_object_mut() {
-        obj.insert("feature_pool_ids".to_string(), serde_json::to_value(&next_feature_ids)?);
-        obj.insert("queued_feature_ids".to_string(), serde_json::to_value(&next_feature_ids)?);
+        obj.insert("queued_features".to_string(), serde_json::to_value(&queued_features)?);
     }
 
     let sprint_id = run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string);
@@ -2019,6 +2335,57 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
         .and_then(Value::as_str)
         .unwrap_or("");
 
+    let terminal_work_unit_state = match status {
+        RunStatus::Success => Some("patch_ready"),
+        RunStatus::Error | RunStatus::Cancelled => Some("development_failed"),
+        _ => None,
+    };
+
+    if let Some(next_state) = terminal_work_unit_state {
+        let blocked_reason = match status {
+            RunStatus::Error => Some("workflow failed"),
+            RunStatus::Cancelled => Some("workflow cancelled"),
+            _ => None,
+        };
+
+        let changed = sqlx::query(
+            r#"
+            UPDATE supervisor_work_units
+            SET state = ?,
+                blocked_reason = ?,
+                context_json = json_set(
+                    CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+                    '$.current_step_id', ?,
+                    '$.workflow_status', ?,
+                    '$.terminal_at', ?
+                ),
+                updated_at = ?
+            WHERE supervisor_run_id = ?
+              AND workflow_run_id = ?
+              AND kind IN ('feature_development', 'manual_shard')
+              AND state NOT IN ('deleted', 'archived')
+            "#,
+        )
+        .bind(next_state)
+        .bind(blocked_reason)
+        .bind(current_step_id)
+        .bind(status_str(&status))
+        .bind(&now)
+        .bind(&now)
+        .bind(supervisor_id.to_string())
+        .bind(workflow_run_id.to_string())
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+
+        if changed > 0 {
+            run.updated_at = Utc::now();
+            update_supervisor_run(state, &run).await?;
+            publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "supervisor work-unit terminal event processed").await?;
+            return Ok(());
+        }
+    }
+
     if input_source == "supervisor_sprint_feature" {
         let sprint_id = supervisor_context_string(&supervisor_context, "sprint_id")
             .or_else(|| run.context.get("current_sprint_id").and_then(Value::as_str).map(str::to_string));
@@ -2201,7 +2568,6 @@ async fn resolve_manual_shard_template_id(state: &AppState, run: &SupervisorRun,
 
 pub async fn create_supervisor_manual_shard(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
-    let sprint_id = current_sprint_id(&run).await?;
     let template_id = resolve_manual_shard_template_id(state, &run, &payload).await?;
     let now = Utc::now().to_rfc3339();
     let manual_count = sqlx::query_scalar::<_, i64>(
@@ -2291,7 +2657,6 @@ pub async fn create_supervisor_manual_shard(state: &AppState, id: Uuid, payload:
     .bind(&shard_path)
     .bind(run.integration_path.clone())
     .bind(serde_json::to_string(&json!({
-        "sprint_id": sprint_id,
         "source": "manual_shard",
         "workflow_type": "manual_shard",
         "pool_key": "manual_shard",
@@ -2305,12 +2670,6 @@ pub async fn create_supervisor_manual_shard(state: &AppState, id: Uuid, payload:
 
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
-    sqlx::query("DELETE FROM sprint_features WHERE supervisor_run_id = ? AND feature_id = ?")
-        .bind(run.id.to_string())
-        .bind(&manual_id)
-        .execute(&state.db)
-        .await?;
-
     sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'feature_development' AND feature_id = ?")
         .bind(run.id.to_string())
         .bind(&manual_id)
@@ -2330,16 +2689,119 @@ pub async fn create_supervisor_manual_shard(state: &AppState, id: Uuid, payload:
 pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
     let feature_id = payload_feature_id(&payload)?;
-    let sprint_id = current_sprint_id(&run).await?;
 
     refresh_supervisor_child_run_statuses(state, &mut run).await?;
-    let spawned_missing = ensure_scheduled_development_children(state, &mut run).await?;
-    if spawned_missing {
-        run.updated_at = Utc::now();
-        update_supervisor_run(state, &run).await?;
-        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "missing scheduled feature workflows created").await?;
-    }
-    let (feature_id, workflow_run_id, _development_state) = supervisor_child_workflow_row(state, &sprint_id, &feature_id).await?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT id,
+               repo_id,
+               feature_id,
+               title,
+               workflow_run_id,
+               shard_path,
+               state,
+               context_json
+        FROM supervisor_work_units
+        WHERE supervisor_run_id = ?
+          AND kind = 'feature_development'
+          AND feature_id = ?
+          AND state NOT IN ('deleted', 'archived')
+        LIMIT 1
+        "#,
+    )
+    .bind(run.id.to_string())
+    .bind(&feature_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("feature {} is not queued for this supervisor", feature_id))?;
+
+    let work_unit_id: String = row.get("id");
+    let feature_id: String = row.get("feature_id");
+    let title: String = row.get("title");
+    let shard_path: String = row
+        .try_get::<Option<String>, _>("shard_path")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("feature work unit shard_path is missing"))?;
+    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
+        .unwrap_or_else(|_| json!({}));
+
+    let template_id = context
+        .get("template_id")
+        .or_else(|| context.get("planned_workflow_template_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| anyhow!("feature work unit template_id is missing"))?;
+
+    let workflow_run_id = match row
+        .try_get::<Option<String>, _>("workflow_run_id")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| Uuid::parse_str(value.as_str()).ok())
+    {
+        Some(workflow_run_id) => workflow_run_id,
+        None => {
+            let feature = run
+                .feature_plan_items
+                .iter()
+                .find(|item| item.id == feature_id)
+                .cloned()
+                .unwrap_or_else(|| FeaturePlanItem {
+                    id: feature_id.clone(),
+                    title: title.clone(),
+                    status: FeaturePlanItemStatus::Scheduled,
+                    summary: title.clone(),
+                    rough_summary: None,
+                    refinement_workflow_run_id: None,
+                    applied_sprint_id: None,
+                    applied_sprint_title: None,
+                    applied_at: None,
+                    requirements: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                    implementation_notes: Vec::new(),
+                    review_expectations: Vec::new(),
+                    target_files_or_areas: Vec::new(),
+                    dependencies: Vec::new(),
+                });
+
+            let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
+            let supervisor_ctx = json!({
+                "supervisor_run_id": run.id,
+                "feature_id": feature_id,
+                "root_repo_path": run.root_repo_path,
+                "snapshot_path": workspace.snapshot,
+                "integration_path": workspace.integration,
+                "patches_path": workspace.patches,
+                "input_source": "supervisor_work_unit",
+                "workflow_type": "feature_development",
+                "pool_key": "feature_development",
+                "template_id": template_id
+            });
+
+            let workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
+                state,
+                &feature,
+                &shard_path,
+                Some(template_id),
+                supervisor_ctx,
+            ).await?;
+
+            sqlx::query(
+                "UPDATE supervisor_work_units SET workflow_run_id = ?, state = 'draft', blocked_reason = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(workflow_run_id.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .bind(&work_unit_id)
+            .execute(&state.db)
+            .await?;
+
+            workflow_run_id
+        }
+    };
+
     let child_run = engine::load_run(state, workflow_run_id).await?;
 
     if matches!(child_run.status, RunStatus::Queued | RunStatus::Running) {
@@ -2355,16 +2817,14 @@ pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload
 
     if matches!(child_run.status, RunStatus::Waiting | RunStatus::Paused) {
         let resume_result = engine::resume_run(state, workflow_run_id).await?;
-        update_sprint_feature_workflow_state(
-            state,
-            &sprint_id,
-            &feature_id,
-            Some(workflow_run_id),
-            "development_running",
-            "development_running",
-            child_run.current_step_id.as_deref(),
-            None,
-        ).await?;
+        sqlx::query(
+            "UPDATE supervisor_work_units SET state = 'development_running', blocked_reason = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(&work_unit_id)
+        .execute(&state.db)
+        .await?;
+
         run.status = SupervisorStatus::RunningChildren;
         run.updated_at = Utc::now();
         update_supervisor_run(state, &run).await?;
@@ -2379,31 +2839,46 @@ pub async fn start_supervisor_child_workflow(state: &AppState, id: Uuid, payload
         }));
     }
 
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("current_step_id".to_string(), Value::Null);
+    }
+
     sqlx::query(
-        "UPDATE sprint_features
-         SET status = 'scheduled',
-             development_state = 'scheduled',
-             last_error = NULL,
-             updated_at = ?
-         WHERE sprint_id = ?
-           AND feature_id = ?
-           AND development_state NOT IN ('development_succeeded', 'integrated', 'applied')",
+        "UPDATE supervisor_work_units SET state = 'development_running', blocked_reason = NULL, context_json = ?, updated_at = ? WHERE id = ?",
     )
+    .bind(serde_json::to_string(&context)?)
     .bind(Utc::now().to_rfc3339())
-    .bind(&sprint_id)
-    .bind(&feature_id)
+    .bind(&work_unit_id)
     .execute(&state.db)
     .await?;
 
     run.status = SupervisorStatus::RunningChildren;
-    start_next_series_child(state, &mut run).await?;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+
+    let start_result = match engine::start_run(state, workflow_run_id, None).await {
+        Ok(value) => value,
+        Err(err) => {
+            let error_text = format!("{:#}", err);
+            sqlx::query(
+                "UPDATE supervisor_work_units SET state = 'development_failed', blocked_reason = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&error_text)
+            .bind(Utc::now().to_rfc3339())
+            .bind(&work_unit_id)
+            .execute(&state.db)
+            .await?;
+            return Err(anyhow!(error_text));
+        }
+    };
+
     publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "feature workflow start requested").await?;
 
     Ok(json!({
         "ok": true,
+        "started": true,
         "workflow_run_id": workflow_run_id,
+        "start_result": start_result,
         "supervisor_run": run
     }))
 }
@@ -2475,8 +2950,15 @@ pub async fn regenerate_supervisor_queue_feature(state: &AppState, id: Uuid, pay
         .to_string();
 
     let queued = run.execution_plan_items.iter().any(|item| item.feature_plan_item_id == feature_id)
-        || import_string_array(run.context.get("queued_feature_ids")).iter().any(|id| id == &feature_id)
-        || import_string_array(run.context.get("feature_pool_ids")).iter().any(|id| id == &feature_id);
+        || import_queued_features(run.context.get("queued_features")).iter().any(|item| item.feature_id == feature_id)
+        || sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'feature_development' AND feature_id = ? AND state NOT IN ('deleted', 'archived')",
+        )
+        .bind(run.id.to_string())
+        .bind(&feature_id)
+        .fetch_one(&state.db)
+        .await?
+        > 0;
     if !queued {
         return Err(anyhow!("feature {} is not queued for this supervisor", feature_id));
     }
@@ -2566,26 +3048,46 @@ pub async fn regenerate_supervisor_queue_feature(state: &AppState, id: Uuid, pay
         .execute(&state.db)
         .await?;
 
-    sqlx::query("UPDATE sprint_features SET status = 'unscheduled', development_state = 'unscheduled', current_workflow_run_id = NULL, current_patch_id = NULL, shard_path = NULL, updated_at = ? WHERE supervisor_run_id = ? AND feature_id = ?")
-        .bind(&now)
-        .bind(run.id.to_string())
-        .bind(&feature_id)
-        .execute(&state.db)
-        .await?;
-
     let pool_was_running = matches!(run.status, SupervisorStatus::RunningChildren);
     invalidate_supervisor_integration(state, &mut run).await?;
 
-    let mut spawned = false;
-    if pool_was_running {
-        spawned = ensure_scheduled_development_children(state, &mut run).await?;
-        run.status = SupervisorStatus::RunningChildren;
-        tick_children(state, &mut run).await?;
-        start_next_series_child(state, &mut run).await?;
-    }
-
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+
+    let mut queued_features = import_queued_features(run.context.get("queued_features"));
+    if !queued_features.iter().any(|item| item.feature_id == feature_id) {
+        let planner_id = run.context.get("selected_planner_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let planner_title = run.context.get("selected_planner_title").and_then(Value::as_str).unwrap_or("").to_string();
+        queued_features.push(SupervisorQueuedFeatureRef {
+            feature_id: feature_id.clone(),
+            planner_id,
+            planner_title,
+        });
+    }
+
+    let queue_result = select_supervisor_feature_pool(
+        state,
+        id,
+        json!({
+            "queued_features": queued_features
+        }),
+    )
+    .await?;
+
+    let mut started = false;
+    let mut start_result = Value::Null;
+    if pool_was_running {
+        start_result = start_supervisor_child_workflow(
+            state,
+            id,
+            json!({
+                "feature_id": feature_id.clone()
+            }),
+        )
+        .await?;
+        started = true;
+    }
+
     let run = load_supervisor_run(state, id).await?;
     publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "queued feature regenerated").await?;
 
@@ -2594,8 +3096,9 @@ pub async fn regenerate_supervisor_queue_feature(state: &AppState, id: Uuid, pay
         "action": "regenerate_queue_feature",
         "feature_id": feature_id,
         "queued": true,
-        "started": pool_was_running,
-        "spawned": spawned,
+        "started": started,
+        "queue_result": queue_result,
+        "start_result": start_result,
         "supervisor_run": run
     }))
 }
@@ -3124,6 +3627,26 @@ pub async fn apply_supervisor_final_patch(state: &AppState, id: Uuid) -> Result<
         .bind(run.id.to_string())
         .execute(&state.db)
         .await?;
+
+    sqlx::query("UPDATE workflow_runs SET status = 'archived', updated_at = ? WHERE id = ?")
+        .bind(&completed_at_text)
+        .bind(integration_run_id.to_string())
+        .execute(&state.db)
+        .await?;
+
+    if let Ok(workspace) = repo_snapshot::workspace_for(&run.root_repo_path, run.id) {
+        let path = &workspace.integration;
+        if path.exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to clean supervisor integration workspace {}", path.display()))?;
+            } else {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to clean supervisor integration workspace file {}", path.display()))?;
+            }
+        }
+    }
+
     sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration'")
         .bind(run.id.to_string())
         .execute(&state.db)
@@ -3262,7 +3785,7 @@ async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result
         FROM supervisor_work_units wu
         WHERE wu.supervisor_run_id = ?
           AND wu.kind = 'feature_development'
-          AND wu.state IN ('patch_ready', 'ready_for_integration')
+          AND wu.state IN ('patch_ready', 'ready_for_integration', 'development_succeeded')
           AND TRIM(COALESCE(wu.shard_path, '')) != ''
           AND COALESCE(json_extract(wu.context_json, '$.integration_skipped'), 0) = 0
         ORDER BY wu.queue_position ASC, wu.updated_at ASC
@@ -3438,13 +3961,30 @@ pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid)
         return Err(anyhow!("integration has no ready unskipped inputs in the integration pool"));
     }
 
+    let archived_at = Utc::now().to_rfc3339();
     if let Some(integration_run_id) = run.integration_run_id.take() {
-        sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration' AND workflow_run_id = ?")
-            .bind(run.id.to_string())
+        sqlx::query("UPDATE workflow_runs SET status = 'archived', updated_at = ? WHERE id = ?")
+            .bind(&archived_at)
             .bind(integration_run_id.to_string())
             .execute(&state.db)
             .await?;
-        delete_supervisor_workflow_run_records(state, integration_run_id).await?;
+    }
+
+    let orphan_integration_run_ids = sqlx::query("SELECT workflow_run_id FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration' AND TRIM(COALESCE(workflow_run_id, '')) != ''")
+        .bind(run.id.to_string())
+        .fetch_all(&state.db)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("workflow_run_id").ok())
+        .filter_map(|value| Uuid::parse_str(value.as_str()).ok())
+        .collect::<Vec<_>>();
+
+    for orphan_integration_run_id in orphan_integration_run_ids {
+        sqlx::query("UPDATE workflow_runs SET status = 'archived', updated_at = ? WHERE id = ?")
+            .bind(&archived_at)
+            .bind(orphan_integration_run_id.to_string())
+            .execute(&state.db)
+            .await?;
     }
 
     sqlx::query("DELETE FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration'")
@@ -3452,10 +3992,16 @@ pub async fn restart_supervisor_integration_workflow(state: &AppState, id: Uuid)
         .execute(&state.db)
         .await?;
 
-    if let Some(integration_path) = run.integration_path.as_deref().filter(|value| !value.trim().is_empty()) {
-        let path = PathBuf::from(integration_path);
+    if let Ok(workspace) = repo_snapshot::workspace_for(&run.root_repo_path, run.id) {
+        let path = &workspace.integration;
         if path.exists() {
-            fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path))?;
+            if path.is_dir() {
+                fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to clean supervisor integration workspace {}", path.display()))?;
+            } else {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to clean supervisor integration workspace file {}", path.display()))?;
+            }
         }
     }
 
@@ -3561,7 +4107,11 @@ fn development_has_remaining_work(run: &SupervisorRun) -> bool {
 
 async fn invalidate_supervisor_integration(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
     if let Some(integration_run_id) = run.integration_run_id.take() {
-        delete_supervisor_workflow_run_records(state, integration_run_id).await?;
+        sqlx::query("UPDATE workflow_runs SET status = 'archived', updated_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(integration_run_id.to_string())
+            .execute(&state.db)
+            .await?;
     }
     run.integration_path = None;
     run.final_patch_path = None;

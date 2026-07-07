@@ -148,7 +148,7 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
     let input_source = supervisor_context
         .get("input_source")
         .and_then(Value::as_str);
-    let is_supervisor_planner_feature = input_source == Some("supervisor_planner_feature");
+    let is_supervisor_planner_feature = input_source == Some("supervisor_planner_feature") || input_source == Some("planner_workspace_feature");
     let is_supervisor_sprint_feature = is_sprint_feature_context(&supervisor_context);
     let is_supervisor_manual_shard = input_source == Some("supervisor_manual_shard");
 
@@ -200,6 +200,12 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
                 .unwrap_or(false),
             "selected_feature_id": item.id,
             "selected_feature": item,
+            "planner_id": supervisor_context
+                .get("planner_workspace_id")
+                .or_else(|| supervisor_context.get("planner_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "planner_title": supervisor_context.get("planner_title").cloned().unwrap_or(Value::Null),
             "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
             "schema_id": structured_output
                 .get("schema_id")

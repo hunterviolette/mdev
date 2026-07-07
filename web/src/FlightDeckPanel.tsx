@@ -26,7 +26,7 @@ import {
 import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
 import { listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
-import { getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, regenerateSupervisorQueueFeature, runSupervisorAction, setSupervisorQueue, unscheduleSupervisorFeature, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, regenerateSupervisorQueueFeature, runSupervisorAction, setSupervisorQueue, unscheduleSupervisorFeature, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 
 type FlightDeckPanelProps = {
   navigate?: (path: string) => void;
@@ -251,21 +251,28 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   const ordered = [...baseStageOrder, ...[...observedKeys].filter((key) => !baseStageOrder.includes(key))];
   const activeKey = activeStep ? stageKeyFromText(activeStep) : null;
   const activeIndex = activeKey ? ordered.indexOf(activeKey) : -1;
-  const failedKeys = new Set(
-    recentStages
-      .filter((stage) => normalize(textField(stage, 'status')) === 'failed')
-      .map((stage) => stageKeyFromText(textField(stage, 'step_id')))
-  );
   const waiting = unit.state === 'waiting_user';
 
+  const latestStageByKey = new Map<string, Record<string, unknown>>();
+  for (const stage of recentStages) {
+    const stepId = textField(stage, 'step_id');
+    if (!stepId) continue;
+    const key = stageKeyFromText(stepId);
+    if (!latestStageByKey.has(key)) {
+      latestStageByKey.set(key, stage);
+    }
+  }
+
   return ordered.map((key, index) => {
-    const matching = recentStages.find((stage) => stageKeyFromText(textField(stage, 'step_id')) === key);
+    const matching = latestStageByKey.get(key);
     const status = normalize(matching ? textField(matching, 'status') : '');
     let state: StageProjection['state'] = 'future';
 
-    if (failedKeys.has(key)) state = 'failed';
-    else if (activeKey === key) state = waiting ? 'waiting' : 'active';
-    else if (status === 'success' || status === 'complete') state = 'complete';
+    if (activeKey === key) state = waiting ? 'waiting' : 'active';
+    else if (status === 'success' || status === 'complete' || status === 'completed') state = 'complete';
+    else if (status === 'failed' || status === 'error' || status === 'cancelled') state = 'failed';
+    else if (status === 'running' || status === 'active') state = 'active';
+    else if (status === 'waiting' || status === 'waiting_user' || status === 'paused') state = 'waiting';
     else if (activeIndex >= 0 && index < activeIndex) state = 'complete';
     else if (activeIndex >= 0 && index === activeIndex + 1) state = 'up_next';
 
@@ -1409,8 +1416,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
-        <Button size="xs" variant="light" onClick={() => props.onOpenPlanner?.(props.supervisor, { refinementTemplateId: selectedTemplate })}>New fine</Button>
-        <Button size="xs" variant="default" disabled={props.units.length === 0}>Promote refined feature</Button>
+        <Button size="xs" variant="light" onClick={() => props.onOpenPlanner?.(props.supervisor, { refinementTemplateId: selectedTemplate })}>Refine feature</Button>
       </Group>
     );
   }
@@ -1729,7 +1735,7 @@ function FeatureQueueModal(props: {
   const supervisor = props.supervisor;
   const supervisorId = supervisor?.id ?? null;
   const [queue, setQueue] = useState<SupervisorQueueProjection | null>(null);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [queuedFeatures, setQueuedFeatures] = useState<SupervisorQueuedFeature[]>([]);
   const [queueLoading, setQueueLoading] = useState(false);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [plannerOptions, setPlannerOptions] = useState<PlannerWorkspace[]>([]);
@@ -1763,7 +1769,7 @@ function FeatureQueueModal(props: {
     let cancelled = false;
     if (!props.opened || !supervisorId) {
       setQueue(null);
-      setSelectedIds([]);
+      setQueuedFeatures([]);
       setQueueError(null);
       return () => {
         cancelled = true;
@@ -1775,7 +1781,7 @@ function FeatureQueueModal(props: {
       .then((next) => {
         if (cancelled) return;
         setQueue(next);
-        setSelectedIds(next.feature_ids ?? []);
+        setQueuedFeatures(next.queued_features ?? []);
       })
       .catch((err) => {
         if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
@@ -1788,6 +1794,7 @@ function FeatureQueueModal(props: {
     };
   }, [props.opened, supervisorId, queuePlannerId]);
 
+  const selectedIds = queuedFeatures.map((item) => item.feature_id);
   const selectedSet = new Set(selectedIds);
   const rawItems = queue?.items ?? [];
   const items = useMemo(() => {
@@ -1810,19 +1817,19 @@ function FeatureQueueModal(props: {
     await unscheduleSupervisorFeature(supervisor.id, item.feature_id, 'delete_development');
     const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
     setQueue(next);
-    setSelectedIds(next.feature_ids ?? []);
+    setQueuedFeatures(next.queued_features ?? []);
     await props.onApplied();
   }
 
-  async function persistQueueSelection(nextIds: string[]) {
+  async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
     if (!supervisor) return;
     const featureSettings = poolSetting(supervisor, 'feature_development');
     const integrationSettings = poolSetting(supervisor, 'integration');
-    const uniqueIds = Array.from(new Set(nextIds.filter(Boolean)));
+    const uniqueQueuedFeatures = nextQueuedFeatures.filter((item, index, rows) => item.feature_id && rows.findIndex((candidate) => candidate.feature_id === item.feature_id) === index);
     setQueueLoading(true);
     setQueueError(null);
     try {
-      await setSupervisorQueue(supervisor.id, uniqueIds, {
+      await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures, {
         workflow_template_id: featureSettings.template_id ?? null,
         integration_template_id: integrationSettings.template_id ?? null,
         feature_concurrency: featureSettings.concurrency ?? null,
@@ -1832,7 +1839,7 @@ function FeatureQueueModal(props: {
       });
       const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
       setQueue(next);
-      setSelectedIds(next.feature_ids ?? []);
+      setQueuedFeatures(next.queued_features ?? []);
       await props.onApplied();
     } catch (err) {
       setQueueError(err instanceof Error ? err.message : String(err));
@@ -1852,22 +1859,31 @@ function FeatureQueueModal(props: {
         setDequeueFeature(item);
         return;
       }
-      void persistQueueSelection(selectedIds.filter((id) => id !== featureId));
+      void persistQueueSelection(queuedFeatures.filter((item) => item.feature_id !== featureId));
       return;
     }
 
-    void persistQueueSelection([...selectedIds, featureId]);
+    const planner = plannerOptions.find((item) => item.id === queuePlannerId);
+    if (!queuePlannerId || !planner) return;
+    void persistQueueSelection([
+      ...queuedFeatures.filter((item) => item.feature_id !== featureId),
+      {
+        feature_id: featureId,
+        planner_id: queuePlannerId,
+        planner_title: planner.title
+      }
+    ]);
   }
 
   function moveQueuedFeature(featureId: string, direction: -1 | 1) {
-    const index = selectedIds.indexOf(featureId);
+    const index = queuedFeatures.findIndex((item) => item.feature_id === featureId);
     const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= selectedIds.length) return;
-    const next = [...selectedIds];
+    if (index < 0 || nextIndex < 0 || nextIndex >= queuedFeatures.length) return;
+    const next = [...queuedFeatures];
     const current = next[index];
     next[index] = next[nextIndex];
     next[nextIndex] = current;
-    setSelectedIds(next);
+    setQueuedFeatures(next);
     void persistQueueSelection(next);
   }
 
@@ -1876,7 +1892,7 @@ function FeatureQueueModal(props: {
     await unscheduleSupervisorFeature(supervisor.id, dequeueFeature.feature_id, mode);
     const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
     setQueue(next);
-    setSelectedIds(next.feature_ids ?? []);
+    setQueuedFeatures(next.queued_features ?? []);
     setDequeueFeature(null);
     await props.onApplied();
   }
@@ -2105,12 +2121,12 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
       <Modal
         opened={newFineChoiceSupervisor !== null}
         onClose={() => setNewFineChoiceSupervisor(null)}
-        title="New fine"
+        title="Refine feature"
         centered
         size="md"
       >
         <Stack gap="sm">
-          <Text size="sm" c="dimmed">Create a fine/refinement workflow from an existing planner feature or start from a new planner feature.</Text>
+          <Text size="sm" c="dimmed">Start a refinement workflow from an existing planner feature or create a new planner feature first.</Text>
           <Group justify="flex-end" gap="xs" wrap="nowrap">
             <Button size="xs" variant="default" onClick={() => setNewFineChoiceSupervisor(null)}>Cancel</Button>
             <Button size="xs" variant="light" onClick={() => {
@@ -2123,7 +2139,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
               setPlannerSupervisor(supervisor);
               setPlannerRefinementTemplateId(templateId);
 
-            }}>Refine existing feature</Button>
+            }}>Existing feature</Button>
             <Button size="xs" onClick={() => {
               if (!newFineChoiceSupervisor) return;
               const supervisor = newFineChoiceSupervisor;

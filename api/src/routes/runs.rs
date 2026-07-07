@@ -22,7 +22,7 @@ pub fn router() -> Router<AppState> {
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE status != 'archived' ORDER BY updated_at DESC"
     )
     .fetch_all(&state.db)
     .await
@@ -944,7 +944,6 @@ fn normalize_planner_for_read(context: &mut Value) {
         return;
     };
 
-    planner.remove("selected_feature");
     planner.remove("feature_plan_items");
     planner.remove("selected_feature_ids");
     planner.remove("enabled");

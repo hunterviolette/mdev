@@ -209,6 +209,12 @@ export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
   return normalizeSupervisorRun(await response.json());
 }
 
+export type SupervisorQueuedFeature = {
+  feature_id: string;
+  planner_id: string;
+  planner_title: string;
+};
+
 export type SupervisorQueueItem = {
   feature_id: string;
   planner_id?: string | null;
@@ -241,6 +247,7 @@ export type SupervisorQueueProjection = {
   ok: boolean;
   supervisor_run_id: string;
   root_repo_path: string;
+  queued_features: SupervisorQueuedFeature[];
   feature_ids: string[];
   items: SupervisorQueueItem[];
 };
@@ -437,7 +444,7 @@ export async function getSupervisorQueue(id: string, plannerId?: string | null):
 
 export async function setSupervisorQueue(
   id: string,
-  selectedFeatureIds: string[],
+  queuedFeatures: SupervisorQueuedFeature[],
   config: {
     workflow_template_id?: string | null;
     integration_template_id?: string | null;
@@ -451,7 +458,7 @@ export async function setSupervisorQueue(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      selected_feature_ids: selectedFeatureIds,
+      queued_features: queuedFeatures,
       ...config
     })
   });
@@ -465,16 +472,17 @@ export async function setSupervisorQueue(
 
 export async function selectSupervisorFeaturePool(
   id: string,
-  selectedFeatureIds: string[],
+  queuedFeatures: SupervisorQueuedFeature[],
   config: {
     workflow_template_id?: string | null;
     integration_template_id?: string | null;
     feature_concurrency?: number | null;
     integration_policy?: 'auto' | 'manual' | null;
     auto_start?: boolean;
+    planner_id?: string | null;
   } = {}
 ): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
-  return setSupervisorQueue(id, selectedFeatureIds, config);
+  return setSupervisorQueue(id, queuedFeatures, config);
 }
 
 export async function previewPlannerImport(id: string, payload: unknown): Promise<PlannerImportPreviewResponse> {

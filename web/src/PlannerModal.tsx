@@ -252,13 +252,15 @@ export function PlannerModal(props: Props) {
     return plannerOptions.find((option) => option.id === appliedPlannerId) ?? plannerOptions.find((option) => option.is_default) ?? plannerOptions[0] ?? null;
   }, [plannerOptions, appliedPlannerId]);
   const features = selectedPlannerWorkspace?.feature_plan_items ?? [];
+  const multiSelectionMode = Boolean(props.selectionMode && props.onSelectFeatures);
+  const singleSelectionMode = Boolean(props.selectionMode && props.onSelectFeature && !props.onSelectFeatures);
   const plannerSelectOptions = useMemo(() => plannerOptions.map((option) => ({
     value: option.id,
     label: plannerOptionLabel(option, appliedPlannerId),
   })), [plannerOptions, appliedPlannerId]);
 
   const filteredFeatures = useMemo(() => {
-    const source = props.selectionMode
+    const source = multiSelectionMode
       ? features.filter((item) => ['fine', 'scheduled'].includes(String(item.status ?? '')))
       : features;
     const needle = featureSearch.trim().toLowerCase();
@@ -270,7 +272,7 @@ export function PlannerModal(props: Props) {
         || (item.summary ?? '').toLowerCase().includes(needle)
         || displayStatus.includes(needle);
     });
-  }, [features, featureSearch, props.selectionMode]);
+  }, [features, featureSearch, multiSelectionMode]);
 
   const importSummaryText = useMemo(() => {
     if (!importPreview) return '';
@@ -316,7 +318,7 @@ export function PlannerModal(props: Props) {
     if (!props.opened) return;
     let cancelled = false;
 
-    if (props.selectionMode) {
+    if (multiSelectionMode) {
       setCreateFeatureOpen(false);
       setCreateFeatureTitle('');
       setCreateFeatureSummary('');
@@ -809,20 +811,17 @@ export function PlannerModal(props: Props) {
                           {props.selectionMode ? (
                             <>
                               <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
-                              {isReady ? (
-                                <Button size="xs" color={isSelected ? 'orange' : 'green'} variant={isSelected ? 'light' : 'filled'} onClick={() => void selectFeature(item)} disabled={!item.id}>{isSelected ? 'Remove selection' : 'Select for pool'}</Button>
+                              {multiSelectionMode ? (
+                                isReady ? (
+                                  <Button size="xs" color={isSelected ? 'orange' : 'green'} variant={isSelected ? 'light' : 'filled'} onClick={() => void selectFeature(item)} disabled={!item.id}>{isSelected ? 'Remove selection' : 'Select for queue'}</Button>
+                                ) : null
                               ) : (
-                                <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Mark ready</Button>
+                                <Button size="xs" color={isSelected ? 'gray' : 'green'} variant={isSelected ? 'light' : 'filled'} onClick={() => void selectFeature(item)} disabled={!item.id || isSelected}>{isSelected ? 'Selected' : 'Select feature'}</Button>
                               )}
                             </>
                           ) : (
                             <>
                               <Button size="xs" variant="light" onClick={() => openFeature(item)}>Open</Button>
-                              {isReady ? (
-                                <Badge size="sm" variant="light" color="green">Available to supervisor</Badge>
-                              ) : (
-                                <Button size="xs" variant="light" onClick={() => void setFeatureStatus(item, 'fine')} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Mark ready</Button>
-                              )}
                               <Button size="xs" variant="light" color="red" onClick={() => void deleteFeature(item)} loading={busyForFeature} disabled={!selectedPlannerWorkspace}>Delete</Button>
                             </>
                           )}
@@ -889,7 +888,7 @@ export function PlannerModal(props: Props) {
                 </Badge>
               </Stack>
               <Group gap="xs">
-                {props.selectionMode ? <Button size="xs" onClick={() => void selectFeature(featureDraft)} disabled={props.selectedFeatureId === featureDraft.id}>{stagedFeatureIds.includes(featureDraft.id) ? 'Remove selection' : 'Select for pool'}</Button> : null}
+                {props.selectionMode ? <Button size="xs" onClick={() => void selectFeature(featureDraft)} disabled={props.selectedFeatureId === featureDraft.id}>{multiSelectionMode ? (stagedFeatureIds.includes(featureDraft.id) ? 'Remove selection' : 'Select for queue') : 'Select feature'}</Button> : null}
                 {featureEditMode ? <Button size="xs" onClick={() => void saveFeatureDraft()} loading={busyFeatureId === featureDraft.id}>Save</Button> : null}
                 <Button
                   size="xs"

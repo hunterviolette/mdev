@@ -712,7 +712,6 @@ fn normalize_runtime_planner(global_state: &mut Value) {
         return;
     };
 
-    planner.remove("selected_feature");
     planner.remove("feature_plan_items");
     planner.remove("selected_feature_ids");
     planner.remove("enabled");

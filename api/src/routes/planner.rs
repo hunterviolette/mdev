@@ -80,6 +80,41 @@ pub struct RefinePlannerFeatureResponse {
     pub reused: bool,
 }
 
+async fn attach_planner_selection_to_workflow_run(
+    state: &AppState,
+    workflow_run_id: Uuid,
+    planner: &PlannerWorkspace,
+    feature: &FeaturePlanItem,
+) -> anyhow::Result<()> {
+    let mut run = crate::engine::load_run(state, workflow_run_id).await?;
+    let root = crate::engine::ensure_engine_root(&mut run.context);
+    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    if !global_state.is_object() {
+        *global_state = json!({});
+    }
+    let global_obj = global_state.as_object_mut().expect("global_state must be object");
+    let capabilities = global_obj.entry("capabilities".to_string()).or_insert_with(|| json!({}));
+    if !capabilities.is_object() {
+        *capabilities = json!({});
+    }
+    let capabilities_obj = capabilities.as_object_mut().expect("capabilities must be object");
+    let planner_state = capabilities_obj.entry("planner".to_string()).or_insert_with(|| json!({}));
+    if !planner_state.is_object() {
+        *planner_state = json!({});
+    }
+    let planner_obj = planner_state.as_object_mut().expect("planner state must be object");
+    planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
+    planner_obj.insert("selected_feature_id".to_string(), Value::String(feature.id.clone()));
+    planner_obj.insert("selected_feature".to_string(), serde_json::to_value(feature)?);
+    planner_obj.insert("planner_id".to_string(), Value::String(planner.id.clone()));
+    planner_obj.insert("planner_workspace_id".to_string(), Value::String(planner.id.clone()));
+    planner_obj.insert("planner_title".to_string(), Value::String(planner.title.clone()));
+    planner_obj.insert("schema_id".to_string(), Value::String("supervisor_feature_plan_item_v1".to_string()));
+    planner_obj.insert("preserve_rough_definition".to_string(), Value::Bool(true));
+    crate::engine::persist_context(state, workflow_run_id, &run.context).await?;
+    Ok(())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/planners", get(list_planners).post(create_planner))
@@ -463,6 +498,8 @@ async fn refine_planner_feature(
             }
         }),
     ).await.map_err(internal)?;
+
+    attach_planner_selection_to_workflow_run(&state, workflow_run_id, &planner, &feature).await.map_err(internal)?;
 
     if let Some(supervisor_id) = req.supervisor_id {
         let now = Utc::now().to_rfc3339();
