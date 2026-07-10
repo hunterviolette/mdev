@@ -185,7 +185,12 @@ pub fn prepare_inference_stage_state_with_hooks(
             .remove("changeset_schema");
     }
 
-    let include_planner_schema = planner::planner_schema_enabled(global_state, step);
+    let include_planner_schema = shared_inference_primitive_enabled(
+        global_state,
+        step,
+        "planner_schema",
+        false,
+    ) && planner::planner_schema_enabled(global_state, step);
 
     let planner_schema_fragment = if include_planner_schema {
         planner::schema::PLANNER_SCHEMA_PROMPT_FRAGMENT.to_string()

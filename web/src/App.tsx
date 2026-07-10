@@ -15,10 +15,7 @@ function shortRouteId(value: string | null): string {
 
 function routeTitle(route: AppRoute): string {
   if (route.workflowRunId) return 'Workflow';
-  if (route.supervisorRunId && route.supervisorView === 'planner') return `Supervisor planner ${shortRouteId(route.supervisorRunId)}`;
-  if (route.supervisorRunId && route.supervisorView === 'sprint') return `Supervisor sprint ${shortRouteId(route.supervisorRunId)}`;
-  if (route.path === '/flight-deck') return 'Flight Deck';
-  if (route.path === '/supervisors') return 'Supervisor list';
+  if (route.path === '/flight-deck' || route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Flight Deck';
   if (route.path === '/workflows' || route.path === '/') return 'Workflow list';
   return 'Workflow Web';
 }

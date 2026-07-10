@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, review_validation, sap};
+use super::{binding_specs, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, review_validation, sap};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -389,23 +389,21 @@ fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation>
 }
 
 fn supervisor_planner_item_auto_apply_enabled(ctx: &CapabilityContext<'_>) -> bool {
-    let planner = ctx
-        .local_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"));
+    if !binding_specs::stage_supports_shared_capability(ctx.step, "planner_apply") {
+        return false;
+    }
 
-    let has_selected_feature_id = planner
+    if !binding_specs::shared_capability_enabled(ctx.local_state, "planner_apply", false) {
+        return false;
+    }
+
+    ctx.local_state
+        .get("capabilities")
+        .and_then(|value| value.get("planner"))
         .and_then(|value| value.get("selected_feature_id"))
         .and_then(serde_json::Value::as_str)
         .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-
-    let auto_apply_enabled = planner
-        .and_then(|value| value.get("auto_apply_armed"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    has_selected_feature_id && auto_apply_enabled
+        .unwrap_or(false)
 }
 
 async fn dispatch(

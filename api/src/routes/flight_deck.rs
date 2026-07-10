@@ -257,12 +257,16 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
             unit.patch_id.is_some() && (unit.state == "patch_ready" || unit.state == "ready_for_integration")
         }).count();
         let integration_state_value = integration_state(&supervisor.status);
+        let integration_workflow_run_id = work_units
+            .iter()
+            .find(|unit| unit.kind == "integration")
+            .and_then(|unit| unit.workflow_run_id.clone());
         let integration = json!({
             "state": integration_state_value,
-            "workflow_run_id": supervisor.integration_run_id,
+            "workflow_run_id": integration_workflow_run_id,
             "pending_patch_count": pending_patch_count,
-            "merge_summary": summary_field(&supervisor.merge_report),
-            "validation_summary": summary_field(&supervisor.validation_report)
+            "merge_summary": null,
+            "validation_summary": null
         });
 
         totals.supervisors += 1;
@@ -308,8 +312,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
 async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::Result<Vec<SupervisorRow>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, mode, status, title, root_repo_path, snapshot_path, integration_path, integration_run_id,
-               merge_report_json, validation_report_json, context_json, created_at, updated_at
+        SELECT id, mode, status, title, root_repo_path, context_json, created_at, updated_at
         FROM supervisor_runs
         ORDER BY updated_at DESC
         "#,
@@ -333,11 +336,11 @@ async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::
             status: row.get("status"),
             title: row.get("title"),
             root_repo_path,
-            snapshot_path: row.get("snapshot_path"),
-            integration_path: row.get("integration_path"),
-            integration_run_id: row.get("integration_run_id"),
-            merge_report: parse_json(row.get::<String, _>("merge_report_json")),
-            validation_report: parse_json(row.get::<String, _>("validation_report_json")),
+            snapshot_path: None,
+            integration_path: None,
+            integration_run_id: None,
+            merge_report: json!({}),
+            validation_report: json!({}),
             context: parse_json(row.get::<String, _>("context_json")),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -605,8 +608,12 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
     let mut seeds = Vec::new();
     for row in rows {
         let workflow_run_id: Option<String> = row.get("workflow_run_id");
+        let kind_text: String = row.get("kind");
         let workflow_exists = row.get::<i64, _>("workflow_exists") == 1;
         let state_text: String = if workflow_exists { row.get("state") } else { "deleted".to_string() };
+        if kind_text == "integration" && workflow_run_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
+            continue;
+        }
         if workflow_run_id.is_some() && !workflow_exists && !include_deleted {
             continue;
         }
@@ -620,7 +627,7 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
             feature_id: row.get("feature_id"),
             workflow_run_id,
             patch_id: row.get("patch_id"),
-            kind: row.get("kind"),
+            kind: kind_text,
             workflow_type: row.get("workflow_type"),
             title: row.get("title"),
             state: state_text,
@@ -848,6 +855,14 @@ fn enrich_projection_context_telemetry(mut telemetry: Value, context: &Value) ->
             let skipped = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
             obj.insert("integration_skipped".to_string(), Value::Bool(skipped));
         }
+        if let Some(value) = context.get("integration_input") {
+            let integration_input = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
+            obj.insert("integration_input".to_string(), Value::Bool(integration_input));
+        }
+        if let Some(value) = context.get("staged_to_integration") {
+            let staged = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
+            obj.insert("staged_to_integration".to_string(), Value::Bool(staged));
+        }
     }
     telemetry
 }
@@ -861,17 +876,19 @@ fn context_string(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn pool_template_ref(value: &Value) -> Option<String> {
+    ["template_id", "workflow_template_id", "template"]
+        .iter()
+        .find_map(|key| context_string(value, key))
+}
+
 fn supervisor_pool_template_id(supervisor: &SupervisorRow, pool_key: &str, direct_key: &str) -> Option<String> {
     supervisor
         .context
         .get("flight_deck_settings")
         .and_then(|value| value.get("pools"))
         .and_then(|value| value.get(pool_key))
-        .and_then(|value| value.get("template_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .and_then(pool_template_ref)
         .or_else(|| context_string(&supervisor.context, direct_key))
 }
 
@@ -895,7 +912,8 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
         }));
     };
 
-    let row = sqlx::query("SELECT name, definition_json FROM workflow_templates WHERE id = ?")
+    let row = sqlx::query("SELECT name, definition_json FROM workflow_templates WHERE id = ? OR name = ? LIMIT 1")
+        .bind(template_id.as_str())
         .bind(template_id.as_str())
         .fetch_optional(&state.db)
         .await?;
@@ -1012,15 +1030,23 @@ fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit])
 
 fn flight_deck_work_unit_state(seed: &WorkUnitSeed) -> String {
     let workflow_status = seed.workflow_status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    if seed.kind == "manual_shard" {
+        return match workflow_status.as_str() {
+            "waiting" | "waiting_user" | "paused" => "waiting_user".to_string(),
+            "running" => "running".to_string(),
+            "failed" | "error" => "failed".to_string(),
+            "cancelled" | "canceled" => "cancelled".to_string(),
+            _ => seed.state.clone(),
+        };
+    }
+
     match workflow_status.as_str() {
         "waiting" | "waiting_user" | "paused" => "waiting_user".to_string(),
         "running" => "running".to_string(),
         "failed" | "error" => "failed".to_string(),
         "cancelled" | "canceled" => "cancelled".to_string(),
         "completed" | "complete" | "success" => {
-            if seed.kind == "manual_shard" && seed.state == "ready_for_integration" {
-                "ready_for_integration".to_string()
-            } else if seed.kind == "integration" {
+            if seed.kind == "integration" {
                 "integrated".to_string()
             } else if seed.state == "patch_ready" || seed.state == "ready_for_integration" {
                 seed.state.clone()

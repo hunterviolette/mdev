@@ -93,9 +93,63 @@ pub struct EnsureSupervisorPlannerResponse {
     pub supervisor_run: SupervisorRun,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorWorkPoolKind {
+    Refine,
+    FeatureDevelopment,
+    ManualShard,
+    Integration,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorActionRequest {
-    pub action: String,
+pub struct CreateSupervisorWorkUnitRequest {
+    pub pool_kind: SupervisorWorkPoolKind,
+    pub name: String,
     #[serde(default)]
-    pub payload: Value,
+    pub feature_id: Option<String>,
+    #[serde(default)]
+    pub template_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SupervisorActionRequest {
+    CreateWorkUnit(CreateSupervisorWorkUnitRequest),
+    DeleteWorkUnit { work_unit_id: String },
+    RegenerateWorkUnit { work_unit_id: String },
+    StartWorkUnit { work_unit_id: String },
+    PauseWorkUnit { work_unit_id: String },
+    StageWorkUnit { work_unit_id: String, #[serde(default = "default_stage_work_unit")] staged: bool },
+    UpdateFlightDeckSettings { flight_deck_settings: Value },
+    PauseFeaturePool,
+    ResumeFeaturePool,
+    SkipIntegrationInput { work_unit_id: String },
+    UnskipIntegrationInput { work_unit_id: String },
+    ApplyIntegration,
+    Cancel,
+}
+
+fn default_stage_work_unit() -> bool {
+    true
+}
+
+impl SupervisorActionRequest {
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            Self::CreateWorkUnit(_) => "create_work_unit",
+            Self::DeleteWorkUnit { .. } => "delete_work_unit",
+            Self::RegenerateWorkUnit { .. } => "regenerate_work_unit",
+            Self::StartWorkUnit { .. } => "start_work_unit",
+            Self::PauseWorkUnit { .. } => "pause_work_unit",
+            Self::StageWorkUnit { .. } => "stage_work_unit",
+            Self::UpdateFlightDeckSettings { .. } => "update_flight_deck_settings",
+            Self::PauseFeaturePool => "pause_feature_pool",
+            Self::ResumeFeaturePool => "resume_feature_pool",
+            Self::SkipIntegrationInput { .. } => "skip_integration_input",
+            Self::UnskipIntegrationInput { .. } => "unskip_integration_input",
+            Self::ApplyIntegration => "apply_integration",
+            Self::Cancel => "cancel",
+        }
+    }
 }

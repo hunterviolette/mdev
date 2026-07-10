@@ -1347,7 +1347,7 @@ async fn build_runtime_snapshot(
 
     let supervisor_rows = if let Some(supervisor_run_id) = query.supervisor_run_id {
         sqlx::query(
-            "SELECT id, mode, status, title, root_repo_path, child_runs_json, integration_run_id, context_json, updated_at FROM supervisor_runs WHERE id = ?",
+            "SELECT id, mode, status, title, root_repo_path, context_json, updated_at FROM supervisor_runs WHERE id = ?",
         )
         .bind(supervisor_run_id.to_string())
         .fetch_all(&state.db)
@@ -1357,7 +1357,7 @@ async fn build_runtime_snapshot(
         Vec::new()
     } else {
         sqlx::query(
-            "SELECT id, mode, status, title, root_repo_path, child_runs_json, integration_run_id, context_json, updated_at FROM supervisor_runs ORDER BY updated_at DESC LIMIT 500",
+            "SELECT id, mode, status, title, root_repo_path, context_json, updated_at FROM supervisor_runs ORDER BY updated_at DESC LIMIT 500",
         )
         .fetch_all(&state.db)
         .await
@@ -1367,8 +1367,6 @@ async fn build_runtime_snapshot(
     for row in supervisor_rows {
         let id: String = row.get("id");
         let supervisor_key = supervisor_node_key(&id);
-        let child_runs_json: String = row.get("child_runs_json");
-        let child_runs = serde_json::from_str::<Value>(&child_runs_json).unwrap_or_else(|_| json!([]));
         let context_json: String = row.get("context_json");
         let context = serde_json::from_str::<Value>(&context_json).unwrap_or_else(|_| json!({}));
         nodes.push(RuntimeNode {
@@ -1387,39 +1385,38 @@ async fn build_runtime_snapshot(
             }),
         });
 
-        if let Some(children) = child_runs.as_array() {
-            for (idx, child) in children.iter().enumerate() {
-                let Some(child_run_id) = child.get("workflow_run_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let child_key = workflow_node_key(child_run_id);
-                edges.push(RuntimeEdge {
-                    key: format!("{}->{}", supervisor_key, child_key),
-                    parent_key: supervisor_key.clone(),
-                    child_key,
-                    edge_type: "supervisor_child_workflow".to_string(),
-                    label: child
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Feature workflow")
-                        .to_string(),
-                    sort_order: idx as i64,
-                    payload: child.clone(),
-                });
-            }
-        }
+        let child_rows = sqlx::query(
+            r#"
+            SELECT id, title, workflow_run_id, kind, queue_position, updated_at
+            FROM supervisor_work_units
+            WHERE supervisor_run_id = ?
+              AND workflow_run_id IS NOT NULL
+              AND TRIM(COALESCE(workflow_run_id, '')) != ''
+              AND archived_at IS NULL
+              AND state NOT IN ('deleted', 'archived')
+            ORDER BY CASE kind WHEN 'integration' THEN 10000 ELSE COALESCE(queue_position, 0) END, updated_at ASC
+            "#,
+        )
+        .bind(&id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
 
-        let integration_run_id: Option<String> = row.get("integration_run_id");
-        if let Some(integration_run_id) = integration_run_id {
-            let child_key = workflow_node_key(&integration_run_id);
+        for (idx, child) in child_rows.iter().enumerate() {
+            let child_run_id: String = child.get("workflow_run_id");
+            let child_key = workflow_node_key(&child_run_id);
+            let kind: String = child.get("kind");
             edges.push(RuntimeEdge {
                 key: format!("{}->{}", supervisor_key, child_key),
                 parent_key: supervisor_key.clone(),
                 child_key,
-                edge_type: "supervisor_integration_workflow".to_string(),
-                label: "Integration workflow".to_string(),
-                sort_order: 10_000,
-                payload: json!({}),
+                edge_type: if kind == "integration" { "supervisor_integration_workflow".to_string() } else { "supervisor_child_workflow".to_string() },
+                label: child.try_get::<String, _>("title").unwrap_or_else(|_| if kind == "integration" { "Integration workflow".to_string() } else { "Feature workflow".to_string() }),
+                sort_order: child.try_get::<Option<i64>, _>("queue_position").ok().flatten().unwrap_or(idx as i64),
+                payload: json!({
+                    "work_unit_id": child.try_get::<String, _>("id").ok(),
+                    "kind": kind,
+                }),
             });
         }
     }

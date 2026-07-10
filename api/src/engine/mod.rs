@@ -123,6 +123,20 @@ async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut Workf
 
     normalize_inference_arm_state(run);
 
+    let selected_step = run
+        .current_step_id
+        .as_deref()
+        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id));
+    let should_rearm_repo_context = selected_step
+        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context"))
+        .unwrap_or(false);
+    let should_rearm_changeset_schema = selected_step
+        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema"))
+        .unwrap_or(false);
+    let should_rearm_planner_fragment = selected_step
+        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment"))
+        .unwrap_or(false);
+
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
     let global_state_obj = global_state
@@ -178,6 +192,26 @@ async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut Workf
         changed = true;
     }
 
+    if should_rearm_repo_context {
+        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+        changed = true;
+    }
+    if should_rearm_changeset_schema {
+        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+        changed = true;
+    }
+    let _ = inference_obj;
+
+    if should_rearm_planner_fragment {
+        let planner = capabilities_obj
+            .entry("planner".to_string())
+            .or_insert_with(|| json!({}));
+        let planner_obj = planner
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("planner capability state must be object"))?;
+        planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
+        changed = true;
+    }
     if changed {
         persist_context(state, run.id, &run.context).await?;
     }
@@ -274,24 +308,37 @@ pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<
         .entry("capabilities".to_string())
         .or_insert_with(|| json!({}));
     let capabilities_obj = ensure_value_object(capabilities);
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = ensure_value_object(inference);
 
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context")
-        && !inference_obj.contains_key("repo_context_armed")
     {
-        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+
+        if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context")
+            && !inference_obj.contains_key("repo_context_armed")
+        {
+            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
+        }
+
+        if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema")
+            && !inference_obj.contains_key("changeset_schema_armed")
+        {
+            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+        }
+
+        inference_obj.remove("shared_inference_state");
     }
 
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema")
-        && !inference_obj.contains_key("changeset_schema_armed")
-    {
-        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
+    if capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment") {
+        let planner = capabilities_obj
+            .entry("planner".to_string())
+            .or_insert_with(|| json!({}));
+        let planner_obj = ensure_value_object(planner);
+        if !planner_obj.contains_key("fragment_armed") {
+            planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
+        }
     }
-
-    inference_obj.remove("shared_inference_state");
 }
 
 pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {

@@ -120,8 +120,278 @@ export type PlannerImportApplyResponse = {
     skipped: number;
     rejected: number;
   };
-  supervisor_run: SupervisorRun;
+  planner?: unknown;
+  supervisor_run?: SupervisorRun;
 };
+
+function importFeatureId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function importString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function importStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => importString(item)).filter(Boolean);
+}
+
+function importStatus(value: unknown): FeaturePlanItemStatus {
+  const status = importString(value);
+  if (status === 'fine' || status === 'refined' || status === 'approved') return 'fine';
+  if (status === 'scheduled') return 'scheduled';
+  if (status === 'applied') return 'applied';
+  if (status === 'completed') return 'completed';
+  return 'rough';
+}
+
+function importedFeatureValues(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === 'object' && Array.isArray((payload as { features?: unknown[] }).features)) return (payload as { features: unknown[] }).features;
+  throw new Error('planner import must be a JSON feature array or an object with a features array');
+}
+
+function normalizeImportedFeature(value: unknown, index: number): FeaturePlanItem {
+  if (!value || typeof value !== 'object') throw new Error(`feature import item ${index + 1} must be an object`);
+  const item = value as Record<string, unknown>;
+  const title = importString(item.title);
+  if (!title) throw new Error('missing required title');
+  const status = importStatus(item.status);
+  const summary = importString(item.summary);
+  const roughSummary = importString(item.rough_summary) || (status === 'rough' ? summary : '');
+  return {
+    id: importString(item.id) || importFeatureId(),
+    title,
+    status,
+    summary,
+    rough_summary: roughSummary || null,
+    refinement_workflow_run_id: importString(item.refinement_workflow_run_id) || null,
+    applied_sprint_id: importString(item.applied_sprint_id) || null,
+    applied_sprint_title: importString(item.applied_sprint_title) || null,
+    applied_at: importString(item.applied_at) || null,
+    requirements: importStringArray(item.requirements),
+    acceptance_criteria: importStringArray(item.acceptance_criteria),
+    implementation_notes: importStringArray(item.implementation_notes),
+    review_expectations: importStringArray(item.review_expectations),
+    target_files_or_areas: importStringArray(item.target_files_or_areas),
+    dependencies: []
+  };
+}
+
+function normalizedImportText(value: string): string {
+  return value.split(/\s+/).filter(Boolean).join(' ').toLowerCase();
+}
+
+function importTitleKey(feature: FeaturePlanItem): string {
+  return normalizedImportText(feature.title);
+}
+
+function importContentFingerprint(feature: FeaturePlanItem): string {
+  return JSON.stringify({
+    title: normalizedImportText(feature.title),
+    summary: normalizedImportText(feature.summary),
+    requirements: feature.requirements.map(normalizedImportText),
+    acceptance_criteria: feature.acceptance_criteria.map(normalizedImportText),
+    implementation_notes: feature.implementation_notes.map(normalizedImportText),
+    review_expectations: feature.review_expectations.map(normalizedImportText),
+    target_files_or_areas: feature.target_files_or_areas.map(normalizedImportText)
+  });
+}
+
+function plannerImportSummary(items: PlannerImportPreviewItem[]): PlannerImportPreviewResponse['summary'] {
+  return {
+    total: items.length,
+    accepted: items.filter((item) => item.status === 'accepted').length,
+    duplicates: items.filter((item) => item.status === 'duplicate').length,
+    conflicts: items.filter((item) => item.status === 'conflict').length,
+    invalid: items.filter((item) => item.status === 'invalid').length
+  };
+}
+
+async function fetchPlannerImportWorkspace(plannerId: string): Promise<{ id: string; features: FeaturePlanItem[] }> {
+  const response = await fetch(`/api/planners/${encodeURIComponent(plannerId)}`);
+  if (!response.ok) throw new Error(await response.text());
+  const planner = await response.json() as { id: string; features?: FeaturePlanItem[] };
+  return {
+    id: planner.id,
+    features: Array.isArray(planner.features) ? planner.features : []
+  };
+}
+
+function buildPlannerImportPreview(existingFeatures: FeaturePlanItem[], payload: unknown): PlannerImportPreviewResponse {
+  const existingById = new Map(existingFeatures.map((item) => [item.id, item]));
+  const existingByTitle = new Map<string, FeaturePlanItem>();
+  for (const feature of existingFeatures) {
+    const key = importTitleKey(feature);
+    if (key && !existingByTitle.has(key)) existingByTitle.set(key, feature);
+  }
+
+  const seenImportIds = new Set<string>();
+  const seenImportTitles = new Set<string>();
+  const items: PlannerImportPreviewItem[] = [];
+
+  for (const [index, raw] of importedFeatureValues(payload).entries()) {
+    let feature: FeaturePlanItem;
+    try {
+      feature = normalizeImportedFeature(raw, index);
+    } catch (err) {
+      items.push({
+        import_index: index,
+        status: 'invalid',
+        default_action: 'reject',
+        reason: err instanceof Error ? err.message : String(err),
+        raw
+      });
+      continue;
+    }
+
+    const titleKey = importTitleKey(feature);
+    const contentFingerprint = importContentFingerprint(feature);
+
+    if (!seenImportIds.has(feature.id)) {
+      seenImportIds.add(feature.id);
+    } else {
+      items.push({
+        import_index: index,
+        status: 'invalid',
+        default_action: 'reject',
+        reason: 'duplicate feature id inside uploaded file',
+        feature,
+        content_fingerprint: contentFingerprint
+      });
+      continue;
+    }
+
+    if (titleKey) {
+      if (seenImportTitles.has(titleKey)) {
+        items.push({
+          import_index: index,
+          status: 'invalid',
+          default_action: 'reject',
+          reason: 'duplicate feature title inside uploaded file',
+          feature,
+          content_fingerprint: contentFingerprint
+        });
+        continue;
+      }
+      seenImportTitles.add(titleKey);
+    }
+
+    const existingByFeatureId = existingById.get(feature.id);
+    const existingByFeatureTitle = titleKey ? existingByTitle.get(titleKey) : undefined;
+    const existing = existingByFeatureId ?? existingByFeatureTitle;
+
+    if (existing) {
+      const duplicate = importContentFingerprint(existing) === contentFingerprint;
+      items.push({
+        import_index: index,
+        status: duplicate ? 'duplicate' : 'conflict',
+        default_action: 'skip',
+        reason: duplicate ? 'feature already exists' : 'feature matches an existing edited feature with different content',
+        existing_feature_id: existing.id,
+        existing_title: existing.title,
+        feature,
+        content_fingerprint: contentFingerprint
+      });
+      continue;
+    }
+
+    items.push({
+      import_index: index,
+      status: 'accepted',
+      default_action: 'create',
+      reason: 'new feature',
+      feature,
+      content_fingerprint: contentFingerprint
+    });
+  }
+
+  return {
+    ok: true,
+    summary: plannerImportSummary(items),
+    items
+  };
+}
+
+export async function previewPlannerImport(plannerId: string, payload: unknown): Promise<PlannerImportPreviewResponse> {
+  const planner = await fetchPlannerImportWorkspace(plannerId);
+  return buildPlannerImportPreview(planner.features, payload);
+}
+
+export async function applyPlannerImport(plannerId: string, payload: unknown, decisions: PlannerImportDecision[]): Promise<PlannerImportApplyResponse> {
+  const planner = await fetchPlannerImportWorkspace(plannerId);
+  const preview = buildPlannerImportPreview(planner.features, payload);
+  const decisionByIndex = new Map(decisions.map((item) => [item.import_index, item]));
+  const nextFeatures = [...planner.features];
+  const created: PlannerImportPreviewItem[] = [];
+  const replaced: PlannerImportPreviewItem[] = [];
+  const skipped: PlannerImportPreviewItem[] = [];
+  const rejected: PlannerImportPreviewItem[] = [];
+
+  for (const item of preview.items) {
+    const decision = decisionByIndex.get(item.import_index);
+    const action = decision?.action ?? item.default_action;
+    const feature = item.feature;
+
+    if (!feature) {
+      rejected.push(item);
+      continue;
+    }
+
+    if (action === 'create' && item.status === 'accepted') {
+      nextFeatures.push(feature);
+      created.push(item);
+      continue;
+    }
+
+    if (action === 'create_copy' && (item.status === 'accepted' || item.status === 'duplicate' || item.status === 'conflict')) {
+      nextFeatures.push({ ...feature, id: importFeatureId() });
+      created.push(item);
+      continue;
+    }
+
+    if (action === 'replace_existing' && item.status === 'conflict') {
+      const existingFeatureId = decision?.existing_feature_id ?? item.existing_feature_id ?? null;
+      const existingIndex = existingFeatureId ? nextFeatures.findIndex((existing) => existing.id === existingFeatureId) : -1;
+      if (existingIndex >= 0 && existingFeatureId) {
+        nextFeatures[existingIndex] = { ...feature, id: existingFeatureId };
+        replaced.push(item);
+      } else {
+        rejected.push({ ...item, reason: `existing feature ${existingFeatureId ?? ''} is missing` });
+      }
+      continue;
+    }
+
+    if (action === 'skip') {
+      skipped.push(item);
+      continue;
+    }
+
+    rejected.push(item);
+  }
+
+  const response = await fetch(`/api/planners/${encodeURIComponent(plannerId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ features: nextFeatures })
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const updatedPlanner = await response.json();
+
+  return {
+    ok: true,
+    summary: {
+      created: created.length,
+      replaced: replaced.length,
+      skipped: skipped.length,
+      rejected: rejected.length
+    },
+    planner: updatedPlanner
+  };
+}
+
 
 function canonicalFeatureStatus(status: FeaturePlanItemStatus): FeaturePlanItemStatus {
   if (status === 'refined' || status === 'approved') return 'fine';
@@ -177,13 +447,6 @@ function serializeCreateSupervisorRunRequest(request: CreateSupervisorRunRequest
   };
 }
 
-export async function listSupervisorRuns(): Promise<SupervisorRun[]> {
-  const response = await fetch('/api/supervisor-runs');
-  if (!response.ok) throw new Error(await response.text());
-  const runs = await response.json();
-  return runs.map(normalizeSupervisorRun);
-}
-
 export async function createSupervisorRun(request: CreateSupervisorRunRequest): Promise<SupervisorRun> {
   const response = await fetch('/api/supervisor-runs', {
     method: 'POST',
@@ -194,20 +457,15 @@ export async function createSupervisorRun(request: CreateSupervisorRunRequest): 
   return normalizeSupervisorRun(await response.json());
 }
 
-function supervisorRouteIsActive(): boolean {
-  if (typeof window === 'undefined') return true;
-  const path = window.location.pathname;
-  return path === '/supervisors' || path.startsWith('/supervisors/');
-}
-
-export async function getSupervisorRun(id: string): Promise<SupervisorRun> {
-  if (!supervisorRouteIsActive()) {
-    throw new Error(`Refusing stale supervisor run fetch outside supervisor route: ${id}`);
-  }
-  const response = await fetch(`/api/supervisor-runs/${id}`);
-  if (!response.ok) throw new Error(await response.text());
-  return normalizeSupervisorRun(await response.json());
-}
+export type SupervisorQueuePlanner = {
+  id: string;
+  root_repo_path: string;
+  title: string;
+  is_default: boolean;
+  feature_count?: number;
+  created_at?: string;
+  updated_at?: string;
+};
 
 export type SupervisorQueuedFeature = {
   feature_id: string;
@@ -232,14 +490,11 @@ export type SupervisorQueueItem = {
   locked_by_other: boolean;
   lock_owner_supervisor_run_id?: string | null;
   disabled_reason?: string | null;
-  current_sprint_id?: string | null;
   current_workflow_run_id?: string | null;
   current_patch_id?: string | null;
   development_state?: string | null;
-  scheduled_at?: string | null;
-  development_started_at?: string | null;
-  development_completed_at?: string | null;
-  integration_completed_at?: string | null;
+  locked_at?: string | null;
+  completed_at?: string | null;
   applied_at?: string | null;
 };
 
@@ -247,6 +502,8 @@ export type SupervisorQueueProjection = {
   ok: boolean;
   supervisor_run_id: string;
   root_repo_path: string;
+  current_planner_id?: string | null;
+  planners?: SupervisorQueuePlanner[];
   queued_features: SupervisorQueuedFeature[];
   feature_ids: string[];
   items: SupervisorQueueItem[];
@@ -413,31 +670,8 @@ export async function deleteSupervisorRun(id: string): Promise<{ ok: boolean }> 
   return response.json();
 }
 
-export async function updateSupervisorPlan(
-  id: string,
-  plannerLogItems: FeaturePlanItem[],
-  sprintItems: ExecutionPlanItem[],
-  sprintConfig: {
-    sprint_strategy: SupervisorExecutionStrategy;
-    workflow_template_id?: string | null;
-    integration_template_id?: string | null;
-    planner_refinement_template_id?: string | null;
-    feature_concurrency?: number | null;
-    integration_policy?: 'auto' | 'manual' | null;
-  }
-): Promise<Record<string, unknown>> {
-  return runSupervisorAction(id, 'update_plan', {
-    planner_log_items: plannerLogItems.map(serializeFeatureForApi),
-    sprint_items: sprintItems,
-    ...sprintConfig
-  });
-}
-
-export async function getSupervisorQueue(id: string, plannerId?: string | null): Promise<SupervisorQueueProjection> {
-  const params = new URLSearchParams();
-  if (plannerId) params.set('planner_id', plannerId);
-  const query = params.toString();
-  const response = await fetch(`/api/supervisor-runs/${id}/queue${query ? `?${query}` : ''}`);
+export async function getSupervisorQueue(id: string): Promise<SupervisorQueueProjection> {
+  const response = await fetch(`/api/supervisor-runs/${id}/queue`);
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -452,6 +686,7 @@ export async function setSupervisorQueue(
     integration_policy?: 'auto' | 'manual' | null;
     auto_start?: boolean;
     planner_id?: string | null;
+    selected_planner_id?: string | null;
   } = {}
 ): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
   const response = await fetch(`/api/supervisor-runs/${id}/queue`, {
@@ -469,87 +704,28 @@ export async function setSupervisorQueue(
     supervisor_run: normalizeSupervisorRun(payload.supervisor_run as SupervisorRun)
   } as { ok: boolean; supervisor_run: SupervisorRun };
 }
+export type SupervisorWorkPoolKind = 'refine' | 'feature_development' | 'manual_shard' | 'integration';
 
-export async function selectSupervisorFeaturePool(
-  id: string,
-  queuedFeatures: SupervisorQueuedFeature[],
-  config: {
-    workflow_template_id?: string | null;
-    integration_template_id?: string | null;
-    feature_concurrency?: number | null;
-    integration_policy?: 'auto' | 'manual' | null;
-    auto_start?: boolean;
-    planner_id?: string | null;
-  } = {}
-): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
-  return setSupervisorQueue(id, queuedFeatures, config);
-}
+export type SupervisorActionRequest =
+  | { action: 'create_work_unit'; pool_kind: SupervisorWorkPoolKind; name: string; feature_id?: string | null; template_id?: string | null }
+  | { action: 'delete_work_unit'; work_unit_id: string }
+  | { action: 'regenerate_work_unit'; work_unit_id: string }
+  | { action: 'start_work_unit'; work_unit_id: string }
+  | { action: 'pause_work_unit'; work_unit_id: string }
+  | { action: 'stage_work_unit'; work_unit_id: string; staged?: boolean }
+  | { action: 'update_flight_deck_settings'; flight_deck_settings: Record<string, unknown> }
+  | { action: 'pause_feature_pool' }
+  | { action: 'resume_feature_pool' }
+  | { action: 'skip_integration_input'; work_unit_id: string }
+  | { action: 'unskip_integration_input'; work_unit_id: string }
+  | { action: 'apply_integration' }
+  | { action: 'cancel' };
 
-export async function previewPlannerImport(id: string, payload: unknown): Promise<PlannerImportPreviewResponse> {
-  return runSupervisorAction(id, 'preview_planner_import', payload as Record<string, unknown>) as Promise<PlannerImportPreviewResponse>;
-}
-
-export async function applyPlannerImport(id: string, payload: unknown, decisions: PlannerImportDecision[]): Promise<PlannerImportApplyResponse> {
-  const response = await runSupervisorAction(id, 'apply_planner_import', {
-    import: payload,
-    decisions
-  });
-  return {
-    ...response,
-    supervisor_run: normalizeSupervisorRun(response.supervisor_run as SupervisorRun)
-  } as PlannerImportApplyResponse;
-}
-
-export type RefineSupervisorFeatureResponse = {
-  ok: boolean;
-  workflow_run_id: string;
-};
-
-export type UnscheduleSupervisorFeatureMode = 'preserve_development' | 'delete_development';
-
-export type UnscheduleSupervisorFeatureResponse = {
-  ok: boolean;
-  supervisor_run: SupervisorRun;
-};
-
-export async function regenerateSupervisorQueueFeature(id: string, featureId: string): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
-  const response = await fetch(`/api/supervisor-runs/${id}/queue/${encodeURIComponent(featureId)}/regenerate`, {
-    method: 'POST'
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const body = await response.json();
-  return {
-    ...body,
-    supervisor_run: normalizeSupervisorRun(body.supervisor_run as SupervisorRun)
-  } as { ok: boolean; supervisor_run: SupervisorRun };
-}
-
-export async function unscheduleSupervisorFeature(id: string, featureId: string, mode: UnscheduleSupervisorFeatureMode): Promise<UnscheduleSupervisorFeatureResponse> {
-  const params = new URLSearchParams();
-  params.set('mode', mode);
-  const response = await fetch(`/api/supervisor-runs/${id}/queue/${encodeURIComponent(featureId)}?${params.toString()}`, {
-    method: 'DELETE'
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const body = await response.json();
-  return {
-    ...body,
-    supervisor_run: normalizeSupervisorRun(body.supervisor_run as SupervisorRun)
-  } as UnscheduleSupervisorFeatureResponse;
-}
-
-export async function refineSupervisorFeature(id: string, featureId: string, workflowTemplateId?: string | null): Promise<RefineSupervisorFeatureResponse> {
-  return runSupervisorAction(id, 'refine_feature', {
-    feature_id: featureId,
-    workflow_template_id: workflowTemplateId ?? null
-  }) as Promise<RefineSupervisorFeatureResponse>;
-}
-
-export async function runSupervisorAction(id: string, action: 'start' | 'tick' | 'apply' | 'cancel' | 'start_integration' | 'restart_integration' | 'restart_sprint' | 'reopen_development' | 'new_sprint' | 'update_plan' | 'update_flight_deck_settings' | 'preview_planner_import' | 'apply_planner_import' | 'refine_feature' | 'start_child_workflow' | 'pause_child_workflow' | 'pause_feature_pool' | 'resume_feature_pool' | 'remove_child_workflow' | 'create_manual_shard' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'skip_integration_input' | 'unskip_integration_input', payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+export async function runSupervisorAction(id: string, request: SupervisorActionRequest): Promise<Record<string, unknown>> {
   const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action, payload })
+    body: JSON.stringify(request)
   });
   if (!response.ok) throw new Error(await response.text());
   const result = await response.json();

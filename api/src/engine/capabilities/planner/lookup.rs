@@ -62,11 +62,16 @@ async fn hydrate_existing_planner_selection(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let Some(supervisor_run_id) = supervisor_run_id else {
-        return Ok(());
+    let mut selected_feature = match supervisor_run_id.as_deref() {
+        Some(supervisor_run_id) => load_supervisor_feature_by_id(db, supervisor_run_id, &selected_feature_id).await?,
+        None => None,
     };
 
-    let Some(selected_feature) = load_supervisor_feature_by_id(db, &supervisor_run_id, &selected_feature_id).await? else {
+    if selected_feature.is_none() {
+        selected_feature = load_planner_feature_by_id(db, &selected_feature_id).await?;
+    }
+
+    let Some(selected_feature) = selected_feature else {
         return Ok(());
     };
 
@@ -82,13 +87,12 @@ async fn hydrate_existing_planner_selection(
     Ok(())
 }
 
-async fn load_supervisor_feature_by_id(
+async fn load_planner_feature_by_id(
     db: &SqlitePool,
-    supervisor_run_id: &str,
     selected_feature_id: &str,
 ) -> Result<Option<Value>> {
-    let row = sqlx::query("SELECT features_json FROM supervisor_runs WHERE id = ?")
-        .bind(supervisor_run_id)
+    let row = sqlx::query("SELECT id, title, status, payload_json FROM planner_features WHERE id = ? LIMIT 1")
+        .bind(selected_feature_id)
         .fetch_optional(db)
         .await?;
 
@@ -96,52 +100,38 @@ async fn load_supervisor_feature_by_id(
         return Ok(None);
     };
 
-    let features_json = row.get::<String, _>("features_json");
-    let value: Value = serde_json::from_str(&features_json)?;
-    let supervisor = value.get("supervisor").unwrap_or(&value);
-    let items = if supervisor.is_array() {
-        supervisor.as_array().cloned().unwrap_or_default()
-    } else {
-        supervisor
-            .get("feature_plan_items")
-            .and_then(Value::as_array)
-            .cloned()
-            .or_else(|| supervisor.get("features").and_then(Value::as_array).cloned())
-            .unwrap_or_default()
-    };
+    let id = row.get::<String, _>("id");
+    let title = row.get::<String, _>("title");
+    let status = row.get::<String, _>("status");
+    let payload_json = row.get::<String, _>("payload_json");
+    let mut item = serde_json::from_str::<Value>(&payload_json).unwrap_or_else(|_| json!({}));
 
-    Ok(items.into_iter().find(|item| {
-        item.get("id")
-            .and_then(Value::as_str)
-            .map(|id| id == selected_feature_id)
-            .unwrap_or(false)
-    }))
+    if !item.is_object() {
+        item = json!({});
+    }
+
+    let obj = item.as_object_mut().expect("planner feature payload must be object");
+    obj.insert("id".to_string(), Value::String(id));
+    obj.insert("title".to_string(), Value::String(title.clone()));
+    obj.entry("status".to_string()).or_insert_with(|| Value::String(status));
+    obj.entry("summary".to_string()).or_insert_with(|| Value::String(title));
+
+    Ok(Some(item))
+}
+
+async fn load_supervisor_feature_by_id(
+    _db: &SqlitePool,
+    _supervisor_run_id: &str,
+    _selected_feature_id: &str,
+) -> Result<Option<Value>> {
+    Ok(None)
 }
 
 async fn load_latest_supervisor_plan_from_db(
-    db: &SqlitePool,
-    repo_ref: &str,
+    _db: &SqlitePool,
+    _repo_ref: &str,
 ) -> Result<Option<Value>> {
-    let repo_ref = repo_ref.trim();
-    if repo_ref.is_empty() {
-        return Ok(None);
-    }
-
-    let row = sqlx::query(
-        "SELECT id, features_json FROM supervisor_runs WHERE root_repo_path = ? ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(repo_ref)
-    .fetch_optional(db)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let supervisor_run_id = row.get::<String, _>("id");
-    let features_json = row.get::<String, _>("features_json");
-    let value: Value = serde_json::from_str(&features_json)?;
-    Ok(supervisor_value_to_planner_state(&value, Some(supervisor_run_id)))
+    Ok(None)
 }
 
 fn load_repo_supervisor_planner_state(global_state: &Value, repo_ref: &str) -> Option<Value> {
@@ -266,12 +256,7 @@ fn supervisor_value_to_planner_state(value: &Value, supervisor_run_id: Option<St
         .or_else(|| items.first().cloned());
 
     let mut out = json!({
-        "fragment_armed": true,
-        "schema_armed": false,
-        "auto_apply_armed": false,
-        "selected_feature_id": selected_feature_id,
-        "schema_id": "supervisor_feature_plan_item_v1",
-        "preserve_rough_definition": true
+        "selected_feature_id": selected_feature_id
     });
 
     if let Some(selected_feature) = selected_feature {

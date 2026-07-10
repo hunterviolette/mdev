@@ -10,7 +10,7 @@ pub enum SharedCapabilityLifecycle {
 
 pub fn shared_capability_lifecycle(primitive_key: &str) -> SharedCapabilityLifecycle {
     match primitive_key {
-        "repo_context" | "changeset_schema" | "planner_fragment" => SharedCapabilityLifecycle::SingleUseGlobal,
+        "repo_context" | "changeset_schema" | "planner_fragment" | "planner_schema" | "planner_apply" => SharedCapabilityLifecycle::SingleUseGlobal,
         _ => SharedCapabilityLifecycle::Sticky,
     }
 }
@@ -19,7 +19,7 @@ pub fn shared_capability_storage_key<'a>(primitive_key: &'a str) -> &'a str {
     match primitive_key {
         "repo_context" => "context_export",
         "changeset_schema" => "changeset_schema",
-        "planner_fragment" => "planner",
+        "planner_fragment" | "planner_schema" | "planner_apply" => "planner",
         _ => primitive_key,
     }
 }
@@ -59,6 +59,28 @@ pub fn stage_supports_shared_capability(step: &WorkflowStepDefinition, primitive
                     .and_then(|v| v.get("planning_fragment").or_else(|| v.get("planner_fragment")).or_else(|| v.get("planner")))
                     .is_some()
         }
+        "planner_schema" => {
+            step.step_type == "design"
+                || step.step_type == "code"
+                || step.step_type == "review"
+                || step
+                    .execution_logic
+                    .get("connections")
+                    .and_then(|v| v.get("inference"))
+                    .and_then(|v| v.get("planner_schema"))
+                    .is_some()
+        }
+        "planner_apply" => {
+            step.step_type == "design"
+                || step.step_type == "code"
+                || step.step_type == "review"
+                || step
+                    .execution_logic
+                    .get("connections")
+                    .and_then(|v| v.get("inference"))
+                    .and_then(|v| v.get("planner_apply"))
+                    .is_some()
+        }
         _ => false,
     }
 }
@@ -81,6 +103,18 @@ pub fn shared_capability_enabled(global_state: &Value, primitive_key: &str, defa
             .get("capabilities")
             .and_then(|v| v.get("planner"))
             .and_then(|v| v.get("fragment_armed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(default_enabled),
+        "planner_schema" => global_state
+            .get("capabilities")
+            .and_then(|v| v.get("planner"))
+            .and_then(|v| v.get("schema_armed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(default_enabled),
+        "planner_apply" => global_state
+            .get("capabilities")
+            .and_then(|v| v.get("planner"))
+            .and_then(|v| v.get("auto_apply_armed"))
             .and_then(Value::as_bool)
             .unwrap_or(default_enabled),
         _ => {

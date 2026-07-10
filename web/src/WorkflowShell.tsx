@@ -92,8 +92,8 @@ import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import type { DiffPanelState } from './DiffPanel';
 import { PlannerModal } from './PlannerModal';
+import { getPlanner, getPlannerFeature } from './planner_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
-import { SupervisorPanel } from './SupervisorPanel';
 import { FlightDeckPanel } from './FlightDeckPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
@@ -162,7 +162,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'supervisors' | 'flight_deck';
+type MonitorHomeView = 'workflows' | 'flight_deck';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -1397,8 +1397,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
   sharedPlannerFragmentState: Record<string, unknown> | null;
+  plannerFeatureLabel: string | null;
   plannerAvailableForRepo: boolean;
-  activePlannerFeatureTitle: string | null;
   stageIncludeRepoContext: boolean;
   stageIncludeChangesetSchema: boolean;
   disabled: boolean;
@@ -1426,8 +1426,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     inferenceTransport,
     sharedInferenceState,
     sharedPlannerFragmentState,
+    plannerFeatureLabel,
     plannerAvailableForRepo,
-    activePlannerFeatureTitle,
     stageIncludeRepoContext,
     stageIncludeChangesetSchema,
     disabled,
@@ -1526,9 +1526,11 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
         toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
         toggleColor: planningFragmentArmed ? 'orange' : 'green',
         onToggle: onTogglePlanningFragment,
-        helperText: activePlannerFeatureTitle
-          ? `Selected feature: ${activePlannerFeatureTitle}`
-          : 'No planner feature selected.'
+        helperText: plannerFeatureLabel
+          ? `Selected feature: ${plannerFeatureLabel}`
+          : selectedPlannerFeatureId
+            ? 'Selected feature is loading.'
+            : 'No planner feature selected.'
       });
     }
 
@@ -1612,7 +1614,6 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     onTogglePlanningFragment,
     onOpenPlanner,
     selectedPlannerFeatureId,
-    activePlannerFeatureTitle,
     usesInference,
     designMode,
     fineFeatureFormatArmed,
@@ -2145,8 +2146,6 @@ export function WorkflowShell(props: {
   const [builderMode, setBuilderMode] = useState<BuilderMode>('builder');
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
   const [monitorHomeView, setMonitorHomeView] = useState<MonitorHomeView>('workflows');
-  const [supervisorCreateRequestToken, setSupervisorCreateRequestToken] = useState(0);
-  const [supervisorRefreshRequestToken, setSupervisorRefreshRequestToken] = useState(0);
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2169,6 +2168,8 @@ export function WorkflowShell(props: {
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
   const hydratedWorkflowEventRunsRef = useRef<Set<string>>(new Set());
   const runRefreshTimersRef = useRef<Record<string, number>>({});
+  const runtimeProjectionInflightRef = useRef<Set<string>>(new Set());
+  const runtimeProjectionLastRequestedAtRef = useRef<Record<string, number>>({});
 
 
   function patchSelectedStepDescriptorField(bindTo: string, value: unknown) {
@@ -2318,6 +2319,7 @@ export function WorkflowShell(props: {
   const [changesetSchemaConfigOpen, setChangesetSchemaConfigOpen] = useState(false);
   const [plannerFragmentConfigOpen, setPlannerFragmentConfigOpen] = useState(false);
   const [plannerSelectedFeatureIdDraft, setPlannerSelectedFeatureIdDraft] = useState<string | null>(null);
+  const [plannerFeatureLabelsByKey, setPlannerFeatureLabelsByKey] = useState<Record<string, string>>({});
   const [applyErrorConfigOpen, setApplyErrorConfigOpen] = useState(false);
   const [globalApplyChangesetOpen, setGlobalApplyChangesetOpen] = useState(false);
   const [globalApplyChangesetText, setGlobalApplyChangesetText] = useState('');
@@ -2673,12 +2675,42 @@ export function WorkflowShell(props: {
   const selectedPlannerFeatureId = plannerSelectedFeatureIdDraft
     ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null);
 
-  const selectedPlannerFeature = useMemo(() => {
-    const feature = sharedPlannerFragmentState?.selected_feature;
-    return feature && typeof feature === 'object' && !Array.isArray(feature)
-      ? feature as Record<string, unknown>
-      : null;
-  }, [sharedPlannerFragmentState]);
+  const selectedPlannerWorkspaceId = typeof sharedPlannerFragmentState?.planner_workspace_id === 'string' && sharedPlannerFragmentState.planner_workspace_id.trim()
+    ? sharedPlannerFragmentState.planner_workspace_id
+    : null;
+  const selectedPlannerFeatureLabelKey = selectedPlannerFeatureId
+    ? `${selectedPlannerWorkspaceId ?? 'canonical'}:${selectedPlannerFeatureId}`
+    : null;
+  const selectedPlannerFeatureLabel = selectedPlannerFeatureLabelKey
+    ? plannerFeatureLabelsByKey[selectedPlannerFeatureLabelKey] ?? null
+    : null;
+
+  useEffect(() => {
+    if (!selectedPlannerFeatureId || !selectedPlannerFeatureLabelKey) return;
+    if (plannerFeatureLabelsByKey[selectedPlannerFeatureLabelKey]) return;
+
+    let cancelled = false;
+    const loadFeature = selectedPlannerWorkspaceId
+      ? getPlanner(selectedPlannerWorkspaceId).then((planner) => planner.features.find((item) => item.id === selectedPlannerFeatureId) ?? null)
+      : getPlannerFeature(selectedPlannerFeatureId);
+
+    void loadFeature
+      .then((feature) => {
+        if (cancelled) return;
+        const title = feature?.title?.trim() ?? '';
+        if (!title) return;
+        setPlannerFeatureLabelsByKey((prev) => ({
+          ...prev,
+          [selectedPlannerFeatureLabelKey]: title
+        }));
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPlannerWorkspaceId, selectedPlannerFeatureId, selectedPlannerFeatureLabelKey, plannerFeatureLabelsByKey]);
+
   const selectedStageState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const stageOverrides = (workflowEngine?.stage_overrides ?? {}) as Record<string, unknown>;
@@ -2872,19 +2904,14 @@ export function WorkflowShell(props: {
       return;
     }
 
-    if (routedPath === '/flight-deck') {
+    if (routedPath === '/flight-deck' || routedSupervisorRunId || routedPath === '/supervisors') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
       setMonitorHomeView((value) => value === 'flight_deck' ? value : 'flight_deck');
       setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
-      return;
-    }
-
-    if (routedSupervisorRunId || routedPath === '/supervisors') {
-      setView((value) => value === 'monitor' ? value : 'monitor');
-      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
-      setMonitorHomeView((value) => value === 'supervisors' ? value : 'supervisors');
-      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+      if (routedPath !== '/flight-deck') {
+        props.navigate?.('/flight-deck');
+      }
       return;
     }
 
@@ -2960,10 +2987,14 @@ export function WorkflowShell(props: {
       },
       onProjection: (projection) => {
         if (cancelled) return;
-        setRuntimeProjectionsByRunId((prev) => ({
-          ...prev,
-          [projection.run_id]: projection
-        }));
+        setRuntimeProjectionsByRunId((prev) => {
+          const existing = prev[projection.run_id];
+          if (existing === projection) return prev;
+          return {
+            ...prev,
+            [projection.run_id]: projection
+          };
+        });
       },
       onEvent: (incoming) => {
         if (cancelled) return;
@@ -3265,14 +3296,10 @@ export function WorkflowShell(props: {
           }
         },
         planner: {
-          fragment_armed: Boolean(currentPlanner.fragment_armed),
-          schema_armed: Boolean(currentPlanner.schema_armed),
-          auto_apply_armed: Boolean(currentPlanner.auto_apply_armed),
+          fragment_armed: Boolean(currentPlanner.fragment_armed && currentPlanner.selected_feature_id),
           selected_feature_id: currentPlanner.selected_feature_id ?? null,
-          planner_id: currentPlanner.planner_id ?? null,
-          supervisor_run_id: null,
-          schema_id: 'supervisor_feature_plan_item_v1',
-          preserve_rough_definition: true
+          planner_workspace_id: currentPlanner.planner_workspace_id ?? null,
+          supervisor_run_id: currentPlanner.supervisor_run_id ?? null
         },
         context_export: {
           ...currentContextExport,
@@ -4041,15 +4068,37 @@ export function WorkflowShell(props: {
   }
 
   async function hydrateRuntimeProjection(runId: string) {
+    const trimmedRunId = runId.trim();
+    if (!trimmedRunId) return;
+
+    if (runtimeProjectionInflightRef.current.has(trimmedRunId)) {
+      return;
+    }
+
+    const now = Date.now();
+    const lastRequestedAt = runtimeProjectionLastRequestedAtRef.current[trimmedRunId] ?? 0;
+    if (now - lastRequestedAt < 1000) {
+      return;
+    }
+
+    runtimeProjectionLastRequestedAtRef.current[trimmedRunId] = now;
+    runtimeProjectionInflightRef.current.add(trimmedRunId);
+
     try {
-      const response: RuntimeProjectionResponse = await getRuntimeProjection({ run_id: runId });
-      const projection = response.runs.find((item) => item.run_id === runId) ?? response.runs[0] ?? null;
+      const response: RuntimeProjectionResponse = await getRuntimeProjection({ run_id: trimmedRunId });
+      const projection = response.runs.find((item) => item.run_id === trimmedRunId) ?? response.runs[0] ?? null;
       if (!projection) return;
-      setRuntimeProjectionsByRunId((prev) => ({
-        ...prev,
-        [projection.run_id]: projection
-      }));
+      setRuntimeProjectionsByRunId((prev) => {
+        const existing = prev[projection.run_id];
+        if (existing === projection) return prev;
+        return {
+          ...prev,
+          [projection.run_id]: projection
+        };
+      });
     } catch {
+    } finally {
+      runtimeProjectionInflightRef.current.delete(trimmedRunId);
     }
   }
 
@@ -4532,14 +4581,12 @@ export function WorkflowShell(props: {
     await patchGlobalCapabilityState({
       capabilities: {
         planner: {
-          ...currentPlanner,
-          ...patch,
           fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && normalizedSelectedFeatureId),
+          schema_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'schema_armed') ? patch.schema_armed : currentPlanner.schema_armed) && normalizedSelectedFeatureId),
+          auto_apply_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'auto_apply_armed') ? patch.auto_apply_armed : currentPlanner.auto_apply_armed) && normalizedSelectedFeatureId),
           selected_feature_id: normalizedSelectedFeatureId,
-          planner_id: patch.planner_id ?? currentPlanner.planner_id ?? null,
-          supervisor_run_id: null,
-          schema_id: 'supervisor_feature_plan_item_v1',
-          preserve_rough_definition: true
+          planner_workspace_id: patch.planner_workspace_id ?? currentPlanner.planner_workspace_id ?? null,
+          supervisor_run_id: patch.supervisor_run_id ?? currentPlanner.supervisor_run_id ?? null
         }
       }
     });
@@ -5749,9 +5796,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await patchPlannerCapabilityState({
       fragment_armed: nextEnabled,
       selected_feature_id: selectedPlannerFeatureId ?? null,
-      selected_feature: nextEnabled ? selectedPlannerFeature : null,
-      planner_id: sharedPlannerFragmentState?.planner_id ?? null,
-      supervisor_run_id: null
+      planner_workspace_id: sharedPlannerFragmentState?.planner_workspace_id ?? null,
+      supervisor_run_id: sharedPlannerFragmentState?.supervisor_run_id ?? null
     });
   }
 
@@ -5762,9 +5808,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await patchPlannerCapabilityState({
       fragment_armed: Boolean(featureId),
       selected_feature_id: featureId,
-      selected_feature: selection.feature,
-      planner_id: selection.planner?.id ?? sharedPlannerFragmentState?.planner_id ?? null,
-      supervisor_run_id: null
+      planner_workspace_id: selection.planner?.id ?? sharedPlannerFragmentState?.planner_workspace_id ?? null,
+      supervisor_run_id: sharedPlannerFragmentState?.supervisor_run_id ?? null
     });
     setPlannerFragmentConfigOpen(false);
   }
@@ -6342,13 +6387,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         onClick={() => {
                           if (monitorHomeView === 'workflows') {
                             void openBuilder();
-                          } else if (monitorHomeView === 'supervisors') {
-                            setSupervisorCreateRequestToken((value) => value + 1);
+                          } else {
+                            props.navigate?.('/flight-deck');
                           }
                         }}
                         loading={monitorHomeView === 'workflows' ? busy : false}
                       >
-                        {monitorHomeView === 'workflows' ? 'New workflow' : monitorHomeView === 'supervisors' ? 'New supervisor' : 'Flight Deck'}
+                        {monitorHomeView === 'workflows' ? 'New workflow' : 'Flight Deck'}
                       </Button>
                       <Button
                         size="xs"
@@ -6357,8 +6402,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         onClick={() => {
                           if (monitorHomeView === 'workflows') {
                             void refreshRunsAndTemplates();
-                          } else if (monitorHomeView === 'supervisors') {
-                            setSupervisorRefreshRequestToken((value) => value + 1);
+                          } else {
+                            props.navigate?.('/flight-deck');
                           }
                         }}
                       >
@@ -6372,13 +6417,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       const next = (value as MonitorHomeView | null) ?? 'workflows';
                       setMonitorHomeView((current) => current === next ? current : next);
                       if (next === 'flight_deck') props.navigate?.('/flight-deck');
-                      else if (next === 'supervisors') props.navigate?.('/supervisors');
                       else props.navigate?.('/workflows');
                     }}
                   >
                     <Tabs.List>
                       <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
-                      <Tabs.Tab value="supervisors">Supervisors</Tabs.Tab>
                       <Tabs.Tab value="flight_deck">Flight Deck</Tabs.Tab>
                     </Tabs.List>
                   </Tabs>
@@ -6388,15 +6431,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               {monitorHomeView === 'flight_deck' ? (
                 <FlightDeckPanel
                   navigate={props.navigate}
-                />
-              ) : monitorHomeView === 'supervisors' ? (
-                <SupervisorPanel
-                  supervisorRunId={props.route?.supervisorRunId ?? null}
-                  supervisorView={props.route?.supervisorView ?? null}
-                  navigate={props.navigate}
-                  createRequestedToken={supervisorCreateRequestToken}
-                  refreshRequestedToken={supervisorRefreshRequestToken}
-                  onOpenWorkflowRun={(workflowRunId) => openWorkflow(workflowRunId)}
                 />
               ) : (
                 <>
@@ -6679,14 +6713,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}
                                     sharedPlannerFragmentState={sharedPlannerFragmentState}
+                                    plannerFeatureLabel={selectedPlannerFeatureLabel}
                   plannerAvailableForRepo={Boolean((selectedRun?.repo_ref ?? repoRef ?? '').trim())}
-                  activePlannerFeatureTitle={selectedPlannerFeature
-                    ? (typeof selectedPlannerFeature.title === 'string' && selectedPlannerFeature.title.trim()
-                        ? selectedPlannerFeature.title.trim()
-                        : typeof selectedPlannerFeature.summary === 'string' && selectedPlannerFeature.summary.trim()
-                          ? selectedPlannerFeature.summary.trim()
-                          : null)
-                    : null}
                                     stageIncludeRepoContext={stageIncludeRepoContext}
                                     stageIncludeChangesetSchema={stageIncludeChangesetSchema}
                                     disabled={isBackendRunLocked}
@@ -6951,7 +6979,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           opened={Boolean(overlayPlanner)}
           rootRepoPath={overlayPlanner?.rootRepoPath ?? ''}
           onClose={() => setOverlayPlanner(null)}
-          onSaved={() => setSupervisorRefreshRequestToken((value) => value + 1)}
+          onSaved={() => props.navigate?.('/flight-deck')}
           onError={setError}
           onWorkflowRunCreated={(workflowRunId) => void openWorkflow(workflowRunId)}
         />
@@ -6959,7 +6987,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         <PlannerModal
           opened={plannerFragmentConfigOpen}
           rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
-          selectedPlannerId={typeof sharedPlannerFragmentState?.planner_id === 'string' ? sharedPlannerFragmentState.planner_id : null}
+          selectedPlannerId={selectedPlannerWorkspaceId}
           selectedFeatureId={selectedPlannerFeatureId}
           selectionMode
           onClose={() => setPlannerFragmentConfigOpen(false)}

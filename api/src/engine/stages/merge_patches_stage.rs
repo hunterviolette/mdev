@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -401,11 +401,10 @@ async fn persist_integrated_feature_patch(
     let base_commit = patches::current_head(Path::new(shard_path))?;
     let patch_hash = patches::patch_content_hash(patch_text);
 
-    sqlx::query("INSERT INTO planner_feature_patches (id, feature_id, repo_id, sprint_id, supervisor_run_id, workflow_run_id, patch_kind, repo_ref, base_commit, head_commit, patch_text, patch_hash, patch_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO planner_feature_patches (id, feature_id, planner_id, supervisor_run_id, workflow_run_id, patch_kind, repo_ref, base_commit, head_commit, patch_text, patch_hash, patch_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&patch_id)
         .bind(feature_id)
         .bind(&repo_id)
-        .bind(sprint_id)
         .bind(supervisor_run_id)
         .bind(workflow_run_id)
         .bind("development")
@@ -419,28 +418,14 @@ async fn persist_integrated_feature_patch(
         .execute(&state.db)
         .await?;
 
-    sqlx::query("UPDATE planner_features SET current_sprint_id = ?, current_supervisor_run_id = ?, current_workflow_run_id = ?, current_patch_id = ?, development_state = 'integrated', integration_completed_at = COALESCE(integration_completed_at, ?), updated_at = ? WHERE repo_id = ? AND id = ?")
-        .bind(sprint_id)
+    sqlx::query("UPDATE planner_features SET locked_supervisor_run_id = COALESCE(NULLIF(locked_supervisor_run_id, ''), ?), locked_at = COALESCE(locked_at, ?), updated_at = ? WHERE planner_id = ? AND id = ?")
         .bind(supervisor_run_id)
-        .bind(workflow_run_id)
-        .bind(&patch_id)
         .bind(&now)
         .bind(&now)
         .bind(&repo_id)
         .bind(feature_id)
         .execute(&state.db)
         .await?;
-
-    if let Some(sprint_id) = sprint_id {
-        sqlx::query("UPDATE sprint_features SET current_patch_id = ?, development_state = 'integrated', integration_completed_at = COALESCE(integration_completed_at, ?), updated_at = ? WHERE sprint_id = ? AND feature_id = ?")
-            .bind(&patch_id)
-            .bind(&now)
-            .bind(&now)
-            .bind(sprint_id)
-            .bind(feature_id)
-            .execute(&state.db)
-            .await?;
-    }
 
     Ok(patch_id)
 }
@@ -512,35 +497,56 @@ async fn persist_final_integration_patch(
     let supervisor_run_id = supervisor_run_id.ok_or_else(|| anyhow!("merge_patches requires supervisor_run_id to persist final patch"))?;
     let patch_text = patches::generate_patch_text(Path::new(integration_repo_path))?;
     let patch_hash = patches::patch_content_hash(&patch_text);
-    let patch_dir = Path::new(root_repo_path)
-        .join(".mdev")
-        .join("supervisors")
-        .join(supervisor_run_id)
-        .join("patches");
-    fs::create_dir_all(&patch_dir)?;
-    let patch_path = patch_dir.join(format!(
-        "final-{}.patch",
-        crate::supervisor::repo_snapshot::sanitize_path_segment(sprint_id)
-    ));
-    fs::write(&patch_path, patch_text.as_bytes())?;
     let now = Utc::now().to_rfc3339();
-    let final_patch_path = patch_path.to_string_lossy().replace('\\', "/");
+    let final_patch_ref = format!("supervisor_work_units:{}:context_json.final_patch_text", supervisor_run_id);
     let report = json!({
         "ok": true,
         "status": "merged",
         "source": "supervisor_integration_pool",
         "sprint_id": sprint_id,
         "integration_path": integration_repo_path,
-        "final_patch_path": final_patch_path,
+        "final_patch_ref": final_patch_ref,
         "final_patch_hash": patch_hash,
         "final_patch_bytes": patch_text.len(),
         "applied": applied,
         "persisted_at": now
     });
 
-    sqlx::query("UPDATE supervisor_runs SET final_patch_path = ?, merge_report_json = ?, updated_at = ? WHERE id = ?")
-        .bind(&final_patch_path)
-        .bind(serde_json::to_string(&report)?)
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET patch_id = COALESCE(NULLIF(patch_id, ''), ?),
+            integration_path = COALESCE(NULLIF(integration_path, ''), ?),
+            state = CASE WHEN state IN ('deleted', 'archived') THEN state ELSE 'patch_ready' END,
+            context_json = json_set(
+                CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+                '$.final_patch_ref', ?,
+                '$.final_patch_text', ?,
+                '$.final_patch_hash', ?,
+                '$.final_patch_bytes', ?,
+                '$.merge_report', json(?),
+                '$.integration_path', ?
+            ),
+            updated_at = ?
+        WHERE supervisor_run_id = ?
+          AND kind = 'integration'
+          AND archived_at IS NULL
+        "#,
+    )
+    .bind(&patch_hash)
+    .bind(integration_repo_path)
+    .bind(&final_patch_ref)
+    .bind(&patch_text)
+    .bind(&patch_hash)
+    .bind(patch_text.len() as i64)
+    .bind(serde_json::to_string(&report)?)
+    .bind(integration_repo_path)
+    .bind(&now)
+    .bind(supervisor_run_id)
+    .execute(&state.db)
+    .await?;
+
+    sqlx::query("UPDATE supervisor_runs SET updated_at = ? WHERE id = ?")
         .bind(&now)
         .bind(supervisor_run_id)
         .execute(&state.db)
@@ -550,26 +556,28 @@ async fn persist_final_integration_patch(
 }
 
 async fn ensure_planner_repo_id(state: &AppState, root_repo_path: &str) -> Result<String> {
-    if let Some(row) = sqlx::query("SELECT id FROM planner_repos WHERE root_repo_path = ?")
-        .bind(root_repo_path)
+    let normalized_root = root_repo_path.trim().replace('\\', "/");
+    if let Some(row) = sqlx::query("SELECT id FROM planner_workspaces WHERE root_repo_path = ? ORDER BY is_default DESC, updated_at DESC, created_at DESC LIMIT 1")
+        .bind(&normalized_root)
         .fetch_optional(&state.db)
         .await?
     {
         return Ok(row.get::<String, _>("id"));
     }
 
-    let repo_id = Uuid::new_v4().to_string();
-    let repo_key = repo_key_for(root_repo_path);
+    let planner_id = Uuid::new_v4().to_string();
+    let repo_key = repo_key_for(&normalized_root);
     let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO planner_repos (id, root_repo_path, repo_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(&repo_id)
-        .bind(root_repo_path)
-        .bind(repo_key)
+    sqlx::query("INSERT INTO planner_workspaces (id, root_repo_path, repo_key, title, is_default, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
+        .bind(&planner_id)
+        .bind(&normalized_root)
+        .bind(&repo_key)
+        .bind(format!("{} Planner", repo_key))
         .bind(&now)
         .bind(&now)
         .execute(&state.db)
         .await?;
-    Ok(repo_id)
+    Ok(planner_id)
 }
 
 fn repo_key_for(root_repo_path: &str) -> String {
@@ -593,7 +601,7 @@ fn repo_key_for(root_repo_path: &str) -> String {
 
 async fn load_supervisor_runtime_context(state: &AppState, supervisor_run_id: &str) -> Result<Value> {
     let row = sqlx::query(
-        "SELECT root_repo_path, snapshot_path, integration_path, context_json FROM supervisor_runs WHERE id = ?",
+        "SELECT root_repo_path, context_json FROM supervisor_runs WHERE id = ?",
     )
     .bind(supervisor_run_id)
     .fetch_optional(&state.db)
@@ -603,13 +611,18 @@ async fn load_supervisor_runtime_context(state: &AppState, supervisor_run_id: &s
         return Err(anyhow!("supervisor {} not found", supervisor_run_id));
     };
 
+    let root_repo_path = row.get::<String, _>("root_repo_path");
     let context_json = row.get::<String, _>("context_json");
     let context = serde_json::from_str::<Value>(&context_json).unwrap_or_else(|_| json!({}));
+    let workspace = crate::supervisor::repo_snapshot::workspace_for(
+        &root_repo_path,
+        Uuid::parse_str(supervisor_run_id)?,
+    ).ok();
 
     Ok(json!({
-        "root_repo_path": row.get::<String, _>("root_repo_path"),
-        "snapshot_path": row.get::<Option<String>, _>("snapshot_path"),
-        "integration_path": row.get::<Option<String>, _>("integration_path"),
+        "root_repo_path": root_repo_path,
+        "snapshot_path": workspace.as_ref().map(|item| item.snapshot.to_string_lossy().replace('\\', "/")),
+        "integration_path": workspace.as_ref().map(|item| item.integration.to_string_lossy().replace('\\', "/")),
         "sprint_id": context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
         "context": context
     }))
@@ -621,8 +634,17 @@ async fn resolve_supervisor_integration_pool_patches(state: &AppState, superviso
         SELECT feature_id, title, workflow_run_id, patch_id, shard_path, kind, state, context_json
         FROM supervisor_work_units
         WHERE supervisor_run_id = ?
-          AND kind IN ('feature_development', 'manual_shard')
-          AND state IN ('patch_ready', 'ready_for_integration')
+          AND (
+              (kind = 'feature_development' AND state IN ('patch_ready', 'ready_for_integration'))
+              OR (
+                  kind = 'manual_shard'
+                  AND state IN ('ready_for_integration', 'integrating', 'integrated')
+                  AND (
+                      COALESCE(json_extract(context_json, '$.integration_input'), 0) = 1
+                      OR COALESCE(json_extract(context_json, '$.staged_to_integration'), 0) = 1
+                  )
+              )
+          )
           AND TRIM(COALESCE(shard_path, '')) != ''
           AND COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 0
         ORDER BY CASE kind WHEN 'feature_development' THEN 0 ELSE 1 END, queue_position ASC, updated_at ASC

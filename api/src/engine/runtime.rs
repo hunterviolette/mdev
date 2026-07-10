@@ -808,7 +808,7 @@ async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested
         }),
     ).await?;
 
-    run_stages(state, run_id, requested_step_id, RunMode::Autonomous).await
+    Box::pin(run_stages(state, run_id, requested_step_id, RunMode::Autonomous)).await
 }
 
 fn step_is_auto_runnable(step: &super::WorkflowStepDefinition) -> bool {

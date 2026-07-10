@@ -18,11 +18,11 @@ pub struct SupervisorWorkspace {
 
 pub fn workspace_for(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
     let root_repo = PathBuf::from(root_repo_path);
-    let root = root_repo.join(".mdev").join("supervisors").join(supervisor_id.to_string());
+    let root = root_repo.join(".mdev").join(supervisor_id.to_string());
     Ok(SupervisorWorkspace {
         snapshot: root.join("snapshot"),
         integration: root.join("integration"),
-        shards: root.join("shards"),
+        shards: root.clone(),
         patches: root.join("patches"),
         logs: root.join("logs"),
         root,
@@ -37,57 +37,134 @@ pub fn create_workspace(root_repo_path: &str, supervisor_id: Uuid, items: &[Feat
         fs::remove_dir_all(&workspace.root).with_context(|| format!("failed to clear {}", workspace.root.display()))?;
     }
     fs::create_dir_all(&workspace.root)?;
-    fs::create_dir_all(&workspace.shards)?;
-    copy_repo_tree(Path::new(root_repo_path), &workspace.integration, Some(&workspace.root))?;
-    for item in items {
-        copy_repo_tree(Path::new(root_repo_path), &workspace.shards.join(sanitize_path_segment(&item.id)), Some(&workspace.root))?;
-    }
-    tracing::info!(supervisor_id = %supervisor_id, integration = %workspace.integration.display(), shards = %workspace.shards.display(), "created supervisor workspace from current worktree");
+    fs::create_dir_all(&workspace.patches)?;
+    fs::create_dir_all(&workspace.logs)?;
+    tracing::info!(supervisor_id = %supervisor_id, workspace = %workspace.root.display(), item_count = items.len(), "created supervisor workspace root");
     Ok(workspace)
+}
+
+pub fn ensure_snapshot_from_worktree(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
+    let workspace = workspace_for(root_repo_path, supervisor_id)?;
+    if !workspace.snapshot.is_dir() {
+        fs::create_dir_all(&workspace.root)?;
+        copy_repo_tree(Path::new(root_repo_path), &workspace.snapshot, Some(&workspace.root))?;
+        tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, snapshot = %workspace.snapshot.display(), "created supervisor snapshot from current worktree");
+    }
+    Ok(workspace)
+}
+
+pub fn reset_integration_from_snapshot(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
+    let workspace = ensure_snapshot_from_worktree(root_repo_path, supervisor_id)?;
+    copy_repo_tree(&workspace.snapshot, &workspace.integration, None)?;
+    tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, integration = %workspace.integration.display(), snapshot = %workspace.snapshot.display(), "reset supervisor integration workspace from snapshot");
+    Ok(workspace)
+}
+
+pub fn create_shard_from_snapshot(root_repo_path: &str, supervisor_id: Uuid, shard_id: Uuid) -> Result<PathBuf> {
+    let workspace = ensure_snapshot_from_worktree(root_repo_path, supervisor_id)?;
+    let shard = shard_path(&workspace, shard_id);
+    copy_repo_tree(&workspace.snapshot, &shard, None)?;
+    Ok(shard)
 }
 
 pub fn refresh_integration_from_worktree(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
     let workspace = workspace_for(root_repo_path, supervisor_id)?;
     fs::create_dir_all(&workspace.root)?;
-    fs::create_dir_all(&workspace.shards)?;
     copy_repo_tree(Path::new(root_repo_path), &workspace.integration, Some(&workspace.root))?;
-    tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, integration = %workspace.integration.display(), "refreshed supervisor integration shard from current worktree");
+    tracing::info!(supervisor_id = %supervisor_id, root_repo_path = %root_repo_path, integration = %workspace.integration.display(), "refreshed supervisor integration workspace from current worktree");
     Ok(workspace)
 }
 
-pub fn reset_integration_from_snapshot(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
-    refresh_integration_from_worktree(root_repo_path, supervisor_id)
+
+fn root_repo_for_workspace(workspace: &SupervisorWorkspace) -> Result<PathBuf> {
+    workspace
+        .root
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("failed to resolve root repo for supervisor workspace {}", workspace.root.display()))
 }
 
-
-pub fn create_shard_from_snapshot(workspace: &SupervisorWorkspace, execution_item_id: &str) -> Result<PathBuf> {
-    if !workspace.integration.is_dir() {
-        return Err(anyhow!("supervisor integration workspace is missing at {}", workspace.integration.display()));
+pub fn create_shard_from_workspace_snapshot(workspace: &SupervisorWorkspace, shard_id: Uuid) -> Result<PathBuf> {
+    fs::create_dir_all(&workspace.root)?;
+    if !workspace.snapshot.is_dir() {
+        let root_repo = root_repo_for_workspace(workspace)?;
+        copy_repo_tree(&root_repo, &workspace.snapshot, Some(&workspace.root))?;
     }
-    fs::create_dir_all(&workspace.shards)?;
-    let shard = shard_path(workspace, execution_item_id);
-    copy_tree(&workspace.integration, &shard)?;
+    let shard = shard_path(workspace, shard_id);
+    copy_repo_tree(&workspace.snapshot, &shard, None)?;
     Ok(shard)
 }
 
-pub fn refresh_shard_from_worktree(root_repo_path: &str, supervisor_id: Uuid, execution_item_id: &str) -> Result<PathBuf> {
+pub fn refresh_shard_from_worktree(root_repo_path: &str, supervisor_id: Uuid, shard_id: Uuid) -> Result<PathBuf> {
     let workspace = workspace_for(root_repo_path, supervisor_id)?;
     fs::create_dir_all(&workspace.root)?;
-    fs::create_dir_all(&workspace.shards)?;
-    let shard = shard_path(&workspace, execution_item_id);
+    let shard = shard_path(&workspace, shard_id);
     copy_repo_tree(Path::new(root_repo_path), &shard, Some(&workspace.root))?;
     tracing::info!(
         supervisor_id = %supervisor_id,
         root_repo_path = %root_repo_path,
-        execution_item_id = %execution_item_id,
+        shard_id = %shard_id,
         shard = %shard.display(),
         "refreshed supervisor child shard from current worktree"
     );
     Ok(shard)
 }
 
-pub fn shard_path(workspace: &SupervisorWorkspace, execution_item_id: &str) -> PathBuf {
-    workspace.shards.join(sanitize_path_segment(execution_item_id))
+pub fn shard_path(workspace: &SupervisorWorkspace, shard_id: Uuid) -> PathBuf {
+    workspace.root.join(shard_id.to_string())
+}
+
+pub fn delete_supervisor_workspace_path(root_repo_path: &str, supervisor_id: Uuid, workspace_path: &str) -> Result<bool> {
+    let workspace_path = workspace_path.trim();
+    if workspace_path.is_empty() {
+        return Ok(false);
+    }
+
+    let workspace = workspace_for(root_repo_path, supervisor_id)?;
+    let candidate = PathBuf::from(workspace_path);
+    let root_repo = fs::canonicalize(root_repo_path)
+        .with_context(|| format!("failed to canonicalize root repo {}", root_repo_path))?;
+    let supervisor_root = canonicalize_existing_or_parent(&workspace.root)?;
+    let integration_root = canonicalize_existing_or_parent(&workspace.integration)?;
+    let candidate_canonical = canonicalize_existing_or_parent(&candidate)?;
+
+    if candidate_canonical == root_repo {
+        return Err(anyhow!("refusing to delete root repo as supervisor workspace"));
+    }
+    if candidate_canonical == supervisor_root {
+        return Err(anyhow!("refusing to delete supervisor workspace root"));
+    }
+    if candidate_canonical == integration_root {
+        return Err(anyhow!("refusing to delete integration root directly; archive the integration work unit instead"));
+    }
+    if !candidate_canonical.starts_with(&supervisor_root) && !candidate_canonical.starts_with(&integration_root) {
+        return Err(anyhow!("refusing to delete path outside supervisor-owned workspaces: {}", candidate.display()));
+    }
+
+    if candidate.exists() {
+        fs::remove_dir_all(&candidate).or_else(|_| fs::remove_file(&candidate))
+            .with_context(|| format!("failed to delete supervisor workspace {}", candidate.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).with_context(|| format!("failed to canonicalize {}", path.display()));
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let parent = canonicalize_existing_or_parent(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no final component: {}", path.display()))?;
+
+    Ok(parent.join(file_name))
 }
 
 pub fn sanitize_path_segment(value: &str) -> String {

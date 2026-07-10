@@ -69,36 +69,6 @@ pub async fn spawn_series_workflow_on_integration(
     })).await
 }
 
-fn template_structured_output(definition: &WorkflowTemplateDefinition) -> Value {
-    definition
-        .steps
-        .iter()
-        .find_map(|step| step.execution_logic.get("structured_output"))
-        .cloned()
-        .unwrap_or_else(|| json!({}))
-}
-
-fn apply_supervisor_planner_template_controls(supervisor_context: &mut Value, definition: &WorkflowTemplateDefinition) {
-    let template_structured_output = template_structured_output(definition);
-    let context_structured_output = supervisor_context
-        .get("structured_output")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let mut structured_output = template_structured_output;
-    if let (Some(target), Some(source)) = (structured_output.as_object_mut(), context_structured_output.as_object()) {
-        for (key, value) in source {
-            target.insert(key.clone(), value.clone());
-        }
-    } else if !context_structured_output.is_null() {
-        structured_output = context_structured_output;
-    }
-
-    if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
-        supervisor_obj.insert("structured_output".to_string(), structured_output);
-    }
-}
-
 fn is_sprint_feature_context(supervisor_context: &Value) -> bool {
     supervisor_context
         .get("input_source")
@@ -148,14 +118,10 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
     let input_source = supervisor_context
         .get("input_source")
         .and_then(Value::as_str);
-    let is_supervisor_planner_feature = input_source == Some("supervisor_planner_feature") || input_source == Some("planner_workspace_feature");
     let is_supervisor_sprint_feature = is_sprint_feature_context(&supervisor_context);
     let is_supervisor_manual_shard = input_source == Some("supervisor_manual_shard");
 
     let mut supervisor_context = supervisor_context;
-    if is_supervisor_planner_feature {
-        apply_supervisor_planner_template_controls(&mut supervisor_context, &definition);
-    }
     if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
         if is_supervisor_manual_shard {
             supervisor_obj.insert("manual_shard_id".to_string(), Value::String(item.id.clone()));
@@ -165,56 +131,21 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
         }
     }
 
-    let structured_output = supervisor_context
-        .get("structured_output")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
     let planner = if is_supervisor_manual_shard {
         json!({
-            "fragment_armed": false,
-            "schema_armed": false,
-            "auto_apply_armed": false,
             "selected_feature_id": Value::Null,
-            "selected_feature": Value::Null,
             "manual_shard_id": item.id,
-            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
-            "schema_id": "manual_shard_v1",
-            "preserve_rough_definition": true
+            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
         })
     } else {
         json!({
-            "fragment_armed": structured_output
-                .get("fragment_armed")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            "schema_armed": structured_output
-                .get("schema_armed")
-                .or_else(|| structured_output.get("fine_feature_format_armed"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            "auto_apply_armed": structured_output
-                .get("auto_apply_armed")
-                .or_else(|| structured_output.get("auto_normalize_and_apply_to_planner"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             "selected_feature_id": item.id,
-            "selected_feature": item,
-            "planner_id": supervisor_context
+            "planner_workspace_id": supervisor_context
                 .get("planner_workspace_id")
                 .or_else(|| supervisor_context.get("planner_id"))
                 .cloned()
                 .unwrap_or(Value::Null),
-            "planner_title": supervisor_context.get("planner_title").cloned().unwrap_or(Value::Null),
-            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
-            "schema_id": structured_output
-                .get("schema_id")
-                .and_then(Value::as_str)
-                .unwrap_or("supervisor_feature_plan_item_v1"),
-            "preserve_rough_definition": structured_output
-                .get("preserve_rough_definition")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
+            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
         })
     };
 
@@ -367,10 +298,6 @@ async fn insert_and_start_run(
         .or_else(|| context.get("workflow_start_step_id").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let is_supervisor_sprint_feature = context
-        .get("supervisor")
-        .map(is_sprint_feature_context)
-        .unwrap_or(false);
     let current_step_id = requested_start_step_id
         .and_then(|step_id| definition.steps.iter().find(|step| step.id == step_id).map(|step| step.id.clone()))
         .or_else(|| definition.steps.first().map(|step| step.id.clone()));

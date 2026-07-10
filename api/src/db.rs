@@ -139,6 +139,8 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             repo_ref TEXT NOT NULL,
             workflow_key TEXT NOT NULL DEFAULT '',
             context_json TEXT NOT NULL,
+            archived_at TEXT,
+            archived_reason TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -242,15 +244,11 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             status TEXT NOT NULL,
             title TEXT NOT NULL,
             root_repo_path TEXT NOT NULL,
-            snapshot_path TEXT,
-            integration_path TEXT,
-            features_json TEXT NOT NULL DEFAULT '[]',
-            child_runs_json TEXT NOT NULL DEFAULT '[]',
-            integration_run_id TEXT,
-            final_patch_path TEXT,
-            merge_report_json TEXT NOT NULL DEFAULT '{}',
-            validation_report_json TEXT NOT NULL DEFAULT '{}',
+            selected_planner_id TEXT,
+            flight_deck_json TEXT NOT NULL DEFAULT '{}',
             context_json TEXT NOT NULL DEFAULT '{}',
+            archived_at TEXT,
+            archived_reason TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -276,8 +274,11 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             title TEXT NOT NULL,
             state TEXT NOT NULL,
             root_repo_path TEXT NOT NULL,
+            workspace_path TEXT,
             shard_path TEXT,
             integration_path TEXT,
+            archived_at TEXT,
+            archived_reason TEXT,
             priority INTEGER NOT NULL DEFAULT 0,
             queue_position INTEGER,
             blocked_reason TEXT,
@@ -290,6 +291,132 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+
+    ensure_column(db, "workflow_runs", "archived_at", "TEXT").await?;
+    ensure_column(db, "workflow_runs", "archived_reason", "TEXT").await?;
+    ensure_column(db, "supervisor_runs", "archived_at", "TEXT").await?;
+    ensure_column(db, "supervisor_runs", "archived_reason", "TEXT").await?;
+    ensure_column(db, "supervisor_runs", "selected_planner_id", "TEXT").await?;
+    ensure_column(db, "supervisor_runs", "flight_deck_json", "TEXT NOT NULL DEFAULT '{}'").await?;
+
+    let supervisor_run_columns = sqlx::query("PRAGMA table_info(supervisor_runs)")
+        .fetch_all(db)
+        .await?;
+    let supervisor_runs_needs_rebuild = supervisor_run_columns.iter().any(|row| {
+        matches!(
+            row.get::<String, _>("name").as_str(),
+            "snapshot_path"
+                | "integration_path"
+                | "features_json"
+                | "child_runs_json"
+                | "integration_run_id"
+                | "final_patch_path"
+                | "merge_report_json"
+                | "validation_report_json"
+        )
+    });
+
+    if supervisor_runs_needs_rebuild {
+        sqlx::query(
+            r#"
+            CREATE TABLE supervisor_runs_next (
+                id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                root_repo_path TEXT NOT NULL,
+                selected_planner_id TEXT,
+                flight_deck_json TEXT NOT NULL DEFAULT '{}',
+                context_json TEXT NOT NULL DEFAULT '{}',
+                archived_at TEXT,
+                archived_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(db)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO supervisor_runs_next (
+                id,
+                mode,
+                status,
+                title,
+                root_repo_path,
+                selected_planner_id,
+                flight_deck_json,
+                context_json,
+                archived_at,
+                archived_reason,
+                created_at,
+                updated_at
+            )
+            SELECT
+                id,
+                mode,
+                status,
+                title,
+                root_repo_path,
+                COALESCE(
+                    NULLIF(selected_planner_id, ''),
+                    NULLIF(json_extract(context_json, '$.queue_planner_id'), ''),
+                    NULLIF(json_extract(context_json, '$.selected_planner_id'), ''),
+                    NULLIF(json_extract(context_json, '$.planner_workspace_id'), ''),
+                    NULLIF(json_extract(context_json, '$.planner_id'), '')
+                ),
+                CASE
+                    WHEN TRIM(COALESCE(flight_deck_json, '')) = '' OR flight_deck_json = '{}' THEN COALESCE(json_extract(context_json, '$.flight_deck_settings'), '{}')
+                    ELSE flight_deck_json
+                END,
+                context_json,
+                archived_at,
+                archived_reason,
+                created_at,
+                updated_at
+            FROM supervisor_runs
+            "#,
+        )
+        .execute(db)
+        .await?;
+
+        sqlx::query("DROP TABLE supervisor_runs")
+            .execute(db)
+            .await?;
+        sqlx::query("ALTER TABLE supervisor_runs_next RENAME TO supervisor_runs")
+            .execute(db)
+            .await?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_runs
+        SET selected_planner_id = COALESCE(
+                NULLIF(selected_planner_id, ''),
+                NULLIF(json_extract(context_json, '$.queue_planner_id'), ''),
+                NULLIF(json_extract(context_json, '$.selected_planner_id'), ''),
+                NULLIF(json_extract(context_json, '$.planner_workspace_id'), ''),
+                NULLIF(json_extract(context_json, '$.planner_id'), '')
+            ),
+            flight_deck_json = CASE
+                WHEN TRIM(COALESCE(flight_deck_json, '')) = '' OR flight_deck_json = '{}' THEN COALESCE(json_extract(context_json, '$.flight_deck_settings'), '{}')
+                ELSE flight_deck_json
+            END
+        WHERE json_valid(context_json)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_supervisor_runs_status_updated ON supervisor_runs (status, updated_at)")
+        .execute(db)
+        .await?;
+    ensure_column(db, "supervisor_work_units", "workspace_path", "TEXT").await?;
+    ensure_column(db, "supervisor_work_units", "shard_id", "TEXT").await?;
+    ensure_column(db, "supervisor_work_units", "archived_at", "TEXT").await?;
+    ensure_column(db, "supervisor_work_units", "archived_reason", "TEXT").await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_supervisor_state ON supervisor_work_units (supervisor_run_id, state, updated_at)")
         .execute(db)
@@ -307,12 +434,26 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await?;
 
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_workspace ON supervisor_work_units (workspace_path)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        "UPDATE supervisor_work_units SET workspace_path = COALESCE(NULLIF(workspace_path, ''), NULLIF(shard_path, ''), NULLIF(integration_path, '')) WHERE TRIM(COALESCE(workspace_path, '')) = ''"
+    )
+    .execute(db)
+    .await?;
+
+
+
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS planner_repos (
+        CREATE TABLE IF NOT EXISTS planner_workspaces (
             id TEXT PRIMARY KEY,
-            root_repo_path TEXT NOT NULL UNIQUE,
-            repo_key TEXT NOT NULL UNIQUE,
+            root_repo_path TEXT NOT NULL,
+            repo_key TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -320,30 +461,40 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+
+    ensure_column(db, "planner_workspaces", "repo_key", "TEXT NOT NULL DEFAULT ''").await?;
+    ensure_column(db, "planner_workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0").await?;
+
+    let has_legacy_planner_repos = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'planner_repos'")
+        .fetch_optional(db)
+        .await?
+        .is_some();
+
+    if has_legacy_planner_repos {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO planner_workspaces (id, root_repo_path, repo_key, title, is_default, created_at, updated_at)
+            SELECT id, root_repo_path, repo_key, repo_key || ' Planner', 1, created_at, updated_at
+            FROM planner_repos
+            "#,
+        )
+        .execute(db)
+        .await?;
+    }
 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS planner_features (
             id TEXT PRIMARY KEY,
-            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
+            planner_id TEXT NOT NULL DEFAULT '' REFERENCES planner_workspaces(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'planned',
+            status TEXT NOT NULL DEFAULT 'rough',
             sort_order INTEGER NOT NULL DEFAULT 0,
             payload_json TEXT NOT NULL DEFAULT '{}',
-            current_sprint_id TEXT,
-            current_supervisor_run_id TEXT,
-            current_workflow_run_id TEXT,
-            current_patch_id TEXT,
-            development_state TEXT NOT NULL DEFAULT 'none',
             refined_at TEXT,
-            scheduled_at TEXT,
-            development_started_at TEXT,
-            development_completed_at TEXT,
-            integration_started_at TEXT,
-            integration_completed_at TEXT,
-            applied_at TEXT,
-            unscheduled_at TEXT,
-            restarted_at TEXT,
+            locked_supervisor_run_id TEXT,
+            locked_at TEXT,
+            completed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -352,105 +503,18 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sprints (
-            id TEXT PRIMARY KEY,
-            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
-            sprint_key TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'planned',
-            workflow_run_id TEXT,
-            supervisor_run_id TEXT,
-            sprint_started_at TEXT,
-            development_started_at TEXT,
-            development_completed_at TEXT,
-            integration_started_at TEXT,
-            integration_completed_at TEXT,
-            sprint_completed_at TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            summary_json TEXT NOT NULL DEFAULT '{}'
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sprint_features (
-            id TEXT PRIMARY KEY,
-            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
-            feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
-            status TEXT NOT NULL DEFAULT 'planned',
-            completed_at TEXT,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (sprint_id, feature_id)
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    ensure_column(db, "sprint_features", "supervisor_run_id", "TEXT").await?;
-    ensure_column(db, "sprint_features", "current_workflow_run_id", "TEXT").await?;
-    ensure_column(db, "sprint_features", "current_patch_id", "TEXT").await?;
-    ensure_column(db, "sprint_features", "shard_path", "TEXT").await?;
-    ensure_column(db, "sprint_features", "development_state", "TEXT NOT NULL DEFAULT 'scheduled'").await?;
-    ensure_column(db, "sprint_features", "development_started_at", "TEXT").await?;
-    ensure_column(db, "sprint_features", "development_completed_at", "TEXT").await?;
-    ensure_column(db, "sprint_features", "integration_started_at", "TEXT").await?;
-    ensure_column(db, "sprint_features", "integration_completed_at", "TEXT").await?;
-    ensure_column(db, "sprint_features", "current_step_id", "TEXT").await?;
-    ensure_column(db, "sprint_features", "last_error", "TEXT").await?;
-    ensure_column(db, "sprint_features", "integration_skipped", "INTEGER DEFAULT 0").await?;
-
-    sqlx::query("UPDATE sprint_features SET integration_skipped = 0 WHERE integration_skipped IS NULL")
-        .execute(db)
-        .await?;
-
-    sqlx::query("DELETE FROM sprint_features WHERE feature_id LIKE 'manual-%'")
-        .execute(db)
-        .await?;
-
-    sqlx::query("DELETE FROM supervisor_work_units WHERE kind = 'feature_development' AND feature_id LIKE 'manual-%'")
-        .execute(db)
-        .await?;
-
-    sqlx::query("UPDATE planner_features SET current_sprint_id = NULL, current_supervisor_run_id = NULL, current_workflow_run_id = NULL, current_patch_id = NULL, status = 'deleted', updated_at = datetime('now') WHERE id LIKE 'manual-%'")
-        .execute(db)
-        .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sprint_events (
-            id TEXT PRIMARY KEY,
-            sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
-            sequence_no INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            event_time TEXT NOT NULL,
-            feature_id TEXT REFERENCES planner_features(id) ON DELETE SET NULL,
-            actor TEXT NOT NULL DEFAULT 'system',
-            message TEXT NOT NULL DEFAULT '',
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL,
-            UNIQUE (sprint_id, sequence_no)
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
+    ensure_column(db, "planner_features", "planner_id", "TEXT NOT NULL DEFAULT ''").await?;
+    ensure_column(db, "planner_features", "refined_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "locked_supervisor_run_id", "TEXT").await?;
+    ensure_column(db, "planner_features", "locked_at", "TEXT").await?;
+    ensure_column(db, "planner_features", "completed_at", "TEXT").await?;
 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS planner_feature_patches (
             id TEXT PRIMARY KEY,
             feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
-            repo_id TEXT NOT NULL REFERENCES planner_repos(id) ON DELETE CASCADE,
-            sprint_id TEXT REFERENCES sprints(id) ON DELETE SET NULL,
+            planner_id TEXT NOT NULL DEFAULT '' REFERENCES planner_workspaces(id) ON DELETE CASCADE,
             supervisor_run_id TEXT,
             workflow_run_id TEXT,
             patch_kind TEXT NOT NULL DEFAULT 'development',
@@ -467,72 +531,90 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_order ON planner_features (repo_id, sort_order)")
-    .execute(db)
-    .await?;
+    ensure_column(db, "planner_feature_patches", "planner_id", "TEXT NOT NULL DEFAULT ''").await?;
 
-    ensure_column(db, "planner_features", "current_sprint_id", "TEXT").await?;
-    ensure_column(db, "planner_features", "current_supervisor_run_id", "TEXT").await?;
-    ensure_column(db, "planner_features", "current_workflow_run_id", "TEXT").await?;
-    ensure_column(db, "planner_features", "current_patch_id", "TEXT").await?;
-    ensure_column(db, "planner_features", "development_state", "TEXT NOT NULL DEFAULT 'none'").await?;
-    ensure_column(db, "planner_features", "refined_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "scheduled_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "development_started_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "development_completed_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "integration_started_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "integration_completed_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "applied_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "unscheduled_at", "TEXT").await?;
-    ensure_column(db, "planner_features", "restarted_at", "TEXT").await?;
+    let patch_columns = sqlx::query("PRAGMA table_info(planner_feature_patches)")
+        .fetch_all(db)
+        .await?;
+    let patches_need_rebuild = patch_columns.iter().any(|row| {
+        matches!(row.get::<String, _>("name").as_str(), "repo_id" | "sprint_id")
+    });
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_status_updated ON planner_features (repo_id, status, updated_at)")
-    .execute(db)
-    .await?;
+    if patches_need_rebuild {
+        sqlx::query(
+            r#"
+            CREATE TABLE planner_feature_patches_next (
+                id TEXT PRIMARY KEY,
+                feature_id TEXT NOT NULL REFERENCES planner_features(id) ON DELETE CASCADE,
+                planner_id TEXT NOT NULL DEFAULT '' REFERENCES planner_workspaces(id) ON DELETE CASCADE,
+                supervisor_run_id TEXT,
+                workflow_run_id TEXT,
+                patch_kind TEXT NOT NULL DEFAULT 'development',
+                repo_ref TEXT NOT NULL,
+                base_commit TEXT,
+                head_commit TEXT,
+                patch_text TEXT NOT NULL,
+                patch_hash TEXT NOT NULL,
+                patch_path TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(db)
+        .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_development_state ON planner_features (repo_id, development_state, updated_at)")
-    .execute(db)
-    .await?;
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO planner_feature_patches_next (id, feature_id, planner_id, supervisor_run_id, workflow_run_id, patch_kind, repo_ref, base_commit, head_commit, patch_text, patch_hash, patch_path, created_at)
+            SELECT id, feature_id, COALESCE(NULLIF(planner_id, ''), NULLIF(repo_id, ''), ''), supervisor_run_id, workflow_run_id, patch_kind, repo_ref, base_commit, head_commit, patch_text, patch_hash, patch_path, created_at
+            FROM planner_feature_patches
+            "#,
+        )
+        .execute(db)
+        .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_completed ON planner_features (repo_id, development_completed_at)")
-    .execute(db)
-    .await?;
+        sqlx::query("DROP TABLE planner_feature_patches")
+            .execute(db)
+            .await?;
+        sqlx::query("ALTER TABLE planner_feature_patches_next RENAME TO planner_feature_patches")
+            .execute(db)
+            .await?;
+    }
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_repo_applied ON planner_features (repo_id, applied_at)")
-    .execute(db)
-    .await?;
+    sqlx::query("DROP TABLE IF EXISTS sprint_events")
+        .execute(db)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS sprint_features")
+        .execute(db)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS sprints")
+        .execute(db)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS planner_repos")
+        .execute(db)
+        .await?;
 
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_workspaces_root_default_updated ON planner_workspaces (root_repo_path, is_default, updated_at)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_planner_order ON planner_features (planner_id, sort_order, created_at)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_planner_status_updated ON planner_features (planner_id, status, updated_at)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_features_supervisor_lock ON planner_features (locked_supervisor_run_id, planner_id, completed_at)")
+        .execute(db)
+        .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_feature_patches_feature_created ON planner_feature_patches (feature_id, created_at)")
-    .execute(db)
-    .await?;
-
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_feature_patches_planner_created ON planner_feature_patches (planner_id, created_at)")
+        .execute(db)
+        .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_planner_feature_patches_workflow ON planner_feature_patches (workflow_run_id)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprints_repo_key ON sprints (repo_id, sprint_key)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_sprint_order ON sprint_features (sprint_id, sort_order)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_sprint_state ON sprint_features (sprint_id, development_state, updated_at)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_workflow ON sprint_features (current_workflow_run_id)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_features_supervisor_state ON sprint_features (supervisor_run_id, development_state, updated_at)")
-    .execute(db)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sprint_events_sprint_seq ON sprint_events (sprint_id, sequence_no)")
-    .execute(db)
-    .await?;
+        .execute(db)
+        .await?;
 
     let template_columns = sqlx::query("PRAGMA table_info(workflow_templates)")
         .fetch_all(db)

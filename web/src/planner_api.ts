@@ -7,8 +7,6 @@ export type FeaturePlanItem = {
   summary: string;
   rough_summary?: string | null;
   refinement_workflow_run_id?: string | null;
-  applied_sprint_id?: string | null;
-  applied_sprint_title?: string | null;
   applied_at?: string | null;
   requirements: string[];
   acceptance_criteria: string[];
@@ -23,7 +21,8 @@ export type PlannerWorkspace = {
   root_repo_path: string;
   title: string;
   is_default: boolean;
-  feature_plan_items: FeaturePlanItem[];
+  feature_count: number;
+  features: FeaturePlanItem[];
   created_at: string;
   updated_at: string;
 };
@@ -58,7 +57,7 @@ export function listPlannersForRepo(rootRepoPath: string): Promise<PlannerWorksp
   return fetchJson<PlannerWorkspace[]>(`/api/planners?${params.toString()}`);
 }
 
-export function createPlannerForRepo(body: { root_repo_path: string; title?: string | null; make_default?: boolean; feature_plan_items?: FeaturePlanItem[] }): Promise<PlannerWorkspace> {
+export function createPlannerForRepo(body: { root_repo_path: string; title?: string | null; make_default?: boolean; features?: FeaturePlanItem[] }): Promise<PlannerWorkspace> {
   return fetchJson<PlannerWorkspace>('/api/planners/create', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -73,24 +72,28 @@ export function ensurePlannerForRepo(body: { root_repo_path: string; title?: str
 }
 
 export function getPlanner(id: string): Promise<PlannerWorkspace> {
-  return fetchJson<PlannerWorkspace>(`/api/planners/${id}`);
+  return fetchJson<PlannerWorkspace>(`/api/planners/${encodeURIComponent(id)}`);
 }
 
-export function updatePlannerFeatures(id: string, featurePlanItems: FeaturePlanItem[]): Promise<PlannerWorkspace> {
-  return fetchJson<PlannerWorkspace>(`/api/planners/${id}`, {
+export function getPlannerFeature(featureId: string): Promise<FeaturePlanItem> {
+  return fetchJson<FeaturePlanItem>(`/api/planner-features/${encodeURIComponent(featureId)}`);
+}
+
+export function updatePlannerFeatures(id: string, features: FeaturePlanItem[]): Promise<PlannerWorkspace> {
+  return fetchJson<PlannerWorkspace>(`/api/planners/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ feature_plan_items: featurePlanItems }),
+    body: JSON.stringify({ features }),
   });
 }
 
 export function deletePlannerForRepo(id: string): Promise<{ ok: boolean }> {
-  return fetchJson<{ ok: boolean }>(`/api/planners/${id}`, {
+  return fetchJson<{ ok: boolean }>(`/api/planners/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
 }
 
 export function setDefaultPlanner(id: string): Promise<SetDefaultPlannerResponse> {
-  return fetchJson<SetDefaultPlannerResponse>(`/api/planners/${id}/default`, {
+  return fetchJson<SetDefaultPlannerResponse>(`/api/planners/${encodeURIComponent(id)}/default`, {
     method: 'POST',
     body: JSON.stringify({}),
   });

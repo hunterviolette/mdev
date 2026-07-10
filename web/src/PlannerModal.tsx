@@ -154,34 +154,61 @@ function normalizePlannerImportPayload(payload: unknown): unknown {
   return payload;
 }
 
+function newFeatureId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return `feature-${crypto.randomUUID()}`;
+  return `feature-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function portableExportFeature(item: FeaturePlanItem): Record<string, unknown> {
+  const { id, ...rest } = item as FeaturePlanItem & Record<string, unknown>;
+  return {
+    ...rest,
+    source_feature_id: id,
+  };
+}
+
+function portableImportFeature(item: unknown): FeaturePlanItem | null {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+  const record = item as Record<string, unknown>;
+  if (typeof record.title !== 'string' || !record.title.trim()) return null;
+
+  const { id: _ignoredId, source_feature_id: _sourceFeatureId, ...rest } = record;
+  return defaultFeatureDraft({
+    ...(rest as Partial<FeaturePlanItem>),
+    id: newFeatureId(),
+    title: record.title,
+    status: (typeof record.status === 'string' ? record.status : 'rough') as FeaturePlanItem['status'],
+    summary: typeof record.summary === 'string' ? record.summary : '',
+    rough_summary: typeof record.rough_summary === 'string' ? record.rough_summary : undefined,
+    requirements: Array.isArray(record.requirements) ? record.requirements.filter((value): value is string => typeof value === 'string') : [],
+    acceptance_criteria: Array.isArray(record.acceptance_criteria) ? record.acceptance_criteria.filter((value): value is string => typeof value === 'string') : [],
+    implementation_notes: Array.isArray(record.implementation_notes) ? record.implementation_notes.filter((value): value is string => typeof value === 'string') : [],
+    review_expectations: Array.isArray(record.review_expectations) ? record.review_expectations.filter((value): value is string => typeof value === 'string') : [],
+    target_files_or_areas: Array.isArray(record.target_files_or_areas) ? record.target_files_or_areas.filter((value): value is string => typeof value === 'string') : [],
+    dependencies: [],
+  } as FeaturePlanItem);
+}
+
 function plannerImportFeatures(payload: unknown): FeaturePlanItem[] {
   const normalized = normalizePlannerImportPayload(payload);
   if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return [];
   const features = (normalized as Record<string, unknown>).features;
   if (!Array.isArray(features)) return [];
-  return features.filter((item): item is FeaturePlanItem => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
-    const record = item as Record<string, unknown>;
-    return typeof record.id === 'string' && typeof record.title === 'string';
-  });
+  return features.map(portableImportFeature).filter((item): item is FeaturePlanItem => item !== null);
 }
 
 function mergePlannerFeatures(current: FeaturePlanItem[], incoming: FeaturePlanItem[]): FeaturePlanItem[] {
-  const merged = [...current];
+  const existingIds = new Set(current.map((item) => item.id));
+  const next = [...current];
   for (const item of incoming) {
-    const index = merged.findIndex((existing) => existing.id === item.id);
-    if (index >= 0) {
-      merged[index] = item;
-    } else {
-      merged.push(item);
+    let feature = item;
+    while (!feature.id || existingIds.has(feature.id)) {
+      feature = { ...feature, id: newFeatureId() };
     }
+    existingIds.add(feature.id);
+    next.push(feature);
   }
-  return merged;
-}
-
-function newFeatureId(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return `feature-${crypto.randomUUID()}`;
-  return `feature-${Date.now().toString(36)}`;
+  return next;
 }
 
 function newFeatureDraft(index: number): FeaturePlanItem {
@@ -205,7 +232,7 @@ function plannerFeatureCountLabel(count: number): string {
 }
 
 function plannerOptionLabel(option: PlannerWorkspace, appliedPlannerId: string | null): string {
-  const parts = [option.title, plannerFeatureCountLabel(option.feature_plan_items?.length ?? 0)];
+  const parts = [option.title, plannerFeatureCountLabel(option.feature_count ?? option.features?.length ?? 0)];
   if (option.id === appliedPlannerId) parts.push('current');
   if (option.is_default) parts.push('default');
   return parts.join(' · ');
@@ -251,7 +278,7 @@ export function PlannerModal(props: Props) {
   const selectedPlannerWorkspace = useMemo(() => {
     return plannerOptions.find((option) => option.id === appliedPlannerId) ?? plannerOptions.find((option) => option.is_default) ?? plannerOptions[0] ?? null;
   }, [plannerOptions, appliedPlannerId]);
-  const features = selectedPlannerWorkspace?.feature_plan_items ?? [];
+  const features = selectedPlannerWorkspace?.features ?? [];
   const multiSelectionMode = Boolean(props.selectionMode && props.onSelectFeatures);
   const singleSelectionMode = Boolean(props.selectionMode && props.onSelectFeature && !props.onSelectFeatures);
   const plannerSelectOptions = useMemo(() => plannerOptions.map((option) => ({
@@ -422,7 +449,7 @@ export function PlannerModal(props: Props) {
         root_repo_path: rootRepoPath,
         title: newPlannerTitle.trim() || repoPlannerTitle(rootRepoPath),
         make_default: plannerOptions.length === 0,
-        feature_plan_items: [],
+        features: [],
       });
       await setDefaultPlanner(planner.id);
       const plannerRows = await listPlannersForRepo(rootRepoPath);
@@ -441,17 +468,19 @@ export function PlannerModal(props: Props) {
 
   function downloadPlanner() {
     if (!selectedPlannerWorkspace) return;
+    const exportedFeatures = (selectedPlannerWorkspace.features ?? []).map(portableExportFeature);
     const payload = {
+      schema_id: 'planner_feature_export_v1',
       version: 1,
       kind: 'planner_features',
-      root_repo_path: selectedPlannerWorkspace.root_repo_path,
-      planner: {
-        id: selectedPlannerWorkspace.id,
-        title: selectedPlannerWorkspace.title,
+      exported_at: new Date().toISOString(),
+      source: {
+        planner_id: selectedPlannerWorkspace.id,
+        planner_title: selectedPlannerWorkspace.title,
         root_repo_path: selectedPlannerWorkspace.root_repo_path,
       },
-      features: selectedPlannerWorkspace.feature_plan_items ?? [],
-      feature_plan_items: selectedPlannerWorkspace.feature_plan_items ?? [],
+      root_repo_path: selectedPlannerWorkspace.root_repo_path,
+      features: exportedFeatures,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -497,7 +526,7 @@ export function PlannerModal(props: Props) {
       setBusy(true);
       const decisions = importPreview.items.map((item) => importDecisions[item.import_index]).filter(Boolean);
       const response = await applyPlannerImport(run.id, importPayload, decisions);
-      setRun(response.supervisor_run);
+      setRun(response.supervisor_run ?? null);
       setImportPayload(null);
       setImportPreview(null);
       setImportDecisions({});
@@ -708,7 +737,7 @@ export function PlannerModal(props: Props) {
             {isPending ? <Badge size="xs" color="yellow" variant="light">Pending</Badge> : null}
             {option.is_default ? <Badge size="xs" color="gray" variant="light">Default</Badge> : null}
           </Group>
-          <Text size="xs" c="dimmed">{option.id.slice(0, 8)} · {plannerFeatureCountLabel(option.feature_plan_items?.length ?? 0)}</Text>
+          <Text size="xs" c="dimmed">{option.id.slice(0, 8)} · {plannerFeatureCountLabel(option.feature_count ?? option.features?.length ?? 0)}</Text>
         </Stack>
       </Group>
     );

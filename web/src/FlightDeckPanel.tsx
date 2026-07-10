@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   Alert,
   Anchor,
@@ -25,8 +25,8 @@ import {
 } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
-import { listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
-import { getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, regenerateSupervisorQueueFeature, runSupervisorAction, setSupervisorQueue, unscheduleSupervisorFeature, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
+import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 
 type FlightDeckPanelProps = {
   navigate?: (path: string) => void;
@@ -680,7 +680,14 @@ function workflowType(unit: FlightDeckWorkUnit): string {
 }
 
 function manualShardIsIntegrationInput(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard' && isIntegrationReadyState(unit.state);
+  return workflowType(unit) === 'manual_shard'
+    && (
+      unit.telemetry?.staged_to_integration === true
+      || unit.telemetry?.integration_input === true
+      || normalize(unit.state) === 'ready_for_integration'
+      || normalize(unit.state) === 'integrating'
+      || normalize(unit.state) === 'integrated'
+    );
 }
 
 function manualShardHasStagedChanges(unit: FlightDeckWorkUnit): boolean {
@@ -702,8 +709,10 @@ function workflowCanPause(unit: FlightDeckWorkUnit): boolean {
 }
 
 function workflowCanRegenerate(unit: FlightDeckWorkUnit): boolean {
-  if (workflowType(unit) === 'integration') return !unit.workflow_deleted && Boolean(unit.workflow_run_id);
-  return workflowType(unit) === 'feature_development' && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
+  const type = workflowType(unit);
+  if (type === 'integration') return !unit.workflow_deleted && Boolean(unit.workflow_run_id);
+  if (type === 'manual_shard') return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
+  return (type === 'feature_development' || type === 'refine') && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
 }
 
 function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
@@ -712,6 +721,10 @@ function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
   if (type === 'refine') return !unit.workflow_deleted && Boolean(unit.feature_id);
   if (type === 'feature_development') return !unit.workflow_deleted && Boolean(unit.feature_id);
   return false;
+}
+
+function workflowDeleteLabel(unit: FlightDeckWorkUnit): string {
+  return workflowType(unit) === 'feature_development' ? 'Unqueue' : 'Delete';
 }
 
 function workflowCanStageManual(unit: FlightDeckWorkUnit): boolean {
@@ -785,11 +798,11 @@ function WorkflowProjectionCard(props: {
 
   const displayCapabilities = capabilities.length > 0 ? capabilities : historyHydration?.capabilities ?? [];
   const displayFallbackStages = recentStageExecutions.length > 0 ? [] : historyHydration?.stages ?? [];
+  const integrationState = normalize(unit.state);
   const canApplyFinalPatch = workflowType(unit) === 'integration'
     && !unit.workflow_deleted
     && Boolean(unit.workflow_run_id)
-    && props.supervisor.integration_run_id === unit.workflow_run_id
-    && normalize(props.supervisor.status) === 'ready_to_apply';
+    && ['patch_ready', 'integrated', 'ready_to_apply'].includes(integrationState);
 
 
   const title = unit.workflow_run_id ? (
@@ -811,26 +824,28 @@ function WorkflowProjectionCard(props: {
     <Title order={5} lineClamp={1}>{unit.title}</Title>
   );
 
-  async function runWorkflowAction(action: 'start_child_workflow' | 'pause_child_workflow' | 'regenerate_queue_feature' | 'dequeue_feature' | 'delete_manual_shard' | 'delete_refine_workflow' | 'stage_manual_shard' | 'unstage_manual_shard' | 'start_integration' | 'restart_integration' | 'apply' | 'cancel') {
-    if (workflowType(unit) !== 'integration' && !unit.feature_id) return;
-    if (action === 'regenerate_queue_feature') {
-      const confirmed = window.confirm(`Delete existing workflow/shard state for ${unit.title} and return it to queued draft state?`);
-      if (!confirmed) return;
-      await regenerateSupervisorQueueFeature(props.supervisor.id, unit.feature_id!);
-      props.onActionComplete?.();
-      return;
-    }
-    if (action === 'dequeue_feature') {
-      const deleteWorkflow = window.confirm(`Remove ${unit.title} from the feature queue?\n\nOK: delete workflow/development state.\nCancel: keep workflow/development state and only dequeue.`);
-      await unscheduleSupervisorFeature(props.supervisor.id, unit.feature_id!, deleteWorkflow ? 'delete_development' : 'preserve_development');
-      props.onActionComplete?.();
-      return;
-    }
-    if (action === 'restart_integration') {
-      const confirmed = window.confirm(`Delete and regenerate integration workflow for ${unit.title}?`);
+  async function runWorkflowAction(action: 'start_work_unit' | 'pause_work_unit' | 'regenerate_work_unit' | 'delete_work_unit' | 'stage_work_unit' | 'unstage_work_unit' | 'apply_integration' | 'cancel') {
+    if (action === 'regenerate_work_unit') {
+      const confirmed = workflowType(unit) === 'refine'
+        ? window.confirm(`Delete and recreate the refine workflow for ${unit.title}?`)
+        : window.confirm(`Delete existing workflow/shard state for ${unit.title} and return it to queued draft state?`);
       if (!confirmed) return;
     }
-    if (action === 'apply') {
+    if (action === 'delete_work_unit') {
+      const confirmed = workflowType(unit) === 'feature_development'
+        ? window.confirm(`Unqueue ${unit.title}? This deletes the supervisor workflow/workspace state and returns the planner feature to the queueable pool.`)
+        : window.confirm(`Delete ${unit.title}? This deletes the supervisor workflow/workspace state for this work unit.`);
+      if (!confirmed) return;
+    }
+    if (action === 'stage_work_unit') {
+      const confirmed = window.confirm(`Stage ${unit.title} to the integration pool? Backend validation requires staged git changes for manual shards.`);
+      if (!confirmed) return;
+    }
+    if (action === 'unstage_work_unit') {
+      const confirmed = window.confirm(`Unstage ${unit.title} from the integration pool?`);
+      if (!confirmed) return;
+    }
+    if (action === 'apply_integration') {
       const confirmed = window.confirm('Apply the final integration patch to the root repository?');
       if (!confirmed) return;
     }
@@ -838,23 +853,14 @@ function WorkflowProjectionCard(props: {
       const confirmed = window.confirm(`Pause integration workflow ${unit.title}?`);
       if (!confirmed) return;
     }
-    if (action === 'delete_manual_shard') {
-      const confirmed = window.confirm(`Delete manual shard ${unit.title}? This will not regenerate it.`);
-      if (!confirmed) return;
+
+    if (action === 'stage_work_unit' || action === 'unstage_work_unit') {
+      await runSupervisorAction(props.supervisor.id, { action: 'stage_work_unit', work_unit_id: unit.id, staged: action === 'stage_work_unit' });
+    } else if (action === 'apply_integration' || action === 'cancel') {
+      await runSupervisorAction(props.supervisor.id, { action });
+    } else {
+      await runSupervisorAction(props.supervisor.id, { action, work_unit_id: unit.id });
     }
-    if (action === 'delete_refine_workflow') {
-      const confirmed = window.confirm(`Delete refine workflow ${unit.title}? This removes it from the refine pool.`);
-      if (!confirmed) return;
-    }
-    if (action === 'stage_manual_shard') {
-      const confirmed = window.confirm(`Stage manual shard ${unit.title} for integration? Backend validation requires staged git changes in the shard.`);
-      if (!confirmed) return;
-    }
-    if (action === 'unstage_manual_shard') {
-      const confirmed = window.confirm(`Unstage manual shard ${unit.title} from integration?`);
-      if (!confirmed) return;
-    }
-    await runSupervisorAction(props.supervisor.id, action, workflowType(unit) === 'integration' ? {} : action === 'delete_manual_shard' || action === 'stage_manual_shard' || action === 'unstage_manual_shard' ? { manual_shard_id: unit.feature_id } : { feature_id: unit.feature_id });
     props.onActionComplete?.();
   }
 
@@ -889,21 +895,21 @@ function WorkflowProjectionCard(props: {
               </Group>
               <Group gap={6} wrap="nowrap">
                 {workflowCanUnstageManual(unit) ? (
-                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_manual_shard')}>Unstage</Button>
+                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Unstage from integration pool</Button>
                 ) : null}
                 {workflowCanPause(unit) ? (
-                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_child_workflow')}>Pause</Button>
+                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
                 ) : workflowCanRun(unit) ? (
-                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'start_integration' : 'start_child_workflow')}>Run</Button>
+                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
                 ) : null}
                 {workflowCanRegenerate(unit) ? (
-                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'restart_integration' : 'regenerate_queue_feature')}>Regenerate</Button>
+                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
                 ) : null}
                 {workflowCanStageManual(unit) ? (
-                  <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_manual_shard')}>Stage to integration</Button>
+                  <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to integration pool</Button>
                 ) : null}
                 {workflowCanDelete(unit) ? (
-                  <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction(workflowType(unit) === 'refine' ? 'delete_refine_workflow' : workflowType(unit) === 'feature_development' ? 'dequeue_feature' : 'delete_manual_shard')}>{workflowType(unit) === 'feature_development' ? 'Dequeue' : 'Delete'}</Button>
+                  <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
                 ) : null}
               </Group>
             </Group>
@@ -918,7 +924,7 @@ function WorkflowProjectionCard(props: {
                   size="md"
                   color="green"
                   variant="filled"
-                  onClick={() => void runWorkflowAction('apply')}
+                  onClick={() => void runWorkflowAction('apply_integration')}
                   style={{ minWidth: 260 }}
                 >
                   Apply final patch to root
@@ -969,8 +975,7 @@ function PoolSelectControl(props: { label: string; ariaLabel: string; data: Temp
         variant="unstyled"
         aria-label={props.ariaLabel}
         data={props.data}
-        value={props.value ?? undefined}
-        defaultValue={props.value === undefined ? props.defaultValue ?? undefined : undefined}
+        value={props.value ?? null}
         onChange={props.onChange}
         searchable={props.searchable}
         allowDeselect={false}
@@ -1004,8 +1009,7 @@ function PoolNumberControl(props: { label: string; ariaLabel: string; value: num
 }
 
 function PoolControls(props: { groupKey: string; templateOptions: TemplateOption[]; settings: FlightDeckPoolSetting; onSettingsChange: (patch: FlightDeckPoolSetting) => void }) {
-  const defaultTemplate = props.templateOptions[0]?.value ?? null;
-  const templateValue = props.settings.template_id ?? defaultTemplate;
+  const templateValue = props.settings.template_id ?? null;
   const modeValue = props.settings.mode ?? (props.groupKey === 'integration' ? 'manual' : 'series');
   const concurrencyValue = Math.max(1, Math.min(64, props.settings.concurrency ?? 1));
 
@@ -1056,7 +1060,7 @@ function unitHasPatch(unit: FlightDeckWorkUnit): boolean {
 }
 
 function manualShardIsStaged(unit: FlightDeckWorkUnit): boolean {
-  return unitHasPatch(unit) || isIntegrationReadyState(unit.state);
+  return manualShardIsIntegrationInput(unit);
 }
 
 function featureIsIntegrationReady(unit: FlightDeckWorkUnit): boolean {
@@ -1117,7 +1121,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     if (!confirmed) return;
     setBusyKey(unit.id);
     try {
-      await runSupervisorAction(props.supervisor.id, 'skip_integration_input', { feature_id: unit.feature_id });
+      await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
       props.onActionComplete?.();
     } finally {
       setBusyKey(null);
@@ -1128,7 +1132,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     if (!unit.feature_id) return;
     setBusyKey(unit.id);
     try {
-      await runSupervisorAction(props.supervisor.id, 'unskip_integration_input', { feature_id: unit.feature_id });
+      await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
       props.onActionComplete?.();
     } finally {
       setBusyKey(null);
@@ -1141,7 +1145,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     if (!confirmed) return;
     setBusyKey(unit.id);
     try {
-      await runSupervisorAction(props.supervisor.id, 'skip_integration_input', { manual_shard_id: unit.feature_id });
+      await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
       props.onActionComplete?.();
     } finally {
       setBusyKey(null);
@@ -1152,7 +1156,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     if (!unit.feature_id) return;
     setBusyKey(unit.id);
     try {
-      await runSupervisorAction(props.supervisor.id, 'unskip_integration_input', { manual_shard_id: unit.feature_id });
+      await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
       props.onActionComplete?.();
     } finally {
       setBusyKey(null);
@@ -1337,13 +1341,13 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
   const queued = props.units.some((unit) => unit.state === 'queued');
   const waiting = props.units.some((unit) => unit.state === 'waiting_user');
   const settings = poolSetting(props.supervisor, props.groupKey);
-  const selectedTemplate = settings.template_id ?? props.templateOptions[0]?.value ?? null;
+  const selectedTemplate = settings.template_id ?? null;
   const [manualBusy, setManualBusy] = useState(false);
   const [manualNameOpen, setManualNameOpen] = useState(false);
   const [manualName, setManualName] = useState('');
   async function updateSettings(patch: FlightDeckPoolSetting) {
     const flightDeckSettings = nextFlightDeckSettings(props.supervisor, props.groupKey, patch);
-    await runSupervisorAction(props.supervisor.id, 'update_flight_deck_settings', { flight_deck_settings: flightDeckSettings });
+    await runSupervisorAction(props.supervisor.id, { action: 'update_flight_deck_settings', flight_deck_settings: flightDeckSettings as Record<string, unknown> });
     props.onActionComplete?.();
   }
   const poolControls = <PoolControls groupKey={props.groupKey} templateOptions={props.templateOptions} settings={settings} onSettingsChange={(patch) => void updateSettings(patch)} />;
@@ -1353,9 +1357,12 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     setManualBusy(true);
     props.onManualShardCreating?.(name);
     try {
-      const payload: Record<string, unknown> = { title: name };
-      if (selectedTemplate) payload.template_id = selectedTemplate;
-      await runSupervisorAction(props.supervisor.id, 'create_manual_shard', payload);
+      await runSupervisorAction(props.supervisor.id, {
+        action: 'create_work_unit',
+        pool_kind: 'manual_shard',
+        name,
+        template_id: selectedTemplate
+      });
       setManualName('');
       setManualNameOpen(false);
       props.onActionComplete?.();
@@ -1367,18 +1374,18 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
 
   async function runFeaturePoolAction() {
     if (running) {
-      await runSupervisorAction(props.supervisor.id, 'pause_feature_pool', {});
+      await runSupervisorAction(props.supervisor.id, { action: 'pause_feature_pool' });
       props.onActionComplete?.();
       return;
     }
 
-    await runSupervisorAction(props.supervisor.id, 'resume_feature_pool', {});
+    await runSupervisorAction(props.supervisor.id, { action: 'resume_feature_pool' });
     const targets = props.units.filter((unit) => {
       if (!unit.feature_id || unit.workflow_deleted) return false;
       return unit.state === 'queued' || unit.state === 'waiting_user';
     });
     for (const unit of targets) {
-      await runSupervisorAction(props.supervisor.id, 'start_child_workflow', { feature_id: unit.feature_id });
+      await runSupervisorAction(props.supervisor.id, { action: 'start_work_unit', work_unit_id: unit.id });
     }
     props.onActionComplete?.();
   }
@@ -1386,10 +1393,11 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
   if (props.groupKey === 'integration') {
     const readiness = integrationReadinessModel(props.supervisor);
     const canRunIntegration = readiness.relevantTotal > 0 && readiness.readyTotal === readiness.relevantTotal && !running;
+    const integrationWorkUnitId = `${props.supervisor.id}:integration`;
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
-        <Button size="xs" variant="default" disabled={!canRunIntegration} onClick={() => void runSupervisorAction(props.supervisor.id, 'start_integration', {}).then(() => props.onActionComplete?.())}>Run integration</Button>
+        <Button size="xs" variant="default" disabled={!canRunIntegration} onClick={() => void runSupervisorAction(props.supervisor.id, { action: 'start_work_unit', work_unit_id: integrationWorkUnitId }).then(() => props.onActionComplete?.())}>Run integration</Button>
       </Group>
     );
   }
@@ -1566,7 +1574,158 @@ function TopologyMap(props: { supervisor: FlightDeckSupervisor; templateOptions:
   );
 }
 
-function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
+function SupervisorPlannerOptionsModal(props: {
+  opened: boolean;
+  supervisor: FlightDeckSupervisor | null;
+  onClose: () => void;
+  onApplied: () => Promise<void> | void;
+  onError?: (message: string) => void;
+}) {
+  const supervisor = props.supervisor;
+  const [planners, setPlanners] = useState<PlannerWorkspace[]>([]);
+  const [selectedPlannerId, setSelectedPlannerId] = useState<string | null>(null);
+  const [newPlannerTitle, setNewPlannerTitle] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const supervisorSelectedPlannerId = typeof supervisor?.context?.selected_planner_id === 'string'
+    ? supervisor.context.selected_planner_id
+    : typeof supervisor?.context?.queue_planner_id === 'string'
+      ? supervisor.context.queue_planner_id
+      : null;
+
+  async function load() {
+    if (!supervisor) return;
+    setLoading(true);
+    try {
+      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      setPlanners(rows);
+      setSelectedPlannerId((current) => current ?? supervisorSelectedPlannerId ?? rows.find((planner) => planner.is_default)?.id ?? rows[0]?.id ?? null);
+      setNewPlannerTitle((current) => current.trim() || `${supervisor.title || 'Supervisor'} Planner`);
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!props.opened) return;
+    setSelectedPlannerId(supervisorSelectedPlannerId);
+    void load();
+  }, [props.opened, supervisor?.id, supervisorSelectedPlannerId]);
+
+  async function assignPlanner() {
+    if (!supervisor || !selectedPlannerId) return;
+    setLoading(true);
+    try {
+      const settings = {
+        ...supervisorFlightDeckSettings(supervisor),
+        selected_planner_id: selectedPlannerId,
+        queue_planner_id: selectedPlannerId,
+      } as Record<string, unknown>;
+      await runSupervisorAction(supervisor.id, {
+        action: 'update_flight_deck_settings',
+        flight_deck_settings: settings,
+      });
+      await props.onApplied();
+      props.onClose();
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createPlanner() {
+    if (!supervisor) return;
+    const title = newPlannerTitle.trim() || `${supervisor.title || 'Supervisor'} Planner`;
+    setLoading(true);
+    try {
+      const planner = await createPlannerForRepo({
+        root_repo_path: supervisor.root_repo_path,
+        title,
+        make_default: false,
+        features: [],
+      });
+      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      setPlanners(rows.some((row) => row.id === planner.id) ? rows : [planner, ...rows]);
+      setSelectedPlannerId(planner.id);
+      setNewPlannerTitle('');
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function deletePlanner() {
+    if (!supervisor || !selectedPlannerId) return;
+    const planner = planners.find((item) => item.id === selectedPlannerId);
+    if (!planner) return;
+    const confirmed = window.confirm(`Delete planner "${planner.title}"? This removes the planner feature log and cannot be undone.`);
+    if (!confirmed) return;
+    setLoading(true);
+    try {
+      await deletePlannerForRepo(planner.id);
+      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      setPlanners(rows);
+      setSelectedPlannerId(rows.find((row) => row.id === supervisorSelectedPlannerId)?.id ?? rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
+      await props.onApplied();
+    } catch (err) {
+      props.onError?.(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Modal opened={props.opened} onClose={props.onClose} title="Supervisor planner options" centered size="lg" zIndex={360}>
+      <Stack gap="sm">
+        <Text size="sm" c="dimmed">
+          The supervisor owns the active planner assignment. Planner options only create/delete planner logs; assigning one writes to supervisor state.
+        </Text>
+        <Select
+          label="Supervisor selected planner"
+          placeholder="Select planner for this supervisor"
+          value={selectedPlannerId}
+          onChange={setSelectedPlannerId}
+          data={planners.map((planner) => {
+            const featureCount = planner.feature_count ?? planner.features?.length ?? 0;
+            return {
+              value: planner.id,
+              label: `${planner.title} · ${featureCount} feature${featureCount === 1 ? '' : 's'}${planner.id === supervisorSelectedPlannerId ? ' · current' : ''}`,
+            };
+          })}
+          searchable
+          comboboxProps={{ withinPortal: true, zIndex: 700 }}
+          disabled={loading || !supervisor}
+        />
+        <Group justify="space-between" align="end" wrap="nowrap">
+          <TextInput
+            label="New planner name"
+            value={newPlannerTitle}
+            onChange={(event) => setNewPlannerTitle(event.currentTarget.value)}
+            style={{ flex: 1 }}
+          />
+          <Button size="xs" variant="light" onClick={() => void createPlanner()} loading={loading} disabled={!supervisor}>Create planner</Button>
+        </Group>
+        <Group justify="space-between" gap="xs" wrap="nowrap">
+          <Button size="xs" color="red" variant="light" onClick={() => void deletePlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
+            Delete selected planner
+          </Button>
+          <Group gap="xs" wrap="nowrap">
+            <Button size="xs" variant="default" onClick={props.onClose}>Cancel</Button>
+            <Button size="xs" onClick={() => void assignPlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
+              Assign to supervisor
+            </Button>
+          </Group>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
+function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: FlightDeckSupervisor) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
   const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting_user').length;
   const failed = supervisor.work_units.filter((unit) => unit.state === 'failed' || unit.state === 'blocked').length;
@@ -1589,7 +1748,7 @@ function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOp
           </Stack>
           <Button
             variant="light"
-            onClick={() => props.onOpenPlanner?.(supervisor)}
+            onClick={() => props.onOpenPlannerOptions?.(supervisor)}
           >
             Planner options
           </Button>
@@ -1613,6 +1772,7 @@ function MissionBar(props: {
   setStateFilter: (value: string | null) => void;
   setKindFilter: (value: string | null) => void;
   setIncludeDeleted: (value: boolean) => void;
+  onOpenSupervisorManagement: () => void;
 }) {
   const supervisorOptions = (props.deck?.supervisors ?? []).map((supervisor) => ({ value: supervisor.id, label: supervisor.title || supervisor.id.slice(0, 8) }));
   const stateOptions = ['queued', 'running', 'waiting_user', 'failed', 'patch_ready', 'ready_for_integration', 'integrating', 'integrated', 'deleted'].map((value) => ({ value, label: titleCase(value) }));
@@ -1649,7 +1809,10 @@ function MissionBar(props: {
               <Text fw={900}>{alerts.length}</Text>
             </Stack>
           </Group>
-          <Button variant="light" onClick={() => props.setFiltersOpen(!props.filtersOpen)}>{props.filtersOpen ? 'Hide filters' : 'Show filters'}</Button>
+          <Group gap="xs" wrap="nowrap">
+            <Button variant="light" onClick={() => props.setFiltersOpen(!props.filtersOpen)}>{props.filtersOpen ? 'Hide filters' : 'Show filters'}</Button>
+            <Button onClick={props.onOpenSupervisorManagement}>Supervisor management</Button>
+          </Group>
         </Group>
 
         {props.filtersOpen ? (
@@ -1682,18 +1845,19 @@ const pageShellStyle: CSSProperties = {
 
 function DequeueFeatureModal(props: {
   opened: boolean;
-  feature: { feature_id: string; title: string; current_workflow_run_id?: string | null; development_state?: string | null } | null;
+  feature: { feature_id: string; title: string; current_workflow_run_id?: string | null; development_state?: string | null; has_development_diff?: boolean | null } | null;
   onClose: () => void;
-  onConfirm: (mode: 'preserve_development' | 'delete_development') => Promise<void>;
+  onConfirm: () => Promise<void>;
 }) {
   const [submitting, setSubmitting] = useState(false);
   const hasWorkflow = Boolean(props.feature?.current_workflow_run_id);
+  const hasDevelopmentDiff = Boolean(props.feature?.has_development_diff);
   const developmentState = props.feature?.development_state ?? 'queued';
 
-  async function confirm(mode: 'preserve_development' | 'delete_development') {
+  async function confirm() {
     setSubmitting(true);
     try {
-      await props.onConfirm(mode);
+      await props.onConfirm();
     } finally {
       setSubmitting(false);
     }
@@ -1705,12 +1869,14 @@ function DequeueFeatureModal(props: {
         <Text size="sm">
           Remove <Text span fw={800}>{props.feature?.title ?? 'this feature'}</Text> from this supervisor queue.
         </Text>
-        {hasWorkflow ? (
-          <Alert color="yellow" title="Existing workflow found">
-            This feature already has a workflow. Choose whether to keep the workflow record and development artifacts, or delete them and reset the feature for later scheduling.
+        {hasDevelopmentDiff ? (
+          <Alert color="yellow" title="Workspace changes found">
+            Unqueue deletes the supervisor workflow/workspace state and discards its local file changes. The planner feature itself is not deleted.
           </Alert>
+        ) : hasWorkflow ? (
+          <Text size="sm" c="dimmed">This workflow has no detected file changes, so it can be removed without preserving a diff. The planner feature itself is not deleted.</Text>
         ) : (
-          <Text size="sm" c="dimmed">No workflow has been created yet. Delete will remove the queued development state and reset the feature for later scheduling.</Text>
+          <Text size="sm" c="dimmed">Unqueue removes this feature from the supervisor queue. The planner feature itself is not deleted.</Text>
         )}
         <Group gap="xs">
           <Badge size="xs" color="gray">{titleCase(developmentState)}</Badge>
@@ -1718,8 +1884,7 @@ function DequeueFeatureModal(props: {
         </Group>
         <Group justify="flex-end" gap="xs">
           <Button size="xs" variant="default" onClick={props.onClose} disabled={submitting}>Cancel</Button>
-          <Button size="xs" variant="light" onClick={() => void confirm('preserve_development')} loading={submitting}>{hasWorkflow ? 'Keep workflow' : 'Dequeue only'}</Button>
-          <Button size="xs" color="red" onClick={() => void confirm('delete_development')} loading={submitting}>{hasWorkflow ? 'Delete workflow' : 'Delete queue state'}</Button>
+          <Button size="xs" color="red" onClick={() => void confirm()} loading={submitting}>Unqueue</Button>
         </Group>
       </Stack>
     </Modal>
@@ -1739,37 +1904,31 @@ function FeatureQueueModal(props: {
   const [queueLoading, setQueueLoading] = useState(false);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [plannerOptions, setPlannerOptions] = useState<PlannerWorkspace[]>([]);
-  const [queuePlannerId, setQueuePlannerId] = useState<string | null>(null);
+  const selectedPlannerId = queue?.current_planner_id ?? null;
   const [dequeueFeature, setDequeueFeature] = useState<SupervisorQueueProjection['items'][number] | null>(null);
+  const queuedFeaturesRef = useRef<SupervisorQueuedFeature[]>([]);
+  const queueWriteRef = useRef<Promise<void>>(Promise.resolve());
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!props.opened || !supervisor?.root_repo_path) {
-      setPlannerOptions([]);
-      setQueuePlannerId(null);
-      return () => {
-        cancelled = true;
-      };
-    }
-    void listPlannersForRepo(supervisor.root_repo_path)
-      .then((rows) => {
-        if (cancelled) return;
-        setPlannerOptions(rows);
-        setQueuePlannerId((current) => current && rows.some((row) => row.id === current) ? current : rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
-      })
-      .catch((err) => {
-        if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [props.opened, supervisor?.root_repo_path]);
+  function updateQueuedFeatures(next: SupervisorQueuedFeature[]) {
+    queuedFeaturesRef.current = next;
+    setQueuedFeatures(next);
+  }
+
+  const uniquePlannerOptions = useMemo(() => {
+    const seen = new Set<string>();
+    return plannerOptions.filter((planner) => {
+      const id = planner.id.trim();
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }, [plannerOptions]);
 
   useEffect(() => {
     let cancelled = false;
     if (!props.opened || !supervisorId) {
       setQueue(null);
-      setQueuedFeatures([]);
+      updateQueuedFeatures([]);
       setQueueError(null);
       return () => {
         cancelled = true;
@@ -1777,11 +1936,13 @@ function FeatureQueueModal(props: {
     }
     setQueueLoading(true);
     setQueueError(null);
-    void getSupervisorQueue(supervisorId, queuePlannerId)
+    void getSupervisorQueue(supervisorId)
       .then((next) => {
         if (cancelled) return;
         setQueue(next);
-        setQueuedFeatures(next.queued_features ?? []);
+        updateQueuedFeatures(next.queued_features ?? []);
+        const nextPlanners = next.planners ?? [];
+        setPlannerOptions(nextPlanners as PlannerWorkspace[]);
       })
       .catch((err) => {
         if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
@@ -1792,7 +1953,7 @@ function FeatureQueueModal(props: {
     return () => {
       cancelled = true;
     };
-  }, [props.opened, supervisorId, queuePlannerId]);
+  }, [props.opened, supervisorId]);
 
   const selectedIds = queuedFeatures.map((item) => item.feature_id);
   const selectedSet = new Set(selectedIds);
@@ -1812,37 +1973,55 @@ function FeatureQueueModal(props: {
     return items.find((item) => item.feature_id === featureId) ?? null;
   }
 
+  function queueItemWorkUnit(item: SupervisorQueueProjection['items'][number]) {
+    return supervisor?.work_units.find((unit) => workflowType(unit) === 'feature_development' && unit.feature_id === item.feature_id) ?? null;
+  }
+
   async function autoDeleteDequeue(item: SupervisorQueueProjection['items'][number]) {
     if (!supervisor) return;
-    await unscheduleSupervisorFeature(supervisor.id, item.feature_id, 'delete_development');
-    const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
+    const workUnit = queueItemWorkUnit(item);
+    if (workUnit) {
+      await runSupervisorAction(supervisor.id, { action: 'delete_work_unit', work_unit_id: workUnit.id });
+    } else {
+      await persistQueueSelection(queuedFeaturesRef.current.filter((queued) => queued.feature_id !== item.feature_id));
+    }
+    const next = await getSupervisorQueue(supervisor.id);
     setQueue(next);
-    setQueuedFeatures(next.queued_features ?? []);
+    updateQueuedFeatures(next.queued_features ?? []);
     await props.onApplied();
   }
 
   async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
     if (!supervisor) return;
+    const activePlannerId = selectedPlannerId;
     const featureSettings = poolSetting(supervisor, 'feature_development');
     const integrationSettings = poolSetting(supervisor, 'integration');
     const uniqueQueuedFeatures = nextQueuedFeatures.filter((item, index, rows) => item.feature_id && rows.findIndex((candidate) => candidate.feature_id === item.feature_id) === index);
+    updateQueuedFeatures(uniqueQueuedFeatures);
     setQueueLoading(true);
     setQueueError(null);
+
+    const write = async () => {
+      try {
+        await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures, {
+          workflow_template_id: featureSettings.template_id ?? null,
+          integration_template_id: integrationSettings.template_id ?? null,
+          feature_concurrency: featureSettings.concurrency ?? null,
+          integration_policy: integrationSettings.mode === 'auto' ? 'auto' : 'manual',
+          auto_start: false,
+        });
+        const next = await getSupervisorQueue(supervisor.id);
+        setQueue(next);
+        updateQueuedFeatures(next.queued_features ?? []);
+        await props.onApplied();
+      } catch (err) {
+        setQueueError(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    queueWriteRef.current = queueWriteRef.current.then(write, write);
     try {
-      await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures, {
-        workflow_template_id: featureSettings.template_id ?? null,
-        integration_template_id: integrationSettings.template_id ?? null,
-        feature_concurrency: featureSettings.concurrency ?? null,
-        integration_policy: integrationSettings.mode === 'auto' ? 'auto' : 'manual',
-        auto_start: false,
-        planner_id: queuePlannerId
-      });
-      const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
-      setQueue(next);
-      setQueuedFeatures(next.queued_features ?? []);
-      await props.onApplied();
-    } catch (err) {
-      setQueueError(err instanceof Error ? err.message : String(err));
+      await queueWriteRef.current;
     } finally {
       setQueueLoading(false);
     }
@@ -1859,40 +2038,45 @@ function FeatureQueueModal(props: {
         setDequeueFeature(item);
         return;
       }
-      void persistQueueSelection(queuedFeatures.filter((item) => item.feature_id !== featureId));
+      void persistQueueSelection(queuedFeaturesRef.current.filter((item) => item.feature_id !== featureId));
       return;
     }
 
-    const planner = plannerOptions.find((item) => item.id === queuePlannerId);
-    if (!queuePlannerId || !planner) return;
+    const planner = uniquePlannerOptions.find((item) => item.id === selectedPlannerId);
+    if (!selectedPlannerId || !planner) return;
     void persistQueueSelection([
-      ...queuedFeatures.filter((item) => item.feature_id !== featureId),
+      ...queuedFeaturesRef.current.filter((item) => item.feature_id !== featureId),
       {
         feature_id: featureId,
-        planner_id: queuePlannerId,
-        planner_title: planner.title
+        planner_id: latestQueueItem(featureId)?.planner_id ?? selectedPlannerId,
+        planner_title: latestQueueItem(featureId)?.planner_title ?? planner.title
       }
     ]);
   }
 
   function moveQueuedFeature(featureId: string, direction: -1 | 1) {
-    const index = queuedFeatures.findIndex((item) => item.feature_id === featureId);
+    const currentQueuedFeatures = queuedFeaturesRef.current;
+    const index = currentQueuedFeatures.findIndex((item) => item.feature_id === featureId);
     const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= queuedFeatures.length) return;
-    const next = [...queuedFeatures];
+    if (index < 0 || nextIndex < 0 || nextIndex >= currentQueuedFeatures.length) return;
+    const next = [...currentQueuedFeatures];
     const current = next[index];
     next[index] = next[nextIndex];
     next[nextIndex] = current;
-    setQueuedFeatures(next);
+    updateQueuedFeatures(next);
     void persistQueueSelection(next);
   }
 
-  async function confirmDequeue(mode: 'preserve_development' | 'delete_development') {
+  async function confirmDequeue() {
     if (!supervisor || !dequeueFeature) return;
-    await unscheduleSupervisorFeature(supervisor.id, dequeueFeature.feature_id, mode);
-    const next = await getSupervisorQueue(supervisor.id, queuePlannerId);
+    const workUnit = queueItemWorkUnit(dequeueFeature);
+    if (workUnit) {
+      await runSupervisorAction(supervisor.id, { action: 'delete_work_unit', work_unit_id: workUnit.id });
+    }
+    await persistQueueSelection(queuedFeaturesRef.current.filter((item) => item.feature_id !== dequeueFeature.feature_id));
+    const next = await getSupervisorQueue(supervisor.id);
     setQueue(next);
-    setQueuedFeatures(next.queued_features ?? []);
+    updateQueuedFeatures(next.queued_features ?? []);
     setDequeueFeature(null);
     await props.onApplied();
   }
@@ -1906,15 +2090,13 @@ function FeatureQueueModal(props: {
     <Modal opened={props.opened} onClose={props.onClose} title="Manage feature queue" size="calc(100vw - 160px)" centered zIndex={320}>
       <Stack gap="sm">
         <Text size="sm" c="dimmed">Queue and dequeue refined planner features for this supervisor. Planner remains the feature ledger; the supervisor owns queue execution.</Text>
-        <Select
-          label="Queueable planner"
-          description="Only this planner's unqueued features can be queued. Features already queued from other planners stay visible for dequeue."
-          data={plannerOptions.map((planner) => ({ value: planner.id, label: planner.title }))}
-          value={queuePlannerId}
-          onChange={setQueuePlannerId}
-          searchable
-          clearable={false}
-        />
+        <Stack gap={2}>
+          <Text size="sm" fw={700}>Queueable planner</Text>
+          <Text size="sm" c="dimmed">
+            {uniquePlannerOptions.find((planner) => planner.id === selectedPlannerId)?.title ?? selectedPlannerId ?? 'No supervisor planner selected'}
+          </Text>
+          <Text size="xs" c="dimmed">Selected by supervisor state. The queue cannot override it.</Text>
+        </Stack>
         <Group gap="xs">
           <Badge color="blue" variant="light">{selectedIds.length} queued</Badge>
           <Badge color="gray" variant="light">{items.length} supervisor-visible planner features</Badge>
@@ -2007,10 +2189,17 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [plannerSupervisor, setPlannerSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [plannerCreateFeatureOnOpen, setPlannerCreateFeatureOnOpen] = useState(false);
   const [plannerSelectFeatureOnOpen, setPlannerSelectFeatureOnOpen] = useState(false);
-    const [queueSupervisor, setQueueSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [queueSupervisor, setQueueSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [plannerOptionsSupervisor, setPlannerOptionsSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<FlightDeckSupervisor | null>(null);
   const [plannerRefinementTemplateId, setPlannerRefinementTemplateId] = useState<string | null>(null);
   const [creatingRefineFeatureId, setCreatingRefineFeatureId] = useState<string | null>(null);
+  const [supervisorManagementOpen, setSupervisorManagementOpen] = useState(false);
+  const [newSupervisorTitle, setNewSupervisorTitle] = useState('Supervisor');
+  const [newSupervisorRootRepoPath, setNewSupervisorRootRepoPath] = useState('');
+  const [creatingSupervisor, setCreatingSupervisor] = useState(false);
+  const [deleteSupervisorId, setDeleteSupervisorId] = useState<string | null>(null);
+  const [deletingSupervisorId, setDeletingSupervisorId] = useState<string | null>(null);
   const templateOptions = useMemo(() => workflowTemplateOptions(templates), [templates]);
 
   useEffect(() => {
@@ -2088,6 +2277,54 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     }
   }
 
+  async function createFlightDeckSupervisor() {
+    const title = newSupervisorTitle.trim() || 'Supervisor';
+    const rootRepoPath = newSupervisorRootRepoPath.trim();
+    if (!rootRepoPath) {
+      setError('Root repo path is required.');
+      return;
+    }
+
+    setCreatingSupervisor(true);
+    setError(null);
+    try {
+      await createSupervisorRun({
+        title,
+        root_repo_path: rootRepoPath,
+        strategy: 'series',
+        workflow_template_id: null,
+        integration_template_id: null,
+        feature_plan_items: [],
+        execution_plan_items: [],
+        context: {}
+      });
+      setNewSupervisorTitle('Supervisor');
+      setNewSupervisorRootRepoPath('');
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreatingSupervisor(false);
+    }
+  }
+
+  async function removeFlightDeckSupervisor(supervisor: FlightDeckSupervisor) {
+    const confirmed = window.confirm(`Delete supervisor "${supervisor.title}"? This removes the supervisor record and cannot be undone from Flight Deck.`);
+    if (!confirmed) return;
+
+    setDeletingSupervisorId(supervisor.id);
+    setError(null);
+    try {
+      await deleteSupervisorRun(supervisor.id);
+      setDeleteSupervisorId((current) => current === supervisor.id ? null : current);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingSupervisorId(null);
+    }
+  }
+
   return (
     <Box p="md" style={pageShellStyle}>
       <Stack gap="md">
@@ -2103,7 +2340,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           setStateFilter={setStateFilter}
           setKindFilter={setKindFilter}
           setIncludeDeleted={setIncludeDeleted}
+          onOpenSupervisorManagement={() => setSupervisorManagementOpen(true)}
         />
+
 
         {error ? <Alert color="red">{error}</Alert> : null}
         {creatingRefineFeatureId ? <Alert color="blue">Creating refine workflow for selected feature…</Alert> : null}
@@ -2111,7 +2350,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
 
         <Stack gap="lg" pr="sm">
           {deck?.supervisors.length ? deck.supervisors.map((supervisor) => (
-            <SupervisorCockpit key={supervisor.id} supervisor={supervisor} templateOptions={templateOptions} navigate={props.navigate} onOpenPlanner={openPlanner} onActionComplete={() => void refresh()} />
+            <SupervisorCockpit key={supervisor.id} supervisor={supervisor} templateOptions={templateOptions} navigate={props.navigate} onOpenPlanner={openPlanner} onOpenPlannerOptions={setPlannerOptionsSupervisor} onActionComplete={() => void refresh()} />
           )) : !loading ? (
             <Card withBorder radius="xl" p="lg">
               <Text c="dimmed">No supervisors matched the current filters.</Text>
@@ -2154,18 +2393,72 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           </Group>
         </Stack>
       </Modal>
+      <Modal opened={supervisorManagementOpen} onClose={() => setSupervisorManagementOpen(false)} title="Supervisor management" centered size="lg">
+        <Stack gap="lg">
+          <Stack gap="sm">
+            <Text fw={700}>Create supervisor</Text>
+            <TextInput label="Title" value={newSupervisorTitle} onChange={(event) => setNewSupervisorTitle(event.currentTarget.value)} />
+            <TextInput label="Root repo path" value={newSupervisorRootRepoPath} onChange={(event) => setNewSupervisorRootRepoPath(event.currentTarget.value)} />
+            <Group justify="flex-end">
+              <Button onClick={() => void createFlightDeckSupervisor()} loading={creatingSupervisor}>Create supervisor</Button>
+            </Group>
+          </Stack>
+
+          <Divider />
+
+          <Stack gap="sm">
+            <Text fw={700}>Delete supervisor</Text>
+            <Select
+              label="Supervisor"
+              placeholder="Select supervisor"
+              value={deleteSupervisorId}
+              onChange={setDeleteSupervisorId}
+              data={(deck?.supervisors ?? []).map((supervisor) => ({ value: supervisor.id, label: supervisor.title }))}
+              searchable
+              clearable
+            />
+            <Group justify="flex-end">
+              <Button
+                color="red"
+                variant="light"
+                disabled={!deleteSupervisorId}
+                loading={deleteSupervisorId ? deletingSupervisorId === deleteSupervisorId : false}
+                onClick={() => {
+                  const supervisor = (deck?.supervisors ?? []).find((item) => item.id === deleteSupervisorId);
+                  if (supervisor) void removeFlightDeckSupervisor(supervisor);
+                }}
+              >
+                Delete selected supervisor
+              </Button>
+            </Group>
+          </Stack>
+        </Stack>
+      </Modal>
       <FeatureQueueModal
         opened={queueSupervisor !== null}
         supervisor={queueSupervisor ? deck?.supervisors.find((item) => item.id === queueSupervisor.id) ?? queueSupervisor : null}
         onClose={() => setQueueSupervisor(null)}
         onApplied={refresh}
       />
+      <SupervisorPlannerOptionsModal
+        opened={plannerOptionsSupervisor !== null}
+        supervisor={plannerOptionsSupervisor ? deck?.supervisors.find((item) => item.id === plannerOptionsSupervisor.id) ?? plannerOptionsSupervisor : null}
+        onClose={() => setPlannerOptionsSupervisor(null)}
+        onApplied={refresh}
+        onError={setError}
+      />
       <PlannerModal
         opened={plannerSupervisor !== null}
         rootRepoPath={plannerSupervisor?.root_repo_path ?? ''}
         run={null}
         templates={templates}
-        selectedPlannerId={null}
+        selectedPlannerId={
+          typeof plannerSupervisor?.context?.selected_planner_id === 'string'
+            ? plannerSupervisor.context.selected_planner_id
+            : typeof plannerSupervisor?.context?.queue_planner_id === 'string'
+              ? plannerSupervisor.context.queue_planner_id
+              : null
+        }
         selectedFeatureId={null}
         createFeatureOnOpen={plannerCreateFeatureOnOpen}
         selectionMode={plannerSelectFeatureOnOpen}
