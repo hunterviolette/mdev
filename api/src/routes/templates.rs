@@ -109,8 +109,8 @@ fn default_refinement_definition() -> WorkflowTemplateDefinition {
                         "fine_feature_format_armed": false,
                         "auto_normalize_and_apply_to_planner": false,
                         "preserve_rough_definition": true,
-                        "schema_id": "supervisor_feature_plan_item_v1",
-                        "apply_handler": "supervisor_planner_item"
+                        "schema_id": "planner_feature_refinement_v1",
+                        "apply_handler": "planner_apply"
                     }
                 },
                 "execution_plan": [

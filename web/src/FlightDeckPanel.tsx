@@ -620,17 +620,16 @@ function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Re
   const stages = sourceStages
     .map((stage, index) => ({ stage, index }))
     .sort((a, b) => {
-      const aStatus = normalize(textField(a.stage, 'status'));
-      const bStatus = normalize(textField(b.stage, 'status'));
-      const aStepId = textField(a.stage, 'step_id');
-      const bStepId = textField(b.stage, 'step_id');
-      const aActive = activeStepKey ? stageKeyFromText(aStepId) === stageKeyFromText(activeStepKey) : false;
-      const bActive = activeStepKey ? stageKeyFromText(bStepId) === stageKeyFromText(activeStepKey) : false;
-      const aFailed = aStatus === 'failed' ? 1 : 0;
-      const bFailed = bStatus === 'failed' ? 1 : 0;
-      if (aActive !== bActive) return aActive ? -1 : 1;
-      if (aFailed !== bFailed) return bFailed - aFailed;
-      return a.index - b.index;
+      const aStartedAt = textField(a.stage, 'started_at') || textField(a.stage, 'created_at');
+      const bStartedAt = textField(b.stage, 'started_at') || textField(b.stage, 'created_at');
+      const aTime = Date.parse(aStartedAt);
+      const bTime = Date.parse(bStartedAt);
+
+      if (Number.isFinite(aTime) && Number.isFinite(bTime) && aTime !== bTime) {
+        return bTime - aTime;
+      }
+
+      return b.index - a.index;
     })
     .slice(0, 4);
 
@@ -1587,11 +1586,7 @@ function SupervisorPlannerOptionsModal(props: {
   const [newPlannerTitle, setNewPlannerTitle] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const supervisorSelectedPlannerId = typeof supervisor?.context?.selected_planner_id === 'string'
-    ? supervisor.context.selected_planner_id
-    : typeof supervisor?.context?.queue_planner_id === 'string'
-      ? supervisor.context.queue_planner_id
-      : null;
+  const supervisorSelectedPlannerId = supervisor?.selected_planner_id ?? null;
 
   async function load() {
     if (!supervisor) return;
@@ -1621,7 +1616,6 @@ function SupervisorPlannerOptionsModal(props: {
       const settings = {
         ...supervisorFlightDeckSettings(supervisor),
         selected_planner_id: selectedPlannerId,
-        queue_planner_id: selectedPlannerId,
       } as Record<string, unknown>;
       await runSupervisorAction(supervisor.id, {
         action: 'update_flight_deck_settings',
@@ -2251,11 +2245,12 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     setPlannerRefinementTemplateId(options?.refinementTemplateId ?? null);
   }
 
-  async function createRefineWorkflowForFeature(plannerId: string, featureId: string) {
+  async function createRefineWorkflowForFeature(featureId: string) {
     const supervisor = plannerSupervisor;
     const templateId = plannerRefinementTemplateId;
-    if (!supervisor || !templateId) {
-      setError('Refine template is required before creating a fine workflow.');
+    const plannerId = supervisor?.selected_planner_id ?? null;
+    if (!supervisor || !templateId || !plannerId) {
+      setError('Supervisor planner and refine template are required before creating a fine workflow.');
       return;
     }
 
@@ -2452,13 +2447,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         rootRepoPath={plannerSupervisor?.root_repo_path ?? ''}
         run={null}
         templates={templates}
-        selectedPlannerId={
-          typeof plannerSupervisor?.context?.selected_planner_id === 'string'
-            ? plannerSupervisor.context.selected_planner_id
-            : typeof plannerSupervisor?.context?.queue_planner_id === 'string'
-              ? plannerSupervisor.context.queue_planner_id
-              : null
-        }
+        selectedPlannerId={plannerSupervisor?.selected_planner_id ?? null}
         selectedFeatureId={null}
         createFeatureOnOpen={plannerCreateFeatureOnOpen}
         selectionMode={plannerSelectFeatureOnOpen}
@@ -2470,15 +2459,15 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           setCreatingRefineFeatureId(null);
         }}
         onSelectFeature={async (selection) => {
-          if (!selection.planner?.id || !selection.feature?.id) return;
+          if (!selection.feature?.id) return;
           if (plannerRefinementTemplateId) {
-            await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+            await createRefineWorkflowForFeature(selection.feature.id);
           }
         }}
         onFeatureCreated={async (selection) => {
-          if (!selection.planner?.id || !selection.feature?.id) return;
+          if (!selection.feature?.id) return;
           if (plannerRefinementTemplateId) {
-            await createRefineWorkflowForFeature(selection.planner.id, selection.feature.id);
+            await createRefineWorkflowForFeature(selection.feature.id);
           }
         }}
         onSaved={refresh}

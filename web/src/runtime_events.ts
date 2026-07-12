@@ -278,6 +278,7 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
       if (disposed || !isLeader) return;
       try {
         const snapshot = JSON.parse((raw as MessageEvent<string>).data) as RuntimeSnapshotResponse;
+        lastEventSequenceNo = Math.max(lastEventSequenceNo, snapshot.latest_sequence_no);
         broadcast('runtime_snapshot', snapshot);
       } catch {
       }

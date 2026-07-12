@@ -24,37 +24,29 @@ pub async fn spawn_series_workflow_on_integration(
         Some(template_id) => load_template_definition(state, template_id).await?,
         None => return Err(anyhow!("workflow_template_id is required for supervisor series runs")),
     };
+    let planner_id = supervisor_context
+        .get("planner_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let selected_feature_id = items.first().map(|item| item.id.clone());
-    let planner = selected_feature_id
-        .as_ref()
-        .map(|id| {
-            let selected_feature = items
-                .iter()
-                .find(|item| item.id == *id)
-                .or_else(|| items.first());
-            let mut planner = json!({
-                "fragment_armed": true,
-                "schema_armed": false,
-                "auto_apply_armed": false,
-                "selected_feature_id": id,
-                "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null),
-                "schema_id": "supervisor_feature_plan_item_v1",
-                "preserve_rough_definition": true
-            });
-            if let Some(selected_feature) = selected_feature {
-                if let Some(obj) = planner.as_object_mut() {
-                    obj.insert("selected_feature".to_string(), serde_json::to_value(selected_feature).unwrap_or_else(|_| json!({})));
-                }
-            }
-            planner
-        })
-        .unwrap_or_else(|| json!({
+    let planner = match (planner_id, selected_feature_id) {
+        (Some(planner_id), Some(feature_id)) => json!({
+            "fragment_armed": true,
+            "schema_armed": false,
+            "auto_apply_armed": false,
+            "planner_id": planner_id,
+            "feature_id": feature_id
+        }),
+        _ => json!({
             "fragment_armed": false,
             "schema_armed": false,
             "auto_apply_armed": false,
-            "schema_id": "supervisor_feature_plan_item_v1",
-            "preserve_rough_definition": true
-        }));
+            "planner_id": "",
+            "feature_id": ""
+        }),
+    };
 
     insert_and_start_run(state, title, integration_path, template_id, definition, json!({
         "supervisor": supervisor_context,
@@ -120,32 +112,66 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
         .and_then(Value::as_str);
     let is_supervisor_sprint_feature = is_sprint_feature_context(&supervisor_context);
     let is_supervisor_manual_shard = input_source == Some("supervisor_manual_shard");
+    let is_planner_refinement = input_source == Some("supervisor_planner_feature");
+    let explicit_planner_id = supervisor_context
+        .get("planner_id")
+        .or_else(|| supervisor_context.get("selected_planner_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let planner_id = if explicit_planner_id.is_some() || is_supervisor_manual_shard {
+        explicit_planner_id
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT planner_id FROM planner_features WHERE id = ? AND TRIM(COALESCE(planner_id, '')) != '' AND COALESCE(status, '') != 'deleted' LIMIT 1",
+        )
+        .bind(&item.id)
+        .fetch_optional(&state.db)
+        .await?
+    };
+
+    if is_planner_refinement && planner_id.is_none() {
+        return Err(anyhow!("planner_id is required for planner refinement workflows"));
+    }
 
     let mut supervisor_context = supervisor_context;
     if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
         if is_supervisor_manual_shard {
             supervisor_obj.insert("manual_shard_id".to_string(), Value::String(item.id.clone()));
             supervisor_obj.remove("feature_id");
+            supervisor_obj.remove("planner_id");
         } else {
             supervisor_obj.insert("feature_id".to_string(), Value::String(item.id.clone()));
+            if let Some(planner_id) = planner_id.as_ref() {
+                supervisor_obj.insert("planner_id".to_string(), Value::String(planner_id.clone()));
+            }
         }
     }
 
     let planner = if is_supervisor_manual_shard {
         json!({
-            "selected_feature_id": Value::Null,
-            "manual_shard_id": item.id,
-            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
+            "planner_id": "",
+            "feature_id": "",
+            "fragment_armed": false,
+            "schema_armed": false,
+            "auto_apply_armed": false
+        })
+    } else if let Some(planner_id) = planner_id {
+        json!({
+            "planner_id": planner_id,
+            "feature_id": item.id,
+            "fragment_armed": true,
+            "schema_armed": is_planner_refinement,
+            "auto_apply_armed": is_planner_refinement
         })
     } else {
         json!({
-            "selected_feature_id": item.id,
-            "planner_workspace_id": supervisor_context
-                .get("planner_workspace_id")
-                .or_else(|| supervisor_context.get("planner_id"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "supervisor_run_id": supervisor_context.get("supervisor_run_id").cloned().unwrap_or(Value::Null)
+            "planner_id": "",
+            "feature_id": "",
+            "fragment_armed": false,
+            "schema_armed": false,
+            "auto_apply_armed": false
         })
     };
 
@@ -216,14 +242,6 @@ async fn load_template_definition(state: &AppState, template_id: Uuid) -> Result
         return Err(anyhow!("workflow template {} not found", template_id));
     };
     Ok(serde_json::from_str(row.get::<String, _>("definition_json").as_str())?)
-}
-
-fn feature_plan_items_prompt_fragment(items: &[FeaturePlanItem]) -> String {
-    items.iter().map(feature_plan_item_prompt_fragment).collect::<Vec<_>>().join("\n\n---\n\n")
-}
-
-fn feature_plan_item_prompt_fragment(item: &FeaturePlanItem) -> String {
-    serde_json::to_string_pretty(item).unwrap_or_else(|_| format!("{}\n\n{}", item.title, item.summary))
 }
 
 fn seed_template_globals_into_context(context: &mut Value, definition: &WorkflowTemplateDefinition, repo_path: &str) -> Result<()> {

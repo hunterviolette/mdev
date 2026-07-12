@@ -162,7 +162,7 @@ pub async fn execute(
     if payload_text.trim().is_empty() {
         return Ok(CapabilityResult {
             ok: false,
-            capability: "gateway_model/changeset".to_string(),
+            capability: "changeset".to_string(),
             payload: json!({
                 "ok": false,
                 "summary": "Inference returned an empty ChangeSet payload.",
@@ -243,7 +243,7 @@ pub async fn execute(
 
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        capability: "gateway_model/changeset".to_string(),
+        capability: "changeset".to_string(),
         payload: result,
         follow_ups: CapabilityInvocationRequest::None,
     })

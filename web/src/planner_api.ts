@@ -99,7 +99,7 @@ export function setDefaultPlanner(id: string): Promise<SetDefaultPlannerResponse
   });
 }
 
-export function refinePlannerFeature(plannerId: string, featureId: string, body: { supervisor_id?: string | null; workflow_template_id?: string | null }): Promise<RefinePlannerFeatureResponse> {
+export function refinePlannerFeature(plannerId: string, featureId: string, body: { supervisor_id: string; workflow_template_id?: string | null }): Promise<RefinePlannerFeatureResponse> {
   return fetchJson<RefinePlannerFeatureResponse>(`/api/planners/${encodeURIComponent(plannerId)}/features/${encodeURIComponent(featureId)}/refine`, {
     method: 'POST',
     body: JSON.stringify(body),

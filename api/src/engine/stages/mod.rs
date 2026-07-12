@@ -323,6 +323,13 @@ pub async fn execute_stage(
     planner::apply_repo_planner_capability(&state.db, &mut global_state, repo_ref.as_str()).await?;
     root.insert("global_state".to_string(), global_state.clone());
 
+    let mut execution_global_state = global_state.clone();
+    planner::hydrate_repo_planner_prompt_fragment(
+        &state.db,
+        &mut execution_global_state,
+    )
+    .await?;
+
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
@@ -347,11 +354,21 @@ pub async fn execute_stage(
         }),
     );
 
-    let prepared_local_state = prepare_stage_local_state(repo_ref.as_str(), &global_state, step, local_state)?;
+    let prepared_local_state = prepare_stage_local_state(
+        repo_ref.as_str(),
+        &execution_global_state,
+        step,
+        local_state,
+    )?;
     if step.step_type.as_str() == "merge_patches" {
         return merge_patches_stage::execute_stage(state, run_id, run, step, repo_ref.as_str(), prepared_local_state).await;
     }
-    let plan = resolve_effective_execution_plan(&global_state, repo_ref.as_str(), step, &prepared_local_state)?;
+    let plan = resolve_effective_execution_plan(
+        &execution_global_state,
+        repo_ref.as_str(),
+        step,
+        &prepared_local_state,
+    )?;
     let prepared_local_state_obj = prepared_local_state
         .as_object()
         .ok_or_else(|| anyhow!("prepared stage local state must be object"))?;

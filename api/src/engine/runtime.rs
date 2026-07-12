@@ -1278,15 +1278,17 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 continue;
             }
             (StageDisposition::RetryStage, Some(target), _) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
-                return Ok(json!({
+                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
+                last_payload = json!({
                     "ok": outcome.ok,
-                    "status": "waiting",
+                    "status": "running",
                     "step_id": step.id,
                     "next_step_id": target,
                     "message": outcome.message,
                     "disposition": "retry_stage"
-                }));
+                });
+                requested = Some(target);
+                continue;
             }
             (StageDisposition::MoveNext, Some(target), _) | (StageDisposition::MoveBack, Some(target), _) => {
                 set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;

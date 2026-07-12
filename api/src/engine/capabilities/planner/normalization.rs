@@ -23,14 +23,7 @@ pub fn extract_inference_text(capability_results: &[Value]) -> Option<String> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StrictRefinedFeatureEnvelope {
-    feature: StrictRefinedFeaturePayload,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StrictRefinedFeaturePayload {
+struct RefinedFeaturePayload {
     summary: String,
     requirements: Vec<String>,
     acceptance_criteria: Vec<String>,
@@ -121,10 +114,8 @@ pub fn normalize_refined_feature_plan_item(
 ) -> Result<FeaturePlanItem> {
     let json_text = normalize_refined_feature_payload_text(text)?;
 
-    let envelope: StrictRefinedFeatureEnvelope = serde_json::from_str(&json_text)
-        .map_err(|err| anyhow!("failed to parse strict refined feature JSON: {}", err))?;
-
-    let feature = envelope.feature;
+    let feature: RefinedFeaturePayload = serde_json::from_str(&json_text)
+        .map_err(|err| anyhow!("failed to parse refined feature JSON: {}", err))?;
     let summary = feature.summary.trim().to_string();
     let requirements = clean_string_array("requirements", feature.requirements)?;
     let acceptance_criteria = clean_string_array("acceptance_criteria", feature.acceptance_criteria)?;

@@ -90,7 +90,7 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
-    if capability == "supervisor_planner_item" || capability == "operator_checkpoint" {
+    if capability == "planner_apply" || capability == "operator_checkpoint" {
         return Ok(());
     }
 
@@ -355,15 +355,17 @@ pub(crate) async fn execute_capability_chain(
             .filter(|item| !existing_capabilities.contains(&item.capability))
             .collect::<Vec<_>>();
 
-        if result.capability == "inference"
-            && supervisor_planner_item_auto_apply_enabled(&ctx)
-            && !existing_capabilities.contains("supervisor_planner_item")
-            && !queue.iter().any(|item| item.capability == "supervisor_planner_item")
-        {
-            follow_ups.push(CapabilityInvocation {
-                capability: "supervisor_planner_item".to_string(),
-                config: json!({}),
-            });
+        if result.capability == "inference" {
+            if let Some(config) = planner_apply_config(&ctx)? {
+                if !existing_capabilities.contains("planner_apply")
+                    && !queue.iter().any(|item| item.capability == "planner_apply")
+                {
+                    follow_ups.push(CapabilityInvocation {
+                        capability: "planner_apply".to_string(),
+                        config,
+                    });
+                }
+            }
         }
 
         queue.extend(follow_ups);
@@ -388,22 +390,20 @@ fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation>
     }
 }
 
-fn supervisor_planner_item_auto_apply_enabled(ctx: &CapabilityContext<'_>) -> bool {
-    if !binding_specs::stage_supports_shared_capability(ctx.step, "planner_apply") {
-        return false;
+fn planner_apply_config(ctx: &CapabilityContext<'_>) -> Result<Option<Value>> {
+    if !binding_specs::stage_supports_shared_capability(ctx.step, "planner_apply")
+        || !binding_specs::shared_capability_enabled(ctx.local_state, "planner_apply", false)
+    {
+        return Ok(None);
     }
 
-    if !binding_specs::shared_capability_enabled(ctx.local_state, "planner_apply", false) {
-        return false;
+    let state = planner::PlannerCapabilityState::from_global_state(ctx.local_state)?;
+
+    if !state.auto_apply_armed {
+        return Ok(None);
     }
 
-    ctx.local_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
-        .and_then(|value| value.get("selected_feature_id"))
-        .and_then(serde_json::Value::as_str)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
+    Ok(Some(serde_json::to_value(state.binding()?)?))
 }
 
 async fn dispatch(
@@ -417,7 +417,7 @@ async fn dispatch(
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
         "changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
-        "supervisor_planner_item" => planner::apply::execute(ctx, prior_results, invocation.config).await,
+        "planner_apply" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
         "review_validation" => review_validation::execute(ctx, prior_results, invocation.config).await,

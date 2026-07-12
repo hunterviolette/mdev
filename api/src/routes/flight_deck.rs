@@ -41,6 +41,7 @@ struct FlightDeckSupervisor {
     status: String,
     title: String,
     root_repo_path: String,
+    selected_planner_id: Option<String>,
     snapshot_path: Option<String>,
     integration_path: Option<String>,
     integration_run_id: Option<String>,
@@ -105,6 +106,7 @@ struct SupervisorRow {
     status: String,
     title: String,
     root_repo_path: String,
+    selected_planner_id: Option<String>,
     snapshot_path: Option<String>,
     integration_path: Option<String>,
     integration_run_id: Option<String>,
@@ -289,6 +291,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
             status: supervisor.status,
             title: supervisor.title,
             root_repo_path: supervisor.root_repo_path,
+            selected_planner_id: supervisor.selected_planner_id,
             snapshot_path: supervisor.snapshot_path,
             integration_path: supervisor.integration_path,
             integration_run_id: supervisor.integration_run_id,
@@ -312,7 +315,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
 async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::Result<Vec<SupervisorRow>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, mode, status, title, root_repo_path, context_json, created_at, updated_at
+        SELECT id, mode, status, title, root_repo_path, selected_planner_id, context_json, created_at, updated_at
         FROM supervisor_runs
         ORDER BY updated_at DESC
         "#,
@@ -336,6 +339,7 @@ async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::
             status: row.get("status"),
             title: row.get("title"),
             root_repo_path,
+            selected_planner_id: row.get("selected_planner_id"),
             snapshot_path: None,
             integration_path: None,
             integration_run_id: None,

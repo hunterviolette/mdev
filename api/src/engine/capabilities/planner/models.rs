@@ -1,4 +1,6 @@
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,62 @@ pub struct FeaturePlanItem {
     pub target_files_or_areas: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerCapabilityBinding {
+    pub planner_id: String,
+    pub feature_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerCapabilityState {
+    pub planner_id: String,
+    pub feature_id: String,
+    #[serde(default)]
+    pub fragment_armed: bool,
+    #[serde(default)]
+    pub schema_armed: bool,
+    #[serde(default)]
+    pub auto_apply_armed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowGlobalState {
+    capabilities: WorkflowCapabilities,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowCapabilities {
+    planner: PlannerCapabilityState,
+}
+
+impl PlannerCapabilityState {
+    pub fn binding_if_present(&self) -> Result<Option<PlannerCapabilityBinding>> {
+        let planner_id = self.planner_id.trim();
+        let feature_id = self.feature_id.trim();
+
+        match (planner_id.is_empty(), feature_id.is_empty()) {
+            (true, true) => Ok(None),
+            (true, false) => Err(anyhow!("planner_id is required when feature_id is set")),
+            (false, true) => Err(anyhow!("feature_id is required when planner_id is set")),
+            (false, false) => Ok(Some(PlannerCapabilityBinding {
+                planner_id: planner_id.to_string(),
+                feature_id: feature_id.to_string(),
+            })),
+        }
+    }
+
+    pub fn binding(&self) -> Result<PlannerCapabilityBinding> {
+        self.binding_if_present()?
+            .ok_or_else(|| anyhow!("planner capability binding is not configured"))
+    }
+
+    pub fn from_global_state(global_state: &Value) -> Result<Self> {
+        let state: WorkflowGlobalState = serde_json::from_value(global_state.clone())
+            .context("invalid planner capability state")?;
+        Ok(state.capabilities.planner)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

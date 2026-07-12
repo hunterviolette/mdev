@@ -2,7 +2,10 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::models::{SprintEventStreamItem, WorkflowEventStreamItem};
+use crate::{
+    engine::workflow_lifecycle::WorkflowCoordinator,
+    models::{SprintEventStreamItem, WorkflowEventStreamItem},
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,6 +13,7 @@ pub struct AppState {
     workflow_events_tx: broadcast::Sender<WorkflowEventStreamItem>,
     sprint_events_tx: broadcast::Sender<SprintEventStreamItem>,
     process_session_id: String,
+    pub workflow_coordinator: WorkflowCoordinator,
 }
 
 impl AppState {
@@ -21,6 +25,7 @@ impl AppState {
             workflow_events_tx,
             sprint_events_tx,
             process_session_id: Uuid::new_v4().to_string(),
+            workflow_coordinator: WorkflowCoordinator::default(),
         }
     }
 

@@ -617,13 +617,11 @@ fn default_globals() -> WorkflowGlobalConfig {
                 "commands": []
             },
             "planner": {
+                "planner_id": "",
+                "feature_id": "",
                 "fragment_armed": false,
                 "schema_armed": false,
-                "auto_apply_armed": false,
-                "selected_feature_id": null,
-                "supervisor_run_id": null,
-                "schema_id": "supervisor_feature_plan_item_v1",
-                "preserve_rough_definition": true
+                "auto_apply_armed": false
             },
             "sap/import": {},
             "sap/export": {}
@@ -701,8 +699,8 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             "fine_feature_format_armed": false,
             "auto_normalize_and_apply_to_planner": false,
             "preserve_rough_definition": true,
-            "schema_id": "supervisor_feature_plan_item_v1",
-            "apply_handler": "supervisor_planner_item"
+            "schema_id": "planner_feature_refinement_v1",
+            "apply_handler": "planner_apply"
         },
         "on_success": {
             "disposition": "move_next",

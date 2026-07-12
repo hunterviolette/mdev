@@ -1,367 +1,153 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
+
+use super::{FeaturePlanItem, PlannerCapabilityBinding, PlannerCapabilityState};
+
+fn planner_state(global_state: &Value) -> Result<Option<PlannerCapabilityState>> {
+    let Some(_) = global_state
+        .get("capabilities")
+        .and_then(|value| value.get("planner"))
+    else {
+        return Ok(None);
+    };
+
+    PlannerCapabilityState::from_global_state(global_state).map(Some)
+}
+
+async fn bound_planner_feature(
+    db: &SqlitePool,
+    global_state: &Value,
+) -> Result<Option<(PlannerCapabilityBinding, FeaturePlanItem)>> {
+    let Some(state) = planner_state(global_state)? else {
+        return Ok(None);
+    };
+    let Some(binding) = state.binding_if_present()? else {
+        return Ok(None);
+    };
+    let feature = load_planner_feature(db, &binding.planner_id, &binding.feature_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "planner feature '{}' was not found in planner '{}'",
+                binding.feature_id,
+                binding.planner_id
+            )
+        })?;
+
+    Ok(Some((binding, feature)))
+}
 
 pub async fn apply_repo_planner_capability(
     db: &SqlitePool,
     global_state: &mut Value,
-    repo_ref: &str,
+    _repo_ref: &str,
 ) -> Result<()> {
-    if existing_planner_fragment_is_populated(global_state) {
-        hydrate_existing_planner_selection(db, global_state).await?;
-        return Ok(());
-    }
-
-    let planner_state = load_latest_supervisor_plan_from_db(db, repo_ref)
-        .await?
-        .or_else(|| load_repo_supervisor_planner_state(global_state, repo_ref));
-
-    let Some(planner_state) = planner_state else {
-        return Ok(());
-    };
-
-    let capabilities = ensure_object_field(global_state, "capabilities");
-    capabilities.insert("planner".to_string(), planner_state);
+    let _ = bound_planner_feature(db, global_state).await?;
     Ok(())
 }
 
-async fn hydrate_existing_planner_selection(
+pub async fn hydrate_repo_planner_prompt_fragment(
     db: &SqlitePool,
     global_state: &mut Value,
 ) -> Result<()> {
-    let selected_feature_id = global_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
-        .and_then(|value| value.get("selected_feature_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let Some(selected_feature_id) = selected_feature_id else {
+    let Some((_binding, feature)) = bound_planner_feature(db, global_state).await? else {
         return Ok(());
     };
 
-    let already_has_selected_feature = global_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
-        .and_then(|value| value.get("selected_feature"))
-        .map(selected_feature_is_populated)
-        .unwrap_or(false);
-
-    if already_has_selected_feature {
-        return Ok(());
-    }
-
-    let supervisor_run_id = global_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
-        .and_then(|value| value.get("supervisor_run_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let mut selected_feature = match supervisor_run_id.as_deref() {
-        Some(supervisor_run_id) => load_supervisor_feature_by_id(db, supervisor_run_id, &selected_feature_id).await?,
-        None => None,
-    };
-
-    if selected_feature.is_none() {
-        selected_feature = load_planner_feature_by_id(db, &selected_feature_id).await?;
-    }
-
-    let Some(selected_feature) = selected_feature else {
-        return Ok(());
-    };
-
-    let Some(planner_obj) = global_state
+    let capabilities = global_state
         .get_mut("capabilities")
-        .and_then(|value| value.get_mut("planner"))
         .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
+        .ok_or_else(|| anyhow!("workflow global capabilities must be an object"))?;
+    let inference = capabilities
+        .entry("inference".to_string())
+        .or_insert_with(|| json!({}));
+    if !inference.is_object() {
+        *inference = json!({});
+    }
+    let prompt_fragments = inference
+        .as_object_mut()
+        .expect("inference capability must be an object")
+        .entry("prompt_fragments".to_string())
+        .or_insert_with(|| json!({}));
+    if !prompt_fragments.is_object() {
+        *prompt_fragments = json!({});
+    }
+    prompt_fragments
+        .as_object_mut()
+        .expect("inference prompt fragments must be an object")
+        .insert(
+            "planning_fragment".to_string(),
+            Value::String(serde_json::to_string_pretty(&feature)?),
+        );
 
-    planner_obj.insert("selected_feature".to_string(), selected_feature);
     Ok(())
 }
 
-async fn load_planner_feature_by_id(
+pub async fn load_planner_feature(
     db: &SqlitePool,
-    selected_feature_id: &str,
-) -> Result<Option<Value>> {
-    let row = sqlx::query("SELECT id, title, status, payload_json FROM planner_features WHERE id = ? LIMIT 1")
-        .bind(selected_feature_id)
-        .fetch_optional(db)
-        .await?;
+    planner_id: &str,
+    feature_id: &str,
+) -> Result<Option<FeaturePlanItem>> {
+    let row = sqlx::query(
+        "SELECT id, title, payload_json FROM planner_features WHERE planner_id = ? AND id = ? AND id NOT LIKE 'manual-%' AND COALESCE(status, '') != 'deleted' LIMIT 1",
+    )
+    .bind(planner_id)
+    .bind(feature_id)
+    .fetch_optional(db)
+    .await?;
 
     let Some(row) = row else {
         return Ok(None);
     };
 
-    let id = row.get::<String, _>("id");
-    let title = row.get::<String, _>("title");
-    let status = row.get::<String, _>("status");
-    let payload_json = row.get::<String, _>("payload_json");
-    let mut item = serde_json::from_str::<Value>(&payload_json).unwrap_or_else(|_| json!({}));
+    let mut feature: FeaturePlanItem = serde_json::from_str(
+        row.get::<String, _>("payload_json").as_str(),
+    )
+    .context("invalid persisted planner feature payload")?;
 
-    if !item.is_object() {
-        item = json!({});
-    }
+    feature.id = row.get("id");
+    feature.title = row.get("title");
 
-    let obj = item.as_object_mut().expect("planner feature payload must be object");
-    obj.insert("id".to_string(), Value::String(id));
-    obj.insert("title".to_string(), Value::String(title.clone()));
-    obj.entry("status".to_string()).or_insert_with(|| Value::String(status));
-    obj.entry("summary".to_string()).or_insert_with(|| Value::String(title));
-
-    Ok(Some(item))
+    Ok(Some(feature))
 }
 
-async fn load_supervisor_feature_by_id(
-    _db: &SqlitePool,
-    _supervisor_run_id: &str,
-    _selected_feature_id: &str,
-) -> Result<Option<Value>> {
-    Ok(None)
-}
-
-async fn load_latest_supervisor_plan_from_db(
-    _db: &SqlitePool,
-    _repo_ref: &str,
-) -> Result<Option<Value>> {
-    Ok(None)
-}
-
-fn load_repo_supervisor_planner_state(global_state: &Value, repo_ref: &str) -> Option<Value> {
-    let candidates = repo_path_candidates(global_state, repo_ref);
-
-    for candidate in candidates {
-        for supervisor_dir in supervisor_dirs_for_path(&candidate) {
-            if let Some(state) = read_supervisor_planner_state(&supervisor_dir) {
-                return Some(state);
-            }
-        }
-    }
-
-    None
-}
-
-fn repo_path_candidates(global_state: &Value, repo_ref: &str) -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    push_repo_path_candidate(&mut candidates, repo_ref);
-
-    if let Some(repo) = global_state.get("resources").and_then(|value| value.get("repo")) {
-        push_repo_path_candidate(&mut candidates, repo.get("repo_ref").and_then(Value::as_str).unwrap_or(""));
-        push_repo_path_candidate(&mut candidates, repo.get("path").and_then(Value::as_str).unwrap_or(""));
-        push_repo_path_candidate(&mut candidates, repo.get("root").and_then(Value::as_str).unwrap_or(""));
-        push_repo_path_candidate(&mut candidates, repo.get("repo_root").and_then(Value::as_str).unwrap_or(""));
-        push_repo_path_candidate(&mut candidates, repo.get("working_dir").and_then(Value::as_str).unwrap_or(""));
-    }
-
-    candidates
-}
-
-fn supervisor_dirs_for_path(path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-
-    for ancestor in path.ancestors() {
-        let supervisors_dir = ancestor.join(".mdev").join("supervisors");
-        if let Ok(entries) = std::fs::read_dir(supervisors_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() && !out.iter().any(|item| item == &path) {
-                    out.push(path);
-                }
-            }
-        }
-    }
-
-    out
-}
-
-fn read_supervisor_planner_state(supervisor_dir: &std::path::Path) -> Option<Value> {
-    let supervisor_run_id = supervisor_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-
-    let files = [
-        supervisor_dir.join("supervisor.json"),
-        supervisor_dir.join("state.json"),
-        supervisor_dir.join("run.json"),
-        supervisor_dir.join("metadata.json"),
-    ];
-
-    for file in files {
-        let Ok(contents) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
-            continue;
-        };
-        if let Some(state) = supervisor_value_to_planner_state(&value, supervisor_run_id.clone()) {
-            return Some(state);
-        }
-    }
-
-    None
-}
-
-fn supervisor_value_to_planner_state(value: &Value, supervisor_run_id: Option<String>) -> Option<Value> {
-    let supervisor = value.get("supervisor").unwrap_or(value);
-    let items = if supervisor.is_array() {
-        supervisor.as_array()?.clone()
-    } else {
-        supervisor
-            .get("feature_plan_items")
-            .and_then(Value::as_array)
-            .cloned()
-            .or_else(|| supervisor.get("features").and_then(Value::as_array).cloned())?
-    };
-
-    let selected_feature_id = supervisor
-        .get("feature_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            supervisor
-                .get("selected_feature_ids")
-                .and_then(Value::as_array)
-                .and_then(|items| items.iter().find_map(Value::as_str))
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            items
-                .first()
-                .and_then(|item| item.get("id"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
+pub async fn set_planner_feature_refinement_workflow_run(
+    db: &SqlitePool,
+    planner_id: &str,
+    feature_id: &str,
+    workflow_run_id: Uuid,
+) -> Result<()> {
+    let mut feature = load_planner_feature(db, planner_id, feature_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "planner feature '{}' was not found in planner '{}'",
+                feature_id,
+                planner_id
+            )
         })?;
+    feature.refinement_workflow_run_id = Some(workflow_run_id);
 
-    let selected_feature = items
-        .iter()
-        .find(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .map(|id| id == selected_feature_id)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .or_else(|| items.first().cloned());
+    let result = sqlx::query(
+        "UPDATE planner_features SET payload_json = ?, updated_at = ? WHERE planner_id = ? AND id = ?",
+    )
+    .bind(serde_json::to_string(&feature)?)
+    .bind(Utc::now().to_rfc3339())
+    .bind(planner_id)
+    .bind(feature_id)
+    .execute(db)
+    .await?;
 
-    let mut out = json!({
-        "selected_feature_id": selected_feature_id
-    });
-
-    if let Some(selected_feature) = selected_feature {
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("selected_feature".to_string(), selected_feature);
-        }
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "planner feature '{}' was not updated in planner '{}'",
+            feature_id,
+            planner_id
+        ));
     }
 
-    if let Some(supervisor_run_id) = supervisor_run_id.filter(|value| !value.trim().is_empty()) {
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("supervisor_run_id".to_string(), Value::String(supervisor_run_id));
-        }
-    }
-
-    Some(out)
-}
-
-fn selected_feature_is_populated(value: &Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-
-    let has_id = obj
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .is_some();
-
-    if !has_id {
-        return false;
-    }
-
-    obj.get("summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-        || obj
-            .get("rough_summary")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-        || obj
-            .get("requirements")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-        || obj
-            .get("acceptance_criteria")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-        || obj
-            .get("implementation_notes")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-        || obj
-            .get("review_expectations")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-        || obj
-            .get("target_files_or_areas")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-}
-
-fn existing_planner_fragment_is_populated(global_state: &Value) -> bool {
-    let Some(planner) = global_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
-    else {
-        return false;
-    };
-
-    let has_selected_feature_id = planner
-        .get("selected_feature_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .is_some();
-
-    has_selected_feature_id
-}
-
-fn ensure_object_field<'a>(root: &'a mut Value, key: &str) -> &'a mut serde_json::Map<String, Value> {
-    if !root.is_object() {
-        *root = json!({});
-    }
-    let obj = root.as_object_mut().expect("root must be object");
-    let value = obj.entry(key.to_string()).or_insert_with(|| json!({}));
-    if !value.is_object() {
-        *value = json!({});
-    }
-    value.as_object_mut().expect("field must be object")
-}
-
-fn push_repo_path_candidate(out: &mut Vec<std::path::PathBuf>, value: &str) {
-    let value = value.trim();
-    if value.is_empty() {
-        return;
-    }
-
-    let path = std::path::PathBuf::from(value);
-    if !out.iter().any(|item| item == &path) {
-        out.push(path);
-    }
+    Ok(())
 }

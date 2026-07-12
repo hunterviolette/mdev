@@ -86,6 +86,19 @@ pub fn stage_supports_shared_capability(step: &WorkflowStepDefinition, primitive
 }
 
 pub fn shared_capability_enabled(global_state: &Value, primitive_key: &str, default_enabled: bool) -> bool {
+    if matches!(primitive_key, "planner_fragment" | "planner_schema" | "planner_apply") {
+        let Ok(planner) = crate::engine::capabilities::planner::PlannerCapabilityState::from_global_state(global_state) else {
+            return default_enabled;
+        };
+
+        return match primitive_key {
+            "planner_fragment" => planner.fragment_armed,
+            "planner_schema" => planner.schema_armed,
+            "planner_apply" => planner.auto_apply_armed,
+            _ => default_enabled,
+        };
+    }
+
     match primitive_key {
         "repo_context" => global_state
             .get("capabilities")
@@ -97,24 +110,6 @@ pub fn shared_capability_enabled(global_state: &Value, primitive_key: &str, defa
             .get("capabilities")
             .and_then(|v| v.get("inference"))
             .and_then(|v| v.get("changeset_schema_armed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(default_enabled),
-        "planner_fragment" => global_state
-            .get("capabilities")
-            .and_then(|v| v.get("planner"))
-            .and_then(|v| v.get("fragment_armed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(default_enabled),
-        "planner_schema" => global_state
-            .get("capabilities")
-            .and_then(|v| v.get("planner"))
-            .and_then(|v| v.get("schema_armed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(default_enabled),
-        "planner_apply" => global_state
-            .get("capabilities")
-            .and_then(|v| v.get("planner"))
-            .and_then(|v| v.get("auto_apply_armed"))
             .and_then(Value::as_bool)
             .unwrap_or(default_enabled),
         _ => {

@@ -67,7 +67,7 @@ pub fn prepare_stage_state(
                     "disposition": "retry_stage",
                     "message": "Code stage apply failed; retry the code stage with the apply error included in the prompt.",
                     "patch_from_capability": {
-                        "capability": "gateway_model/changeset",
+                        "capability": "changeset",
                         "mode": "apply_error_to_code_prompt"
                     }
                 })
@@ -86,7 +86,7 @@ pub fn prepare_stage_state(
 pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
     let apply_result = capability_results
         .iter()
-        .find(|item| item.get("key").and_then(Value::as_str) == Some("gateway_model/changeset"))
+        .find(|item| item.get("key").and_then(Value::as_str) == Some("changeset"))
         .and_then(|item| item.get("result"))
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -120,11 +120,10 @@ pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
         "global_state": {
             "capabilities": {
                 "inference": {
-                    "next_prompt_fragments": [
-                        {
-                            "text": fragment
-                        }
-                    ]
+                    "pending_retry_feedback": {
+                        "kind": "changeset_apply_error",
+                        "text": fragment
+                    }
                 }
             }
         }

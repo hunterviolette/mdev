@@ -63,6 +63,7 @@ struct StageChainSummary {
     latest_message: String,
     latest_level: String,
     latest_created_at: String,
+    latest_sequence_no: i64,
     is_current: bool,
     is_active: bool,
     event_count: usize,
@@ -661,6 +662,7 @@ async fn build_event_chain_summary(
                 latest_message: inferred_latest_message,
                 latest_level: inferred_latest_level,
                 latest_created_at: latest.created_at.clone(),
+                latest_sequence_no: latest.sequence_no,
                 is_current: run.current_step_id.as_deref() == Some(step_id.as_str()) && stage_is_active,
                 is_active: stage_is_active,
                 event_count: stage_rows.len(),
@@ -673,7 +675,9 @@ async fn build_event_chain_summary(
     stages.sort_by(|a, b| {
         let a_rank = if a.is_current && a.is_active { 0 } else if a.is_active { 1 } else { 2 };
         let b_rank = if b.is_current && b.is_active { 0 } else if b.is_active { 1 } else { 2 };
-        a_rank.cmp(&b_rank).then_with(|| b.latest_created_at.cmp(&a.latest_created_at))
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| b.latest_sequence_no.cmp(&a.latest_sequence_no))
     });
 
     stages.truncate(6);
@@ -1120,7 +1124,7 @@ async fn stream_runtime_events(
             }
         }
 
-        let workflow_rows = runtime_event_rows(&state_for_task, &query, query.after_sequence.unwrap_or(0))
+        let workflow_rows = runtime_event_rows(&state_for_task, &query, last_sequence)
             .await
             .unwrap_or_default();
         for row in workflow_rows {

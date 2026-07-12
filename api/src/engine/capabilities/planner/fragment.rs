@@ -1,61 +1,40 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::models::WorkflowStepDefinition;
 
-fn planner_state(global_state: &Value) -> Option<&Value> {
-    global_state
-        .get("capabilities")
-        .and_then(|value| value.get("planner"))
+use super::PlannerCapabilityState;
+
+fn planner_state(global_state: &Value) -> Option<PlannerCapabilityState> {
+    PlannerCapabilityState::from_global_state(global_state).ok()
+}
+
+fn planner_binding_present(global_state: &Value) -> bool {
+    planner_state(global_state)
+        .and_then(|state| state.binding_if_present().ok().flatten())
+        .is_some()
 }
 
 pub fn planner_fragment_enabled(global_state: &Value, _step: &WorkflowStepDefinition) -> bool {
-    let Some(planner) = planner_state(global_state) else {
-        return false;
-    };
-
-    selected_feature_id(planner).is_some()
+    planner_state(global_state)
+        .map(|state| state.fragment_armed)
+        .unwrap_or(false)
+        && planner_binding_present(global_state)
 }
 
 pub fn planner_schema_enabled(global_state: &Value, _step: &WorkflowStepDefinition) -> bool {
-    let Some(planner) = planner_state(global_state) else {
-        return false;
-    };
-
-    selected_feature_id(planner).is_some()
+    planner_state(global_state)
+        .map(|state| state.schema_armed)
+        .unwrap_or(false)
+        && planner_binding_present(global_state)
 }
 
 pub fn build_planning_fragment(global_state: &Value) -> String {
-    let Some(planner) = planner_state(global_state) else {
-        return String::new();
-    };
-
-    if selected_feature_id(planner).is_none() {
-        return String::new();
-    }
-
-    let Some(selected_feature) = selected_feature_payload(planner).cloned() else {
-        return String::new();
-    };
-
-    let payload = json!({
-        "feature": selected_feature
-    });
-
-    serde_json::to_string_pretty(&payload).unwrap_or_default()
-}
-
-fn selected_feature_payload(planner: &Value) -> Option<&Value> {
-    planner
-        .get("selected_feature")
-        .or_else(|| planner.get("feature"))
-        .or_else(|| planner.get("feature_plan_item"))
-        .filter(|value| value.is_object())
-}
-
-fn selected_feature_id(planner: &Value) -> Option<String> {
-    planner
-        .get("selected_feature_id")
+    global_state
+        .get("capabilities")
+        .and_then(|value| value.get("inference"))
+        .and_then(|value| value.get("prompt_fragments"))
+        .and_then(|value| value.get("planning_fragment"))
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+        .unwrap_or("")
+        .to_string()
 }

@@ -1466,8 +1466,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const plannerCapabilityState = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
   const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
   const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
-  const selectedPlannerFeatureId = typeof plannerCapabilityState.selected_feature_id === 'string' && plannerCapabilityState.selected_feature_id.trim()
-    ? plannerCapabilityState.selected_feature_id
+  const selectedPlannerFeatureId = typeof plannerCapabilityState.feature_id === 'string' && plannerCapabilityState.feature_id.trim()
+    ? plannerCapabilityState.feature_id
     : null;
   const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed && selectedPlannerFeatureId);
   const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed && selectedPlannerFeatureId);
@@ -2411,9 +2411,19 @@ export function WorkflowShell(props: {
   }, [selectedRun?.definition]);
 
   function normalizeCheckpointDisposition(disposition: string) {
-    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous') return 'continue_auto';
-    if (disposition === 'select_stage' || disposition === 'select' || disposition === 'continue_manual' || disposition === 'manual') return 'select_stage';
-    if (disposition === 'continue_auto' || disposition === 'auto' || disposition === 'autonomous' || disposition === 'move_next' || disposition === 'continue') return 'continue_auto';
+    if (
+      disposition === 'continue_auto'
+      || disposition === 'auto'
+      || disposition === 'autonomous'
+      || disposition === 'move_next'
+      || disposition === 'continue'
+    ) return 'continue_auto';
+    if (
+      disposition === 'select_stage'
+      || disposition === 'select'
+      || disposition === 'continue_manual'
+      || disposition === 'manual'
+    ) return 'select_stage';
     if (disposition === 'pause_error' || disposition === 'pause' || disposition === 'paused') return 'pause_error';
     return disposition;
   }
@@ -2445,20 +2455,70 @@ export function WorkflowShell(props: {
   }
 
   const pendingDispositionReview = useMemo(() => {
+    const normalizeCheckpoint = (value: Record<string, unknown> | null) => {
+      if (!value) return null;
+
+      const kind = typeof value.kind === 'string' ? value.kind : '';
+      if (kind && kind !== 'operator_checkpoint' && kind !== 'disposition_review') return null;
+
+      return {
+        stageId: typeof value.stage_id === 'string' ? value.stage_id : selectedRun?.current_step_id ?? '',
+        stageType: typeof value.stage_type === 'string' ? value.stage_type : '',
+        recommendedDisposition: typeof value.recommended_disposition === 'string' ? value.recommended_disposition : '',
+        nextStepId: typeof value.next_step_id === 'string' ? value.next_step_id : '',
+        message: typeof value.message === 'string' ? value.message : '',
+        availableDispositions: ['continue_auto', 'pause_error', 'select_stage']
+      };
+    };
+
     const workflowEngine = ((selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine ?? undefined) as Record<string, unknown> | undefined;
     const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
     const blockedOn = (runState.blocked_on ?? null) as Record<string, unknown> | null;
-    if (!blockedOn || (blockedOn.kind !== 'operator_checkpoint' && blockedOn.kind !== 'disposition_review')) return null;
+    const persistedCheckpoint = normalizeCheckpoint(blockedOn);
 
-    return {
-      stageId: typeof blockedOn.stage_id === 'string' ? blockedOn.stage_id : selectedRun?.current_step_id ?? '',
-      stageType: typeof blockedOn.stage_type === 'string' ? blockedOn.stage_type : '',
-      recommendedDisposition: typeof blockedOn.recommended_disposition === 'string' ? blockedOn.recommended_disposition : '',
-      nextStepId: typeof blockedOn.next_step_id === 'string' ? blockedOn.next_step_id : '',
-      message: typeof blockedOn.message === 'string' ? blockedOn.message : '',
-      availableDispositions: ['continue_auto', 'pause_error', 'select_stage']
-    };
-  }, [selectedRun?.context, selectedRun?.current_step_id]);
+    if (persistedCheckpoint) return persistedCheckpoint;
+    if (!selectedRunId) return null;
+
+    const events = runtimeEvents.workflowEventsByRunId[selectedRunId] ?? [];
+
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+
+      if (
+        event.kind === 'operator_checkpoint_resolved'
+        || event.kind === 'stage_execution_completed'
+        || event.kind === 'workflow_completed'
+        || event.kind === 'workflow_process_stopped'
+      ) {
+        return null;
+      }
+
+      if (
+        event.kind !== 'operator_checkpoint_waiting'
+        && event.kind !== 'stage_execution_waiting_for_operator_checkpoint'
+        && event.kind !== 'workflow_waiting_for_operator_checkpoint'
+      ) {
+        continue;
+      }
+
+      const payload = (event.payload ?? {}) as Record<string, unknown>;
+      const result = (payload.result ?? null) as Record<string, unknown> | null;
+      const checkpoint = (payload.checkpoint ?? null) as Record<string, unknown> | null;
+      const blocked = (payload.blocked_on ?? null) as Record<string, unknown> | null;
+
+      return normalizeCheckpoint(result)
+        ?? normalizeCheckpoint(checkpoint)
+        ?? normalizeCheckpoint(blocked)
+        ?? normalizeCheckpoint(payload);
+    }
+
+    return null;
+  }, [
+    selectedRun?.context,
+    selectedRun?.current_step_id,
+    selectedRunId,
+    runtimeEvents.workflowEventsByRunId
+  ]);
 
   const hasPendingDispositionReview = Boolean(pendingDispositionReview);
 
@@ -2673,10 +2733,10 @@ export function WorkflowShell(props: {
   }, [selectedRun?.context]);
 
   const selectedPlannerFeatureId = plannerSelectedFeatureIdDraft
-    ?? (typeof sharedPlannerFragmentState?.selected_feature_id === 'string' && sharedPlannerFragmentState.selected_feature_id.trim() ? sharedPlannerFragmentState.selected_feature_id : null);
+    ?? (typeof sharedPlannerFragmentState?.feature_id === 'string' && sharedPlannerFragmentState.feature_id.trim() ? sharedPlannerFragmentState.feature_id : null);
 
-  const selectedPlannerWorkspaceId = typeof sharedPlannerFragmentState?.planner_workspace_id === 'string' && sharedPlannerFragmentState.planner_workspace_id.trim()
-    ? sharedPlannerFragmentState.planner_workspace_id
+  const selectedPlannerWorkspaceId = typeof sharedPlannerFragmentState?.planner_id === 'string' && sharedPlannerFragmentState.planner_id.trim()
+    ? sharedPlannerFragmentState.planner_id
     : null;
   const selectedPlannerFeatureLabelKey = selectedPlannerFeatureId
     ? `${selectedPlannerWorkspaceId ?? 'canonical'}:${selectedPlannerFeatureId}`
@@ -3296,10 +3356,11 @@ export function WorkflowShell(props: {
           }
         },
         planner: {
-          fragment_armed: Boolean(currentPlanner.fragment_armed && currentPlanner.selected_feature_id),
-          selected_feature_id: currentPlanner.selected_feature_id ?? null,
-          planner_workspace_id: currentPlanner.planner_workspace_id ?? null,
-          supervisor_run_id: currentPlanner.supervisor_run_id ?? null
+          planner_id: typeof currentPlanner.planner_id === 'string' ? currentPlanner.planner_id : '',
+          feature_id: typeof currentPlanner.feature_id === 'string' ? currentPlanner.feature_id : '',
+          fragment_armed: Boolean(currentPlanner.fragment_armed && currentPlanner.planner_id && currentPlanner.feature_id),
+          schema_armed: Boolean(currentPlanner.schema_armed && currentPlanner.planner_id && currentPlanner.feature_id),
+          auto_apply_armed: Boolean(currentPlanner.auto_apply_armed && currentPlanner.planner_id && currentPlanner.feature_id)
         },
         context_export: {
           ...currentContextExport,
@@ -4571,22 +4632,26 @@ export function WorkflowShell(props: {
   async function patchPlannerCapabilityState(patch: Record<string, unknown>) {
     if (!selectedRun?.id) return;
     const currentPlanner = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
-    const nextSelectedFeatureId = Object.prototype.hasOwnProperty.call(patch, 'selected_feature_id')
-      ? patch.selected_feature_id
-      : currentPlanner.selected_feature_id ?? selectedPlannerFeatureId ?? null;
-    const normalizedSelectedFeatureId = typeof nextSelectedFeatureId === 'string' && nextSelectedFeatureId.trim()
-      ? nextSelectedFeatureId
-      : null;
+    const nextPlannerId = Object.prototype.hasOwnProperty.call(patch, 'planner_id')
+      ? patch.planner_id
+      : currentPlanner.planner_id ?? selectedPlannerWorkspaceId ?? '';
+    const normalizedPlannerId = typeof nextPlannerId === 'string' ? nextPlannerId.trim() : '';
+    const nextSelectedFeatureId = Object.prototype.hasOwnProperty.call(patch, 'feature_id')
+      ? patch.feature_id
+      : currentPlanner.feature_id ?? selectedPlannerFeatureId ?? '';
+    const normalizedSelectedFeatureId = typeof nextSelectedFeatureId === 'string'
+      ? nextSelectedFeatureId.trim()
+      : '';
+    const hasPlannerBinding = Boolean(normalizedPlannerId && normalizedSelectedFeatureId);
 
     await patchGlobalCapabilityState({
       capabilities: {
         planner: {
-          fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && normalizedSelectedFeatureId),
-          schema_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'schema_armed') ? patch.schema_armed : currentPlanner.schema_armed) && normalizedSelectedFeatureId),
-          auto_apply_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'auto_apply_armed') ? patch.auto_apply_armed : currentPlanner.auto_apply_armed) && normalizedSelectedFeatureId),
-          selected_feature_id: normalizedSelectedFeatureId,
-          planner_workspace_id: patch.planner_workspace_id ?? currentPlanner.planner_workspace_id ?? null,
-          supervisor_run_id: patch.supervisor_run_id ?? currentPlanner.supervisor_run_id ?? null
+          planner_id: normalizedPlannerId,
+          feature_id: normalizedSelectedFeatureId,
+          fragment_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'fragment_armed') ? patch.fragment_armed : currentPlanner.fragment_armed) && hasPlannerBinding),
+          schema_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'schema_armed') ? patch.schema_armed : currentPlanner.schema_armed) && hasPlannerBinding),
+          auto_apply_armed: Boolean((Object.prototype.hasOwnProperty.call(patch, 'auto_apply_armed') ? patch.auto_apply_armed : currentPlanner.auto_apply_armed) && hasPlannerBinding)
         }
       }
     });

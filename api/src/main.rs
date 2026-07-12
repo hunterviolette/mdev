@@ -45,6 +45,20 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db);
 
+    let recovered_runs = crate::engine::fail_active_runs_for_process_stop(
+        &state,
+        "The previous API process stopped while workflow execution was active.",
+    )
+    .await?;
+
+    if recovered_runs > 0 {
+        tracing::warn!(
+            recovered_runs,
+            "marked workflows from the previous API process as failed"
+        );
+    }
+
+    let shutdown_state = state.clone();
     let app = build_router(state, &layout.web_dist);
 
     let addr = crate::runtime_env::workflow_api_bind_addr()?;
@@ -62,8 +76,30 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, web_dist = %layout.web_dist.display(), data_dir = %layout.data_dir.display(), "workflow api listening");
     open_mdev_web_ui(addr);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+
+            match crate::engine::fail_active_runs_for_process_stop(
+                &shutdown_state,
+                "The API stopped while workflow execution was active.",
+            )
+            .await
+            {
+                Ok(failed_runs) if failed_runs > 0 => {
+                    tracing::warn!(
+                        failed_runs,
+                        "marked active workflows as failed during API shutdown"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %format!("{:#}", error),
+                        "failed to mark active workflows as failed during API shutdown"
+                    );
+                }
+            }
+
             crate::engine::capabilities::inference::browser::adapter::shutdown_browser_bridge();
         })
         .await?;

@@ -4,6 +4,7 @@ mod runtime;
 
 mod stages;
 mod transitions;
+pub mod workflow_lifecycle;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -18,6 +19,128 @@ use crate::{
 
 pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resolve_operator_checkpoint, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
+
+pub async fn fail_active_runs_for_process_stop(
+    state: &AppState,
+    reason: &str,
+) -> Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, current_step_id, context_json
+        FROM workflow_runs
+        WHERE status IN ('queued', 'running', 'waiting')
+        ORDER BY created_at ASC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut failed_count = 0usize;
+
+    for row in rows {
+        let run_id = Uuid::parse_str(row.get::<String, _>("id").as_str())?;
+        let current_step_id = row.get::<Option<String>, _>("current_step_id");
+        let context_json = row.get::<String, _>("context_json");
+        let mut context = serde_json::from_str::<Value>(&context_json)
+            .unwrap_or_else(|_| json!({}));
+
+        let workflow_engine = context
+            .as_object_mut()
+            .expect("workflow context must be an object")
+            .entry("workflow_engine".to_string())
+            .or_insert_with(|| json!({}));
+
+        let workflow_engine = workflow_engine
+            .as_object_mut()
+            .expect("workflow_engine must be an object");
+
+        let run_state = workflow_engine
+            .entry("run_state".to_string())
+            .or_insert_with(|| json!({}));
+
+        let run_state = run_state
+            .as_object_mut()
+            .expect("run_state must be an object");
+
+        let interrupted_checkpoint = run_state.remove("blocked_on");
+
+        run_state.insert(
+            "terminal_error".to_string(),
+            json!({
+                "kind": "process_stopped",
+                "message": reason,
+                "process_session_id": state.process_session_id(),
+                "interrupted_checkpoint": interrupted_checkpoint,
+                "occurred_at": Utc::now().to_rfc3339()
+            }),
+        );
+
+        if let Some(step_id) = current_step_id.as_deref() {
+            let local_state = workflow_engine
+                .entry("local_state".to_string())
+                .or_insert_with(|| json!({}));
+
+            if let Some(local_state) = local_state.as_object_mut() {
+                let stages = local_state
+                    .entry("stages".to_string())
+                    .or_insert_with(|| json!({}));
+
+                if let Some(stages) = stages.as_object_mut() {
+                    let stage = stages
+                        .entry(step_id.to_string())
+                        .or_insert_with(|| json!({}));
+
+                    if let Some(stage) = stage.as_object_mut() {
+                        stage.insert("status".to_string(), Value::String("error".to_string()));
+                        stage.insert("error".to_string(), Value::String(reason.to_string()));
+                        stage.insert(
+                            "completed_at".to_string(),
+                            Value::String(Utc::now().to_rfc3339()),
+                        );
+                    }
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_runs
+            SET status = 'error',
+                context_json = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND status IN ('queued', 'running', 'waiting')
+            "#,
+        )
+        .bind(serde_json::to_string_pretty(&context)?)
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id.to_string())
+        .execute(&state.db)
+        .await?;
+
+        append_engine_event(
+            state,
+            run_id,
+            current_step_id.as_deref(),
+            "error",
+            "workflow_process_stopped",
+            reason,
+            json!({
+                "reason": reason,
+                "terminal": true,
+                "process_session_id": state.process_session_id(),
+                "event_meta": {
+                    "is_header_event": true
+                }
+            }),
+        )
+        .await?;
+
+        failed_count += 1;
+    }
+
+    Ok(failed_count)
+}
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let row = sqlx::query(
@@ -261,14 +384,33 @@ pub(crate) fn activate_next_prompt_fragments_for_stage(run: &mut WorkflowRun) {
         .or_insert_with(|| json!({}));
     let inference_obj = ensure_value_object(inference);
 
-    let next = inference_obj
+    let mut active = inference_obj
         .remove("next_prompt_fragments")
-        .unwrap_or_else(|| json!([]));
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
 
-    if next.as_array().map(|items| !items.is_empty()).unwrap_or(false) {
-        inference_obj.insert("active_prompt_fragments".to_string(), next);
-    } else {
+    if let Some(retry_feedback) = inference_obj.remove("pending_retry_feedback") {
+        let retry_text = retry_feedback
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(retry_text) = retry_text {
+            active.push(json!({
+                "kind": retry_feedback
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stage_retry"),
+                "text": retry_text
+            }));
+        }
+    }
+
+    if active.is_empty() {
         inference_obj.remove("active_prompt_fragments");
+    } else {
+        inference_obj.insert("active_prompt_fragments".to_string(), Value::Array(active));
     }
 }
 
@@ -330,15 +472,6 @@ pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<
         inference_obj.remove("shared_inference_state");
     }
 
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment") {
-        let planner = capabilities_obj
-            .entry("planner".to_string())
-            .or_insert_with(|| json!({}));
-        let planner_obj = ensure_value_object(planner);
-        if !planner_obj.contains_key("fragment_armed") {
-            planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
-        }
-    }
 }
 
 pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
@@ -380,7 +513,7 @@ pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected
             .or_insert_with(|| json!({}));
         let planner_obj = ensure_value_object(planner);
         let has_selected_feature = planner_obj
-            .get("selected_feature_id")
+            .get("feature_id")
             .and_then(Value::as_str)
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);

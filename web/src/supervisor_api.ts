@@ -559,6 +559,7 @@ export type FlightDeckSupervisor = {
   status: string;
   title: string;
   root_repo_path: string;
+  selected_planner_id?: string | null;
   snapshot_path?: string | null;
   integration_path?: string | null;
   integration_run_id?: string | null;
