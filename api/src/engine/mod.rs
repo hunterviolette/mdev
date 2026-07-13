@@ -1,6 +1,7 @@
 pub(crate) mod capabilities;
 pub(crate) mod governance;
 mod runtime;
+pub(crate) mod runtime_tools;
 
 mod stages;
 mod transitions;
@@ -19,6 +20,94 @@ use crate::{
 
 pub use runtime::{force_wait_run, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resolve_operator_checkpoint, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
+
+async fn fail_interrupted_qa_capability(
+    state: &AppState,
+    run_id: Uuid,
+    step_id: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let Some(step_id) = step_id else {
+        return Ok(());
+    };
+
+    let started = sqlx::query(
+        r#"
+        SELECT payload_json
+        FROM workflow_events
+        WHERE run_id = ?
+          AND step_id = ?
+          AND kind = 'qa_environment_started'
+        ORDER BY sequence_no DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(step_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some(started) = started else {
+        return Ok(());
+    };
+
+    let payload_json = started.get::<String, _>("payload_json");
+    let payload = serde_json::from_str::<Value>(&payload_json)
+        .unwrap_or_else(|_| json!({}));
+    let event_meta = payload
+        .get("event_meta")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let invocation_id = event_meta
+        .get("capability_invocation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    if invocation_id.is_empty() {
+        return Ok(());
+    }
+
+    let terminal_exists = sqlx::query(
+        r#"
+        SELECT 1
+        FROM workflow_events
+        WHERE run_id = ?
+          AND step_id = ?
+          AND kind IN ('qa_environment_completed', 'qa_environment_failed')
+          AND json_extract(payload_json, '$.event_meta.capability_invocation_id') = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(step_id)
+    .bind(invocation_id)
+    .fetch_optional(&state.db)
+    .await?
+    .is_some();
+
+    if terminal_exists {
+        return Ok(());
+    }
+
+    append_engine_event(
+        state,
+        run_id,
+        Some(step_id),
+        "error",
+        "qa_environment_failed",
+        "qa environment stopped because the API process ended",
+        json!({
+            "capability": "qa_environment",
+            "ok": false,
+            "error": reason,
+            "interrupted": true,
+            "event_meta": event_meta
+        }),
+    )
+    .await?;
+
+    Ok(())
+}
 
 pub async fn fail_active_runs_for_process_stop(
     state: &AppState,
@@ -101,6 +190,14 @@ pub async fn fail_active_runs_for_process_stop(
                 }
             }
         }
+
+        fail_interrupted_qa_capability(
+            state,
+            run_id,
+            current_step_id.as_deref(),
+            reason,
+        )
+        .await?;
 
         sqlx::query(
             r#"
@@ -388,24 +485,6 @@ pub(crate) fn activate_next_prompt_fragments_for_stage(run: &mut WorkflowRun) {
         .remove("next_prompt_fragments")
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
-
-    if let Some(retry_feedback) = inference_obj.remove("pending_retry_feedback") {
-        let retry_text = retry_feedback
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        if let Some(retry_text) = retry_text {
-            active.push(json!({
-                "kind": retry_feedback
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stage_retry"),
-                "text": retry_text
-            }));
-        }
-    }
 
     if active.is_empty() {
         inference_obj.remove("active_prompt_fragments");

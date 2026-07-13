@@ -3,6 +3,7 @@ import type {
   WorkflowBuilderDocument,
   WorkflowBuilderStageDocument,
   WorkflowGlobalConfig,
+  SharedDependenciesConfig,
   WorkflowGovernancePolicyDescriptor,
   WorkflowStageDescriptor,
   WorkflowStageField,
@@ -25,6 +26,14 @@ export function capabilityDisplayLabel(capabilityKey: string): string {
       return 'Inference';
     case 'changeset':
       return 'ChangeSet apply';
+    case 'shared_dependencies':
+      return 'Shared dependencies';
+    case 'terminal_runtime':
+      return 'Terminal runtime';
+    case 'deploy_qa':
+      return 'DeployQA';
+    case 'qa_environment':
+      return 'DeployQA';
     case 'compile_commands':
       return 'Compile commands';
     case 'sap/import':
@@ -92,6 +101,97 @@ export function buildStageDocument(step: BuilderStep): WorkflowBuilderStageDocum
   };
 }
 
+function defaultSharedDependencies(): SharedDependenciesConfig {
+  return {
+    enabled: true,
+    providers: [
+      {
+        id: 'node-root',
+        label: 'Node root',
+        ecosystem: 'node',
+        root: '.',
+        manifests: ['package.json', 'package-lock.json'],
+        trusted_artifact: {
+          kind: 'node_modules',
+          path: 'node_modules',
+          read_only: true,
+        },
+        isolated: {
+          storage_path: '.mdev/dependencies/node',
+          seed_from_trusted: false,
+          install: {
+            commands: [
+              {
+                id: 'npm-install',
+                label: 'npm install',
+                command: 'npm install',
+                arguments: [],
+                working_directory: '.',
+                environment: {},
+                shell: 'system',
+                mode: 'run',
+                timeout_seconds: null,
+                continue_on_error: false,
+              },
+            ],
+            stop_on_failure: true,
+          },
+        },
+        mismatch: {
+          disposition: 'operator_checkpoint',
+          allowed_dispositions: [
+            'create_isolated_dependencies',
+            'continue_trusted_with_warning',
+            'skip_stage',
+          ],
+        },
+      },
+      {
+        id: 'cargo-root',
+        label: 'Cargo root',
+        ecosystem: 'cargo',
+        root: 'api',
+        manifests: ['Cargo.toml'],
+        trusted_artifact: {
+          kind: 'cargo',
+          cargo_home: null,
+          target_directory: 'target',
+          share_target: false,
+        },
+        isolated: {
+          storage_path: '.mdev/dependencies/cargo',
+          seed_from_trusted: true,
+          install: {
+            commands: [
+              {
+                id: 'cargo-fetch',
+                label: 'cargo fetch',
+                command: 'cargo fetch',
+                arguments: [],
+                working_directory: 'api',
+                environment: {},
+                shell: 'system',
+                mode: 'run',
+                timeout_seconds: null,
+                continue_on_error: false,
+              },
+            ],
+            stop_on_failure: true,
+          },
+        },
+        mismatch: {
+          disposition: 'operator_checkpoint',
+          allowed_dispositions: [
+            'create_isolated_dependencies',
+            'continue_trusted_with_warning',
+            'skip_stage',
+          ],
+        },
+      },
+    ],
+  };
+}
+
 export function defaultGlobals(): WorkflowGlobalConfig {
   return {
     resources: {
@@ -124,6 +224,7 @@ export function defaultGlobals(): WorkflowGlobalConfig {
         },
       },
     },
+    shared_dependencies: defaultSharedDependencies(),
     automation: {
     },
   };

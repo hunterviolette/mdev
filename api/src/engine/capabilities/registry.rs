@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
 
-use super::{binding_specs, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, review_validation, sap};
+use super::{binding_specs, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, review_validation, sap, shared_dependencies};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -136,25 +136,6 @@ pub(crate) async fn execute_capability_chain(
     while let Some(invocation) = queue.first().cloned() {
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
-
-        if invocation.capability == "operator_checkpoint" && previous_capability_failed(&results) {
-            append_engine_event(
-                ctx.state,
-                ctx.run_id,
-                Some(ctx.step.id.as_str()),
-                "info",
-                "operator_checkpoint_skipped",
-                "Operator checkpoint skipped because the previous capability failed",
-                json!({
-                    "capability": invocation.capability,
-                    "reason": "previous_capability_failed",
-                    "previous_capability": results.last().map(|item| item.capability.clone()),
-                    "event_meta": event_meta(stage_execution_id.as_deref(), None, None, false)
-                }),
-            )
-            .await?;
-            continue;
-        }
 
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let before_decisions = governance::before_capability(
@@ -378,10 +359,6 @@ pub(crate) async fn execute_capability_chain(
     Ok(results)
 }
 
-fn previous_capability_failed(results: &[CapabilityResult]) -> bool {
-    results.last().map(|item| !item.ok).unwrap_or(false)
-}
-
 fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation> {
     match req {
         CapabilityInvocationRequest::None => Vec::new(),
@@ -419,6 +396,8 @@ async fn dispatch(
         "changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
         "planner_apply" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
+        "shared_dependencies" => shared_dependencies::execute(ctx, prior_results, invocation.config).await,
+        "qa_environment" => qa_environment::execute(ctx, prior_results, invocation.config).await,
         "git_patch_payload" => git_patch_payload::execute(ctx, prior_results, invocation.config).await,
         "review_validation" => review_validation::execute(ctx, prior_results, invocation.config).await,
         "operator_checkpoint" => operator_checkpoint::execute(ctx, prior_results, invocation.config).await,

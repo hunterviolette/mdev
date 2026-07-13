@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::engine::runtime_tools::{CompileStageSpec, QaStageSpec, SharedDependenciesConfig};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -70,6 +72,8 @@ pub struct WorkflowGlobalConfig {
     pub capabilities: Value,
     #[serde(default)]
     pub automation: Value,
+    #[serde(default)]
+    pub shared_dependencies: SharedDependenciesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -78,6 +82,10 @@ pub struct WorkflowStepExecutionConfig {
     pub changeset_apply: Value,
     #[serde(default)]
     pub compile_checks: Value,
+    #[serde(default)]
+    pub compile: Option<CompileStageSpec>,
+    #[serde(default)]
+    pub qa: Option<QaStageSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

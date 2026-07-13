@@ -220,10 +220,43 @@ fn compile_stage(
         }
     }
 
+    normalize_qa_readiness_discriminators(&mut step_value);
+
     let mut step: WorkflowStepDefinition = serde_json::from_value(step_value).map_err(|err| err.to_string())?;
     planner::normalize_planner_features(&mut step, global_state, repo_ref);
     normalize_compile_commands_from_text(&mut step);
     Ok(step)
+}
+
+fn normalize_qa_readiness_discriminators(step: &mut Value) {
+    let Some(services) = step
+        .get_mut("execution")
+        .and_then(|value| value.get_mut("qa"))
+        .and_then(|value| value.get_mut("environment"))
+        .and_then(|value| value.get_mut("services"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for service in services {
+        let Some(readiness) = service
+            .get_mut("readiness")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+
+        if !readiness.contains_key("kind") {
+            if let Some(value) = readiness.remove("type") {
+                readiness.insert("kind".to_string(), value);
+            } else {
+                readiness.insert("kind".to_string(), Value::String("http".to_string()));
+            }
+        } else {
+            readiness.remove("type");
+        }
+    }
 }
 
 async fn normalize_global_planner_fragment(
@@ -376,16 +409,50 @@ fn resolve_builder_effective_execution_plan(
                 include_changeset_schema: false,
             },
         ),
-        "compile" => Ok(vec![StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "compile_commands".to_string(),
-            enabled: true,
-            config: json!({}),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec![],
-            condition: Value::Null,
-        }]),
+        "compile" => Ok(vec![
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "shared_dependencies".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec![],
+                condition: Value::Null,
+            },
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "compile_commands".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec!["shared_dependencies".to_string()],
+                condition: Value::Null,
+            },
+        ]),
+        "qa" => Ok(vec![
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "shared_dependencies".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec![],
+                condition: Value::Null,
+            },
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "qa_environment".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec!["shared_dependencies".to_string()],
+                condition: Value::Null,
+            },
+        ]),
         _ => {
             if !step.execution_plan.is_empty() {
                 Ok(step.execution_plan.clone())
@@ -495,6 +562,7 @@ fn default_builder_catalog() -> WorkflowBuilderCatalog {
             design_descriptor(),
             code_descriptor(),
             compile_descriptor(),
+            qa_descriptor(),
             merge_patches_descriptor(),
             review_descriptor(),
             sap_import_descriptor(),
@@ -627,6 +695,7 @@ fn default_globals() -> WorkflowGlobalConfig {
             "sap/export": {}
         }),
         automation: json!({}),
+        shared_dependencies: crate::engine::runtime_tools::SharedDependenciesConfig::default(),
     }
 }
 
@@ -760,6 +829,7 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             "enabled": true
         }),
         compile_checks: json!({}),
+        ..WorkflowStepExecutionConfig::default()
     };
     template.execution_logic = json!({
         "kind": "code_stage_policy",
@@ -822,6 +892,7 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
         compile_checks: json!({
             "commands": []
         }),
+        ..WorkflowStepExecutionConfig::default()
     };
     template.execution_logic = json!({
         "kind": "compile_stage_policy",
@@ -829,7 +900,10 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
             "run_compile_checks": true
         }
     });
-    template.execution_plan = vec![capability_node("compile_commands")];
+    template.execution_plan = vec![
+        capability_node("shared_dependencies"),
+        capability_node_after("compile_commands", vec!["shared_dependencies"]),
+    ];
 
     WorkflowStageDescriptor {
         step_type: "compile".to_string(),
@@ -841,11 +915,172 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
             key: "compile".to_string(),
             label: "Compile".to_string(),
             fields: vec![
+                WorkflowStageField {
+                    key: "dependency_providers".to_string(),
+                    label: "Shared dependency providers".to_string(),
+                    field_type: "dependency_providers".to_string(),
+                    bind_to: "execution.compile.dependency_providers".to_string(),
+                    default: json!([]),
+                    description: "Optional shared dependency providers resolved before compile commands run.".to_string(),
+                    required: false,
+                    options: Vec::new(),
+                    visible_when: Vec::new(),
+                    ui: WorkflowStageFieldUi {
+                        control: "dependency_providers".to_string(),
+                        placeholder: "Select shared dependencies".to_string(),
+                        min_rows: 0,
+                        format: String::new(),
+                    },
+                },
                 text_field("execution.compile_checks.commands_text", "Compile commands", "execution.compile_checks.commands_text", ""),
             ],
         }],
         available_governance_policies: vec![compile_governance_policy_descriptor()],
         routes: default_routes("review", "compile", "compile"),
+    }
+}
+
+fn qa_descriptor() -> WorkflowStageDescriptor {
+    let template = WorkflowStepDefinition {
+        id: "qa-preview".to_string(),
+        name: "DeployQA".to_string(),
+        step_type: "qa".to_string(),
+        automation_mode: AutomationMode::Manual,
+        execution: WorkflowStepExecutionConfig {
+            qa: Some(crate::engine::runtime_tools::QaStageSpec {
+                dependency_providers: Vec::new(),
+                environment: crate::engine::runtime_tools::QaEnvironmentSpec {
+                    port_range: crate::engine::runtime_tools::PortRangeSpec {
+                        start: 24000,
+                        end: 24999,
+                    },
+                    hostname_template: "{run}.qa.localhost".to_string(),
+                    prepare: crate::engine::runtime_tools::TerminalSequenceSpec::default(),
+                    services: vec![crate::engine::runtime_tools::QaServiceSpec {
+                        id: "application".to_string(),
+                        label: "Application".to_string(),
+                        command: crate::engine::runtime_tools::TerminalCommandSpec {
+                            id: "application-dev".to_string(),
+                            label: "npm run dev".to_string(),
+                            command: "npm run dev".to_string(),
+                            arguments: Vec::new(),
+                            working_directory: ".".to_string(),
+                            environment: Default::default(),
+                            shell: crate::engine::runtime_tools::TerminalShell::System,
+                            mode: crate::engine::runtime_tools::TerminalCommandMode::Service,
+                            timeout_seconds: None,
+                            continue_on_error: false,
+                        },
+                        port: crate::engine::runtime_tools::QaServicePortSpec {
+                            environment_variable: "PORT".to_string(),
+                            preferred: None,
+                        },
+                        readiness: crate::engine::runtime_tools::QaReadinessSpec::Http {
+                            path: "/".to_string(),
+                            expected_status: Some(200),
+                            timeout_seconds: 60,
+                        },
+                        public: true,
+                    }],
+                    shutdown_grace_seconds: 5,
+                },
+            }),
+            ..WorkflowStepExecutionConfig::default()
+        },
+        prompt: WorkflowStepPromptConfig::default(),
+        config: json!({}),
+        capabilities: vec![WorkflowCapabilityBinding {
+            capability: "qa_environment".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+        }],
+        execution_logic: json!({}),
+        execution_plan: vec![
+            capability_node("shared_dependencies"),
+            capability_node_after("qa_environment", vec!["shared_dependencies"]),
+        ],
+        transitions: Vec::new(),
+        advancement: WorkflowStepAdvancementConfig {
+            mode: Some("manual".to_string()),
+            auto_run_on_enter: false,
+            auto_advance_on_success: false,
+            auto_advance_on_error: false,
+            auto_advance_on_paused: false,
+        },
+    };
+
+    WorkflowStageDescriptor {
+        step_type: "qa".to_string(),
+        label: "DeployQA".to_string(),
+        category: "validation".to_string(),
+        description: "Deploy and manage a QA application with optional shared dependencies, allocated ports, readiness checks, and temporary routing.".to_string(),
+        definition_template: template.clone(),
+        editable_fields: vec![
+            WorkflowStageFieldGroup {
+                key: "dependencies".to_string(),
+                label: "Dependencies".to_string(),
+                fields: vec![WorkflowStageField {
+                    key: "dependency_providers".to_string(),
+                    label: "Dependency providers".to_string(),
+                    field_type: "dependency_providers".to_string(),
+                    bind_to: "execution.qa.dependency_providers".to_string(),
+                    default: json!([]),
+                    description: "Trusted dependency providers resolved before the QA environment starts.".to_string(),
+                    required: false,
+                    options: Vec::new(),
+                    visible_when: Vec::new(),
+                    ui: WorkflowStageFieldUi {
+                        control: "dependency_providers".to_string(),
+                        placeholder: "node-root, cargo-root".to_string(),
+                        min_rows: 0,
+                        format: String::new(),
+                    },
+                }],
+            },
+            WorkflowStageFieldGroup {
+                key: "services".to_string(),
+                label: "Services".to_string(),
+                fields: vec![WorkflowStageField {
+                    key: "services".to_string(),
+                    label: "Deployment services".to_string(),
+                    field_type: "qa_services".to_string(),
+                    bind_to: "execution.qa.environment.services".to_string(),
+                    default: serde_json::to_value(
+                        template
+                            .execution
+                            .qa
+                            .as_ref()
+                            .map(|qa| qa.environment.services.clone())
+                            .unwrap_or_default(),
+                    )
+                    .unwrap_or_else(|_| json!([])),
+                    description: "Commands, environments, ports, readiness checks, and routing for every deployed service.".to_string(),
+                    required: true,
+                    options: Vec::new(),
+                    visible_when: Vec::new(),
+                    ui: WorkflowStageFieldUi {
+                        control: "qa_services".to_string(),
+                        placeholder: String::new(),
+                        min_rows: 0,
+                        format: "json".to_string(),
+                    },
+                }],
+            },
+            WorkflowStageFieldGroup {
+                key: "routing".to_string(),
+                label: "Routing".to_string(),
+                fields: vec![
+                    int_field("port_start", "Port range start", "execution.qa.environment.port_range.start", 24000),
+                    int_field("port_end", "Port range end", "execution.qa.environment.port_range.end", 24999),
+                    text_field("hostname_template", "Hostname template", "execution.qa.environment.hostname_template", "{run}.qa.localhost"),
+                    int_field("shutdown_grace_seconds", "Shutdown grace seconds", "execution.qa.environment.shutdown_grace_seconds", 5),
+                ],
+            },
+        ],
+        available_governance_policies: Vec::new(),
+        routes: default_routes("", "qa", "qa"),
     }
 }
 
@@ -1176,26 +1411,81 @@ fn select_field(key: &str, label: &str, bind_to: &str, default: &str, options: V
 }
 
 fn set_path(root: &mut Value, path: &str, value: Value) -> Result<(), String> {
-    let parts: Vec<&str> = path.split('.').filter(|part| !part.trim().is_empty()).collect();
+    let parts: Vec<&str> = path
+        .split('.')
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+
     if parts.is_empty() {
         return Err("path cannot be empty".to_string());
     }
 
-    let mut cursor = root;
-    for part in &parts[..parts.len() - 1] {
+    fn assign(cursor: &mut Value, parts: &[&str], value: Value) -> Result<(), String> {
+        let part = parts[0];
+        let is_last = parts.len() == 1;
+
+        if let Ok(index) = part.parse::<usize>() {
+            if !cursor.is_array() {
+                *cursor = Value::Array(Vec::new());
+            }
+
+            let array = cursor
+                .as_array_mut()
+                .ok_or_else(|| format!("{} is not an array", part))?;
+
+            while array.len() <= index {
+                array.push(Value::Null);
+            }
+
+            if is_last {
+                array[index] = value;
+                return Ok(());
+            }
+
+            let next_is_index = parts[1].parse::<usize>().is_ok();
+            if array[index].is_null() {
+                array[index] = if next_is_index {
+                    Value::Array(Vec::new())
+                } else {
+                    json!({})
+                };
+            }
+
+            return assign(&mut array[index], &parts[1..], value);
+        }
+
         if !cursor.is_object() {
             *cursor = json!({});
         }
-        let obj = cursor.as_object_mut().ok_or_else(|| format!("{} is not an object", part))?;
-        cursor = obj.entry((*part).to_string()).or_insert_with(|| json!({}));
+
+        let object = cursor
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not an object", part))?;
+
+        if is_last {
+            object.insert(part.to_string(), value);
+            return Ok(());
+        }
+
+        let next_is_index = parts[1].parse::<usize>().is_ok();
+        let child = object.entry(part.to_string()).or_insert_with(|| {
+            if next_is_index {
+                Value::Array(Vec::new())
+            } else {
+                json!({})
+            }
+        });
+
+        if next_is_index && !child.is_array() {
+            *child = Value::Array(Vec::new());
+        } else if !next_is_index && !child.is_object() {
+            *child = json!({});
+        }
+
+        assign(child, &parts[1..], value)
     }
 
-    if !cursor.is_object() {
-        *cursor = json!({});
-    }
-    let obj = cursor.as_object_mut().ok_or_else(|| "target is not an object".to_string())?;
-    obj.insert(parts[parts.len() - 1].to_string(), value);
-    Ok(())
+    assign(root, &parts, value)
 }
 
 fn is_empty_object(value: &Value) -> bool {

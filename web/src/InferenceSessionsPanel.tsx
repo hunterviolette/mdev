@@ -44,6 +44,9 @@ function normalizeGlobals(globals: Record<string, unknown> | null | undefined): 
     resources: asRecord(globals?.resources),
     capabilities: asRecord(globals?.capabilities),
     automation: asRecord(globals?.automation),
+    shared_dependencies: globals?.shared_dependencies && typeof globals.shared_dependencies === 'object' && !Array.isArray(globals.shared_dependencies)
+      ? globals.shared_dependencies as WorkflowGlobalConfig['shared_dependencies']
+      : undefined,
   };
 }
 

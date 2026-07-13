@@ -4,6 +4,7 @@ mod compile_stage;
 mod design_stage;
 mod review_stage;
 mod merge_patches_stage;
+mod qa_stage;
 mod sap_export_stage;
 mod sap_import_stage;
 mod sap_syntax_stage;
@@ -16,7 +17,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    app_state::AppState,
+    app_state::{AppState, WorkflowTransientPromptFragment},
     engine::capabilities::inference::stage_support::{
         build_inference_execution_plan,
         InferenceStageSettings,
@@ -49,12 +50,14 @@ pub struct StageOutcome {
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
+    pub transient_prompt_fragments: Vec<WorkflowTransientPromptFragment>,
 }
 
 pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> capability_contract::StageCapabilities {
     match step.step_type.as_str() {
         "code" => code_stage::capabilities(),
         "compile" => compile_stage::capabilities(),
+        "qa" => qa_stage::capabilities(),
         "review" => review_stage::capabilities(),
         "merge_patches" => merge_patches_stage::capabilities(),
         "sap_import" => sap_import_stage::capabilities(),
@@ -330,6 +333,31 @@ pub async fn execute_stage(
     )
     .await?;
 
+    let transient_prompt_fragments = state.take_transient_prompt_fragments(run_id);
+    if !transient_prompt_fragments.is_empty() {
+        let execution_global_state_obj = ensure_value_object(&mut execution_global_state);
+        let capabilities = execution_global_state_obj
+            .entry("capabilities".to_string())
+            .or_insert_with(|| json!({}));
+        let capabilities_obj = ensure_value_object(capabilities);
+        let inference = capabilities_obj
+            .entry("inference".to_string())
+            .or_insert_with(|| json!({}));
+        let inference_obj = ensure_value_object(inference);
+        let active_prompt_fragments = inference_obj
+            .entry("active_prompt_fragments".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let active_prompt_fragments = active_prompt_fragments
+            .as_array_mut()
+            .expect("active_prompt_fragments must be array");
+        active_prompt_fragments.extend(transient_prompt_fragments.iter().map(|fragment| {
+            json!({
+                "kind": fragment.kind(),
+                "text": fragment.text()
+            })
+        }));
+    }
+
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
@@ -406,6 +434,7 @@ pub async fn execute_stage(
             message,
             capability_results,
             local_state: Value::Object(prepared_local_state_obj.clone()),
+            transient_prompt_fragments: Vec::new(),
         });
     }
 
@@ -446,6 +475,7 @@ pub async fn execute_stage(
         message: branch.message.clone(),
         capability_results: capability_results.clone(),
         local_state: prepared_local_state,
+        transient_prompt_fragments: branch.transient_prompt_fragments.clone(),
     };
 
     let pending_operator_checkpoint = outcome.ok
@@ -508,6 +538,7 @@ struct StageBranch {
     disposition: StageDisposition,
     message: String,
     patch: Option<Value>,
+    transient_prompt_fragments: Vec<WorkflowTransientPromptFragment>,
 }
 
 fn resolve_stage_branch(
@@ -528,6 +559,8 @@ fn resolve_stage_branch(
         .unwrap_or_else(|| Value::Object(Map::new()));
 
     let patch = build_branch_patch(step, &branch, capability_results);
+    let transient_prompt_fragments =
+        build_branch_transient_prompt_fragments(step, &branch, capability_results);
 
     let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
 
@@ -540,6 +573,7 @@ fn resolve_stage_branch(
             .map(ToString::to_string)
             .unwrap_or_else(|| default_branch_message(step, capability_failed, &disposition)),
         patch,
+        transient_prompt_fragments,
     }
 }
 
@@ -556,9 +590,7 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
         ("compile", "compile_commands", "compile_error_to_code_prompt") => {
             Some(compile_stage::build_compile_error_patch(capability_results))
         }
-        ("code", "changeset", "apply_error_to_code_prompt") => {
-            Some(code_stage::build_apply_error_patch(capability_results))
-        }
+        ("code", "changeset", "apply_error_to_code_prompt") => None,
         ("review", "review_validation", "review_failure_to_code_prompt") => {
             Some(review_stage::build_review_failure_patch(capability_results))
         }
@@ -572,6 +604,33 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
             Some(sap_export_stage::build_sap_execution_patch(capability_results))
         }
         _ => None,
+    }
+}
+
+fn build_branch_transient_prompt_fragments(
+    step: &WorkflowStepDefinition,
+    branch: &Value,
+    capability_results: &[Value],
+) -> Vec<WorkflowTransientPromptFragment> {
+    let Some(descriptor) = branch.get("patch_from_capability") else {
+        return Vec::new();
+    };
+    let capability = descriptor
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mode = descriptor
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match (step.step_type.as_str(), capability, mode) {
+        ("code", "changeset", "apply_error_to_code_prompt") => {
+            vec![WorkflowTransientPromptFragment::ChangesetApplyError {
+                text: code_stage::build_apply_error_feedback(capability_results),
+            }]
+        }
+        _ => Vec::new(),
     }
 }
 

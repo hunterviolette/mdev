@@ -8,9 +8,13 @@ type GlobalCapabilitiesPanelProps = {
   onOpenPlanner: () => void;
   onOpenApplyChangeset: () => void;
   onOpenGitPatchPayload: () => void;
+  onOpenSharedDependencies: () => void;
+  onOpenDeployQA: () => void;
   repoContextArmed: boolean;
   changesetSchemaArmed: boolean;
   plannerArmed: boolean;
+  sharedDependenciesEnabled: boolean;
+  deployQAAvailable: boolean;
 };
 
 type CapabilityCardProps = {
@@ -58,9 +62,13 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
     onOpenPlanner,
     onOpenApplyChangeset,
     onOpenGitPatchPayload,
+    onOpenSharedDependencies,
+    onOpenDeployQA,
     repoContextArmed,
     changesetSchemaArmed,
     plannerArmed,
+    sharedDependenciesEnabled,
+    deployQAAvailable,
   } = props;
 
   return (
@@ -124,6 +132,30 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           buttonLabel="Generate or apply"
           onClick={onOpenGitPatchPayload}
           badge={<Badge color="violet" variant="light">Portable</Badge>}
+        />
+        <CapabilityCard
+          eyebrow="Dependencies"
+          title="Shared dependencies"
+          description="Configure reusable Node and Cargo dependency providers that Compile and DeployQA stages may select."
+          buttonLabel="Configure dependencies"
+          onClick={onOpenSharedDependencies}
+          badge={
+            <Badge color={sharedDependenciesEnabled ? 'green' : 'gray'} variant="light">
+              {sharedDependenciesEnabled ? 'Enabled' : 'Disabled'}
+            </Badge>
+          }
+        />
+        <CapabilityCard
+          eyebrow="QA deployment"
+          title="DeployQA"
+          description="Configure and monitor the selected workflow QA deployment, services, readiness, ports, routing, and output."
+          buttonLabel={deployQAAvailable ? 'Configure deployment' : 'No QA stage'}
+          onClick={onOpenDeployQA}
+          badge={
+            <Badge color={deployQAAvailable ? 'blue' : 'gray'} variant="light">
+              {deployQAAvailable ? 'Available' : 'Unavailable'}
+            </Badge>
+          }
         />
       </SimpleGrid>
     </Stack>

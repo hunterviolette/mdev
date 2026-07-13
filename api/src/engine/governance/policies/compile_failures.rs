@@ -46,7 +46,6 @@ pub fn after_capability(
             "compile_failures": {
                 "pause_after_consecutive_failures": pause_after,
                 "consecutive": consecutive,
-                "latest_result": result.payload,
                 "pause_reason": pause_reason
             }
         }

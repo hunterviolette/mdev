@@ -72,6 +72,7 @@ import {
   type RuntimeEventEnvelope,
   type RuntimeProjectionResponse,
   type RepoTreeResponse,
+  type SharedDependenciesConfig,
   type SapExportScanItem,
   type SapSearchObject,
   type StageExecutionChain,
@@ -94,6 +95,10 @@ import type { DiffPanelState } from './DiffPanel';
 import { PlannerModal } from './PlannerModal';
 import { getPlanner, getPlannerFeature } from './planner_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
+import { DeployQA, defaultDeployQAValues, type DeployQAValues } from './Capabilities/DeployQA';
+import { DeployQARuntime } from './Capabilities/DeployQARuntime';
+import { RuntimeAdmin } from './Capabilities/RuntimeAdmin';
+import { SharedDependencies } from './Capabilities/SharedDependencies';
 import { FlightDeckPanel } from './FlightDeckPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
@@ -162,7 +167,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'flight_deck';
+type MonitorHomeView = 'workflows' | 'flight_deck' | 'runtime';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -1388,6 +1393,7 @@ const StageModifierActions = memo(function StageModifierActions(props: {
 const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPanel(props: {
   descriptor: WorkflowStageDescriptor | null;
   selectedWorkflowStep: WorkflowStepDefinition | null;
+  selectedRunId: string | null;
   repoFragmentSummary: string | null;
   stageApplyError: string;
   stageCompileError: string;
@@ -1408,6 +1414,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   onOpenPlanner: () => void;
   onPatchSelectedStepConfig: (key: string, value: unknown) => void;
   onOpenInferenceConfig: () => void;
+  onOpenDeployQA: () => void;
   onOpenRepoConfig: () => void;
   onOpenSchemaConfig: () => void;
   onOpenApplyErrorConfig: () => void;
@@ -1417,6 +1424,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const {
     descriptor,
     selectedWorkflowStep,
+    selectedRunId,
     repoFragmentSummary,
     stageApplyError,
     stageCompileError,
@@ -1437,6 +1445,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     onOpenPlanner,
     onPatchSelectedStepConfig,
     onOpenInferenceConfig,
+    onOpenDeployQA,
     onOpenRepoConfig,
     onOpenSchemaConfig,
     onOpenApplyErrorConfig,
@@ -1474,7 +1483,15 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
   const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
   const plannerSupportedStep = selectedWorkflowStep?.step_type === 'design' || selectedWorkflowStep?.step_type === 'code' || selectedWorkflowStep?.step_type === 'review';
-  const showPlannerControls = Boolean(hasBackendPlanningFragment || planningFragmentArmed || selectedPlannerFeatureId || (plannerAvailableForRepo && plannerSupportedStep));
+  const showPlannerControls = Boolean(
+    plannerSupportedStep
+      && (
+        hasBackendPlanningFragment
+        || planningFragmentArmed
+        || selectedPlannerFeatureId
+        || plannerAvailableForRepo
+      )
+  );
 
   useEffect(() => {
     setPlannerSchemaArmedDraft(null);
@@ -1575,6 +1592,18 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       });
     }
 
+    if (selectedWorkflowStep?.step_type === 'qa') {
+      actions.push({
+        key: 'deploy_qa',
+        label: 'DeployQA',
+        status: 'Configured',
+        color: 'blue',
+        buttonLabel: 'Configure',
+        onOpen: onOpenDeployQA,
+        helperText: 'Configure the QA command, shared dependencies, readiness, ports, and routing.'
+      });
+    }
+
     if (stageApplyError.trim()) {
       actions.push({
         key: 'apply_error',
@@ -1621,6 +1650,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     inferenceConnectionStatus,
     inferenceTransport,
     onOpenInferenceConfig,
+    onOpenDeployQA,
     stageApplyError,
     onOpenApplyErrorConfig,
     stageCompileError,
@@ -1752,7 +1782,11 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
 
   return (
     <Stack>
-      <Title order={6}>{descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs</Title>
+      <Title order={6}>
+        {selectedWorkflowStep?.step_type === 'qa'
+          ? 'DeployQA'
+          : `${descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs`}
+      </Title>
       {!descriptor ? (
         <Textarea
           label="User input"
@@ -1763,12 +1797,18 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           autosize
         />
       ) : null}
-      {descriptor?.editable_fields.map((group) => (
-        <Stack key={group.key} gap="xs">
-          {descriptor?.editable_fields.length > 1 ? <Text fw={600} size="sm">{group.label}</Text> : null}
-          {group.fields.filter((field) => fieldVisible(field)).map((field) => renderField(field))}
-        </Stack>
-      ))}
+      {selectedWorkflowStep?.step_type !== 'qa'
+        ? descriptor?.editable_fields.map((group) => (
+            <Stack key={group.key} gap="xs">
+              {descriptor.editable_fields.length > 1 ? (
+                <Text fw={600} size="sm">{group.label}</Text>
+              ) : null}
+              {group.fields
+                .filter((field) => fieldVisible(field))
+                .map((field) => renderField(field))}
+            </Stack>
+          ))
+        : null}
 
       {selectedWorkflowStep?.step_type === 'review' ? (
         <Group>
@@ -1777,6 +1817,14 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           </Button>
         </Group>
       ) : null}
+      {selectedWorkflowStep?.step_type === 'qa' ? (
+        <DeployQARuntime
+          runId={selectedRunId}
+          step={selectedWorkflowStep}
+          disabled={disabled}
+        />
+      ) : null}
+
       <StageModifierActions actions={modifierActions} />
     </Stack>
   );
@@ -2172,6 +2220,44 @@ export function WorkflowShell(props: {
   const runtimeProjectionLastRequestedAtRef = useRef<Record<string, number>>({});
 
 
+  function patchRuntimeDeployQAField<K extends keyof DeployQAValues>(
+    key: K,
+    value: DeployQAValues[K]
+  ) {
+    if (!selectedRunId) return;
+
+    const nextValues: DeployQAValues = {
+      ...runtimeDeployQAValues,
+      [key]: value,
+    };
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const currentGlobalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const currentCapabilities = (currentGlobalState.capabilities ?? {}) as Record<string, unknown>;
+
+    void patchWorkflowGlobalState(selectedRunId, {
+      ...currentGlobalState,
+      capabilities: {
+        ...currentCapabilities,
+        qa_environment: {
+          dependency_providers: nextValues.dependency_providers,
+          environment: {
+            services: nextValues.services,
+            port_range: {
+              start: nextValues.port_start,
+              end: nextValues.port_end,
+            },
+            hostname_template: nextValues.hostname_template,
+            shutdown_grace_seconds: nextValues.shutdown_grace_seconds,
+          },
+        },
+      },
+    })
+      .then(() => refreshRunDetails(selectedRunId))
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+  }
+
   function patchSelectedStepDescriptorField(bindTo: string, value: unknown) {
     if (!selectedRunId || !selectedWorkflowStep) return;
 
@@ -2243,7 +2329,11 @@ export function WorkflowShell(props: {
         cursor = next;
       }
     }
-    void patchWorkflowStageState(selectedRunId, selectedWorkflowStep.id, payload);
+    void patchWorkflowStageState(selectedRunId, selectedWorkflowStep.id, payload)
+      .then(() => refreshRunDetails(selectedRunId))
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
   }
 
   useEffect(() => {
@@ -2274,6 +2364,12 @@ export function WorkflowShell(props: {
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [loadTemplateOpen, setLoadTemplateOpen] = useState(false);
   const [globalCapabilitiesOpen, setGlobalCapabilitiesOpen] = useState(false);
+  const [deployQAOpen, setDeployQAOpen] = useState(false);
+  const [sharedDependenciesOpen, setSharedDependenciesOpen] = useState(false);
+  const [sharedDependenciesDraft, setSharedDependenciesDraft] = useState<SharedDependenciesConfig>({
+    enabled: false,
+    providers: [],
+  });
 
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [pendingStageSelectionId, setPendingStageSelectionId] = useState<string | null>(null);
@@ -2410,6 +2506,61 @@ export function WorkflowShell(props: {
     return selectedRun?.definition ?? null;
   }, [selectedRun?.definition]);
 
+  const selectedRunSharedDependencies = useMemo<SharedDependenciesConfig>(() => {
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const runtimeValue = globalState.shared_dependencies;
+
+    if (runtimeValue && typeof runtimeValue === 'object' && !Array.isArray(runtimeValue)) {
+      const value = runtimeValue as Record<string, unknown>;
+      return {
+        enabled: value.enabled === true,
+        providers: Array.isArray(value.providers)
+          ? value.providers as SharedDependenciesConfig['providers']
+          : [],
+      };
+    }
+
+    return selectedRunDefinition?.globals?.shared_dependencies ?? {
+      enabled: false,
+      providers: [],
+    };
+  }, [selectedRun?.context, selectedRunDefinition]);
+
+  const selectedRunQAStage = useMemo(() => {
+    return selectedRunDefinition?.steps.find((step) => step.step_type === 'qa') ?? null;
+  }, [selectedRunDefinition]);
+
+  function openSharedDependenciesFromCockpit() {
+    setSharedDependenciesDraft(structuredClone(selectedRunSharedDependencies));
+    setSharedDependenciesOpen(true);
+  }
+
+  function openDeployQAFromCockpit() {
+    if (!selectedRunQAStage) {
+      setError('This workflow does not contain a DeployQA stage.');
+      return;
+    }
+
+    setSelectedStepId(selectedRunQAStage.id);
+    setDeployQAOpen(true);
+  }
+
+  async function saveRuntimeSharedDependencies(next: SharedDependenciesConfig) {
+    setSharedDependenciesDraft(next);
+    if (!selectedRunId) return;
+
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const currentGlobalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+
+    await patchWorkflowGlobalState(selectedRunId, {
+      ...currentGlobalState,
+      shared_dependencies: next,
+    });
+
+    await refreshRunDetails(selectedRunId);
+  }
+
   function normalizeCheckpointDisposition(disposition: string) {
     if (
       disposition === 'continue_auto'
@@ -2527,6 +2678,60 @@ export function WorkflowShell(props: {
   const selectedWorkflowStep = useMemo(() => {
     return selectedRunDefinition?.steps.find((step) => step.id === selectedRunStepId) ?? null;
   }, [selectedRunDefinition, selectedRunStepId]);
+
+  const runtimeDeployQAValues = useMemo<DeployQAValues>(() => {
+    const definitionQa = selectedWorkflowStep?.execution?.qa;
+    const definitionEnvironment = definitionQa?.environment;
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    const capabilityQa = (capabilities.qa_environment ?? {}) as Record<string, unknown>;
+    const capabilityEnvironment = (capabilityQa.environment ?? {}) as Record<string, unknown>;
+    const capabilityPortRange = (capabilityEnvironment.port_range ?? {}) as Record<string, unknown>;
+    const dependencyProviders = capabilityQa.dependency_providers;
+    const services = capabilityEnvironment.services;
+    const portStart = capabilityPortRange.start;
+    const portEnd = capabilityPortRange.end;
+    const hostnameTemplate = capabilityEnvironment.hostname_template;
+    const shutdownGraceSeconds = capabilityEnvironment.shutdown_grace_seconds;
+
+    return {
+      dependency_providers: Array.isArray(dependencyProviders)
+        ? dependencyProviders.filter(
+            (value): value is string => typeof value === 'string'
+          )
+        : Array.isArray(definitionQa?.dependency_providers)
+          ? definitionQa.dependency_providers.filter(
+              (value): value is string => typeof value === 'string'
+            )
+          : [],
+      services: Array.isArray(services)
+        ? structuredClone(services as DeployQAValues['services'])
+        : Array.isArray(definitionEnvironment?.services)
+          ? structuredClone(definitionEnvironment.services)
+          : structuredClone(defaultDeployQAValues.services),
+      port_start:
+        typeof portStart === 'number'
+          ? portStart
+          : definitionEnvironment?.port_range?.start
+            ?? defaultDeployQAValues.port_start,
+      port_end:
+        typeof portEnd === 'number'
+          ? portEnd
+          : definitionEnvironment?.port_range?.end
+            ?? defaultDeployQAValues.port_end,
+      hostname_template:
+        typeof hostnameTemplate === 'string'
+          ? hostnameTemplate
+          : definitionEnvironment?.hostname_template
+            ?? defaultDeployQAValues.hostname_template,
+      shutdown_grace_seconds:
+        typeof shutdownGraceSeconds === 'number'
+          ? shutdownGraceSeconds
+          : definitionEnvironment?.shutdown_grace_seconds
+            ?? defaultDeployQAValues.shutdown_grace_seconds,
+    };
+  }, [selectedWorkflowStep, selectedRun?.context]);
 
 
   const [sapImportPackageName, setSapImportPackageName] = useState('');
@@ -2706,22 +2911,8 @@ export function WorkflowShell(props: {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
     const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
-    const inference = (capabilities.inference ?? null) as Record<string, unknown> | null;
-    const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
-    const lastPreparedStage = (runState.last_prepared_stage ?? null) as Record<string, unknown> | null;
-    const preparedStepId = typeof lastPreparedStage?.step_id === 'string' ? lastPreparedStage.step_id : null;
-    const preparedInference = (lastPreparedStage?.inference ?? null) as Record<string, unknown> | null;
-
-    if (preparedStepId && preparedStepId === selectedRunStepId && preparedInference) {
-      return {
-        ...preparedInference,
-        ...(inference ?? {}),
-        last_prepared_stage: lastPreparedStage
-      };
-    }
-
-    return inference;
-  }, [selectedRun?.context, selectedRunStepId]);
+    return (capabilities.inference ?? null) as Record<string, unknown> | null;
+  }, [selectedRun?.context]);
   const sharedPlannerFragmentState = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
@@ -2972,6 +3163,14 @@ export function WorkflowShell(props: {
       if (routedPath !== '/flight-deck') {
         props.navigate?.('/flight-deck');
       }
+      return;
+    }
+
+    if (routedPath === '/runtime') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'runtime' ? value : 'runtime');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
       return;
     }
 
@@ -4407,7 +4606,9 @@ export function WorkflowShell(props: {
       setError(null);
       const parsed = builderMode === 'json'
         ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
-        : applyBuilderGlobalsToDefinition(compiledBuilderDefinition, builderGlobals);
+        : compiledBuilderDefinition
+          ? structuredClone(compiledBuilderDefinition)
+          : null;
       if (!parsed) {
         throw new Error('Builder has not produced a compiled workflow definition yet.');
       }
@@ -4470,7 +4671,9 @@ export function WorkflowShell(props: {
       setError(null);
       const parsed = builderMode === 'json'
         ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
-        : applyBuilderGlobalsToDefinition(compiledBuilderDefinition, builderGlobals);
+        : compiledBuilderDefinition
+          ? structuredClone(compiledBuilderDefinition)
+          : null;
       if (!parsed) {
         throw new Error('Builder has not produced a compiled workflow definition yet.');
       }
@@ -6436,6 +6639,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 onOpenGitPatchPayload={() => {
                   setGitPatchPayloadOpen(true);
                 }}
+                onOpenSharedDependencies={openSharedDependenciesFromCockpit}
+                onOpenDeployQA={openDeployQAFromCockpit}
+                sharedDependenciesEnabled={selectedRunSharedDependencies.enabled}
+                deployQAAvailable={Boolean(selectedRunQAStage)}
               />
             </Card>
           ) : monitorView === 'workflow_list' ? (
@@ -6467,8 +6674,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         onClick={() => {
                           if (monitorHomeView === 'workflows') {
                             void refreshRunsAndTemplates();
-                          } else {
+                          } else if (monitorHomeView === 'flight_deck') {
                             props.navigate?.('/flight-deck');
+                          } else {
+                            props.navigate?.('/runtime');
                           }
                         }}
                       >
@@ -6481,19 +6690,27 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     onChange={(value) => {
                       const next = (value as MonitorHomeView | null) ?? 'workflows';
                       setMonitorHomeView((current) => current === next ? current : next);
-                      if (next === 'flight_deck') props.navigate?.('/flight-deck');
-                      else props.navigate?.('/workflows');
+                      if (next === 'runtime') {
+                        props.navigate?.('/runtime');
+                      } else if (next === 'flight_deck') {
+                        props.navigate?.('/flight-deck');
+                      } else {
+                        props.navigate?.('/workflows');
+                      }
                     }}
                   >
                     <Tabs.List>
                       <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
                       <Tabs.Tab value="flight_deck">Flight Deck</Tabs.Tab>
+                      <Tabs.Tab value="runtime">Runtime</Tabs.Tab>
                     </Tabs.List>
                   </Tabs>
                 </Stack>
               </Card>
 
-              {monitorHomeView === 'flight_deck' ? (
+              {monitorHomeView === 'runtime' ? (
+                <RuntimeAdmin />
+              ) : monitorHomeView === 'flight_deck' ? (
                 <FlightDeckPanel
                   navigate={props.navigate}
                 />
@@ -6769,6 +6986,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                   <BackendDrivenStageInputsPanel
                                     descriptor={selectedStageDescriptor}
                                     selectedWorkflowStep={selectedWorkflowStep ?? null}
+                                    selectedRunId={selectedRunId}
+                                    onOpenDeployQA={() => setDeployQAOpen(true)}
                                     repoFragmentSummary={repoFragmentSummary}
                                     stageApplyError={stageApplyError}
                                     stageCompileError={stageCompileError}
@@ -7412,7 +7631,24 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Stack>
         </Modal>
 
-        <Modal opened={templateModalOpen} onClose={() => setTemplateModalOpen(false)} title="Save template" centered zIndex={300}>
+        <SharedDependencies
+          opened={sharedDependenciesOpen}
+          value={sharedDependenciesDraft}
+          onClose={() => setSharedDependenciesOpen(false)}
+          onChange={(next) => {
+            void saveRuntimeSharedDependencies(next);
+          }}
+        />
+
+        <DeployQA
+        opened={deployQAOpen && selectedWorkflowStep?.step_type === 'qa'}
+        onClose={() => setDeployQAOpen(false)}
+        disabled={!selectedRunId || !selectedWorkflowStep}
+        providers={selectedRun?.definition?.globals?.shared_dependencies?.providers ?? []}
+        values={runtimeDeployQAValues}
+        onChange={patchRuntimeDeployQAField}
+      />
+      <Modal opened={templateModalOpen} onClose={() => setTemplateModalOpen(false)} title="Save template" centered zIndex={300}>
           <Stack>
             <TextInput label="Template name" value={workflowName} onChange={(e) => setWorkflowName(e.currentTarget.value)} placeholder="My workflow template" />
             <Textarea label="Description" value={workflowDescription} onChange={(e) => setWorkflowDescription(e.currentTarget.value)} minRows={3} autosize />

@@ -8,9 +8,26 @@ export type WorkflowCapabilityBinding = {
   output_mapping: Record<string, unknown>;
 };
 
+export type QaEnvironmentSpec = {
+  port_range: {
+    start: number;
+    end: number;
+  };
+  hostname_template: string;
+  prepare: TerminalSequenceSpec;
+  services: QaServiceSpec[];
+  shutdown_grace_seconds: number;
+};
+
+export type QaStageSpec = {
+  dependency_providers: string[];
+  environment: QaEnvironmentSpec;
+};
+
 export type WorkflowStepExecutionConfig = {
   changeset_apply: Record<string, unknown>;
   compile_checks: Record<string, unknown>;
+  qa?: QaStageSpec;
 };
 
 export type WorkflowStepPromptConfig = {
@@ -70,10 +87,16 @@ export type WorkflowStepDefinition = {
   advancement?: WorkflowStepAdvancementConfig;
 };
 
+export type SharedDependenciesConfig = {
+  enabled: boolean;
+  providers: DependencyProviderSpec[];
+};
+
 export type WorkflowGlobalConfig = {
   resources: Record<string, unknown>;
   capabilities: Record<string, unknown>;
   automation: Record<string, unknown>;
+  shared_dependencies?: SharedDependenciesConfig;
 };
 
 export type WorkflowTemplateDefinition = {
@@ -109,13 +132,203 @@ export type InferenceConfigPanelResponse = {
   inference: Record<string, unknown>;
 };
 
+export type TerminalShell = 'system' | 'direct' | 'cmd' | 'power_shell' | 'sh' | 'bash';
+
+export type TerminalCommandMode = 'run' | 'service';
+
+export type TerminalCommandSpec = {
+  id: string;
+  label: string;
+  command: string;
+  arguments: string[];
+  working_directory: string;
+  environment: Record<string, string>;
+  shell: TerminalShell;
+  mode: TerminalCommandMode;
+  timeout_seconds: number | null;
+  continue_on_error: boolean;
+};
+
+export type ProcessExecutionOwner = {
+  run_id: string;
+  step_id: string;
+  capability: string;
+  service_id: string | null;
+};
+
+export type RuntimeProcessRecord = {
+  execution_id: string;
+  pid: number | null;
+  command_id: string;
+  label: string;
+  command: string;
+  arguments: string[];
+  working_directory: string;
+  environment_keys: string[];
+  environment: Record<string, string>;
+  mode: TerminalCommandMode;
+  status: string;
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+  stdout: string;
+  stderr: string;
+  owner: ProcessExecutionOwner;
+};
+
+export type RuntimeProcessesResponse = {
+  ok: boolean;
+  processes: RuntimeProcessRecord[];
+};
+
+export type TerminalSequenceSpec = {
+  commands: TerminalCommandSpec[];
+  stop_on_failure: boolean;
+};
+
+export type DependencyProviderSpec = {
+  id: string;
+  label: string;
+  ecosystem: 'node' | 'cargo';
+  root: string;
+  manifests: string[];
+  trusted_artifact: Record<string, unknown>;
+  isolated: {
+    storage_path: string;
+    seed_from_trusted: boolean;
+    install: TerminalSequenceSpec;
+  };
+  mismatch: {
+    disposition: 'operator_checkpoint' | 'skip_stage' | 'continue_trusted_with_warning';
+    allowed_dispositions: Array<'create_isolated_dependencies' | 'continue_trusted_with_warning' | 'skip_stage'>;
+  };
+};
+
+export type QaServiceSpec = {
+  id: string;
+  label: string;
+  command: TerminalCommandSpec;
+  port: {
+    environment_variable: string;
+    preferred: number | null;
+  };
+  readiness: Record<string, unknown>;
+  public: boolean;
+};
+
+async function runtimeProcessRequest<T>(
+  path: string,
+  init?: RequestInit
+): Promise<T> {
+  const configuredBase = String(import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/$/, '');
+  const apiBase = configuredBase || '/api';
+  const response = await fetch(`${apiBase}${path}`, {
+    ...init,
+    headers: {
+      Accept: 'application/json',
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.headers ?? {}),
+    },
+  });
+
+  const contentType = response.headers.get('content-type') ?? '';
+  const payload = contentType.includes('application/json')
+    ? await response.json()
+    : await response.text();
+
+  if (!response.ok) {
+    const message =
+      payload && typeof payload === 'object' && 'error' in payload
+        ? String((payload as { error?: unknown }).error)
+        : typeof payload === 'string' && payload.trim()
+          ? payload
+          : `Runtime API request failed with status ${response.status}`;
+
+    throw new Error(message);
+  }
+
+  return payload as T;
+}
+
+export async function getRuntimeProcesses(): Promise<RuntimeProcessesResponse> {
+  const payload = await runtimeProcessRequest<unknown>('/processes');
+
+  if (Array.isArray(payload)) {
+    return {
+      ok: true,
+      processes: payload as RuntimeProcessRecord[],
+    };
+  }
+
+  if (payload && typeof payload === 'object') {
+    const record = payload as Record<string, unknown>;
+    const nestedData = record.data && typeof record.data === 'object'
+      ? record.data as Record<string, unknown>
+      : null;
+    const processes = Array.isArray(record.processes)
+      ? record.processes
+      : Array.isArray(nestedData?.processes)
+        ? nestedData.processes
+        : [];
+
+    return {
+      ok: record.ok !== false,
+      processes: processes as RuntimeProcessRecord[],
+    };
+  }
+
+  return {
+    ok: false,
+    processes: [],
+  };
+}
+
+export async function terminateRuntimeProcess(
+  executionId: string,
+  force = false
+): Promise<{ ok: boolean; process: RuntimeProcessRecord }> {
+  return runtimeProcessRequest(`/processes/${encodeURIComponent(executionId)}/terminate`, {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+  });
+}
+
+export async function terminateRuntimeDeployment(
+  runId: string,
+  stepId: string,
+  force = false
+): Promise<RuntimeProcessesResponse> {
+  return runtimeProcessRequest<RuntimeProcessesResponse>('/processes/deployment/terminate', {
+    method: 'POST',
+    body: JSON.stringify({ run_id: runId, step_id: stepId, force }),
+  });
+}
+
+export async function terminateRuntimeRun(
+  runId: string,
+  force = false
+): Promise<RuntimeProcessesResponse> {
+  return runtimeProcessRequest<RuntimeProcessesResponse>(`/processes/run/${encodeURIComponent(runId)}/terminate`, {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+  });
+}
+
+export async function clearCompletedRuntimeProcesses(): Promise<{
+  ok: boolean;
+  removed: number;
+}> {
+  return runtimeProcessRequest('/processes/completed', { method: 'DELETE' });
+}
+
 export type WorkflowStageFieldOption = {
   value: string;
   label: string;
 };
 
 export type WorkflowStageFieldUi = {
-  control: 'text' | 'textarea' | 'switch' | 'number' | 'select';
+  control: 'text' | 'textarea' | 'switch' | 'number' | 'select' | 'string_list' | 'terminal_command' | 'qa_services' | 'dependency_providers';
   placeholder?: string;
   min_rows?: number;
   format?: string;
@@ -129,7 +342,7 @@ export type WorkflowStageFieldVisibility = {
 export type WorkflowStageField = {
   key: string;
   label: string;
-  type: 'boolean' | 'integer' | 'text' | 'multiline_text';
+  type: 'boolean' | 'integer' | 'text' | 'multiline_text' | 'string_list' | 'terminal_command' | 'qa_services' | 'dependency_providers';
   bind_to: string;
   default: unknown;
   description?: string;

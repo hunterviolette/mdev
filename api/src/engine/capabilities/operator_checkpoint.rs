@@ -56,41 +56,37 @@ pub async fn execute(
     let latest_result = prior_results.last();
     let latest_payload = latest_result.map(|result| result.payload.clone()).unwrap_or_else(|| json!({}));
 
-    if latest_result.map(|result| !result.ok).unwrap_or(false) {
-        return Ok(CapabilityResult {
-            ok: false,
-            capability: "operator_checkpoint".to_string(),
-            payload: json!({
-                "ok": false,
-                "mode": "operator_checkpoint",
-                "status": "skipped",
-                "needs_user_response": false,
-                "summary": "Operator checkpoint skipped because the previous capability failed.",
-                "message": "Operator checkpoint skipped because the previous capability failed.",
-                "stage_id": ctx.step.id,
-                "stage_type": ctx.step.step_type,
-                "prior_result": latest_payload
-            }),
-            follow_ups: CapabilityInvocationRequest::None,
-        });
-    }
+    let previous_failed = latest_result.map(|result| !result.ok).unwrap_or(false);
 
     let configured_options = config
         .get("available_dispositions")
         .or_else(|| config.get("options"));
     let options = normalize_options(configured_options);
 
-    let recommended = normalize_recommended(
-        string_field(&config, "recommended_disposition")
-            .or_else(|| string_field(&config, "disposition"))
-            .or_else(|| latest_payload.get("disposition").and_then(Value::as_str)),
-    );
+    let recommended = if previous_failed {
+        "pause_error".to_string()
+    } else {
+        normalize_recommended(
+            string_field(&config, "recommended_disposition")
+                .or_else(|| string_field(&config, "disposition"))
+                .or_else(|| latest_payload.get("disposition").and_then(Value::as_str)),
+        )
+    };
 
-    let message = string_field(&config, "message")
-        .or_else(|| latest_payload.get("summary").and_then(Value::as_str))
-        .or_else(|| latest_payload.get("message").and_then(Value::as_str))
-        .unwrap_or("Operator checkpoint is waiting for a disposition.")
-        .to_string();
+    let message = if previous_failed {
+        latest_payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .or_else(|| latest_payload.get("message").and_then(Value::as_str))
+            .map(|value| format!("The previous capability failed: {}", value))
+            .unwrap_or_else(|| "The previous capability failed. Select how the workflow should proceed.".to_string())
+    } else {
+        string_field(&config, "message")
+            .or_else(|| latest_payload.get("summary").and_then(Value::as_str))
+            .or_else(|| latest_payload.get("message").and_then(Value::as_str))
+            .unwrap_or("Operator checkpoint is waiting for a disposition.")
+            .to_string()
+    };
 
     Ok(CapabilityResult {
         ok: true,
@@ -100,8 +96,13 @@ pub async fn execute(
             "mode": "operator_checkpoint",
             "status": "waiting",
             "needs_user_response": true,
-            "summary": "Operator checkpoint is waiting for user input.",
+            "summary": if previous_failed {
+                "Operator action is required after a capability failure."
+            } else {
+                "Operator checkpoint is waiting for user input."
+            },
             "message": message,
+            "previous_capability_failed": previous_failed,
             "stage_id": ctx.step.id,
             "stage_type": ctx.step.step_type,
             "recommended_disposition": recommended,

@@ -3408,7 +3408,24 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
     };
 
     let child_run = engine::load_run(state, workflow_run_id).await?;
-    let start_result = if matches!(child_run.status, RunStatus::Waiting | RunStatus::Paused) {
+    let waiting_on_operator_checkpoint = child_run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("operator_checkpoint");
+
+    let start_result = if waiting_on_operator_checkpoint {
+        json!({
+            "ok": false,
+            "status": "waiting",
+            "blocked_on": "operator_checkpoint",
+            "workflow_run_id": workflow_run_id,
+            "message": "The workflow is waiting on an operator checkpoint and was not restarted."
+        })
+    } else if matches!(child_run.status, RunStatus::Waiting | RunStatus::Paused) {
         engine::resume_run(state, workflow_run_id).await?
     } else if matches!(child_run.status, RunStatus::Queued | RunStatus::Running) {
         json!({ "ok": true, "already_running": true })
@@ -3417,8 +3434,17 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
     };
 
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE supervisor_work_units SET state = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?")
-        .bind(work_unit_running_state(&kind))
+    sqlx::query("UPDATE supervisor_work_units SET state = ?, blocked_reason = ?, updated_at = ? WHERE id = ?")
+        .bind(if waiting_on_operator_checkpoint {
+            work_unit_paused_state(&kind)
+        } else {
+            work_unit_running_state(&kind)
+        })
+        .bind(if waiting_on_operator_checkpoint {
+            Some("Waiting on operator checkpoint")
+        } else {
+            None
+        })
         .bind(&now)
         .bind(&work_unit_id)
         .execute(&state.db)

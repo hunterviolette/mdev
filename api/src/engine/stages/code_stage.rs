@@ -83,7 +83,7 @@ pub fn prepare_stage_state(
     Ok(state)
 }
 
-pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
+pub fn build_apply_error_feedback(capability_results: &[Value]) -> String {
     let apply_result = capability_results
         .iter()
         .find(|item| item.get("key").and_then(Value::as_str) == Some("changeset"))
@@ -103,29 +103,22 @@ pub fn build_apply_error_patch(capability_results: &[Value]) -> Value {
         .cloned()
         .unwrap_or_default();
 
-    let detail = if summary.contains("no JSON object found in changeset payload") {
-        summary.clone()
-    } else if lines.is_empty() {
-        summary.clone()
+    let detail = if summary.contains("no JSON object found in changeset payload") || lines.is_empty() {
+        summary
     } else {
-        format!("{}\n\n{}", summary, lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+        format!(
+            "{}\n\n{}",
+            summary,
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     };
 
-    let fragment = format!(
+    format!(
         "{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the apply errors.",
         detail
-    );
-
-    json!({
-        "global_state": {
-            "capabilities": {
-                "inference": {
-                    "pending_retry_feedback": {
-                        "kind": "changeset_apply_error",
-                        "text": fragment
-                    }
-                }
-            }
-        }
-    })
+    )
 }

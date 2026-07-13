@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,9 +59,11 @@ pub struct PlannerCapabilityBinding {
     pub feature_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlannerCapabilityState {
+    #[serde(default)]
     pub planner_id: String,
+    #[serde(default)]
     pub feature_id: String,
     #[serde(default)]
     pub fragment_armed: bool,
@@ -103,9 +105,14 @@ impl PlannerCapabilityState {
     }
 
     pub fn from_global_state(global_state: &Value) -> Result<Self> {
-        let state: WorkflowGlobalState = serde_json::from_value(global_state.clone())
-            .context("invalid planner capability state")?;
-        Ok(state.capabilities.planner)
+        let planner = global_state
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("planner"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        serde_json::from_value(planner)
+            .context("invalid planner capability state")
     }
 }
 

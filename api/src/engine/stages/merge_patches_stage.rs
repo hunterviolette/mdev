@@ -353,6 +353,7 @@ pub async fn execute_stage(
         message: format!("merge_patches stage {}", status),
         capability_results,
         local_state,
+        transient_prompt_fragments: Vec::new(),
     })
 }
 

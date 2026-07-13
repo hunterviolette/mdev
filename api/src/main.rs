@@ -9,7 +9,6 @@ mod routes;
 use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
 
 use anyhow::Context;
-use dotenvy::dotenv;
 use axum::Router;
 use tower_http::{
     cors::CorsLayer,
@@ -22,7 +21,9 @@ use crate::app_state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = dotenv();
+    let cwd = env::current_dir().context("failed to determine current directory")?;
+    let app_root = resolve_app_root(&cwd)?;
+    load_runtime_env(&app_root)?;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -31,8 +32,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let layout = runtime_layout()?;
-    load_runtime_env(&layout.app_root);
+    let layout = runtime_layout(app_root)?;
 
     fs::create_dir_all(&layout.data_dir)
         .with_context(|| format!("failed to create data directory {}", layout.data_dir.display()))?;
@@ -78,6 +78,20 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+
+            let terminated = shutdown_state
+                .process_registry
+                .terminate_all(true)
+                .await;
+
+            for result in terminated {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        error = %format!("{:#}", error),
+                        "failed to terminate a managed process during API shutdown"
+                    );
+                }
+            }
 
             match crate::engine::fail_active_runs_for_process_stop(
                 &shutdown_state,
@@ -128,34 +142,51 @@ struct RuntimeLayout {
     web_dist: PathBuf,
 }
 
-fn load_runtime_env(app_root: &Path) {
-    let env_path = app_root.join(".env");
-    if env_path.exists() {
-        let _ = dotenvy::from_path(env_path);
-        return;
-    }
-
-    let example_path = app_root.join(".env.example");
-    if example_path.exists() {
-        let _ = dotenvy::from_path(example_path);
-    }
-}
-
-fn runtime_layout() -> anyhow::Result<RuntimeLayout> {
-    let cwd = env::current_dir().context("failed to determine current directory")?;
-    if let Some(repo_root) = detect_repo_root(&cwd) {
-        return Ok(RuntimeLayout {
-            app_root: repo_root.clone(),
-            data_dir: repo_root.join(".data"),
-            web_dist: repo_root.join("web").join("dist"),
-        });
+fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(repo_root) = detect_repo_root(cwd) {
+        return Ok(repo_root);
     }
 
     let exe = env::current_exe().context("failed to determine executable path")?;
-    let app_root = exe
+    Ok(exe
         .parent()
         .context("executable has no parent directory")?
-        .to_path_buf();
+        .to_path_buf())
+}
+
+fn load_runtime_env(app_root: &Path) -> anyhow::Result<()> {
+    let env_path = app_root.join(".env");
+    if env_path.exists() {
+        dotenvy::from_path(&env_path)
+            .with_context(|| format!("failed to load {}", env_path.display()))?;
+    }
+    Ok(())
+}
+
+fn resolve_runtime_path(app_root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        app_root.join(path)
+    }
+}
+
+fn runtime_layout(app_root: PathBuf) -> anyhow::Result<RuntimeLayout> {
+    if detect_repo_root(&app_root).is_some() {
+        let data_dir = env::var("MDEV_DATA_DIR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| resolve_runtime_path(&app_root, &value))
+            .unwrap_or_else(|| app_root.join(".data"));
+
+        return Ok(RuntimeLayout {
+            web_dist: app_root.join("web").join("dist"),
+            data_dir,
+            app_root,
+        });
+    }
 
     Ok(RuntimeLayout {
         web_dist: app_root.join("web").join("dist"),
@@ -168,7 +199,7 @@ fn mdev_data_dir(app_root: &Path) -> PathBuf {
     if let Ok(value) = env::var("MDEV_DATA_DIR") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            return resolve_runtime_path(app_root, trimmed);
         }
     }
 

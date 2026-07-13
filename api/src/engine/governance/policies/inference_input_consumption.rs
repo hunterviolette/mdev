@@ -77,11 +77,6 @@ pub fn after_stage(
         planner_patch.insert("fragment_armed".to_string(), Value::Bool(false));
     }
 
-    if consumed_contains("prompt_fragments") {
-        inference_patch.insert("active_prompt_fragments".to_string(), Value::Array(Vec::new()));
-        inference_patch.insert("next_prompt_fragments".to_string(), Value::Array(Vec::new()));
-    }
-
     if inference_patch.is_empty() && context_export_patch.is_empty() && planner_patch.is_empty() {
         return Ok(Vec::new());
     }

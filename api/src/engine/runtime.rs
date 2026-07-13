@@ -139,6 +139,31 @@ pub async fn start_run(state: &AppState, run_id: Uuid, requested_step_id: Option
 
 pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
+
+    let operator_checkpoint = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .filter(|blocked| {
+            blocked
+                .get("kind")
+                .and_then(Value::as_str)
+                == Some("operator_checkpoint")
+        })
+        .cloned();
+
+    if let Some(blocked_on) = operator_checkpoint {
+        return Ok(json!({
+            "ok": false,
+            "status": "waiting",
+            "blocked_on": "operator_checkpoint",
+            "current_step_id": run.current_step_id,
+            "checkpoint": blocked_on,
+            "message": "Resolve the operator checkpoint with a disposition instead of resuming the run."
+        }));
+    }
+
     if run_is_blocked_by_user_control(&run) {
         let current_step_id = run.current_step_id.clone();
         clear_user_control_block(&mut run);
@@ -686,26 +711,6 @@ async fn prepare_stage_for_execution(
     governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
     refresh_inference_arm_state(&mut run, Some(&step));
 
-    let prepared_inference_snapshot = run
-        .context
-        .get("workflow_engine")
-        .and_then(|value| value.get("global_state"))
-        .and_then(|value| value.get("capabilities"))
-        .and_then(|value| value.get("inference"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    {
-        let root = ensure_engine_root(&mut run.context);
-        let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
-        let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
-        run_state_obj.insert("last_prepared_stage".to_string(), json!({
-            "step_id": step.id,
-            "step_type": step.step_type,
-            "inference": prepared_inference_snapshot
-        }));
-    }
-
     let pause_message = governance::pause_message(&decisions);
     let prepared_status = match mode {
         RunMode::Manual | RunMode::Autonomous => RunStatus::Running,
@@ -784,6 +789,48 @@ pub async fn prepare_run_stage_for_execution(state: &AppState, run_id: Uuid, req
 }
 
 pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
+    let run = load_run(state, run_id).await?;
+
+    if matches!(run.status, RunStatus::Running | RunStatus::Queued) {
+        let requested_step_id = requested_step_id
+            .map(str::to_string)
+            .or_else(|| run.current_step_id.clone());
+
+        append_engine_event(
+            state,
+            run_id,
+            requested_step_id.as_deref(),
+            "warn",
+            "duplicate_stage_execution_rejected",
+            "Stage execution request was rejected because the workflow is already active.",
+            json!({
+                "current_step_id": run.current_step_id,
+                "requested_step_id": requested_step_id,
+                "status": run_status_label(&run.status)
+            }),
+        )
+        .await?;
+
+        return Ok(json!({
+            "ok": false,
+            "status": run_status_label(&run.status),
+            "already_running": true,
+            "current_step_id": run.current_step_id,
+            "requested_step_id": requested_step_id,
+            "message": "The workflow is already executing a stage."
+        }));
+    }
+
+    if run_is_waiting_on_operator_checkpoint(&run) {
+        return Ok(json!({
+            "ok": false,
+            "status": "waiting",
+            "blocked_on": "operator_checkpoint",
+            "current_step_id": run.current_step_id,
+            "message": "Resolve the active operator checkpoint before starting another stage execution."
+        }));
+    }
+
     run_stages(state, run_id, requested_step_id, RunMode::Manual).await
 }
 
@@ -1089,6 +1136,10 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         activate_next_prompt_fragments_for_stage(&mut run);
         let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
         clear_active_prompt_fragments_for_stage(&mut run);
+        state.replace_transient_prompt_fragments(
+            run_id,
+            outcome.transient_prompt_fragments.clone(),
+        );
 
         let latest_run = load_run(state, run_id).await?;
         if run_cancel_requested(&latest_run) {
@@ -1130,7 +1181,9 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             consume_single_use_inference_arm_state(&mut run, &step);
         }
 
-        let pending_disposition_review = outcome.ok && stage_disposition_review_enabled(&step, &outcome);
+        let explicit_operator_checkpoint = operator_checkpoint_result(&outcome).is_some();
+        let pending_disposition_review = explicit_operator_checkpoint
+            || (outcome.ok && stage_disposition_review_enabled(&step, &outcome));
 
         if pending_disposition_review {
             clear_pending_disposition_review(&mut run);
@@ -1156,7 +1209,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 }),
             ).await?;
             return Ok(json!({
-                "ok": true,
+                "ok": outcome.ok,
                 "status": "waiting",
                 "blocked_on": "operator_checkpoint",
                 "step_id": step.id,

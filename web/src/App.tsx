@@ -16,6 +16,7 @@ function shortRouteId(value: string | null): string {
 function routeTitle(route: AppRoute): string {
   if (route.workflowRunId) return 'Workflow';
   if (route.path === '/flight-deck' || route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Flight Deck';
+  if (route.path === '/runtime') return 'Runtime';
   if (route.path === '/workflows' || route.path === '/') return 'Workflow list';
   return 'Workflow Web';
 }
