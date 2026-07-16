@@ -368,8 +368,7 @@ fn resolve_qa_spec(ctx: &CapabilityContext<'_>, config: Value) -> Result<QaStage
         .and_then(|value| value.get("qa_environment"))
         .filter(|value| value.is_object())
     {
-        return serde_json::from_value(capability.clone())
-            .map_err(|error| anyhow!("invalid global QA environment capability configuration: {}", error));
+        return compact_qa_capability_to_stage_spec(capability.clone());
     }
 
     ctx.step
@@ -377,6 +376,112 @@ fn resolve_qa_spec(ctx: &CapabilityContext<'_>, config: Value) -> Result<QaStage
         .qa
         .clone()
         .ok_or_else(|| anyhow!("QA capability configuration is missing for stage '{}'", ctx.step.id))
+}
+
+fn compact_qa_capability_to_stage_spec(value: Value) -> Result<QaStageSpec> {
+    if value.get("environment").is_some() {
+        return serde_json::from_value(value)
+            .map_err(|error| anyhow!("invalid legacy QA environment configuration: {}", error));
+    }
+
+    let port_range = value
+        .get("port_range")
+        .cloned()
+        .unwrap_or_else(|| json!({ "start": 24000, "end": 24999 }));
+
+    let services = value
+        .get("services")
+        .and_then(Value::as_array)
+        .map(|services| {
+            services
+                .iter()
+                .enumerate()
+                .map(|(index, service)| {
+                    let id = service
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("service");
+                    let label = service
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id);
+                    let command = service
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let working_directory = service
+                        .get("working_directory")
+                        .and_then(Value::as_str)
+                        .unwrap_or(".");
+                    let environment = service
+                        .get("environment")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let readiness = service
+                        .get("readiness")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "kind": "http",
+                            "path": "/",
+                            "timeout_seconds": 60
+                        }));
+
+                    json!({
+                        "id": id,
+                        "label": label,
+                        "command": {
+                            "id": format!("qa-service-{}", index + 1),
+                            "label": label,
+                            "command": command,
+                            "arguments": [],
+                            "working_directory": working_directory,
+                            "environment": environment,
+                            "shell": "system",
+                            "mode": "service",
+                            "timeout_seconds": null,
+                            "continue_on_error": false
+                        },
+                        "port": {
+                            "environment_variable": service
+                                .get("port_environment_variable")
+                                .and_then(Value::as_str)
+                                .unwrap_or("PORT"),
+                            "preferred": service
+                                .get("preferred_port")
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        },
+                        "readiness": readiness,
+                        "public": service
+                            .get("public")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::from_value(json!({
+        "dependency_providers": [],
+        "environment": {
+            "port_range": port_range,
+            "hostname_template": value
+                .get("hostname_template")
+                .and_then(Value::as_str)
+                .unwrap_or("{run}.qa.localhost"),
+            "prepare": {
+                "commands": [],
+                "stop_on_failure": true
+            },
+            "services": services,
+            "shutdown_grace_seconds": value
+                .get("shutdown_grace_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+        }
+    }))
+    .map_err(|error| anyhow!("invalid compact QA environment capability configuration: {}", error))
 }
 
 fn shared_dependency_environment(

@@ -4,7 +4,11 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{app_state::AppState, models::{CreateTemplateRequest, WorkflowTemplate, WorkflowTemplateDefinition}};
+use crate::{
+    app_state::AppState,
+    models::{CreateTemplateRequest, WorkflowTemplate, WorkflowTemplateDefinition},
+    routes::{normalize_shared_dependencies, workflow_builder::normalize_qa_environment},
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -159,7 +163,13 @@ async fn list_templates(State(state): State<AppState>) -> Result<Json<Vec<Workfl
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let definition: WorkflowTemplateDefinition = serde_json::from_str(row.get::<String, _>("definition_json").as_str()).map_err(internal)?;
+        let mut definition: WorkflowTemplateDefinition = serde_json::from_str(
+            row.get::<String, _>("definition_json").as_str(),
+        )
+        .map_err(internal)?;
+        normalize_shared_dependencies(&mut definition.globals);
+        normalize_qa_environment(&mut definition.globals, &definition.steps);
+
         out.push(WorkflowTemplate {
             id: parse_uuid(row.get("id"))?,
             name: row.get("name"),
@@ -179,7 +189,10 @@ async fn create_template(
     Json(req): Json<CreateTemplateRequest>,
 ) -> Result<Json<WorkflowTemplate>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
-    let definition_json = serde_json::to_string_pretty(&req.definition).map_err(internal)?;
+    let mut definition = req.definition;
+    normalize_shared_dependencies(&mut definition.globals);
+    normalize_qa_environment(&mut definition.globals, &definition.steps);
+    let definition_json = serde_json::to_string_pretty(&definition).map_err(internal)?;
 
     let existing = sqlx::query(
         "SELECT id, created_at FROM workflow_templates WHERE name = ?"
@@ -231,7 +244,7 @@ async fn create_template(
         name: req.name,
         description: req.description,
         repo_ref: req.repo_ref,
-        definition: req.definition,
+        definition,
         created_at,
         updated_at: now,
     }))

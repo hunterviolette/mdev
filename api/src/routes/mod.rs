@@ -14,6 +14,7 @@ mod processes;
 mod supervisor;
 mod templates;
 mod workflow_builder;
+pub(crate) use workflow_builder::{normalize_qa_environment, normalize_shared_dependencies};
 mod workflow_scope;
 
 use axum::Router;

@@ -1410,7 +1410,6 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   disabled: boolean;
   onToggleSharedRepoContext: () => void;
   onToggleSharedChangesetSchema: () => void;
-  onTogglePlanningFragment: () => void;
   onOpenPlanner: () => void;
   onPatchSelectedStepConfig: (key: string, value: unknown) => void;
   onOpenInferenceConfig: () => void;
@@ -1441,7 +1440,6 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     disabled,
     onToggleSharedRepoContext,
     onToggleSharedChangesetSchema,
-    onTogglePlanningFragment,
     onOpenPlanner,
     onPatchSelectedStepConfig,
     onOpenInferenceConfig,
@@ -1473,15 +1471,16 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     ? designModeDraftValue
     : readStringValue(selectedWorkflowStep, 'config.design_mode', 'v1');
   const plannerCapabilityState = (sharedPlannerFragmentState ?? {}) as Record<string, unknown>;
+  const [plannerFragmentArmedDraft, setPlannerFragmentArmedDraft] = useState<boolean | null>(null);
   const [plannerSchemaArmedDraft, setPlannerSchemaArmedDraft] = useState<boolean | null>(null);
   const [plannerAutoApplyDraft, setPlannerAutoApplyDraft] = useState<boolean | null>(null);
   const selectedPlannerFeatureId = typeof plannerCapabilityState.feature_id === 'string' && plannerCapabilityState.feature_id.trim()
     ? plannerCapabilityState.feature_id
     : null;
+  const planningFragmentArmed = plannerFragmentArmedDraft ?? Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
   const fineFeatureFormatArmed = plannerSchemaArmedDraft ?? Boolean(plannerCapabilityState.schema_armed && selectedPlannerFeatureId);
   const autoNormalizeAndApplyToPlanner = plannerAutoApplyDraft ?? Boolean(plannerCapabilityState.auto_apply_armed && selectedPlannerFeatureId);
   const hasBackendPlanningFragment = Boolean(sharedPlannerFragmentState);
-  const planningFragmentArmed = Boolean(plannerCapabilityState.fragment_armed && selectedPlannerFeatureId);
   const plannerSupportedStep = selectedWorkflowStep?.step_type === 'design' || selectedWorkflowStep?.step_type === 'code' || selectedWorkflowStep?.step_type === 'review';
   const showPlannerControls = Boolean(
     plannerSupportedStep
@@ -1494,10 +1493,12 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   );
 
   useEffect(() => {
+    setPlannerFragmentArmedDraft(null);
     setPlannerSchemaArmedDraft(null);
     setPlannerAutoApplyDraft(null);
   }, [
     selectedWorkflowStep?.id,
+    plannerCapabilityState.fragment_armed,
     plannerCapabilityState.schema_armed,
     plannerCapabilityState.auto_apply_armed
   ]);
@@ -1542,7 +1543,11 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
         onOpen: onOpenPlanner,
         toggleLabel: planningFragmentArmed ? 'Disarm' : 'Arm',
         toggleColor: planningFragmentArmed ? 'orange' : 'green',
-        onToggle: onTogglePlanningFragment,
+        onToggle: () => {
+          const next = !planningFragmentArmed;
+          setPlannerFragmentArmedDraft(next);
+          onPatchSelectedStepConfig('capabilities.planner.fragment_armed', next);
+        },
         helperText: plannerFeatureLabel
           ? `Selected feature: ${plannerFeatureLabel}`
           : selectedPlannerFeatureId
@@ -1640,7 +1645,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     plannerAvailableForRepo,
     showPlannerControls,
     planningFragmentArmed,
-    onTogglePlanningFragment,
+    onPatchSelectedStepConfig,
     onOpenPlanner,
     selectedPlannerFeatureId,
     usesInference,
@@ -2263,29 +2268,20 @@ export function WorkflowShell(props: {
 
     if (bindTo === 'prompt.user_input') {
       setStageUserInput(typeof value === 'string' ? value : String(value ?? ''));
+      return;
     } else if (bindTo === 'execution.compile_checks.commands_text') {
-      const text = typeof value === 'string' ? value : String(value ?? '');
-      setStageCompileCommandsText(text);
-      const compileCommands = text
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .map((command) => ({ command, label: command }));
-      const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
-      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      const currentCompileCommands = (currentCapabilities.compile_commands as Record<string, unknown> | undefined) ?? {};
-      void patchWorkflowGlobalState(selectedRunId, {
-        ...currentGlobalState,
-        capabilities: {
-          ...currentCapabilities,
-          compile_commands: {
-            ...currentCompileCommands,
-            commands: compileCommands
-          }
-        }
-      });
-    } else if (bindTo === 'capabilities.planner.schema_armed' || bindTo === 'capabilities.planner.auto_apply_armed') {
-      const plannerKey = bindTo === 'capabilities.planner.schema_armed' ? 'schema_armed' : 'auto_apply_armed';
+      setStageCompileCommandsText(typeof value === 'string' ? value : String(value ?? ''));
+      return;
+    } else if (
+      bindTo === 'capabilities.planner.fragment_armed'
+      || bindTo === 'capabilities.planner.schema_armed'
+      || bindTo === 'capabilities.planner.auto_apply_armed'
+    ) {
+      const plannerKey = bindTo === 'capabilities.planner.fragment_armed'
+        ? 'fragment_armed'
+        : bindTo === 'capabilities.planner.schema_armed'
+          ? 'schema_armed'
+          : 'auto_apply_armed';
       void patchPlannerCapabilityState({
         [plannerKey]: Boolean(value)
       });
@@ -2302,6 +2298,7 @@ export function WorkflowShell(props: {
       setStageAutoApplyChangeset(Boolean(value));
     } else if (bindTo === 'review.notes') {
       setStageReviewNotes(typeof value === 'string' ? value : String(value ?? ''));
+      return;
     } else if (bindTo === 'review.approved') {
       const checked = Boolean(value);
       setStageApproved(checked);
@@ -2509,7 +2506,8 @@ export function WorkflowShell(props: {
   const selectedRunSharedDependencies = useMemo<SharedDependenciesConfig>(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
-    const runtimeValue = globalState.shared_dependencies;
+    const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
+    const runtimeValue = capabilities.shared_dependencies ?? globalState.shared_dependencies;
 
     if (runtimeValue && typeof runtimeValue === 'object' && !Array.isArray(runtimeValue)) {
       const value = runtimeValue as Record<string, unknown>;
@@ -2521,7 +2519,15 @@ export function WorkflowShell(props: {
       };
     }
 
-    return selectedRunDefinition?.globals?.shared_dependencies ?? {
+    const definitionCapabilities = selectedRunDefinition?.globals?.capabilities ?? {};
+    const definitionValue = definitionCapabilities.shared_dependencies
+      ?? selectedRunDefinition?.globals?.shared_dependencies;
+
+    if (definitionValue && typeof definitionValue === 'object' && !Array.isArray(definitionValue)) {
+      return definitionValue as SharedDependenciesConfig;
+    }
+
+    return {
       enabled: false,
       providers: [],
     };
@@ -2553,10 +2559,18 @@ export function WorkflowShell(props: {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const currentGlobalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
 
-    await patchWorkflowGlobalState(selectedRunId, {
+    const currentCapabilities = (currentGlobalState.capabilities ?? {}) as Record<string, unknown>;
+    const nextGlobalState: Record<string, unknown> = {
       ...currentGlobalState,
-      shared_dependencies: next,
-    });
+      capabilities: {
+        ...currentCapabilities,
+        shared_dependencies: next,
+      },
+    };
+
+    delete nextGlobalState.shared_dependencies;
+
+    await patchWorkflowGlobalState(selectedRunId, nextGlobalState);
 
     await refreshRunDetails(selectedRunId);
   }
@@ -5893,7 +5907,19 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     const stepType = step?.step_type ?? null;
 
     if (stepType === 'compile') {
+      const commands = stageCompileCommandsText
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((command) => ({ command, label: command }));
+
       return {
+        execution: {
+          compile_checks: {
+            commands_text: stageCompileCommandsText,
+            commands
+          }
+        },
         execution_logic: {
           kind: 'compile_stage_policy'
         }
@@ -7004,7 +7030,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     disabled={isBackendRunLocked}
                                     onToggleSharedRepoContext={onToggleSharedRepoContext}
                                     onToggleSharedChangesetSchema={onToggleSharedChangesetSchema}
-                                    onTogglePlanningFragment={onTogglePlanningFragment}
                                     onOpenPlanner={openRepoSupervisorPlanner}
                                     onPatchSelectedStepConfig={patchSelectedStepDescriptorField}
                                     onOpenInferenceConfig={openGlobalInferenceConfig}

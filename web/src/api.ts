@@ -94,7 +94,10 @@ export type SharedDependenciesConfig = {
 
 export type WorkflowGlobalConfig = {
   resources: Record<string, unknown>;
-  capabilities: Record<string, unknown>;
+  capabilities: Record<string, unknown> & {
+    shared_dependencies?: SharedDependenciesConfig;
+    qa_environment?: Record<string, unknown>;
+  };
   automation: Record<string, unknown>;
   shared_dependencies?: SharedDependenciesConfig;
 };
@@ -193,13 +196,14 @@ export type DependencyProviderSpec = {
   ecosystem: 'node' | 'cargo';
   root: string;
   manifests: string[];
-  trusted_artifact: Record<string, unknown>;
-  isolated: {
+
+  trusted_artifact?: Record<string, unknown>;
+  isolated?: {
     storage_path: string;
     seed_from_trusted: boolean;
-    install: TerminalSequenceSpec;
+    install?: TerminalSequenceSpec;
   };
-  mismatch: {
+  mismatch?: {
     disposition: 'operator_checkpoint' | 'skip_stage' | 'continue_trusted_with_warning';
     allowed_dispositions: Array<'create_isolated_dependencies' | 'continue_trusted_with_warning' | 'skip_stage'>;
   };

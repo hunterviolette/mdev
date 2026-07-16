@@ -7,7 +7,7 @@ use crate::{
 };
 
 pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["compile_commands"])
+    StageCapabilities::new(["shared_dependencies", "compile_commands"])
 }
 
 pub fn prepare_stage_state(

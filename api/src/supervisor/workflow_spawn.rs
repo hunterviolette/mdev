@@ -309,6 +309,11 @@ async fn insert_and_start_run(
     let id = Uuid::new_v4();
     let key = new_workflow_key(repo_path);
     let now = Utc::now();
+    crate::routes::normalize_shared_dependencies(&mut definition.globals);
+    crate::routes::normalize_qa_environment(
+        &mut definition.globals,
+        &definition.steps,
+    );
     let requested_start_step_id = context
         .get("supervisor")
         .and_then(|value| value.get("workflow_start_step_id"))

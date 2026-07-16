@@ -187,41 +187,80 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   );
 
   const sharedDependencies = useMemo<SharedDependenciesConfig>(() => {
-    return editableGlobals.shared_dependencies ?? {
+    const capabilities = editableGlobals.capabilities ?? {};
+    const configured = capabilities.shared_dependencies;
+    const legacy = editableGlobals.shared_dependencies;
+
+    if (configured && typeof configured === 'object' && !Array.isArray(configured)) {
+      return configured as SharedDependenciesConfig;
+    }
+
+    return legacy ?? {
       enabled: false,
       providers: [],
     };
-  }, [editableGlobals.shared_dependencies]);
+  }, [editableGlobals.capabilities, editableGlobals.shared_dependencies]);
 
   const deployQAValues = useMemo<DeployQAValues>(() => {
-    const fields = selectedStep?.fields ?? {};
+    const capabilities = editableGlobals.capabilities ?? {};
+    const qaEnvironment = capabilities.qa_environment
+      && typeof capabilities.qa_environment === 'object'
+      && !Array.isArray(capabilities.qa_environment)
+        ? capabilities.qa_environment as Record<string, unknown>
+        : {};
+    const environment = qaEnvironment.environment
+      && typeof qaEnvironment.environment === 'object'
+      && !Array.isArray(qaEnvironment.environment)
+        ? qaEnvironment.environment as Record<string, unknown>
+        : {};
+    const portRange = environment.port_range
+      && typeof environment.port_range === 'object'
+      && !Array.isArray(environment.port_range)
+        ? environment.port_range as Record<string, unknown>
+        : {};
+    const legacyFields = selectedStep?.fields ?? {};
+
     return {
-      dependency_providers: Array.isArray(fields.dependency_providers)
-        ? fields.dependency_providers.filter(
+      dependency_providers: Array.isArray(qaEnvironment.dependency_providers)
+        ? qaEnvironment.dependency_providers.filter(
             (value): value is string => typeof value === 'string'
           )
-        : defaultDeployQAValues.dependency_providers,
-      services: Array.isArray(fields.services)
-        ? structuredClone(fields.services) as DeployQAValues['services']
-        : structuredClone(defaultDeployQAValues.services),
+        : Array.isArray(legacyFields.dependency_providers)
+          ? legacyFields.dependency_providers.filter(
+              (value): value is string => typeof value === 'string'
+            )
+          : defaultDeployQAValues.dependency_providers,
+      services: Array.isArray(environment.services)
+        ? structuredClone(environment.services) as DeployQAValues['services']
+        : Array.isArray(legacyFields.services)
+          ? structuredClone(legacyFields.services) as DeployQAValues['services']
+          : structuredClone(defaultDeployQAValues.services),
       port_start:
-        typeof fields.port_start === 'number'
-          ? fields.port_start
-          : defaultDeployQAValues.port_start,
+        typeof portRange.start === 'number'
+          ? portRange.start
+          : typeof legacyFields.port_start === 'number'
+            ? legacyFields.port_start
+            : defaultDeployQAValues.port_start,
       port_end:
-        typeof fields.port_end === 'number'
-          ? fields.port_end
-          : defaultDeployQAValues.port_end,
+        typeof portRange.end === 'number'
+          ? portRange.end
+          : typeof legacyFields.port_end === 'number'
+            ? legacyFields.port_end
+            : defaultDeployQAValues.port_end,
       hostname_template:
-        typeof fields.hostname_template === 'string'
-          ? fields.hostname_template
-          : defaultDeployQAValues.hostname_template,
+        typeof environment.hostname_template === 'string'
+          ? environment.hostname_template
+          : typeof legacyFields.hostname_template === 'string'
+            ? legacyFields.hostname_template
+            : defaultDeployQAValues.hostname_template,
       shutdown_grace_seconds:
-        typeof fields.shutdown_grace_seconds === 'number'
-          ? fields.shutdown_grace_seconds
-          : defaultDeployQAValues.shutdown_grace_seconds,
+        typeof environment.shutdown_grace_seconds === 'number'
+          ? environment.shutdown_grace_seconds
+          : typeof legacyFields.shutdown_grace_seconds === 'number'
+            ? legacyFields.shutdown_grace_seconds
+            : defaultDeployQAValues.shutdown_grace_seconds,
     };
-  }, [selectedStep]);
+  }, [editableGlobals.capabilities, selectedStep]);
 
   useEffect(() => {
     let cancelled = false;
@@ -749,10 +788,16 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
           const nextSharedDependencies = structuredClone(next);
 
           setEditableGlobals((current) => {
+            const currentCapabilities = structuredClone(current.capabilities ?? {});
             const nextGlobals = {
               ...structuredClone(current),
-              shared_dependencies: nextSharedDependencies,
+              capabilities: {
+                ...currentCapabilities,
+                shared_dependencies: nextSharedDependencies,
+              },
             };
+
+            delete nextGlobals.shared_dependencies;
 
             const latestDefinition = latestCompiledDefinitionRef.current;
             if (latestDefinition) {
@@ -779,7 +824,57 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
           onClose={() => setDeployQAOpen(false)}
           providers={sharedDependencies.providers}
           values={deployQAValues}
-          onChange={(key, value) => updateStepField(selectedStep.id, key, value)}
+          onChange={(key, value) => {
+            const nextValues: DeployQAValues = {
+              ...deployQAValues,
+              [key]: value,
+            };
+
+            setEditableGlobals((current) => {
+              const nextGlobals: WorkflowGlobalConfig = {
+                ...structuredClone(current),
+                capabilities: {
+                  ...structuredClone(current.capabilities ?? {}),
+                  qa_environment: {
+                    enabled: true,
+                    port_range: {
+                      start: nextValues.port_start,
+                      end: nextValues.port_end,
+                    },
+                    hostname_template: nextValues.hostname_template,
+                    services: nextValues.services.map((service) => ({
+                      id: service.id,
+                      label: service.label,
+                      command: service.command.command,
+                      working_directory: service.command.working_directory,
+                      environment: structuredClone(service.command.environment),
+                      port_environment_variable: service.port.environment_variable,
+                      preferred_port: service.port.preferred,
+                      readiness: structuredClone(service.readiness),
+                      public: service.public,
+                    })),
+                    shutdown_grace_seconds: nextValues.shutdown_grace_seconds,
+                  },
+                },
+              };
+
+              const latestDefinition = latestCompiledDefinitionRef.current;
+              if (latestDefinition) {
+                const synchronizedDefinition: WorkflowTemplateDefinition = {
+                  ...structuredClone(latestDefinition),
+                  globals: structuredClone(nextGlobals),
+                };
+                latestCompiledDefinitionRef.current = synchronizedDefinition;
+                onCompiledDefinitionChange(structuredClone(synchronizedDefinition));
+              }
+
+              return nextGlobals;
+            });
+
+            setGlobalsRevision((current) => current + 1);
+            setCompileState('dirty');
+            setCompileMessage('DeployQA capability configuration changed');
+          }}
         />
       ) : null}
     </Box>

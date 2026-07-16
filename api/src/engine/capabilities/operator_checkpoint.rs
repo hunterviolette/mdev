@@ -9,9 +9,8 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn normalize_checkpoint_option(value: &str) -> Option<&'static str> {
     match value {
-        "continue_auto" | "auto" | "autonomous" => Some("continue_auto"),
-        "select_stage" | "select" | "continue_manual" | "manual" => Some("select_stage"),
         "continue_auto" | "auto" | "autonomous" | "move_next" | "continue" => Some("continue_auto"),
+        "select_stage" | "select" | "continue_manual" | "manual" => Some("select_stage"),
         "pause_error" | "pause" | "paused" => Some("pause_error"),
         _ => None,
     }

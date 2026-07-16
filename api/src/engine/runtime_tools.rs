@@ -199,7 +199,8 @@ pub struct DependencyProviderSpec {
     pub root: String,
     #[serde(default)]
     pub manifests: Vec<String>,
-    pub trusted_artifact: TrustedDependencyArtifactSpec,
+    #[serde(default)]
+    pub trusted_artifact: Option<TrustedDependencyArtifactSpec>,
     #[serde(default)]
     pub isolated: IsolatedDependencySpec,
     #[serde(default)]

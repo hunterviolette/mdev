@@ -29,14 +29,9 @@ function newProvider(index: number): DependencyProviderSpec {
     label: `Dependency provider ${index}`,
     ecosystem: 'node',
     root: '.',
-    manifests: ['package-lock.json'],
-    trusted_artifact: {
-      kind: 'node_modules',
-      path: 'node_modules',
-      read_only: true,
-    },
+    manifests: ['package.json', 'package-lock.json'],
     isolated: {
-      storage_path: `.mdev/dependencies/provider-${index}`,
+      storage_path: 'node_modules',
       seed_from_trusted: true,
       install: {
         commands: [],
@@ -72,35 +67,6 @@ export function SharedDependencies({
     });
   }
 
-  function updateEcosystem(
-    index: number,
-    ecosystem: DependencyProviderSpec['ecosystem']
-  ) {
-    const provider = value.providers[index];
-    const node = ecosystem === 'node';
-
-    updateProvider(index, {
-      ecosystem,
-      manifests: node ? ['package-lock.json'] : ['Cargo.lock'],
-      trusted_artifact: node
-        ? {
-            kind: 'node_modules',
-            path: 'node_modules',
-            read_only: true,
-          }
-        : {
-            kind: 'cargo',
-            cargo_home: '.cargo',
-            target_directory: 'target',
-            share_target: true,
-            read_only: true,
-          },
-      isolated: {
-        ...provider.isolated,
-        storage_path: `.mdev/dependencies/${provider.id}`,
-      },
-    });
-  }
 
   return (
     <Modal
@@ -173,17 +139,9 @@ export function SharedDependencies({
 
                 <Select
                   label="Ecosystem"
-                  value={provider.ecosystem}
-                  data={[
-                    { value: 'node', label: 'Node' },
-                    { value: 'cargo', label: 'Cargo' },
-                  ]}
-                  onChange={(next) =>
-                    updateEcosystem(
-                      index,
-                      next === 'cargo' ? 'cargo' : 'node'
-                    )
-                  }
+                  value="node"
+                  data={[{ value: 'node', label: 'Node' }]}
+                  disabled
                 />
               </Group>
 
@@ -210,31 +168,7 @@ export function SharedDependencies({
                 }
               />
 
-              <TextInput
-                label="Isolated storage path"
-                value={provider.isolated.storage_path}
-                onChange={(event) =>
-                  updateProvider(index, {
-                    isolated: {
-                      ...provider.isolated,
-                      storage_path: event.currentTarget.value,
-                    },
-                  })
-                }
-              />
 
-              <Switch
-                label="Seed isolated dependencies from trusted artifacts"
-                checked={provider.isolated.seed_from_trusted}
-                onChange={(event) =>
-                  updateProvider(index, {
-                    isolated: {
-                      ...provider.isolated,
-                      seed_from_trusted: event.currentTarget.checked,
-                    },
-                  })
-                }
-              />
             </Stack>
           </Card>
         ))}

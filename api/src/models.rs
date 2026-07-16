@@ -72,7 +72,7 @@ pub struct WorkflowGlobalConfig {
     pub capabilities: Value,
     #[serde(default)]
     pub automation: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub shared_dependencies: SharedDependenciesConfig,
 }
 

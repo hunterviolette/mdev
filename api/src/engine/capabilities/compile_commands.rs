@@ -20,6 +20,33 @@ pub async fn execute(
     prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
+    if let Some(shared_dependencies) = blocking_shared_dependency_result(prior_results) {
+        let issues = shared_dependencies
+            .payload
+            .get("issues")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let summary = shared_dependencies
+            .payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("Shared dependency validation failed.");
+
+        return Ok(CapabilityResult {
+            ok: false,
+            capability: "compile_commands".to_string(),
+            payload: json!({
+                "ok": false,
+                "blocked": true,
+                "reason": "shared_dependency_validation",
+                "summary": summary,
+                "issues": issues,
+                "results": []
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        });
+    }
+
     let mut sequence = resolve_compile_sequence(ctx, config)?;
     let shared_environment = shared_dependency_environment(prior_results);
 
@@ -31,18 +58,19 @@ pub async fn execute(
                 .or_insert_with(|| value.clone());
         }
     }
+
     let execution_mode = ctx
         .local_state
         .get("execution")
         .and_then(|value| value.get("mode"))
-        .and_then(Value::as_str)
+        .and_then(|value| value.as_str())
         .unwrap_or("manual");
     let repo_ref = ctx
         .local_state
         .get("resources")
         .and_then(|value| value.get("repo"))
         .and_then(|value| value.get("repo_ref"))
-        .and_then(Value::as_str)
+        .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(ctx.repo_ref);
 
@@ -61,11 +89,28 @@ pub async fn execute(
     .await?;
 
     Ok(CapabilityResult {
-        ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        ok: result.get("ok").and_then(|value| value.as_bool()).unwrap_or(false),
         capability: "compile_commands".to_string(),
         payload: result,
         follow_ups: CapabilityInvocationRequest::None,
     })
+}
+
+fn blocking_shared_dependency_result(
+    prior_results: &[CapabilityResult],
+) -> Option<&CapabilityResult> {
+    prior_results
+        .iter()
+        .rev()
+        .find(|result| {
+            result.capability == "shared_dependencies"
+                && (!result.ok
+                    || result
+                        .payload
+                        .get("requires_operator_checkpoint")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false))
+        })
 }
 
 fn shared_dependency_environment(

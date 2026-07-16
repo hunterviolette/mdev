@@ -5,6 +5,7 @@ import {
   buildWorkflowBuilderInferencePanel,
   type InferenceConfigPanel,
   type InferenceConfigPanelSession,
+  type SharedDependenciesConfig,
   type WorkflowGlobalConfig,
   type WorkflowTemplateDefinition,
 } from './api';
@@ -40,13 +41,24 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function normalizeGlobals(globals: Record<string, unknown> | null | undefined): WorkflowGlobalConfig {
+  const capabilities = asRecord(globals?.capabilities);
+  const legacySharedDependencies = globals?.shared_dependencies
+    && typeof globals.shared_dependencies === 'object'
+    && !Array.isArray(globals.shared_dependencies)
+      ? globals.shared_dependencies
+      : undefined;
+  const sharedDependencies = (
+    capabilities.shared_dependencies
+    ?? legacySharedDependencies
+  ) as SharedDependenciesConfig | undefined;
+
   return {
     resources: asRecord(globals?.resources),
-    capabilities: asRecord(globals?.capabilities),
+    capabilities: {
+      ...capabilities,
+      shared_dependencies: sharedDependencies,
+    },
     automation: asRecord(globals?.automation),
-    shared_dependencies: globals?.shared_dependencies && typeof globals.shared_dependencies === 'object' && !Array.isArray(globals.shared_dependencies)
-      ? globals.shared_dependencies as WorkflowGlobalConfig['shared_dependencies']
-      : undefined,
   };
 }
 

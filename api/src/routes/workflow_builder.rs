@@ -112,6 +112,7 @@ async fn compile_document(
     };
 
     normalize_global_planner_fragment(state, &mut globals).await.map_err(internal)?;
+    normalize_shared_dependencies(&mut globals);
 
     let global_state = serde_json::to_value(&globals).map_err(internal)?;
     let repo_ref = globals
@@ -140,6 +141,8 @@ async fn compile_document(
     if document.stages.is_empty() {
         warnings.push("Builder document has no stages.".to_string());
     }
+
+    normalize_qa_environment(&mut globals, &steps);
 
     let capability_summary = compile_workflow_capability_summary(&globals, &steps).map_err(internal)?;
 
@@ -555,6 +558,249 @@ fn compile_governance(catalog: &WorkflowBuilderCatalog, governance: &Value) -> R
     Ok(compiled)
 }
 
+pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) {
+    let capability_value = globals
+        .capabilities
+        .get("shared_dependencies")
+        .cloned();
+
+    let source = capability_value
+        .or_else(|| serde_json::to_value(&globals.shared_dependencies).ok())
+        .unwrap_or_else(|| json!({
+            "enabled": false,
+            "providers": []
+        }));
+
+    let enabled = source
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    let providers = source
+        .get("providers")
+        .and_then(|value| value.as_array())
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|provider| {
+                    let provider = provider.as_object()?;
+                    let id = provider.get("id")?.as_str()?.trim();
+                    let ecosystem = provider.get("ecosystem")?.as_str()?.trim();
+                    let root = provider
+                        .get("root")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(".")
+                        .trim();
+
+                    if id.is_empty() || ecosystem != "node" {
+                        return None;
+                    }
+
+                    let label = provider
+                        .get("label")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(id);
+
+                    let manifests = provider
+                        .get("manifests")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|values| !values.is_empty())
+                        .unwrap_or_else(|| vec!["package-lock.json".to_string()]);
+
+                    let isolated = provider
+                        .get("isolated")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "storage_path": "node_modules",
+                            "seed_from_trusted": true,
+                            "install": {
+                                "commands": [],
+                                "stop_on_failure": true
+                            }
+                        }));
+
+                    let mismatch = provider
+                        .get("mismatch")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "disposition": "operator_checkpoint",
+                            "allowed_dispositions": [
+                                "create_isolated_dependencies",
+                                "continue_trusted_with_warning",
+                                "skip_stage"
+                            ]
+                        }));
+
+                    Some(json!({
+                        "id": id,
+                        "label": label,
+                        "ecosystem": ecosystem,
+                        "root": if root.is_empty() { "." } else { root },
+                        "manifests": manifests,
+                        "isolated": isolated,
+                        "mismatch": mismatch
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !globals.capabilities.is_object() {
+        globals.capabilities = json!({});
+    }
+
+    if let Some(capabilities) = globals.capabilities.as_object_mut() {
+        capabilities.insert(
+            "shared_dependencies".to_string(),
+            json!({
+                "enabled": enabled,
+                "providers": providers
+            }),
+        );
+    }
+
+    globals.shared_dependencies = Default::default();
+}
+
+pub(crate) fn normalize_qa_environment(
+    globals: &mut WorkflowGlobalConfig,
+    steps: &[WorkflowStepDefinition],
+) {
+    if !globals.capabilities.is_object() {
+        globals.capabilities = json!({});
+    }
+
+    let source = globals
+        .capabilities
+        .get("qa_environment")
+        .cloned()
+        .or_else(|| {
+            steps
+                .iter()
+                .find(|step| step.step_type == "qa")
+                .and_then(|step| step.execution.qa.as_ref())
+                .and_then(|qa| serde_json::to_value(qa).ok())
+        });
+
+    let Some(source) = source else {
+        if let Some(capabilities) = globals.capabilities.as_object_mut() {
+            capabilities.remove("qa_environment");
+        }
+        return;
+    };
+
+    let environment = source.get("environment").unwrap_or(&source);
+    let port_range = environment
+        .get("port_range")
+        .cloned()
+        .unwrap_or_else(|| json!({ "start": 24000, "end": 24999 }));
+    let hostname_template = environment
+        .get("hostname_template")
+        .and_then(Value::as_str)
+        .unwrap_or("{run}.qa.localhost");
+    let shutdown_grace_seconds = environment
+        .get("shutdown_grace_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(5);
+
+    let services = environment
+        .get("services")
+        .and_then(Value::as_array)
+        .map(|services| {
+            services
+                .iter()
+                .filter_map(|service| {
+                    let id = service.get("id")?.as_str()?;
+                    let label = service
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id);
+                    let command_value = service.get("command")?;
+                    let command = command_value
+                        .as_str()
+                        .or_else(|| command_value.get("command").and_then(Value::as_str))?;
+                    let working_directory = service
+                        .get("working_directory")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            command_value
+                                .get("working_directory")
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or(".");
+                    let command_environment = command_value
+                        .get("environment")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let service_environment = service
+                        .get("environment")
+                        .cloned()
+                        .unwrap_or(command_environment);
+                    let port = service.get("port").cloned().unwrap_or_else(|| json!({}));
+                    let readiness = service
+                        .get("readiness")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "kind": "http",
+                            "path": "/",
+                            "timeout_seconds": 60
+                        }));
+
+                    Some(json!({
+                        "id": id,
+                        "label": label,
+                        "command": command,
+                        "working_directory": working_directory,
+                        "environment": service_environment,
+                        "port_environment_variable": port
+                            .get("environment_variable")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                service
+                                    .get("port_environment_variable")
+                                    .and_then(Value::as_str)
+                            })
+                            .unwrap_or("PORT"),
+                        "preferred_port": port
+                            .get("preferred")
+                            .cloned()
+                            .or_else(|| service.get("preferred_port").cloned())
+                            .unwrap_or(Value::Null),
+                        "readiness": readiness,
+                        "public": service
+                            .get("public")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(capabilities) = globals.capabilities.as_object_mut() {
+        capabilities.insert(
+            "qa_environment".to_string(),
+            json!({
+                "enabled": true,
+                "port_range": port_range,
+                "hostname_template": hostname_template,
+                "services": services,
+                "shutdown_grace_seconds": shutdown_grace_seconds
+            }),
+        );
+    }
+}
+
 fn default_builder_catalog() -> WorkflowBuilderCatalog {
     WorkflowBuilderCatalog {
         version: 2,
@@ -915,23 +1161,6 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
             key: "compile".to_string(),
             label: "Compile".to_string(),
             fields: vec![
-                WorkflowStageField {
-                    key: "dependency_providers".to_string(),
-                    label: "Shared dependency providers".to_string(),
-                    field_type: "dependency_providers".to_string(),
-                    bind_to: "execution.compile.dependency_providers".to_string(),
-                    default: json!([]),
-                    description: "Optional shared dependency providers resolved before compile commands run.".to_string(),
-                    required: false,
-                    options: Vec::new(),
-                    visible_when: Vec::new(),
-                    ui: WorkflowStageFieldUi {
-                        control: "dependency_providers".to_string(),
-                        placeholder: "Select shared dependencies".to_string(),
-                        min_rows: 0,
-                        format: String::new(),
-                    },
-                },
                 text_field("execution.compile_checks.commands_text", "Compile commands", "execution.compile_checks.commands_text", ""),
             ],
         }],

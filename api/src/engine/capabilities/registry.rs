@@ -330,7 +330,13 @@ pub(crate) async fn execute_capability_chain(
             .chain(results.iter().map(|item| item.capability.clone()))
             .collect();
 
-        let mut follow_ups = follow_up_vec(&result.follow_ups)
+        let capability_follow_ups = if result.ok {
+            follow_up_vec(&result.follow_ups)
+        } else {
+            Vec::new()
+        };
+
+        let mut follow_ups = capability_follow_ups
             .into_iter()
             .chain(governance_follow_ups.into_iter())
             .filter(|item| !existing_capabilities.contains(&item.capability))

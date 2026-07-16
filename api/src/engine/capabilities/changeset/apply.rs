@@ -146,6 +146,45 @@ struct EditSequenceReport {
     failed: Vec<EditActionFailure>,
 }
 
+fn unwrap_inference_payload_text(raw: &str) -> String {
+    let mut current = raw.trim().to_string();
+
+    for _ in 0..4 {
+        let Ok(value) = serde_json::from_str::<Value>(&current) else {
+            break;
+        };
+
+        let next = value
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                value
+                    .get("result")
+                    .and_then(|result| result.get("text"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                value
+                    .get("data")
+                    .and_then(|data| data.get("text"))
+                    .and_then(Value::as_str)
+            });
+
+        let Some(next) = next else {
+            break;
+        };
+
+        let next = next.trim();
+        if next.is_empty() || next == current {
+            break;
+        }
+
+        current = next.to_string();
+    }
+
+    current
+}
+
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],
@@ -154,10 +193,10 @@ pub async fn execute(
     let inference = find_result(prior_results, "inference");
     let payload_text = inference
         .and_then(|item| item.payload.get("result"))
-        .and_then(|v| v.get("text"))
+        .and_then(|value| value.get("text"))
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .map(unwrap_inference_payload_text)
+        .unwrap_or_default();
 
     if payload_text.trim().is_empty() {
         return Ok(CapabilityResult {
