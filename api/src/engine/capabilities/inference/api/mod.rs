@@ -3,16 +3,13 @@ pub mod oai;
 use anyhow::Result;
 use serde_json::json;
 
-use super::{session, persist_inference_config, InferenceResult, InferenceTransport};
+use super::{prompting::ModelInput, session, persist_inference_config, InferenceResult, InferenceTransport};
 use super::super::registry::CapabilityContext;
 
-pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
-    let prompt = ctx
-        .local_state
-        .get("composed_prompt")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
+pub async fn execute(
+    ctx: &CapabilityContext<'_>,
+    input: &ModelInput,
+) -> Result<serde_json::Value> {
 
     let resolved_session = session::resolve_inference_session(ctx).await?;
     let mut inference_cfg = resolved_session.config;
@@ -25,7 +22,7 @@ pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
             &inference_cfg.model,
             prior_conversation_id,
             Vec::new(),
-            vec![("user".to_string(), prompt)],
+            vec![("user".to_string(), input.text.clone())],
         )
         .await?;
 

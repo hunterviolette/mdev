@@ -104,6 +104,7 @@ pub async fn execute(
             "previous_capability_failed": previous_failed,
             "stage_id": ctx.step.id,
             "stage_type": ctx.step.step_type,
+            "phase": string_field(&config, "phase").unwrap_or("after_stage"),
             "recommended_disposition": recommended,
             "available_dispositions": options,
             "prior_result": latest_payload,

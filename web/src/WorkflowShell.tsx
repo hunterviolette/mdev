@@ -41,6 +41,7 @@ import {
   getRun,
   getRuntimeProjection,
   getRuntimeSnapshot,
+  openEventStream,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -53,6 +54,7 @@ import {
   listTemplates,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
+  patchWorkflowStageUserInput,
   pauseWorkflowRun,
   prepareWorkflowStage,
   forceWaitWorkflowRun,
@@ -1453,6 +1455,39 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
 
   const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
+  const userInputIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
+  const [userInputDraft, setUserInputDraft] = useState(stageUserInput);
+  const lastSavedUserInputRef = useRef(stageUserInput);
+
+  useEffect(() => {
+    setUserInputDraft(stageUserInput);
+    lastSavedUserInputRef.current = stageUserInput;
+  }, [userInputIdentity, stageUserInput]);
+
+  useEffect(() => {
+    if (!selectedRunId || !selectedWorkflowStep?.id) return;
+    if (userInputDraft === lastSavedUserInputRef.current) return;
+
+    const runId = selectedRunId;
+    const stepId = selectedWorkflowStep.id;
+    const valueToSave = userInputDraft;
+    let cancelled = false;
+
+    const timeout = window.setTimeout(() => {
+      void patchWorkflowStageUserInput(runId, stepId, valueToSave)
+        .then((response) => {
+          if (!cancelled) {
+            lastSavedUserInputRef.current = response.text;
+          }
+        })
+        .catch(() => undefined);
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [userInputDraft, selectedRunId, selectedWorkflowStep?.id]);
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
@@ -1664,7 +1699,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
 
   function valueForField(field: WorkflowStageField): unknown {
     if (field.bind_to === 'prompt.user_input') {
-      return stageUserInput;
+      return userInputDraft;
     }
 
     if (field.bind_to === 'execution.compile_checks.commands_text') {
@@ -1695,6 +1730,12 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       ...prev,
       [field.key]: value
     }));
+
+    if (field.bind_to === 'prompt.user_input') {
+      setUserInputDraft(typeof value === 'string' ? value : String(value ?? ''));
+      return;
+    }
+
     onPatchSelectedStepConfig(field.bind_to, value);
   }
 
@@ -1795,11 +1836,10 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       {!descriptor ? (
         <Textarea
           label="User input"
-          value={stageUserInput}
-          onChange={(event) => onPatchSelectedStepConfig('prompt.user_input', event.currentTarget.value)}
+          value={userInputDraft}
+          onChange={(event) => setUserInputDraft(event.currentTarget.value)}
           disabled={disabled}
           minRows={2}
-          autosize
         />
       ) : null}
       {selectedWorkflowStep?.step_type !== 'qa'
@@ -2185,6 +2225,28 @@ const workflowLiveBarKeyframes = `
 }
 `;
 
+let canonicalChangesetSchemaCache: string | null = null;
+let canonicalChangesetSchemaRequest: Promise<string> | null = null;
+
+async function getCachedCanonicalChangesetSchema(): Promise<string> {
+  if (canonicalChangesetSchemaCache !== null) {
+    return canonicalChangesetSchemaCache;
+  }
+
+  if (!canonicalChangesetSchemaRequest) {
+    canonicalChangesetSchemaRequest = getChangesetSchema()
+      .then((response) => {
+        canonicalChangesetSchemaCache = response.schema;
+        return response.schema;
+      })
+      .finally(() => {
+        canonicalChangesetSchemaRequest = null;
+      });
+  }
+
+  return canonicalChangesetSchemaRequest;
+}
+
 export function WorkflowShell(props: {
   route?: {
     path: string;
@@ -2218,6 +2280,7 @@ export function WorkflowShell(props: {
   const [runtimeProjectionsByRunId, setRuntimeProjectionsByRunId] = useState<Record<string, EventChainSummaryResponse>>({});
 
   const selectedRunIdRef = useRef<string | null>(null);
+  const receivedWorkflowEventIdsRef = useRef<Set<string>>(new Set());
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
   const hydratedWorkflowEventRunsRef = useRef<Set<string>>(new Set());
   const runRefreshTimersRef = useRef<Record<string, number>>({});
@@ -2650,7 +2713,8 @@ export function WorkflowShell(props: {
       const event = events[index];
 
       if (
-        event.kind === 'operator_checkpoint_resolved'
+        event.kind === 'operator_checkpoint_completed'
+        || event.kind === 'operator_checkpoint_resolved'
         || event.kind === 'stage_execution_completed'
         || event.kind === 'workflow_completed'
         || event.kind === 'workflow_process_stopped'
@@ -2694,8 +2758,6 @@ export function WorkflowShell(props: {
   }, [selectedRunDefinition, selectedRunStepId]);
 
   const runtimeDeployQAValues = useMemo<DeployQAValues>(() => {
-    const definitionQa = selectedWorkflowStep?.execution?.qa;
-    const definitionEnvironment = definitionQa?.environment;
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
     const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
@@ -2714,38 +2776,28 @@ export function WorkflowShell(props: {
         ? dependencyProviders.filter(
             (value): value is string => typeof value === 'string'
           )
-        : Array.isArray(definitionQa?.dependency_providers)
-          ? definitionQa.dependency_providers.filter(
-              (value): value is string => typeof value === 'string'
-            )
-          : [],
+        : defaultDeployQAValues.dependency_providers,
       services: Array.isArray(services)
         ? structuredClone(services as DeployQAValues['services'])
-        : Array.isArray(definitionEnvironment?.services)
-          ? structuredClone(definitionEnvironment.services)
-          : structuredClone(defaultDeployQAValues.services),
+        : structuredClone(defaultDeployQAValues.services),
       port_start:
         typeof portStart === 'number'
           ? portStart
-          : definitionEnvironment?.port_range?.start
-            ?? defaultDeployQAValues.port_start,
+          : defaultDeployQAValues.port_start,
       port_end:
         typeof portEnd === 'number'
           ? portEnd
-          : definitionEnvironment?.port_range?.end
-            ?? defaultDeployQAValues.port_end,
+          : defaultDeployQAValues.port_end,
       hostname_template:
         typeof hostnameTemplate === 'string'
           ? hostnameTemplate
-          : definitionEnvironment?.hostname_template
-            ?? defaultDeployQAValues.hostname_template,
+          : defaultDeployQAValues.hostname_template,
       shutdown_grace_seconds:
         typeof shutdownGraceSeconds === 'number'
           ? shutdownGraceSeconds
-          : definitionEnvironment?.shutdown_grace_seconds
-            ?? defaultDeployQAValues.shutdown_grace_seconds,
+          : defaultDeployQAValues.shutdown_grace_seconds,
     };
-  }, [selectedWorkflowStep, selectedRun?.context]);
+  }, [selectedRun?.context]);
 
 
   const [sapImportPackageName, setSapImportPackageName] = useState('');
@@ -3116,8 +3168,71 @@ export function WorkflowShell(props: {
     setJsonDraft(JSON.stringify(definition, null, 2));
   }, [definition]);
 
+  function applyLiveWorkflowEvent(event: StageExecutionEvent) {
+    if (receivedWorkflowEventIdsRef.current.has(event.id)) return;
+    receivedWorkflowEventIdsRef.current.add(event.id);
+
+    const scope: RuntimeEventEnvelope['scope'] = event.capability_invocation_id
+      ? 'capability_invocation'
+      : event.stage_execution_id
+        ? 'stage_execution'
+        : 'workflow_run';
+
+    const envelope: RuntimeEventEnvelope = {
+      scope,
+      node_key: `workflow_run:${event.run_id}`,
+      run_id: event.run_id,
+      event
+    };
+
+    setRuntimeEvents((prev) => reduceRuntimeEvent(prev, envelope));
+    applyIncomingWorkflowEvent(event.run_id, event);
+    setRuntimeProjectionsByRunId((prev) => {
+      const projected = projectRuntimeLifecycleEvent(prev[event.run_id], event);
+      if (!projected) return prev;
+      return {
+        ...prev,
+        [event.run_id]: projected
+      };
+    });
+  }
+
   useEffect(() => {
     selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+
+    const runId = selectedRunId;
+    const source = openEventStream(runId, { liveOnly: true });
+
+    source.addEventListener('workflow_event', (raw) => {
+      try {
+        const event = JSON.parse(
+          (raw as MessageEvent<string>).data
+        ) as StageExecutionEvent;
+        applyLiveWorkflowEvent(event);
+      } catch {
+      }
+    });
+
+    source.addEventListener('monitor_snapshot', (raw) => {
+      try {
+        const projection = JSON.parse(
+          (raw as MessageEvent<string>).data
+        ) as EventChainSummaryResponse;
+        setRuntimeProjectionsByRunId((prev) => ({
+          ...prev,
+          [projection.run_id]: projection
+        }));
+      } catch {
+      }
+    });
+
+    return () => {
+      source.close();
+    };
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -3131,6 +3246,7 @@ export function WorkflowShell(props: {
     const shouldHydrateSelectedRun = latest.kind === 'workflow_waiting_for_operator_checkpoint'
       || latest.kind === 'stage_execution_waiting_for_operator_checkpoint'
       || latest.kind === 'stage_execution_waiting_for_disposition_review'
+      || latest.kind === 'operator_checkpoint_completed'
       || latest.kind === 'operator_checkpoint_resolved'
       || latest.kind === 'stage_execution_completed'
       || latest.kind === 'supervisor.workflow_terminal'
@@ -3247,11 +3363,6 @@ export function WorkflowShell(props: {
       onError: () => {
         if (cancelled) return;
         setRuntimeEvents((prev) => ({ ...prev, connected: false }));
-        const runId = selectedRunIdRef.current;
-        if (runId) {
-          void hydrateWorkflowEventsFromHistory(runId);
-          void hydrateRuntimeProjection(runId);
-        }
       },
       onSnapshot: (snapshot) => {
         if (cancelled) return;
@@ -3271,12 +3382,7 @@ export function WorkflowShell(props: {
       },
       onEvent: (incoming) => {
         if (cancelled) return;
-        setRuntimeEvents((prev) => reduceRuntimeEvent(prev, incoming));
-        applyIncomingWorkflowEvent(incoming.event.run_id, incoming.event);
-
-        if (incoming.event.run_id === selectedRunIdRef.current) {
-          void hydrateRuntimeProjection(incoming.event.run_id);
-        }
+        applyLiveWorkflowEvent(incoming.event);
       }
     });
 
@@ -3307,11 +3413,7 @@ export function WorkflowShell(props: {
     });
     setLiveExecutionTrails(projection ? mapLiveExecutionTrailsFromProjection(projection) : []);
 
-    if (!hydratedWorkflowEventRunsRef.current.has(selectedRunId)) {
-      hydratedWorkflowEventRunsRef.current.add(selectedRunId);
-      void hydrateWorkflowEventsFromHistory(selectedRunId);
-      void hydrateRuntimeProjection(selectedRunId);
-    } else if (!projection) {
+    if (!projection) {
       void hydrateRuntimeProjection(selectedRunId);
     }
   }, [selectedRunId, runtimeEvents.workflowEventsByRunId, runtimeProjectionsByRunId]);
@@ -3325,40 +3427,35 @@ export function WorkflowShell(props: {
     if (!selectedRunId) return;
     if (monitorView !== 'workflow_detail') return;
 
-    const selectedStatus = selectedRun?.status ?? '';
-    const shouldPollBackend = selectedStatus === 'queued'
-      || selectedStatus === 'running'
-      || selectedStatus === 'waiting'
-      || busy
-      || manualCapabilityBusy
-      || pauseRequestBusy;
-
-    if (!shouldPollBackend) return;
-
     let cancelled = false;
     const runId = selectedRunId;
 
-    async function refreshSelectedRunFromBackend() {
-      if (cancelled) return;
+    async function reconcileSelectedRun() {
+      if (cancelled || document.visibilityState !== 'visible') return;
       try {
-        await Promise.all([
-          refreshRunDetails(runId),
-          hydrateRuntimeProjection(runId)
-        ]);
+        await refreshRunDetails(runId);
       } catch {
       }
     }
 
-    void refreshSelectedRunFromBackend();
+    function reconcileAfterVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        void reconcileSelectedRun();
+      }
+    }
+
     const timer = window.setInterval(() => {
-      void refreshSelectedRunFromBackend();
-    }, 3500);
+      void reconcileSelectedRun();
+    }, 60_000);
+
+    document.addEventListener('visibilitychange', reconcileAfterVisibilityChange);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', reconcileAfterVisibilityChange);
     };
-  }, [selectedRunId, selectedRun?.status, monitorView, busy, manualCapabilityBusy, pauseRequestBusy]);
+  }, [selectedRunId, monitorView]);
 
 
   useEffect(() => {
@@ -3385,7 +3482,19 @@ export function WorkflowShell(props: {
   useEffect(() => {
     if (!changesetSchemaConfigOpen) return;
     if (stageChangesetSchemaText.trim()) return;
-    void loadCanonicalChangesetSchema(false);
+
+    let cancelled = false;
+    void getCachedCanonicalChangesetSchema()
+      .then((schema) => {
+        if (!cancelled) {
+          setStageChangesetSchemaText(schema);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [changesetSchemaConfigOpen, stageChangesetSchemaText]);
 
   useEffect(() => {
@@ -3422,10 +3531,6 @@ export function WorkflowShell(props: {
       ? repoContext.include_files.filter((value): value is string => typeof value === 'string')
       : [];
 
-    if (step.step_type === 'code' && typeof promptFragments.changeset_schema !== 'string') {
-      void loadCanonicalChangesetSchema(false);
-    }
-
     const globalChangesetSchema = (globalCapabilities.changeset_schema ?? {}) as Record<string, unknown>;
     const selectedPrompt = ((selectedStageState?.prompt ?? {}) as Record<string, unknown>);
     const selectedExecutionLogic = (selectedStageState?.execution_logic ?? step.execution_logic ?? {}) as Record<string, unknown>;
@@ -3439,12 +3544,24 @@ export function WorkflowShell(props: {
     const canToggleSharedRepoContext = step.step_type === 'design' || step.step_type === 'code';
     const canToggleSharedChangesetSchema = step.step_type === 'code';
 
-    if (step.step_type === 'code' && !hydratedSchemaText.trim()) {
-      void loadCanonicalChangesetSchema(false);
-    }
 
-    setStageUserInput(hydratedUserInput);
-    setStageChangesetSchemaText(hydratedSchemaText);
+    if (hydratedSchemaText.trim()) {
+      canonicalChangesetSchemaCache = hydratedSchemaText;
+      setStageChangesetSchemaText(hydratedSchemaText);
+    } else if (canonicalChangesetSchemaCache !== null) {
+      setStageChangesetSchemaText(canonicalChangesetSchemaCache);
+    } else if (step.step_type === 'code') {
+      void getCachedCanonicalChangesetSchema()
+        .then((schema) => {
+          const stageIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
+          const hydratedStageIdentityRef = { current: stageIdentity };
+
+          if (hydratedStageIdentityRef.current === stageIdentity) {
+            setStageChangesetSchemaText(schema);
+          }
+        })
+        .catch(() => {});
+    }
     setStageApplyError(typeof promptFragments.apply_error === 'string' ? promptFragments.apply_error : '');
     setStageReviewNotes(typeof review.notes === 'string' ? review.notes : '');
     setStageCompileError(typeof promptFragments.compile_error === 'string' ? promptFragments.compile_error : '');
@@ -3507,7 +3624,10 @@ export function WorkflowShell(props: {
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
     setStageRepoContextInlinePrompt(Boolean(repoContext.inline_repo_context_in_prompt));
+
+    setStageUserInput(hydratedUserInput);
   }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
+
 
   function buildInteractiveGlobalStatePayload() {
     const includeFiles = stageRepoContextIncludeFilesText
@@ -4223,19 +4343,6 @@ export function WorkflowShell(props: {
       });
     }
 
-    if (resultStageEvent && !eventIndicatesOperatorCheckpointWait(resultStageEvent)) {
-      for (const capability of mapped) {
-        if (!capability.isActive) continue;
-        capability.isActive = false;
-        capability.statusColor = capability.statusColor === 'red' ? 'red' : 'green';
-        capability.statusLabel = capability.statusLabel === 'FAILED' || capability.statusLabel === 'ERROR' ? capability.statusLabel : 'SUCCESS';
-        capability.latestCreatedAt = resultStageEvent.created_at;
-        capability.latestKind = resultStageEvent.kind;
-        capability.latestLevel = capability.statusColor === 'red' ? 'error' : 'info';
-        capability.durationText = formatDuration(capability.startedAtRaw, resultStageEvent.created_at);
-      }
-    }
-
     return mapped.sort((a, b) => {
       if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
 
@@ -4272,6 +4379,168 @@ export function WorkflowShell(props: {
       || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
       || event.kind === 'stage_execution_waiting_for_disposition_review'
       || (Array.isArray(capabilityResults) && capabilityResults.length > 0);
+  }
+
+  function runtimeEventCapabilityName(event: StageExecutionEvent): string {
+    const payload = asRecord(event.payload) ?? {};
+    const payloadCapability = stringFrom(payload.capability);
+    if (payloadCapability) return payloadCapability;
+
+    return event.kind
+      .replace(/_(started|completed|failed)$/g, '')
+      .replace(/_/g, ' ');
+  }
+
+  function runtimeEventDurationMs(startedAt: string | null | undefined, completedAt: string): number | null {
+    if (!startedAt) return null;
+    const start = Date.parse(startedAt);
+    const end = Date.parse(completedAt);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+    return Math.max(0, end - start);
+  }
+
+  function projectRuntimeLifecycleEvent(
+    current: EventChainSummaryResponse | undefined,
+    event: StageExecutionEvent
+  ): EventChainSummaryResponse | undefined {
+    const stepId = event.step_id;
+    const stageExecutionId = event.stage_execution_id;
+    if (!stepId || !stageExecutionId) return current;
+
+    const projection: EventChainSummaryResponse = current
+      ? {
+          ...current,
+          stages: current.stages.map((stage) => ({
+            ...stage,
+            capabilities: stage.capabilities.map((capability) => ({ ...capability }))
+          }))
+        }
+      : {
+          run_id: event.run_id,
+          stages: []
+        };
+
+    let stage = projection.stages.find(
+      (item) => item.stage_execution_id === stageExecutionId
+    );
+
+    if (!stage) {
+      stage = {
+        key: stageExecutionId,
+        step_id: stepId,
+        label: labelFromCapabilityKey(stepId) || stepId,
+        stage_execution_id: stageExecutionId,
+        latest_kind: event.kind,
+        latest_message: event.message,
+        latest_level: event.level,
+        latest_created_at: event.created_at,
+        is_current: true,
+        is_active: true,
+        event_count: 0,
+        duration_ms: null,
+        capabilities: []
+      };
+      projection.stages = [stage, ...projection.stages];
+    }
+
+    stage.latest_kind = event.kind;
+    stage.latest_message = event.message;
+    stage.latest_level = event.level;
+    stage.latest_created_at = event.created_at;
+    stage.event_count += 1;
+
+    if (event.kind === 'stage_execution_started') {
+      for (const item of projection.stages) {
+        item.is_current = item.stage_execution_id === stageExecutionId;
+      }
+      stage.is_active = true;
+      stage.is_current = true;
+      stage.duration_ms = null;
+    }
+
+    if (isTerminalStageEvent(event)) {
+      const stageStart = runtimeEvents.workflowEventsByRunId[event.run_id]
+        ?.find((item) => (
+          item.stage_execution_id === stageExecutionId
+          && item.kind === 'stage_execution_started'
+        ));
+      stage.is_active = false;
+      stage.is_current = false;
+      stage.duration_ms = runtimeEventDurationMs(stageStart?.created_at, event.created_at);
+    }
+
+    const capabilityInvocationId = event.capability_invocation_id;
+    if (capabilityInvocationId) {
+      let capability = stage.capabilities.find(
+        (item) => item.capability_id === capabilityInvocationId
+      );
+      const isStarted = event.kind.endsWith('_started');
+      const isFailed = event.kind.endsWith('_failed') || event.level === 'error';
+      const isCompleted = event.kind.endsWith('_completed');
+
+      if (!capability) {
+        capability = {
+          key: capabilityInvocationId,
+          capability_id: capabilityInvocationId,
+          name: runtimeEventCapabilityName(event),
+          status_color: isFailed ? 'red' : isCompleted ? 'green' : 'blue',
+          status_label: isFailed ? 'Failed' : isCompleted ? 'Completed' : 'Running',
+          message: event.message,
+          started_at: isStarted ? event.created_at : null,
+          completed_at: isCompleted || isFailed ? event.created_at : null,
+          duration_ms: null,
+          latest_created_at: event.created_at,
+          latest_kind: event.kind,
+          latest_level: event.level,
+          is_active: isStarted && !isCompleted && !isFailed,
+          event_count: 0,
+          start_event_id: isStarted ? event.id : null,
+          end_event_id: isCompleted || isFailed ? event.id : null,
+          start_payload: isStarted ? event.payload : null,
+          end_payload: isCompleted || isFailed ? event.payload : null,
+          latest_payload: event.payload
+        };
+        stage.capabilities = [capability, ...stage.capabilities];
+      }
+
+      capability.message = event.message;
+      capability.latest_created_at = event.created_at;
+      capability.latest_kind = event.kind;
+      capability.latest_level = event.level;
+      capability.latest_payload = event.payload;
+      capability.event_count += 1;
+
+      if (isStarted) {
+        capability.started_at = event.created_at;
+        capability.start_event_id = event.id;
+        capability.start_payload = event.payload;
+        capability.completed_at = null;
+        capability.duration_ms = null;
+        capability.is_active = true;
+        capability.status_color = 'blue';
+        capability.status_label = 'Running';
+      }
+
+      if (isCompleted || isFailed) {
+        capability.completed_at = event.created_at;
+        capability.end_event_id = event.id;
+        capability.end_payload = event.payload;
+        capability.duration_ms = runtimeEventDurationMs(
+          capability.started_at,
+          event.created_at
+        );
+        capability.is_active = false;
+        capability.status_color = isFailed ? 'red' : 'green';
+        capability.status_label = isFailed ? 'Failed' : 'Completed';
+      }
+    }
+
+    projection.stages.sort((a, b) => {
+      if (a.is_active !== b.is_active) return a.is_active ? -1 : 1;
+      return b.latest_created_at.localeCompare(a.latest_created_at);
+    });
+
+    return projection;
   }
 
   function mapLiveExecutionTrailsFromProjection(projection: EventChainSummaryResponse): LiveStageTrail[] {
@@ -4500,23 +4769,20 @@ export function WorkflowShell(props: {
   }
 
   async function refreshRunDetails(runId: string) {
-    const [run, runEvents] = await Promise.all([getRun(runId), listRunEvents(runId)]);
+    const run = await getRun(runId);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
-    hydratedWorkflowEventRunsRef.current.add(run.id);
-    await hydrateRuntimeProjection(run.id);
-    if (selectedRunIdRef.current === run.id) {
-      setSelectedRunId(run.id);
+    if (!runtimeProjectionsByRunId[run.id]) {
+      await hydrateRuntimeProjection(run.id);
     }
   }
 
   async function refreshRunDetailsOnOpen(runId: string) {
-    const [run, runEvents] = await Promise.all([openWorkflowRun(runId), listRunEvents(runId)]);
+    const run = await openWorkflowRun(runId);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    mergeWorkflowEventsIntoRuntimeStore(run.id, runEvents);
-    hydratedWorkflowEventRunsRef.current.add(run.id);
-    await hydrateRuntimeProjection(run.id);
     setSelectedRunId(run.id);
+    if (!runtimeProjectionsByRunId[run.id]) {
+      await hydrateRuntimeProjection(run.id);
+    }
   }
 
 
@@ -4759,7 +5025,11 @@ export function WorkflowShell(props: {
     try {
       setBusy(true);
       setError(null);
-      const prepared = await prepareWorkflowStage(runId);
+
+      const stepId = selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? null;
+      const latestUserInput = stageUserInput;
+
+      const prepared = await prepareWorkflowStage(runId, stepId);
       const preparedRun = prepared.run;
       if (preparedRun) {
         setRuns((prev) => [
@@ -4770,7 +5040,13 @@ export function WorkflowShell(props: {
       } else {
         await refreshRunDetails(runId);
       }
-      await startWorkflowRun(runId);
+      await startWorkflowRun(
+        runId,
+        stepId,
+        latestUserInput
+      );
+
+      setStageUserInput(latestUserInput);
       await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

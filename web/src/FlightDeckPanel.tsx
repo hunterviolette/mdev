@@ -49,6 +49,7 @@ type FlightDeckPoolSetting = {
 
 type FlightDeckSettings = {
   pools?: Record<string, FlightDeckPoolSetting>;
+  execution_event_limit?: number;
 };
 
 type StageProjection = {
@@ -63,6 +64,8 @@ type CapabilityProjection = {
   label: string;
   state: string;
   message: string;
+  created_at?: string;
+  duration_ms?: number;
   step_id?: string | null;
   stage_execution_id?: string | null;
   capability_invocation_id?: string | null;
@@ -120,6 +123,13 @@ function workflowTemplateOptions(templates: WorkflowTemplate[]): TemplateOption[
 function supervisorFlightDeckSettings(supervisor: FlightDeckSupervisor): FlightDeckSettings {
   const raw = supervisor.context?.flight_deck_settings;
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as FlightDeckSettings : {};
+}
+
+function supervisorExecutionEventLimit(supervisor: FlightDeckSupervisor): number {
+  const value = supervisorFlightDeckSettings(supervisor).execution_event_limit;
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(10, Math.min(1000, Math.floor(value)))
+    : 100;
 }
 
 function poolSetting(supervisor: FlightDeckSupervisor, groupKey: string): FlightDeckPoolSetting {
@@ -198,6 +208,58 @@ function textField(item: Record<string, unknown>, key: string): string {
   return typeof value === 'string' && value.trim() ? value : '';
 }
 
+function numberField(item: Record<string, unknown>, key: string): number | undefined {
+  const value = item[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function relativeExecutionTime(value?: string): string {
+  if (!value) return '';
+
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return '';
+
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds} second${elapsedSeconds === 1 ? '' : 's'} ago`;
+  }
+
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) {
+    return `${elapsedMinutes} minute${elapsedMinutes === 1 ? '' : 's'} ago`;
+  }
+
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 72) {
+    return `${elapsedHours} hour${elapsedHours === 1 ? '' : 's'} ago`;
+  }
+
+  const elapsedDays = Math.floor(elapsedHours / 24);
+  return `${elapsedDays} day${elapsedDays === 1 ? '' : 's'} ago`;
+}
+
+function executionDuration(durationMs?: number): string {
+  if (durationMs === undefined || durationMs < 0) return '';
+
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  if (totalMinutes < 60) {
+    return remainingSeconds > 0
+      ? `${totalMinutes}m ${remainingSeconds}s`
+      : `${totalMinutes}m`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const remainingMinutes = totalMinutes % 60;
+  return remainingMinutes > 0
+    ? `${hours}h ${remainingMinutes}m`
+    : `${hours}h`;
+}
+
 function telemetryString(unit: FlightDeckWorkUnit, key: string): string {
   const value = unit.telemetry?.[key];
   return typeof value === 'string' && value.trim() ? value : '';
@@ -216,6 +278,12 @@ function stageKeyFromText(value: string): string {
     .replace(/^_+|_+$/g, '');
   return normalized || 'stage';
 }
+
+function stageExecutionDisplayName(stepId: string): string {
+  const key = stageKeyFromText(stepId);
+  return STAGE_LABELS[key] ?? titleCase(key);
+}
+
 
 function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   const templateStages = telemetryArray(unit, 'stage_template');
@@ -313,13 +381,15 @@ function buildCapabilityProjection(unit: FlightDeckWorkUnit): CapabilityProjecti
       label: titleCase(textField(capability, 'capability') || existing?.label || 'capability'),
       state: nextState,
       message: textField(capability, 'message') || existing?.message || 'No message',
+      created_at: textField(capability, 'created_at') || existing?.created_at,
+      duration_ms: numberField(capability, 'duration_ms') ?? existing?.duration_ms,
       step_id: textField(capability, 'step_id') || existing?.step_id || currentStepId(unit),
       stage_execution_id: textField(capability, 'stage_execution_id') || existing?.stage_execution_id || null,
       capability_invocation_id: textField(capability, 'capability_invocation_id') || existing?.capability_invocation_id || null,
     });
   });
 
-  return [...byInvocation.values()].slice(0, 4);
+  return [...byInvocation.values()];
 }
 
 function StageRail(props: { stages: StageProjection[] }) {
@@ -547,6 +617,10 @@ function deriveWorkflowCardHistoryHydration(unit: FlightDeckWorkUnit, items: Wor
         label,
         state: executionStatusFromEvent(item),
         message: item.message || titleCase(item.kind),
+        created_at: item.created_at,
+        duration_ms:
+          numberField(item.payload ?? {}, 'duration_ms')
+          ?? numberField(item.payload ?? {}, 'elapsed_ms'),
         step_id: item.step_id || currentStepId(unit),
         stage_execution_id: item.stage_execution_id || null,
         capability_invocation_id: item.capability_invocation_id,
@@ -568,53 +642,174 @@ function deriveWorkflowCardHistoryHydration(unit: FlightDeckWorkUnit, items: Wor
   }
 
   return {
-    capabilities: [...capabilityByKey.values()].slice(0, 4),
-    stages: [...stageByKey.values()].slice(0, 4),
+    capabilities: [...capabilityByKey.values()],
+    stages: [...stageByKey.values()],
   };
+}
+
+type ExecutionEventRowItem = {
+  id: string;
+  label: string;
+  status: string;
+  message?: string;
+  createdAt?: string;
+  durationMs?: number;
+};
+
+function ExecutionEventRow(props: {
+  item: ExecutionEventRowItem;
+  onClick?: () => void;
+}) {
+  const { item } = props;
+  const statusTone = tone(item.status);
+  const relativeTime = relativeExecutionTime(item.createdAt);
+  const duration = executionDuration(item.durationMs);
+  const timing = [duration, relativeTime].filter(Boolean).join(' · ');
+  const exactTime = item.createdAt && Number.isFinite(Date.parse(item.createdAt))
+    ? new Date(item.createdAt).toLocaleString()
+    : '';
+
+  const messageText = (
+    <Text
+      size="10px"
+      c="dimmed"
+      truncate
+      style={{ flex: '1 1 auto', minWidth: 0 }}
+    >
+      {item.message}
+    </Text>
+  );
+
+  return (
+    <Group
+      gap={8}
+      wrap="nowrap"
+      px={8}
+      py={3}
+      onClick={props.onClick}
+      style={{
+        minHeight: 24,
+        cursor: props.onClick ? 'pointer' : undefined,
+        border: `1px solid var(--mantine-color-${statusTone}-7)`,
+        borderRadius: 'var(--mantine-radius-sm)',
+        background: `var(--mantine-color-${statusTone}-light)`,
+      }}
+    >
+      <Text
+        fw={600}
+        size="xs"
+        truncate
+        style={{ flex: '0 1 120px', minWidth: 64, maxWidth: 140 }}
+      >
+        {item.label}
+      </Text>
+
+      {item.message ? (
+        <Tooltip
+          label={(
+            <Stack gap={4}>
+              <Text size="xs" style={{ whiteSpace: 'normal' }}>
+                {item.message}
+              </Text>
+              {duration ? (
+                <Text size="10px" c="dimmed">
+                  Duration: {duration}
+                </Text>
+              ) : null}
+              {exactTime ? (
+                <Text size="10px" c="dimmed">
+                  Recorded: {exactTime}
+                </Text>
+              ) : null}
+            </Stack>
+          )}
+          position="bottom-start"
+          multiline
+          maw={360}
+          withArrow
+          openDelay={350}
+        >
+          {messageText}
+        </Tooltip>
+      ) : (
+        <Box style={{ flex: '1 1 auto', minWidth: 0 }} />
+      )}
+
+      {timing ? (
+        <Text
+          size="10px"
+          c="dimmed"
+          truncate
+          style={{ flex: '0 0 auto', whiteSpace: 'nowrap', maxWidth: '42%' }}
+        >
+          {timing}
+        </Text>
+      ) : null}
+    </Group>
+  );
 }
 
 function CapabilityStrip(props: { capabilities: CapabilityProjection[]; onOpenHistory?: (capability: CapabilityProjection) => void }) {
   const { capabilities } = props;
   if (capabilities.length === 0) {
-    return (
-      <Paper withBorder radius="md" p="md" style={{ background: 'rgba(255,255,255,0.025)' }}>
-        <Text size="sm" c="dimmed">No capability invocations captured for the active stage.</Text>
-      </Paper>
-    );
+    return <Text size="sm" c="dimmed">No capability executions yet.</Text>;
   }
 
+  let previousStageExecutionId: string | null | undefined;
+
   return (
-    <Group gap="sm" wrap="nowrap" style={{ overflowX: 'auto', paddingBottom: 4 }}>
-      {capabilities.map((capability) => (
-        <Paper
-          key={capability.id}
-          withBorder
-          radius="lg"
-          p="sm"
-          onClick={() => props.onOpenHistory?.(capability)}
-          style={{
-            minWidth: 210,
-            cursor: props.onOpenHistory ? 'pointer' : undefined,
-            borderColor: `var(--mantine-color-${tone(capability.state)}-5)`,
-            background: 'rgba(255,255,255,0.035)',
-          }}
-        >
-          <Stack gap={4}>
-            <Group justify="space-between" gap="xs">
-              <Badge size="xs" color={tone(capability.state)}>{titleCase(capability.state)}</Badge>
-              <Text size="xs" c="dimmed">{capability.id.slice(0, 8)}</Text>
-            </Group>
-            <Text fw={800} size="sm" truncate>{capability.label}</Text>
-            <Text size="xs" c="dimmed" lineClamp={2}>{capability.message}</Text>
-          </Stack>
-        </Paper>
-      ))}
-    </Group>
+    <Stack gap={4}>
+      {capabilities.map((capability) => {
+        const stageExecutionId = capability.stage_execution_id || capability.step_id || null;
+        const stageChanged = previousStageExecutionId !== undefined
+          && previousStageExecutionId !== stageExecutionId;
+        previousStageExecutionId = stageExecutionId;
+
+        return (
+          <Box key={capability.id}>
+            {stageChanged ? (
+              <Group gap={6} my={2} wrap="nowrap">
+                <Text
+                  size="9px"
+                  fw={700}
+                  c="dimmed"
+                  tt="uppercase"
+                  style={{ flex: '0 0 auto', lineHeight: 1 }}
+                >
+                  {capability.step_id
+                    ? stageExecutionDisplayName(capability.step_id)
+                    : 'Stage'}
+                </Text>
+                <Box
+                  style={{
+                    height: 1,
+                    flex: '1 1 auto',
+                    background: 'var(--mantine-color-dark-4)',
+                  }}
+                />
+              </Group>
+            ) : null}
+            <ExecutionEventRow
+              item={{
+                id: capability.id,
+                label: capability.label,
+                status: capability.state,
+                message: capability.message,
+                createdAt: capability.created_at,
+                durationMs: capability.duration_ms,
+              }}
+              onClick={props.onOpenHistory
+                ? () => props.onOpenHistory?.(capability)
+                : undefined}
+            />
+          </Box>
+        );
+      })}
+    </Stack>
   );
 }
 
 function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Record<string, unknown>[]; onOpenHistory?: (stage: Record<string, unknown>) => void }) {
-  const activeStepKey = currentStepId(props.unit);
   const nativeStages = telemetryArray(props.unit, 'recent_stage_executions');
   const sourceStages = nativeStages.length > 0 ? nativeStages : props.fallbackStages ?? [];
   const stages = sourceStages
@@ -630,44 +825,38 @@ function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Re
       }
 
       return b.index - a.index;
-    })
-    .slice(0, 4);
+    });
 
   if (stages.length === 0) {
     return <Text size="sm" c="dimmed">No previous stage executions yet.</Text>;
   }
 
   return (
-    <Stack gap="xs">
+    <Stack gap={4}>
       {stages.map(({ stage, index }) => {
         const status = textField(stage, 'status') || 'event';
         const stepId = textField(stage, 'step_id') || 'stage';
-        const message = textField(stage, 'message') || 'No message';
+        const stageExecutionId = textField(stage, 'stage_execution_id');
+        const stageName = stageExecutionDisplayName(stepId);
+        const message = textField(stage, 'message') || '';
         const createdAt = textField(stage, 'created_at');
-        const isCurrentStep = activeStepKey ? stageKeyFromText(stepId) === stageKeyFromText(activeStepKey) : false;
+        const durationMs = numberField(stage, 'duration_ms');
+
         return (
-          <Paper
-            key={`${stepId}-${index}-${createdAt}`}
-            withBorder
-            radius="md"
-            p="sm"
-            onClick={() => props.onOpenHistory?.(stage)}
-            style={{
-              cursor: props.onOpenHistory ? 'pointer' : undefined,
-              borderColor: isCurrentStep ? `var(--mantine-color-${tone(status)}-5)` : undefined,
-              background: isCurrentStep ? 'rgba(34,184,207,0.08)' : 'rgba(255,255,255,0.025)',
+          <ExecutionEventRow
+            key={stageExecutionId || `${stepId}-${index}-${createdAt}`}
+            item={{
+              id: stageExecutionId || `${stepId}-${index}-${createdAt}`,
+              label: stageName,
+              status,
+              message,
+              createdAt,
+              durationMs,
             }}
-          >
-            <Group justify="space-between" gap="xs" wrap="nowrap">
-              <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-                <Badge color={tone(status)} size="sm">{titleCase(status)}</Badge>
-                <Text fw={isCurrentStep ? 900 : 700} size="sm" truncate>{titleCase(stepId)}</Text>
-                {isCurrentStep ? <Badge color="cyan" variant="light" size="xs">Current workflow</Badge> : null}
-              </Group>
-              <Text size="xs" c="dimmed" style={{ flex: '0 0 auto' }}>{createdAt ? new Date(createdAt).toLocaleTimeString() : ''}</Text>
-            </Group>
-            <Text size="xs" c="dimmed" lineClamp={2} mt={4}>{message}</Text>
-          </Paper>
+            onClick={props.onOpenHistory
+              ? () => props.onOpenHistory?.(stage)
+              : undefined}
+          />
         );
       })}
     </Stack>
@@ -863,18 +1052,32 @@ function WorkflowProjectionCard(props: {
     props.onActionComplete?.();
   }
 
+  const workflowHeaderState = normalize(telemetryString(unit, 'status') || unit.state);
+  const workflowHeaderWaiting = ['waiting', 'waiting_user', 'paused'].includes(workflowHeaderState);
+  const workflowHeaderActive = ['queued', 'running', 'active'].includes(workflowHeaderState);
+  const workflowHeaderAnimated = workflowHeaderWaiting || workflowHeaderActive;
+  const workflowHeaderColor = workflowHeaderWaiting
+    ? '250, 176, 5'
+    : '34, 139, 230';
+
   return (
     <Card
       withBorder
       radius="lg"
       p="sm"
       style={{
-        background: 'linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.018))',
-        borderColor: `var(--mantine-color-${tone(unit.state)}-5)`,
+        background: 'linear-gradient(135deg, rgba(39, 42, 48, 0.96), rgba(31, 34, 39, 0.94))',
+        borderColor: `var(--mantine-color-${tone(unit.state)}-7)`,
         marginLeft: props.compact ? 16 : 0,
       }}
     >
       <Stack gap="sm">
+        <style>{`
+          @keyframes flight-deck-workflow-header-flow {
+            0% { background-position: 0% 50%; }
+            100% { background-position: 200% 50%; }
+          }
+        `}</style>
         <div
           style={{
             display: 'grid',
@@ -885,33 +1088,71 @@ function WorkflowProjectionCard(props: {
           }}
         >
           <Stack gap={6} style={{ minWidth: 0 }}>
-            <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
-              <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-                <Badge color={tone(unit.state)}>{titleCase(unit.state)}</Badge>
-                {title}
-                {unit.workflow_deleted ? <Badge color="red" variant="outline">Deleted</Badge> : null}
-                {unit.patch_id ? <Badge color="violet" variant="light">Patch {unit.patch_id.slice(0, 8)}</Badge> : null}
+            <Box
+              px="xs"
+              py={6}
+              style={{
+                border: workflowHeaderAnimated
+                  ? `1px solid rgba(${workflowHeaderColor}, 0.46)`
+                  : '1px solid transparent',
+                borderRadius: 'var(--mantine-radius-sm)',
+                backgroundColor: workflowHeaderWaiting
+                  ? 'rgba(250, 176, 5, 0.10)'
+                  : workflowHeaderActive
+                    ? 'rgba(34, 139, 230, 0.10)'
+                    : 'transparent',
+                backgroundImage: workflowHeaderAnimated
+                  ? `linear-gradient(
+                      105deg,
+                      transparent 0%,
+                      rgba(${workflowHeaderColor}, 0.015) 40%,
+                      rgba(${workflowHeaderColor}, 0.10) 50%,
+                      rgba(${workflowHeaderColor}, 0.015) 60%,
+                      transparent 100%
+                    )`
+                  : undefined,
+                backgroundSize: workflowHeaderAnimated ? '220% 100%' : undefined,
+                boxShadow: workflowHeaderAnimated
+                  ? `inset 2px 0 0 rgba(${workflowHeaderColor}, 0.78)`
+                  : 'none',
+                animation: workflowHeaderAnimated
+                  ? 'flight-deck-workflow-header-flow 3.6s linear infinite'
+                  : undefined,
+              }}
+            >
+              <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
+                <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+                  <Badge
+                    color={tone(workflowHeaderState)}
+                    variant="filled"
+                  >
+                    {titleCase(workflowHeaderState)}
+                  </Badge>
+                  {title}
+                  {unit.workflow_deleted ? <Badge color="red" variant="outline">Deleted</Badge> : null}
+                  {unit.patch_id ? <Badge color="violet" variant="light">Patch {unit.patch_id.slice(0, 8)}</Badge> : null}
+                </Group>
+                <Group gap={6} wrap="nowrap">
+                  {workflowCanUnstageManual(unit) ? (
+                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Unstage from integration pool</Button>
+                  ) : null}
+                  {workflowCanPause(unit) ? (
+                    <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
+                  ) : workflowCanRun(unit) ? (
+                    <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
+                  ) : null}
+                  {workflowCanRegenerate(unit) ? (
+                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
+                  ) : null}
+                  {workflowCanStageManual(unit) ? (
+                    <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to integration pool</Button>
+                  ) : null}
+                  {workflowCanDelete(unit) ? (
+                    <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
+                  ) : null}
+                </Group>
               </Group>
-              <Group gap={6} wrap="nowrap">
-                {workflowCanUnstageManual(unit) ? (
-                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Unstage from integration pool</Button>
-                ) : null}
-                {workflowCanPause(unit) ? (
-                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
-                ) : workflowCanRun(unit) ? (
-                  <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
-                ) : null}
-                {workflowCanRegenerate(unit) ? (
-                  <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
-                ) : null}
-                {workflowCanStageManual(unit) ? (
-                  <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to integration pool</Button>
-                ) : null}
-                {workflowCanDelete(unit) ? (
-                  <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
-                ) : null}
-              </Group>
-            </Group>
+            </Box>
             <Group gap="xs" wrap="nowrap">
               <Text fw={800} size="sm">Workflow stages</Text>
               <Badge variant="light" size="xs">Progression</Badge>
@@ -932,32 +1173,21 @@ function WorkflowProjectionCard(props: {
             ) : null}
           </Stack>
           <Stack gap={6} style={{ minWidth: 0 }}>
-            <Group justify="space-between">
-              <Text fw={800} size="sm">Capability execution</Text>
-              <Badge variant="light" size="xs">Last 4</Badge>
-            </Group>
-            <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
+            <Text fw={800} size="sm">Capability execution</Text>
+            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+              <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
+            </ScrollArea.Autosize>
           </Stack>
           <Stack gap={6} style={{ minWidth: 0 }}>
-            <Group justify="space-between">
-              <Text fw={800} size="sm">Stage execution</Text>
-              <Badge variant="light" size="xs">Last 4</Badge>
-            </Group>
-            <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
+            <Text fw={800} size="sm">Stage execution</Text>
+            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+              <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
+            </ScrollArea.Autosize>
           </Stack>
         </div>
 
         <EventHistoryModal anchor={historyAnchor} onClose={() => setHistoryAnchor(null)} />
 
-        {unit.alerts.length > 0 ? (
-          <Stack gap="xs">
-            {unit.alerts.map((alert) => (
-              <Alert key={alert.id} color={alert.level === 'error' ? 'red' : 'yellow'} variant="light">
-                {alert.message}
-              </Alert>
-            ))}
-          </Stack>
-        ) : null}
       </Stack>
     </Card>
   );
@@ -1342,6 +1572,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
   const settings = poolSetting(props.supervisor, props.groupKey);
   const selectedTemplate = settings.template_id ?? null;
   const [manualBusy, setManualBusy] = useState(false);
+  const [featurePoolBusy, setFeaturePoolBusy] = useState(false);
   const [manualNameOpen, setManualNameOpen] = useState(false);
   const [manualName, setManualName] = useState('');
   async function updateSettings(patch: FlightDeckPoolSetting) {
@@ -1372,21 +1603,17 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
   }
 
   async function runFeaturePoolAction() {
-    if (running) {
-      await runSupervisorAction(props.supervisor.id, { action: 'pause_feature_pool' });
-      props.onActionComplete?.();
-      return;
-    }
+    if (featurePoolBusy) return;
 
-    await runSupervisorAction(props.supervisor.id, { action: 'resume_feature_pool' });
-    const targets = props.units.filter((unit) => {
-      if (!unit.feature_id || unit.workflow_deleted) return false;
-      return unit.state === 'queued' || unit.state === 'waiting_user';
-    });
-    for (const unit of targets) {
-      await runSupervisorAction(props.supervisor.id, { action: 'start_work_unit', work_unit_id: unit.id });
+    setFeaturePoolBusy(true);
+    try {
+      await runSupervisorAction(props.supervisor.id, {
+        action: running ? 'pause_feature_pool' : 'resume_feature_pool',
+      });
+      props.onActionComplete?.();
+    } finally {
+      setFeaturePoolBusy(false);
     }
-    props.onActionComplete?.();
   }
 
   if (props.groupKey === 'integration') {
@@ -1412,8 +1639,16 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
         >
           Manage queue
         </Button>
-        <Button size="xs" variant="default" disabled={!running && !queued && !waiting && !poolPaused} onClick={() => void runFeaturePoolAction()}>
-          {running ? 'Pause' : 'Run'}
+        <Button
+          size="xs"
+          variant="default"
+          loading={featurePoolBusy}
+          disabled={featurePoolBusy || (!running && !queued && !waiting && !poolPaused)}
+          onClick={() => void runFeaturePoolAction()}
+        >
+          {featurePoolBusy
+            ? running ? 'Pausing…' : 'Starting…'
+            : running ? 'Pause' : 'Run'}
         </Button>
       </Group>
     );
@@ -1488,8 +1723,8 @@ function WorkPoolProjectionSection(props: {
           px="xs"
           py={6}
           style={{
-            background: 'linear-gradient(90deg, rgba(34,184,207,0.10), rgba(255,255,255,0.025), transparent)',
-            borderLeft: '3px solid rgba(34,184,207,0.65)',
+            background: 'linear-gradient(90deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015), transparent)',
+            borderLeft: '3px solid rgba(255,255,255,0.20)',
           }}
         >
           <Group justify="space-between" align="center" wrap="nowrap">
@@ -1865,10 +2100,10 @@ function DequeueFeatureModal(props: {
         </Text>
         {hasDevelopmentDiff ? (
           <Alert color="yellow" title="Workspace changes found">
-            Unqueue deletes the supervisor workflow/workspace state and discards its local file changes. The planner feature itself is not deleted.
+            Unqueue releases the planner feature from this supervisor. Backend reconciliation removes its workflow/workspace state and discards local file changes. The planner feature itself is not deleted.
           </Alert>
         ) : hasWorkflow ? (
-          <Text size="sm" c="dimmed">This workflow has no detected file changes, so it can be removed without preserving a diff. The planner feature itself is not deleted.</Text>
+          <Text size="sm" c="dimmed">This releases the planner feature from the supervisor queue. Backend reconciliation will remove the associated workflow state. The planner feature itself is not deleted.</Text>
         ) : (
           <Text size="sm" c="dimmed">Unqueue removes this feature from the supervisor queue. The planner feature itself is not deleted.</Text>
         )}
@@ -1967,22 +2202,14 @@ function FeatureQueueModal(props: {
     return items.find((item) => item.feature_id === featureId) ?? null;
   }
 
-  function queueItemWorkUnit(item: SupervisorQueueProjection['items'][number]) {
-    return supervisor?.work_units.find((unit) => workflowType(unit) === 'feature_development' && unit.feature_id === item.feature_id) ?? null;
-  }
-
   async function autoDeleteDequeue(item: SupervisorQueueProjection['items'][number]) {
     if (!supervisor) return;
-    const workUnit = queueItemWorkUnit(item);
-    if (workUnit) {
-      await runSupervisorAction(supervisor.id, { action: 'delete_work_unit', work_unit_id: workUnit.id });
-    } else {
-      await persistQueueSelection(queuedFeaturesRef.current.filter((queued) => queued.feature_id !== item.feature_id));
-    }
-    const next = await getSupervisorQueue(supervisor.id);
-    setQueue(next);
-    updateQueuedFeatures(next.queued_features ?? []);
-    await props.onApplied();
+
+    await persistQueueSelection(
+      queuedFeaturesRef.current.filter(
+        (queued) => queued.feature_id !== item.feature_id,
+      ),
+    );
   }
 
   async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
@@ -2063,16 +2290,15 @@ function FeatureQueueModal(props: {
 
   async function confirmDequeue() {
     if (!supervisor || !dequeueFeature) return;
-    const workUnit = queueItemWorkUnit(dequeueFeature);
-    if (workUnit) {
-      await runSupervisorAction(supervisor.id, { action: 'delete_work_unit', work_unit_id: workUnit.id });
-    }
-    await persistQueueSelection(queuedFeaturesRef.current.filter((item) => item.feature_id !== dequeueFeature.feature_id));
-    const next = await getSupervisorQueue(supervisor.id);
-    setQueue(next);
-    updateQueuedFeatures(next.queued_features ?? []);
+
+    const featureId = dequeueFeature.feature_id;
     setDequeueFeature(null);
-    await props.onApplied();
+
+    await persistQueueSelection(
+      queuedFeaturesRef.current.filter(
+        (item) => item.feature_id !== featureId,
+      ),
+    );
   }
 
   async function applyQueue() {
@@ -2194,6 +2420,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [creatingSupervisor, setCreatingSupervisor] = useState(false);
   const [deleteSupervisorId, setDeleteSupervisorId] = useState<string | null>(null);
   const [deletingSupervisorId, setDeletingSupervisorId] = useState<string | null>(null);
+  const [settingsSupervisorId, setSettingsSupervisorId] = useState<string | null>(null);
+  const [executionEventLimit, setExecutionEventLimit] = useState<number | string>(100);
+  const [savingExecutionEventLimit, setSavingExecutionEventLimit] = useState(false);
   const templateOptions = useMemo(() => workflowTemplateOptions(templates), [templates]);
 
   useEffect(() => {
@@ -2209,6 +2438,30 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
       cancelled = true;
     };
   }, []);
+
+  const settingsSupervisor = (deck?.supervisors ?? []).find((supervisor) => supervisor.id === settingsSupervisorId) ?? null;
+
+  async function saveExecutionEventLimit() {
+    if (!settingsSupervisor) return;
+    const parsedLimit = typeof executionEventLimit === 'number'
+      ? executionEventLimit
+      : Number.parseInt(executionEventLimit, 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(10, Math.min(1000, Math.floor(parsedLimit))) : 100;
+    setSavingExecutionEventLimit(true);
+    try {
+      await runSupervisorAction(settingsSupervisor.id, {
+        action: 'update_flight_deck_settings',
+        flight_deck_settings: {
+          ...supervisorFlightDeckSettings(settingsSupervisor),
+          execution_event_limit: limit,
+        },
+      });
+      setExecutionEventLimit(limit);
+      await refresh();
+    } finally {
+      setSavingExecutionEventLimit(false);
+    }
+  }
 
   async function refresh() {
     try {
@@ -2398,6 +2651,48 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
               <Button onClick={() => void createFlightDeckSupervisor()} loading={creatingSupervisor}>Create supervisor</Button>
             </Group>
           </Stack>
+
+          <Divider />
+
+          <Stack gap="sm">
+            <Text fw={700}>Execution history</Text>
+            <Select
+              label="Supervisor"
+              placeholder="Select supervisor"
+              value={settingsSupervisorId}
+              onChange={(value) => {
+                setSettingsSupervisorId(value);
+                const supervisor = (deck?.supervisors ?? []).find((item) => item.id === value);
+                setExecutionEventLimit(supervisor ? supervisorExecutionEventLimit(supervisor) : 100);
+              }}
+              data={(deck?.supervisors ?? []).map((supervisor) => ({ value: supervisor.id, label: supervisor.title }))}
+              searchable
+              clearable
+            />
+            <NumberInput
+              label="Retained execution events per workflow"
+              description="Controls how many recent stage and capability execution events Flight Deck retains in each workflow projection."
+              value={executionEventLimit}
+              onChange={setExecutionEventLimit}
+              min={10}
+              max={1000}
+              step={10}
+              clampBehavior="strict"
+              disabled={!settingsSupervisor}
+            />
+            <Group justify="flex-end">
+              <Button
+                variant="light"
+                disabled={!settingsSupervisor}
+                loading={savingExecutionEventLimit}
+                onClick={() => void saveExecutionEventLimit()}
+              >
+                Save execution history setting
+              </Button>
+            </Group>
+          </Stack>
+
+          <Divider />
 
           <Divider />
 

@@ -171,8 +171,17 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         let mut supervisor_alerts = Vec::new();
 
         for seed in seeds {
+            let execution_event_limit = supervisor
+                .context
+                .get("flight_deck_settings")
+                .and_then(|settings| settings.get("execution_event_limit"))
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(10, 1000) as usize;
             let telemetry = match seed.workflow_run_id.as_deref() {
-                Some(workflow_run_id) if !seed.workflow_deleted => workflow_telemetry(state, workflow_run_id).await?,
+                Some(workflow_run_id) if !seed.workflow_deleted => {
+                    workflow_telemetry(state, workflow_run_id, execution_event_limit).await?
+                }
                 _ => draft_workflow_telemetry(state, &seed.context).await?,
             };
             let telemetry = enrich_projection_context_telemetry(telemetry, &seed.context);
@@ -612,9 +621,31 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
     let mut seeds = Vec::new();
     for row in rows {
         let workflow_run_id: Option<String> = row.get("workflow_run_id");
+        let workflow_status = row
+            .try_get::<Option<String>, _>("workflow_status")
+            .ok()
+            .flatten()
+            .map(|status| match status.as_str() {
+                "success" => "complete".to_string(),
+                _ => status,
+            });
         let kind_text: String = row.get("kind");
         let workflow_exists = row.get::<i64, _>("workflow_exists") == 1;
-        let state_text: String = if workflow_exists { row.get("state") } else { "deleted".to_string() };
+        let persisted_state: String = row.get("state");
+        let has_workflow_reference = workflow_run_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+        let state_text = if !has_workflow_reference {
+            persisted_state
+        } else if !workflow_exists {
+            "deleted".to_string()
+        } else {
+            workflow_status
+                .clone()
+                .unwrap_or_else(|| persisted_state)
+        };
         if kind_text == "integration" && workflow_run_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
             continue;
         }
@@ -635,7 +666,7 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
             workflow_type: row.get("workflow_type"),
             title: row.get("title"),
             state: state_text,
-            workflow_status: row.get("workflow_status"),
+            workflow_status,
             root_repo_path: row.get("root_repo_path"),
             shard_path: row.get("shard_path"),
             integration_path: row.get("integration_path"),
@@ -743,7 +774,25 @@ fn workflow_stage_template(definition_json: Option<&str>) -> (Vec<Value>, Option
     (stages, None)
 }
 
-async fn workflow_telemetry(state: &AppState, workflow_run_id: &str) -> anyhow::Result<Value> {
+fn execution_duration_ms(started_at: Option<&str>, finished_at: Option<&str>) -> Option<i64> {
+    let started_at = started_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+    let finished_at = finished_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+
+    Some(
+        finished_at
+            .signed_duration_since(started_at)
+            .num_milliseconds()
+            .max(0),
+    )
+}
+
+async fn workflow_telemetry(
+    state: &AppState,
+    workflow_run_id: &str,
+    execution_event_limit: usize,
+) -> anyhow::Result<Value> {
     let run_row = sqlx::query("SELECT status, current_step_id, definition_json FROM workflow_runs WHERE id = ?")
         .bind(workflow_run_id)
         .fetch_optional(&state.db)
@@ -759,20 +808,56 @@ async fn workflow_telemetry(state: &AppState, workflow_run_id: &str) -> anyhow::
 
     let rows = sqlx::query(
         r#"
-        SELECT step_id, stage_execution_id, capability_invocation_id, parent_invocation_id,
-               level, kind, message, payload_json, created_at, sequence_no
+        SELECT
+            step_id,
+            stage_execution_id,
+            capability_invocation_id,
+            parent_invocation_id,
+            is_header_event,
+            level,
+            kind,
+            message,
+            payload_json,
+            created_at,
+            sequence_no,
+            MIN(created_at) OVER (
+                PARTITION BY stage_execution_id
+            ) AS stage_started_at,
+            MAX(created_at) OVER (
+                PARTITION BY stage_execution_id
+            ) AS stage_finished_at,
+            MIN(created_at) OVER (
+                PARTITION BY capability_invocation_id
+            ) AS capability_started_at,
+            MAX(created_at) OVER (
+                PARTITION BY capability_invocation_id
+            ) AS capability_finished_at
         FROM workflow_events
         WHERE run_id = ?
         ORDER BY sequence_no DESC
-        LIMIT 200
+        LIMIT ?
         "#,
     )
     .bind(workflow_run_id)
+    .bind(execution_event_limit.max(10).min(1000) as i64)
     .fetch_all(&state.db)
     .await?;
 
+    let current_stage_execution_id = current_step_id.as_deref().and_then(|current_step_id| {
+        rows.iter().find_map(|row| {
+            let row_step_id = row.get::<Option<String>, _>("step_id")?;
+            if row_step_id != current_step_id {
+                return None;
+            }
+
+            row.get::<Option<String>, _>("stage_execution_id")
+        })
+    });
+
     let mut seen_stages = HashSet::new();
+    let mut seen_capabilities = HashSet::new();
     let mut recent_stage_executions = Vec::new();
+    let mut stage_execution_fallbacks = Vec::<(String, Value)>::new();
     let mut current_stage_recent_capabilities = Vec::new();
 
     for row in rows {
@@ -780,39 +865,99 @@ async fn workflow_telemetry(state: &AppState, workflow_run_id: &str) -> anyhow::
         let stage_execution_id: Option<String> = row.get("stage_execution_id");
         let capability_invocation_id: Option<String> = row.get("capability_invocation_id");
         let parent_invocation_id: Option<String> = row.get("parent_invocation_id");
+        let is_header_event: i64 = row.get("is_header_event");
         let level: String = row.get("level");
         let kind: String = row.get("kind");
         let message: String = row.get("message");
         let payload = parse_json(row.get::<String, _>("payload_json"));
         let created_at: String = row.get("created_at");
+        let stage_started_at: Option<String> = row.try_get("stage_started_at").ok().flatten();
+        let stage_finished_at: Option<String> = row.try_get("stage_finished_at").ok().flatten();
+        let capability_started_at: Option<String> = row.try_get("capability_started_at").ok().flatten();
+        let capability_finished_at: Option<String> = row.try_get("capability_finished_at").ok().flatten();
+        let stage_duration_ms = execution_duration_ms(
+            stage_started_at.as_deref(),
+            stage_finished_at.as_deref(),
+        );
+        let capability_duration_ms = payload
+            .get("duration_ms")
+            .or_else(|| payload.get("elapsed_ms"))
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                execution_duration_ms(
+                    capability_started_at.as_deref(),
+                    capability_finished_at.as_deref(),
+                )
+            });
 
         if let Some(stage_id) = stage_execution_id.clone() {
-            if recent_stage_executions.len() < 4 && seen_stages.insert(stage_id.clone()) {
-                recent_stage_executions.push(json!({
-                    "stage_execution_id": stage_id,
-                    "step_id": step_id,
-                    "status": event_state(&level, &kind, &message),
-                    "level": level,
-                    "kind": kind,
-                    "message": message,
-                    "created_at": created_at
-                }));
+            let stage_projection = json!({
+                "stage_execution_id": stage_id,
+                "step_id": step_id,
+                "status": event_state(&level, &kind, &message),
+                "level": level,
+                "kind": kind,
+                "message": message,
+                "created_at": created_at,
+                "started_at": stage_started_at,
+                "finished_at": stage_finished_at,
+                "duration_ms": stage_duration_ms
+            });
+
+            if is_header_event != 0 {
+                if recent_stage_executions.len() < execution_event_limit
+                    && seen_stages.insert(stage_id.clone())
+                {
+                    recent_stage_executions.push(stage_projection);
+                }
+            } else if !stage_execution_fallbacks
+                .iter()
+                .any(|(fallback_stage_id, _)| fallback_stage_id == &stage_id)
+            {
+                stage_execution_fallbacks.push((stage_id, stage_projection));
             }
         }
 
-        if current_stage_recent_capabilities.len() < 16 && current_step_id.as_deref() == step_id.as_deref() {
+        let is_current_stage = match (
+            current_stage_execution_id.as_deref(),
+            stage_execution_id.as_deref(),
+        ) {
+            (Some(current_stage_id), Some(event_stage_id)) => current_stage_id == event_stage_id,
+            _ => false,
+        };
+
+        if is_current_stage
+            && current_stage_recent_capabilities.len() < execution_event_limit
+        {
             if let Some(capability_id) = capability_invocation_id.clone() {
-                current_stage_recent_capabilities.push(json!({
-                    "capability_invocation_id": capability_id,
-                    "parent_invocation_id": parent_invocation_id,
-                    "capability": payload.get("capability").and_then(Value::as_str).unwrap_or("capability"),
-                    "status": event_state(&level, &kind, &message),
-                    "level": level,
-                    "kind": kind,
-                    "message": message,
-                    "created_at": created_at
-                }));
+                if seen_capabilities.insert(capability_id.clone()) {
+                    current_stage_recent_capabilities.push(json!({
+                        "capability_invocation_id": capability_id,
+                        "parent_invocation_id": parent_invocation_id,
+                        "stage_execution_id": stage_execution_id,
+                        "step_id": step_id,
+                        "capability": payload.get("capability").and_then(Value::as_str).unwrap_or("capability"),
+                        "status": event_state(&level, &kind, &message),
+                        "level": level,
+                        "kind": kind,
+                        "message": message,
+                        "created_at": created_at,
+                        "started_at": capability_started_at,
+                        "finished_at": capability_finished_at,
+                        "duration_ms": capability_duration_ms
+                    }));
+                }
             }
+        }
+    }
+
+    for (stage_id, fallback) in stage_execution_fallbacks {
+        if recent_stage_executions.len() >= execution_event_limit {
+            break;
+        }
+
+        if seen_stages.insert(stage_id) {
+            recent_stage_executions.push(fallback);
         }
     }
 
@@ -822,7 +967,8 @@ async fn workflow_telemetry(state: &AppState, workflow_run_id: &str) -> anyhow::
         "stage_template": stage_template,
         "stage_template_error": stage_template_error,
         "recent_stage_executions": recent_stage_executions,
-        "current_stage_recent_capabilities": current_stage_recent_capabilities
+        "current_stage_recent_capabilities": current_stage_recent_capabilities,
+        "execution_event_limit": execution_event_limit
     }))
 }
 
@@ -1073,15 +1219,46 @@ fn integration_state(status: &str) -> String {
 }
 
 fn event_state(level: &str, kind: &str, message: &str) -> String {
-    let haystack = format!("{} {} {}", level, kind, message).to_ascii_lowercase();
+    let normalized_kind = kind.trim().to_ascii_lowercase();
+    let normalized_level = level.trim().to_ascii_lowercase();
+
+    if normalized_kind.ends_with("_failed")
+        || normalized_kind.ends_with("_error")
+        || normalized_level == "error"
+    {
+        return "failed".to_string();
+    }
+
+    if normalized_kind.ends_with("_completed")
+        || normalized_kind.ends_with("_complete")
+        || normalized_kind.ends_with("_succeeded")
+        || normalized_kind.ends_with("_success")
+    {
+        return "success".to_string();
+    }
+
+    if normalized_kind.ends_with("_started")
+        || normalized_kind.ends_with("_running")
+    {
+        return "running".to_string();
+    }
+
+    if normalized_kind.contains("waiting")
+        || normalized_kind.contains("checkpoint_required")
+        || normalized_kind.contains("input_required")
+    {
+        return "waiting_user".to_string();
+    }
+
+    let haystack = format!("{} {}", level, message).to_ascii_lowercase();
     if haystack.contains("fail") || haystack.contains("error") {
         "failed".to_string()
-    } else if haystack.contains("wait") || haystack.contains("pause") || haystack.contains("input") {
-        "waiting_user".to_string()
     } else if haystack.contains("success") || haystack.contains("complete") {
         "success".to_string()
     } else if haystack.contains("start") || haystack.contains("running") {
         "running".to_string()
+    } else if haystack.contains("wait") || haystack.contains("pause") {
+        "waiting_user".to_string()
     } else {
         "event".to_string()
     }

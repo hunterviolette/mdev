@@ -9,7 +9,8 @@ const rl = readline.createInterface({
 });
 
 const manager = new SessionManager();
-
+const sessionQueues = new Map<string, Promise<void>>();
+let stdoutQueue = Promise.resolve();
 let shuttingDown = false;
 
 async function shutdown(code = 0) {
@@ -20,14 +21,25 @@ async function shutdown(code = 0) {
   shuttingDown = true;
 
   try {
+    await Promise.allSettled([...sessionQueues.values()]);
     await manager.closeAllSessions();
+    await stdoutQueue;
   } finally {
     process.exit(code);
   }
 }
 
 function writeResponse(resp: BridgeResponse) {
-  process.stdout.write(JSON.stringify(resp) + '\n');
+  stdoutQueue = stdoutQueue.then(() => new Promise<void>((resolve, reject) => {
+    process.stdout.write(`${JSON.stringify(resp)}\n`, err => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+  }));
+  return stdoutQueue;
 }
 
 async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
@@ -87,7 +99,45 @@ async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
   }
 }
 
-rl.on('line', async (line) => {
+function commandSessionId(cmd: BridgeCommand) {
+  return 'session_id' in cmd && typeof cmd.session_id === 'string' && cmd.session_id.trim()
+    ? cmd.session_id
+    : undefined;
+}
+
+function dispatchCommand(cmd: BridgeCommand) {
+  const sessionId = commandSessionId(cmd);
+  const run = async () => {
+    try {
+      await writeResponse(await handleCommand(cmd));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await writeResponse({
+        id: cmd.id,
+        ok: false,
+        cmd: cmd.cmd,
+        session_id: sessionId,
+        error: message
+      });
+    }
+  };
+
+  if (!sessionId) {
+    void run();
+    return;
+  }
+
+  const previous = sessionQueues.get(sessionId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(run);
+  sessionQueues.set(sessionId, current);
+  void current.finally(() => {
+    if (sessionQueues.get(sessionId) === current) {
+      sessionQueues.delete(sessionId);
+    }
+  });
+}
+
+rl.on('line', line => {
   const trimmed = line.trim();
   if (!trimmed) {
     return;
@@ -97,11 +147,10 @@ rl.on('line', async (line) => {
 
   try {
     parsed = JSON.parse(trimmed) as BridgeCommand;
-    const resp = await handleCommand(parsed);
-    writeResponse(resp);
+    dispatchCommand(parsed);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    writeResponse({
+    void writeResponse({
       id: parsed?.id ?? 'unknown',
       ok: false,
       cmd: parsed?.cmd,

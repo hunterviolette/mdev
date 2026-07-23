@@ -847,8 +847,21 @@ export function getStageExecutionChain(runId: string, stepId: string, stageExecu
   );
 }
 
-export function openEventStream(runId: string, afterSequence = 0): EventSource {
-  return new EventSource(`/api/workflow-runs/${runId}/events/stream?after_sequence=${afterSequence}`);
+export function openEventStream(
+  runId: string,
+  options: { afterSequence?: number; liveOnly?: boolean } = {}
+): EventSource {
+  const params = new URLSearchParams();
+  if (typeof options.afterSequence === 'number') {
+    params.set('after_sequence', String(options.afterSequence));
+  }
+  if (options.liveOnly) {
+    params.set('live_only', 'true');
+  }
+  const query = params.toString();
+  return new EventSource(
+    `/api/workflow-runs/${runId}/events/stream${query ? `?${query}` : ''}`
+  );
 }
 
 function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
@@ -882,8 +895,22 @@ export function sendRunAction(runId: string, body: { action: string; step_id?: s
   });
 }
 
-export function startWorkflowRun(runId: string) {
-  return sendRunAction(runId, { action: 'start_run' });
+export function startWorkflowRun(
+  runId: string,
+  stepId?: string | null,
+  userInput?: string,
+  clientId?: string
+) {
+  return sendRunAction(runId, {
+    action: 'start_run',
+    step_id: stepId ?? undefined,
+    payload: typeof userInput === 'string'
+      ? {
+          user_input: userInput,
+          ...(clientId ? { client_id: clientId } : {})
+        }
+      : undefined
+  });
 }
 
 export function prepareWorkflowStage(runId: string, stepId?: string | null) {
@@ -918,6 +945,16 @@ export function runCurrentWorkflowStep(
   });
 }
 
+export function restartWorkflowStage(
+  runId: string,
+  stepId?: string | null
+) {
+  return sendRunAction(runId, {
+    action: 'restart_stage',
+    step_id: stepId ?? undefined
+  });
+}
+
 export function resolveWorkflowOperatorCheckpoint(runId: string, disposition: string, selectedStepId?: string | null) {
   return sendRunAction(runId, {
     action: 'resolve_operator_checkpoint',
@@ -942,6 +979,36 @@ export function previousWorkflowStep(runId: string) {
 
 export function patchWorkflowStageState(runId: string, stepId: string, payload: Record<string, unknown>) {
   return sendRunAction(runId, { action: 'patch_stage_state', step_id: stepId, payload });
+}
+
+export function getWorkflowStageUserInput(runId: string, stepId: string) {
+  return sendRunAction(runId, {
+    action: 'get_transient_stage_user_input',
+    step_id: stepId,
+    payload: {},
+  }) as Promise<{ ok: boolean; run_id: string; step_id: string; text: string }>;
+}
+
+export function patchWorkflowStageUserInput(
+  runId: string,
+  stepId: string,
+  text: string,
+  clientId?: string
+) {
+  return sendRunAction(runId, {
+    action: 'patch_transient_stage_user_input',
+    step_id: stepId,
+    payload: {
+      text,
+      ...(clientId ? { client_id: clientId } : {})
+    },
+  }) as Promise<{
+    ok: boolean;
+    run_id: string;
+    step_id: string;
+    text: string;
+    client_id?: string;
+  }>;
 }
 
 export function patchWorkflowGlobalState(runId: string, payload: Record<string, unknown>) {

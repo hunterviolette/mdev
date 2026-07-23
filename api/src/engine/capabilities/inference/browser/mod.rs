@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use super::{ensure_object_slot, persist_inference_config, session, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
+use super::{ensure_object_slot, persist_inference_config, prompting::ModelInput, session, BrowserConfig, BrowserProbeResult, InferenceConfig, InferenceTransport};
 use super::super::registry::{find_result, CapabilityContext, CapabilityResult};
 use crate::engine::capabilities::{binding_specs, context_export};
 
@@ -312,13 +312,10 @@ fn apply_app_browser_defaults(inference_cfg: &mut InferenceConfig, app_settings:
     }
 }
 
-pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityResult]) -> Result<serde_json::Value> {
-    let prompt = ctx
-        .local_state
-        .get("composed_prompt")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
+pub async fn execute(
+    ctx: &CapabilityContext<'_>,
+    input: &ModelInput,
+) -> Result<serde_json::Value> {
 
     let resolved_session = session::resolve_inference_session(ctx).await?;
     let mut inference_cfg = resolved_session.config;
@@ -344,24 +341,100 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         reset_session_scoped_shared_capability_lifecycle_on_new_browser_session(ctx).await?;
     }
 
-    let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
-    let should_open_target = if target_url.is_empty() {
-        false
-    } else {
-        match current_probe.as_ref() {
-            Some(probe) => !probe.page_open || probe.url != target_url,
-            None => true,
+    let inline_repo_context = repo_context_inline_prompt_enabled(ctx);
+    let pasted_context_text = if inline_repo_context {
+        match repo_context_payload(ctx) {
+            Some(payload) => Some(context_export::render_context_export_text(payload)?),
+            None => None,
         }
+    } else {
+        None
     };
+    let attachment_paths = input
+        .attachments
+        .iter()
+        .map(|attachment| attachment.path.clone())
+        .collect::<Vec<_>>();
+    let input_text = input.text.clone();
+    let blocking_target_url = target_url.clone();
+    let blocking_session_id = session_id.clone();
 
-    if should_open_target {
-        adapter::open_url(&mut inference_cfg.browser, &target_url)?;
-    }
+    let blocking_result = tokio::task::spawn_blocking(move || -> Result<_> {
+        let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
+        let should_open_target = if blocking_target_url.is_empty() {
+            false
+        } else {
+            match current_probe.as_ref() {
+                Some(probe) => !probe.page_open || probe.url != blocking_target_url,
+                None => true,
+            }
+        };
 
-    let readiness_target_url = inference_cfg.browser.target_url.trim().to_string();
-    let readiness_probe = wait_for_browser_chat_ready(&mut inference_cfg.browser, &readiness_target_url)?;
-    if !readiness_probe.ready || !browser_probe_url_matches(&readiness_probe.url, &readiness_target_url) {
-        persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
+        if should_open_target {
+            adapter::open_url(&mut inference_cfg.browser, &blocking_target_url)?;
+        }
+
+        let readiness_target_url = inference_cfg.browser.target_url.trim().to_string();
+        let readiness_probe =
+            wait_for_browser_chat_ready(&mut inference_cfg.browser, &readiness_target_url)?;
+
+        if !readiness_probe.ready
+            || !browser_probe_url_matches(&readiness_probe.url, &readiness_target_url)
+        {
+            return Ok((
+                inference_cfg,
+                Some(readiness_probe),
+                None,
+                Vec::<String>::new(),
+            ));
+        }
+
+        let pasted_context_enabled = pasted_context_text.is_some();
+        let mut uploaded_files = Vec::new();
+
+        if !pasted_context_enabled {
+            for attachment_path in attachment_paths {
+                if attachment_path.exists() {
+                    adapter::upload_file(
+                        &mut inference_cfg.browser,
+                        attachment_path.as_path(),
+                    )?;
+                    uploaded_files.push(attachment_path.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        let result = adapter::send_chat_and_wait_with_pasted_context(
+            &mut inference_cfg.browser,
+            input_text.as_str(),
+            pasted_context_text.as_deref(),
+        )?;
+
+        let probe = match adapter::probe(&mut inference_cfg.browser) {
+            Ok(probe) => probe,
+            Err(_) => BrowserProbeResult {
+                session_id: blocking_session_id,
+                browser_connected: true,
+                page_open: !blocking_target_url.is_empty(),
+                url: blocking_target_url,
+                profile: inference_cfg.browser.profile.clone(),
+                chat_input_found: false,
+                chat_input_visible: false,
+                chat_submit_found: false,
+                ready: false,
+            },
+        };
+
+        Ok((inference_cfg, None, Some((result, probe)), uploaded_files))
+    })
+    .await
+    .map_err(|error| anyhow!("Browser bridge blocking task failed: {}", error))??;
+
+    let (mut inference_cfg, readiness_failure, completed, uploaded_files) = blocking_result;
+    persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
+
+    if let Some(readiness_probe) = readiness_failure {
+        let readiness_target_url = inference_cfg.browser.target_url.trim().to_string();
         return Ok(json!({
             "transport": "browser",
             "text": "",
@@ -380,52 +453,8 @@ pub async fn execute(ctx: &CapabilityContext<'_>, prior_results: &[CapabilityRes
         }));
     }
 
-    let inline_repo_context = repo_context_inline_prompt_enabled(ctx);
-    let pasted_context_text = if inline_repo_context {
-        match repo_context_payload(ctx) {
-            Some(payload) => Some(context_export::render_context_export_text(payload)?),
-            None => None,
-        }
-    } else {
-        None
-    };
-    let pasted_context_enabled = pasted_context_text.is_some();
-
-    let upload_paths = if pasted_context_enabled {
-        Vec::new()
-    } else {
-        dependency_upload_paths(ctx, prior_results)?
-    };
-    let mut uploaded_files = Vec::new();
-
-    for upload_path in upload_paths.iter() {
-        if upload_path.exists() {
-            adapter::upload_file(&mut inference_cfg.browser, upload_path.as_path())?;
-            uploaded_files.push(upload_path.to_string_lossy().to_string());
-        }
-    }
-
-    let result = adapter::send_chat_and_wait_with_pasted_context(
-        &mut inference_cfg.browser,
-        &prompt,
-        pasted_context_text.as_deref(),
-    )?;
-    persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
-
-    let probe = match adapter::probe(&mut inference_cfg.browser) {
-        Ok(probe) => probe,
-        Err(_) => BrowserProbeResult {
-            session_id,
-            browser_connected: true,
-            page_open: !target_url.is_empty(),
-            url: target_url,
-            profile: inference_cfg.browser.profile.clone(),
-            chat_input_found: false,
-            chat_input_visible: false,
-            chat_submit_found: false,
-            ready: false,
-        },
-    };
+    let (result, probe) = completed
+        .ok_or_else(|| anyhow!("Browser bridge blocking task returned no result"))?;
 
     let bridge_result = serde_json::from_str::<Value>(&result.text).unwrap_or_else(|_| json!({
         "ok": true,

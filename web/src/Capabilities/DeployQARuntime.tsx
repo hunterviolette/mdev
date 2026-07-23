@@ -14,17 +14,13 @@ import {
 } from '@mantine/core';
 import {
   IconExternalLink,
-  IconPlayerPlay,
-  IconRefresh,
   IconRotateClockwise,
-  IconSquare,
   IconTerminal2,
 } from '@tabler/icons-react';
 
 import {
   getRuntimeProcesses,
-  runCurrentWorkflowStep,
-  terminateRuntimeDeployment,
+  restartWorkflowStage,
   type QaServiceSpec,
   type RuntimeProcessRecord,
   type WorkflowStepDefinition,
@@ -40,7 +36,6 @@ const ACTIVE_STATUSES = new Set([
 export type DeployQARuntimeProps = {
   runId: string | null;
   step: WorkflowStepDefinition;
-  services?: QaServiceSpec[];
   disabled?: boolean;
 };
 
@@ -73,23 +68,17 @@ function serviceUrl(
 export function DeployQARuntime({
   runId,
   step,
-  services,
   disabled = false,
 }: DeployQARuntimeProps) {
   const [processes, setProcesses] = useState<RuntimeProcessRecord[]>([]);
   const [logExecutionId, setLogExecutionId] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'start' | 'stop' | 'restart' | ''>('');
-  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<'restart' | ''>('');
   const [error, setError] = useState('');
 
-  const refresh = useCallback(async (showLoading = false) => {
+  const refresh = useCallback(async () => {
     if (!runId) {
       setProcesses([]);
       return;
-    }
-
-    if (showLoading) {
-      setLoading(true);
     }
 
     try {
@@ -110,20 +99,16 @@ export function DeployQARuntime({
       setError(
         nextError instanceof Error ? nextError.message : String(nextError)
       );
-    } finally {
-      if (showLoading) {
-        setLoading(false);
-      }
     }
   }, [runId, step.id]);
 
   useEffect(() => {
-    void refresh(true);
+    void refresh();
 
     if (!runId) return;
 
     const timer = window.setInterval(() => {
-      void refresh(false);
+      void refresh();
     }, 1500);
 
     return () => window.clearInterval(timer);
@@ -170,40 +155,32 @@ export function DeployQARuntime({
   }, [processes]);
 
   const qaServices = useMemo<QaServiceSpec[]>(() => {
-    if (Array.isArray(services) && services.length > 0) {
-      return services;
-    }
-
-    if (serviceProcesses.length > 0) {
-      return serviceProcesses.map((process, index): QaServiceSpec => ({
-        id: process.owner.service_id || `service-${index + 1}`,
-        label: process.owner.service_id || process.label || `Service ${index + 1}`,
-        command: {
-          id: process.command_id,
-          label: process.label,
-          command: process.command,
-          arguments: [],
-          working_directory: process.working_directory,
-          environment: process.environment ?? {},
-          shell: 'system',
-          mode: 'service',
-          timeout_seconds: null,
-          continue_on_error: false,
-        },
-        port: {
-          environment_variable: 'PORT',
-          preferred: null,
-        },
-        readiness: {},
-        public: Boolean(
-          process.environment?.MDEV_QA_PUBLIC_URL
-          ?? process.environment?.SERVICE_PUBLIC_URL
-        ),
-      }));
-    }
-
-    return step.execution.qa?.environment.services ?? [];
-  }, [services, serviceProcesses, step.execution.qa]);
+    return serviceProcesses.map((process, index): QaServiceSpec => ({
+      id: process.owner.service_id || `service-${index + 1}`,
+      label: process.owner.service_id || process.label || `Service ${index + 1}`,
+      command: {
+        id: process.command_id,
+        label: process.label,
+        command: process.command,
+        arguments: process.arguments ?? [],
+        working_directory: process.working_directory,
+        environment: process.environment ?? {},
+        shell: 'system',
+        mode: 'service',
+        timeout_seconds: null,
+        continue_on_error: false,
+      },
+      port: {
+        environment_variable: 'PORT',
+        preferred: null,
+      },
+      readiness: {},
+      public: Boolean(
+        process.environment?.MDEV_QA_PUBLIC_URL
+        ?? process.environment?.SERVICE_PUBLIC_URL
+      ),
+    }));
+  }, [serviceProcesses]);
 
   const prepareProcesses = useMemo(
     () =>
@@ -229,58 +206,12 @@ export function DeployQARuntime({
         ? 'STOPPED'
         : 'NOT STARTED';
 
-  async function start() {
-    if (!runId) return;
-
-    setBusy('start');
-    try {
-      const deployment = runCurrentWorkflowStep(runId, step.id, {
-        prompt: { user_input: '' },
-      });
-
-      window.setTimeout(() => {
-        setBusy((current) => current === 'start' ? '' : current);
-        void refresh();
-      }, 1500);
-
-      await deployment;
-      await refresh();
-      setError('');
-    } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : String(nextError)
-      );
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function stop(force = false) {
-    if (!runId) return;
-
-    setBusy('stop');
-    try {
-      await terminateRuntimeDeployment(runId, step.id, force);
-      await refresh();
-      setError('');
-    } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : String(nextError)
-      );
-    } finally {
-      setBusy('');
-    }
-  }
-
   async function restart() {
     if (!runId) return;
 
     setBusy('restart');
     try {
-      await terminateRuntimeDeployment(runId, step.id, true);
-      const deployment = runCurrentWorkflowStep(runId, step.id, {
-        prompt: { user_input: '' },
-      });
+      const deployment = restartWorkflowStage(runId, step.id);
       window.setTimeout(() => {
         setBusy((current) => current === 'restart' ? '' : current);
         void refresh();
@@ -351,54 +282,25 @@ export function DeployQARuntime({
             </Text>
           </Stack>
 
-          <Button
-            size="compact-xs"
-            variant="subtle"
-            leftSection={<IconRefresh size={14} />}
-            loading={loading}
-            onClick={() => void refresh(true)}
-          >
-            Refresh
-          </Button>
+
         </Group>
 
         {error ? <Alert color="red">{error}</Alert> : null}
 
-        <Group gap="xs">
-          <Button
-            size="xs"
-            color="green"
-            leftSection={<IconPlayerPlay size={15} />}
-            disabled={disabled || !runId || active}
-            loading={busy === 'start'}
-            onClick={() => void start()}
-          >
-            Start
-          </Button>
-
-          <Button
-            size="xs"
-            color="orange"
-            variant="light"
-            leftSection={<IconSquare size={15} />}
-            disabled={!runId || !active || busy !== ''}
-            loading={busy === 'stop'}
-            onClick={() => void stop(false)}
-          >
-            Stop
-          </Button>
-
-          <Button
-            size="xs"
-            variant="light"
-            leftSection={<IconRotateClockwise size={15} />}
-            disabled={disabled || !runId || busy !== ''}
-            loading={busy === 'restart'}
-            onClick={() => void restart()}
-          >
-            Restart
-          </Button>
-        </Group>
+        {active ? (
+          <Group gap="xs">
+            <Button
+              size="xs"
+              variant="light"
+              leftSection={<IconRotateClockwise size={15} />}
+              disabled={disabled || !runId || busy !== ''}
+              loading={busy === 'restart'}
+              onClick={() => void restart()}
+            >
+              Restart
+            </Button>
+          </Group>
+        ) : null}
 
         {qaServices.map((service, index) => {
           const serviceRecord = service as unknown as Record<string, unknown>;

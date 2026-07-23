@@ -10,9 +10,7 @@ use crate::{
 };
 
 use super::{
-    activate_next_prompt_fragments_for_stage,
     append_engine_event,
-    clear_active_prompt_fragments_for_stage,
     event_meta,
     current_step,
     ensure_engine_root,
@@ -22,7 +20,64 @@ use super::{
     set_run_status,
 };
 use super::stages::{execute_stage, StageDisposition};
-use super::transitions::{next_step_id, resolve_next_target, should_auto_advance};
+use super::transitions::{next_step_id, resolve_next_target, should_auto_advance, transition_to_step};
+
+pub async fn patch_transient_stage_user_input(
+    state: &AppState,
+    run_id: Uuid,
+    step_id: &str,
+    payload: Value,
+) -> Result<Value> {
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("payload.text must be a string"))?
+        .to_string();
+    let client_id = payload
+        .get("client_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    state
+        .orchestration_inputs
+        .set_user_instruction(run_id, step_id, text.clone());
+
+    append_engine_event(
+        state,
+        run_id,
+        Some(step_id),
+        "info",
+        "transient_stage_user_input_patched",
+        "Transient stage user input updated",
+        json!({
+            "text": text,
+            "client_id": client_id
+        }),
+    )
+    .await?;
+
+    Ok(json!({
+        "ok": true,
+        "run_id": run_id,
+        "step_id": step_id,
+        "text": text,
+        "client_id": client_id
+    }))
+}
+
+pub fn get_transient_stage_user_input(
+    state: &AppState,
+    run_id: Uuid,
+    step_id: &str,
+) -> Value {
+    json!({
+        "ok": true,
+        "run_id": run_id,
+        "step_id": step_id,
+        "text": state.orchestration_inputs.user_instruction(run_id, step_id)
+    })
+}
 
 fn run_status_label(status: &RunStatus) -> &'static str {
     match status {
@@ -31,7 +86,7 @@ fn run_status_label(status: &RunStatus) -> &'static str {
         RunStatus::Running => "running",
         RunStatus::Waiting => "waiting",
         RunStatus::Paused => "paused",
-        RunStatus::Success => "success",
+        RunStatus::Success => "complete",
         RunStatus::Error => "error",
         RunStatus::Cancelled => "cancelled",
     }
@@ -82,6 +137,38 @@ fn clear_user_control_block(run: &mut super::WorkflowRun) {
             run_state.remove("blocked_on");
         }
     }
+}
+
+async fn run_stage_exit_hook_if_transitioning(
+    state: &AppState,
+    run_id: Uuid,
+    definition: &crate::models::WorkflowTemplateDefinition,
+    previous_step_id: Option<&str>,
+    next_step_id: Option<&str>,
+) -> Result<()> {
+    if previous_step_id == next_step_id {
+        return Ok(());
+    }
+
+    let Some(previous_step_id) = previous_step_id else {
+        return Ok(());
+    };
+
+    let Some(previous_step) = definition
+        .steps
+        .iter()
+        .find(|step| step.id == previous_step_id)
+    else {
+        return Ok(());
+    };
+
+    super::stages::invoke_stage_exit_hook(
+        state,
+        run_id,
+        previous_step,
+        next_step_id,
+    )
+    .await
 }
 
 pub async fn start_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
@@ -371,6 +458,11 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         .and_then(Value::as_str)
         .unwrap_or("manual")
         .to_string();
+    let checkpoint_phase = blocked_on
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("after_stage")
+        .to_string();
     let stage_execution_id = match blocked_on
         .get("stage_execution_id")
         .and_then(Value::as_str)
@@ -434,22 +526,41 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 "stage_id": stage_id,
                 "disposition": normalized_disposition
             },
-            "event_meta": event_meta(stage_execution_id.as_deref(), capability_invocation_id.as_deref(), None, true)
+            "event_meta": event_meta(stage_execution_id.as_deref(), capability_invocation_id.as_deref(), None, false)
         }),
     ).await?;
 
     match normalized_disposition {
         "pause_error" => {
+            if checkpoint_phase != "before_stage" {
+                let definition = load_template_definition(state, &run)
+                    .await?
+                    .ok_or_else(|| anyhow!("run has no template definition"))?;
+                run_stage_exit_hook_if_transitioning(
+                    state,
+                    run_id,
+                    &definition,
+                    Some(stage_id.as_str()),
+                    None,
+                )
+                .await?;
+            }
+
             append_disposition_stage_completion_event(
                 state,
                 run_id,
                 stage_id.as_str(),
                 stage_execution_id.as_deref(),
-                false,
-                "pause_error",
-                "Stage paused by operator checkpoint.",
+                true,
+                "paused",
+                if checkpoint_phase == "before_stage" {
+                    "Stage paused before execution by operator checkpoint."
+                } else {
+                    "Stage paused by operator checkpoint."
+                },
                 None,
-            ).await?;
+            )
+            .await?;
 
             set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
             append_engine_event(
@@ -459,20 +570,30 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 "info",
                 "operator_checkpoint_resolved",
                 "Operator paused workflow at checkpoint.",
-                json!({ "disposition": "pause_error", "stage_id": stage_id }),
-            ).await?;
+                json!({
+                    "disposition": "pause_error",
+                    "stage_id": stage_id,
+                    "phase": checkpoint_phase,
+                    "status": "paused"
+                }),
+            )
+            .await?;
+
             Ok(json!({
                 "ok": true,
                 "status": "paused",
                 "disposition": "pause_error",
                 "current_step_id": stage_id,
-                "followup_action": "pause"
+                "followup_action": "pause",
+                "continue_workflow": false
             }))
         }
         "continue_auto" | "select_stage" => {
             let definition = load_template_definition(state, &run).await?
                 .ok_or_else(|| anyhow!("run has no template definition"))?;
-            let target = if normalized_disposition == "select_stage" {
+            let target = if checkpoint_phase == "before_stage" {
+                Some(stage_id.clone())
+            } else if normalized_disposition == "select_stage" {
                 selected_step_id
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_string)
@@ -499,7 +620,7 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                     stage_id.as_str(),
                     stage_execution_id.as_deref(),
                     true,
-                    "success",
+                    "complete",
                     "Final workflow stage completed successfully after disposition review.",
                     None,
                 ).await?;
@@ -508,7 +629,7 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
                 return Ok(json!({
                     "ok": true,
-                    "status": "success",
+                    "status": "complete",
                     "disposition": normalized_disposition,
                     "current_step_id": stage_id,
                     "next_step_id": Value::Null,
@@ -518,6 +639,63 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
 
             let target = target.expect("target checked above");
             let target_step = current_step(&definition, &run, Some(target.as_str()))?.clone();
+
+            if checkpoint_phase == "before_stage" {
+                crate::engine::stages::record_stage_checkpoint_continue(
+                    &mut run,
+                    &target_step,
+                    checkpoint_phase.as_str(),
+                )?;
+                persist_context(state, run_id, &run.context).await?;
+
+                append_disposition_stage_completion_event(
+                    state,
+                    run_id,
+                    stage_id.as_str(),
+                    stage_execution_id.as_deref(),
+                    true,
+                    "continue_auto",
+                    "QA entry checkpoint approved.",
+                    Some(stage_id.as_str()),
+                )
+                .await?;
+
+                set_current_step_waiting(state, run_id, stage_id.as_str()).await?;
+                append_engine_event(
+                    state,
+                    run_id,
+                    Some(stage_id.as_str()),
+                    "info",
+                    "operator_checkpoint_resolved",
+                    "Operator approved starting the QA stage.",
+                    json!({
+                        "disposition": normalized_disposition,
+                        "stage_id": stage_id,
+                        "next_step_id": stage_id,
+                        "phase": "before_stage"
+                    }),
+                )
+                .await?;
+
+                return continue_from_disposition_transition(
+                    state,
+                    run_id,
+                    stage_id.as_str(),
+                    "autonomous",
+                    &target_step,
+                )
+                .await;
+            }
+
+            let source_step = current_step(&definition, &run, Some(stage_id.as_str()))?.clone();
+            run_stage_exit_hook_if_transitioning(
+                state,
+                run_id,
+                &definition,
+                Some(source_step.id.as_str()),
+                Some(target.as_str()),
+            )
+            .await?;
             append_engine_event(
                 state,
                 run_id,
@@ -703,9 +881,15 @@ async fn prepare_stage_for_execution(
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run).await?
         .ok_or_else(|| anyhow!("run has no template definition"))?;
-    let step = current_step(&definition, &run, requested_step_id)?.clone();
-
-    run.current_step_id = Some(step.id.clone());
+    let target_step_id = current_step(&definition, &run, requested_step_id)?.id.clone();
+    let step = transition_to_step(
+        state,
+        run_id,
+        &mut run,
+        &definition,
+        target_step_id.as_str(),
+    )
+    .await?;
 
     let decisions = governance::before_stage(state, run_id, &mut run, &step).await?;
     governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
@@ -832,6 +1016,65 @@ pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<
     }
 
     run_stages(state, run_id, requested_step_id, RunMode::Manual).await
+}
+
+pub async fn restart_stage(
+    state: &AppState,
+    run_id: Uuid,
+    requested_step_id: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut run = load_run(state, run_id).await?;
+    let definition = load_template_definition(state, &run)
+        .await?
+        .ok_or_else(|| anyhow!("run has no template definition"))?;
+    let step = current_step(&definition, &run, requested_step_id)?.clone();
+
+    let blocked_checkpoint = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .filter(|blocked| {
+            blocked.get("kind").and_then(Value::as_str)
+                == Some("operator_checkpoint")
+                && blocked.get("stage_id").and_then(Value::as_str)
+                    == Some(step.id.as_str())
+                && blocked.get("phase").and_then(Value::as_str)
+                    == Some("after_stage")
+        })
+        .is_some();
+
+    if run_is_waiting_on_operator_checkpoint(&run) && !blocked_checkpoint {
+        return Ok(json!({
+            "ok": false,
+            "status": "waiting",
+            "blocked_on": "operator_checkpoint",
+            "current_step_id": run.current_step_id,
+            "message": "The active operator checkpoint does not belong to this stage runtime."
+        }));
+    }
+
+    if blocked_checkpoint {
+        clear_pending_disposition_review(&mut run);
+        persist_context(state, run_id, &run.context).await?;
+    }
+
+    super::stages::invoke_stage_restart_hook(state, run_id, &step).await?;
+    set_run_status(
+        state,
+        run_id,
+        RunStatus::Waiting,
+        Some(step.id.as_str()),
+    )
+    .await?;
+
+    run_stages(
+        state,
+        run_id,
+        Some(step.id.as_str()),
+        RunMode::Manual,
+    )
+    .await
 }
 
 async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>) -> Result<serde_json::Value> {
@@ -1044,6 +1287,7 @@ fn set_pending_disposition_review(
         "stage_type": step.step_type,
         "stage_execution_id": stage_execution_id,
         "capability_invocation_id": checkpoint.get("_capability_invocation_id").and_then(Value::as_str).unwrap_or(""),
+        "phase": checkpoint.get("phase").and_then(Value::as_str).unwrap_or("after_stage"),
         "recommended_disposition": checkpoint
             .get("recommended_disposition")
             .and_then(Value::as_str)
@@ -1133,11 +1377,15 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }));
         }
 
-        activate_next_prompt_fragments_for_stage(&mut run);
         let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
-        clear_active_prompt_fragments_for_stage(&mut run);
-        state.replace_transient_prompt_fragments(
+        let next_target = resolve_next_target(&definition, &step, &outcome);
+        let generated_input_step_id = next_target
+            .as_deref()
+            .unwrap_or(step.id.as_str());
+
+        state.orchestration_inputs.replace_stage_generated(
             run_id,
+            generated_input_step_id,
             outcome.transient_prompt_fragments.clone(),
         );
 
@@ -1146,7 +1394,6 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             let mut cancelled_run = latest_run;
             clear_run_cancel_requested(&mut cancelled_run);
             clear_pending_disposition_review(&mut cancelled_run);
-            clear_active_prompt_fragments_for_stage(&mut cancelled_run);
             persist_context(state, run_id, &cancelled_run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
             append_engine_event(
@@ -1187,7 +1434,6 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
 
         if pending_disposition_review {
             clear_pending_disposition_review(&mut run);
-            let next_target = resolve_next_target(&definition, &step, &outcome);
             let disposition_resume_mode = if automatic { "autonomous" } else { "manual" };
             set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode, state.process_session_id());
             persist_context(state, run_id, &run.context).await?;
@@ -1237,7 +1483,6 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         ).await?;
 
         clear_pending_disposition_review(&mut run);
-        let next_target = resolve_next_target(&definition, &step, &outcome);
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
@@ -1294,6 +1539,14 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 | StageDisposition::Stay => RunStatus::Waiting,
             };
             let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
+            run_stage_exit_hook_if_transitioning(
+                state,
+                run_id,
+                &definition,
+                Some(step.id.as_str()),
+                current_step_id,
+            )
+            .await?;
             set_run_status(state, run_id, status.clone(), current_step_id).await?;
 
             return Ok(json!({
@@ -1304,7 +1557,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                     RunStatus::Running => "running",
                     RunStatus::Waiting => "waiting",
                     RunStatus::Paused => "paused",
-                    RunStatus::Success => "success",
+                    RunStatus::Success => "complete",
                     RunStatus::Error => "error",
                     RunStatus::Cancelled => "cancelled",
                 },
@@ -1316,6 +1569,15 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 "local_state": outcome.local_state,
             }));
         }
+
+        run_stage_exit_hook_if_transitioning(
+            state,
+            run_id,
+            &definition,
+            Some(step.id.as_str()),
+            next_target.as_deref(),
+        )
+        .await?;
 
         match (&outcome.disposition, next_target.clone(), auto_advance) {
             (StageDisposition::Success, Some(target), true) => {
@@ -1360,7 +1622,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": outcome.ok,
-                    "status": "success",
+                    "status": "complete",
                     "step_id": step.id,
                     "message": outcome.message,
                 }));
@@ -1380,7 +1642,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": true,
-                    "status": "success",
+                    "status": "complete",
                     "step_id": step.id,
                     "message": outcome.message,
                 }));

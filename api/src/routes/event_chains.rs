@@ -87,6 +87,8 @@ struct StreamQuery {
     #[serde(default)]
     after_sequence: Option<i64>,
     #[serde(default)]
+    live_only: bool,
+    #[serde(default)]
     stage: Option<String>,
     #[serde(default)]
     capability: Option<String>,
@@ -858,30 +860,42 @@ async fn stream_events(
     let mut last_sequence = query.after_sequence.unwrap_or(0);
 
     tokio::spawn(async move {
-        let rows = sqlx::query(
-            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
-        )
-        .bind(&run_id_str)
-        .bind(last_sequence)
-        .fetch_all(&state_for_task.db)
-        .await
-        .unwrap_or_default();
+        if query.live_only {
+            last_sequence = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT MAX(sequence_no) FROM workflow_events WHERE run_id = ?"
+            )
+            .bind(&run_id_str)
+            .fetch_one(&state_for_task.db)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0);
+        } else {
+            let rows = sqlx::query(
+                "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
+            )
+            .bind(&run_id_str)
+            .bind(last_sequence)
+            .fetch_all(&state_for_task.db)
+            .await
+            .unwrap_or_default();
 
-        let mut sent_snapshot = false;
-        for row in rows {
-            if let Ok(item) = row_to_stage_chain_event(row) {
-                if !event_matches_history_query(&item, &query) {
+            for row in rows {
+                if let Ok(item) = row_to_stage_chain_event(row) {
+                    if !event_matches_history_query(&item, &query) {
+                        last_sequence = last_sequence.max(item.sequence_no);
+                        continue;
+                    }
                     last_sequence = last_sequence.max(item.sequence_no);
-                    continue;
-                }
-                last_sequence = last_sequence.max(item.sequence_no);
-                if let Some(event) = workflow_event_sse(&item) {
-                    if tx.send(Ok(event)).is_err() {
-                        return;
+                    if let Some(event) = workflow_event_sse(&item) {
+                        if tx.send(Ok(event)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
         }
+
+        let mut sent_snapshot = false;
 
         if let Ok(summary) = build_event_chain_summary(&state_for_task, run_id).await {
             if let Some(event) = monitor_snapshot_sse(&summary) {

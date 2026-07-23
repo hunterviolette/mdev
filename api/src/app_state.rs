@@ -1,5 +1,3 @@
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -7,30 +5,11 @@ use uuid::Uuid;
 use crate::{
     engine::{
         capabilities::terminal_runtime::ProcessRegistry,
+        orchestration_inputs::OrchestrationInputStore,
         workflow_lifecycle::WorkflowCoordinator,
     },
     models::{SprintEventStreamItem, WorkflowEventStreamItem},
 };
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorkflowTransientPromptFragment {
-    ChangesetApplyError { text: String },
-}
-
-impl WorkflowTransientPromptFragment {
-    pub fn text(&self) -> &str {
-        match self {
-            Self::ChangesetApplyError { text } => text,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::ChangesetApplyError { .. } => "changeset_apply_error",
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -40,7 +19,7 @@ pub struct AppState {
     process_session_id: String,
     pub workflow_coordinator: WorkflowCoordinator,
     pub process_registry: ProcessRegistry,
-    transient_prompt_fragments: DashMap<Uuid, Vec<WorkflowTransientPromptFragment>>,
+    pub orchestration_inputs: OrchestrationInputStore,
 }
 
 impl AppState {
@@ -54,7 +33,7 @@ impl AppState {
             process_session_id: Uuid::new_v4().to_string(),
             workflow_coordinator: WorkflowCoordinator::default(),
             process_registry: ProcessRegistry::default(),
-            transient_prompt_fragments: DashMap::new(),
+            orchestration_inputs: OrchestrationInputStore::default(),
         }
     }
 
@@ -72,32 +51,6 @@ impl AppState {
 
     pub fn publish_sprint_event(&self, event: SprintEventStreamItem) {
         let _ = self.sprint_events_tx.send(event);
-    }
-
-    pub fn replace_transient_prompt_fragments(
-        &self,
-        run_id: Uuid,
-        fragments: Vec<WorkflowTransientPromptFragment>,
-    ) {
-        if fragments.is_empty() {
-            self.transient_prompt_fragments.remove(&run_id);
-        } else {
-            self.transient_prompt_fragments.insert(run_id, fragments);
-        }
-    }
-
-    pub fn take_transient_prompt_fragments(
-        &self,
-        run_id: Uuid,
-    ) -> Vec<WorkflowTransientPromptFragment> {
-        self.transient_prompt_fragments
-            .remove(&run_id)
-            .map(|(_, fragments)| fragments)
-            .unwrap_or_default()
-    }
-
-    pub fn clear_transient_prompt_fragments(&self, run_id: Uuid) {
-        self.transient_prompt_fragments.remove(&run_id);
     }
 
     pub fn process_session_id(&self) -> &str {

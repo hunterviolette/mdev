@@ -41,7 +41,7 @@ pub fn after_capability(
         None
     };
 
-    let mut patch = json!({
+    let patch = json!({
         "governance": {
             "compile_failures": {
                 "pause_after_consecutive_failures": pause_after,
@@ -50,16 +50,6 @@ pub fn after_capability(
             }
         }
     });
-
-    if !ok {
-        merge_json_values(&mut patch, &json!({
-            "capabilities": {
-                "inference": {
-                    "repo_context_armed": true
-                }
-            }
-        }));
-    }
 
     Ok(vec![GovernanceDecision::MutateContext {
         mutation: ContextMutation {
@@ -78,15 +68,3 @@ fn governance_value<'a>(run: &'a WorkflowRun, policy_key: &str) -> Option<&'a Va
         .or_else(|| root.get("governance").and_then(|gov| gov.get(policy_key)))
 }
 
-fn merge_json_values(target: &mut Value, patch: &Value) {
-    match (target, patch) {
-        (Value::Object(target), Value::Object(patch)) => {
-            for (key, value) in patch {
-                merge_json_values(target.entry(key.clone()).or_insert(Value::Null), value);
-            }
-        }
-        (target, patch) => {
-            *target = patch.clone();
-        }
-    }
-}

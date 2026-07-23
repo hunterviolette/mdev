@@ -82,6 +82,152 @@ pub struct SupervisorWorkflowArchiveResult {
     pub archived: bool,
 }
 
+pub async fn promise_supervisor_work_unit(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+    root_repo_path: &str,
+    pool_kind: SupervisorPoolKind,
+    work_unit_id: &str,
+    feature_id: Option<&str>,
+    title: &str,
+    template_id: Option<Uuid>,
+    mut work_unit_context: Value,
+    priority: i64,
+    queue_position: Option<i64>,
+) -> Result<()> {
+    if !work_unit_context.is_object() {
+        work_unit_context = json!({});
+    }
+
+    if let Some(obj) = work_unit_context.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            Value::String("queued".to_string()),
+        );
+        obj.insert(
+            "materialization_state".to_string(),
+            Value::String("pending".to_string()),
+        );
+        obj.insert(
+            "workflow_type".to_string(),
+            Value::String(pool_kind.as_str().to_string()),
+        );
+        obj.insert(
+            "pool_key".to_string(),
+            Value::String(pool_kind.as_str().to_string()),
+        );
+        obj.insert(
+            "work_unit_id".to_string(),
+            Value::String(work_unit_id.to_string()),
+        );
+
+        if let Some(feature_id) = feature_id {
+            obj.insert(
+                "feature_id".to_string(),
+                Value::String(feature_id.to_string()),
+            );
+        }
+
+        if let Some(template_id) = template_id {
+            obj.insert(
+                "template_id".to_string(),
+                Value::String(template_id.to_string()),
+            );
+            obj.insert(
+                "planned_workflow_template_id".to_string(),
+                Value::String(template_id.to_string()),
+            );
+        }
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let context_json = serde_json::to_string(&work_unit_context)?;
+    let feature_id = feature_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(work_unit_id);
+
+    sqlx::query(
+        r#"
+        INSERT INTO supervisor_work_units (
+            id,
+            supervisor_run_id,
+            repo_id,
+            feature_id,
+            workflow_run_id,
+            patch_id,
+            kind,
+            title,
+            state,
+            root_repo_path,
+            workspace_path,
+            shard_id,
+            shard_path,
+            integration_path,
+            priority,
+            queue_position,
+            blocked_reason,
+            waiting_user_input_json,
+            context_json,
+            archived_at,
+            archived_reason,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            ?, ?, NULL, ?, NULL, NULL, ?, ?, 'queued', ?,
+            NULL, NULL, NULL, NULL, ?, ?, NULL, '{}', ?,
+            NULL, NULL, ?, ?
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            supervisor_run_id = excluded.supervisor_run_id,
+            feature_id = excluded.feature_id,
+            workflow_run_id = NULL,
+            patch_id = NULL,
+            kind = excluded.kind,
+            title = excluded.title,
+            state = 'queued',
+            root_repo_path = excluded.root_repo_path,
+            workspace_path = NULL,
+            shard_id = NULL,
+            shard_path = NULL,
+            integration_path = NULL,
+            priority = excluded.priority,
+            queue_position = excluded.queue_position,
+            blocked_reason = NULL,
+            waiting_user_input_json = '{}',
+            context_json = excluded.context_json,
+            archived_at = NULL,
+            archived_reason = NULL,
+            updated_at = excluded.updated_at
+        WHERE supervisor_work_units.archived_at IS NOT NULL
+           OR supervisor_work_units.state IN ('deleted', 'archived', 'cancelled', 'failed')
+        "#,
+    )
+    .bind(work_unit_id)
+    .bind(supervisor_run_id.to_string())
+    .bind(feature_id)
+    .bind(pool_kind.as_str())
+    .bind(title)
+    .bind(root_repo_path)
+    .bind(priority)
+    .bind(queue_position)
+    .bind(context_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!(
+        supervisor_run_id = %supervisor_run_id,
+        work_unit_id,
+        feature_id,
+        pool_kind = pool_kind.as_str(),
+        "supervisor work unit promised in queued state"
+    );
+
+    Ok(())
+}
+
 pub async fn spawn_supervisor_workflow(
     state: &AppState,
     request: SupervisorWorkflowSpawnRequest,
@@ -103,7 +249,28 @@ pub async fn spawn_supervisor_workflow(
     )
     .await?;
 
-    upsert_work_unit_for_spawn(&state.db, &request, workflow_run_id, &workspace_path, shard_id).await?;
+    let mut materialized_context = request.work_unit_context.clone();
+    if !materialized_context.is_object() {
+        materialized_context = json!({});
+    }
+    if let Some(obj) = materialized_context.as_object_mut() {
+        obj.insert(
+            "materialization_state".to_string(),
+            Value::String("materialized".to_string()),
+        );
+    }
+
+    let mut materialized_request = request.clone();
+    materialized_request.work_unit_context = materialized_context;
+
+    upsert_work_unit_for_spawn(
+        &state.db,
+        &materialized_request,
+        workflow_run_id,
+        &workspace_path,
+        shard_id,
+    )
+    .await?;
 
     Ok(SupervisorWorkflowSpawnResult {
         work_unit_id: request.work_unit_id,

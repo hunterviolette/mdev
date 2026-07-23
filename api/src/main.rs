@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     let recovered_runs = crate::engine::fail_active_runs_for_process_stop(
         &state,
-        "The previous API process stopped while workflow execution was active.",
+        "The server was shut down before the stage execution completed.",
     )
     .await?;
 
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
             match crate::engine::fail_active_runs_for_process_stop(
                 &shutdown_state,
-                "The API stopped while workflow execution was active.",
+                "The server was shut down before the stage execution completed.",
             )
             .await
             {

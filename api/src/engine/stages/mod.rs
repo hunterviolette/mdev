@@ -10,17 +10,20 @@ mod sap_import_stage;
 mod sap_syntax_stage;
 mod stage_utility;
 
-use std::time::Instant;
+use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    app_state::{AppState, WorkflowTransientPromptFragment},
-    engine::capabilities::inference::stage_support::{
-        build_inference_execution_plan,
-        InferenceStageSettings,
+    app_state::AppState,
+    engine::{
+        capabilities::inference::stage_support::{
+            build_inference_execution_plan,
+            InferenceStageSettings,
+        },
+        orchestration_inputs::OrchestrationInputPayload,
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowCapabilityBinding, WorkflowRun, WorkflowStepDefinition},
 };
@@ -50,7 +53,7 @@ pub struct StageOutcome {
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
-    pub transient_prompt_fragments: Vec<WorkflowTransientPromptFragment>,
+    pub transient_prompt_fragments: Vec<OrchestrationInputPayload>,
 }
 
 pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> capability_contract::StageCapabilities {
@@ -86,6 +89,32 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         .entry("inference".to_string())
         .or_insert_with(|| json!({}));
     let inference_obj = ensure_value_object(inference);
+
+    inference_obj.remove("next_prompt_fragments");
+    inference_obj.remove("active_prompt_fragments");
+
+    if let Some(enabled) = inference_obj
+        .get_mut("prompt_fragment_enabled")
+        .and_then(Value::as_object_mut)
+    {
+        enabled.remove("apply_error");
+        enabled.remove("compile_error");
+        if enabled.is_empty() {
+            inference_obj.remove("prompt_fragment_enabled");
+        }
+    }
+
+    if let Some(fragments) = inference_obj
+        .get_mut("prompt_fragments")
+        .and_then(Value::as_object_mut)
+    {
+        fragments.remove("apply_error");
+        fragments.remove("compile_error");
+        if fragments.is_empty() {
+            inference_obj.remove("prompt_fragments");
+        }
+    }
+
     let connection_runtime = inference_obj
         .entry("connection_runtime".to_string())
         .or_insert_with(|| json!({}));
@@ -107,46 +136,10 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         "process_session_id".to_string(),
         Value::String(current_process_session_id),
     );
-
-    inference_obj.remove("next_prompt_fragments");
-    inference_obj.remove("active_prompt_fragments");
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
-    let mut run = crate::engine::load_run(state, run_id).await?;
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = global_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("global_state must be object"))?;
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = ensure_value_object(inference);
-
-    {
-        let enabled = inference_obj
-            .entry("prompt_fragment_enabled".to_string())
-            .or_insert_with(|| json!({}));
-        let enabled_obj = ensure_value_object(enabled);
-        enabled_obj.insert("apply_error".to_string(), Value::Bool(false));
-        enabled_obj.insert("compile_error".to_string(), Value::Bool(false));
-    }
-
-    {
-        let fragments = inference_obj
-            .entry("prompt_fragments".to_string())
-            .or_insert_with(|| json!({}));
-        let fragments_obj = ensure_value_object(fragments);
-        fragments_obj.remove("apply_error");
-        fragments_obj.remove("compile_error");
-    }
-
-    persist_context(state, run_id, &run.context).await?;
+    state.orchestration_inputs.clear_run(run_id);
     Ok(())
 }
 
@@ -235,11 +228,15 @@ fn operator_checkpoint_config(local_state: &Value) -> Value {
     config
 }
 
-fn append_operator_checkpoint_to_plan(mut plan: Vec<StageExecutionNode>, local_state: &Value) -> Vec<StageExecutionNode> {
-    if !stage_operator_checkpoint_enabled(local_state) {
-        return plan;
-    }
-    if plan.iter().any(|node| node.kind == StageExecutionNodeKind::Capability && node.key == "operator_checkpoint") {
+fn apply_configured_operator_checkpoint(
+    mut plan: Vec<StageExecutionNode>,
+    local_state: &Value,
+) -> Vec<StageExecutionNode> {
+    if plan
+        .iter()
+        .any(|node| node.kind == StageExecutionNodeKind::Capability && node.key == "operator_checkpoint")
+        || !stage_operator_checkpoint_enabled(local_state)
+    {
         return plan;
     }
 
@@ -259,7 +256,124 @@ fn append_operator_checkpoint_to_plan(mut plan: Vec<StageExecutionNode>, local_s
         run_after,
         condition: Value::Null,
     });
+
     plan
+}
+
+pub struct StageExitContext<'a> {
+    pub state: &'a AppState,
+    pub run_id: Uuid,
+    pub step: &'a WorkflowStepDefinition,
+    pub next_step_id: Option<&'a str>,
+}
+
+pub trait StageLifecycleHook: Send + Sync {
+    fn prepare_plan(
+        &self,
+        _run: &mut WorkflowRun,
+        _step: &WorkflowStepDefinition,
+        _automatic_execution: bool,
+        _local_state: &Value,
+        plan: Vec<StageExecutionNode>,
+    ) -> Vec<StageExecutionNode> {
+        plan
+    }
+
+    fn on_checkpoint_continue(
+        &self,
+        _run: &mut WorkflowRun,
+        _step: &WorkflowStepDefinition,
+        _phase: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_restart<'a>(
+        &'a self,
+        _context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_exit<'a>(
+        &'a self,
+        context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+struct NoopStageLifecycleHook;
+
+impl StageLifecycleHook for NoopStageLifecycleHook {
+    fn on_exit<'a>(
+        &'a self,
+        _context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub fn lifecycle_hook_for_step(step: &WorkflowStepDefinition) -> Box<dyn StageLifecycleHook> {
+    match step.step_type.as_str() {
+        "qa" => Box::new(qa_stage::QaStageLifecycleHook),
+        _ => Box::new(NoopStageLifecycleHook),
+    }
+}
+
+pub fn prepare_stage_execution_plan(
+    run: &mut WorkflowRun,
+    step: &WorkflowStepDefinition,
+    automatic_execution: bool,
+    local_state: &Value,
+    plan: Vec<StageExecutionNode>,
+) -> Vec<StageExecutionNode> {
+    let plan = lifecycle_hook_for_step(step).prepare_plan(
+        run,
+        step,
+        automatic_execution,
+        local_state,
+        plan,
+    );
+
+    apply_configured_operator_checkpoint(plan, local_state)
+}
+
+pub fn record_stage_checkpoint_continue(
+    run: &mut WorkflowRun,
+    step: &WorkflowStepDefinition,
+    phase: &str,
+) -> Result<()> {
+    lifecycle_hook_for_step(step).on_checkpoint_continue(run, step, phase)
+}
+
+pub async fn invoke_stage_restart_hook(
+    state: &AppState,
+    run_id: Uuid,
+    step: &WorkflowStepDefinition,
+) -> Result<()> {
+    lifecycle_hook_for_step(step)
+        .on_restart(StageExitContext {
+            state,
+            run_id,
+            step,
+            next_step_id: Some(step.id.as_str()),
+        })
+        .await
+}
+
+pub async fn invoke_stage_exit_hook(
+    state: &AppState,
+    run_id: Uuid,
+    step: &WorkflowStepDefinition,
+    next_step_id: Option<&str>,
+) -> Result<()> {
+    lifecycle_hook_for_step(step)
+        .on_exit(StageExitContext {
+            state,
+            run_id,
+            step,
+            next_step_id,
+        })
+        .await
 }
 
 pub async fn execute_stage(
@@ -333,31 +447,6 @@ pub async fn execute_stage(
     )
     .await?;
 
-    let transient_prompt_fragments = state.take_transient_prompt_fragments(run_id);
-    if !transient_prompt_fragments.is_empty() {
-        let execution_global_state_obj = ensure_value_object(&mut execution_global_state);
-        let capabilities = execution_global_state_obj
-            .entry("capabilities".to_string())
-            .or_insert_with(|| json!({}));
-        let capabilities_obj = ensure_value_object(capabilities);
-        let inference = capabilities_obj
-            .entry("inference".to_string())
-            .or_insert_with(|| json!({}));
-        let inference_obj = ensure_value_object(inference);
-        let active_prompt_fragments = inference_obj
-            .entry("active_prompt_fragments".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let active_prompt_fragments = active_prompt_fragments
-            .as_array_mut()
-            .expect("active_prompt_fragments must be array");
-        active_prompt_fragments.extend(transient_prompt_fragments.iter().map(|fragment| {
-            json!({
-                "kind": fragment.kind(),
-                "text": fragment.text()
-            })
-        }));
-    }
-
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
@@ -397,6 +486,14 @@ pub async fn execute_stage(
         step,
         &prepared_local_state,
     )?;
+    let plan = prepare_stage_execution_plan(
+        run,
+        step,
+        automatic_execution,
+        &prepared_local_state,
+        plan,
+    );
+    persist_context(state, run_id, &run.context).await?;
     let prepared_local_state_obj = prepared_local_state
         .as_object()
         .ok_or_else(|| anyhow!("prepared stage local state must be object"))?;
@@ -538,7 +635,7 @@ struct StageBranch {
     disposition: StageDisposition,
     message: String,
     patch: Option<Value>,
-    transient_prompt_fragments: Vec<WorkflowTransientPromptFragment>,
+    transient_prompt_fragments: Vec<OrchestrationInputPayload>,
 }
 
 fn resolve_stage_branch(
@@ -587,9 +684,6 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
     let mode = descriptor.get("mode").and_then(Value::as_str).unwrap_or("");
 
     match (step.step_type.as_str(), capability, mode) {
-        ("compile", "compile_commands", "compile_error_to_code_prompt") => {
-            Some(compile_stage::build_compile_error_patch(capability_results))
-        }
         ("code", "changeset", "apply_error_to_code_prompt") => None,
         ("review", "review_validation", "review_failure_to_code_prompt") => {
             Some(review_stage::build_review_failure_patch(capability_results))
@@ -611,9 +705,33 @@ fn build_branch_transient_prompt_fragments(
     step: &WorkflowStepDefinition,
     branch: &Value,
     capability_results: &[Value],
-) -> Vec<WorkflowTransientPromptFragment> {
+) -> Vec<OrchestrationInputPayload> {
+    let mut fragments = Vec::new();
+
+    fragments.extend(capability_results.iter().filter_map(|item| {
+        let contribution = item
+            .get("result")
+            .and_then(|result| result.get("prompt_contribution"))?
+            .clone();
+
+        serde_json::from_value::<OrchestrationInputPayload>(contribution).ok()
+    }));
+
+    let planner_apply_failed = capability_results.iter().any(|item| {
+        item.get("key").and_then(Value::as_str) == Some("planner_apply")
+            && item.get("ok").and_then(Value::as_bool) == Some(false)
+    });
+
+    if planner_apply_failed {
+        fragments.push(OrchestrationInputPayload::PromptContribution {
+            text: planner::apply::build_apply_error_feedback(capability_results),
+            source: Some("planner_apply".to_string()),
+            label: Some("Previous planner application failure".to_string()),
+        });
+    }
+
     let Some(descriptor) = branch.get("patch_from_capability") else {
-        return Vec::new();
+        return fragments;
     };
     let capability = descriptor
         .get("capability")
@@ -624,14 +742,18 @@ fn build_branch_transient_prompt_fragments(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    match (step.step_type.as_str(), capability, mode) {
-        ("code", "changeset", "apply_error_to_code_prompt") => {
-            vec![WorkflowTransientPromptFragment::ChangesetApplyError {
-                text: code_stage::build_apply_error_feedback(capability_results),
-            }]
-        }
-        _ => Vec::new(),
+    if matches!(
+        (step.step_type.as_str(), capability, mode),
+        ("code", "changeset", "apply_error_to_code_prompt")
+    ) {
+        fragments.push(OrchestrationInputPayload::PromptContribution {
+            text: code_stage::build_apply_error_feedback(capability_results),
+            source: Some("changeset".to_string()),
+            label: Some("Previous ChangeSet application failure".to_string()),
+        });
     }
+
+    fragments
 }
 
 fn parse_stage_disposition(
@@ -871,7 +993,7 @@ fn resolve_effective_execution_plan(
         }
     };
 
-    Ok(append_operator_checkpoint_to_plan(plan, local_state))
+    Ok(plan)
 }
 
 fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<StageExecutionNode> {

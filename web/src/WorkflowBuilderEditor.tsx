@@ -836,24 +836,23 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                 capabilities: {
                   ...structuredClone(current.capabilities ?? {}),
                   qa_environment: {
-                    enabled: true,
-                    port_range: {
-                      start: nextValues.port_start,
-                      end: nextValues.port_end,
+                    dependency_providers: structuredClone(
+                      nextValues.dependency_providers
+                    ),
+                    environment: {
+                      port_range: {
+                        start: nextValues.port_start,
+                        end: nextValues.port_end,
+                      },
+                      hostname_template: nextValues.hostname_template,
+                      prepare: {
+                        commands: [],
+                        stop_on_failure: true,
+                      },
+                      services: structuredClone(nextValues.services),
+                      shutdown_grace_seconds:
+                        nextValues.shutdown_grace_seconds,
                     },
-                    hostname_template: nextValues.hostname_template,
-                    services: nextValues.services.map((service) => ({
-                      id: service.id,
-                      label: service.label,
-                      command: service.command.command,
-                      working_directory: service.command.working_directory,
-                      environment: structuredClone(service.command.environment),
-                      port_environment_variable: service.port.environment_variable,
-                      preferred_port: service.port.preferred,
-                      readiness: structuredClone(service.readiness),
-                      public: service.public,
-                    })),
-                    shutdown_grace_seconds: nextValues.shutdown_grace_seconds,
                   },
                 },
               };

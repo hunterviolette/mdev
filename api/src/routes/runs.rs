@@ -234,36 +234,35 @@ async fn run_action(
     let response = match action {
         "select_step" => {
             let _ = crate::engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id).await;
-            let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "step_id required".to_string(),
+                )
+            })?;
 
-            let mut run = engine::load_run(&state, run_id).await.map_err(internal)?;
-            let definition = engine::load_template_definition(&state, &run)
+            engine::select_step(&state, run_id, step_id)
                 .await
                 .map_err(internal)?
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "run has no template definition".to_string()))?;
-            let step = definition
-                .steps
-                .iter()
-                .find(|item| item.id == step_id)
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, format!("unknown step_id {}", step_id)))?;
-
-            run.current_step_id = Some(step.id.clone());
-            let decisions = engine::governance::before_stage(&state, run_id, &mut run, step)
-                .await
-                .map_err(internal)?;
-            engine::governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)
-                .map_err(internal)?;
-            engine::persist_context(&state, run_id, &run.context).await.map_err(internal)?;
-            engine::set_run_status(&state, run_id, RunStatus::Waiting, Some(step.id.as_str()))
-                .await
-                .map_err(internal)?;
-
-            serde_json::json!({
-                "ok": true,
-                "run_id": run_id,
-                "current_step_id": step.id,
-                "status": "waiting"
-            })
+        }
+        "get_transient_stage_user_input" => {
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string())
+            })?;
+            engine::get_transient_stage_user_input(&state, run_id, step_id)
+        }
+        "patch_transient_stage_user_input" => {
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string())
+            })?;
+            engine::patch_transient_stage_user_input(
+                &state,
+                run_id,
+                step_id,
+                req.payload,
+            )
+            .await
+            .map_err(internal)?
         }
         "patch_global_state" => {
             engine::patch_global_state(&state, run_id, req.payload).await.map_err(internal)?
@@ -308,7 +307,38 @@ async fn run_action(
             engine::prepare_run_stage_for_execution(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
         "start_run" => {
-            engine::start_run(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+            if let Some(user_input) = req
+                .payload
+                .get("user_input")
+                .and_then(serde_json::Value::as_str)
+            {
+                let step_id = req.step_id.as_deref().ok_or_else(|| {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "step_id required when start_run includes user_input".to_string(),
+                    )
+                })?;
+
+                engine::patch_transient_stage_user_input(
+                    &state,
+                    run_id,
+                    step_id,
+                    serde_json::json!({
+                        "text": user_input,
+                        "client_id": req
+                            .payload
+                            .get("client_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+            }
+
+            engine::start_run(&state, run_id, req.step_id.as_deref())
+                .await
+                .map_err(internal)?
         }
         "resume_run" => {
             engine::resume_run(&state, run_id).await.map_err(internal)?
@@ -319,6 +349,11 @@ async fn run_action(
         "cancel_run" | "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
             engine::force_wait_run(&state, run_id).await.map_err(internal)?
         }
+        "restart_stage" | "restart_current_stage" => {
+            engine::restart_stage(&state, run_id, req.step_id.as_deref())
+                .await
+                .map_err(internal)?
+        }
         "run_step" | "run_current_step" => {
             if !req.payload.is_null() {
                 let step_id = req.step_id.as_deref().ok_or_else(|| {
@@ -328,6 +363,7 @@ async fn run_action(
                     .await
                     .map_err(internal)?;
             }
+
             engine::run_step(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
         }
         "next_step" => {
@@ -843,7 +879,7 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
             "running" => RunStatus::Running,
             "waiting" => RunStatus::Waiting,
             "paused" => RunStatus::Paused,
-            "success" => RunStatus::Success,
+            "complete" | "success" => RunStatus::Success,
             "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Error,
         },

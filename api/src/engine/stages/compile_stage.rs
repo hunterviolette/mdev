@@ -70,21 +70,7 @@ pub fn prepare_stage_state(
             } else {
                 json!({
                     "disposition": "move_next",
-                    "message": "Compile stage completed successfully through backend workflow engine.",
-                    "patch": {
-                        "global_state": {
-                            "capabilities": {
-                                "inference": {
-                                    "prompt_fragment_enabled": {
-                                        "compile_error": false
-                                    },
-                                    "prompt_fragments": {
-                                        "compile_error": null
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    "message": "Compile stage completed successfully through backend workflow engine."
                 })
             },
         );
@@ -95,11 +81,7 @@ pub fn prepare_stage_state(
             "on_error".to_string(),
             json!({
                 "disposition": "move_back",
-                "message": "Compile stage failed during backend workflow execution.",
-                "patch_from_capability": {
-                    "capability": "compile_commands",
-                    "mode": "compile_error_to_code_prompt"
-                }
+                "message": "Compile stage failed during backend workflow execution."
             }),
         );
     }
@@ -188,49 +170,6 @@ fn commands_text_to_rows(value: Option<&Value>) -> Option<Value> {
     }
 }
 
-pub fn build_compile_error_patch(capability_results: &[Value]) -> Value {
-    let outputs = capability_results
-        .iter()
-        .filter(|item| item.get("key").and_then(Value::as_str) == Some("compile_commands"))
-        .filter_map(|item| item.get("result"))
-        .filter_map(|result| result.get("results"))
-        .filter_map(Value::as_array)
-        .flat_map(|items| items.iter())
-        .map(|row| {
-            let label = row.get("label").and_then(Value::as_str).unwrap_or("command");
-            let status = row.get("status").and_then(Value::as_i64).unwrap_or(-1);
-            let stdout = row.get("stdout").and_then(Value::as_str).unwrap_or("");
-            let stderr = row.get("stderr").and_then(Value::as_str).unwrap_or("");
-            format!(
-                "COMMAND: {}\nSTATUS: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-                label,
-                status,
-                stdout,
-                stderr
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let compile_fragment = format!(
-        "Postprocess command failed after applying the previous ChangeSet.\n\nPOSTPROCESS OUTPUT:\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
-        outputs
-    );
-
-    json!({
-        "global_state": {
-            "capabilities": {
-                "inference": {
-                    "next_prompt_fragments": [
-                        {
-                            "text": compile_fragment
-                        }
-                    ]
-                }
-            }
-        }
-    })
-}
 
 fn ensure_object(value: Value) -> Value {
     match value {

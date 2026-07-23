@@ -362,20 +362,20 @@ fn resolve_qa_spec(ctx: &CapabilityContext<'_>, config: Value) -> Result<QaStage
             .map_err(|error| anyhow!("invalid QA environment configuration: {}", error));
     }
 
-    if let Some(capability) = ctx
+    let capability = ctx
         .local_state
         .get("capabilities")
         .and_then(|value| value.get("qa_environment"))
         .filter(|value| value.is_object())
-    {
-        return compact_qa_capability_to_stage_spec(capability.clone());
-    }
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "QA runtime capability state is missing for stage '{}'",
+                ctx.step.id
+            )
+        })?;
 
-    ctx.step
-        .execution
-        .qa
-        .clone()
-        .ok_or_else(|| anyhow!("QA capability configuration is missing for stage '{}'", ctx.step.id))
+    compact_qa_capability_to_stage_spec(capability)
 }
 
 fn compact_qa_capability_to_stage_spec(value: Value) -> Result<QaStageSpec> {

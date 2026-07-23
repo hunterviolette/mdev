@@ -664,6 +664,44 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             .await?;
     }
 
+    sqlx::query("UPDATE workflow_runs SET status = 'complete' WHERE status = 'success'")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET state = CASE
+                WHEN workflow_run_id IS NULL THEN state
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM workflow_runs wr
+                    WHERE wr.id = supervisor_work_units.workflow_run_id
+                      AND wr.status = 'complete'
+                ) THEN 'complete'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM workflow_runs wr
+                    WHERE wr.id = supervisor_work_units.workflow_run_id
+                ) THEN (
+                    SELECT wr.status
+                    FROM workflow_runs wr
+                    WHERE wr.id = supervisor_work_units.workflow_run_id
+                )
+                ELSE state
+            END,
+            updated_at = CASE
+                WHEN workflow_run_id IS NOT NULL THEN ?
+                ELSE updated_at
+            END
+        WHERE workflow_run_id IS NOT NULL
+          AND archived_at IS NULL
+        "#,
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(db)
+    .await?;
+
     backfill_workflow_keys(db).await?;
     backfill_changeset_workflow_keys(db).await?;
 

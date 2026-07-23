@@ -245,25 +245,46 @@ fn timeout_ms(cfg: &BrowserConfig) -> u64 {
     cfg.response_timeout_ms.max(1_000)
 }
 
-struct BridgeClient {
+struct BridgeProcessState {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    stdout: Option<BufReader<ChildStdout>>,
-    launched_browsers: Vec<Child>,
+    generation: u64,
+}
+
+type PendingResponse = std::sync::mpsc::Sender<std::result::Result<Value, String>>;
+
+struct BridgeClient {
+    state: std::sync::Arc<Mutex<BridgeProcessState>>,
+    pending: std::sync::Arc<Mutex<std::collections::HashMap<String, PendingResponse>>>,
+    session_locks: Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    launched_browsers: Mutex<Vec<Child>>,
 }
 
 impl BridgeClient {
     fn new() -> Self {
         Self {
-            child: None,
-            stdin: None,
-            stdout: None,
-            launched_browsers: Vec::new(),
+            state: std::sync::Arc::new(Mutex::new(BridgeProcessState {
+                child: None,
+                stdin: None,
+                generation: 0,
+            })),
+            pending: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            session_locks: Mutex::new(std::collections::HashMap::new()),
+            launched_browsers: Mutex::new(Vec::new()),
         }
     }
 
-    fn ensure_started(&mut self) -> Result<()> {
-        if self.child.is_some() {
+    fn session_lock(&self, session_id: &str) -> Result<std::sync::Arc<Mutex<()>>> {
+        let mut locks = self.session_locks.lock().map_err(|_| anyhow!("Browser session lock registry poisoned"))?;
+        Ok(locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    fn ensure_started(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| anyhow!("Browser bridge state mutex poisoned"))?;
+        if state.child.is_some() {
             debug!("browser bridge already running");
             return Ok(());
         }
@@ -285,67 +306,176 @@ impl BridgeClient {
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("bridge stdin unavailable"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("bridge stdout unavailable"))?;
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.stdin = Some(stdin);
+        state.child = Some(child);
 
-        self.stdin = Some(stdin);
-        self.stdout = Some(BufReader::new(stdout));
-        self.child = Some(child);
+        let shared_state = self.state.clone();
+        let pending = self.pending.clone();
+        std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => {
+                        BridgeClient::fail_pending(&pending, "browser bridge terminated: stdout closed");
+                        if let Ok(mut state) = shared_state.lock() {
+                            if state.generation == generation {
+                                state.stdin.take();
+                                state.child.take();
+                            }
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let response = match serde_json::from_str::<Value>(trimmed) {
+                            Ok(response) => response,
+                            Err(err) => {
+                                error!(error = %err, response = %trimmed, "browser bridge returned malformed response");
+                                continue;
+                            }
+                        };
+                        let Some(request_id) = response.get("id").and_then(Value::as_str).map(str::to_string) else {
+                            error!(response = %trimmed, "browser bridge response missing request id");
+                            continue;
+                        };
+                        let waiter = pending.lock().ok().and_then(|mut pending| pending.remove(&request_id));
+                        if let Some(waiter) = waiter {
+                            let _ = waiter.send(Ok(response));
+                        } else {
+                            warn!(request_id = %request_id, "browser bridge returned response without a pending caller");
+                        }
+                    }
+                    Err(err) => {
+                        BridgeClient::fail_pending(&pending, &format!("browser bridge terminated: stdout read failed: {}", err));
+                        if let Ok(mut state) = shared_state.lock() {
+                            if state.generation == generation {
+                                state.stdin.take();
+                                state.child.take();
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         info!("browser bridge process started");
         Ok(())
     }
 
-    fn send_json(&mut self, value: Value) -> Result<Value> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("bridge stdin unavailable"))?;
-        let stdout = self.stdout.as_mut().ok_or_else(|| anyhow!("bridge stdout unavailable"))?;
+    fn fail_pending(
+        pending: &std::sync::Arc<Mutex<std::collections::HashMap<String, PendingResponse>>>,
+        message: &str,
+    ) {
+        let waiters = pending
+            .lock()
+            .map(|mut pending| pending.drain().map(|(_, waiter)| waiter).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(Err(message.to_string()));
+        }
+    }
 
+    fn send_json(&self, value: Value) -> Result<Value> {
+        self.ensure_started()?;
+        let request_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("bridge command missing request id"))?
+            .to_string();
         let cmd = value.get("cmd").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let session_id = value.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let timeout = Duration::from_millis(
+            value
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000)
+                .saturating_add(5_000),
+        );
         let payload = serde_json::to_string(&value)?;
-        debug!(cmd, payload = %payload, "sending command to browser bridge");
-        stdin.write_all(payload.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+        let (sender, receiver) = std::sync::mpsc::channel();
 
-        let mut line = String::new();
-        stdout.read_line(&mut line)?;
-        if line.trim().is_empty() {
-            error!(cmd, "browser bridge returned empty response");
-            return Err(anyhow!("bridge returned empty response"));
+        self.pending
+            .lock()
+            .map_err(|_| anyhow!("Browser bridge pending registry poisoned"))?
+            .insert(request_id.clone(), sender);
+
+        let write_result = (|| -> Result<()> {
+            let mut state = self.state.lock().map_err(|_| anyhow!("Browser bridge state mutex poisoned"))?;
+            let stdin = state.stdin.as_mut().ok_or_else(|| anyhow!("bridge stdin unavailable"))?;
+            debug!(request_id = %request_id, session_id = %session_id, cmd = %cmd, payload = %payload, "sending command to browser bridge");
+            stdin.write_all(payload.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&request_id);
+            }
+            return Err(err);
         }
 
-        debug!(cmd, response = %line.trim(), "received response from browser bridge");
-        let response: Value = serde_json::from_str(line.trim())?;
-        if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
-            error!(cmd, error = %err, "browser bridge returned error response");
+        let response = match receiver.recv_timeout(timeout) {
+            Ok(Ok(response)) => response,
+            Ok(Err(message)) => return Err(anyhow!(message)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                return Err(anyhow!("browser bridge request timed out (request_id={}, session_id={}, cmd={})", request_id, session_id, cmd));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                return Err(anyhow!("browser bridge request waiter disconnected (request_id={}, session_id={}, cmd={})", request_id, session_id, cmd));
+            }
+        };
+
+        debug!(request_id = %request_id, session_id = %session_id, cmd = %cmd, response = %response, "received response from browser bridge");
+        if let Some(err) = response.get("error").and_then(Value::as_str) {
+            error!(request_id = %request_id, session_id = %session_id, cmd = %cmd, error = %err, "browser bridge returned error response");
             return Err(anyhow!(err.to_string()));
         }
         Ok(response)
     }
 
-    fn shutdown(&mut self) {
-        self.stdin.take();
-        self.stdout.take();
-
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stdin.take();
+            if let Some(mut child) = state.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            state.generation = state.generation.wrapping_add(1);
         }
 
-        for mut browser in self.launched_browsers.drain(..) {
-            let _ = browser.kill();
-            let _ = browser.wait();
-        }
-    }
-}
+        Self::fail_pending(&self.pending, "browser bridge terminated by shutdown");
 
-impl Drop for BridgeClient {
-    fn drop(&mut self) {
-        self.shutdown();
+        if let Ok(mut browsers) = self.launched_browsers.lock() {
+            for mut browser in browsers.drain(..) {
+                let _ = browser.kill();
+                let _ = browser.wait();
+            }
+        }
+
+        if let Ok(mut locks) = self.session_locks.lock() {
+            locks.clear();
+        }
     }
 }
 
 pub fn shutdown_browser_bridge() {
-    if let Ok(mut client) = bridge_client().lock() {
-        client.shutdown();
-    }
+    bridge_client().shutdown();
 }
 
 fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
@@ -390,9 +520,9 @@ fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
     Ok(child)
 }
 
-fn bridge_client() -> &'static Mutex<BridgeClient> {
-    static CLIENT: OnceLock<Mutex<BridgeClient>> = OnceLock::new();
-    CLIENT.get_or_init(|| Mutex::new(BridgeClient::new()))
+fn bridge_client() -> &'static BridgeClient {
+    static CLIENT: OnceLock<BridgeClient> = OnceLock::new();
+    CLIENT.get_or_init(BridgeClient::new)
 }
 
 fn cdp_reachable(cdp_url: &str) -> bool {
@@ -419,13 +549,6 @@ fn resolve_browser_executable(cfg: &BrowserConfig) -> String {
         return configured.to_string();
     }
 
-    if let Ok(value) = std::env::var("MDEV_BROWSER_EXECUTABLE") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
     for candidate in bundled_chromium_candidates() {
         if candidate.exists() {
             return candidate.to_string_lossy().into_owned();
@@ -434,56 +557,41 @@ fn resolve_browser_executable(cfg: &BrowserConfig) -> String {
 
     #[cfg(target_os = "windows")]
     {
-        let candidates = [
-            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-        ];
-
-        for candidate in candidates {
+        for candidate in [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 return candidate.to_string();
             }
         }
-
         "msedge.exe".to_string()
     }
 
     #[cfg(target_os = "macos")]
     {
-        let candidates = [
+        for candidate in [
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            "/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
-        ];
-
-        for candidate in candidates {
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 return candidate.to_string();
             }
         }
-
-        "msedge".to_string()
+        "Microsoft Edge".to_string()
     }
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
-        let candidates = [
-            "microsoft-edge",
-            "microsoft-edge-stable",
-            "msedge",
-        ];
-
-        for candidate in candidates {
-            if Command::new("sh")
-                .args(["-lc", &format!("command -v {} >/dev/null 2>&1", candidate)])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-            {
+        for candidate in ["microsoft-edge", "google-chrome", "chromium", "chromium-browser"] {
+            if Command::new(candidate).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
                 return candidate.to_string();
             }
         }
-
-        "msedge".to_string()
+        "chromium".to_string()
     }
 }
 
@@ -498,7 +606,6 @@ fn normalize_browser_url_for_launch(url: &str) -> String {
     format!("https://{}", trimmed.trim_start_matches('/'))
 }
 
-
 pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
     let resolved_bridge_dir = resolve_bridge_dir("");
     info!(cdp_url = %cfg.cdp_url, bridge_dir = %resolved_bridge_dir.display(), target_url = %cfg.target_url, page_url_contains = %cfg.page_url_contains, auto_launch_edge = cfg.auto_launch_edge, "launch_and_attach starting");
@@ -507,8 +614,8 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
         if cfg.auto_launch_edge {
             info!(cdp_url = %cfg.cdp_url, "attempting to launch edge with remote debugging");
             let child = launch_edge(cfg)?;
-            if let Ok(mut client) = bridge_client().lock() {
-                client.launched_browsers.push(child);
+            if let Ok(mut browsers) = bridge_client().launched_browsers.lock() {
+                browsers.push(child);
             }
         }
     }
@@ -530,7 +637,7 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
     for attempt_index in 0..20 {
         let attempt = (|| -> Result<String> {
             debug!(attempt = attempt_index + 1, cdp_url = %cfg.cdp_url, "attempting browser bridge connect_over_cdp");
-            let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+            let client = bridge_client();
             client.ensure_started()?;
             let mut payload = bridge_cmd("connect_over_cdp");
             payload["cdp_url"] = Value::String(cfg.cdp_url.clone());
@@ -580,8 +687,10 @@ pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before open_url"))?;
     let normalized_url = normalize_browser_url_for_launch(url);
     info!(session_id = %session_id, url = %normalized_url, "opening browser url");
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    let client = bridge_client();
     client.ensure_started()?;
+    let session_lock = client.session_lock(&session_id)?;
+    let _session_guard = session_lock.lock().map_err(|_| anyhow!("Browser session mutex poisoned"))?;
     let mut payload = bridge_cmd("open_page");
     payload["session_id"] = Value::String(session_id);
     payload["url"] = Value::String(normalized_url.clone());
@@ -595,8 +704,10 @@ pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {
 pub fn probe(cfg: &mut BrowserConfig) -> Result<BrowserProbeResult> {
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before probe"))?;
     debug!(session_id = %session_id, "probing browser session");
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    let client = bridge_client();
     client.ensure_started()?;
+    let session_lock = client.session_lock(&session_id)?;
+    let _session_guard = session_lock.lock().map_err(|_| anyhow!("Browser session mutex poisoned"))?;
     let mut payload = bridge_cmd("probe_page");
     payload["session_id"] = Value::String(session_id.clone());
     payload["profile"] = Value::String(if cfg.profile.is_empty() { "auto".to_string() } else { cfg.profile.clone() });
@@ -609,7 +720,7 @@ pub fn probe(cfg: &mut BrowserConfig) -> Result<BrowserProbeResult> {
 }
 
 pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Result<()> {
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    let client = bridge_client();
     client.ensure_started()?;
 
     if cfg.session_id.is_none() {
@@ -618,6 +729,8 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
     }
 
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
+    let session_lock = client.session_lock(&session_id)?;
+    let _session_guard = session_lock.lock().map_err(|_| anyhow!("Browser session mutex poisoned"))?;
 
     let mut payload = bridge_cmd("upload_file");
     payload["session_id"] = Value::String(session_id);
@@ -644,14 +757,14 @@ pub fn upload_file(cfg: &mut BrowserConfig, file_path: &std::path::Path) -> Resu
         .or_else(|| uploaded)
         .or_else(|| file_path.file_name().and_then(|v| v.to_str()))
         .unwrap_or("unknown");
-    return Err(anyhow!(
+    Err(anyhow!(
         "Browser bridge upload failed or did not become ready ({})",
         upload_name
-    ));
+    ))
 }
 
 pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<String> {
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    let client = bridge_client();
     client.ensure_started()?;
 
     if cfg.session_id.is_none() {
@@ -660,8 +773,10 @@ pub fn get_session_cookies(cfg: &mut BrowserConfig, urls: &[String]) -> Result<S
     }
 
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing after connect"))?;
+    let session_lock = client.session_lock(&session_id)?;
+    let _session_guard = session_lock.lock().map_err(|_| anyhow!("Browser session mutex poisoned"))?;
     let started = Instant::now();
-    let timeout = Duration::from_millis((timeout_ms(cfg) as u64).max(5_000));
+    let timeout = Duration::from_millis(timeout_ms(cfg).max(5_000));
     let poll = Duration::from_millis(1_000);
     let url_list = urls.join(", ");
     let mut attempt: u32 = 0;
@@ -770,8 +885,10 @@ pub fn send_chat_and_wait_with_pasted_context(
         ));
     }
 
-    let mut client = bridge_client().lock().map_err(|_| anyhow!("Browser bridge mutex poisoned"))?;
+    let client = bridge_client();
     client.ensure_started()?;
+    let session_lock = client.session_lock(&session_id)?;
+    let _session_guard = session_lock.lock().map_err(|_| anyhow!("Browser session mutex poisoned"))?;
 
     let mut send_payload = bridge_cmd("send_chat");
     send_payload["session_id"] = Value::String(session_id.clone());

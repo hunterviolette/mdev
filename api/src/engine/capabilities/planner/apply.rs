@@ -8,6 +8,36 @@ use crate::engine::capabilities::{
     registry::{find_result, CapabilityContext, CapabilityInvocationRequest, CapabilityResult},
 };
 
+pub fn build_apply_error_feedback(capability_results: &[Value]) -> String {
+    let apply_result = capability_results
+        .iter()
+        .find(|item| item.get("key").and_then(Value::as_str) == Some("planner_apply"))
+        .and_then(|item| item.get("result"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let summary = apply_result
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Planner apply failed.");
+
+    let error = apply_result
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+
+    let detail = match error {
+        Some(error) if error != summary => format!("{}\n\n{}", summary, error),
+        _ => summary.to_string(),
+    };
+
+    format!(
+        "The previous planner apply attempt failed.\n\n{}\n\nRevise the planner output to resolve this apply error. Do not repeat the failed output unchanged.",
+        detail
+    )
+}
+
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],

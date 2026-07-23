@@ -97,12 +97,40 @@ pub fn prepare_inference_stage_state_with_hooks(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+
+    let transient_user_input = state
+        .get("transient_prompt_fragments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|fragment| {
+            let is_user_input = fragment
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "user_input")
+                .unwrap_or(false);
+
+            if !is_user_input {
+                return None;
+            }
+
+            fragment
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        });
+
     let default_user_input = resolve_empty_user_input_default(
         step,
         &state,
         hooks.empty_user_input_default.as_deref(),
     );
-    let user_input = explicit_user_input.or(default_user_input);
+
+    let user_input = explicit_user_input
+        .or(transient_user_input)
+        .or(default_user_input);
 
     if let Some(user_input_fragment) = user_input.clone() {
         fragments
@@ -213,7 +241,7 @@ pub fn prepare_inference_stage_state_with_hooks(
             .remove("planner_schema");
     }
 
-    let transient_prompt_fragments = collect_active_transient_prompt_fragments(global_state);
+    let transient_prompt_fragments = collect_transient_prompt_fragments(&state);
 
     let mut effective_enabled = json!({});
     let enabled_obj = effective_enabled
@@ -314,16 +342,22 @@ fn resolve_empty_user_input_default(
         })
 }
 
-fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String> {
-    global_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("active_prompt_fragments"))
+fn collect_transient_prompt_fragments(state: &Value) -> Vec<String> {
+    state
+        .get("transient_prompt_fragments")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .filter(|item| {
+                    item.get("kind")
+                        .and_then(Value::as_str)
+                        .map(|kind| kind != "user_input")
+                        .unwrap_or(true)
+                })
+                .filter_map(|item| {
+                    item.as_str().or_else(|| item.get("text").and_then(Value::as_str))
+                })
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)

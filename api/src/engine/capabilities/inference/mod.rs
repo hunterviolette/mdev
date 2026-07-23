@@ -1,6 +1,7 @@
 pub mod api;
 pub mod browser;
 pub mod panel;
+pub mod prompting;
 pub mod session;
 pub mod stage_support;
 pub mod model_output;
@@ -137,6 +138,60 @@ pub struct BrowserProbeResult {
 
 pub use session::persist_inference_config;
 
+pub(crate) fn resolve_inference_prompt(local_state: &Value) -> String {
+    let composed_prompt = local_state
+        .get("composed_prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    if !composed_prompt.is_empty() {
+        return composed_prompt.to_string();
+    }
+
+    for key in ["model_input_blocks", "prompt_blocks", "composed_prompt_blocks"] {
+        let prompt = local_state
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| {
+                block
+                    .get("content")
+                    .or_else(|| block.get("text"))
+                    .or_else(|| block.get("value"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if !prompt.is_empty() {
+            return prompt;
+        }
+    }
+
+    local_state
+        .get("transient_prompt_fragments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fragment| {
+            fragment.as_str().or_else(|| {
+                fragment
+                    .get("text")
+                    .or_else(|| fragment.get("content"))
+                    .or_else(|| fragment.get("value"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],
@@ -162,23 +217,19 @@ pub async fn execute(
     let selected_provider = resolved_session.config.provider.clone();
     let selected_model = resolved_session.config.model.clone();
 
-    let sent_prompt = ctx
-        .local_state
-        .get("composed_prompt")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let model_input = prompting::build_model_input(ctx, prior_results)?;
+    let sent_prompt = model_input.text.clone();
 
-    if selected_transport == InferenceTransport::Browser && sent_prompt.trim().is_empty() {
+    if sent_prompt.trim().is_empty() {
         return Ok(CapabilityResult {
             ok: false,
             capability: "inference".to_string(),
             payload: json!({
-                "message": "Browser inference prompt is empty before send_chat",
+                "message": "Central prompting produced an empty model input.",
                 "prompt": sent_prompt,
                 "result": {
                     "ok": false,
-                    "message": "Browser inference prompt is empty before send_chat"
+                    "message": "Central prompting produced an empty model input."
                 }
             }),
             follow_ups: CapabilityInvocationRequest::None,
@@ -186,9 +237,13 @@ pub async fn execute(
     }
 
     let response = match selected_transport {
-        InferenceTransport::Browser => browser::execute(ctx, prior_results).await?,
-        InferenceTransport::Api => api::execute(ctx).await?,
+        InferenceTransport::Browser => browser::execute(ctx, &model_input).await?,
+        InferenceTransport::Api => api::execute(ctx, &model_input).await?,
     };
+
+    ctx.state
+        .orchestration_inputs
+        .acknowledge(ctx.run_id, &model_input.consumed_input_ids);
 
     let response_ok = response
         .get("ok")
@@ -216,7 +271,10 @@ pub async fn execute(
             .to_string()
     };
 
-    let prompt_blocks = model_input_blocks(ctx.local_state);
+    let prompt_blocks = serde_json::to_value(&model_input.input_blocks)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
 
     Ok(CapabilityResult {
         ok: capability_ok,
