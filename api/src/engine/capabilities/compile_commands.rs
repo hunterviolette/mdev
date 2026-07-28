@@ -32,7 +32,7 @@ pub async fn execute(
             .and_then(Value::as_str)
             .unwrap_or("Shared dependency validation failed.");
 
-        let mut payload = json!({
+        let payload = json!({
             "ok": false,
             "blocked": true,
             "reason": "shared_dependency_validation",
@@ -40,7 +40,6 @@ pub async fn execute(
             "issues": issues,
             "results": []
         });
-        attach_compile_failure_prompt_contribution(&mut payload);
 
         return Ok(CapabilityResult {
             ok: false,
@@ -77,7 +76,7 @@ pub async fn execute(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(ctx.repo_ref);
 
-    let mut result = execute_compile_commands(
+    let result = execute_compile_commands(
         &ctx.state.process_registry,
         PathBuf::from(repo_ref),
         sequence,
@@ -95,8 +94,47 @@ pub async fn execute(
         .get("ok")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+
     if !ok {
-        attach_compile_failure_prompt_contribution(&mut result);
+        let output = result
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|results| {
+                results
+                    .iter()
+                    .filter(|item| {
+                        item.get("status")
+                            .and_then(Value::as_i64)
+                            .map(|status| status != 0)
+                            .unwrap_or(true)
+                    })
+                    .flat_map(|item| {
+                        [
+                            item.get("command").and_then(Value::as_str),
+                            item.get("stdout").and_then(Value::as_str),
+                            item.get("stderr").and_then(Value::as_str),
+                        ]
+                    })
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Compilation failed.")
+                    .to_string()
+            });
+
+        ctx.provide_prompt_text(
+            "compile_commands",
+            "Compile errors",
+            output,
+        );
     }
 
     Ok(CapabilityResult {
@@ -105,68 +143,6 @@ pub async fn execute(
         payload: result,
         follow_ups: CapabilityInvocationRequest::None,
     })
-}
-
-fn attach_compile_failure_prompt_contribution(payload: &mut Value) {
-    let summary = payload
-        .get("summary")
-        .and_then(Value::as_str)
-        .unwrap_or("Postprocess command failed after applying the previous ChangeSet.");
-
-    let outputs = payload
-        .get("results")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|row| {
-            let label = row
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("command");
-            let status = row
-                .get("status")
-                .and_then(Value::as_i64)
-                .unwrap_or(-1);
-            let stdout = row
-                .get("stdout")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let stderr = row
-                .get("stderr")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-
-            format!(
-                "COMMAND: {}\nSTATUS: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-                label, status, stdout, stderr
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let text = if outputs.trim().is_empty() {
-        format!(
-            "{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
-            summary
-        )
-    } else {
-        format!(
-            "{}\n\nPOSTPROCESS OUTPUT:\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
-            summary, outputs
-        )
-    };
-
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "prompt_contribution".to_string(),
-            json!({
-                "kind": "prompt_contribution",
-                "text": text,
-                "source": "compile_commands",
-                "label": "Previous compile failure"
-            }),
-        );
-    }
 }
 
 fn blocking_shared_dependency_result(

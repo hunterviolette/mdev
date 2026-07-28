@@ -172,24 +172,7 @@ pub(crate) fn resolve_inference_prompt(local_state: &Value) -> String {
         }
     }
 
-    local_state
-        .get("transient_prompt_fragments")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|fragment| {
-            fragment.as_str().or_else(|| {
-                fragment
-                    .get("text")
-                    .or_else(|| fragment.get("content"))
-                    .or_else(|| fragment.get("value"))
-                    .and_then(Value::as_str)
-            })
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    String::new()
 }
 
 pub async fn execute(
@@ -334,49 +317,7 @@ fn model_input_blocks(local_state: &Value) -> Vec<Value> {
         return items.clone();
     }
 
-    local_state
-        .get("transient_prompt_fragments")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    let object = item.as_object()?;
-                    let key = object
-                        .get("capability_key")
-                        .or_else(|| object.get("capability"))
-                        .or_else(|| object.get("key"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("prompt_fragment");
-                    let label = object
-                        .get("label")
-                        .or_else(|| object.get("title"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(key);
-                    let content = object
-                        .get("content")
-                        .or_else(|| object.get("text"))
-                        .or_else(|| object.get("value"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let content_format = object
-                        .get("content_format")
-                        .or_else(|| object.get("format"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("markdown");
-
-                    Some(json!({
-                        "index": index,
-                        "capability_key": key,
-                        "label": label,
-                        "content_format": content_format,
-                        "content": content
-                    }))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+    Vec::new()
 }
 
 fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
@@ -408,15 +349,6 @@ fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
         .unwrap_or(false)
     {
         consumed.push("planner_fragment".to_string());
-    }
-
-    if local_state
-        .get("transient_prompt_fragments")
-        .and_then(Value::as_array)
-        .map(|items| !items.is_empty())
-        .unwrap_or(false)
-    {
-        consumed.push("prompt_fragments".to_string());
     }
 
     consumed

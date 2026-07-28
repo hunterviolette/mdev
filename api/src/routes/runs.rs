@@ -271,14 +271,6 @@ async fn run_action(
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
         }
-        "resolve_disposition_review" => {
-            let disposition = req
-                .payload
-                .get("disposition")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?;
-            engine::resolve_disposition_review(&state, run_id, disposition).await.map_err(internal)?
-        }
         "resolve_operator_checkpoint" => {
             let disposition = req
                 .payload

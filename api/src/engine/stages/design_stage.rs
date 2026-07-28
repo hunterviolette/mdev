@@ -6,22 +6,108 @@ use crate::{
         capabilities::{
             binding_specs,
             inference::stage_support::{
+                build_inference_execution_plan,
                 prepare_inference_stage_state_with_hooks,
                 InferenceStageHooks,
                 InferenceStageSettings,
             },
             planner,
         },
-        stages::{capability_contract::StageCapabilities, stage_utility},
+        stages::{
+            Stage,
+            StageCapabilities,
+            StageExecutionNode,
+            StageExecutionNodeKind,
+            StagePlanContext,
+            StagePrepareContext,
+        },
     },
     models::WorkflowStepDefinition,
 };
 
-pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["inference"])
+pub struct DesignStage;
+
+pub static STAGE: DesignStage = DesignStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(
+impl Stage for DesignStage {
+    fn stage_type(&self) -> &'static str {
+        "design"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["inference"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_design_state(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            local_state,
+        )
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        build_design_execution_plan(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            context.local_state,
+            context.automatic_execution,
+        )
+    }
+}
+
+fn build_design_execution_plan(
+    repo_ref: &str,
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+    local_state: &Value,
+    automatic_execution: bool,
+) -> Result<Vec<StageExecutionNode>> {
+    let mut plan = build_inference_execution_plan(
+        repo_ref,
+        global_state,
+        step,
+        local_state,
+        InferenceStageSettings {
+            include_changeset_schema: false,
+        },
+    )?;
+
+    if automatic_execution {
+        plan.push(StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "operator_checkpoint".to_string(),
+            enabled: true,
+            config: json!({
+                "phase": "after_stage",
+                "message": "Design is complete. Continue automatically or pause to realign.",
+                "recommended_disposition": "continue_auto",
+                "available_dispositions": ["continue_auto", "pause_error"]
+            }),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec!["inference".to_string()],
+            condition: Value::Null,
+        });
+    }
+
+    Ok(plan)
+}
+
+fn prepare_design_state(
     repo_ref: &str,
     global_state: &Value,
     step: &WorkflowStepDefinition,
@@ -57,22 +143,6 @@ pub fn prepare_stage_state(
     if !execution_logic.is_object() {
         *execution_logic = json!({});
     }
-    let config_design_v2 = step
-        .config
-        .get("design_mode")
-        .and_then(Value::as_str)
-        .map(|value| value.eq_ignore_ascii_case("v2"))
-        .unwrap_or(false);
-    let logic_design_v2 = execution_logic
-        .get("mode")
-        .and_then(Value::as_str)
-        .map(|value| value.eq_ignore_ascii_case("v2"))
-        .unwrap_or(false);
-
-    if config_design_v2 || logic_design_v2 {
-        stage_utility::enable_continue_or_pause_checkpoint(execution_logic);
-    }
-
     let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
 
     if !exec_obj.contains_key("on_success") {

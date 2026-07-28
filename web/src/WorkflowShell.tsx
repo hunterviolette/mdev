@@ -2687,7 +2687,12 @@ export function WorkflowShell(props: {
       if (!value) return null;
 
       const kind = typeof value.kind === 'string' ? value.kind : '';
-      if (kind && kind !== 'operator_checkpoint' && kind !== 'disposition_review') return null;
+      if (
+        kind
+        && kind !== 'capability_user_input'
+        && kind !== 'operator_checkpoint'
+        && kind !== 'disposition_review'
+      ) return null;
 
       return {
         stageId: typeof value.stage_id === 'string' ? value.stage_id : selectedRun?.current_step_id ?? '',
@@ -2722,11 +2727,8 @@ export function WorkflowShell(props: {
         return null;
       }
 
-      if (
-        event.kind !== 'operator_checkpoint_waiting'
-        && event.kind !== 'stage_execution_waiting_for_operator_checkpoint'
-        && event.kind !== 'workflow_waiting_for_operator_checkpoint'
-      ) {
+      const eventPayload = asRecord(event.payload) ?? {};
+      if (eventPayload.execution_state !== 'awaiting_user_input') {
         continue;
       }
 
@@ -3243,9 +3245,8 @@ export function WorkflowShell(props: {
     const latest = events[events.length - 1];
     if (!latest) return;
 
-    const shouldHydrateSelectedRun = latest.kind === 'workflow_waiting_for_operator_checkpoint'
-      || latest.kind === 'stage_execution_waiting_for_operator_checkpoint'
-      || latest.kind === 'stage_execution_waiting_for_disposition_review'
+    const latestPayload = asRecord(latest.payload) ?? {};
+    const shouldHydrateSelectedRun = latestPayload.execution_state === 'awaiting_user_input'
       || latest.kind === 'operator_checkpoint_completed'
       || latest.kind === 'operator_checkpoint_resolved'
       || latest.kind === 'stage_execution_completed'
@@ -4006,41 +4007,20 @@ export function WorkflowShell(props: {
       status: capability.statusLabel,
       latest_kind: capability.latestKind,
       latest_level: capability.latestLevel,
-      start_event_payload: capability.inputPayload ?? null,
-      end_event_payload: capability.outputPayload ?? null,
-      latest_payload: capability.latestPayload ?? null,
-      input_payload: capability.inputPayload ?? null,
-      output_payload: capability.outputPayload ?? null,
+      input: capability.inputPayload ?? null,
       output: capability.outputPayload ?? capability.latestPayload ?? null
     };
   }
 
-  function payloadIndicatesUserWait(payload: unknown): boolean {
-    const record = asRecord(payload) ?? {};
-    const result = asRecord(record.result) ?? {};
-    const nestedResult = asRecord(result.result) ?? {};
-
-    return record.waiting_for_user === true
-      || record.needs_user_response === true
-      || result.waiting_for_user === true
-      || result.needs_user_response === true
-      || nestedResult.waiting_for_user === true
-      || nestedResult.needs_user_response === true;
-  }
-
-  function eventIndicatesOperatorCheckpointWait(event: StageExecutionEvent | null): boolean {
+  function eventIndicatesUserInputWait(event: StageExecutionEvent | null): boolean {
     if (!event) return false;
     const payload = asRecord(event.payload) ?? {};
-    const capability = typeof payload.capability === 'string' ? payload.capability : '';
-    return event.kind === 'operator_checkpoint_waiting'
-      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
-      || event.kind === 'workflow_waiting_for_operator_checkpoint'
-      || (capability === 'operator_checkpoint' && payloadIndicatesUserWait(event.payload));
+    return payload.execution_state === 'awaiting_user_input';
   }
 
   function deriveCapabilityStatusLabel(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
-    if (eventIndicatesOperatorCheckpointWait(event)) return 'USER INPUT';
+    if (eventIndicatesUserInputWait(event)) return 'USER INPUT';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'FAILED';
     if (event.kind.endsWith('_completed')) return 'COMPLETE';
     if (event.kind.endsWith('_started')) return 'RUNNING';
@@ -4049,7 +4029,7 @@ export function WorkflowShell(props: {
 
   function deriveCapabilityStatusColor(event: StageExecutionEvent | null, fallback: string): string {
     if (!event) return fallback;
-    if (eventIndicatesOperatorCheckpointWait(event)) return 'yellow';
+    if (eventIndicatesUserInputWait(event)) return 'yellow';
     if (event.level === 'error' || event.kind.endsWith('_failed')) return 'red';
     if (event.level === 'warn') return 'yellow';
     if (event.kind.endsWith('_started')) return 'blue';
@@ -4301,7 +4281,7 @@ export function WorkflowShell(props: {
       const ok = result.ok !== false;
       const resultPayload = capabilityResultSpecificPayload(result);
       const resultRecord = asRecord(resultPayload) ?? {};
-      const resultWaitingForUser = resultKey === 'operator_checkpoint' && payloadIndicatesUserWait(resultPayload);
+      const resultWaitingForUser = asRecord(resultPayload)?.execution_state === 'awaiting_user_input';
       if (existing) {
         const resultClosesCapability = existing.outputPayload == null && !resultWaitingForUser;
         existing.statusColor = resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red';
@@ -4376,8 +4356,7 @@ export function WorkflowShell(props: {
     const payload = asRecord(event.payload) ?? {};
     const capabilityResults = payload.capability_results;
     return isTerminalStageEvent(event)
-      || event.kind === 'stage_execution_waiting_for_operator_checkpoint'
-      || event.kind === 'stage_execution_waiting_for_disposition_review'
+      || event.kind === 'stage_execution_state_changed'
       || (Array.isArray(capabilityResults) && capabilityResults.length > 0);
   }
 
@@ -4458,6 +4437,15 @@ export function WorkflowShell(props: {
       stage.duration_ms = null;
     }
 
+    if (eventIndicatesUserInputWait(event)) {
+      for (const item of projection.stages) {
+        item.is_current = item.stage_execution_id === stageExecutionId;
+      }
+      stage.is_active = true;
+      stage.is_current = true;
+      stage.duration_ms = null;
+    }
+
     if (isTerminalStageEvent(event)) {
       const stageStart = runtimeEvents.workflowEventsByRunId[event.run_id]
         ?.find((item) => (
@@ -4477,14 +4465,15 @@ export function WorkflowShell(props: {
       const isStarted = event.kind.endsWith('_started');
       const isFailed = event.kind.endsWith('_failed') || event.level === 'error';
       const isCompleted = event.kind.endsWith('_completed');
+      const isWaitingForUser = eventIndicatesUserInputWait(event);
 
       if (!capability) {
         capability = {
           key: capabilityInvocationId,
           capability_id: capabilityInvocationId,
           name: runtimeEventCapabilityName(event),
-          status_color: isFailed ? 'red' : isCompleted ? 'green' : 'blue',
-          status_label: isFailed ? 'Failed' : isCompleted ? 'Completed' : 'Running',
+          status_color: isWaitingForUser ? 'yellow' : isFailed ? 'red' : isCompleted ? 'green' : 'blue',
+          status_label: isWaitingForUser ? 'User input' : isFailed ? 'Failed' : isCompleted ? 'Completed' : 'Running',
           message: event.message,
           started_at: isStarted ? event.created_at : null,
           completed_at: isCompleted || isFailed ? event.created_at : null,
@@ -4492,7 +4481,7 @@ export function WorkflowShell(props: {
           latest_created_at: event.created_at,
           latest_kind: event.kind,
           latest_level: event.level,
-          is_active: isStarted && !isCompleted && !isFailed,
+          is_active: isWaitingForUser || isStarted && !isCompleted && !isFailed,
           event_count: 0,
           start_event_id: isStarted ? event.id : null,
           end_event_id: isCompleted || isFailed ? event.id : null,
@@ -4519,6 +4508,16 @@ export function WorkflowShell(props: {
         capability.is_active = true;
         capability.status_color = 'blue';
         capability.status_label = 'Running';
+      }
+
+      if (isWaitingForUser) {
+        capability.completed_at = null;
+        capability.end_event_id = null;
+        capability.end_payload = null;
+        capability.duration_ms = null;
+        capability.is_active = true;
+        capability.status_color = 'yellow';
+        capability.status_label = 'User input';
       }
 
       if (isCompleted || isFailed) {

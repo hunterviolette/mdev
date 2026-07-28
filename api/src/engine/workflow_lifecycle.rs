@@ -153,6 +153,40 @@ impl WorkflowCoordinator {
             .clone()
     }
 
+    pub async fn stop_active_executions(&self) -> Vec<Uuid> {
+        let guards = self
+            .workflows
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect::<Vec<_>>();
+
+        let mut active_run_ids = Vec::new();
+
+        for (workflow_run_id, guard) in guards {
+            let mut runtime = guard.runtime.lock().await;
+            let is_active = runtime
+                .execution_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished());
+
+            if !is_active {
+                continue;
+            }
+
+            active_run_ids.push(workflow_run_id);
+
+            if let Some(cancellation) = runtime.cancellation.take() {
+                cancellation.cancel();
+            }
+
+            if let Some(task) = runtime.execution_task.take() {
+                task.abort();
+            }
+        }
+
+        active_run_ids
+    }
+
     pub async fn execute(
         &self,
         state: &AppState,

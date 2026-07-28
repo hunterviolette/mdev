@@ -280,32 +280,12 @@ fn capability_result_payload(result: &Value) -> Value {
         .unwrap_or_else(|| strip_runtime_context_from_capability_payload(result))
 }
 
-fn payload_indicates_user_wait(payload: &Value) -> bool {
-    payload
-        .get("waiting_for_user")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || payload
-            .get("needs_user_response")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || payload
-            .get("result")
-            .map(payload_indicates_user_wait)
-            .unwrap_or(false)
-}
-
-fn event_indicates_operator_checkpoint_wait(event: &StageChainEvent) -> bool {
-    event.kind == "operator_checkpoint_waiting"
-        || event.kind == "stage_execution_waiting_for_operator_checkpoint"
-        || event.kind == "workflow_waiting_for_operator_checkpoint"
-        || event
-            .payload
-            .get("capability")
-            .and_then(Value::as_str)
-            .map(|capability| capability == "operator_checkpoint")
-            .unwrap_or(false)
-            && payload_indicates_user_wait(&event.payload)
+fn event_indicates_user_input_wait(event: &StageChainEvent) -> bool {
+    event
+        .payload
+        .get("execution_state")
+        .and_then(Value::as_str)
+        == Some("awaiting_user_input")
 }
 
 fn capability_result_key(result: &Value) -> Option<String> {
@@ -431,11 +411,24 @@ async fn build_event_chain_summary(
                     let completed = capability_rows
                         .iter()
                         .rev()
-                        .find(|event| event.kind.ends_with("_completed") || event.kind.ends_with("_failed"))
+                        .find(|event| {
+                            event.kind.ends_with("_completed")
+                                || event.kind.ends_with("_failed")
+                                || event
+                                    .payload
+                                    .get("execution_state")
+                                    .and_then(Value::as_str)
+                                    == Some("completed")
+                                || event
+                                    .payload
+                                    .get("execution_state")
+                                    .and_then(Value::as_str)
+                                    == Some("failed")
+                        })
                         .copied();
                     let status_event = completed.unwrap_or(latest_capability);
                     let capability_name = capability_name_from_event(first);
-                    let waiting_for_user = event_indicates_operator_checkpoint_wait(status_event);
+                    let waiting_for_user = event_indicates_user_input_wait(status_event);
                     let status_color = if waiting_for_user {
                         "yellow"
                     } else if status_event.level == "error" {
@@ -494,8 +487,7 @@ async fn build_event_chain_summary(
                 .find(|event| {
                     event.capability_invocation_id.is_none()
                         && (event.kind == "stage_execution_completed"
-                            || event.kind == "stage_execution_waiting_for_operator_checkpoint"
-                            || event.kind == "stage_execution_waiting_for_disposition_review"
+                            || event.kind == "stage_execution_state_changed"
                             || event.kind == "stage_executed"
                             || event.payload
                                 .get("capability_results")
@@ -525,7 +517,10 @@ async fn build_event_chain_summary(
                     .unwrap_or(&result_key)
                     .to_string();
 
-                let result_waiting_for_user = result_key == "operator_checkpoint" && payload_indicates_user_wait(&result_payload);
+                let result_waiting_for_user = result_payload
+                    .get("execution_state")
+                    .and_then(Value::as_str)
+                    == Some("awaiting_user_input");
 
                 if let Some(existing) = capabilities.iter_mut().find(|capability| {
                     normalized_capability_key(&capability.name) == normalized_result_key
@@ -599,7 +594,7 @@ async fn build_event_chain_summary(
             }
 
             if let Some(stage_event) = result_stage_event {
-                if !event_indicates_operator_checkpoint_wait(stage_event) {
+                if !event_indicates_user_input_wait(stage_event) {
                     for capability in &mut capabilities {
                         if !capability.is_active {
                             continue;

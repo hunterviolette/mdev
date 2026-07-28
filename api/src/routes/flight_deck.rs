@@ -843,22 +843,11 @@ async fn workflow_telemetry(
     .fetch_all(&state.db)
     .await?;
 
-    let current_stage_execution_id = current_step_id.as_deref().and_then(|current_step_id| {
-        rows.iter().find_map(|row| {
-            let row_step_id = row.get::<Option<String>, _>("step_id")?;
-            if row_step_id != current_step_id {
-                return None;
-            }
-
-            row.get::<Option<String>, _>("stage_execution_id")
-        })
-    });
-
     let mut seen_stages = HashSet::new();
     let mut seen_capabilities = HashSet::new();
     let mut recent_stage_executions = Vec::new();
     let mut stage_execution_fallbacks = Vec::<(String, Value)>::new();
-    let mut current_stage_recent_capabilities = Vec::new();
+    let mut recent_capability_executions = Vec::new();
 
     for row in rows {
         let step_id: Option<String> = row.get("step_id");
@@ -918,20 +907,10 @@ async fn workflow_telemetry(
             }
         }
 
-        let is_current_stage = match (
-            current_stage_execution_id.as_deref(),
-            stage_execution_id.as_deref(),
-        ) {
-            (Some(current_stage_id), Some(event_stage_id)) => current_stage_id == event_stage_id,
-            _ => false,
-        };
-
-        if is_current_stage
-            && current_stage_recent_capabilities.len() < execution_event_limit
-        {
+        if recent_capability_executions.len() < execution_event_limit {
             if let Some(capability_id) = capability_invocation_id.clone() {
                 if seen_capabilities.insert(capability_id.clone()) {
-                    current_stage_recent_capabilities.push(json!({
+                    recent_capability_executions.push(json!({
                         "capability_invocation_id": capability_id,
                         "parent_invocation_id": parent_invocation_id,
                         "stage_execution_id": stage_execution_id,
@@ -967,7 +946,7 @@ async fn workflow_telemetry(
         "stage_template": stage_template,
         "stage_template_error": stage_template_error,
         "recent_stage_executions": recent_stage_executions,
-        "current_stage_recent_capabilities": current_stage_recent_capabilities,
+        "recent_capability_executions": recent_capability_executions,
         "execution_event_limit": execution_event_limit
     }))
 }
@@ -1058,7 +1037,7 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
             "stage_template": [],
             "stage_template_error": "No workflow template is configured for this supervisor pool.",
             "recent_stage_executions": [],
-            "current_stage_recent_capabilities": []
+            "recent_capability_executions": []
         }));
     };
 
@@ -1078,7 +1057,7 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
             "stage_template": [],
             "stage_template_error": "Configured workflow template was not found.",
             "recent_stage_executions": [],
-            "current_stage_recent_capabilities": []
+            "recent_capability_executions": []
         }));
     };
 
@@ -1096,7 +1075,7 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
         "stage_template": stage_template,
         "stage_template_error": stage_template_error,
         "recent_stage_executions": [],
-        "current_stage_recent_capabilities": []
+        "recent_capability_executions": []
     }))
 }
 
@@ -1105,7 +1084,7 @@ fn empty_telemetry() -> Value {
         "status": null,
         "current_step_id": null,
         "recent_stage_executions": [],
-        "current_stage_recent_capabilities": []
+        "recent_capability_executions": []
     })
 }
 

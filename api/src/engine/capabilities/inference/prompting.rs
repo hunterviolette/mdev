@@ -32,6 +32,7 @@ pub struct ModelInputBlock {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInput {
     pub text: String,
+    pub pasted_context_text: Option<String>,
     pub attachments: Vec<ModelAttachment>,
     pub input_blocks: Vec<ModelInputBlock>,
     pub consumed_input_ids: Vec<Uuid>,
@@ -71,6 +72,35 @@ fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<String> 
     } else {
         Some(value.to_string())
     }
+}
+
+fn configured_stage_user_input(ctx: &CapabilityContext<'_>) -> Option<(String, String)> {
+    for key in ["model_input_blocks", "prompt_blocks", "composed_prompt_blocks"] {
+        let Some(blocks) = ctx.local_state.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+
+        let Some(block) = blocks.iter().find(|block| {
+            block.get("role").and_then(Value::as_str) == Some("user")
+                || block.get("key").and_then(Value::as_str) == Some("user_input")
+                || block.get("id").and_then(Value::as_str) == Some("user_input")
+        }) else {
+            continue;
+        };
+
+        let Some(content) = block
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        return Some(("user_input".to_string(), content.to_string()));
+    }
+
+    None
 }
 
 fn orchestration_blocks(
@@ -186,10 +216,12 @@ pub fn build_model_input(
     let consumed_input_ids = resolved.iter().map(|item| item.id).collect::<Vec<_>>();
     let (primary, mut input_blocks, mut attachments) = orchestration_blocks(&resolved);
 
-    let primary = primary.or_else(|| {
-        configured_default_user_input(ctx)
-            .map(|value| ("empty_user_input_default".to_string(), value))
-    });
+    let primary = primary
+        .or_else(|| configured_stage_user_input(ctx))
+        .or_else(|| {
+            configured_default_user_input(ctx)
+                .map(|value| ("empty_user_input_default".to_string(), value))
+        });
 
     let mut sections = Vec::new();
 
@@ -199,21 +231,28 @@ pub fn build_model_input(
             0,
             ModelInputBlock {
                 source: source.clone(),
-                label: if source == "user_instruction" {
-                    "User instruction".to_string()
-                } else {
-                    "Default user instruction".to_string()
+                label: match source.as_str() {
+                    "user_instruction" | "user_input" => "User instruction".to_string(),
+                    _ => "Default user instruction".to_string(),
                 },
                 content: text.clone(),
             },
         );
     }
 
+    let mut pasted_context_sections = Vec::new();
+
     for block in &input_blocks {
-        if !matches!(
+        if matches!(
             block.source.as_str(),
-            "user_instruction" | "empty_user_input_default"
+            "user_instruction" | "user_input" | "empty_user_input_default"
         ) {
+            continue;
+        }
+
+        if block.source == "compile_commands" {
+            append_unique_section(&mut pasted_context_sections, block.content.clone());
+        } else {
             append_unique_section(&mut sections, block.content.clone());
         }
     }
@@ -231,12 +270,22 @@ pub fn build_model_input(
     }
 
     let text = sections.join("\n\n");
+    let pasted_context_text = if pasted_context_sections.is_empty() {
+        None
+    } else {
+        Some(pasted_context_sections.join("\n\n"))
+    };
 
     tracing::info!(
         run_id = %ctx.run_id,
         step_id = %ctx.step.id,
         primary_input_source = ?primary.as_ref().map(|item| item.0.as_str()),
         text_length = text.chars().count(),
+        pasted_context_length = pasted_context_text
+            .as_deref()
+            .map(str::chars)
+            .map(Iterator::count)
+            .unwrap_or(0),
         attachment_count = attachments.len(),
         orchestration_input_count = resolved.len(),
         "central model input built"
@@ -244,6 +293,7 @@ pub fn build_model_input(
 
     Ok(ModelInput {
         text,
+        pasted_context_text,
         attachments,
         input_blocks,
         consumed_input_ids,

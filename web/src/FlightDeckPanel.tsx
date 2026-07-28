@@ -368,7 +368,12 @@ function buildCapabilityProjection(unit: FlightDeckWorkUnit): CapabilityProjecti
 
   const byInvocation = new Map<string, CapabilityProjection>();
 
-  telemetryArray(unit, 'current_stage_recent_capabilities').forEach((capability, index) => {
+  const recentCapabilities = telemetryArray(unit, 'recent_capability_executions');
+  const capabilityEvents = recentCapabilities.length > 0
+    ? recentCapabilities
+    : telemetryArray(unit, 'current_stage_recent_capabilities');
+
+  capabilityEvents.forEach((capability, index) => {
     const id = textField(capability, 'capability_invocation_id') || `${unit.id}-capability-${index}`;
     const nextState = textField(capability, 'status') || 'event';
     const existing = byInvocation.get(id);

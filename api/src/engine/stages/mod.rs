@@ -1,4 +1,3 @@
-pub mod capability_contract;
 mod code_stage;
 mod compile_stage;
 mod design_stage;
@@ -18,19 +17,96 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    engine::{
-        capabilities::inference::stage_support::{
-            build_inference_execution_plan,
-            InferenceStageSettings,
-        },
-        orchestration_inputs::OrchestrationInputPayload,
-    },
-    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowCapabilityBinding, WorkflowRun, WorkflowStepDefinition},
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
 };
 
-use super::capabilities::{execute_capability_invocations, planner, CapabilityContext, CapabilityInvocation};
+use super::capabilities::{
+    execute_capability_invocations,
+    planner,
+    CapabilityContext,
+    CapabilityInvocation,
+};
 use super::governance;
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
+
+pub struct StageRegistration {
+    implementation: &'static dyn Stage,
+}
+
+impl StageRegistration {
+    pub const fn new(implementation: &'static dyn Stage) -> Self {
+        Self { implementation }
+    }
+}
+
+inventory::collect!(StageRegistration);
+
+fn stage_registry() -> &'static std::collections::HashMap<&'static str, &'static dyn Stage> {
+    static REGISTRY: std::sync::OnceLock<
+        std::collections::HashMap<&'static str, &'static dyn Stage>,
+    > = std::sync::OnceLock::new();
+
+    REGISTRY.get_or_init(|| {
+        let mut stages = std::collections::HashMap::new();
+
+        for registration in inventory::iter::<StageRegistration> {
+            let stage = registration.implementation;
+            let stage_type = stage.stage_type();
+
+            if stages.insert(stage_type, stage).is_some() {
+                panic!("duplicate stage type registered: {stage_type}");
+            }
+        }
+
+        stages
+    })
+}
+
+pub struct StagePrepareContext<'a> {
+    pub repo_ref: &'a str,
+    pub global_state: &'a Value,
+    pub step: &'a WorkflowStepDefinition,
+}
+
+pub struct StagePlanContext<'a> {
+    pub run: &'a mut WorkflowRun,
+    pub automatic_execution: bool,
+    pub global_state: &'a Value,
+    pub repo_ref: &'a str,
+    pub step: &'a WorkflowStepDefinition,
+    pub local_state: &'a Value,
+}
+
+pub trait Stage: Send + Sync {
+    fn stage_type(&self) -> &'static str;
+
+    fn capabilities(&self) -> StageCapabilities;
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value>;
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>>;
+
+    fn lifecycle_hook(&self) -> Box<dyn StageLifecycleHook> {
+        Box::new(NoopStageLifecycleHook)
+    }
+}
+
+fn stage_for_step(step: &WorkflowStepDefinition) -> &'static dyn Stage {
+    let registry = stage_registry();
+
+    registry
+        .get(step.step_type.as_str())
+        .copied()
+        .or_else(|| registry.get("design").copied())
+        .expect("design stage must be registered")
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -53,21 +129,56 @@ pub struct StageOutcome {
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
-    pub transient_prompt_fragments: Vec<OrchestrationInputPayload>,
 }
 
-pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> capability_contract::StageCapabilities {
-    match step.step_type.as_str() {
-        "code" => code_stage::capabilities(),
-        "compile" => compile_stage::capabilities(),
-        "qa" => qa_stage::capabilities(),
-        "review" => review_stage::capabilities(),
-        "merge_patches" => merge_patches_stage::capabilities(),
-        "sap_import" => sap_import_stage::capabilities(),
-        "sap_syntax" => sap_syntax_stage::capabilities(),
-        "sap_export" => sap_export_stage::capabilities(),
-        _ => design_stage::capabilities(),
+#[derive(Debug, Clone)]
+pub struct StageCapabilities {
+    keys: Vec<&'static str>,
+}
+
+impl StageCapabilities {
+    pub fn new<const N: usize>(keys: [&'static str; N]) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+        }
     }
+
+    pub fn empty() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.iter().any(|item| *item == key)
+    }
+
+    pub fn keys(&self) -> &[&'static str] {
+        &self.keys
+    }
+}
+
+pub fn configured_execution_plan(step: &WorkflowStepDefinition) -> Vec<StageExecutionNode> {
+    if !step.execution_plan.is_empty() {
+        return step.execution_plan.clone();
+    }
+
+    step.capabilities
+        .iter()
+        .filter(|binding| binding.enabled)
+        .map(|binding| StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: binding.capability.clone(),
+            enabled: true,
+            config: binding.config.clone(),
+            input_mapping: binding.input_mapping.clone(),
+            output_mapping: binding.output_mapping.clone(),
+            run_after: Vec::new(),
+            condition: Value::Null,
+        })
+        .collect()
+}
+
+pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> StageCapabilities {
+    stage_for_step(step).capabilities()
 }
 
 fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -175,89 +286,29 @@ fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
     }
 }
 
-fn operator_checkpoint_result(capability_results: &[Value]) -> Option<Value> {
+fn capability_user_input_result(capability_results: &[Value]) -> Option<Value> {
     capability_results.iter().find_map(|item| {
-        if item.get("key").and_then(Value::as_str) != Some("operator_checkpoint") {
+        let capability = item
+            .get("key")
+            .or_else(|| item.get("capability"))
+            .and_then(Value::as_str)?;
+        let mut result = item
+            .get("result")
+            .or_else(|| item.get("payload"))?
+            .clone();
+
+        if result.get("needs_user_response").and_then(Value::as_bool) != Some(true) {
             return None;
         }
-        let result = item.get("result")?.clone();
-        if result.get("needs_user_response").and_then(Value::as_bool) == Some(true) {
-            Some(result)
-        } else {
-            None
+
+        if let Some(result_obj) = result.as_object_mut() {
+            result_obj
+                .entry("capability".to_string())
+                .or_insert_with(|| Value::String(capability.to_string()));
         }
+
+        Some(result)
     })
-}
-
-fn stage_operator_checkpoint_enabled(local_state: &Value) -> bool {
-    let automation = local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"));
-
-    automation
-        .and_then(|v| v.get("user_checkpoint"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            automation
-                .and_then(|v| v.get("disposition_review"))
-                .and_then(|v| v.get("enabled"))
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(false)
-}
-
-fn operator_checkpoint_config(local_state: &Value) -> Value {
-    let automation = local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"));
-
-    let configured = automation
-        .and_then(|v| v.get("user_checkpoint"))
-        .cloned()
-        .or_else(|| automation.and_then(|v| v.get("disposition_review")).cloned())
-        .unwrap_or_else(|| json!({}));
-
-    let mut config = if configured.is_object() { configured } else { json!({}) };
-    if let Some(obj) = config.as_object_mut() {
-        obj.entry("available_dispositions".to_string()).or_insert_with(|| {
-            json!(["continue_auto", "pause_error", "select_stage"])
-        });
-        obj.entry("recommended_disposition".to_string()).or_insert_with(|| json!("continue_auto"));
-    }
-    config
-}
-
-fn apply_configured_operator_checkpoint(
-    mut plan: Vec<StageExecutionNode>,
-    local_state: &Value,
-) -> Vec<StageExecutionNode> {
-    if plan
-        .iter()
-        .any(|node| node.kind == StageExecutionNodeKind::Capability && node.key == "operator_checkpoint")
-        || !stage_operator_checkpoint_enabled(local_state)
-    {
-        return plan;
-    }
-
-    let run_after = plan
-        .iter()
-        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
-        .map(|node| node.key.clone())
-        .collect::<Vec<_>>();
-
-    plan.push(StageExecutionNode {
-        kind: StageExecutionNodeKind::Capability,
-        key: "operator_checkpoint".to_string(),
-        enabled: true,
-        config: operator_checkpoint_config(local_state),
-        input_mapping: json!({}),
-        output_mapping: json!({}),
-        run_after,
-        condition: Value::Null,
-    });
-
-    plan
 }
 
 pub struct StageExitContext<'a> {
@@ -268,26 +319,6 @@ pub struct StageExitContext<'a> {
 }
 
 pub trait StageLifecycleHook: Send + Sync {
-    fn prepare_plan(
-        &self,
-        _run: &mut WorkflowRun,
-        _step: &WorkflowStepDefinition,
-        _automatic_execution: bool,
-        _local_state: &Value,
-        plan: Vec<StageExecutionNode>,
-    ) -> Vec<StageExecutionNode> {
-        plan
-    }
-
-    fn on_checkpoint_continue(
-        &self,
-        _run: &mut WorkflowRun,
-        _step: &WorkflowStepDefinition,
-        _phase: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     fn on_restart<'a>(
         &'a self,
         _context: StageExitContext<'a>,
@@ -313,28 +344,7 @@ impl StageLifecycleHook for NoopStageLifecycleHook {
 }
 
 pub fn lifecycle_hook_for_step(step: &WorkflowStepDefinition) -> Box<dyn StageLifecycleHook> {
-    match step.step_type.as_str() {
-        "qa" => Box::new(qa_stage::QaStageLifecycleHook),
-        _ => Box::new(NoopStageLifecycleHook),
-    }
-}
-
-pub fn prepare_stage_execution_plan(
-    run: &mut WorkflowRun,
-    step: &WorkflowStepDefinition,
-    automatic_execution: bool,
-    local_state: &Value,
-    plan: Vec<StageExecutionNode>,
-) -> Vec<StageExecutionNode> {
-    let plan = lifecycle_hook_for_step(step).prepare_plan(
-        run,
-        step,
-        automatic_execution,
-        local_state,
-        plan,
-    );
-
-    apply_configured_operator_checkpoint(plan, local_state)
+    stage_for_step(step).lifecycle_hook()
 }
 
 pub fn record_stage_checkpoint_continue(
@@ -342,7 +352,26 @@ pub fn record_stage_checkpoint_continue(
     step: &WorkflowStepDefinition,
     phase: &str,
 ) -> Result<()> {
-    lifecycle_hook_for_step(step).on_checkpoint_continue(run, step, phase)
+    if phase != "before_stage" {
+        return Ok(());
+    }
+
+    let root = ensure_engine_root(&mut run.context);
+    let run_state = root
+        .entry("run_state".to_string())
+        .or_insert_with(|| json!({}));
+    let run_state = run_state
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("run_state must be object"))?;
+    run_state.insert(
+        "stage_checkpoint_approval".to_string(),
+        json!({
+            "step_id": step.id,
+            "phase": phase
+        }),
+    );
+
+    Ok(())
 }
 
 pub async fn invoke_stage_restart_hook(
@@ -477,22 +506,25 @@ pub async fn execute_stage(
         step,
         local_state,
     )?;
-    if step.step_type.as_str() == "merge_patches" {
-        return merge_patches_stage::execute_stage(state, run_id, run, step, repo_ref.as_str(), prepared_local_state).await;
+    if stage_for_step(step).stage_type() == "merge_patches" {
+        return merge_patches_stage::execute_stage(
+            state,
+            run_id,
+            run,
+            step,
+            repo_ref.as_str(),
+            prepared_local_state,
+        )
+        .await;
     }
     let plan = resolve_effective_execution_plan(
+        run,
+        automatic_execution,
         &execution_global_state,
         repo_ref.as_str(),
         step,
         &prepared_local_state,
     )?;
-    let plan = prepare_stage_execution_plan(
-        run,
-        step,
-        automatic_execution,
-        &prepared_local_state,
-        plan,
-    );
     persist_context(state, run_id, &run.context).await?;
     let prepared_local_state_obj = prepared_local_state
         .as_object()
@@ -531,7 +563,6 @@ pub async fn execute_stage(
             message,
             capability_results,
             local_state: Value::Object(prepared_local_state_obj.clone()),
-            transient_prompt_fragments: Vec::new(),
         });
     }
 
@@ -572,25 +603,25 @@ pub async fn execute_stage(
         message: branch.message.clone(),
         capability_results: capability_results.clone(),
         local_state: prepared_local_state,
-        transient_prompt_fragments: branch.transient_prompt_fragments.clone(),
     };
 
-    let pending_operator_checkpoint = outcome.ok
-        && operator_checkpoint_result(&outcome.capability_results).is_some();
-    let checkpoint_payload = operator_checkpoint_result(&outcome.capability_results).unwrap_or_else(|| json!({}));
+    let pending_capability_user_input = outcome.ok
+        && capability_user_input_result(&outcome.capability_results).is_some();
+    let user_input_payload = capability_user_input_result(&outcome.capability_results)
+        .unwrap_or_else(|| json!({}));
 
     append_engine_event(
         state,
         run_id,
         Some(step.id.as_str()),
         if outcome.ok { "info" } else { "error" },
-        if pending_operator_checkpoint {
-            "stage_execution_waiting_for_operator_checkpoint"
+        if pending_capability_user_input {
+            "stage_execution_state_changed"
         } else {
             "stage_execution_completed"
         },
-        if pending_operator_checkpoint {
-            "Stage execution is waiting for operator checkpoint."
+        if pending_capability_user_input {
+            "Stage execution is awaiting capability user input."
         } else {
             "Stage executed through backend workflow engine"
         },
@@ -598,11 +629,15 @@ pub async fn execute_stage(
             "step_id": step.id,
             "step_type": step.step_type,
             "ok": outcome.ok,
-            "pending_operator_checkpoint": pending_operator_checkpoint,
-            "checkpoint": checkpoint_payload,
+            "execution_state": if pending_capability_user_input { "awaiting_user_input" } else { "completed" },
+            "user_input": user_input_payload,
             "message": outcome.message,
             "disposition": format_disposition(&outcome.disposition),
-            "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "duration_ms": if pending_capability_user_input {
+                Value::Null
+            } else {
+                json!(i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX))
+            },
             "capability_results": outcome.capability_results,
             "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
         }),
@@ -618,16 +653,14 @@ fn prepare_stage_local_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
-    match step.step_type.as_str() {
-        "code" => code_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
-        "compile" => compile_stage::prepare_stage_state(step, local_state),
-        "review" => review_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
-        "merge_patches" => merge_patches_stage::prepare_stage_state(step, local_state),
-        "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
-        "sap_syntax" => sap_syntax_stage::prepare_stage_state(step, local_state),
-        "sap_export" => sap_export_stage::prepare_stage_state(step, local_state),
-        _ => design_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
-    }
+    stage_for_step(step).prepare_state(
+        StagePrepareContext {
+            repo_ref,
+            global_state,
+            step,
+        },
+        local_state,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -635,7 +668,6 @@ struct StageBranch {
     disposition: StageDisposition,
     message: String,
     patch: Option<Value>,
-    transient_prompt_fragments: Vec<OrchestrationInputPayload>,
 }
 
 fn resolve_stage_branch(
@@ -656,9 +688,6 @@ fn resolve_stage_branch(
         .unwrap_or_else(|| Value::Object(Map::new()));
 
     let patch = build_branch_patch(step, &branch, capability_results);
-    let transient_prompt_fragments =
-        build_branch_transient_prompt_fragments(step, &branch, capability_results);
-
     let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
 
     StageBranch {
@@ -670,7 +699,6 @@ fn resolve_stage_branch(
             .map(ToString::to_string)
             .unwrap_or_else(|| default_branch_message(step, capability_failed, &disposition)),
         patch,
-        transient_prompt_fragments,
     }
 }
 
@@ -699,61 +727,6 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
         }
         _ => None,
     }
-}
-
-fn build_branch_transient_prompt_fragments(
-    step: &WorkflowStepDefinition,
-    branch: &Value,
-    capability_results: &[Value],
-) -> Vec<OrchestrationInputPayload> {
-    let mut fragments = Vec::new();
-
-    fragments.extend(capability_results.iter().filter_map(|item| {
-        let contribution = item
-            .get("result")
-            .and_then(|result| result.get("prompt_contribution"))?
-            .clone();
-
-        serde_json::from_value::<OrchestrationInputPayload>(contribution).ok()
-    }));
-
-    let planner_apply_failed = capability_results.iter().any(|item| {
-        item.get("key").and_then(Value::as_str) == Some("planner_apply")
-            && item.get("ok").and_then(Value::as_bool) == Some(false)
-    });
-
-    if planner_apply_failed {
-        fragments.push(OrchestrationInputPayload::PromptContribution {
-            text: planner::apply::build_apply_error_feedback(capability_results),
-            source: Some("planner_apply".to_string()),
-            label: Some("Previous planner application failure".to_string()),
-        });
-    }
-
-    let Some(descriptor) = branch.get("patch_from_capability") else {
-        return fragments;
-    };
-    let capability = descriptor
-        .get("capability")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mode = descriptor
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    if matches!(
-        (step.step_type.as_str(), capability, mode),
-        ("code", "changeset", "apply_error_to_code_prompt")
-    ) {
-        fragments.push(OrchestrationInputPayload::PromptContribution {
-            text: code_stage::build_apply_error_feedback(capability_results),
-            source: Some("changeset".to_string()),
-            label: Some("Previous ChangeSet application failure".to_string()),
-        });
-    }
-
-    fragments
 }
 
 fn parse_stage_disposition(
@@ -922,101 +895,26 @@ fn materialize_capability_runtime_state(stage_state: Value, global_state: &Value
 }
 
 fn resolve_effective_execution_plan(
+    run: &mut WorkflowRun,
+    automatic_execution: bool,
     global_state: &Value,
     repo_ref: &str,
     step: &WorkflowStepDefinition,
     local_state: &Value,
 ) -> Result<Vec<StageExecutionNode>> {
-    let plan = match step.step_type.as_str() {
-        "code" => build_inference_execution_plan(
-            repo_ref,
-            global_state,
-            step,
-            local_state,
-            InferenceStageSettings {
-                include_changeset_schema: step.prompt.include_changeset_schema,
-            },
-        )?,
-        "design" => build_inference_execution_plan(
-            repo_ref,
-            global_state,
-            step,
-            local_state,
-            InferenceStageSettings {
-                include_changeset_schema: false,
-            },
-        )?,
-        "review" => review_stage::build_review_execution_plan(
-            repo_ref,
-            global_state,
-            step,
-            local_state,
-        )?,
-        "compile" => vec![
-            StageExecutionNode {
-                kind: StageExecutionNodeKind::Capability,
-                key: "shared_dependencies".to_string(),
-                enabled: true,
-                config: json!({}),
-                input_mapping: json!({}),
-                output_mapping: json!({}),
-                run_after: vec![],
-                condition: Value::Null,
-            },
-            StageExecutionNode {
-                kind: StageExecutionNodeKind::Capability,
-                key: "compile_commands".to_string(),
-                enabled: true,
-                config: json!({}),
-                input_mapping: json!({}),
-                output_mapping: json!({}),
-                run_after: vec!["shared_dependencies".to_string()],
-                condition: Value::Null,
-            },
-        ],
-        "merge_patches" => vec![StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "git_patch_payload".to_string(),
-            enabled: true,
-            config: json!({}),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec![],
-            condition: Value::Null,
-        }],
-        _ => {
-            if !step.execution_plan.is_empty() {
-                step.execution_plan.clone()
-            } else {
-                synthesize_execution_plan(&step.capabilities)
-            }
-        }
-    };
-
-    Ok(plan)
-}
-
-fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<StageExecutionNode> {
-    bindings
-        .iter()
-        .filter(|binding| binding.enabled)
-        .map(|binding| StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: binding.capability.clone(),
-            enabled: true,
-            config: binding.config.clone(),
-            input_mapping: binding.input_mapping.clone(),
-            output_mapping: binding.output_mapping.clone(),
-            run_after: Vec::new(),
-            condition: Value::Null,
-        })
-        .collect()
+    stage_for_step(step).build_execution_plan(StagePlanContext {
+        run,
+        automatic_execution,
+        global_state,
+        repo_ref,
+        step,
+        local_state,
+    })
 }
 
 pub(crate) fn compose_prompt_from_state(
     enabled: &Value,
     fragments: &Value,
-    transient_fragments: &[String],
 ) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
@@ -1029,13 +927,6 @@ pub(crate) fn compose_prompt_from_state(
             continue;
         }
         let value = fragments_obj.get(key).and_then(Value::as_str).unwrap_or("").trim();
-        if !value.is_empty() {
-            parts.push(value.to_string());
-        }
-    }
-
-    for value in transient_fragments {
-        let value = value.trim();
         if !value.is_empty() {
             parts.push(value.to_string());
         }

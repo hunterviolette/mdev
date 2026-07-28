@@ -3,11 +3,54 @@ use serde_json::{json, Value};
 
 use crate::models::WorkflowStepDefinition;
 
-pub fn capabilities() -> crate::engine::stages::capability_contract::StageCapabilities {
-    crate::engine::stages::capability_contract::StageCapabilities::new(["sap/export"])
+use super::{
+    configured_execution_plan,
+    Stage,
+    StageCapabilities,
+    StagePlanContext,
+    StagePrepareContext,
+};
+
+pub struct SapExportStage;
+
+pub static STAGE: SapExportStage = SapExportStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(
+impl Stage for SapExportStage {
+    fn stage_type(&self) -> &'static str {
+        "sap_export"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["sap/export"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_sap_export_state(context.step, local_state)
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<crate::models::StageExecutionNode>> {
+        Ok(build_sap_export_execution_plan(context.step))
+    }
+}
+
+fn build_sap_export_execution_plan(
+    step: &WorkflowStepDefinition,
+) -> Vec<crate::models::StageExecutionNode> {
+    configured_execution_plan(step)
+}
+
+fn prepare_sap_export_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {

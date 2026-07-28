@@ -4,7 +4,23 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{app_state::AppState, engine::{append_engine_event, event_meta, governance, load_run, persist_context}, models::{StageExecutionNodeKind, WorkflowStepDefinition}};
+use crate::{
+    app_state::AppState,
+    engine::{
+        append_engine_event,
+        event_meta,
+        governance,
+        load_run,
+        orchestration_inputs::{
+            AttachmentRole,
+            OrchestrationInputLifecycle,
+            OrchestrationInputPayload,
+            OrchestrationInputScope,
+        },
+        persist_context,
+    },
+    models::{StageExecutionNodeKind, WorkflowStepDefinition},
+};
 
 use super::{binding_specs, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, review_validation, sap, shared_dependencies};
 
@@ -21,6 +37,58 @@ pub struct CapabilityContext<'a> {
     pub repo_ref: &'a str,
     pub step: &'a WorkflowStepDefinition,
     pub local_state: &'a Value,
+}
+
+impl CapabilityContext<'_> {
+    pub fn provide_prompt_text(
+        &self,
+        source: impl Into<String>,
+        label: impl Into<String>,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        self.state.orchestration_inputs.publish(
+            self.run_id,
+            OrchestrationInputScope::Run,
+            OrchestrationInputLifecycle::SingleUse,
+            500,
+            OrchestrationInputPayload::PromptContribution {
+                text,
+                source: Some(source.into()),
+                label: Some(label.into()),
+            },
+        );
+    }
+
+    pub fn provide_prompt_attachment(
+        &self,
+        path: impl Into<String>,
+        filename: impl Into<String>,
+        media_type: Option<String>,
+        role: AttachmentRole,
+    ) {
+        let path = path.into();
+        if path.trim().is_empty() {
+            return;
+        }
+
+        self.state.orchestration_inputs.publish(
+            self.run_id,
+            OrchestrationInputScope::Run,
+            OrchestrationInputLifecycle::SingleUse,
+            500,
+            OrchestrationInputPayload::Attachment {
+                path,
+                filename: filename.into(),
+                media_type,
+                role,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -278,15 +346,33 @@ pub(crate) async fn execute_capability_chain(
             governance::injected_capabilities(&after_decisions)
         };
 
-        let capability_waiting_for_user = result.capability == "operator_checkpoint"
-            && result.payload.get("needs_user_response").and_then(Value::as_bool) == Some(true);
+        let capability_waiting_for_user = result
+            .payload
+            .get("needs_user_response")
+            .and_then(Value::as_bool)
+            == Some(true);
+
+        if let Some(payload) = result.payload.as_object_mut() {
+            payload.insert(
+                "execution_state".to_string(),
+                Value::String(
+                    if capability_waiting_for_user {
+                        "awaiting_user_input"
+                    } else {
+                        "completed"
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+
         let capability_event_kind = if capability_waiting_for_user {
-            format!("{}_waiting", result.capability)
+            "capability_execution_state_changed".to_string()
         } else {
             format!("{}_completed", result.capability)
         };
         let capability_event_message = if capability_waiting_for_user {
-            "Operator checkpoint is waiting for user input.".to_string()
+            format!("{} is awaiting user input", result.capability.replace('_', " "))
         } else {
             format!("{} completed", result.capability.replace('_', " "))
         };
@@ -301,8 +387,12 @@ pub(crate) async fn execute_capability_chain(
             json!({
                 "capability": result.capability,
                 "ok": result.ok,
-                "waiting_for_user": capability_waiting_for_user,
-                "duration_ms": i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                "execution_state": if capability_waiting_for_user { "awaiting_user_input" } else { "completed" },
+                "duration_ms": if capability_waiting_for_user {
+                    Value::Null
+                } else {
+                    json!(i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX))
+                },
                 "result": result.payload,
                 "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
             }),

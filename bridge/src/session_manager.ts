@@ -458,8 +458,7 @@ export class SessionManager {
       await composer.evaluate((el) => {
         el.focus();
         el.textContent = '';
-        const root = el;
-        root.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
       });
       await page.keyboard.insertText(text);
       return;
@@ -476,9 +475,20 @@ export class SessionManager {
   }
 
   private async appendChatComposerText(page: Page, composer: Locator, text: string): Promise<void> {
+    if (text.trim().length === 0) {
+      return;
+    }
+
     await composer.click({ timeout: 20000 });
     const spacer = text.startsWith('\n') ? '' : '\n\n';
-    await page.keyboard.insertText(spacer + text);
+    const value = spacer + text;
+
+    if (value.length >= 4096) {
+      await this.pasteLargeContextAsClipboardText(page, composer, value);
+      return;
+    }
+
+    await page.keyboard.insertText(value);
   }
 
   private async pasteLargeContextAsClipboardText(page: Page, composer: Locator, text: string): Promise<void> {
@@ -512,16 +522,15 @@ export class SessionManager {
     const composer = await this.findVisibleChatComposer(state.page, timeout, inputSelector, state.domPollMs);
     const pastedContext = Boolean(cmd.pasted_context_text?.trim());
 
+    await this.writeChatComposerText(state.page, composer, cmd.text);
+
     if (pastedContext) {
       await this.pasteLargeContextAsClipboardText(state.page, composer, cmd.pasted_context_text ?? '');
       await state.page.waitForTimeout(15000);
-      await this.appendChatComposerText(state.page, composer, cmd.text);
-    } else {
-      await this.writeChatComposerText(state.page, composer, cmd.text);
     }
 
     const beforeSendText = await this.readComposerText(composer);
-    if (beforeSendText.length === 0 && !pastedContext) {
+    if (beforeSendText.length === 0) {
       state.lastResponseBaseline = undefined;
       return {
         session_id: state.sessionId,

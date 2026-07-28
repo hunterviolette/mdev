@@ -280,8 +280,33 @@ pub async fn execute(
         }
     }
 
+    let ok = result
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if !ok {
+        let lines = result
+            .get("lines")
+            .and_then(Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        ctx.provide_prompt_text(
+            "changeset_apply",
+            "ChangeSet apply errors",
+            lines,
+        );
+    }
+
     Ok(CapabilityResult {
-        ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        ok,
         capability: "changeset".to_string(),
         payload: result,
         follow_ups: CapabilityInvocationRequest::None,

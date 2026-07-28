@@ -438,9 +438,15 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if blocked_kind != "operator_checkpoint" {
-        return Err(anyhow!("workflow is blocked on {}, not operator_checkpoint", blocked_kind));
+    if blocked_kind != "capability_user_input" && blocked_kind != "operator_checkpoint" {
+        return Err(anyhow!("workflow is blocked on {}, not capability user input", blocked_kind));
     }
+
+    let blocked_capability = blocked_on
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or("operator_checkpoint")
+        .to_string();
 
     let stage_id = blocked_on
         .get("stage_id")
@@ -509,12 +515,12 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         run_id,
         Some(stage_id.as_str()),
         if checkpoint_ok { "info" } else { "warn" },
-        "operator_checkpoint_completed",
-        if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
+        format!("{}_completed", blocked_capability).as_str(),
+        if checkpoint_ok { "Capability user input resolved." } else { "Capability user input paused workflow." },
         json!({
-            "capability": "operator_checkpoint",
+            "capability": blocked_capability,
             "ok": checkpoint_ok,
-            "waiting_for_user": false,
+            "execution_state": "completed",
             "disposition": normalized_disposition,
             "result": {
                 "ok": checkpoint_ok,
@@ -621,7 +627,7 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                     stage_execution_id.as_deref(),
                     true,
                     "complete",
-                    "Final workflow stage completed successfully after disposition review.",
+                    "Final workflow stage completed successfully after operator checkpoint.",
                     None,
                 ).await?;
 
@@ -677,7 +683,7 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 )
                 .await?;
 
-                return continue_from_disposition_transition(
+                return continue_from_operator_checkpoint(
                     state,
                     run_id,
                     stage_id.as_str(),
@@ -748,8 +754,8 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 run_id,
                 Some(target.as_str()),
                 "info",
-                "disposition_transition_committed",
-                "Disposition review transition committed before backend continuation.",
+                "operator_checkpoint_transition_committed",
+                "Operator checkpoint transition committed before backend continuation.",
                 json!({
                     "disposition": normalized_disposition,
                     "from_step_id": stage_id,
@@ -759,7 +765,7 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 }),
             ).await?;
 
-            continue_from_disposition_transition(
+            continue_from_operator_checkpoint(
                 state,
                 run_id,
                 target.as_str(),
@@ -771,72 +777,68 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
     }
 }
 
-pub async fn resolve_disposition_review(state: &AppState, run_id: Uuid, disposition: &str) -> Result<serde_json::Value> {
-    resolve_operator_checkpoint(state, run_id, disposition, None).await
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DispositionFollowupAction {
+enum CheckpointFollowupAction {
     StartAutonomous,
     RunStage,
     Pause,
     None,
 }
 
-fn resolve_disposition_followup_action(
+fn resolve_checkpoint_followup_action(
     resume_mode: &str,
     target_step: &super::WorkflowStepDefinition,
-) -> DispositionFollowupAction {
+) -> CheckpointFollowupAction {
     match resume_mode {
-        "autonomous" => DispositionFollowupAction::StartAutonomous,
-        "pause" | "paused" => DispositionFollowupAction::Pause,
-        "none" | "wait" | "waiting" => DispositionFollowupAction::None,
-        _ if step_is_auto_runnable(target_step) => DispositionFollowupAction::StartAutonomous,
-        _ => DispositionFollowupAction::RunStage,
+        "autonomous" => CheckpointFollowupAction::StartAutonomous,
+        "pause" | "paused" => CheckpointFollowupAction::Pause,
+        "none" | "wait" | "waiting" => CheckpointFollowupAction::None,
+        _ if step_is_auto_runnable(target_step) => CheckpointFollowupAction::StartAutonomous,
+        _ => CheckpointFollowupAction::RunStage,
     }
 }
 
-fn format_disposition_followup_action(action: DispositionFollowupAction) -> &'static str {
+fn format_checkpoint_followup_action(action: CheckpointFollowupAction) -> &'static str {
     match action {
-        DispositionFollowupAction::StartAutonomous => "start_run",
-        DispositionFollowupAction::RunStage => "run_step",
-        DispositionFollowupAction::Pause => "pause",
-        DispositionFollowupAction::None => "none",
+        CheckpointFollowupAction::StartAutonomous => "start_run",
+        CheckpointFollowupAction::RunStage => "run_step",
+        CheckpointFollowupAction::Pause => "pause",
+        CheckpointFollowupAction::None => "none",
     }
 }
 
-async fn continue_from_disposition_transition(
+async fn continue_from_operator_checkpoint(
     state: &AppState,
     run_id: Uuid,
     target_step_id: &str,
     resume_mode: &str,
     target_step: &super::WorkflowStepDefinition,
 ) -> Result<serde_json::Value> {
-    let followup_action = resolve_disposition_followup_action(resume_mode, target_step);
+    let followup_action = resolve_checkpoint_followup_action(resume_mode, target_step);
 
     append_engine_event(
         state,
         run_id,
         Some(target_step_id),
         "info",
-        "disposition_transition_committed",
-        "Disposition review transition committed; backend continuation policy selected follow-up action.",
+        "operator_checkpoint_transition_committed",
+        "Operator checkpoint transition committed; backend continuation policy selected follow-up action.",
         json!({
             "step_id": target_step_id,
             "resume_mode": resume_mode,
             "auto_runnable": step_is_auto_runnable(target_step),
-            "followup_action": format_disposition_followup_action(followup_action),
+            "followup_action": format_checkpoint_followup_action(followup_action),
         }),
     ).await?;
 
     match followup_action {
-        DispositionFollowupAction::StartAutonomous => {
+        CheckpointFollowupAction::StartAutonomous => {
             start_run(state, run_id, Some(target_step_id)).await
         }
-        DispositionFollowupAction::RunStage => {
+        CheckpointFollowupAction::RunStage => {
             run_step(state, run_id, Some(target_step_id)).await
         }
-        DispositionFollowupAction::Pause => {
+        CheckpointFollowupAction::Pause => {
             set_run_status(state, run_id, RunStatus::Paused, Some(target_step_id)).await?;
             Ok(json!({
                 "ok": true,
@@ -846,7 +848,7 @@ async fn continue_from_disposition_transition(
                 "followup_action": "pause"
             }))
         }
-        DispositionFollowupAction::None => {
+        CheckpointFollowupAction::None => {
             set_run_status(state, run_id, RunStatus::Waiting, Some(target_step_id)).await?;
             Ok(json!({
                 "ok": true,
@@ -1055,7 +1057,7 @@ pub async fn restart_stage(
     }
 
     if blocked_checkpoint {
-        clear_pending_disposition_review(&mut run);
+        clear_pending_capability_user_input(&mut run);
         persist_context(state, run_id, &run.context).await?;
     }
 
@@ -1150,84 +1152,48 @@ fn clear_run_cancel_requested(run: &mut super::WorkflowRun) {
     }
 }
 
-fn operator_checkpoint_result(outcome: &super::stages::StageOutcome) -> Option<Value> {
+fn capability_user_input_result(outcome: &super::stages::StageOutcome) -> Option<Value> {
     outcome.capability_results.iter().find_map(|item| {
-        let key = item
+        let capability = item
             .get("key")
             .or_else(|| item.get("capability"))
             .and_then(Value::as_str)?;
-        if key != "operator_checkpoint" {
+        let mut result = item
+            .get("result")
+            .or_else(|| item.get("payload"))?
+            .clone();
+
+        if result.get("needs_user_response").and_then(Value::as_bool) != Some(true) {
             return None;
         }
-        let result = item.get("result").or_else(|| item.get("payload"))?.clone();
-        if result.get("needs_user_response").and_then(Value::as_bool) == Some(true) {
-            Some(result)
-        } else {
-            None
+
+        if let Some(result_obj) = result.as_object_mut() {
+            result_obj
+                .entry("capability".to_string())
+                .or_insert_with(|| Value::String(capability.to_string()));
         }
+
+        Some(result)
     })
 }
 
-fn stage_disposition_review_enabled(
-    step: &super::WorkflowStepDefinition,
-    outcome: &super::stages::StageOutcome,
-) -> bool {
-    if operator_checkpoint_result(outcome).is_some() {
-        return true;
-    }
-
-    let automation_enabled = |automation: Option<&Value>| {
-        automation
-            .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
-            .and_then(|v| v.get("enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    };
-
-    automation_enabled(step.execution_logic.get("automation"))
-        || automation_enabled(
-            outcome
-                .local_state
-                .get("execution_logic")
-                .and_then(|v| v.get("automation")),
-        )
-}
-
-fn disposition_review_options(
-    step: &super::WorkflowStepDefinition,
+fn capability_user_input_options(
     outcome: &super::stages::StageOutcome,
 ) -> Value {
-    if let Some(checkpoint) = operator_checkpoint_result(outcome) {
-        return normalize_disposition_review_options(checkpoint.get("available_dispositions").cloned());
-    }
-
-    let configured = outcome
-        .local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
-        .and_then(|v| v.get("available_dispositions"))
-        .cloned()
-        .or_else(|| {
-            step.execution_logic
-                .get("automation")
-                .and_then(|v| v.get("user_checkpoint").or_else(|| v.get("disposition_review")))
-                .and_then(|v| v.get("available_dispositions"))
-                .cloned()
-        });
-
-    normalize_disposition_review_options(configured)
+    normalize_capability_user_input_options(
+        capability_user_input_result(outcome)
+            .and_then(|user_input| user_input.get("available_dispositions").cloned()),
+    )
 }
 
-fn normalize_disposition_review_options(configured: Option<Value>) -> Value {
+fn normalize_capability_user_input_options(configured: Option<Value>) -> Value {
     let options = configured
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|value| match value.as_str() {
-            Some("continue_auto") | Some("auto") | Some("autonomous") => Some(json!("continue_auto")),
-            Some("select_stage") | Some("select") | Some("continue_manual") | Some("manual") => Some(json!("select_stage")),
             Some("continue_auto") | Some("auto") | Some("autonomous") | Some("move_next") | Some("continue") => Some(json!("continue_auto")),
+            Some("select_stage") | Some("select") | Some("continue_manual") | Some("manual") => Some(json!("select_stage")),
             Some("pause_error") | Some("pause") | Some("paused") => Some(json!("pause_error")),
             _ => None,
         })
@@ -1240,7 +1206,7 @@ fn normalize_disposition_review_options(configured: Option<Value>) -> Value {
     }
 }
 
-fn clear_pending_disposition_review(run: &mut super::WorkflowRun) {
+fn clear_pending_capability_user_input(run: &mut super::WorkflowRun) {
     let root = ensure_engine_root(&mut run.context);
     if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
         run_state.remove("blocked_on");
@@ -1262,7 +1228,7 @@ async fn set_current_step_waiting(state: &AppState, run_id: Uuid, step_id: &str)
     Ok(())
 }
 
-fn set_pending_disposition_review(
+fn set_pending_capability_user_input(
     run: &mut super::WorkflowRun,
     step: &super::WorkflowStepDefinition,
     outcome: &super::stages::StageOutcome,
@@ -1279,22 +1245,26 @@ fn set_pending_disposition_review(
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    let checkpoint = operator_checkpoint_result(outcome).unwrap_or_else(|| json!({}));
+    let user_input = capability_user_input_result(outcome).unwrap_or_else(|| json!({}));
     run_state_obj.insert("blocked_on".to_string(), json!({
-        "kind": "operator_checkpoint",
+        "kind": "capability_user_input",
+        "capability": user_input
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or("operator_checkpoint"),
         "process_session_id": process_session_id,
         "stage_id": step.id,
         "stage_type": step.step_type,
         "stage_execution_id": stage_execution_id,
-        "capability_invocation_id": checkpoint.get("_capability_invocation_id").and_then(Value::as_str).unwrap_or(""),
-        "phase": checkpoint.get("phase").and_then(Value::as_str).unwrap_or("after_stage"),
-        "recommended_disposition": checkpoint
+        "capability_invocation_id": user_input.get("_capability_invocation_id").and_then(Value::as_str).unwrap_or(""),
+        "phase": user_input.get("phase").and_then(Value::as_str).unwrap_or("after_stage"),
+        "recommended_disposition": user_input
             .get("recommended_disposition")
             .and_then(Value::as_str)
             .unwrap_or("continue_auto"),
-        "available_dispositions": disposition_review_options(step, outcome),
+        "available_dispositions": capability_user_input_options(outcome),
         "next_step_id": next_target,
-        "message": checkpoint
+        "message": user_input
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or(outcome.message.as_str()),
@@ -1336,7 +1306,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
         if run_cancel_requested(&latest_run) {
             let mut cancelled_run = latest_run;
             clear_run_cancel_requested(&mut cancelled_run);
-            clear_pending_disposition_review(&mut cancelled_run);
+            clear_pending_capability_user_input(&mut cancelled_run);
             persist_context(state, run_id, &cancelled_run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
             append_engine_event(
@@ -1379,21 +1349,11 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
 
         let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
         let next_target = resolve_next_target(&definition, &step, &outcome);
-        let generated_input_step_id = next_target
-            .as_deref()
-            .unwrap_or(step.id.as_str());
-
-        state.orchestration_inputs.replace_stage_generated(
-            run_id,
-            generated_input_step_id,
-            outcome.transient_prompt_fragments.clone(),
-        );
-
         let latest_run = load_run(state, run_id).await?;
         if run_cancel_requested(&latest_run) {
             let mut cancelled_run = latest_run;
             clear_run_cancel_requested(&mut cancelled_run);
-            clear_pending_disposition_review(&mut cancelled_run);
+            clear_pending_capability_user_input(&mut cancelled_run);
             persist_context(state, run_id, &cancelled_run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
             append_engine_event(
@@ -1428,14 +1388,12 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             consume_single_use_inference_arm_state(&mut run, &step);
         }
 
-        let explicit_operator_checkpoint = operator_checkpoint_result(&outcome).is_some();
-        let pending_disposition_review = explicit_operator_checkpoint
-            || (outcome.ok && stage_disposition_review_enabled(&step, &outcome));
+        let pending_capability_user_input = capability_user_input_result(&outcome).is_some();
 
-        if pending_disposition_review {
-            clear_pending_disposition_review(&mut run);
+        if pending_capability_user_input {
+            clear_pending_capability_user_input(&mut run);
             let disposition_resume_mode = if automatic { "autonomous" } else { "manual" };
-            set_pending_disposition_review(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode, state.process_session_id());
+            set_pending_capability_user_input(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode, state.process_session_id());
             persist_context(state, run_id, &run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
             append_engine_event(
@@ -1443,13 +1401,14 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
                 run_id,
                 Some(step.id.as_str()),
                 "info",
-                "workflow_waiting_for_operator_checkpoint",
-                "Workflow is waiting for operator checkpoint.",
+                "workflow_execution_state_changed",
+                "Workflow is awaiting capability user input.",
                 json!({
+                    "execution_state": "awaiting_user_input",
                     "stage_id": step.id,
                     "stage_type": step.step_type,
                     "recommended_disposition": format_disposition(&outcome.disposition),
-                    "available_dispositions": disposition_review_options(&step, &outcome),
+                    "available_dispositions": capability_user_input_options(&outcome),
                     "next_step_id": next_target.clone(),
                     "resume_mode": disposition_resume_mode,
                 }),
@@ -1457,7 +1416,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             return Ok(json!({
                 "ok": outcome.ok,
                 "status": "waiting",
-                "blocked_on": "operator_checkpoint",
+                "blocked_on": "capability_user_input",
                 "step_id": step.id,
                 "next_step_id": next_target,
                 "message": outcome.message,
@@ -1482,7 +1441,7 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }),
         ).await?;
 
-        clear_pending_disposition_review(&mut run);
+        clear_pending_capability_user_input(&mut run);
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
@@ -1548,6 +1507,33 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             )
             .await?;
             set_run_status(state, run_id, status.clone(), current_step_id).await?;
+            append_engine_event(
+                state,
+                run_id,
+                current_step_id,
+                "info",
+                "run_status_changed",
+                "Workflow run advanced after stage completion.",
+                json!({
+                    "status": match status {
+                        RunStatus::Draft => "waiting",
+                        RunStatus::Queued => "queued",
+                        RunStatus::Running => "running",
+                        RunStatus::Waiting => "waiting",
+                        RunStatus::Paused => "paused",
+                        RunStatus::Success => "complete",
+                        RunStatus::Error => "error",
+                        RunStatus::Cancelled => "cancelled",
+                    },
+                    "completed_step_id": step.id,
+                    "current_step_id": current_step_id,
+                    "next_step_id": next_target,
+                    "event_meta": {
+                        "is_header_event": true
+                    }
+                }),
+            )
+            .await?;
 
             return Ok(json!({
                 "ok": outcome.ok,

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::collections::HashMap;
 
-use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, Row, SqlitePool};
+use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, AssertSqlSafe, Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::engine::capabilities::changeset::persistence::{CHANGESET_ATTEMPTS_TABLE_SQL, CHANGESET_FILE_EFFECTS_TABLE_SQL};
@@ -85,14 +85,14 @@ async fn backfill_changeset_workflow_keys(db: &SqlitePool) -> anyhow::Result<()>
 }
 
 async fn ensure_column(db: &SqlitePool, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
+    let rows = sqlx::query(AssertSqlSafe(format!("PRAGMA table_info({})", table)))
         .fetch_all(db)
         .await?;
     let exists = rows
         .iter()
         .any(|row| row.get::<String, _>("name") == column);
     if !exists {
-        sqlx::query(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition))
+        sqlx::query(AssertSqlSafe(format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition)))
             .execute(db)
             .await?;
     }

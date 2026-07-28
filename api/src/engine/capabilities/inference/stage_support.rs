@@ -98,39 +98,13 @@ pub fn prepare_inference_stage_state_with_hooks(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let transient_user_input = state
-        .get("transient_prompt_fragments")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find_map(|fragment| {
-            let is_user_input = fragment
-                .get("kind")
-                .and_then(Value::as_str)
-                .map(|kind| kind == "user_input")
-                .unwrap_or(false);
-
-            if !is_user_input {
-                return None;
-            }
-
-            fragment
-                .get("text")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        });
-
     let default_user_input = resolve_empty_user_input_default(
         step,
         &state,
         hooks.empty_user_input_default.as_deref(),
     );
 
-    let user_input = explicit_user_input
-        .or(transient_user_input)
-        .or(default_user_input);
+    let user_input = explicit_user_input.or(default_user_input);
 
     if let Some(user_input_fragment) = user_input.clone() {
         fragments
@@ -241,8 +215,6 @@ pub fn prepare_inference_stage_state_with_hooks(
             .remove("planner_schema");
     }
 
-    let transient_prompt_fragments = collect_transient_prompt_fragments(&state);
-
     let mut effective_enabled = json!({});
     let enabled_obj = effective_enabled
         .as_object_mut()
@@ -257,24 +229,14 @@ pub fn prepare_inference_stage_state_with_hooks(
     enabled_obj.insert("review_failure".to_string(), Value::Bool(review_failure_fragment.is_some()));
     enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 
-    let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
-    let model_input_blocks = build_model_input_blocks(&effective_enabled, &fragments, &transient_prompt_fragments);
+    let prompt = compose_prompt_from_state(&effective_enabled, &fragments);
+    let model_input_blocks = build_model_input_blocks(&effective_enabled, &fragments);
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
     obj.insert("model_input_blocks".to_string(), Value::Array(model_input_blocks.clone()));
     obj.insert("prompt_blocks".to_string(), Value::Array(model_input_blocks));
-    obj.insert(
-        "transient_prompt_fragments".to_string(),
-        Value::Array(
-            transient_prompt_fragments
-                .iter()
-                .map(|item| Value::String(item.clone()))
-                .collect(),
-        ),
-    );
-
     if let Some(repo_context) = repo_context {
         obj.insert("repo_context".to_string(), repo_context);
     } else {
@@ -342,31 +304,7 @@ fn resolve_empty_user_input_default(
         })
 }
 
-fn collect_transient_prompt_fragments(state: &Value) -> Vec<String> {
-    state
-        .get("transient_prompt_fragments")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    item.get("kind")
-                        .and_then(Value::as_str)
-                        .map(|kind| kind != "user_input")
-                        .unwrap_or(true)
-                })
-                .filter_map(|item| {
-                    item.as_str().or_else(|| item.get("text").and_then(Value::as_str))
-                })
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn build_model_input_blocks(enabled: &Value, fragments: &Value, transient_fragments: &[String]) -> Vec<Value> {
+fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<Value> {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
     let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
@@ -382,14 +320,6 @@ fn build_model_input_blocks(enabled: &Value, fragments: &Value, transient_fragme
             continue;
         }
         blocks.push(prompt_block(blocks.len(), key, prompt_fragment_label(key), prompt_fragment_role(key), prompt_fragment_source(key), content));
-    }
-
-    for content in transient_fragments {
-        let content = content.trim();
-        if content.is_empty() {
-            continue;
-        }
-        blocks.push(prompt_block(blocks.len(), "transient_prompt_fragment", "Transient prompt fragment".to_string(), "capability", "inference", content));
     }
 
     blocks

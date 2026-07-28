@@ -2,7 +2,7 @@ use axum::{extract::{Path, Query, State}, routing::{get, post, put}, Json, Route
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{AssertSqlSafe, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -120,14 +120,14 @@ fn planner_repo_key(root: &str) -> String {
 }
 
 async fn ensure_column(state: &AppState, table: &str, column: &str, definition: &str) -> anyhow::Result<()> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({})", table))
+    let rows = sqlx::query(AssertSqlSafe(format!("PRAGMA table_info({})", table)))
         .fetch_all(&state.db)
         .await?;
     let exists = rows
         .iter()
         .any(|row| row.get::<String, _>("name") == column);
     if !exists {
-        sqlx::query(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition))
+        sqlx::query(AssertSqlSafe(format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition)))
             .execute(&state.db)
             .await?;
     }

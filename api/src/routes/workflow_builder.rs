@@ -959,16 +959,7 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
         },
         config: json!({}),
         capabilities: Vec::<WorkflowCapabilityBinding>::new(),
-        execution_logic: json!({
-            "automation": {
-                "user_checkpoint": {
-                    "enabled": false,
-                    "kind": "operator_checkpoint",
-                    "recommended_disposition": "continue_auto",
-                    "available_dispositions": ["continue_auto", "pause_error", "select_stage"]
-                }
-            }
-        }),
+        execution_logic: json!({}),
         execution_plan: Vec::<StageExecutionNode>::new(),
         transitions: Vec::<WorkflowTransition>::new(),
         advancement: WorkflowStepAdvancementConfig {
@@ -1002,13 +993,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
-            "empty_user_input_default": "",
-            "user_checkpoint": {
-                "enabled": true,
-                "kind": "operator_checkpoint",
-                "recommended_disposition": "continue_manual",
-                "available_dispositions": ["continue_auto", "continue_manual", "pause_error"]
-            }
+            "empty_user_input_default": ""
         },
         "structured_output": {
             "fine_feature_format_armed": false,

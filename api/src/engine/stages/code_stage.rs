@@ -5,20 +5,82 @@ use crate::{
     engine::{
         capabilities::inference::stage_support::{
             auto_apply_enabled,
+            build_inference_execution_plan,
             prepare_inference_stage_state_with_hooks,
             InferenceStageHooks,
             InferenceStageSettings,
         },
-        stages::capability_contract::StageCapabilities,
+        stages::{
+            Stage,
+            StageCapabilities,
+            StagePlanContext,
+            StagePrepareContext,
+        },
     },
-    models::WorkflowStepDefinition,
+    models::{StageExecutionNode, WorkflowStepDefinition},
 };
 
-pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["inference", "changeset"])
+pub struct CodeStage;
+
+pub static STAGE: CodeStage = CodeStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(
+impl Stage for CodeStage {
+    fn stage_type(&self) -> &'static str {
+        "code"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["inference", "changeset"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_code_state(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            local_state,
+        )
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        build_code_execution_plan(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            context.local_state,
+        )
+    }
+}
+
+fn build_code_execution_plan(
+    repo_ref: &str,
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+    local_state: &Value,
+) -> Result<Vec<StageExecutionNode>> {
+    build_inference_execution_plan(
+        repo_ref,
+        global_state,
+        step,
+        local_state,
+        InferenceStageSettings {
+            include_changeset_schema: step.prompt.include_changeset_schema,
+        },
+    )
+}
+
+fn prepare_code_state(
     repo_ref: &str,
     global_state: &Value,
     step: &WorkflowStepDefinition,

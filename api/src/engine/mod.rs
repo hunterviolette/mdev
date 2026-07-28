@@ -19,99 +19,12 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{force_wait_run, get_transient_stage_user_input, patch_transient_stage_user_input, pause_run, prepare_run_stage_for_execution, resolve_disposition_review, resolve_operator_checkpoint, restart_stage, resume_run, run_step, start_run};
+pub use runtime::{force_wait_run, get_transient_stage_user_input, patch_transient_stage_user_input, pause_run, prepare_run_stage_for_execution, resolve_operator_checkpoint, restart_stage, resume_run, run_step, start_run};
 pub use transitions::{next_step_id, previous_step_id};
-
-async fn fail_interrupted_qa_capability(
-    state: &AppState,
-    run_id: Uuid,
-    step_id: Option<&str>,
-    reason: &str,
-) -> Result<()> {
-    let Some(step_id) = step_id else {
-        return Ok(());
-    };
-
-    let started = sqlx::query(
-        r#"
-        SELECT payload_json
-        FROM workflow_events
-        WHERE run_id = ?
-          AND step_id = ?
-          AND kind = 'qa_environment_started'
-        ORDER BY sequence_no DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(run_id.to_string())
-    .bind(step_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let Some(started) = started else {
-        return Ok(());
-    };
-
-    let payload_json = started.get::<String, _>("payload_json");
-    let payload = serde_json::from_str::<Value>(&payload_json)
-        .unwrap_or_else(|_| json!({}));
-    let event_meta = payload
-        .get("event_meta")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let invocation_id = event_meta
-        .get("capability_invocation_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    if invocation_id.is_empty() {
-        return Ok(());
-    }
-
-    let terminal_exists = sqlx::query(
-        r#"
-        SELECT 1
-        FROM workflow_events
-        WHERE run_id = ?
-          AND step_id = ?
-          AND kind IN ('qa_environment_completed', 'qa_environment_failed')
-          AND json_extract(payload_json, '$.event_meta.capability_invocation_id') = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(run_id.to_string())
-    .bind(step_id)
-    .bind(invocation_id)
-    .fetch_optional(&state.db)
-    .await?
-    .is_some();
-
-    if terminal_exists {
-        return Ok(());
-    }
-
-    append_engine_event(
-        state,
-        run_id,
-        Some(step_id),
-        "error",
-        "qa_environment_failed",
-        "qa environment stopped because the API process ended",
-        json!({
-            "capability": "qa_environment",
-            "ok": false,
-            "error": reason,
-            "interrupted": true,
-            "event_meta": event_meta
-        }),
-    )
-    .await?;
-
-    Ok(())
-}
 
 async fn fail_open_capability_invocations_for_process_stop(
     state: &AppState,
+    run_ids: &[Uuid],
     reason: &str,
 ) -> Result<usize> {
     let rows = sqlx::query(
@@ -151,6 +64,12 @@ async fn fail_open_capability_invocations_for_process_stop(
         let step_id = row.get::<Option<String>, _>("step_id");
         let stage_execution_id = row.get::<Option<String>, _>("stage_execution_id");
         let capability_invocation_id = row.get::<String, _>("capability_invocation_id");
+        if !run_ids.contains(&run_id) {
+            continue;
+        }
+        if !run_ids.contains(&run_id) {
+            continue;
+        }
         let parent_invocation_id = row.get::<Option<String>, _>("parent_invocation_id");
         let started_kind = row.get::<String, _>("kind");
         let capability = row
@@ -195,6 +114,7 @@ async fn fail_open_capability_invocations_for_process_stop(
 
 async fn fail_open_stage_executions_for_process_stop(
     state: &AppState,
+    run_ids: &[Uuid],
     reason: &str,
 ) -> Result<usize> {
     let rows = sqlx::query(
@@ -226,6 +146,12 @@ async fn fail_open_stage_executions_for_process_stop(
         let run_id = Uuid::parse_str(row.get::<String, _>("run_id").as_str())?;
         let step_id = row.get::<Option<String>, _>("step_id");
         let stage_execution_id = row.get::<String, _>("stage_execution_id");
+        if !run_ids.contains(&run_id) {
+            continue;
+        }
+        if !run_ids.contains(&run_id) {
+            continue;
+        }
 
         append_engine_event(
             state,
@@ -259,12 +185,17 @@ async fn fail_open_stage_executions_for_process_stop(
 
 pub async fn fail_active_runs_for_process_stop(
     state: &AppState,
+    run_ids: &[Uuid],
     reason: &str,
 ) -> Result<usize> {
+    if run_ids.is_empty() {
+        return Ok(0);
+    }
+
     let failed_capability_invocations =
-        fail_open_capability_invocations_for_process_stop(state, reason).await?;
+        fail_open_capability_invocations_for_process_stop(state, run_ids, reason).await?;
     let failed_stage_executions =
-        fail_open_stage_executions_for_process_stop(state, reason).await?;
+        fail_open_stage_executions_for_process_stop(state, run_ids, reason).await?;
 
     if failed_capability_invocations > 0 {
         tracing::warn!(
@@ -284,7 +215,6 @@ pub async fn fail_active_runs_for_process_stop(
         r#"
         SELECT id, current_step_id, context_json
         FROM workflow_runs
-        WHERE status IN ('queued', 'running', 'waiting')
         ORDER BY created_at ASC
         "#,
     )
@@ -295,6 +225,9 @@ pub async fn fail_active_runs_for_process_stop(
 
     for row in rows {
         let run_id = Uuid::parse_str(row.get::<String, _>("id").as_str())?;
+        if !run_ids.contains(&run_id) {
+            continue;
+        }
         let current_step_id = row.get::<Option<String>, _>("current_step_id");
         let context_json = row.get::<String, _>("context_json");
         let mut context = serde_json::from_str::<Value>(&context_json)
@@ -358,14 +291,6 @@ pub async fn fail_active_runs_for_process_stop(
             }
         }
 
-        fail_interrupted_qa_capability(
-            state,
-            run_id,
-            current_step_id.as_deref(),
-            reason,
-        )
-        .await?;
-
         sqlx::query(
             r#"
             UPDATE workflow_runs
@@ -373,7 +298,6 @@ pub async fn fail_active_runs_for_process_stop(
                 context_json = ?,
                 updated_at = ?
             WHERE id = ?
-              AND status IN ('queued', 'running', 'waiting')
             "#,
         )
         .bind(serde_json::to_string_pretty(&context)?)

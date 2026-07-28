@@ -162,43 +162,6 @@ impl OrchestrationInputStore {
             .unwrap_or_default()
     }
 
-    pub fn replace_stage_generated(
-        &self,
-        run_id: Uuid,
-        step_id: &str,
-        payloads: Vec<OrchestrationInputPayload>,
-    ) {
-        let mut inputs = self.inputs.entry(run_id).or_default();
-
-        inputs.retain(|item| {
-            let generated_feedback = matches!(
-                item.payload,
-                OrchestrationInputPayload::PromptContribution { .. }
-            );
-            let same_stage = matches!(
-                &item.scope,
-                OrchestrationInputScope::Stage { step_id: existing_step }
-                    if existing_step == step_id
-            );
-
-            !(generated_feedback && same_stage)
-        });
-
-        for payload in payloads {
-            inputs.push(OrchestrationInputEnvelope {
-                id: Uuid::new_v4(),
-                run_id,
-                scope: OrchestrationInputScope::Stage {
-                    step_id: step_id.to_string(),
-                },
-                lifecycle: OrchestrationInputLifecycle::SingleUse,
-                priority: 500,
-                created_at: Utc::now(),
-                payload,
-            });
-        }
-    }
-
     pub fn resolve_for_step(
         &self,
         run_id: Uuid,

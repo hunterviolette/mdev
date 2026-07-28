@@ -10,13 +10,58 @@ use crate::{
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
-use super::{capability_contract::StageCapabilities, stage_utility};
+use super::{
+    stage_utility,
+    Stage,
+    StageCapabilities,
+    StagePlanContext,
+    StagePrepareContext,
+};
 
-pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["context_export", "inference", "review_validation"])
+pub struct ReviewStage;
+
+pub static STAGE: ReviewStage = ReviewStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(
+impl Stage for ReviewStage {
+    fn stage_type(&self) -> &'static str {
+        "review"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["context_export", "inference", "review_validation"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_review_state(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            local_state,
+        )
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        build_review_plan(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            context.local_state,
+        )
+    }
+}
+
+fn prepare_review_state(
     repo_ref: &str,
     global_state: &Value,
     step: &WorkflowStepDefinition,
@@ -100,16 +145,7 @@ pub fn prepare_stage_state(
         *execution_logic = json!({});
     }
 
-    if require_manual_approval || should_run_ai_review {
-        stage_utility::enable_continue_or_pause_checkpoint(execution_logic);
-    }
-
-    let require_checkpoint = execution_logic
-        .get("automation")
-        .and_then(|v| v.get("user_checkpoint"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let require_checkpoint = require_manual_approval || should_run_ai_review;
 
     let exec_obj = execution_logic.as_object_mut().expect("execution_logic must be object");
 
@@ -148,65 +184,78 @@ pub fn prepare_stage_state(
     Ok(state)
 }
 
-pub fn build_review_execution_plan(
+fn build_review_plan(
     repo_ref: &str,
     global_state: &Value,
     step: &WorkflowStepDefinition,
     local_state: &Value,
 ) -> Result<Vec<StageExecutionNode>> {
-    let supervisor_feature_review = stage_utility::review_should_run_supervisor_feature_validation(
+    let ai_review = stage_utility::review_should_run_supervisor_feature_validation(
         global_state,
         step,
         local_state,
     );
 
-    if !supervisor_feature_review {
-        return Ok(vec![StageExecutionNode {
+    let mut plan = Vec::new();
+
+    if ai_review {
+        let mut inference_global_state = global_state.clone();
+        stage_utility::force_review_repo_context_for_inference(&mut inference_global_state, repo_ref);
+
+        plan = build_inference_execution_plan(
+            repo_ref,
+            &inference_global_state,
+            step,
+            local_state,
+            InferenceStageSettings {
+                include_changeset_schema: false,
+            },
+        )?;
+
+        for node in plan.iter_mut() {
+            if node.key == "context_export" {
+                node.config = stage_utility::one_time_review_repo_context(repo_ref, global_state);
+            }
+        }
+
+        let review_run_after = if plan
+            .iter()
+            .any(|node| node.key == "inference" && node.enabled)
+        {
+            vec!["inference".to_string()]
+        } else {
+            Vec::new()
+        };
+
+        plan.push(StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
             key: "review_validation".to_string(),
             enabled: true,
             config: json!({}),
             input_mapping: json!({}),
             output_mapping: json!({}),
-            run_after: vec![],
+            run_after: review_run_after,
             condition: Value::Null,
-        }]);
+        });
     }
-
-    let mut inference_global_state = global_state.clone();
-    stage_utility::force_review_repo_context_for_inference(&mut inference_global_state, repo_ref);
-
-    let mut plan = build_inference_execution_plan(
-        repo_ref,
-        &inference_global_state,
-        step,
-        local_state,
-        InferenceStageSettings {
-            include_changeset_schema: false,
-        },
-    )?;
-
-    for node in plan.iter_mut() {
-        if node.key == "context_export" {
-            node.config = stage_utility::one_time_review_repo_context(repo_ref, global_state);
-        }
-    }
-
-    let inference_present = plan.iter().any(|node| node.key == "inference" && node.enabled);
-    let review_run_after = if inference_present {
-        vec!["inference".to_string()]
-    } else {
-        Vec::new()
-    };
 
     plan.push(StageExecutionNode {
         kind: StageExecutionNodeKind::Capability,
-        key: "review_validation".to_string(),
+        key: "operator_checkpoint".to_string(),
         enabled: true,
-        config: json!({}),
+        config: json!({
+            "phase": "after_stage",
+            "message": "Review is ready for human approval.",
+            "recommended_disposition": "continue_auto",
+            "available_dispositions": ["continue_auto", "select_stage", "pause_error"]
+        }),
         input_mapping: json!({}),
         output_mapping: json!({}),
-        run_after: review_run_after,
+        run_after: if ai_review {
+            vec!["review_validation".to_string()]
+        } else {
+            Vec::new()
+        },
         condition: Value::Null,
     });
 

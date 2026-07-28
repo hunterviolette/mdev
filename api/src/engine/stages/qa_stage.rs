@@ -3,17 +3,65 @@ use std::{future::Future, pin::Pin};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use crate::{
-    engine::stages::capability_contract::StageCapabilities,
-    models::WorkflowStepDefinition,
-};
+use crate::models::WorkflowStepDefinition;
 
 use super::{
+    configured_execution_plan,
+    Stage,
+    StageCapabilities,
     StageExecutionNode,
     StageExecutionNodeKind,
     StageExitContext,
     StageLifecycleHook,
+    StagePlanContext,
+    StagePrepareContext,
 };
+
+pub struct QaStage;
+
+pub static STAGE: QaStage = QaStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
+}
+
+impl Stage for QaStage {
+    fn stage_type(&self) -> &'static str {
+        "qa"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["shared_dependencies", "qa_environment"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_qa_state(
+            context.repo_ref,
+            context.global_state,
+            context.step,
+            local_state,
+        )
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        Ok(build_qa_execution_plan(
+            context.run,
+            context.step,
+            context.automatic_execution,
+        ))
+    }
+
+    fn lifecycle_hook(&self) -> Box<dyn StageLifecycleHook> {
+        Box::new(QaStageLifecycleHook)
+    }
+}
 
 pub struct QaStageLifecycleHook;
 
@@ -25,27 +73,6 @@ fn qa_entry_approved(run: &crate::models::WorkflowRun, step_id: &str) -> bool {
         .and_then(|value| value.get("step_id"))
         .and_then(Value::as_str)
         == Some(step_id)
-}
-
-fn set_qa_entry_approval(run: &mut crate::models::WorkflowRun, step_id: &str) {
-    let engine = run
-        .context
-        .as_object_mut()
-        .expect("workflow context must be object")
-        .entry("workflow_engine".to_string())
-        .or_insert_with(|| json!({}));
-    let engine = engine.as_object_mut().expect("workflow_engine must be object");
-    let run_state = engine
-        .entry("run_state".to_string())
-        .or_insert_with(|| json!({}));
-    let run_state = run_state.as_object_mut().expect("run_state must be object");
-    run_state.insert(
-        "stage_checkpoint_approval".to_string(),
-        json!({
-            "step_id": step_id,
-            "phase": "before_stage"
-        }),
-    );
 }
 
 fn consume_qa_entry_approval(run: &mut crate::models::WorkflowRun, step_id: &str) -> bool {
@@ -84,92 +111,6 @@ fn checkpoint_node(phase: &str, message: &str, run_after: Vec<String>) -> StageE
 }
 
 impl StageLifecycleHook for QaStageLifecycleHook {
-    fn prepare_plan(
-        &self,
-        run: &mut crate::models::WorkflowRun,
-        step: &WorkflowStepDefinition,
-        automatic_execution: bool,
-        _local_state: &Value,
-        mut plan: Vec<StageExecutionNode>,
-    ) -> Vec<StageExecutionNode> {
-        plan.retain(|node| {
-            node.kind != StageExecutionNodeKind::Capability
-                || node.key != "operator_checkpoint"
-        });
-
-        if automatic_execution && !consume_qa_entry_approval(run, step.id.as_str()) {
-            plan.insert(
-                0,
-                checkpoint_node(
-                    "before_stage",
-                    "QA is ready to start. Continue to launch the QA environment.",
-                    vec![],
-                ),
-            );
-            return plan;
-        }
-
-        let run_after = plan
-            .iter()
-            .filter(|node| {
-                node.enabled
-                    && node.kind == StageExecutionNodeKind::Capability
-            })
-            .map(|node| node.key.clone())
-            .collect::<Vec<_>>();
-
-        plan.push(checkpoint_node(
-            "after_stage",
-            "QA is running and ready for testing. Continue when QA validation is complete.",
-            run_after,
-        ));
-
-        plan
-    }
-
-    fn on_checkpoint_continue(
-        &self,
-        run: &mut crate::models::WorkflowRun,
-        step: &WorkflowStepDefinition,
-        phase: &str,
-    ) -> Result<()> {
-        if phase == "before_stage" {
-            set_qa_entry_approval(run, step.id.as_str());
-        }
-
-        Ok(())
-    }
-
-    fn on_restart<'a>(
-        &'a self,
-        context: StageExitContext<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let run_id = context.run_id.to_string();
-            let results = context
-                .state
-                .process_registry
-                .terminate_deployment(
-                    run_id.as_str(),
-                    context.step.id.as_str(),
-                    true,
-                )
-                .await;
-
-            let failures = results.iter().filter(|result| result.is_err()).count();
-
-            tracing::info!(
-                run_id = %context.run_id,
-                step_id = %context.step.id,
-                terminated_processes = results.len().saturating_sub(failures),
-                termination_failures = failures,
-                "terminated QA processes before stage restart"
-            );
-
-            Ok(())
-        })
-    }
-
     fn on_exit<'a>(
         &'a self,
         context: StageExitContext<'a>,
@@ -202,11 +143,41 @@ impl StageLifecycleHook for QaStageLifecycleHook {
     }
 }
 
-pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["shared_dependencies", "qa_environment"])
+fn build_qa_execution_plan(
+    run: &mut crate::models::WorkflowRun,
+    step: &WorkflowStepDefinition,
+    automatic_execution: bool,
+) -> Vec<StageExecutionNode> {
+    let mut plan = configured_execution_plan(step);
+    plan.retain(|node| {
+        node.kind != StageExecutionNodeKind::Capability
+            || node.key != "operator_checkpoint"
+    });
+
+    if automatic_execution && !consume_qa_entry_approval(run, step.id.as_str()) {
+        return vec![checkpoint_node(
+            "before_stage",
+            "QA is ready to start. Continue to launch the QA environment.",
+            vec![],
+        )];
+    }
+
+    let run_after = plan
+        .iter()
+        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
+        .map(|node| node.key.clone())
+        .collect::<Vec<_>>();
+
+    plan.push(checkpoint_node(
+        "after_stage",
+        "QA is running and ready for testing. Continue when QA validation is complete.",
+        run_after,
+    ));
+
+    plan
 }
 
-pub fn prepare_stage_state(
+fn prepare_qa_state(
     repo_ref: &str,
     global_state: &Value,
     step: &WorkflowStepDefinition,

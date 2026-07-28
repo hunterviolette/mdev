@@ -45,19 +45,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db);
 
-    let recovered_runs = crate::engine::fail_active_runs_for_process_stop(
-        &state,
-        "The server was shut down before the stage execution completed.",
-    )
-    .await?;
-
-    if recovered_runs > 0 {
-        tracing::warn!(
-            recovered_runs,
-            "marked workflows from the previous API process as failed"
-        );
-    }
-
     let shutdown_state = state.clone();
     let app = build_router(state, &layout.web_dist);
 
@@ -79,6 +66,11 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
 
+            let active_run_ids = shutdown_state
+                .workflow_coordinator
+                .stop_active_executions()
+                .await;
+
             let terminated = shutdown_state
                 .process_registry
                 .terminate_all(true)
@@ -95,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
 
             match crate::engine::fail_active_runs_for_process_stop(
                 &shutdown_state,
+                &active_run_ids,
                 "The server was shut down before the stage execution completed.",
             )
             .await

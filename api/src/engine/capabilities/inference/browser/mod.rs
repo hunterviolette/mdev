@@ -342,13 +342,27 @@ pub async fn execute(
     }
 
     let inline_repo_context = repo_context_inline_prompt_enabled(ctx);
-    let pasted_context_text = if inline_repo_context {
-        match repo_context_payload(ctx) {
-            Some(payload) => Some(context_export::render_context_export_text(payload)?),
-            None => None,
+    let mut pasted_context_sections = Vec::new();
+
+    if inline_repo_context {
+        if let Some(payload) = repo_context_payload(ctx) {
+            let context = context_export::render_context_export_text(payload)?;
+            if !context.trim().is_empty() {
+                pasted_context_sections.push(context);
+            }
         }
-    } else {
+    }
+
+    if let Some(compile_context) = input.pasted_context_text.as_deref() {
+        if !compile_context.trim().is_empty() {
+            pasted_context_sections.push(compile_context.trim().to_string());
+        }
+    }
+
+    let pasted_context_text = if pasted_context_sections.is_empty() {
         None
+    } else {
+        Some(pasted_context_sections.join("\n\n"))
     };
     let attachment_paths = input
         .attachments
@@ -430,7 +444,7 @@ pub async fn execute(
     .await
     .map_err(|error| anyhow!("Browser bridge blocking task failed: {}", error))??;
 
-    let (mut inference_cfg, readiness_failure, completed, uploaded_files) = blocking_result;
+    let (inference_cfg, readiness_failure, completed, uploaded_files) = blocking_result;
     persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
 
     if let Some(readiness_probe) = readiness_failure {

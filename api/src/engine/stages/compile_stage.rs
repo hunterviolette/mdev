@@ -2,15 +2,74 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::stages::capability_contract::StageCapabilities,
-    models::WorkflowStepDefinition,
+    engine::stages::{
+        Stage,
+        StageCapabilities,
+        StagePlanContext,
+        StagePrepareContext,
+    },
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
-pub fn capabilities() -> StageCapabilities {
-    StageCapabilities::new(["shared_dependencies", "compile_commands"])
+pub struct CompileStage;
+
+pub static STAGE: CompileStage = CompileStage;
+
+inventory::submit! {
+    crate::engine::stages::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(
+impl Stage for CompileStage {
+    fn stage_type(&self) -> &'static str {
+        "compile"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["shared_dependencies", "compile_commands"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_compile_state(context.step, local_state)
+    }
+
+    fn build_execution_plan(
+        &self,
+        _context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        Ok(build_compile_execution_plan())
+    }
+}
+
+fn build_compile_execution_plan() -> Vec<StageExecutionNode> {
+    vec![
+        StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "shared_dependencies".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec![],
+            condition: Value::Null,
+        },
+        StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "compile_commands".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec!["shared_dependencies".to_string()],
+            condition: Value::Null,
+        },
+    ]
+}
+
+fn prepare_compile_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {

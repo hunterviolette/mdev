@@ -9,17 +9,66 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine,
-    models::{WorkflowRun, WorkflowStepDefinition},
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
     supervisor::patches,
 };
 
-use super::{StageDisposition, StageOutcome};
+use super::{
+    Stage,
+    StageCapabilities,
+    StageDisposition,
+    StageOutcome,
+    StagePlanContext,
+    StagePrepareContext,
+};
 
-pub fn capabilities() -> crate::engine::stages::capability_contract::StageCapabilities {
-    crate::engine::stages::capability_contract::StageCapabilities::new(["git_patch_payload"])
+pub struct MergePatchesStage;
+
+pub static STAGE: MergePatchesStage = MergePatchesStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
 }
 
-pub fn prepare_stage_state(_step: &WorkflowStepDefinition, local_state: Value) -> Result<Value> {
+impl Stage for MergePatchesStage {
+    fn stage_type(&self) -> &'static str {
+        "merge_patches"
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["git_patch_payload"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_merge_patches_state(context.step, local_state)
+    }
+
+    fn build_execution_plan(
+        &self,
+        _context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        Ok(build_merge_patches_execution_plan())
+    }
+}
+
+fn build_merge_patches_execution_plan() -> Vec<StageExecutionNode> {
+    vec![StageExecutionNode {
+        kind: StageExecutionNodeKind::Capability,
+        key: "git_patch_payload".to_string(),
+        enabled: true,
+        config: json!({}),
+        input_mapping: json!({}),
+        output_mapping: json!({}),
+        run_after: vec![],
+        condition: Value::Null,
+    }]
+}
+
+fn prepare_merge_patches_state(_step: &WorkflowStepDefinition, local_state: Value) -> Result<Value> {
     Ok(local_state)
 }
 
@@ -353,7 +402,6 @@ pub async fn execute_stage(
         message: format!("merge_patches stage {}", status),
         capability_results,
         local_state,
-        transient_prompt_fragments: Vec::new(),
     })
 }
 
