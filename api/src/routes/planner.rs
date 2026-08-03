@@ -1,4 +1,4 @@
-use axum::{extract::{Path, Query, State}, routing::{get, post, put}, Json, Router};
+use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

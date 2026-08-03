@@ -4,7 +4,7 @@ pub(crate) mod orchestration_inputs;
 mod runtime;
 pub(crate) mod runtime_tools;
 
-mod stages;
+pub(crate) mod stages;
 mod transitions;
 pub mod workflow_lifecycle;
 
@@ -19,7 +19,8 @@ use crate::{
     models::{RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-pub use runtime::{force_wait_run, get_transient_stage_user_input, patch_transient_stage_user_input, pause_run, prepare_run_stage_for_execution, resolve_operator_checkpoint, restart_stage, resume_run, run_step, start_run};
+pub use runtime::{get_transient_stage_user_input, patch_transient_stage_user_input, prepare_run_stage_for_execution, validate_workflow_action_request, WorkflowActionPreconditions};
+pub(crate) use runtime::{fail_runtime_workflow, run_workflow_runtime};
 pub use transitions::{next_step_id, previous_step_id};
 
 async fn fail_open_capability_invocations_for_process_stop(
@@ -330,6 +331,35 @@ pub async fn fail_active_runs_for_process_stop(
     Ok(failed_count)
 }
 
+pub async fn fail_stale_running_runs_on_startup(state: &AppState) -> Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id
+        FROM workflow_runs
+        WHERE status = 'running'
+        ORDER BY created_at ASC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let run_ids = rows
+        .into_iter()
+        .map(|row| Uuid::parse_str(row.get::<String, _>("id").as_str()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if run_ids.is_empty() {
+        return Ok(0);
+    }
+
+    fail_active_runs_for_process_stop(
+        state,
+        &run_ids,
+        "The previous API process stopped before the stage execution completed.",
+    )
+    .await
+}
+
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let row = sqlx::query(
         "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE id = ?"
@@ -361,9 +391,7 @@ pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
         updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())?.with_timezone(&chrono::Utc),
     };
 
-    if rearm_session_scoped_behavior_on_load(state, &mut run).await? {
-        run.updated_at = Utc::now();
-    }
+    normalize_inference_arm_state(&mut run);
 
     Ok(run)
 }
@@ -422,114 +450,6 @@ fn parse_context_json_for_load(run_id: &str, raw: &str) -> Value {
     }
 }
 
-async fn rearm_session_scoped_behavior_on_load(state: &AppState, run: &mut WorkflowRun) -> Result<bool> {
-    let had_nested_shared_state = run
-        .context
-        .get("workflow_engine")
-        .and_then(|v| v.get("global_state"))
-        .and_then(|v| v.get("capabilities"))
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("shared_inference_state"))
-        .is_some();
-
-    normalize_inference_arm_state(run);
-
-    let selected_step = run
-        .current_step_id
-        .as_deref()
-        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id));
-    let should_rearm_repo_context = selected_step
-        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context"))
-        .unwrap_or(false);
-    let should_rearm_changeset_schema = selected_step
-        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema"))
-        .unwrap_or(false);
-    let should_rearm_planner_fragment = selected_step
-        .map(|step| capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment"))
-        .unwrap_or(false);
-
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = global_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("global_state must be object"))?;
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = capabilities
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("capabilities must be object"))?;
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = inference
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("inference must be object"))?;
-    let connection_runtime = inference_obj
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}));
-    let connection_runtime_obj = connection_runtime
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("connection_runtime must be object"))?;
-
-    let current_process_session_id = state.process_session_id().to_string();
-    let persisted_process_session_id = connection_runtime_obj
-        .get("process_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    if persisted_process_session_id == current_process_session_id {
-        if had_nested_shared_state {
-            persist_context(state, run.id, &run.context).await?;
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-
-    let previous_connection_runtime = connection_runtime_obj.clone();
-    let mut changed = !previous_connection_runtime.is_empty() || had_nested_shared_state;
-
-    connection_runtime_obj.clear();
-    connection_runtime_obj.insert(
-        "process_session_id".to_string(),
-        Value::String(current_process_session_id),
-    );
-
-    if inference_obj.remove("next_prompt_fragments").is_some() {
-        changed = true;
-    }
-    if inference_obj.remove("active_prompt_fragments").is_some() {
-        changed = true;
-    }
-
-    if should_rearm_repo_context {
-        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-        changed = true;
-    }
-    if should_rearm_changeset_schema {
-        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
-        changed = true;
-    }
-    let _ = inference_obj;
-
-    if should_rearm_planner_fragment {
-        let planner = capabilities_obj
-            .entry("planner".to_string())
-            .or_insert_with(|| json!({}));
-        let planner_obj = planner
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("planner capability state must be object"))?;
-        planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
-        changed = true;
-    }
-    if changed {
-        persist_context(state, run.id, &run.context).await?;
-    }
-
-    Ok(changed)
-}
-
 fn strip_inference_enabled_fields_from_stage_patch(payload: &mut Map<String, Value>) {
     let Some(execution_logic) = payload.get_mut("execution_logic") else {
         return;
@@ -566,91 +486,15 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-pub fn refresh_inference_arm_state(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
+pub fn refresh_inference_arm_state(run: &mut WorkflowRun, _selected_step: Option<&WorkflowStepDefinition>) {
     normalize_inference_arm_state(run);
-
-    let Some(step) = selected_step else {
-        return;
-    };
-
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = ensure_value_object(global_state);
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-
-    {
-        let inference = capabilities_obj
-            .entry("inference".to_string())
-            .or_insert_with(|| json!({}));
-        let inference_obj = ensure_value_object(inference);
-
-        if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context")
-            && !inference_obj.contains_key("repo_context_armed")
-        {
-            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-        }
-
-        if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema")
-            && !inference_obj.contains_key("changeset_schema_armed")
-        {
-            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
-        }
-
-        inference_obj.remove("shared_inference_state");
-    }
-
 }
 
-pub fn rearm_inference_input_fragments_for_stage(run: &mut WorkflowRun, selected_step: Option<&WorkflowStepDefinition>) {
+pub fn rearm_inference_inputs_for_stage(
+    run: &mut WorkflowRun,
+    _step: &WorkflowStepDefinition,
+) {
     normalize_inference_arm_state(run);
-
-    let Some(step) = selected_step else {
-        return;
-    };
-
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = ensure_value_object(global_state);
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "repo_context") {
-        let inference = capabilities_obj
-            .entry("inference".to_string())
-            .or_insert_with(|| json!({}));
-        let inference_obj = ensure_value_object(inference);
-        inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-        inference_obj.remove("shared_inference_state");
-    }
-
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "changeset_schema") {
-        let inference = capabilities_obj
-            .entry("inference".to_string())
-            .or_insert_with(|| json!({}));
-        let inference_obj = ensure_value_object(inference);
-        inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
-        inference_obj.remove("shared_inference_state");
-    }
-
-    if capabilities::binding_specs::stage_supports_shared_capability(step, "planner_fragment") {
-        let planner = capabilities_obj
-            .entry("planner".to_string())
-            .or_insert_with(|| json!({}));
-        let planner_obj = ensure_value_object(planner);
-        let has_selected_feature = planner_obj
-            .get("feature_id")
-            .and_then(Value::as_str)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
-        if has_selected_feature {
-            planner_obj.insert("fragment_armed".to_string(), Value::Bool(true));
-        }
-    }
 }
 
 fn normalize_inference_arm_state(run: &mut WorkflowRun) {
@@ -690,11 +534,67 @@ fn normalize_inference_arm_state(run: &mut WorkflowRun) {
     inference_obj.remove("shared_inference_state");
 }
 
+pub async fn reconcile_inference_session(
+    state: &AppState,
+    run: &mut WorkflowRun,
+) -> Result<bool> {
+    let step = run
+        .current_step_id
+        .as_deref()
+        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id))
+        .cloned();
+
+    let Some(step) = step else {
+        return Ok(false);
+    };
+
+    let changed = capabilities::inference::browser::reconcile_browser_session_rearm(
+        state,
+        run,
+        &step,
+    )
+    .await?;
+
+    if changed {
+        persist_context(state, run.id, &run.context).await?;
+    }
+
+    Ok(changed)
+}
+
+pub async fn preprocess_run_for_current_stage(
+    state: &AppState,
+    run: &mut WorkflowRun,
+    previous_step_id: Option<&str>,
+) -> Result<bool> {
+    let step = run
+        .current_step_id
+        .as_deref()
+        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id))
+        .cloned();
+
+    let Some(step) = step else {
+        return Ok(false);
+    };
+
+    if previous_step_id.is_some() && previous_step_id != Some(step.id.as_str()) {
+        rearm_inference_inputs_for_stage(run, &step);
+    } else {
+        refresh_inference_arm_state(run, Some(&step));
+    }
+
+    let changed = reconcile_inference_session(state, run).await?;
+    persist_context(state, run.id, &run.context).await?;
+
+    Ok(changed)
+}
+
 pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Result<Value> {
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run)
         .await?
         .ok_or_else(|| anyhow!("run has no template definition"))?;
+    let previous_step_id = run.current_step_id.clone();
 
     let step = transitions::transition_to_step(
         state,
@@ -705,14 +605,12 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
     )
     .await?;
 
-    let decisions = governance::before_stage(state, run_id, &mut run, &step).await?;
-    governance::apply_context_mutations(
+    preprocess_run_for_current_stage(
+        state,
         &mut run,
-        &decisions,
-        Some(step.id.as_str()),
-        None,
-    )?;
-    refresh_inference_arm_state(&mut run, Some(&step));
+        previous_step_id.as_deref(),
+    )
+    .await?;
 
     run.status = RunStatus::Waiting;
     update_run_context(&state.db, run_id, &run.context).await?;
@@ -728,7 +626,8 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
         "ok": true,
         "run_id": run_id,
         "current_step_id": step.id,
-        "status": "waiting"
+        "status": "waiting",
+        "run": run
     }))
 }
 

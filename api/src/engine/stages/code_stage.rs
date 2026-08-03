@@ -34,7 +34,12 @@ impl Stage for CodeStage {
     }
 
     fn capabilities(&self) -> StageCapabilities {
-        StageCapabilities::new(["inference", "changeset"])
+        StageCapabilities::new([
+            "inference",
+            "repo_context",
+            "changeset_schema",
+            "changeset",
+        ])
     }
 
     fn prepare_state(

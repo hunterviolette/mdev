@@ -23,6 +23,11 @@ export type ConnectOverCdpCommand = {
   timeout_ms?: number;
 };
 
+export type ListSessionsCommand = {
+  id: string;
+  cmd: "list_sessions";
+};
+
 export type OpenPageCommand = {
   id: string;
   cmd: "open_page";
@@ -105,6 +110,7 @@ export type CloseSessionCommand = {
 export type BridgeCommand =
   | StartSessionCommand
   | ConnectOverCdpCommand
+  | ListSessionsCommand
   | OpenPageCommand
   | ProbePageCommand
   | ClosePageCommand

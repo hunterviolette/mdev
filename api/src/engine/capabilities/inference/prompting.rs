@@ -74,20 +74,21 @@ fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<String> 
     }
 }
 
-fn configured_stage_user_input(ctx: &CapabilityContext<'_>) -> Option<(String, String)> {
-    for key in ["model_input_blocks", "prompt_blocks", "composed_prompt_blocks"] {
-        let Some(blocks) = ctx.local_state.get(key).and_then(Value::as_array) else {
-            continue;
-        };
+fn configured_stage_input(
+    ctx: &CapabilityContext<'_>,
+) -> (Option<(String, String)>, Vec<ModelInputBlock>) {
+    let Some(blocks) = ctx
+        .local_state
+        .get("model_input_blocks")
+        .and_then(Value::as_array)
+    else {
+        return (None, Vec::new());
+    };
 
-        let Some(block) = blocks.iter().find(|block| {
-            block.get("role").and_then(Value::as_str) == Some("user")
-                || block.get("key").and_then(Value::as_str) == Some("user_input")
-                || block.get("id").and_then(Value::as_str) == Some("user_input")
-        }) else {
-            continue;
-        };
+    let mut primary = None;
+    let mut input_blocks = Vec::new();
 
+    for block in blocks {
         let Some(content) = block
             .get("content")
             .and_then(Value::as_str)
@@ -97,10 +98,48 @@ fn configured_stage_user_input(ctx: &CapabilityContext<'_>) -> Option<(String, S
             continue;
         };
 
-        return Some(("user_input".to_string(), content.to_string()));
+        let key = block
+            .get("key")
+            .or_else(|| block.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("inference");
+        let role = block
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if primary.is_none() && (role == "user" || key == "user_input") {
+            primary = Some(("user_input".to_string(), content.to_string()));
+            continue;
+        }
+
+        let source = block
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(key)
+            .to_string();
+        let label = block
+            .get("label")
+            .or_else(|| block.get("title"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(key)
+            .to_string();
+
+        input_blocks.push(ModelInputBlock {
+            source,
+            label,
+            content: content.to_string(),
+        });
     }
 
-    None
+    (primary, input_blocks)
 }
 
 fn orchestration_blocks(
@@ -214,10 +253,13 @@ pub fn build_model_input(
         .resolve_for_step(ctx.run_id, ctx.step.id.as_str());
 
     let consumed_input_ids = resolved.iter().map(|item| item.id).collect::<Vec<_>>();
-    let (primary, mut input_blocks, mut attachments) = orchestration_blocks(&resolved);
+    let (stage_primary, mut input_blocks) = configured_stage_input(ctx);
+    let (orchestration_primary, orchestration_input_blocks, mut attachments) =
+        orchestration_blocks(&resolved);
+    input_blocks.extend(orchestration_input_blocks);
 
-    let primary = primary
-        .or_else(|| configured_stage_user_input(ctx))
+    let primary = orchestration_primary
+        .or(stage_primary)
         .or_else(|| {
             configured_default_user_input(ctx)
                 .map(|value| ("empty_user_input_default".to_string(), value))
@@ -257,8 +299,6 @@ pub fn build_model_input(
         }
     }
 
-    let composed = super::resolve_inference_prompt(ctx.local_state);
-    append_unique_section(&mut sections, composed);
 
     if let Some(attachment) = context_export_attachment(prior_results) {
         if !attachments

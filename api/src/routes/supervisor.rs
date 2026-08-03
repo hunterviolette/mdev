@@ -57,7 +57,28 @@ async fn supervisor_action(
         SupervisorActionRequest::CreateWorkUnit(request) => supervisor::create_supervisor_work_unit(&state, supervisor_id, request).await,
         SupervisorActionRequest::DeleteWorkUnit { work_unit_id } => supervisor::delete_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::RegenerateWorkUnit { work_unit_id } => supervisor::regenerate_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
-        SupervisorActionRequest::StartWorkUnit { work_unit_id } => supervisor::start_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
+        SupervisorActionRequest::StartWorkUnit { work_unit_id } => {
+            let background_state = state.clone();
+            let background_work_unit_id = work_unit_id.clone();
+
+            tokio::spawn(async move {
+                let _ = supervisor::start_supervisor_work_unit(
+                    &background_state,
+                    supervisor_id,
+                    background_work_unit_id,
+                )
+                .await;
+            });
+
+            Ok(json!({
+                "ok": true,
+                "accepted": true,
+                "background": true,
+                "action": "start_work_unit",
+                "supervisor_id": supervisor_id,
+                "work_unit_id": work_unit_id
+            }))
+        },
         SupervisorActionRequest::PauseWorkUnit { work_unit_id } => supervisor::pause_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::StageWorkUnit { work_unit_id, staged } => supervisor::stage_supervisor_work_unit(&state, supervisor_id, work_unit_id, staged).await,
         SupervisorActionRequest::UpdateFlightDeckSettings { flight_deck_settings } => supervisor::update_supervisor_flight_deck_settings(&state, supervisor_id, json!({ "flight_deck_settings": flight_deck_settings })).await,

@@ -138,43 +138,6 @@ pub struct BrowserProbeResult {
 
 pub use session::persist_inference_config;
 
-pub(crate) fn resolve_inference_prompt(local_state: &Value) -> String {
-    let composed_prompt = local_state
-        .get("composed_prompt")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-
-    if !composed_prompt.is_empty() {
-        return composed_prompt.to_string();
-    }
-
-    for key in ["model_input_blocks", "prompt_blocks", "composed_prompt_blocks"] {
-        let prompt = local_state
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|block| {
-                block
-                    .get("content")
-                    .or_else(|| block.get("text"))
-                    .or_else(|| block.get("value"))
-                    .and_then(Value::as_str)
-            })
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        if !prompt.is_empty() {
-            return prompt;
-        }
-    }
-
-    String::new()
-}
-
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],
@@ -349,6 +312,14 @@ fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
         .unwrap_or(false)
     {
         consumed.push("planner_fragment".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("planner_schema"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("planner_schema".to_string());
     }
 
     consumed

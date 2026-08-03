@@ -139,6 +139,9 @@ async fn get_run(
 
     let mut run = row_to_run_for_open(row)?;
     sanitize_run_for_current_process(&state, &mut run);
+    engine::preprocess_run_for_current_stage(&state, &mut run, None)
+        .await
+        .map_err(internal)?;
     Ok(Json(run))
 }
 
@@ -156,6 +159,9 @@ async fn open_run(
 
     let mut run = row_to_run_for_open(row)?;
     sanitize_run_for_current_process(&state, &mut run);
+    engine::preprocess_run_for_current_stage(&state, &mut run, None)
+        .await
+        .map_err(internal)?;
     Ok(Json(run))
 }
 
@@ -231,9 +237,51 @@ async fn run_action(
         "workflow run action requested"
     );
 
+    let expected_status = req
+        .payload
+        .get("expected_status")
+        .and_then(serde_json::Value::as_str);
+    let expected_step_id = req
+        .payload
+        .get("expected_step_id")
+        .and_then(serde_json::Value::as_str);
+    let expected_stage_execution_id = req
+        .payload
+        .get("stage_execution_id")
+        .and_then(serde_json::Value::as_str);
+    let expected_capability_invocation_id = req
+        .payload
+        .get("capability_invocation_id")
+        .and_then(serde_json::Value::as_str);
+
+    engine::validate_workflow_action_request(
+        &state,
+        run_id,
+        action,
+        req.step_id.as_deref(),
+        engine::WorkflowActionPreconditions {
+            expected_status,
+            expected_step_id,
+            expected_stage_execution_id,
+            expected_capability_invocation_id,
+        },
+    )
+    .await
+    .map_err(|error| {
+        (
+            axum::http::StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "code": "stale_workflow_action",
+                "action": action,
+                "message": error.to_string()
+            })
+            .to_string(),
+        )
+    })?;
+
     let response = match action {
         "select_step" => {
-            let _ = crate::engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id).await;
             let step_id = req.step_id.as_deref().ok_or_else(|| {
                 (
                     axum::http::StatusCode::BAD_REQUEST,
@@ -276,24 +324,30 @@ async fn run_action(
                 .payload
                 .get("disposition")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?;
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?
+                .to_string();
             let selected_step_id = req
                 .payload
                 .get("selected_step_id")
                 .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty());
-            engine::resolve_operator_checkpoint(&state, run_id, disposition, selected_step_id)
-                .await
-                .map_err(|err| {
-                    let message = err.to_string();
-                    if message.contains("workflow is not waiting on operator checkpoint")
-                        || message.contains("workflow is blocked on")
-                    {
-                        (axum::http::StatusCode::CONFLICT, message)
-                    } else {
-                        internal(message)
-                    }
-                })?
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+
+            let result = crate::engine::workflow_lifecycle::execute_workflow_command(
+                &state,
+                crate::engine::workflow_lifecycle::WorkflowCommandEnvelope {
+                    command_id: Uuid::new_v4(),
+                    workflow_run_id: run_id,
+                    command: crate::engine::workflow_lifecycle::WorkflowCommand::ResolveCheckpoint {
+                        disposition,
+                        selected_step_id,
+                    },
+                },
+            )
+            .await
+            .map_err(internal)?;
+
+            serde_json::to_value(result).map_err(internal)?
         }
         "prepare_stage" | "prepare_current_stage" => {
             engine::prepare_run_stage_for_execution(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
@@ -328,23 +382,55 @@ async fn run_action(
                 .map_err(internal)?;
             }
 
-            engine::start_run(&state, run_id, req.step_id.as_deref())
-                .await
-                .map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::MultiStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "resume_run" => {
-            engine::resume_run(&state, run_id).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Resume,
+            )
+            .await
+            .map_err(internal)?
         }
         "pause_run" => {
-            engine::pause_run(&state, run_id).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Pause,
+            )
+            .await
+            .map_err(internal)?
         }
         "cancel_run" | "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
-            engine::force_wait_run(&state, run_id).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Cancel,
+            )
+            .await
+            .map_err(internal)?
         }
         "restart_stage" | "restart_current_stage" => {
-            engine::restart_stage(&state, run_id, req.step_id.as_deref())
-                .await
-                .map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::SingleStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "run_step" | "run_current_step" => {
             if !req.payload.is_null() {
@@ -356,7 +442,16 @@ async fn run_action(
                     .map_err(internal)?;
             }
 
-            engine::run_step(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::SingleStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "next_step" => {
             let run = engine::load_run(&state, run_id).await.map_err(internal)?;

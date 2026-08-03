@@ -3,7 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use serde_json::Value;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -15,32 +16,26 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowRunMode {
-    Automatic,
-    Manual,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowContinuation {
-    StayPaused,
-    RunAutomatic,
-    RunManual,
+pub enum WorkflowExecutionMode {
+    SingleStage,
+    MultiStage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WorkflowCommand {
-    Run {
-        mode: WorkflowRunMode,
+    Start {
+        mode: WorkflowExecutionMode,
+        step_id: Option<String>,
     },
     Pause,
-    Resume {
-        mode: WorkflowRunMode,
+    Resume,
+    ResolveCheckpoint {
+        disposition: String,
+        selected_step_id: Option<String>,
     },
     MoveTo {
         step_id: String,
-        continuation: WorkflowContinuation,
     },
     Cancel,
     Archive,
@@ -73,40 +68,18 @@ impl From<&WorkflowRun> for WorkflowSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WorkflowCommandOutcome {
-    Started {
-        mode: WorkflowRunMode,
+    Accepted {
+        command: String,
+        mode: Option<WorkflowExecutionMode>,
         workflow: WorkflowSnapshot,
     },
-    AlreadyRunning {
-        mode: WorkflowRunMode,
-        workflow: WorkflowSnapshot,
-    },
-    Paused {
+    AlreadyActive {
         workflow: WorkflowSnapshot,
     },
     AlreadyPaused {
         workflow: WorkflowSnapshot,
     },
-    Resumed {
-        mode: WorkflowRunMode,
-        workflow: WorkflowSnapshot,
-    },
-    Moved {
-        step_id: String,
-        continuation: WorkflowContinuation,
-        workflow: WorkflowSnapshot,
-    },
-    AlreadyAtTarget {
-        step_id: String,
-        workflow: WorkflowSnapshot,
-    },
-    Cancelled {
-        workflow: WorkflowSnapshot,
-    },
     AlreadyCancelled {
-        workflow: WorkflowSnapshot,
-    },
-    Archived {
         workflow: WorkflowSnapshot,
     },
 }
@@ -116,6 +89,27 @@ pub struct WorkflowCommandResult {
     pub workflow_run_id: Uuid,
     pub command_id: Uuid,
     pub outcome: WorkflowCommandOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) enum WorkflowRuntimeCommand {
+    Start {
+        mode: WorkflowExecutionMode,
+        step_id: Option<String>,
+    },
+    Pause,
+    Resume,
+    ResolveCheckpoint {
+        disposition: String,
+        selected_step_id: Option<String>,
+    },
+    MoveTo {
+        step_id: String,
+    },
+    Cancel {
+        reason: String,
+    },
+    Archive,
 }
 
 #[derive(Clone, Default)]
@@ -131,7 +125,8 @@ struct WorkflowGuard {
 
 #[derive(Default)]
 struct WorkflowRuntimeState {
-    execution_task: Option<tokio::task::JoinHandle<()>>,
+    execution_task: Option<std::thread::JoinHandle<()>>,
+    command_tx: Option<mpsc::Sender<WorkflowRuntimeCommand>>,
     cancellation: Option<CancellationToken>,
 }
 
@@ -153,7 +148,89 @@ impl WorkflowCoordinator {
             .clone()
     }
 
-    pub async fn stop_active_executions(&self) -> Vec<Uuid> {
+    async fn ensure_runtime(
+        &self,
+        state: &AppState,
+        workflow_run_id: Uuid,
+    ) -> Result<mpsc::Sender<WorkflowRuntimeCommand>> {
+        let guard = self.guard_for(workflow_run_id);
+        let mut runtime = guard.runtime.lock().await;
+
+        if runtime
+            .execution_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return runtime
+                .command_tx
+                .clone()
+                .ok_or_else(|| anyhow!("workflow runtime command channel is unavailable"));
+        }
+
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let cancellation = CancellationToken::new();
+        let task_state = state.clone();
+        let task_cancellation = cancellation.clone();
+
+        let execution_task = std::thread::Builder::new()
+            .name(format!("workflow-runtime-{}", workflow_run_id))
+            .spawn(move || {
+                let workflow_runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::error!(
+                            workflow_run_id = %workflow_run_id,
+                            error = %error,
+                            "failed to create workflow runtime"
+                        );
+                        return;
+                    }
+                };
+
+                workflow_runtime.block_on(async move {
+                    if let Err(error) = engine::run_workflow_runtime(
+                        &task_state,
+                        workflow_run_id,
+                        command_rx,
+                        task_cancellation,
+                    )
+                    .await
+                    {
+                        let error_message = format!("{:#}", error);
+
+                        tracing::error!(
+                            workflow_run_id = %workflow_run_id,
+                            error = %error_message,
+                            "workflow runtime failed"
+                        );
+
+                        let _ = engine::fail_runtime_workflow(
+                            &task_state,
+                            workflow_run_id,
+                            "workflow_runtime_failed",
+                            error_message.as_str(),
+                        )
+                        .await;
+                    }
+                });
+            })
+            .map_err(|error| anyhow!("failed to spawn workflow runtime thread: {}", error))?;
+
+        runtime.command_tx = Some(command_tx.clone());
+        runtime.cancellation = Some(cancellation);
+        runtime.execution_task = Some(execution_task);
+
+        Ok(command_tx)
+    }
+
+    pub async fn stop_active_executions(
+        &self,
+        state: &AppState,
+        reason: &str,
+    ) -> Vec<Uuid> {
         let guards = self
             .workflows
             .iter()
@@ -163,25 +240,35 @@ impl WorkflowCoordinator {
         let mut active_run_ids = Vec::new();
 
         for (workflow_run_id, guard) in guards {
-            let mut runtime = guard.runtime.lock().await;
-            let is_active = runtime
+            let runtime = guard.runtime.lock().await;
+            let active = runtime
                 .execution_task
                 .as_ref()
                 .is_some_and(|task| !task.is_finished());
 
-            if !is_active {
+            if !active {
                 continue;
             }
 
             active_run_ids.push(workflow_run_id);
 
-            if let Some(cancellation) = runtime.cancellation.take() {
-                cancellation.cancel();
+            if let Some(command_tx) = runtime.command_tx.clone() {
+                let _ = command_tx
+                    .send(WorkflowRuntimeCommand::Cancel {
+                        reason: reason.to_string(),
+                    })
+                    .await;
             }
+        }
 
-            if let Some(task) = runtime.execution_task.take() {
-                task.abort();
-            }
+        for workflow_run_id in &active_run_ids {
+            let _ = engine::fail_runtime_workflow(
+                state,
+                *workflow_run_id,
+                "api_shutdown",
+                reason,
+            )
+            .await;
         }
 
         active_run_ids
@@ -205,7 +292,133 @@ impl WorkflowCoordinator {
             return Ok(result);
         }
 
-        let result = execute_locked_command(state, &guard, &envelope).await?;
+        let run = engine::load_run(state, envelope.workflow_run_id).await?;
+        let outcome = match &envelope.command {
+            WorkflowCommand::Start { mode, step_id } => {
+                if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                    WorkflowCommandOutcome::AlreadyActive {
+                        workflow: WorkflowSnapshot::from(&run),
+                    }
+                } else {
+                    let command_tx = self
+                        .ensure_runtime(state, envelope.workflow_run_id)
+                        .await?;
+                    command_tx
+                        .send(WorkflowRuntimeCommand::Start {
+                            mode: *mode,
+                            step_id: step_id.clone(),
+                        })
+                        .await
+                        .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                    WorkflowCommandOutcome::Accepted {
+                        command: "start".to_string(),
+                        mode: Some(*mode),
+                        workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                    }
+                }
+            }
+            WorkflowCommand::Pause => {
+                if matches!(run.status, RunStatus::Paused) {
+                    WorkflowCommandOutcome::AlreadyPaused {
+                        workflow: WorkflowSnapshot::from(&run),
+                    }
+                } else {
+                    self.ensure_runtime(state, envelope.workflow_run_id)
+                        .await?
+                        .send(WorkflowRuntimeCommand::Pause)
+                        .await
+                        .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                    WorkflowCommandOutcome::Accepted {
+                        command: "pause".to_string(),
+                        mode: None,
+                        workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                    }
+                }
+            }
+            WorkflowCommand::Resume => {
+                self.ensure_runtime(state, envelope.workflow_run_id)
+                    .await?
+                    .send(WorkflowRuntimeCommand::Resume)
+                    .await
+                    .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                WorkflowCommandOutcome::Accepted {
+                    command: "resume".to_string(),
+                    mode: None,
+                    workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                }
+            }
+            WorkflowCommand::ResolveCheckpoint {
+                disposition,
+                selected_step_id,
+            } => {
+                self.ensure_runtime(state, envelope.workflow_run_id)
+                    .await?
+                    .send(WorkflowRuntimeCommand::ResolveCheckpoint {
+                        disposition: disposition.clone(),
+                        selected_step_id: selected_step_id.clone(),
+                    })
+                    .await
+                    .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                WorkflowCommandOutcome::Accepted {
+                    command: "resolve_checkpoint".to_string(),
+                    mode: None,
+                    workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                }
+            }
+            WorkflowCommand::MoveTo { step_id } => {
+                self.ensure_runtime(state, envelope.workflow_run_id)
+                    .await?
+                    .send(WorkflowRuntimeCommand::MoveTo {
+                        step_id: step_id.clone(),
+                    })
+                    .await
+                    .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                WorkflowCommandOutcome::Accepted {
+                    command: "move_to".to_string(),
+                    mode: None,
+                    workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                }
+            }
+            WorkflowCommand::Cancel => {
+                if matches!(run.status, RunStatus::Cancelled) {
+                    WorkflowCommandOutcome::AlreadyCancelled {
+                        workflow: WorkflowSnapshot::from(&run),
+                    }
+                } else {
+                    self.ensure_runtime(state, envelope.workflow_run_id)
+                        .await?
+                        .send(WorkflowRuntimeCommand::Cancel {
+                            reason: "user_cancelled".to_string(),
+                        })
+                        .await
+                        .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                    WorkflowCommandOutcome::Accepted {
+                        command: "cancel".to_string(),
+                        mode: None,
+                        workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                    }
+                }
+            }
+            WorkflowCommand::Archive => {
+                self.ensure_runtime(state, envelope.workflow_run_id)
+                    .await?
+                    .send(WorkflowRuntimeCommand::Archive)
+                    .await
+                    .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                WorkflowCommandOutcome::Accepted {
+                    command: "archive".to_string(),
+                    mode: None,
+                    workflow: reload_snapshot(state, envelope.workflow_run_id).await?,
+                }
+            }
+        };
+
+        let result = WorkflowCommandResult {
+            workflow_run_id: envelope.workflow_run_id,
+            command_id: envelope.command_id,
+            outcome,
+        };
+
         guard
             .completed_commands
             .lock()
@@ -216,219 +429,31 @@ impl WorkflowCoordinator {
     }
 }
 
-async fn stop_execution_task(guard: &WorkflowGuard) {
-    let mut runtime = guard.runtime.lock().await;
-
-    if let Some(cancellation) = runtime.cancellation.take() {
-        cancellation.cancel();
-    }
-
-    if let Some(task) = runtime.execution_task.take() {
-        task.abort();
-    }
-}
-
-async fn spawn_automatic_execution(
+async fn reload_snapshot(
     state: &AppState,
-    guard: &WorkflowGuard,
     workflow_run_id: Uuid,
-) -> Result<bool> {
-    let mut runtime = guard.runtime.lock().await;
-
-    if runtime
-        .execution_task
-        .as_ref()
-        .is_some_and(|task| !task.is_finished())
-    {
-        return Ok(false);
-    }
-
-    let cancellation = CancellationToken::new();
-    let task_cancellation = cancellation.clone();
-    let task_state = state.clone();
-
-    runtime.cancellation = Some(cancellation);
-    runtime.execution_task = Some(tokio::spawn(async move {
-        if task_cancellation.is_cancelled() {
-            return;
-        }
-
-        if let Err(error) = engine::start_run(&task_state, workflow_run_id, None).await {
-            tracing::error!(
-                workflow_run_id = %workflow_run_id,
-                error = %format!("{:#}", error),
-                "automatic workflow execution failed"
-            );
-        }
-    }));
-
-    Ok(true)
-}
-
-async fn reload_snapshot(state: &AppState, workflow_run_id: Uuid) -> Result<WorkflowSnapshot> {
+) -> Result<WorkflowSnapshot> {
     let run = engine::load_run(state, workflow_run_id).await?;
     Ok(WorkflowSnapshot::from(&run))
 }
 
-async fn run_workflow(
+pub async fn execute_workflow_command_value(
     state: &AppState,
-    guard: &WorkflowGuard,
-    run: &WorkflowRun,
-    mode: WorkflowRunMode,
-) -> Result<WorkflowCommandOutcome> {
-    if matches!(run.status, RunStatus::Running) {
-        return Ok(WorkflowCommandOutcome::AlreadyRunning {
-            mode,
-            workflow: WorkflowSnapshot::from(run),
-        });
-    }
-
-    match mode {
-        WorkflowRunMode::Automatic => {
-            if !spawn_automatic_execution(state, guard, run.id).await? {
-                return Ok(WorkflowCommandOutcome::AlreadyRunning {
-                    mode,
-                    workflow: reload_snapshot(state, run.id).await?,
-                });
-            }
-        }
-        WorkflowRunMode::Manual => {
-            engine::run_step(state, run.id, run.current_step_id.as_deref()).await?;
-        }
-    }
-
-    Ok(WorkflowCommandOutcome::Started {
-        mode,
-        workflow: reload_snapshot(state, run.id).await?,
-    })
-}
-
-async fn resume_workflow(
-    state: &AppState,
-    guard: &WorkflowGuard,
-    run: &WorkflowRun,
-    mode: WorkflowRunMode,
-) -> Result<WorkflowCommandOutcome> {
-    if matches!(run.status, RunStatus::Running) {
-        return Ok(WorkflowCommandOutcome::AlreadyRunning {
-            mode,
-            workflow: WorkflowSnapshot::from(run),
-        });
-    }
-
-    engine::resume_run(state, run.id).await?;
-
-    match mode {
-        WorkflowRunMode::Automatic => {
-            let _started = spawn_automatic_execution(state, guard, run.id).await?;
-        }
-        WorkflowRunMode::Manual => {}
-    }
-
-    Ok(WorkflowCommandOutcome::Resumed {
-        mode,
-        workflow: reload_snapshot(state, run.id).await?,
-    })
-}
-
-async fn move_workflow(
-    state: &AppState,
-    guard: &WorkflowGuard,
-    run: &WorkflowRun,
-    step_id: &str,
-    continuation: WorkflowContinuation,
-) -> Result<WorkflowCommandOutcome> {
-    if run.current_step_id.as_deref() == Some(step_id) {
-        return Ok(WorkflowCommandOutcome::AlreadyAtTarget {
-            step_id: step_id.to_string(),
-            workflow: WorkflowSnapshot::from(run),
-        });
-    }
-
-    stop_execution_task(guard).await;
-    engine::select_step(state, run.id, step_id).await?;
-
-    match continuation {
-        WorkflowContinuation::StayPaused => {
-            engine::pause_run(state, run.id).await?;
-        }
-        WorkflowContinuation::RunAutomatic => {
-            engine::resume_run(state, run.id).await?;
-            let _started = spawn_automatic_execution(state, guard, run.id).await?;
-        }
-        WorkflowContinuation::RunManual => {
-            engine::resume_run(state, run.id).await?;
-            engine::run_step(state, run.id, Some(step_id)).await?;
-        }
-    }
-
-    Ok(WorkflowCommandOutcome::Moved {
-        step_id: step_id.to_string(),
-        continuation,
-        workflow: reload_snapshot(state, run.id).await?,
-    })
-}
-
-async fn execute_locked_command(
-    state: &AppState,
-    guard: &WorkflowGuard,
-    envelope: &WorkflowCommandEnvelope,
-) -> Result<WorkflowCommandResult> {
-    let run = engine::load_run(state, envelope.workflow_run_id).await?;
-
-    let outcome = match &envelope.command {
-        WorkflowCommand::Run { mode } => {
-            run_workflow(state, guard, &run, *mode).await?
-        }
-        WorkflowCommand::Pause => {
-            if matches!(run.status, RunStatus::Paused) {
-                WorkflowCommandOutcome::AlreadyPaused {
-                    workflow: WorkflowSnapshot::from(&run),
-                }
-            } else {
-                stop_execution_task(guard).await;
-                engine::pause_run(state, run.id).await?;
-                WorkflowCommandOutcome::Paused {
-                    workflow: reload_snapshot(state, run.id).await?,
-                }
-            }
-        }
-        WorkflowCommand::Resume { mode } => {
-            resume_workflow(state, guard, &run, *mode).await?
-        }
-        WorkflowCommand::MoveTo {
-            step_id,
-            continuation,
-        } => {
-            move_workflow(state, guard, &run, step_id, *continuation).await?
-        }
-        WorkflowCommand::Cancel => {
-            if matches!(run.status, RunStatus::Cancelled) {
-                WorkflowCommandOutcome::AlreadyCancelled {
-                    workflow: WorkflowSnapshot::from(&run),
-                }
-            } else {
-                stop_execution_task(guard).await;
-                engine::force_wait_run(state, run.id).await?;
-                WorkflowCommandOutcome::Cancelled {
-                    workflow: reload_snapshot(state, run.id).await?,
-                }
-            }
-        }
-        WorkflowCommand::Archive => {
-            stop_execution_task(guard).await;
-            engine::force_wait_run(state, run.id).await?;
-            WorkflowCommandOutcome::Archived {
-                workflow: reload_snapshot(state, run.id).await?,
-            }
-        }
-    };
-
-    Ok(WorkflowCommandResult {
-        workflow_run_id: envelope.workflow_run_id,
-        command_id: envelope.command_id,
-        outcome,
-    })
+    workflow_run_id: Uuid,
+    command: WorkflowCommand,
+) -> Result<Value> {
+    serde_json::to_value(
+        execute_workflow_command(
+            state,
+            WorkflowCommandEnvelope {
+                command_id: Uuid::new_v4(),
+                workflow_run_id,
+                command,
+            },
+        )
+        .await?,
+    )
+    .map_err(Into::into)
 }
 
 pub async fn execute_workflow_command(
@@ -440,4 +465,33 @@ pub async fn execute_workflow_command(
     }
 
     state.workflow_coordinator.execute(state, envelope).await
+}
+
+pub(crate) fn command_payload(command: &WorkflowRuntimeCommand) -> Value {
+    match command {
+        WorkflowRuntimeCommand::Start { mode, step_id } => serde_json::json!({
+            "kind": "start",
+            "mode": mode,
+            "step_id": step_id
+        }),
+        WorkflowRuntimeCommand::Pause => serde_json::json!({ "kind": "pause" }),
+        WorkflowRuntimeCommand::Resume => serde_json::json!({ "kind": "resume" }),
+        WorkflowRuntimeCommand::ResolveCheckpoint {
+            disposition,
+            selected_step_id,
+        } => serde_json::json!({
+            "kind": "resolve_checkpoint",
+            "disposition": disposition,
+            "selected_step_id": selected_step_id
+        }),
+        WorkflowRuntimeCommand::MoveTo { step_id } => serde_json::json!({
+            "kind": "move_to",
+            "step_id": step_id
+        }),
+        WorkflowRuntimeCommand::Cancel { reason } => serde_json::json!({
+            "kind": "cancel",
+            "reason": reason
+        }),
+        WorkflowRuntimeCommand::Archive => serde_json::json!({ "kind": "archive" }),
+    }
 }

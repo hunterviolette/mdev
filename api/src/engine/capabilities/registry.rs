@@ -22,7 +22,7 @@ use crate::{
     models::{StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
-use super::{binding_specs, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, review_validation, sap, shared_dependencies};
+use super::{capability_enabled, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, review_validation, sap, shared_dependencies};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -464,8 +464,8 @@ fn follow_up_vec(req: &CapabilityInvocationRequest) -> Vec<CapabilityInvocation>
 }
 
 fn planner_apply_config(ctx: &CapabilityContext<'_>) -> Result<Option<Value>> {
-    if !binding_specs::stage_supports_shared_capability(ctx.step, "planner_apply")
-        || !binding_specs::shared_capability_enabled(ctx.local_state, "planner_apply", false)
+    if !crate::engine::stages::stage_supports_capability(ctx.step, "planner_apply")
+        || !capability_enabled(ctx.local_state, "planner_apply", false)
     {
         return Ok(None);
     }

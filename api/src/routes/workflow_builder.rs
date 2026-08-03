@@ -348,6 +348,14 @@ fn compile_workflow_capability_summary(
             stage_keys.dedup();
         }
 
+        if builder_stage_uses_automation(&global_state, step)
+            && !stage_keys.iter().any(|key| key == "automation")
+        {
+            stage_keys.push("automation".to_string());
+            stage_keys.sort();
+            stage_keys.dedup();
+        }
+
         for key in stage_keys {
             let entry = by_key.entry(key.clone()).or_insert_with(|| WorkflowCapabilitySummaryItem {
                 key: key.clone(),
@@ -376,6 +384,18 @@ fn builder_stage_uses_inference(step: &WorkflowStepDefinition) -> bool {
             .get("connections")
             .and_then(|v| v.get("inference"))
             .is_some()
+}
+
+fn builder_stage_uses_automation(
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+) -> bool {
+    let profile = crate::engine::capabilities::automation::profile_from_global_state(global_state);
+
+    profile.enabled
+        && profile.new_session.iter().any(|capability| {
+            crate::engine::stages::stage_supports_capability(step, capability)
+        })
 }
 
 fn materialize_builder_stage_state(step: &WorkflowStepDefinition) -> Value {

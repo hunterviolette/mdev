@@ -165,7 +165,7 @@ type RuntimeEventBusHandlers = {
   onError?: () => void;
 };
 
-export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
+function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
   let disposed = false;
   let source: EventSource | null = null;
   let reconnectTimer: number | null = null;
@@ -368,5 +368,46 @@ export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     stopLeading();
     channel?.close();
     handlers.onClose?.();
+  };
+}
+
+const runtimeEventBusSubscribers = new Set<RuntimeEventBusHandlers>();
+let stopSharedRuntimeEventBus: (() => void) | null = null;
+
+function dispatchRuntimeEventBus<K extends keyof RuntimeEventBusHandlers>(
+  key: K,
+  value?: Parameters<NonNullable<RuntimeEventBusHandlers[K]>>[0]
+) {
+  for (const subscriber of runtimeEventBusSubscribers) {
+    const handler = subscriber[key] as ((payload?: unknown) => void) | undefined;
+    handler?.(value);
+  }
+}
+
+function ensureSharedRuntimeEventBus() {
+  if (stopSharedRuntimeEventBus) return;
+
+  stopSharedRuntimeEventBus = startRuntimeEventBus({
+    onOpen: () => dispatchRuntimeEventBus('onOpen'),
+    onClose: () => dispatchRuntimeEventBus('onClose'),
+    onSnapshot: (snapshot) => dispatchRuntimeEventBus('onSnapshot', snapshot),
+    onProjection: (projection) => dispatchRuntimeEventBus('onProjection', projection),
+    onEvent: (event) => dispatchRuntimeEventBus('onEvent', event),
+    onError: () => dispatchRuntimeEventBus('onError')
+  });
+}
+
+export function subscribeRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
+  runtimeEventBusSubscribers.add(handlers);
+  ensureSharedRuntimeEventBus();
+
+  return () => {
+    runtimeEventBusSubscribers.delete(handlers);
+
+    if (runtimeEventBusSubscribers.size === 0 && stopSharedRuntimeEventBus) {
+      const stop = stopSharedRuntimeEventBus;
+      stopSharedRuntimeEventBus = null;
+      stop();
+    }
   };
 }

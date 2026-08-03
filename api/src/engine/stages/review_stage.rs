@@ -32,7 +32,12 @@ impl Stage for ReviewStage {
     }
 
     fn capabilities(&self) -> StageCapabilities {
-        StageCapabilities::new(["context_export", "inference", "review_validation"])
+        StageCapabilities::new([
+            "context_export",
+            "inference",
+            "repo_context",
+            "review_validation",
+        ])
     }
 
     fn prepare_state(

@@ -3879,11 +3879,24 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
             "message": "The workflow is waiting on an operator checkpoint and was not restarted."
         })
     } else if matches!(child_run.status, RunStatus::Waiting | RunStatus::Paused) {
-        engine::resume_run(state, workflow_run_id).await?
+        crate::engine::workflow_lifecycle::execute_workflow_command_value(
+            state,
+            workflow_run_id,
+            crate::engine::workflow_lifecycle::WorkflowCommand::Resume,
+        )
+        .await?
     } else if matches!(child_run.status, RunStatus::Queued | RunStatus::Running) {
         json!({ "ok": true, "already_running": true })
     } else {
-        engine::start_run(state, workflow_run_id, None).await?
+        crate::engine::workflow_lifecycle::execute_workflow_command_value(
+            state,
+            workflow_run_id,
+            crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::MultiStage,
+                step_id: None,
+            },
+        )
+        .await?
     };
 
     let now = Utc::now().to_rfc3339();
@@ -3923,7 +3936,12 @@ pub async fn pause_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
     let workflow_run_id = row.try_get::<Option<String>, _>("workflow_run_id").ok().flatten().and_then(|value| Uuid::parse_str(value.as_str()).ok());
 
     let pause_result = if let Some(workflow_run_id) = workflow_run_id {
-        engine::pause_run(state, workflow_run_id).await?
+        crate::engine::workflow_lifecycle::execute_workflow_command_value(
+            state,
+            workflow_run_id,
+            crate::engine::workflow_lifecycle::WorkflowCommand::Pause,
+        )
+        .await?
     } else {
         json!({ "ok": true, "paused": true, "workflow_run_id": null })
     };
@@ -4963,7 +4981,16 @@ async fn spawn_live_integration_workflow(state: &AppState, run: &mut SupervisorR
     run.updated_at = Utc::now();
     update_supervisor_run(state, run).await?;
 
-    if let Err(err) = Box::pin(engine::start_run(state, spawn_result.workflow_run_id, None)).await {
+    if let Err(err) = Box::pin(crate::engine::workflow_lifecycle::execute_workflow_command_value(
+        state,
+        spawn_result.workflow_run_id,
+        crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+            mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::MultiStage,
+            step_id: None,
+        },
+    ))
+    .await
+    {
         tracing::error!(
             supervisor_run_id = %run.id,
             integration_run_id = %spawn_result.workflow_run_id,
@@ -5603,7 +5630,16 @@ async fn start_next_series_child(state: &AppState, run: &mut SupervisorRun) -> R
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 let _ = update_sprint_feature_workflow_state(&state_for_task, &sprint_id_for_task, &feature_id_for_task, Some(child_run_id), "development_running", "development_running", None, None).await;
-                match engine::start_run(&state_for_task, child_run_id, None).await {
+                match crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                    &state_for_task,
+                    child_run_id,
+                    crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                        mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::MultiStage,
+                        step_id: None,
+                    },
+                )
+                .await
+                {
                     Ok(start_result) => {
                         if start_result.get("blocked_on").and_then(Value::as_str) == Some("pause_after_stage") {
                             tracing::warn!(

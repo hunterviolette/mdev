@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::{
+    engine::normalize_inference_arm_state,
     app_state::AppState,
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
 };
@@ -181,6 +182,13 @@ pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> StageCapa
     stage_for_step(step).capabilities()
 }
 
+pub fn stage_supports_capability(
+    step: &WorkflowStepDefinition,
+    capability: &str,
+) -> bool {
+    capability_contract_for_stage(step).contains(capability)
+}
+
 fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     if !value.is_object() {
         *value = json!({});
@@ -188,7 +196,18 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) {
+pub fn rearm_session_scoped_inference_inputs(
+    run: &mut WorkflowRun,
+    _step: &WorkflowStepDefinition,
+) {
+    normalize_inference_arm_state(run);
+    crate::engine::capabilities::automation::apply_trigger(
+        run,
+        crate::engine::capabilities::automation::AutomationTrigger::NewInferenceSession,
+    );
+}
+
+fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) -> bool {
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
     let global_state_obj = ensure_value_object(global_state);
@@ -239,7 +258,7 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         .to_string();
 
     if persisted_process_session_id == current_process_session_id {
-        return;
+        return false;
     }
 
     connection_runtime_obj.clear();
@@ -247,6 +266,8 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         "process_session_id".to_string(),
         Value::String(current_process_session_id),
     );
+
+    true
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
@@ -415,7 +436,9 @@ pub async fn execute_stage(
     let stage_execution_id = format!("{}-{}", sanitize_stage_execution_prefix(&step.step_type), Uuid::new_v4());
     let stage_started_at = Instant::now();
 
-    reset_session_scoped_inference_state(state, run);
+    if reset_session_scoped_inference_state(state, run) {
+        rearm_session_scoped_inference_inputs(run, step);
+    }
 
     append_engine_event(
         state,

@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use crate::{
     engine::{
         capabilities::{
-            binding_specs,
+            capability_enabled,
             inference::stage_support::{
                 build_inference_execution_plan,
                 prepare_inference_stage_state_with_hooks,
@@ -39,7 +39,13 @@ impl Stage for DesignStage {
     }
 
     fn capabilities(&self) -> StageCapabilities {
-        StageCapabilities::new(["inference"])
+        StageCapabilities::new([
+            "inference",
+            "repo_context",
+            "planner_fragment",
+            "planner_schema",
+            "planner_apply",
+        ])
     }
 
     fn prepare_state(
@@ -113,8 +119,8 @@ fn prepare_design_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
-    let planner_fragment_enabled = binding_specs::stage_supports_shared_capability(step, "planner_fragment")
-        && binding_specs::shared_capability_enabled(global_state, "planner_fragment", false)
+    let planner_fragment_enabled = super::stage_supports_capability(step, "planner_fragment")
+        && capability_enabled(global_state, "planner_fragment", false)
         && planner::planner_fragment_enabled(global_state, step);
 
     let empty_user_input_default = if planner_fragment_enabled {

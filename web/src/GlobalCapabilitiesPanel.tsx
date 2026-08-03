@@ -3,6 +3,7 @@ import { Badge, Button, Card, Group, SimpleGrid, Stack, Text, Title } from '@man
 
 type GlobalCapabilitiesPanelProps = {
   onOpenInference: () => void;
+  onOpenAutomation?: () => void;
   onOpenRepoFragment: () => void;
   onOpenChangesetSchema: () => void;
   onOpenPlanner: () => void;
@@ -15,6 +16,7 @@ type GlobalCapabilitiesPanelProps = {
   plannerArmed: boolean;
   sharedDependenciesEnabled: boolean;
   deployQAAvailable: boolean;
+  automationEnabled?: boolean;
 };
 
 type CapabilityCardProps = {
@@ -57,6 +59,7 @@ function ArmedBadge(props: { armed: boolean }) {
 export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
   const {
     onOpenInference,
+    onOpenAutomation = () => {},
     onOpenRepoFragment,
     onOpenChangesetSchema,
     onOpenPlanner,
@@ -69,6 +72,7 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
     plannerArmed,
     sharedDependenciesEnabled,
     deployQAAvailable,
+    automationEnabled = true,
   } = props;
 
   return (
@@ -92,6 +96,18 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           buttonLabel="Manage sessions"
           onClick={onOpenInference}
           badge={<Badge color="blue" variant="light">Core</Badge>}
+        />
+        <CapabilityCard
+          eyebrow="Lifecycle"
+          title="Automation"
+          description="Configure stage-entry and new-session rearming for connected single-use inference capabilities."
+          buttonLabel="Configure automation"
+          onClick={onOpenAutomation}
+          badge={
+            <Badge color={automationEnabled ? 'green' : 'gray'} variant="light">
+              {automationEnabled ? 'Enabled' : 'Disabled'}
+            </Badge>
+          }
         />
         <CapabilityCard
           eyebrow="Context"

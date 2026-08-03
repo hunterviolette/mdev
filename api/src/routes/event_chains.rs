@@ -728,18 +728,6 @@ async fn get_event_history(
     Query(query): Query<EventHistoryQuery>,
 ) -> Result<Json<EventHistoryResponse>, (axum::http::StatusCode, String)> {
     let limit = query.limit.unwrap_or(100).clamp(25, 500);
-    eprintln!(
-        "[event_history] request run_id={} limit={} before_sequence={:?} start={:?} end={:?} stage={:?} capability={:?} stage_execution_id={:?} capability_invocation_id={:?}",
-        run_id,
-        limit,
-        query.before_sequence,
-        query.start,
-        query.end,
-        query.stage,
-        query.capability,
-        query.stage_execution_id,
-        query.capability_invocation_id
-    );
     let mut builder = QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = "
     );
@@ -786,7 +774,6 @@ async fn get_event_history(
     builder.push_bind(limit + 1);
 
     let mut rows = builder.build().fetch_all(&state.db).await.map_err(internal)?;
-    eprintln!("[event_history] db rows run_id={} count={} requested_limit={}", run_id, rows.len(), limit);
     let has_more = rows.len() as i64 > limit;
     if has_more {
         rows.truncate(limit as usize);
@@ -795,14 +782,6 @@ async fn get_event_history(
     let mut items = rows.into_iter().map(row_to_stage_chain_event).collect::<Result<Vec<_>, _>>()?;
     items.reverse();
     let next_before_sequence = items.first().map(|item| item.sequence_no);
-
-    eprintln!(
-        "[event_history] response run_id={} items={} has_more={} next_before_sequence={:?}",
-        run_id,
-        items.len(),
-        has_more,
-        next_before_sequence
-    );
 
     Ok(Json(EventHistoryResponse {
         run_id: run_id.to_string(),

@@ -3,8 +3,8 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::{binding_specs, changeset::schema as changeset_schema, context_export, planner},
-        stages::compose_prompt_from_state,
+        capabilities::{capability_enabled, changeset::schema as changeset_schema, context_export, planner},
+        stages::{compose_prompt_from_state, stage_supports_capability},
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
 };
@@ -69,21 +69,21 @@ pub fn prepare_inference_stage_state_with_hooks(
         }
     }
 
-    let include_repo_context = shared_inference_primitive_enabled(
+    let include_repo_context = inference_input_enabled(
         global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = shared_inference_primitive_enabled(
+    let include_changeset_schema = inference_input_enabled(
         global_state,
         step,
         "changeset_schema",
         settings.include_changeset_schema,
     );
 
-    let include_planning_fragment = shared_inference_primitive_enabled(
+    let include_planning_fragment = inference_input_enabled(
         global_state,
         step,
         "planner_fragment",
@@ -187,7 +187,7 @@ pub fn prepare_inference_stage_state_with_hooks(
             .remove("changeset_schema");
     }
 
-    let include_planner_schema = shared_inference_primitive_enabled(
+    let include_planner_schema = inference_input_enabled(
         global_state,
         step,
         "planner_schema",
@@ -407,17 +407,14 @@ pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
     }
 }
 
-fn shared_inference_primitive_enabled(
+fn inference_input_enabled(
     global_state: &Value,
     step: &WorkflowStepDefinition,
     key: &str,
-    _default_enabled: bool,
+    default_enabled: bool,
 ) -> bool {
-    if !binding_specs::stage_supports_shared_capability(step, key) {
-        return false;
-    }
-
-    binding_specs::shared_capability_enabled(global_state, key, false)
+    stage_supports_capability(step, key)
+        && capability_enabled(global_state, key, default_enabled)
 }
 
 pub fn build_inference_execution_plan(
@@ -427,14 +424,14 @@ pub fn build_inference_execution_plan(
     local_state: &Value,
     settings: InferenceStageSettings,
 ) -> Result<Vec<StageExecutionNode>> {
-    let include_repo_context = shared_inference_primitive_enabled(
+    let include_repo_context = inference_input_enabled(
         global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = shared_inference_primitive_enabled(
+    let include_changeset_schema = inference_input_enabled(
         global_state,
         step,
         "changeset_schema",

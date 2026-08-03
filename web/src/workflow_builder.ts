@@ -20,6 +20,8 @@ export type BuilderStep = {
 
 export function capabilityDisplayLabel(capabilityKey: string): string {
   switch (capabilityKey) {
+    case 'automation':
+      return 'Automation';
     case 'context_export':
       return 'Context export';
     case 'inference':

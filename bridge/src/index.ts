@@ -52,6 +52,10 @@ async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
       const data = await manager.connectOverCdp(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: data.session_id, data };
     }
+    case 'list_sessions': {
+      const data = manager.listSessions();
+      return { id: cmd.id, ok: true, cmd: cmd.cmd, data };
+    }
     case 'open_page': {
       const data = await manager.openPage(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };

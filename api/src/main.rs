@@ -45,6 +45,22 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(db);
 
+    match crate::engine::fail_stale_running_runs_on_startup(&state).await {
+        Ok(failed_runs) if failed_runs > 0 => {
+            tracing::warn!(
+                failed_runs,
+                "marked workflows interrupted by the previous API process as failed"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{:#}", error),
+                "failed to reconcile workflows interrupted by the previous API process"
+            );
+        }
+    }
+
     let shutdown_state = state.clone();
     let app = build_router(state, &layout.web_dist);
 
@@ -68,7 +84,10 @@ async fn main() -> anyhow::Result<()> {
 
             let active_run_ids = shutdown_state
                 .workflow_coordinator
-                .stop_active_executions()
+                .stop_active_executions(
+                    &shutdown_state,
+                    "The API shut down while workflow execution was active.",
+                )
                 .await;
 
             let terminated = shutdown_state

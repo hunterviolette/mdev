@@ -2,7 +2,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -681,6 +681,24 @@ pub fn launch_and_attach(cfg: &mut BrowserConfig) -> Result<String> {
     let err = last_err.unwrap_or_else(|| anyhow!("Browser attach failed after retries"));
     error!(error = %format!("{:#}", err), "launch_and_attach exhausted retries");
     Err(err)
+}
+
+pub fn list_session_ids() -> Result<Vec<String>> {
+    let client = bridge_client();
+    client.ensure_started()?;
+    let payload = bridge_cmd("list_sessions");
+    let value = client.send_json(payload)?;
+    let data = value.get("data").cloned().unwrap_or(value);
+    Ok(data
+        .get("session_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 pub fn open_url(cfg: &mut BrowserConfig, url: &str) -> Result<()> {

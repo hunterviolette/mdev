@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::{
-    engine::{capabilities::binding_specs, stages},
+    engine::{capabilities::capability_enabled, stages},
     models::{WorkflowRun, WorkflowStepDefinition},
 };
 
@@ -54,27 +54,49 @@ pub fn after_stage(
 
     let consumed_contains = |key: &str| consumed.iter().any(|item| item.as_str() == Some(key));
 
+    let planner_apply_invoked = capability_results.iter().any(|item| {
+        item.get("key").and_then(Value::as_str) == Some("planner_apply")
+            || item.get("capability").and_then(Value::as_str) == Some("planner_apply")
+            || item
+                .get("result")
+                .and_then(|value| value.get("capability"))
+                .and_then(Value::as_str)
+                == Some("planner_apply")
+    });
+
     let mut inference_patch = Map::new();
     let mut context_export_patch = Map::new();
     let mut planner_patch = Map::new();
 
     if consumed_contains("repo_context")
-        && binding_specs::shared_capability_enabled(&global_state, "repo_context", false)
+        && capability_enabled(&global_state, "repo_context", false)
     {
         inference_patch.insert("repo_context_armed".to_string(), Value::Bool(false));
         context_export_patch.insert("single_use_override".to_string(), Value::Null);
     }
 
     if consumed_contains("changeset_schema")
-        && binding_specs::shared_capability_enabled(&global_state, "changeset_schema", false)
+        && capability_enabled(&global_state, "changeset_schema", false)
     {
         inference_patch.insert("changeset_schema_armed".to_string(), Value::Bool(false));
     }
 
     if consumed_contains("planner_fragment")
-        && binding_specs::shared_capability_enabled(&global_state, "planner_fragment", false)
+        && capability_enabled(&global_state, "planner_fragment", false)
     {
         planner_patch.insert("fragment_armed".to_string(), Value::Bool(false));
+    }
+
+    if consumed_contains("planner_schema")
+        && capability_enabled(&global_state, "planner_schema", false)
+    {
+        planner_patch.insert("schema_armed".to_string(), Value::Bool(false));
+    }
+
+    if planner_apply_invoked
+        && capability_enabled(&global_state, "planner_apply", false)
+    {
+        planner_patch.insert("auto_apply_armed".to_string(), Value::Bool(false));
     }
 
     if inference_patch.is_empty() && context_export_patch.is_empty() && planner_patch.is_empty() {

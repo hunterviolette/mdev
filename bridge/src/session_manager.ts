@@ -209,6 +209,22 @@ export class SessionManager {
     const page = state.page;
     const { name: resolvedProfileName, profile } = await resolveInteractionProfile(page, cmd.profile ?? state.profile ?? 'auto');
 
+    const browserConnected = state.browser?.isConnected() ?? true;
+    if (!browserConnected) {
+      this.sessions.delete(state.sessionId);
+      return {
+        session_id: state.sessionId,
+        browser_connected: false,
+        page_open: false,
+        url: '',
+        profile: state.profile ?? 'auto',
+        chat_input_found: false,
+        chat_input_visible: false,
+        chat_submit_found: false,
+        ready: false
+      };
+    }
+
 
     state.profile = resolvedProfileName;
     state.responseSelector = profile.responseSelector;
@@ -220,7 +236,7 @@ export class SessionManager {
     if (page.isClosed()) {
       return {
         session_id: state.sessionId,
-        browser_connected: true,
+        browser_connected: browserConnected,
         page_open: false,
         url: '',
         profile: state.profile ?? 'auto',
@@ -235,7 +251,7 @@ export class SessionManager {
     if (!chatInputSelector) {
       return {
         session_id: state.sessionId,
-        browser_connected: true,
+        browser_connected: browserConnected,
         page_open: true,
         url: page.url(),
         profile: state.profile ?? 'auto',
@@ -259,7 +275,7 @@ export class SessionManager {
 
     return {
       session_id: state.sessionId,
-      browser_connected: true,
+      browser_connected: browserConnected,
       page_open: true,
       url: page.url(),
       profile: state.profile ?? 'auto',
@@ -955,6 +971,23 @@ export class SessionManager {
       cookies: cookieData.cookies,
       cookie_names: cookieData.cookie_names,
       cookie_header: cookieData.cookie_header
+    };
+  }
+
+  listSessions() {
+    const sessionIds: string[] = [];
+
+    for (const [sessionId, state] of this.sessions.entries()) {
+      if (state.browser && !state.browser.isConnected()) {
+        this.sessions.delete(sessionId);
+        continue;
+      }
+
+      sessionIds.push(sessionId);
+    }
+
+    return {
+      session_ids: sessionIds
     };
   }
 

@@ -9,6 +9,22 @@ const repoDirectory = path.resolve(webDirectory, '..');
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, repoDirectory, '');
 
+  const webHost =
+    env.WORKFLOW_WEB_HOST?.trim() ||
+    process.env.WORKFLOW_WEB_HOST?.trim() ||
+    '127.0.0.1';
+
+  const webPort = Number.parseInt(
+    env.WORKFLOW_WEB_PORT?.trim() ||
+      process.env.WORKFLOW_WEB_PORT?.trim() ||
+      '5173',
+    10,
+  );
+
+  if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65535) {
+    throw new Error('WORKFLOW_WEB_PORT must be a valid TCP port');
+  }
+
   const apiHost =
     env.WORKFLOW_API_HOST?.trim() ||
     process.env.WORKFLOW_API_HOST?.trim() ||
@@ -33,11 +49,17 @@ export default defineConfig(({ mode }) => {
     envDir: repoDirectory,
     plugins: [react()],
     server: {
+      host: webHost,
+      port: webPort,
+      strictPort: true,
       proxy: {
         '/api': apiProxy,
       },
     },
     preview: {
+      host: webHost,
+      port: webPort,
+      strictPort: true,
       proxy: {
         '/api': apiProxy,
       },

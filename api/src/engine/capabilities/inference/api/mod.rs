@@ -13,6 +13,7 @@ pub async fn execute(
 
     let resolved_session = session::resolve_inference_session(ctx).await?;
     let mut inference_cfg = resolved_session.config;
+    let current_process_session_id = ctx.state.process_session_id().to_string();
     let prior_conversation_id = session::runtime_string(&inference_cfg, "conversation_id")
         .or_else(|| inference_cfg.conversation_id.clone());
 
@@ -28,7 +29,11 @@ pub async fn execute(
 
     inference_cfg.conversation_id = Some(conversation_id.clone());
     session::set_runtime_string(&mut inference_cfg, "conversation_id", Some(conversation_id.clone()));
-    session::set_runtime_string(&mut inference_cfg, "process_session_id", Some(ctx.state.process_session_id().to_string()));
+    session::set_runtime_string(
+        &mut inference_cfg,
+        "process_session_id",
+        Some(current_process_session_id.clone()),
+    );
     persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
 
     let result = InferenceResult {

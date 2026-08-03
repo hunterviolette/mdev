@@ -847,23 +847,6 @@ export function getStageExecutionChain(runId: string, stepId: string, stageExecu
   );
 }
 
-export function openEventStream(
-  runId: string,
-  options: { afterSequence?: number; liveOnly?: boolean } = {}
-): EventSource {
-  const params = new URLSearchParams();
-  if (typeof options.afterSequence === 'number') {
-    params.set('after_sequence', String(options.afterSequence));
-  }
-  if (options.liveOnly) {
-    params.set('live_only', 'true');
-  }
-  const query = params.toString();
-  return new EventSource(
-    `/api/workflow-runs/${runId}/events/stream${query ? `?${query}` : ''}`
-  );
-}
-
 function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
   const params = new URLSearchParams();
   if (query.run_id) params.set('run_id', query.run_id);
@@ -888,10 +871,36 @@ export function openRuntimeEventStream(query: RuntimeEventQuery = {}): EventSour
   return new EventSource(`/api/events/stream${runtimeEventQueryString(query)}`);
 }
 
-export function sendRunAction(runId: string, body: { action: string; step_id?: string | null; payload?: Record<string, unknown> }) {
+export type WorkflowActionExpectation = {
+  expectedStatus?: string | null;
+  expectedStepId?: string | null;
+};
+
+export function sendRunAction(
+  runId: string,
+  body: {
+    action: string;
+    step_id?: string | null;
+    payload?: Record<string, unknown>;
+  },
+  expectation?: WorkflowActionExpectation
+) {
+  const payload = {
+    ...(body.payload ?? {}),
+    ...(expectation?.expectedStatus
+      ? { expected_status: expectation.expectedStatus }
+      : {}),
+    ...(expectation?.expectedStepId
+      ? { expected_step_id: expectation.expectedStepId }
+      : {})
+  };
+
   return fetchJson<WorkflowRunActionResult>(`/api/workflow-runs/${runId}/actions`, {
     method: 'POST',
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      ...body,
+      payload
+    })
   });
 }
 
@@ -955,18 +964,35 @@ export function restartWorkflowStage(
   });
 }
 
-export function resolveWorkflowOperatorCheckpoint(runId: string, disposition: string, selectedStepId?: string | null) {
+export type OperatorCheckpointIdentity = {
+  stageExecutionId: string;
+  capabilityInvocationId: string;
+};
+
+export function resolveWorkflowOperatorCheckpoint(
+  runId: string,
+  disposition: string,
+  checkpoint: OperatorCheckpointIdentity,
+  selectedStepId?: string | null
+) {
   return sendRunAction(runId, {
     action: 'resolve_operator_checkpoint',
     payload: {
       disposition,
+      stage_execution_id: checkpoint.stageExecutionId,
+      capability_invocation_id: checkpoint.capabilityInvocationId,
       ...(selectedStepId ? { selected_step_id: selectedStepId } : {})
     }
   });
 }
 
-export function resolveWorkflowDispositionReview(runId: string, disposition: string, selectedStepId?: string | null) {
-  return resolveWorkflowOperatorCheckpoint(runId, disposition, selectedStepId);
+export function resolveWorkflowDispositionReview(
+  runId: string,
+  disposition: string,
+  checkpoint: OperatorCheckpointIdentity,
+  selectedStepId?: string | null
+) {
+  return resolveWorkflowOperatorCheckpoint(runId, disposition, checkpoint, selectedStepId);
 }
 
 export function nextWorkflowStep(runId: string) {

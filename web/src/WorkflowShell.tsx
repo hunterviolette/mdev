@@ -41,7 +41,6 @@ import {
   getRun,
   getRuntimeProjection,
   getRuntimeSnapshot,
-  openEventStream,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -59,7 +58,7 @@ import {
   prepareWorkflowStage,
   forceWaitWorkflowRun,
   resumeWorkflowRun,
-  resolveWorkflowDispositionReview,
+  resolveWorkflowDispositionReview as resolveWorkflowDispositionReviewRequest,
   sapScanExportCandidates,
   sapSearchObjects,
   runCurrentWorkflowStep,
@@ -2697,6 +2696,18 @@ export function WorkflowShell(props: {
       return {
         stageId: typeof value.stage_id === 'string' ? value.stage_id : selectedRun?.current_step_id ?? '',
         stageType: typeof value.stage_type === 'string' ? value.stage_type : '',
+        stageExecutionId:
+          typeof value.stage_execution_id === 'string'
+            ? value.stage_execution_id
+            : typeof value._stage_execution_id === 'string'
+              ? value._stage_execution_id
+              : '',
+        capabilityInvocationId:
+          typeof value.capability_invocation_id === 'string'
+            ? value.capability_invocation_id
+            : typeof value._capability_invocation_id === 'string'
+              ? value._capability_invocation_id
+              : '',
         recommendedDisposition: typeof value.recommended_disposition === 'string' ? value.recommended_disposition : '',
         nextStepId: typeof value.next_step_id === 'string' ? value.next_step_id : '',
         message: typeof value.message === 'string' ? value.message : '',
@@ -2737,10 +2748,15 @@ export function WorkflowShell(props: {
       const checkpoint = (payload.checkpoint ?? null) as Record<string, unknown> | null;
       const blocked = (payload.blocked_on ?? null) as Record<string, unknown> | null;
 
-      return normalizeCheckpoint(result)
-        ?? normalizeCheckpoint(checkpoint)
-        ?? normalizeCheckpoint(blocked)
-        ?? normalizeCheckpoint(payload);
+      const checkpointIdentity = {
+        stage_execution_id: event.stage_execution_id ?? '',
+        capability_invocation_id: event.capability_invocation_id ?? ''
+      };
+
+      return normalizeCheckpoint(result ? { ...checkpointIdentity, ...result } : null)
+        ?? normalizeCheckpoint(checkpoint ? { ...checkpointIdentity, ...checkpoint } : null)
+        ?? normalizeCheckpoint(blocked ? { ...checkpointIdentity, ...blocked } : null)
+        ?? normalizeCheckpoint({ ...checkpointIdentity, ...payload });
     }
 
     return null;
@@ -2752,6 +2768,33 @@ export function WorkflowShell(props: {
   ]);
 
   const hasPendingDispositionReview = Boolean(pendingDispositionReview);
+
+  async function resolveWorkflowDispositionReview(
+    runId: string,
+    disposition: string,
+    selectedStepId?: string | null
+  ) {
+    if (!pendingDispositionReview) {
+      throw new Error('The operator checkpoint is no longer active.');
+    }
+
+    if (
+      !pendingDispositionReview.stageExecutionId
+      || !pendingDispositionReview.capabilityInvocationId
+    ) {
+      throw new Error('The active operator checkpoint is missing its execution identity. Refresh the workflow and try again.');
+    }
+
+    return resolveWorkflowDispositionReviewRequest(
+      runId,
+      disposition,
+      {
+        stageExecutionId: pendingDispositionReview.stageExecutionId,
+        capabilityInvocationId: pendingDispositionReview.capabilityInvocationId
+      },
+      selectedStepId
+    );
+  }
 
   const selectedRunStepId = selectedStepId ?? selectedRun?.current_step_id ?? selectedRunDefinition?.steps[0]?.id ?? null;
 
@@ -3111,6 +3154,25 @@ export function WorkflowShell(props: {
     return `${includeFiles.length} file${includeFiles.length === 1 ? '' : 's'} selected`;
   }, [selectedRepoPaths]);
   const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
+
+  useEffect(() => {
+    const runId = selectedRun?.id;
+    const stepId = selectedStepId ?? selectedRun?.current_step_id;
+    if (!runId || !stepId) return;
+
+    let cancelled = false;
+
+    void getRun(runId)
+      .then((run) => {
+        if (cancelled) return;
+        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedStageHydrationKey]);
   const definition = useMemo<WorkflowTemplateDefinition>(() => compiledBuilderDefinition ?? ({
     version: 1,
     globals: {
@@ -3201,40 +3263,6 @@ export function WorkflowShell(props: {
 
   useEffect(() => {
     selectedRunIdRef.current = selectedRunId;
-  }, [selectedRunId]);
-
-  useEffect(() => {
-    if (!selectedRunId) return;
-
-    const runId = selectedRunId;
-    const source = openEventStream(runId, { liveOnly: true });
-
-    source.addEventListener('workflow_event', (raw) => {
-      try {
-        const event = JSON.parse(
-          (raw as MessageEvent<string>).data
-        ) as StageExecutionEvent;
-        applyLiveWorkflowEvent(event);
-      } catch {
-      }
-    });
-
-    source.addEventListener('monitor_snapshot', (raw) => {
-      try {
-        const projection = JSON.parse(
-          (raw as MessageEvent<string>).data
-        ) as EventChainSummaryResponse;
-        setRuntimeProjectionsByRunId((prev) => ({
-          ...prev,
-          [projection.run_id]: projection
-        }));
-      } catch {
-      }
-    });
-
-    return () => {
-      source.close();
-    };
   }, [selectedRunId]);
 
   useEffect(() => {

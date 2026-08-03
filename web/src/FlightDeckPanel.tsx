@@ -26,7 +26,8 @@ import {
 import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
 import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
-import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, workflowEventHistoryStreamUrl, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { subscribeRuntimeEventBus } from './runtime_events';
 
 type FlightDeckPanelProps = {
   navigate?: (path: string) => void;
@@ -520,14 +521,36 @@ function EventHistoryModal(props: { anchor: EventHistoryAnchor | null; onClose: 
 
   useEffect(() => {
     if (!props.anchor) return;
-    const source = new EventSource(workflowEventHistoryStreamUrl(props.anchor.runId, baseQuery));
-    source.addEventListener('workflow_event', (event) => {
-      try {
-        const item = JSON.parse((event as MessageEvent).data) as WorkflowEventHistoryItem;
-        setItems((current) => current.some((existing) => existing.id === item.id) ? current : [...current, item]);
-      } catch {}
+
+    const anchor = props.anchor;
+    const unsubscribe = subscribeRuntimeEventBus({
+      onEvent: (incoming) => {
+        const item = incoming.event;
+        if (item.run_id !== anchor.runId) return;
+        if (baseQuery.stage && item.step_id !== baseQuery.stage) return;
+        if (baseQuery.stage_execution_id && item.stage_execution_id !== baseQuery.stage_execution_id) return;
+        if (baseQuery.capability_invocation_id && item.capability_invocation_id !== baseQuery.capability_invocation_id) return;
+
+        const capability = typeof item.payload?.capability === 'string'
+          ? item.payload.capability
+          : typeof item.payload?.capability_key === 'string'
+            ? item.payload.capability_key
+            : null;
+        if (baseQuery.capability && capability !== baseQuery.capability) return;
+
+        const createdAt = Date.parse(item.created_at);
+        const start = baseQuery.start ? Date.parse(baseQuery.start) : Number.NaN;
+        const end = baseQuery.end ? Date.parse(baseQuery.end) : Number.NaN;
+        if (!Number.isNaN(start) && createdAt < start) return;
+        if (!Number.isNaN(end) && createdAt > end) return;
+
+        setItems((current) => current.some((existing) => existing.id === item.id)
+          ? current
+          : [...current, item]);
+      }
     });
-    return () => source.close();
+
+    return unsubscribe;
   }, [props.anchor, baseQuery]);
 
   const grouped = useMemo(() => {
