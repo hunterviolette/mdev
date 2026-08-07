@@ -168,7 +168,11 @@ impl WorkflowCoordinator {
         }
 
         let (command_tx, command_rx) = mpsc::channel(64);
-        let cancellation = CancellationToken::new();
+        let cancellation = runtime
+            .cancellation
+            .take()
+            .filter(|token| !token.is_cancelled())
+            .unwrap_or_else(CancellationToken::new);
         let task_state = state.clone();
         let task_cancellation = cancellation.clone();
 
@@ -226,6 +230,29 @@ impl WorkflowCoordinator {
         Ok(command_tx)
     }
 
+    pub async fn execution_token(&self, workflow_run_id: Uuid) -> CancellationToken {
+        let guard = self.guard_for(workflow_run_id);
+        let mut runtime = guard.runtime.lock().await;
+        if let Some(token) = runtime
+            .cancellation
+            .as_ref()
+            .filter(|token| !token.is_cancelled())
+        {
+            return token.clone();
+        }
+        let token = CancellationToken::new();
+        runtime.cancellation = Some(token.clone());
+        token
+    }
+
+    pub async fn cancel_execution(&self, workflow_run_id: Uuid) {
+        let guard = self.guard_for(workflow_run_id);
+        let runtime = guard.runtime.lock().await;
+        if let Some(cancellation) = runtime.cancellation.as_ref() {
+            cancellation.cancel();
+        }
+    }
+
     pub async fn stop_active_executions(
         &self,
         state: &AppState,
@@ -251,6 +278,10 @@ impl WorkflowCoordinator {
             }
 
             active_run_ids.push(workflow_run_id);
+
+            if let Some(cancellation) = runtime.cancellation.as_ref() {
+                cancellation.cancel();
+            }
 
             if let Some(command_tx) = runtime.command_tx.clone() {
                 let _ = command_tx
@@ -385,13 +416,15 @@ impl WorkflowCoordinator {
                         workflow: WorkflowSnapshot::from(&run),
                     }
                 } else {
-                    self.ensure_runtime(state, envelope.workflow_run_id)
-                        .await?
+                    let command_tx = self
+                        .ensure_runtime(state, envelope.workflow_run_id)
+                        .await?;
+                    self.cancel_execution(envelope.workflow_run_id).await;
+                    let _ = command_tx
                         .send(WorkflowRuntimeCommand::Cancel {
                             reason: "user_cancelled".to_string(),
                         })
-                        .await
-                        .map_err(|_| anyhow!("workflow runtime command channel closed"))?;
+                        .await;
                     WorkflowCommandOutcome::Accepted {
                         command: "cancel".to_string(),
                         mode: None,

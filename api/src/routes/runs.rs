@@ -678,8 +678,8 @@ async fn create_run(
     .await
     .map_err(internal)?;
 
-    engine::append_event(
-        &state.db,
+    engine::append_engine_event(
+        &state,
         id,
         None,
         "info",

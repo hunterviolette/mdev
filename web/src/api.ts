@@ -550,6 +550,7 @@ export type StageExecutionEvent = {
   capability_invocation_id: string | null;
   parent_invocation_id: string | null;
   sequence_no: number;
+  global_sequence_no: number;
   level: string;
   kind: string;
   message: string;
@@ -614,7 +615,7 @@ export type RuntimeEventQuery = {
   workflow_key?: string | null;
   repo_ref?: string | null;
   scope?: string | null;
-  after_sequence?: number | null;
+  after_cursor?: number | null;
 };
 
 export type WorkflowRunActionResult = {
@@ -854,7 +855,7 @@ function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
   if (query.workflow_key) params.set('workflow_key', query.workflow_key);
   if (query.repo_ref) params.set('repo_ref', query.repo_ref);
   if (query.scope) params.set('scope', query.scope);
-  if (typeof query.after_sequence === 'number') params.set('after_sequence', String(query.after_sequence));
+  if (typeof query.after_cursor === 'number') params.set('after_cursor', String(query.after_cursor));
   const value = params.toString();
   return value ? `?${value}` : '';
 }

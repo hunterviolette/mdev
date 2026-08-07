@@ -1,4 +1,4 @@
-import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionIcon,
   Alert,
@@ -1400,6 +1400,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   stageCompileError: string;
   stageCompileCommandsText: string;
   stageUserInput: string;
+  onStageUserInputChange: (value: string) => void;
+  onStageUserInputDraftChange: (value: string) => void;
   inferenceConnectionStatus: InferenceConnectionStatus;
   inferenceTransport: InferenceTransport;
   sharedInferenceState: Record<string, unknown> | null;
@@ -1430,6 +1432,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     stageCompileError,
     stageCompileCommandsText,
     stageUserInput,
+    onStageUserInputChange,
+    onStageUserInputDraftChange,
     inferenceConnectionStatus,
     inferenceTransport,
     sharedInferenceState,
@@ -1455,11 +1459,16 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const fields = useMemo(() => descriptor ? flattenStageFields(descriptor) : [], [descriptor]);
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
   const userInputIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
-  const [userInputDraft, setUserInputDraft] = useState(stageUserInput);
+  const [userInputDraft, setUserInputDraftState] = useState(stageUserInput);
+
+  const setUserInputDraft = useCallback((value: string) => {
+    setUserInputDraftState(value);
+    onStageUserInputDraftChange(value);
+  }, [onStageUserInputDraftChange]);
   const lastSavedUserInputRef = useRef(stageUserInput);
 
   useEffect(() => {
-    setUserInputDraft(stageUserInput);
+    setUserInputDraftState(stageUserInput);
     lastSavedUserInputRef.current = stageUserInput;
   }, [userInputIdentity, stageUserInput]);
 
@@ -1477,6 +1486,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
         .then((response) => {
           if (!cancelled) {
             lastSavedUserInputRef.current = response.text;
+            onStageUserInputChange(response.text);
           }
         })
         .catch(() => undefined);
@@ -1486,7 +1496,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [userInputDraft, selectedRunId, selectedWorkflowStep?.id]);
+  }, [userInputDraft, selectedRunId, selectedWorkflowStep?.id, onStageUserInputChange]);
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
@@ -2225,6 +2235,11 @@ const workflowLiveBarKeyframes = `
 `;
 
 let canonicalChangesetSchemaCache: string | null = null;
+const hydratedWorkflowEventRunIds = new Set<string>();
+const hydratedRuntimeProjectionRunIds = new Set<string>();
+const workflowEventHydrationByRunId = new Map<string, Promise<void>>();
+const runtimeProjectionHydrationByRunId = new Map<string, Promise<void>>();
+
 let canonicalChangesetSchemaRequest: Promise<string> | null = null;
 
 async function getCachedCanonicalChangesetSchema(): Promise<string> {
@@ -2282,6 +2297,7 @@ export function WorkflowShell(props: {
   const receivedWorkflowEventIdsRef = useRef<Set<string>>(new Set());
   const allWorkflowEventsRef = useRef<Record<string, WorkflowEvent[]>>({});
   const hydratedWorkflowEventRunsRef = useRef<Set<string>>(new Set());
+  const hydratedRuntimeProjectionRunsRef = useRef<Set<string>>(new Set());
   const runRefreshTimersRef = useRef<Record<string, number>>({});
   const runtimeProjectionInflightRef = useRef<Set<string>>(new Set());
   const runtimeProjectionLastRequestedAtRef = useRef<Record<string, number>>({});
@@ -2445,7 +2461,17 @@ export function WorkflowShell(props: {
   const [inferencePollBusy, setInferencePollBusy] = useState(false);
   const [inferenceConnected, setInferenceConnected] = useState(false);
 
-  const [stageUserInput, setStageUserInput] = useState('');
+  const [stageUserInput, setStageUserInputState] = useState('');
+  const stageUserInputRef = useRef('');
+
+  function setStageUserInput(value: string) {
+    stageUserInputRef.current = value;
+    setStageUserInputState(value);
+  }
+
+  const setStageUserInputDraft = useCallback((value: string) => {
+    stageUserInputRef.current = value;
+  }, []);
   const [stageIncludeRepoContext, setStageIncludeRepoContext] = useState(false);
   const [stageRepoContextGitRef, setStageRepoContextGitRef] = useState('WORKTREE');
   const [stageRepoContextIncludeFilesText, setStageRepoContextIncludeFilesText] = useState('');
@@ -2753,10 +2779,14 @@ export function WorkflowShell(props: {
         capability_invocation_id: event.capability_invocation_id ?? ''
       };
 
-      return normalizeCheckpoint(result ? { ...checkpointIdentity, ...result } : null)
+      const candidate = normalizeCheckpoint(result ? { ...checkpointIdentity, ...result } : null)
         ?? normalizeCheckpoint(checkpoint ? { ...checkpointIdentity, ...checkpoint } : null)
         ?? normalizeCheckpoint(blocked ? { ...checkpointIdentity, ...blocked } : null)
         ?? normalizeCheckpoint({ ...checkpointIdentity, ...payload });
+
+      if (candidate?.stageExecutionId && candidate.capabilityInvocationId) {
+        return candidate;
+      }
     }
 
     return null;
@@ -2794,6 +2824,47 @@ export function WorkflowShell(props: {
       },
       selectedStepId
     );
+  }
+
+  async function handleDispositionReview(
+    disposition: string,
+    selectedStepId?: string | null
+  ) {
+    if (!selectedRunId || !pendingDispositionReview) return;
+
+    const runId = selectedRunId;
+    const normalizedDisposition = normalizeCheckpointDisposition(disposition);
+
+    try {
+      setBusy(true);
+      setError(null);
+      const result = await resolveWorkflowDispositionReview(
+        runId,
+        normalizedDisposition,
+        selectedStepId
+      );
+      await refreshRunDetails(runId);
+
+      const resultRecord = asRecord(result) ?? {};
+      const nextStepId = typeof resultRecord.next_step_id === 'string'
+        ? resultRecord.next_step_id
+        : null;
+      const runAutomatically = resultRecord.run_automatically === true;
+
+      if (nextStepId) {
+        setSelectedStepId(nextStepId);
+        setPendingDispositionAutoRun({
+          runId,
+          stepId: nextStepId,
+          runAutomatically
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      await refreshRunDetails(runId).catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
   }
 
   const selectedRunStepId = selectedStepId ?? selectedRun?.current_step_id ?? selectedRunDefinition?.steps[0]?.id ?? null;
@@ -3102,10 +3173,11 @@ export function WorkflowShell(props: {
     const pending = pendingDispositionAutoRun;
     setPendingDispositionAutoRun(null);
     window.setTimeout(() => {
-      const action = pending.runAutomatically
-        ? startWorkflowRun(pending.runId)
-        : runCurrentWorkflowStep(pending.runId, pending.stepId);
-      void action
+      void executeWorkflowStage(
+        pending.runId,
+        pending.stepId,
+        stageUserInputRef.current
+      )
         .catch((err) => {
           setError(err instanceof Error ? err.message : String(err));
         })
@@ -3155,24 +3227,6 @@ export function WorkflowShell(props: {
   }, [selectedRepoPaths]);
   const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
 
-  useEffect(() => {
-    const runId = selectedRun?.id;
-    const stepId = selectedStepId ?? selectedRun?.current_step_id;
-    if (!runId || !stepId) return;
-
-    let cancelled = false;
-
-    void getRun(runId)
-      .then((run) => {
-        if (cancelled) return;
-        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-      })
-      .catch(() => undefined);
-
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedStageHydrationKey]);
   const definition = useMemo<WorkflowTemplateDefinition>(() => compiledBuilderDefinition ?? ({
     version: 1,
     globals: {
@@ -3265,37 +3319,6 @@ export function WorkflowShell(props: {
     selectedRunIdRef.current = selectedRunId;
   }, [selectedRunId]);
 
-  useEffect(() => {
-    const runId = selectedRunIdRef.current;
-    if (!runId) return;
-
-    const events = runtimeEvents.workflowEventsByRunId[runId] ?? [];
-    const latest = events[events.length - 1];
-    if (!latest) return;
-
-    const latestPayload = asRecord(latest.payload) ?? {};
-    const shouldHydrateSelectedRun = latestPayload.execution_state === 'awaiting_user_input'
-      || latest.kind === 'operator_checkpoint_completed'
-      || latest.kind === 'operator_checkpoint_resolved'
-      || latest.kind === 'stage_execution_completed'
-      || latest.kind === 'supervisor.workflow_terminal'
-      || latest.kind === 'run_started'
-      || latest.kind === 'run_status_changed';
-
-    if (!shouldHydrateSelectedRun) return;
-
-    let cancelled = false;
-    void getRun(runId)
-      .then((run) => {
-        if (cancelled) return;
-        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-      })
-      .catch(() => undefined);
-
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedRunId, runtimeEvents.workflowEventsByRunId]);
 
   useEffect(() => {
     const routedRunId = props.route?.workflowRunId ?? null;
@@ -3309,7 +3332,6 @@ export function WorkflowShell(props: {
       setActiveWorkspaceTab((value) => value === routedWorkflowTab ? value : routedWorkflowTab);
       if (routedRunId !== selectedRunIdRef.current) {
         setSelectedRunId(routedRunId);
-        void refreshRunDetailsOnOpen(routedRunId);
       }
       return;
     }
@@ -3426,6 +3448,36 @@ export function WorkflowShell(props: {
   }, []);
 
   useEffect(() => {
+    if (!selectedRunId) return;
+
+    const runId = selectedRunId;
+
+    if (!hydratedWorkflowEventRunIds.has(runId)) {
+      let request = workflowEventHydrationByRunId.get(runId);
+      if (!request) {
+        request = hydrateWorkflowEventsFromHistory(runId)
+          .finally(() => {
+            workflowEventHydrationByRunId.delete(runId);
+          });
+        workflowEventHydrationByRunId.set(runId, request);
+      }
+      void request.catch(() => undefined);
+    }
+
+    if (!hydratedRuntimeProjectionRunIds.has(runId)) {
+      let request = runtimeProjectionHydrationByRunId.get(runId);
+      if (!request) {
+        request = hydrateRuntimeProjection(runId)
+          .finally(() => {
+            runtimeProjectionHydrationByRunId.delete(runId);
+          });
+        runtimeProjectionHydrationByRunId.set(runId, request);
+      }
+      void request.catch(() => undefined);
+    }
+  }, [selectedRunId]);
+
+  useEffect(() => {
     if (!selectedRunId) {
       setEvents([]);
       setLiveExecutionTrails([]);
@@ -3442,49 +3494,12 @@ export function WorkflowShell(props: {
     });
     setLiveExecutionTrails(projection ? mapLiveExecutionTrailsFromProjection(projection) : []);
 
-    if (!projection) {
-      void hydrateRuntimeProjection(selectedRunId);
-    }
   }, [selectedRunId, runtimeEvents.workflowEventsByRunId, runtimeProjectionsByRunId]);
 
   useEffect(() => {
     setEventStreamConnected(runtimeEvents.connected);
     setEventStreamStatusText(runtimeEvents.connected ? 'Runtime stream connected' : 'Runtime stream disconnected');
   }, [runtimeEvents.connected]);
-
-  useEffect(() => {
-    if (!selectedRunId) return;
-    if (monitorView !== 'workflow_detail') return;
-
-    let cancelled = false;
-    const runId = selectedRunId;
-
-    async function reconcileSelectedRun() {
-      if (cancelled || document.visibilityState !== 'visible') return;
-      try {
-        await refreshRunDetails(runId);
-      } catch {
-      }
-    }
-
-    function reconcileAfterVisibilityChange() {
-      if (document.visibilityState === 'visible') {
-        void reconcileSelectedRun();
-      }
-    }
-
-    const timer = window.setInterval(() => {
-      void reconcileSelectedRun();
-    }, 60_000);
-
-    document.addEventListener('visibilitychange', reconcileAfterVisibilityChange);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', reconcileAfterVisibilityChange);
-    };
-  }, [selectedRunId, monitorView]);
 
 
   useEffect(() => {
@@ -4635,6 +4650,7 @@ export function WorkflowShell(props: {
   async function hydrateWorkflowEventsFromHistory(runId: string) {
     const runEvents = await listRunEvents(runId);
     mergeWorkflowEventsIntoRuntimeStore(runId, runEvents);
+    hydratedWorkflowEventRunIds.add(runId);
   }
 
   async function hydrateRuntimeProjection(runId: string) {
@@ -4666,6 +4682,7 @@ export function WorkflowShell(props: {
           [projection.run_id]: projection
         };
       });
+      hydratedRuntimeProjectionRunIds.add(trimmedRunId);
     } catch {
     } finally {
       runtimeProjectionInflightRef.current.delete(trimmedRunId);
@@ -4694,6 +4711,17 @@ export function WorkflowShell(props: {
 
   function projectRunStateFromRuntimeEvent(run: WorkflowRun, incoming: StageExecutionEvent): WorkflowRun {
     const payload = asRecord(incoming.payload) ?? {};
+    if (incoming.kind === 'run_status_changed') {
+      const status = stringFrom(payload.status) as WorkflowRunStatus | null;
+      const currentStepId = stringFrom(payload.current_step_id) || incoming.step_id || run.current_step_id;
+      return {
+        ...run,
+        ...(status ? { status } : {}),
+        current_step_id: currentStepId,
+        updated_at: incoming.created_at
+      };
+    }
+
     if (incoming.kind === 'stage_execution_waiting_for_operator_checkpoint' || incoming.kind === 'stage_execution_waiting_for_disposition_review') {
       const stepId = stringFrom(payload.step_id) || incoming.step_id || run.current_step_id || '';
       const stepType = stringFrom(payload.step_type);
@@ -4879,7 +4907,6 @@ export function WorkflowShell(props: {
     setMonitorView('workflow_detail');
     setActiveWorkspaceTab('workflows');
     props.navigate?.(workflowTabRoute(runId, 'workflows'));
-    void refreshRunDetailsOnOpen(runId);
   }
 
   function backToWorkflowList() {
@@ -5046,34 +5073,44 @@ export function WorkflowShell(props: {
     }
   }
 
+  async function executeWorkflowStage(
+    runId: string,
+    stepId: string | null,
+    userInput: string
+  ) {
+    setStageUserInput(userInput);
+
+    if (stepId) {
+      await patchWorkflowStageUserInput(runId, stepId, userInput);
+    }
+
+    const prepared = await prepareWorkflowStage(runId, stepId);
+    const preparedRun = prepared.run;
+
+    if (preparedRun) {
+      setRuns((prev) => [
+        preparedRun,
+        ...prev.filter((item) => item.id !== preparedRun.id)
+      ]);
+      setSelectedRunId(preparedRun.id);
+    } else {
+      await refreshRunDetails(runId);
+    }
+
+    return startWorkflowRun(runId, stepId, userInput);
+  }
+
   async function handleStartRun() {
     if (!selectedRunId) return;
+
     const runId = selectedRunId;
+    const stepId = selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? null;
+    const latestUserInput = stageUserInputRef.current;
+
     try {
       setBusy(true);
       setError(null);
-
-      const stepId = selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? null;
-      const latestUserInput = stageUserInput;
-
-      const prepared = await prepareWorkflowStage(runId, stepId);
-      const preparedRun = prepared.run;
-      if (preparedRun) {
-        setRuns((prev) => [
-          preparedRun,
-          ...prev.filter((item) => item.id !== preparedRun.id)
-        ]);
-        setSelectedRunId(preparedRun.id);
-      } else {
-        await refreshRunDetails(runId);
-      }
-      await startWorkflowRun(
-        runId,
-        stepId,
-        latestUserInput
-      );
-
-      setStageUserInput(latestUserInput);
+      await executeWorkflowStage(runId, stepId, latestUserInput);
       await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -7322,6 +7359,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     stageCompileError={stageCompileError}
                                     stageCompileCommandsText={stageCompileCommandsText}
                                     stageUserInput={stageUserInput}
+                                    onStageUserInputChange={setStageUserInput}
+                                    onStageUserInputDraftChange={setStageUserInputDraft}
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
                                     sharedInferenceState={sharedInferenceState}

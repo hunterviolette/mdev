@@ -510,28 +510,41 @@ fn normalize_inference_arm_state(run: &mut WorkflowRun) {
         .or_insert_with(|| json!({}));
     let inference_obj = ensure_value_object(inference);
 
-    let nested_repo_context_armed = inference_obj
-        .get("shared_inference_state")
-        .and_then(|v| v.get("repo_context_armed"))
-        .and_then(Value::as_bool);
-    let nested_changeset_schema_armed = inference_obj
-        .get("shared_inference_state")
-        .and_then(|v| v.get("changeset_schema_armed"))
-        .and_then(Value::as_bool);
-
-    if !inference_obj.contains_key("repo_context_armed") {
-        if nested_repo_context_armed == Some(true) {
-            inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-        }
-    }
-
-    if !inference_obj.contains_key("changeset_schema_armed") {
-        if nested_changeset_schema_armed == Some(true) {
-            inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
-        }
-    }
-
     inference_obj.remove("shared_inference_state");
+}
+
+fn prepared_inference_step_id(run: &WorkflowRun) -> Option<&str> {
+    run.context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("prepared_inference_step_id"))
+        .and_then(Value::as_str)
+}
+
+fn set_prepared_inference_step_id(run: &mut WorkflowRun, step_id: &str) {
+    let root = ensure_engine_root(&mut run.context);
+    let run_state = root
+        .entry("run_state".to_string())
+        .or_insert_with(|| json!({}));
+    let run_state = ensure_value_object(run_state);
+    run_state.insert(
+        "prepared_inference_step_id".to_string(),
+        Value::String(step_id.to_string()),
+    );
+}
+
+pub fn clear_prepared_inference_step(run: &mut WorkflowRun) {
+    let Some(run_state) = run
+        .context
+        .get_mut("workflow_engine")
+        .and_then(Value::as_object_mut)
+        .and_then(|root| root.get_mut("run_state"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    run_state.remove("prepared_inference_step_id");
 }
 
 pub async fn reconcile_inference_session(
@@ -577,16 +590,22 @@ pub async fn preprocess_run_for_current_stage(
         return Ok(false);
     };
 
-    if previous_step_id.is_some() && previous_step_id != Some(step.id.as_str()) {
+    let stage_changed = previous_step_id.is_some()
+        && previous_step_id != Some(step.id.as_str());
+    let stage_prepared = prepared_inference_step_id(run) == Some(step.id.as_str());
+
+    if stage_changed || !stage_prepared {
         rearm_inference_inputs_for_stage(run, &step);
-    } else {
-        refresh_inference_arm_state(run, Some(&step));
+        let changed = reconcile_inference_session(state, run).await?;
+        set_prepared_inference_step_id(run, step.id.as_str());
+        persist_context(state, run.id, &run.context).await?;
+        return Ok(changed);
     }
 
-    let changed = reconcile_inference_session(state, run).await?;
+    refresh_inference_arm_state(run, Some(&step));
     persist_context(state, run.id, &run.context).await?;
 
-    Ok(changed)
+    Ok(false)
 }
 
 pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Result<Value> {
@@ -614,8 +633,8 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
 
     run.status = RunStatus::Waiting;
     update_run_context(&state.db, run_id, &run.context).await?;
-    update_run_status(
-        &state.db,
+    set_run_status(
+        state,
         run_id,
         RunStatus::Waiting,
         Some(step.id.as_str()),
@@ -762,7 +781,7 @@ pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) 
     Ok(())
 }
 
-pub(crate) async fn append_event(
+async fn persist_workflow_event(
     db: &SqlitePool,
     run_id: Uuid,
     step_id: Option<&str>,
@@ -791,6 +810,11 @@ pub(crate) async fn append_event(
         .bind(run_id.to_string())
         .fetch_one(db)
         .await?;
+    let global_sequence_no: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(global_sequence_no), 0) + 1 FROM workflow_events",
+    )
+    .fetch_one(db)
+    .await?;
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().to_string();
     let run_id_str = run_id.to_string();
@@ -806,6 +830,7 @@ pub(crate) async fn append_event(
             capability_invocation_id,
             parent_invocation_id,
             sequence_no,
+            global_sequence_no,
             is_header_event,
             level,
             kind,
@@ -813,7 +838,7 @@ pub(crate) async fn append_event(
             payload_json,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&id)
@@ -823,6 +848,7 @@ pub(crate) async fn append_event(
     .bind(&capability_invocation_id)
     .bind(&parent_invocation_id)
     .bind(sequence_no)
+    .bind(global_sequence_no)
     .bind(if is_header_event { 1 } else { 0 })
     .bind(level)
     .bind(kind)
@@ -846,6 +872,7 @@ pub(crate) async fn append_event(
         capability_invocation_id,
         parent_invocation_id,
         sequence_no,
+        global_sequence_no,
         level: level.to_string(),
         kind: kind.to_string(),
         message: message.to_string(),
@@ -953,7 +980,16 @@ pub(crate) async fn append_engine_event(
     message: &str,
     payload: Value,
 ) -> Result<()> {
-    let event = append_event(&state.db, run_id, step_id, level, kind, message, payload).await?;
+    let event = persist_workflow_event(
+        &state.db,
+        run_id,
+        step_id,
+        level,
+        kind,
+        message,
+        payload,
+    )
+    .await?;
     state.publish_workflow_event(event);
     Ok(())
 }
@@ -978,7 +1014,24 @@ pub(crate) async fn set_run_status(
     status: RunStatus,
     current_step_id: Option<&str>,
 ) -> Result<()> {
+    let status_value = serde_json::to_value(status)?;
     update_run_status(&state.db, run_id, status, current_step_id).await?;
+    append_engine_event(
+        state,
+        run_id,
+        current_step_id,
+        "info",
+        "run_status_changed",
+        "Workflow run status changed.",
+        json!({
+            "status": status_value,
+            "current_step_id": current_step_id,
+            "event_meta": {
+                "is_header_event": true
+            }
+        }),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1020,19 +1073,17 @@ pub(crate) async fn on_browser_session_changed(
         }),
     );
 
-    inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-    inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
     inference_obj.remove("shared_inference_state");
     inference_obj.remove("next_prompt_fragments");
     inference_obj.remove("active_prompt_fragments");
+
+    clear_prepared_inference_step(&mut run);
 
     tracing::warn!(
         run_id = %run_id,
         previous_session_id = %previous_session_id,
         next_session_id = %next_session_id,
-        repo_context_armed = true,
-        changeset_schema_armed = true,
-        "browser inference session missing or stale; re-armed inference fragments for next run"
+        "browser inference session changed; deferred inference fragment rearming to stage preprocessing"
     );
 
     persist_context(state, run_id, &run.context).await

@@ -81,6 +81,25 @@ export function reduceRuntimeSnapshot(previous: RuntimeEventStore, snapshot: Run
   };
 }
 
+const MAX_RUNTIME_EVENTS_PER_WORKFLOW = 250;
+const RUNTIME_GLOBAL_CURSOR_KEY = 'mdev-runtime-global-cursor-v1';
+
+function readRuntimeGlobalCursor(): number {
+  try {
+    const value = Number(window.sessionStorage.getItem(RUNTIME_GLOBAL_CURSOR_KEY));
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeRuntimeGlobalCursor(cursor: number) {
+  try {
+    window.sessionStorage.setItem(RUNTIME_GLOBAL_CURSOR_KEY, String(cursor));
+  } catch {
+  }
+}
+
 export function reduceRuntimeEvent(previous: RuntimeEventStore, envelope: RuntimeEventEnvelope): RuntimeEventStore {
   const event = envelope.event;
   const current = previous.workflowEventsByRunId[event.run_id] ?? [];
@@ -89,15 +108,20 @@ export function reduceRuntimeEvent(previous: RuntimeEventStore, envelope: Runtim
     ? current.map((item) => item.id === event.id ? event : item)
     : [...current, event];
 
-  nextEvents.sort((a, b) => a.sequence_no - b.sequence_no);
+  nextEvents.sort((a, b) => a.global_sequence_no - b.global_sequence_no);
+  const boundedEvents = nextEvents.length > MAX_RUNTIME_EVENTS_PER_WORKFLOW
+    ? nextEvents.slice(nextEvents.length - MAX_RUNTIME_EVENTS_PER_WORKFLOW)
+    : nextEvents;
+  const latestSequenceNo = Math.max(previous.latestSequenceNo, event.global_sequence_no);
+  writeRuntimeGlobalCursor(latestSequenceNo);
 
   return {
     ...previous,
     workflowEventsByRunId: {
       ...previous.workflowEventsByRunId,
-      [event.run_id]: nextEvents
+      [event.run_id]: boundedEvents
     },
-    latestSequenceNo: Math.max(previous.latestSequenceNo, event.sequence_no)
+    latestSequenceNo
   };
 }
 
@@ -168,11 +192,8 @@ type RuntimeEventBusHandlers = {
 function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
   let disposed = false;
   let source: EventSource | null = null;
-  let reconnectTimer: number | null = null;
   let electionTimer: number | null = null;
   let heartbeatTimer: number | null = null;
-  let reconnectAttempt = 0;
-  let lastEventSequenceNo = 0;
   let isLeader = false;
   const tabId = createRuntimeEventBusTabId();
   const channel = typeof BroadcastChannel !== 'undefined'
@@ -205,13 +226,6 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     channel?.postMessage(message);
   }
 
-  function clearReconnectTimer() {
-    if (reconnectTimer !== null) {
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-  }
-
   function clearElectionTimer() {
     if (electionTimer !== null) {
       window.clearInterval(electionTimer);
@@ -233,52 +247,27 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     }
   }
 
-  async function refreshSnapshotFromBackend() {
-    try {
-      const snapshot = await getRuntimeSnapshot({ scope: 'all' });
-      if (disposed || !isLeader) return;
-      broadcast('runtime_snapshot', snapshot);
-    } catch {
-    }
-  }
-
-  function scheduleReconnect() {
-    if (disposed || !isLeader || reconnectTimer !== null) return;
-
-    closeSource();
-    broadcast('disconnected');
-
-    const delayMs = Math.min(1000 * 2 ** reconnectAttempt, 10000);
-    reconnectAttempt += 1;
-
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, delayMs);
-  }
-
   function connect() {
     if (disposed || !isLeader) return;
 
     closeSource();
+    const afterCursor = readRuntimeGlobalCursor();
     const nextSource = openRuntimeEventStream({
       scope: 'all',
-      after_sequence: lastEventSequenceNo
+      ...(afterCursor > 0 ? { after_cursor: afterCursor } : {})
     });
     source = nextSource;
 
     nextSource.onopen = () => {
       if (disposed || !isLeader) return;
-      reconnectAttempt = 0;
       broadcast('connected');
-      void refreshSnapshotFromBackend();
     };
 
     nextSource.addEventListener('runtime_snapshot', (raw) => {
       if (disposed || !isLeader) return;
       try {
         const snapshot = JSON.parse((raw as MessageEvent<string>).data) as RuntimeSnapshotResponse;
-        lastEventSequenceNo = Math.max(lastEventSequenceNo, snapshot.latest_sequence_no);
+        writeRuntimeGlobalCursor(snapshot.latest_sequence_no);
         broadcast('runtime_snapshot', snapshot);
       } catch {
       }
@@ -297,7 +286,10 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
       if (disposed || !isLeader) return;
       try {
         const event = JSON.parse((raw as MessageEvent<string>).data) as RuntimeEventEnvelope;
-        lastEventSequenceNo = Math.max(lastEventSequenceNo, event.event.sequence_no ?? 0);
+        const cursor = event.event.global_sequence_no;
+        if (Number.isFinite(cursor) && cursor > 0) {
+          writeRuntimeGlobalCursor(cursor);
+        }
         broadcast('runtime_event', event);
       } catch {
       }
@@ -306,14 +298,13 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     nextSource.onerror = () => {
       if (disposed || !isLeader) return;
       handlers.onError?.();
-      scheduleReconnect();
+      broadcast('disconnected');
     };
   }
 
   function stopLeading() {
     if (!isLeader) return;
     isLeader = false;
-    clearReconnectTimer();
     clearHeartbeatTimer();
     closeSource();
     clearRuntimeEventBusLeaderIfOwned(tabId);

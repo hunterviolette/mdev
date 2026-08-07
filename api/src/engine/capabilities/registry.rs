@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -37,9 +38,17 @@ pub struct CapabilityContext<'a> {
     pub repo_ref: &'a str,
     pub step: &'a WorkflowStepDefinition,
     pub local_state: &'a Value,
+    pub cancellation: CancellationToken,
 }
 
 impl CapabilityContext<'_> {
+    pub fn ensure_active(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(anyhow!("workflow execution was cancelled"));
+        }
+        Ok(())
+    }
+
     pub fn provide_prompt_text(
         &self,
         source: impl Into<String>,
@@ -202,6 +211,7 @@ pub(crate) async fn execute_capability_chain(
         .map(ToString::to_string);
 
     while let Some(invocation) = queue.first().cloned() {
+        ctx.ensure_active()?;
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
 
@@ -259,7 +269,35 @@ pub(crate) async fn execute_capability_chain(
         )
         .await?;
 
-        let mut result = match dispatch(&ctx, policy, &results, invocation.clone()).await {
+        let dispatch_result = tokio::select! {
+            biased;
+            _ = ctx.cancellation.cancelled() => {
+                let duration_ms = i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+                append_engine_event(
+                    ctx.state,
+                    ctx.run_id,
+                    Some(ctx.step.id.as_str()),
+                    "error",
+                    &format!("{}_failed", invocation.capability),
+                    &format!("{} cancelled", invocation.capability.replace('_', " ")),
+                    json!({
+                        "capability": invocation.capability,
+                        "config": invocation.config,
+                        "error": "workflow execution was cancelled",
+                        "cancelled": true,
+                        "duration_ms": duration_ms,
+                        "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
+                    }),
+                )
+                .await?;
+                return Err(anyhow!("workflow execution was cancelled"));
+            }
+            result = dispatch(&ctx, policy, &results, invocation.clone()) => result,
+        };
+
+        ctx.ensure_active()?;
+
+        let mut result = match dispatch_result {
             Ok(result) => {
                 tracing::info!(
                     run_id = %ctx.run_id,
@@ -318,6 +356,8 @@ pub(crate) async fn execute_capability_chain(
             obj.insert("_stage_execution_id".to_string(), Value::String(stage_execution_id.clone().unwrap_or_default()));
             obj.insert("_capability_invocation_id".to_string(), Value::String(capability_invocation_id.clone()));
         }
+
+        ctx.ensure_active()?;
 
         let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
         let after_decisions = governance::after_capability(

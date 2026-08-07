@@ -14,6 +14,7 @@ use std::{future::Future, pin::Pin, time::Instant};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     engine::normalize_inference_arm_state,
@@ -432,13 +433,16 @@ pub async fn execute_stage(
     run: &mut WorkflowRun,
     step: &WorkflowStepDefinition,
     automatic_execution: bool,
+    cancellation: CancellationToken,
 ) -> Result<StageOutcome> {
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
     let stage_execution_id = format!("{}-{}", sanitize_stage_execution_prefix(&step.step_type), Uuid::new_v4());
     let stage_started_at = Instant::now();
 
-    if reset_session_scoped_inference_state(state, run) {
-        rearm_session_scoped_inference_inputs(run, step);
-    }
+    reset_session_scoped_inference_state(state, run);
+    crate::engine::clear_prepared_inference_step(run);
 
     append_engine_event(
         state,
@@ -554,7 +558,69 @@ pub async fn execute_stage(
         .ok_or_else(|| anyhow!("prepared stage local state must be object"))?;
 
     let execution_local_state = materialize_capability_runtime_state(prepared_local_state.clone(), &global_state, repo_ref.as_str());
-    let capability_results = run_capability_plan(state, run_id, repo_ref.as_str(), step, &execution_local_state, &plan).await?;
+    let capability_results = match run_capability_plan(
+        state,
+        run_id,
+        repo_ref.as_str(),
+        step,
+        &execution_local_state,
+        &plan,
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            let cancelled = cancellation.is_cancelled();
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "error",
+                "stage_execution_failed",
+                if cancelled {
+                    "Stage execution was cancelled"
+                } else {
+                    "Stage execution failed"
+                },
+                json!({
+                    "step_id": step.id,
+                    "step_type": step.step_type,
+                    "ok": false,
+                    "cancelled": cancelled,
+                    "execution_state": "failed",
+                    "message": error.to_string(),
+                    "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
+                }),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+
+    if cancellation.is_cancelled() {
+        append_engine_event(
+            state,
+            run_id,
+            Some(step.id.as_str()),
+            "error",
+            "stage_execution_failed",
+            "Stage execution was cancelled",
+            json!({
+                "step_id": step.id,
+                "step_type": step.step_type,
+                "ok": false,
+                "cancelled": true,
+                "execution_state": "failed",
+                "message": "workflow execution was cancelled",
+                "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
+            }),
+        )
+        .await?;
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
     let capability_failed = capability_results
         .iter()
         .any(|item| item.get("ok").and_then(Value::as_bool) == Some(false));
@@ -828,7 +894,11 @@ async fn run_capability_plan(
     step: &WorkflowStepDefinition,
     local_state: &Value,
     plan: &[StageExecutionNode],
+    cancellation: CancellationToken,
 ) -> Result<Vec<Value>> {
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
     let queue = plan
         .iter()
         .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
@@ -848,6 +918,7 @@ async fn run_capability_plan(
         repo_ref,
         step,
         local_state,
+        cancellation,
     };
 
     let results = execute_capability_invocations(ctx, queue).await?;

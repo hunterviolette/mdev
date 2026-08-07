@@ -389,6 +389,7 @@ pub struct WorkflowEventStreamItem {
     pub capability_invocation_id: Option<String>,
     pub parent_invocation_id: Option<String>,
     pub sequence_no: i64,
+    pub global_sequence_no: i64,
     pub level: String,
     pub kind: String,
     pub message: String,

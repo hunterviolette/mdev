@@ -81,12 +81,25 @@ async fn execute_workflow_capability(
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     let scope = resolve_workflow_scope(&state, run_id).await?;
     let config = req.config.or(req.input).unwrap_or_else(|| json!({}));
+    let cancellation = state
+        .workflow_coordinator
+        .execution_token(scope.run_id)
+        .await;
+
+    if cancellation.is_cancelled() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "workflow execution was cancelled".to_string(),
+        ));
+    }
+
     let ctx = CapabilityContext {
         state: &state,
         run_id: scope.run_id,
         repo_ref: scope.repo_ref.as_str(),
         step: &scope.step,
         local_state: &scope.local_state,
+        cancellation,
     };
     let results = execute_capability_invocations(ctx, vec![CapabilityInvocation { capability: capability_id, config }])
         .await

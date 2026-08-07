@@ -294,6 +294,19 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     ensure_column(db, "workflow_runs", "archived_at", "TEXT").await?;
     ensure_column(db, "workflow_runs", "archived_reason", "TEXT").await?;
+    ensure_column(db, "workflow_events", "global_sequence_no", "INTEGER NOT NULL DEFAULT 0").await?;
+
+    sqlx::query(
+        "UPDATE workflow_events SET global_sequence_no = rowid WHERE global_sequence_no = 0",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_global_sequence ON workflow_events (global_sequence_no)",
+    )
+    .execute(db)
+    .await?;
     ensure_column(db, "supervisor_runs", "archived_at", "TEXT").await?;
     ensure_column(db, "supervisor_runs", "archived_reason", "TEXT").await?;
     ensure_column(db, "supervisor_runs", "selected_planner_id", "TEXT").await?;
@@ -699,6 +712,40 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         "#,
     )
     .bind(chrono::Utc::now().to_rfc3339())
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET context_json = json_remove(
+            context_json,
+            '$.workflow_engine.global_state.capabilities.inference.shared_inference_state'
+        )
+        WHERE json_valid(context_json)
+          AND json_type(
+              context_json,
+              '$.workflow_engine.global_state.capabilities.inference.shared_inference_state'
+          ) IS NOT NULL
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET context_json = json_remove(
+            context_json,
+            '$.workflow_engine.global_state.capabilities.inference.shared_inference_state'
+        )
+        WHERE json_valid(context_json)
+          AND json_type(
+              context_json,
+              '$.workflow_engine.global_state.capabilities.inference.shared_inference_state'
+          ) IS NOT NULL
+        "#,
+    )
     .execute(db)
     .await?;
 

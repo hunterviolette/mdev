@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 
 use axum::{
     extract::{Path, Query, State},
@@ -139,7 +139,7 @@ struct RuntimeEventQuery {
     #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
-    after_sequence: Option<i64>,
+    after_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1099,12 +1099,11 @@ async fn stream_runtime_events(
     let state_for_task = state.clone();
     let mut workflow_live_rx = state.subscribe_workflow_events();
     let mut sprint_live_rx = state.subscribe_sprint_events();
-    let mut last_sequence = query.after_sequence.unwrap_or(0);
-    let mut last_sprint_sequence = query.after_sequence.unwrap_or(0);
+    let mut last_workflow_sequence_by_run_id = HashMap::<String, i64>::new();
+    let mut last_sprint_sequence = 0;
 
     tokio::spawn(async move {
         if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
-            last_sequence = last_sequence.max(snapshot.latest_sequence_no);
             if let Some(event) = runtime_snapshot_sse(&snapshot) {
                 if tx.send(Ok(event)).is_err() {
                     return;
@@ -1112,45 +1111,50 @@ async fn stream_runtime_events(
             }
         }
 
-        let workflow_rows = runtime_event_rows(&state_for_task, &query, last_sequence)
+        if let Some(after_cursor) = query.after_cursor {
+            let workflow_rows = runtime_event_rows(
+                &state_for_task,
+                &query,
+                after_cursor,
+            )
             .await
             .unwrap_or_default();
-        for row in workflow_rows {
-            if let Ok(item) = row_to_stage_chain_event(row) {
-                last_sequence = last_sequence.max(item.sequence_no);
-                if let Ok(Some(envelope)) = runtime_event_envelope(&state_for_task, item).await {
-                    if let Some(event) = runtime_event_sse(&envelope) {
-                        if tx.send(Ok(event)).is_err() {
-                            return;
-                        }
+            let mut replayed_run_ids = Vec::<String>::new();
+
+            for row in workflow_rows {
+                if let Ok(item) = row_to_stage_chain_event(row) {
+                    let item_run_id = item.run_id.clone();
+                    last_workflow_sequence_by_run_id
+                        .entry(item_run_id.clone())
+                        .and_modify(|sequence| *sequence = (*sequence).max(item.sequence_no))
+                        .or_insert(item.sequence_no);
+
+                    if !replayed_run_ids.contains(&item_run_id) {
+                        replayed_run_ids.push(item_run_id);
                     }
-                    if let Some(run_id) = envelope.run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
-                        if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
-                            if let Some(event) = runtime_projection_sse(&projection) {
-                                if tx.send(Ok(event)).is_err() {
-                                    return;
-                                }
+
+                    if let Ok(Some(envelope)) = runtime_event_envelope(&state_for_task, item).await {
+                        if let Some(event) = runtime_event_sse(&envelope) {
+                            if tx.send(Ok(event)).is_err() {
+                                return;
                             }
                         }
                     }
                 }
             }
-        }
 
-        let sprint_rows = runtime_sprint_event_rows(&state_for_task, &query, query.after_sequence.unwrap_or(0))
-            .await
-            .unwrap_or_default();
-        for row in sprint_rows {
-            if let Ok(item) = row_to_sprint_event(row) {
-                last_sprint_sequence = last_sprint_sequence.max(item.sequence_no);
-                if let Ok(Some(envelope)) = sprint_event_envelope(&state_for_task, &query, item).await {
-                    if let Some(event) = sprint_event_sse(&envelope) {
-                        if tx.send(Ok(event)).is_err() {
-                            return;
+            for run_id in replayed_run_ids {
+                if let Ok(run_id) = Uuid::parse_str(&run_id) {
+                    if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
+                        if let Some(event) = runtime_projection_sse(&projection) {
+                            if tx.send(Ok(event)).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
             }
+
         }
 
         if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
@@ -1161,6 +1165,10 @@ async fn stream_runtime_events(
             tokio::select! {
                 workflow_message = workflow_live_rx.recv() => match workflow_message {
                     Ok(item) => {
+                        let last_sequence = last_workflow_sequence_by_run_id
+                            .get(&item.run_id)
+                            .copied()
+                            .unwrap_or(0);
                         if item.sequence_no <= last_sequence {
                             continue;
                         }
@@ -1169,65 +1177,44 @@ async fn stream_runtime_events(
                             Ok(false) => continue,
                             Err(_) => continue,
                         }
-                        last_sequence = item.sequence_no;
-                        if let Ok(Some(envelope)) = runtime_event_envelope(&state_for_task, item).await {
-                            if let Some(event) = runtime_event_sse(&envelope) {
-                                if tx.send(Ok(event)).is_err() {
-                                    return;
-                                }
-                            }
-                            if let Some(run_id) = envelope.run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
-                                if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
-                                    if let Some(event) = runtime_projection_sse(&projection) {
-                                        if tx.send(Ok(event)).is_err() {
-                                            return;
-                                        }
+                        last_workflow_sequence_by_run_id
+                            .insert(item.run_id.clone(), item.sequence_no);
+                        let item_run_id = item.run_id.clone();
+                        let item_sequence_no = item.sequence_no;
+                        match runtime_event_envelope(&state_for_task, item).await {
+                            Ok(Some(envelope)) => {
+                                if let Some(event) = runtime_event_sse(&envelope) {
+                                    if tx.send(Ok(event)).is_err() {
+                                        return;
                                     }
                                 }
-                            }
-                        }
-                        if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
-                            if let Some(event) = runtime_snapshot_sse(&snapshot) {
-                                if tx.send(Ok(event)).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(RecvError::Lagged(_)) => {
-                        let rows = runtime_event_rows(&state_for_task, &query, last_sequence)
-                            .await
-                            .unwrap_or_default();
-                        let mut sent_any = false;
-                        for row in rows {
-                            if let Ok(item) = row_to_stage_chain_event(row) {
-                                last_sequence = last_sequence.max(item.sequence_no);
-                                if let Ok(Some(envelope)) = runtime_event_envelope(&state_for_task, item).await {
-                                    if let Some(event) = runtime_event_sse(&envelope) {
-                                        if tx.send(Ok(event)).is_err() {
-                                            return;
-                                        }
-                                        sent_any = true;
-                                    }
-                                    if let Some(run_id) = envelope.run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
-                                        if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
-                                            if let Some(event) = runtime_projection_sse(&projection) {
-                                                if tx.send(Ok(event)).is_err() {
-                                                    return;
-                                                }
-                                                sent_any = true;
+                                if let Some(run_id) = envelope.run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
+                                    if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
+                                        if let Some(event) = runtime_projection_sse(&projection) {
+                                            if tx.send(Ok(event)).is_err() {
+                                                return;
                                             }
                                         }
                                     }
                                 }
                             }
+                            Ok(None) => {}
+                            Err((status, message)) => {
+                                tracing::error!(
+                                    run_id = %item_run_id,
+                                    sequence_no = item_sequence_no,
+                                    status = %status,
+                                    error = %message,
+                                    "failed to construct runtime event envelope"
+                                );
+                            }
                         }
-                        if sent_any {
-                            if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
-                                if let Some(event) = runtime_snapshot_sse(&snapshot) {
-                                    if tx.send(Ok(event)).is_err() {
-                                        return;
-                                    }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
+                            if let Some(event) = runtime_snapshot_sse(&snapshot) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
                                 }
                             }
                         }
@@ -1426,7 +1413,7 @@ async fn build_runtime_snapshot(
 async fn runtime_event_rows(
     state: &AppState,
     query: &RuntimeEventQuery,
-    after_sequence: i64,
+    after_cursor: i64,
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, (axum::http::StatusCode, String)> {
     let run_ids = runtime_filter_run_ids(state, query).await?;
     if run_ids.is_empty() && !runtime_filter_allows_empty_run_set(query) {
@@ -1435,9 +1422,9 @@ async fn runtime_event_rows(
 
     if run_ids.is_empty() {
         return sqlx::query(
-            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE sequence_no > ? ORDER BY created_at ASC, sequence_no ASC LIMIT 1000",
+            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, global_sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE global_sequence_no > ? ORDER BY global_sequence_no ASC LIMIT 1000",
         )
-        .bind(after_sequence)
+        .bind(after_cursor)
         .fetch_all(&state.db)
         .await
         .map_err(internal);
@@ -1446,25 +1433,17 @@ async fn runtime_event_rows(
     let mut rows = Vec::new();
     for run_id in run_ids {
         let mut run_rows = sqlx::query(
-            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC LIMIT 1000",
+            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, global_sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND global_sequence_no > ? ORDER BY global_sequence_no ASC LIMIT 1000",
         )
         .bind(run_id)
-        .bind(after_sequence)
+        .bind(after_cursor)
         .fetch_all(&state.db)
         .await
         .map_err(internal)?;
         rows.append(&mut run_rows);
     }
 
-    rows.sort_by(|a, b| {
-        let a_time: String = a.get("created_at");
-        let b_time: String = b.get("created_at");
-        a_time.cmp(&b_time).then_with(|| {
-            let a_seq: i64 = a.get("sequence_no");
-            let b_seq: i64 = b.get("sequence_no");
-            a_seq.cmp(&b_seq)
-        })
-    });
+    rows.sort_by_key(|row| row.get::<i64, _>("global_sequence_no"));
     Ok(rows)
 }
 
@@ -1583,30 +1562,18 @@ async fn runtime_event_envelope(
     };
 
     let supervisor_run_id = sqlx::query_scalar::<_, String>(
-        "SELECT s.supervisor_run_id
-         FROM sprint_features sf
-         JOIN sprints s ON s.id = sf.sprint_id
-         WHERE sf.current_workflow_run_id = ?
-           AND TRIM(COALESCE(s.supervisor_run_id, '')) != ''
+        "SELECT supervisor_run_id
+         FROM supervisor_work_units
+         WHERE workflow_run_id = ?
+           AND archived_at IS NULL
+           AND TRIM(COALESCE(supervisor_run_id, '')) != ''
+         ORDER BY updated_at DESC
          LIMIT 1",
     )
     .bind(&item.run_id)
     .fetch_optional(&state.db)
     .await
-    .map_err(internal)?
-    .or_else(|| None);
-
-    let supervisor_run_id = if supervisor_run_id.is_some() {
-        supervisor_run_id
-    } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM supervisor_runs WHERE integration_run_id = ? LIMIT 1",
-        )
-        .bind(&item.run_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(internal)?
-    };
+    .map_err(internal)?;
 
     let scope = if item.capability_invocation_id.is_some() {
         "capability_invocation"
@@ -1633,7 +1600,7 @@ async fn latest_runtime_sequence(
 ) -> Result<i64, (axum::http::StatusCode, String)> {
     if run_ids.is_empty() {
         return sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(sequence_no), 0) FROM workflow_events",
+            "SELECT COALESCE(MAX(global_sequence_no), 0) FROM workflow_events",
         )
         .fetch_one(&state.db)
         .await
@@ -1643,7 +1610,7 @@ async fn latest_runtime_sequence(
     let mut latest = 0;
     for run_id in run_ids {
         let value = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(sequence_no), 0) FROM workflow_events WHERE run_id = ?",
+            "SELECT COALESCE(MAX(global_sequence_no), 0) FROM workflow_events WHERE run_id = ?",
         )
         .bind(run_id)
         .fetch_one(&state.db)
@@ -1707,6 +1674,9 @@ fn row_to_stage_chain_event(row: sqlx::sqlite::SqliteRow) -> Result<StageChainEv
         capability_invocation_id: row.get("capability_invocation_id"),
         parent_invocation_id: row.get("parent_invocation_id"),
         sequence_no: row.get("sequence_no"),
+        global_sequence_no: row
+            .try_get("global_sequence_no")
+            .unwrap_or_else(|_| row.get("sequence_no")),
         level: row.get("level"),
         kind: row.get("kind"),
         message: row.get("message"),

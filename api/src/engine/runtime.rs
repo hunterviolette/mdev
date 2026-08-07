@@ -1176,7 +1176,14 @@ pub async fn run_step(state: &AppState, run_id: Uuid, requested_step_id: Option<
         }));
     }
 
-    run_stages(state, run_id, requested_step_id, RunMode::Manual).await
+    run_stages(
+        state,
+        run_id,
+        requested_step_id,
+        RunMode::Manual,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
 }
 
 pub async fn restart_stage(
@@ -1234,6 +1241,7 @@ pub async fn restart_stage(
         run_id,
         Some(step.id.as_str()),
         RunMode::Manual,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
 }
@@ -1259,7 +1267,14 @@ async fn start_or_resume_automatic_run(state: &AppState, run_id: Uuid, requested
         }),
     ).await?;
 
-    Box::pin(run_stages(state, run_id, requested_step_id, RunMode::Autonomous)).await
+    Box::pin(run_stages(
+        state,
+        run_id,
+        requested_step_id,
+        RunMode::Autonomous,
+        tokio_util::sync::CancellationToken::new(),
+    ))
+    .await
 }
 
 fn step_is_auto_runnable(step: &super::WorkflowStepDefinition) -> bool {
@@ -1503,15 +1518,17 @@ pub(crate) async fn run_workflow_runtime(
         };
 
         let execution_step_id = requested_step_id.take();
-        let execution = run_stages(state, run_id, execution_step_id.as_deref(), mode);
+        let execution = run_stages(
+            state,
+            run_id,
+            execution_step_id.as_deref(),
+            mode,
+            cancellation.clone(),
+        );
         tokio::pin!(execution);
 
         let result = loop {
             tokio::select! {
-                _ = cancellation.cancelled() => {
-                    fail_runtime_workflow(state, run_id, "runtime_cancelled", "Workflow runtime was cancelled.").await?;
-                    return Ok(());
-                }
                 command = command_rx.recv() => {
                     let Some(command) = command else {
                         fail_runtime_workflow(state, run_id, "runtime_channel_closed", "Workflow runtime command channel closed.").await?;
@@ -1522,9 +1539,8 @@ pub(crate) async fn run_workflow_runtime(
                         WorkflowRuntimeCommand::Pause => {
                             pause_run(state, run_id).await?;
                         }
-                        WorkflowRuntimeCommand::Cancel { reason } => {
-                            fail_runtime_workflow(state, run_id, reason.as_str(), "Workflow execution was cancelled.").await?;
-                            return Ok(());
+                        WorkflowRuntimeCommand::Cancel { .. } => {
+                            cancellation.cancel();
                         }
                         WorkflowRuntimeCommand::ResolveCheckpoint { disposition, selected_step_id } => {
                             resolve_operator_checkpoint(state, run_id, disposition.as_str(), selected_step_id.as_deref()).await?;
@@ -1579,13 +1595,26 @@ pub(crate) async fn run_workflow_runtime(
     }
 }
 
-async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&str>, mode: RunMode) -> Result<serde_json::Value> {
+async fn run_stages(
+    state: &AppState,
+    run_id: Uuid,
+    requested_step_id: Option<&str>,
+    mode: RunMode,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<serde_json::Value> {
     let mut last_payload = json!({ "ok": true, "status": "waiting" });
     let mut requested = requested_step_id.map(|s| s.to_string());
     let mut hops = 0usize;
 
     loop {
         let automatic = matches!(mode, RunMode::Autonomous);
+        if cancellation.is_cancelled() {
+            return Ok(json!({
+                "ok": false,
+                "status": "cancelled",
+                "cancelled": true
+            }));
+        }
         if automatic {
             hops += 1;
         }
@@ -1654,7 +1683,15 @@ async fn run_stages(state: &AppState, run_id: Uuid, requested_step_id: Option<&s
             }));
         }
 
-        let outcome = execute_stage(state, run_id, &mut run, &step, automatic).await?;
+        let outcome = execute_stage(
+            state,
+            run_id,
+            &mut run,
+            &step,
+            automatic,
+            cancellation.clone(),
+        )
+        .await?;
         let next_target = resolve_next_target(&definition, &step, &outcome);
         let latest_run = load_run(state, run_id).await?;
         if run_cancel_requested(&latest_run) {
