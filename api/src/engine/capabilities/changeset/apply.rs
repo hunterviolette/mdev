@@ -247,6 +247,33 @@ pub async fn execute(
     };
 
     let mut result = result;
+    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let normalized_changeset = normalize_changeset_payload_text(&payload_text)?;
+        match crate::engine::capabilities::repo_sync::mirror_changeset(
+            &ctx.state.repo_sync,
+            normalized_changeset.as_str(),
+        )
+        .await
+        {
+            Ok(Some(sync)) => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("repo_sync".to_string(), sync);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert(
+                        "repo_sync".to_string(),
+                        json!({
+                            "state": "failed",
+                            "error": format!("{:#}", error)
+                        }),
+                    );
+                }
+            }
+        }
+    }
     if let Some(obj) = result.as_object_mut() {
         obj.insert("target".to_string(), json!({
             "repo_ref": target.repo_ref,

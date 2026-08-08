@@ -1,4 +1,6 @@
-import type { ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { RepoSync } from './Capabilities/RepoSync';
+import { getRepoSyncStatus, type RepoSyncStatus } from './api';
 import { Badge, Button, Card, Group, SimpleGrid, Stack, Text, Title } from '@mantine/core';
 
 type GlobalCapabilitiesPanelProps = {
@@ -16,6 +18,8 @@ type GlobalCapabilitiesPanelProps = {
   plannerArmed: boolean;
   sharedDependenciesEnabled: boolean;
   deployQAAvailable: boolean;
+  repoSyncEnabled?: boolean;
+  repoSyncPaired?: boolean;
   automationEnabled?: boolean;
 };
 
@@ -73,7 +77,51 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
     sharedDependenciesEnabled,
     deployQAAvailable,
     automationEnabled = true,
+    repoSyncEnabled = false,
+    repoSyncPaired = false,
   } = props;
+
+  const [repoSyncOpen, setRepoSyncOpen] = useState(false);
+  const [repoSyncStatus, setRepoSyncStatus] = useState<RepoSyncStatus | null>(null);
+
+  const workflowRunId = useMemo(() => {
+    const match = window.location.pathname.match(/^\/workflows\/([^/]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : '';
+  }, []);
+
+  async function refreshRepoSyncStatus() {
+    if (!workflowRunId) {
+      setRepoSyncStatus(null);
+      return;
+    }
+
+    try {
+      setRepoSyncStatus(await getRepoSyncStatus(workflowRunId));
+    } catch {
+      setRepoSyncStatus(null);
+    }
+  }
+
+  useEffect(() => {
+    if (!repoSyncOpen) {
+      void refreshRepoSyncStatus();
+    }
+  }, [workflowRunId, repoSyncOpen]);
+
+  const repoSyncMapping = repoSyncStatus?.mappings[0] ?? null;
+  const repoSyncTrusted = Boolean(repoSyncMapping?.peer_certificate_pem?.trim());
+  const repoSyncConnected = Boolean(repoSyncTrusted && repoSyncMapping?.connected);
+  const repoSyncAutoApply = Boolean(
+    repoSyncConnected && repoSyncMapping?.sync_mode === 'auto_apply'
+  );
+
+  const repoSyncBadge = repoSyncAutoApply
+    ? { label: 'Active', color: 'green' }
+    : repoSyncConnected
+      ? { label: 'Connected', color: 'green' }
+      : repoSyncTrusted
+        ? { label: 'Paired', color: 'blue' }
+        : { label: 'Unpaired', color: 'gray' };
 
   return (
     <Stack gap="md">
@@ -150,6 +198,18 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           badge={<Badge color="violet" variant="light">Portable</Badge>}
         />
         <CapabilityCard
+          eyebrow="Repository mirror"
+          title="Repo Sync"
+          description="Pair another computer over authenticated TLS and mirror successful ChangeSets between mapped repositories."
+          buttonLabel="Configure sync"
+          onClick={() => setRepoSyncOpen(true)}
+          badge={
+            <Badge color={repoSyncBadge.color} variant="light">
+              {repoSyncBadge.label}
+            </Badge>
+          }
+        />
+        <CapabilityCard
           eyebrow="Dependencies"
           title="Shared dependencies"
           description="Configure reusable Node and Cargo dependency providers that Compile and DeployQA stages may select."
@@ -174,6 +234,14 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           }
         />
       </SimpleGrid>
+
+      <RepoSync
+        opened={repoSyncOpen}
+        onClose={() => {
+          setRepoSyncOpen(false);
+          void refreshRepoSyncStatus();
+        }}
+      />
     </Stack>
   );
 }

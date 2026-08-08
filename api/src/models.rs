@@ -452,6 +452,8 @@ pub struct AppSettings {
     pub bridges: Value,
     #[serde(default)]
     pub git: Value,
+    #[serde(default)]
+    pub repo_sync: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

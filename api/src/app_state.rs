@@ -2,6 +2,9 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::engine::capabilities::repo_sync::RepoSyncRuntime;
+use crate::engine::runtime_endpoints::RuntimeEndpointManager;
+
 use crate::{
     engine::{
         capabilities::terminal_runtime::ProcessRegistry,
@@ -20,6 +23,8 @@ pub struct AppState {
     pub workflow_coordinator: WorkflowCoordinator,
     pub process_registry: ProcessRegistry,
     pub orchestration_inputs: OrchestrationInputStore,
+    pub repo_sync: RepoSyncRuntime,
+    pub runtime_endpoints: RuntimeEndpointManager,
 }
 
 impl AppState {
@@ -34,6 +39,8 @@ impl AppState {
             workflow_coordinator: WorkflowCoordinator::default(),
             process_registry: ProcessRegistry::default(),
             orchestration_inputs: OrchestrationInputStore::default(),
+            repo_sync: RepoSyncRuntime::default(),
+            runtime_endpoints: RuntimeEndpointManager::default(),
         }
     }
 

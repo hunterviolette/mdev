@@ -21,6 +21,7 @@ use crate::app_state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let app_root = resolve_app_root(&cwd)?;
     load_runtime_env(&app_root)?;

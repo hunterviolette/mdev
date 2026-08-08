@@ -5,6 +5,7 @@ mod flight_deck;
 mod filesystem;
 mod health;
 mod repo_tree;
+mod repo_sync;
 mod runs;
 mod sap;
 mod review;
@@ -27,6 +28,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(processes::router())
         .merge(supervisor::router())
         .merge(repo_tree::router())
+        .merge(repo_sync::router())
         .merge(templates::router())
         .merge(review::router())
         .merge(workflow_builder::router())

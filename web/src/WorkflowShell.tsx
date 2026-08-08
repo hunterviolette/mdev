@@ -92,6 +92,7 @@ import {
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
+import { ContextExportTree, resolveContextExport } from './Capabilities/ContextExport';
 import type { DiffPanelState } from './DiffPanel';
 import { PlannerModal } from './PlannerModal';
 import { getPlanner, getPlannerFeature } from './planner_api';
@@ -2474,8 +2475,10 @@ export function WorkflowShell(props: {
   }, []);
   const [stageIncludeRepoContext, setStageIncludeRepoContext] = useState(false);
   const [stageRepoContextGitRef, setStageRepoContextGitRef] = useState('WORKTREE');
-  const [stageRepoContextIncludeFilesText, setStageRepoContextIncludeFilesText] = useState('');
+  const [stageRepoContextExcludeDirectoriesText, setStageRepoContextExcludeDirectoriesText] = useState('');
+  const [stageRepoContextExcludeFilesText, setStageRepoContextExcludeFilesText] = useState('');
   const [stageRepoContextExcludeRegexText, setStageRepoContextExcludeRegexText] = useState('');
+  const [stageRepoContextIncludeOverrideRegexText, setStageRepoContextIncludeOverrideRegexText] = useState('');
   const [stageRepoContextSavePath, setStageRepoContextSavePath] = useState('/tmp/repo_context.txt');
   const [stageRepoContextSkipBinary, setStageRepoContextSkipBinary] = useState(true);
   const [stageRepoContextSkipGitignore, setStageRepoContextSkipGitignore] = useState(true);
@@ -2527,6 +2530,7 @@ export function WorkflowShell(props: {
   const [treeError, setTreeError] = useState<string | null>(null);
   const [selectedRepoPaths, setSelectedRepoPaths] = useState<string[]>([]);
   const [selectedRepoDirs, setSelectedRepoDirs] = useState<Set<string>>(new Set());
+  const [repoFragmentFileCount, setRepoFragmentFileCount] = useState(0);
 
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(new Set());
   const [collapsedStageIds, setCollapsedStageIds] = useState<Set<string>>(new Set());
@@ -3219,12 +3223,80 @@ export function WorkflowShell(props: {
   const rootTreeEntries = useMemo(() => treeChildrenByParent[''] ?? [], [treeChildrenByParent]);
   const selectedRepoPathSet = useMemo(() => new Set(selectedRepoPaths), [selectedRepoPaths]);
   const repoFragmentSummary = useMemo(() => {
+    return `${repoFragmentFileCount} file${repoFragmentFileCount === 1 ? '' : 's'} selected`;
+  }, [repoFragmentFileCount]);
+  useEffect(() => {
+    const includeDirectories = Array.from(selectedRepoDirs);
     const includeFiles = Array.from(new Set(selectedRepoPaths.map((value) => value.trim()).filter(Boolean)));
-    if (includeFiles.length === 0) {
-      return '0 files selected';
+    const excludeDirectories = stageRepoContextExcludeDirectoriesText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const excludeFiles = stageRepoContextExcludeFilesText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const excludeRegex = stageRepoContextExcludeRegexText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const includeOverrideRegex = stageRepoContextIncludeOverrideRegexText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    if (includeDirectories.length === 0 && includeFiles.length === 0) {
+      setRepoFragmentFileCount(0);
+      return;
     }
-    return `${includeFiles.length} file${includeFiles.length === 1 ? '' : 's'} selected`;
-  }, [selectedRepoPaths]);
+
+    const repo = view === 'builder' ? repoRef.trim() : selectedRun?.repo_ref?.trim() ?? '';
+    if (!repo) {
+      setRepoFragmentFileCount(0);
+      return;
+    }
+
+    let cancelled = false;
+
+    void listRepoTree(repo, stageRepoContextGitRef.trim() || 'WORKTREE', {
+      recursive: true,
+      skipBinary: stageRepoContextSkipBinary,
+      skipGitignore: stageRepoContextSkipGitignore
+    })
+      .then((response) => {
+        if (cancelled) return;
+        const resolved = resolveContextExport(response.entries, {
+          includeDirectories,
+          includeFiles,
+          excludeDirectories,
+          excludeFiles,
+          excludeRegex,
+          includeOverrideRegex
+        });
+        setRepoFragmentFileCount(resolved.includedFiles.length);
+      })
+      .catch(() => {
+        if (!cancelled) setRepoFragmentFileCount(0);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    view,
+    repoRef,
+    selectedRun?.repo_ref,
+    stageRepoContextGitRef,
+    stageRepoContextSkipBinary,
+    stageRepoContextSkipGitignore,
+    selectedRepoPaths,
+    selectedRepoDirs,
+    stageRepoContextExcludeDirectoriesText,
+    stageRepoContextExcludeFilesText,
+    stageRepoContextExcludeRegexText,
+    stageRepoContextIncludeOverrideRegexText
+  ]);
+
   const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
 
   const definition = useMemo<WorkflowTemplateDefinition>(() => compiledBuilderDefinition ?? ({
@@ -3574,6 +3646,18 @@ export function WorkflowShell(props: {
     const includeFiles = Array.isArray(repoContext.include_files)
       ? repoContext.include_files.filter((value): value is string => typeof value === 'string')
       : [];
+    const includeDirectories = Array.isArray(repoContext.include_directories)
+      ? repoContext.include_directories.filter((value): value is string => typeof value === 'string')
+      : [];
+    const excludeFiles = Array.isArray(repoContext.exclude_files)
+      ? repoContext.exclude_files.filter((value): value is string => typeof value === 'string')
+      : [];
+    const excludeDirectories = Array.isArray(repoContext.exclude_directories)
+      ? repoContext.exclude_directories.filter((value): value is string => typeof value === 'string')
+      : [];
+    const includeOverrideRegex = Array.isArray(repoContext.include_override_regex)
+      ? repoContext.include_override_regex.filter((value): value is string => typeof value === 'string')
+      : [];
 
     const globalChangesetSchema = (globalCapabilities.changeset_schema ?? {}) as Record<string, unknown>;
     const selectedPrompt = ((selectedStageState?.prompt ?? {}) as Record<string, unknown>);
@@ -3650,14 +3734,16 @@ export function WorkflowShell(props: {
     const inferenceSession = inferenceSessionName ? ((inferenceSessions[inferenceSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
     setInferenceTransport(inferenceSession.transport === 'browser' ? 'browser' : 'api');
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
-    setStageRepoContextIncludeFilesText(includeFiles.join('\n'));
     setSelectedRepoPaths(includeFiles);
-    setSelectedRepoDirs(new Set());
+    setSelectedRepoDirs(new Set(includeDirectories));
+    setStageRepoContextExcludeDirectoriesText(excludeDirectories.join('\n'));
+    setStageRepoContextExcludeFilesText(excludeFiles.join('\n'));
     setStageRepoContextExcludeRegexText(
       Array.isArray(repoContext.exclude_regex)
         ? repoContext.exclude_regex.filter((value): value is string => typeof value === 'string').join('\n')
         : ''
     );
+    setStageRepoContextIncludeOverrideRegexText(includeOverrideRegex.join('\n'));
     setStageRepoContextSavePath(
       typeof repoContext.save_path === 'string' && repoContext.save_path.trim()
         ? repoContext.save_path
@@ -3674,10 +3760,7 @@ export function WorkflowShell(props: {
 
 
   function buildInteractiveGlobalStatePayload() {
-    const includeFiles = stageRepoContextIncludeFilesText
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const includeFiles = Array.from(new Set(selectedRepoPaths.map((value) => value.trim()).filter(Boolean)));
     const excludeRegex = stageRepoContextExcludeRegexText
       .split('\n')
       .map((line) => line.trim())
@@ -3744,6 +3827,7 @@ export function WorkflowShell(props: {
           enabled: stageIncludeRepoContext,
           git_ref: stageRepoContextGitRef || 'WORKTREE',
           include_files: includeFiles,
+          include_directories: Array.from(selectedRepoDirs),
           exclude_regex: excludeRegex,
           save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
           skip_binary: stageRepoContextSkipBinary,
@@ -3791,7 +3875,6 @@ export function WorkflowShell(props: {
     if (!repoContextConfigOpen) return;
     setTreeRootData(null);
     setTreeChildrenByParent({});
-    setSelectedRepoDirs(new Set());
     void loadRepoTreeForActiveRef('', true);
   }, [repoContextConfigOpen, repoTreeScopeKey]);
 
@@ -5228,11 +5311,23 @@ export function WorkflowShell(props: {
     const capabilities = ((globals.capabilities as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
     const contextExport = ((capabilities.context_export as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
 
+    const includeDirectories = Array.isArray(contextExport.include_directories)
+      ? contextExport.include_directories.filter((value): value is string => typeof value === 'string')
+      : [];
     const includeFiles = Array.isArray(contextExport.include_files)
       ? contextExport.include_files.filter((value): value is string => typeof value === 'string')
       : [];
+    const excludeDirectories = Array.isArray(contextExport.exclude_directories)
+      ? contextExport.exclude_directories.filter((value): value is string => typeof value === 'string')
+      : [];
+    const excludeFiles = Array.isArray(contextExport.exclude_files)
+      ? contextExport.exclude_files.filter((value): value is string => typeof value === 'string')
+      : [];
     const excludeRegex = Array.isArray(contextExport.exclude_regex)
       ? contextExport.exclude_regex.filter((value): value is string => typeof value === 'string')
+      : [];
+    const includeOverrideRegex = Array.isArray(contextExport.include_override_regex)
+      ? contextExport.include_override_regex.filter((value): value is string => typeof value === 'string')
       : [];
 
     setStageRepoContextGitRef(
@@ -5240,8 +5335,12 @@ export function WorkflowShell(props: {
         ? contextExport.git_ref
         : 'WORKTREE'
     );
-    syncRepoSelectionState(includeFiles);
+    setSelectedRepoPaths(Array.from(new Set(includeFiles.map((path) => path.trim()).filter(Boolean))).sort());
+    setSelectedRepoDirs(new Set(includeDirectories));
+    setStageRepoContextExcludeDirectoriesText(excludeDirectories.join('\n'));
+    setStageRepoContextExcludeFilesText(excludeFiles.join('\n'));
     setStageRepoContextExcludeRegexText(excludeRegex.join('\n'));
+    setStageRepoContextIncludeOverrideRegexText(includeOverrideRegex.join('\n'));
     setStageRepoContextSavePath(
       typeof contextExport.save_path === 'string' && contextExport.save_path.trim()
         ? contextExport.save_path
@@ -5556,7 +5655,6 @@ export function WorkflowShell(props: {
   function syncRepoSelectionState(nextPaths: string[]) {
     const normalized = Array.from(new Set(nextPaths.map((path) => path.trim()).filter(Boolean))).sort();
     setSelectedRepoPaths(normalized);
-    setStageRepoContextIncludeFilesText(normalized.join('\n'));
   }
 
   function resolveActiveRepoRef(): string {
@@ -5567,6 +5665,7 @@ export function WorkflowShell(props: {
     const gitRef = stageRepoContextGitRef.trim() || 'WORKTREE';
     const options = {
       basePath,
+      recursive: true,
       skipBinary: stageRepoContextSkipBinary,
       skipGitignore: stageRepoContextSkipGitignore
     };
@@ -5609,7 +5708,6 @@ export function WorkflowShell(props: {
       if (replaceRoot) {
         setTreeRootData(data);
         setTreeChildrenByParent({ '': data.entries });
-        setSelectedRepoDirs(new Set());
       } else {
         setTreeChildrenByParent((prev) => ({ ...prev, [basePath]: data.entries }));
       }
@@ -5638,50 +5736,18 @@ export function WorkflowShell(props: {
     setPaths([path], !selectedRepoPathSet.has(path));
   }
 
-  async function loadTreeSubtree(basePath: string): Promise<{ children: Record<string, RepoTreeEntry[]>; files: string[] }> {
-    const data = await listRepoTreeForCurrentScope(basePath);
-
-    const children: Record<string, RepoTreeEntry[]> = {
-      [basePath]: data.entries
-    };
-    const files: string[] = [];
-
-    for (const entry of data.entries) {
-      if (entry.kind === 'file') {
-        files.push(entry.path);
-      } else if (entry.has_children) {
-        const nested = await loadTreeSubtree(entry.path);
-        Object.assign(children, nested.children);
-        files.push(...nested.files);
-      }
-    }
-
-    return { children, files };
+  function toggleContextExportDirectoryPath(path: string) {
+    const next = new Set(selectedRepoDirs);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    setSelectedRepoDirs(next);
   }
 
-  async function toggleDirectory(entry: RepoTreeEntry, checked: boolean) {
-    if (view !== 'builder' && !selectedRun?.id) return;
-    if (view === 'builder' && !repoRef.trim()) return;
-
-    if (checked) {
-      const nested = await loadTreeSubtree(entry.path);
-      setTreeChildrenByParent((prev) => ({ ...prev, ...nested.children }));
-      setSelectedRepoDirs((prev) => {
-        const next = new Set(prev);
-        next.add(entry.path);
-        return next;
-      });
-      setPaths(nested.files, true);
-      return;
-    }
-
-    const descendantFiles = collectLoadedFilePaths(entry.path, treeChildrenByParent);
-    setSelectedRepoDirs((prev) => {
-      const next = new Set(prev);
-      next.delete(entry.path);
-      return next;
-    });
-    setPaths(descendantFiles, false);
+  async function toggleContextExportDirectory(entry: RepoTreeEntry, checked: boolean) {
+    const next = new Set(selectedRepoDirs);
+    if (checked) next.add(entry.path);
+    else next.delete(entry.path);
+    setSelectedRepoDirs(next);
   }
 
   const composedInferencePrompt = useMemo(() => {
@@ -6463,25 +6529,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     await refreshSelectedRunArtifacts();
   }
 
-  async function handleDispositionReview(disposition: string, selectedStepId?: string | null) {
-    if (!selectedRun) return;
-    const runId = selectedRun.id;
-    const normalizedDisposition = normalizeCheckpointDisposition(disposition);
-    await runManualCapability(async () => {
-      const json = await resolveWorkflowDispositionReview(runId, normalizedDisposition, selectedStepId) as Record<string, unknown>;
-      await refreshSelectedRunArtifacts();
-
-      if (normalizedDisposition === 'continue_auto' || normalizedDisposition === 'select_stage') {
-        const nextStepId = typeof json.current_step_id === 'string' ? json.current_step_id : selectedStepId ?? null;
-        if (nextStepId) {
-          setSelectedStepId(nextStepId);
-        }
-      }
-
-      return json;
-    }, `Checkpoint selected: ${checkpointDispositionLabel(normalizedDisposition)}.`);
-  }
-
   async function handleManualPatchStageState() {
     if (!selectedRun || !selectedRunStepId) return;
     const stepId = selectedRunStepId;
@@ -6673,7 +6720,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
   }
 
   async function handleSaveBuilderRepoContext() {
-    const includeFiles = stageRepoContextIncludeFilesText
+    const includeDirectories = Array.from(selectedRepoDirs).map((item) => item.trim()).filter(Boolean).sort();
+    const includeFiles = Array.from(new Set(selectedRepoPaths.map((item) => item.trim()).filter(Boolean))).sort();
+    const excludeDirectories = stageRepoContextExcludeDirectoriesText
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const excludeFiles = stageRepoContextExcludeFilesText
       .split('\n')
       .map((item) => item.trim())
       .filter(Boolean);
@@ -6681,12 +6734,20 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
       .split('\n')
       .map((item) => item.trim())
       .filter(Boolean);
+    const includeOverrideRegex = stageRepoContextIncludeOverrideRegexText
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
 
     if (view === 'builder') {
       saveBuilderCapability('context_export', {
         git_ref: stageRepoContextGitRef.trim() || 'WORKTREE',
+        include_directories: includeDirectories,
         include_files: includeFiles,
+        exclude_directories: excludeDirectories,
+        exclude_files: excludeFiles,
         exclude_regex: excludeRegex,
+        include_override_regex: includeOverrideRegex,
         save_path: stageRepoContextSavePath.trim() || '/tmp/repo_context.txt',
         skip_binary: stageRepoContextSkipBinary,
         skip_gitignore: stageRepoContextSkipGitignore,
@@ -7551,79 +7612,89 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
           }}
         >
-          <Stack h="100%" gap="md">
-            <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(e) => setStageRepoContextGitRef(e.currentTarget.value)} placeholder="WORKTREE" />
-            <TextInput label="Save path" value={stageRepoContextSavePath} onChange={(e) => setStageRepoContextSavePath(e.currentTarget.value)} placeholder="/tmp/repo_context.txt" />
-            <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <Switch label="Skip binary" checked={stageRepoContextSkipBinary} onChange={(e) => setStageRepoContextSkipBinary(e.currentTarget.checked)} />
-              <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(e) => setStageRepoContextSkipGitignore(e.currentTarget.checked)} />
-              <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(e) => setStageRepoContextIncludeStagedDiff(e.currentTarget.checked)} />
-              <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(e) => setStageRepoContextIncludeUnstagedDiff(e.currentTarget.checked)} />
-              <Switch label="Inline repo context in prompt instead of uploading attachment" checked={stageRepoContextInlinePrompt} onChange={(e) => setStageRepoContextInlinePrompt(e.currentTarget.checked)} />
-            </SimpleGrid>
-            <Group justify="space-between">
-              <Group>
-                <Button
-                  size="xs"
-                  variant="light"
-                  onClick={() => {
-                    const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
-                    if (activeRepoRef) {
-                      void loadRepoTreeForActiveRef('', true);
-                    }
-                  }}
-                  disabled={!(view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim()}
-                >
-                  Refresh tree
-                </Button>
-                <Button size="xs" variant="light" onClick={() => { syncRepoSelectionState([]); setSelectedRepoDirs(new Set()); }}>
-                  Clear selection
-                </Button>
-                <Button size="xs" variant="light" onClick={() => {
-                  const allVisibleFiles = collectLoadedFilePaths('', treeChildrenByParent);
-                  setSelectedRepoDirs(new Set(rootTreeEntries.filter((entry) => entry.kind === 'dir').map((entry) => entry.path)));
-                  setPaths(allVisibleFiles, true);
-                }}>
-                  Select loaded files
-                </Button>
+          <Group h="100%" align="stretch" wrap="nowrap" gap="lg">
+            <ScrollArea style={{ flex: '0 0 430px' }} offsetScrollbars>
+              <Stack gap="md" pr="sm">
+                <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(event) => setStageRepoContextGitRef(event.currentTarget.value)} placeholder="WORKTREE" />
+                <TextInput label="Save path" value={stageRepoContextSavePath} onChange={(event) => setStageRepoContextSavePath(event.currentTarget.value)} placeholder="/tmp/repo_context.txt" />
+                <SimpleGrid cols={2}>
+                  <Switch label="Skip binary" checked={stageRepoContextSkipBinary} onChange={(event) => setStageRepoContextSkipBinary(event.currentTarget.checked)} />
+                  <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(event) => setStageRepoContextSkipGitignore(event.currentTarget.checked)} />
+                  <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(event) => setStageRepoContextIncludeStagedDiff(event.currentTarget.checked)} />
+                  <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(event) => setStageRepoContextIncludeUnstagedDiff(event.currentTarget.checked)} />
+                </SimpleGrid>
+                <Switch label="Inline repo context in prompt instead of uploading attachment" checked={stageRepoContextInlinePrompt} onChange={(event) => setStageRepoContextInlinePrompt(event.currentTarget.checked)} />
+                <Group gap="xs">
+                  <Button
+                    size="xs"
+                    variant="light"
+                    onClick={() => {
+                      const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
+                      if (activeRepoRef) void loadRepoTreeForActiveRef('', true);
+                    }}
+                    disabled={!(view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim()}
+                  >
+                    Refresh tree
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="light"
+                    onClick={() => {
+                      setSelectedRepoPaths([]);
+                      setSelectedRepoDirs(new Set());
+                    }}
+                  >
+                    Clear selection
+                  </Button>
+                </Group>
+                <Group gap="xs">
+                  <Text size="sm">Directories: <Code>{selectedRepoDirs.size}</Code></Text>
+                  <Text size="sm">Files: <Code>{selectedRepoPaths.length}</Code></Text>
+                </Group>
+                {treeError ? <Alert color="red">{treeError}</Alert> : null}
+                {treeRootData ? <Text size="sm" c="dimmed">Refreshed {treeRootData.refreshed_at}</Text> : null}
+                <Textarea label="Include directories" minRows={6} value={Array.from(selectedRepoDirs).sort().join('\n')} onChange={(event) => {
+                  setSelectedRepoDirs(new Set(event.currentTarget.value.split('\n').map((item) => item.trim()).filter(Boolean)));
+                }} placeholder={"api/src\nweb/src"} />
+                <Textarea label="Include files" minRows={6} value={selectedRepoPaths.join('\n')} onChange={(event) => {
+                  setSelectedRepoPaths(Array.from(new Set(event.currentTarget.value.split('\n').map((item) => item.trim()).filter(Boolean))).sort());
+                }} placeholder={"README.md\nCargo.toml"} />
+                <Textarea label="Exclude directories" minRows={6} value={stageRepoContextExcludeDirectoriesText} onChange={(event) => setStageRepoContextExcludeDirectoriesText(event.currentTarget.value)} placeholder={"generated\nfixtures"} />
+                <Textarea label="Exclude files" minRows={6} value={stageRepoContextExcludeFilesText} onChange={(event) => setStageRepoContextExcludeFilesText(event.currentTarget.value)} placeholder={"api/Cargo.lock\nweb/package-lock.json"} />
+                <Textarea label="Exclude regex" minRows={5} value={stageRepoContextExcludeRegexText} onChange={(event) => setStageRepoContextExcludeRegexText(event.currentTarget.value)} placeholder={"^generated/\n\\.snapshot$"} />
+                <Textarea label="Include override regex" minRows={4} value={stageRepoContextIncludeOverrideRegexText} onChange={(event) => setStageRepoContextIncludeOverrideRegexText(event.currentTarget.value)} placeholder={"^api/Cargo\\.lock$"} />
+                <Group justify="flex-end">
+                  <Button size="xs" variant="default" onClick={() => setRepoContextConfigOpen(false)}>Cancel</Button>
+                  <Button size="xs" onClick={handleSaveBuilderRepoContext}>Save</Button>
+                </Group>
+              </Stack>
+            </ScrollArea>
+            <Stack gap="sm" style={{ flex: 1, minWidth: 0 }}>
+              <Group justify="space-between">
+                <Group gap="xs">
+                  <Badge color="green" variant="light">Included</Badge>
+                  <Badge color="red" variant="light">Excluded</Badge>
+                  <Badge color="gray" variant="outline">Not selected</Badge>
+                </Group>
+                <Text size="sm" c="dimmed">Repository tree</Text>
               </Group>
-              <Text size="sm">Selected files: <Code>{selectedRepoPaths.length}</Code></Text>
-            </Group>
-            {treeError ? <Alert color="red">{treeError}</Alert> : null}
-            {treeRootData ? <Text size="sm" c="dimmed">Refreshed {treeRootData.refreshed_at}</Text> : null}
-            {treeBusy && !treeRootData ? (
-              <Group><Loader size="sm" /><Text size="sm">Scanning repository…</Text></Group>
-            ) : (
-              <RepoTree
-                rootEntries={rootTreeEntries}
-                childrenByParent={treeChildrenByParent}
-                loadingDirs={loadingTreeDirs}
-                selected={selectedRepoPathSet}
-                selectedDirs={selectedRepoDirs}
-                onLoadDir={(path) => {
-                  const activeRepoRef = (view === 'builder' ? repoRef : (selectedRun?.repo_ref ?? repoRef)).trim();
-                  if (activeRepoRef) {
-                    void loadRepoTreeForActiveRef(path, false);
-                  }
-                }}
-                onToggleFile={toggleFile}
-                onToggleDir={(entry, checked) => {
-                  void toggleDirectory(entry, checked);
-                }}
-                onSetPaths={setPaths}
-                height={360}
-              />
-            )}
-            <Textarea label="Include files" minRows={8} value={stageRepoContextIncludeFilesText} onChange={(e) => {
-              const value = e.currentTarget.value;
-              syncRepoSelectionState(value.split('\n').map((item) => item.trim()).filter(Boolean));
-            }} placeholder={"src/main.rs\nsrc/lib.rs"} />
-            <Textarea label="Exclude regex" minRows={6} value={stageRepoContextExcludeRegexText} onChange={(e) => setStageRepoContextExcludeRegexText(e.currentTarget.value)} placeholder={"target/.*\nnode_modules/.*"} />
-            <Group justify="flex-end">
-              <Button size="xs" variant="default" onClick={() => setRepoContextConfigOpen(false)}>Cancel</Button>
-              <Button size="xs" onClick={handleSaveBuilderRepoContext}>Save</Button>
-            </Group>
-          </Stack>
+              {treeBusy && !treeRootData ? (
+                <Group><Loader size="sm" /><Text size="sm">Scanning repository…</Text></Group>
+              ) : (
+                <ContextExportTree
+                  entries={treeRootData?.entries ?? []}
+                  includeDirectories={Array.from(selectedRepoDirs)}
+                  includeFiles={selectedRepoPaths}
+                  excludeDirectories={stageRepoContextExcludeDirectoriesText.split('\n').map((item) => item.trim()).filter(Boolean)}
+                  excludeFiles={stageRepoContextExcludeFilesText.split('\n').map((item) => item.trim()).filter(Boolean)}
+                  excludeRegex={stageRepoContextExcludeRegexText.split('\n').map((item) => item.trim()).filter(Boolean)}
+                  includeOverrideRegex={stageRepoContextIncludeOverrideRegexText.split('\n').map((item) => item.trim()).filter(Boolean)}
+                  onToggleDirectory={toggleContextExportDirectoryPath}
+                  onToggleFile={toggleFile}
+                />
+              )}
+            </Stack>
+          </Group>
         </Modal>
 
         <PlannerModal

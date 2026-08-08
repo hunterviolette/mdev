@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -8,6 +8,8 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::engine::runtime_endpoints::{NetworkExposure, RuntimeEndpointManager};
 
 use crate::engine::{
     capabilities::{
@@ -114,7 +116,7 @@ pub async fn execute(
         });
     }
 
-    let mut services = allocate_services(&qa.environment)?;
+    let mut services = allocate_services(&ctx.state.runtime_endpoints, &qa.environment)?;
 
     let service_ports = services
         .iter()
@@ -853,38 +855,31 @@ fn validate_environment(environment: &QaEnvironmentSpec) -> Result<()> {
 }
 
 fn allocate_services(
+    endpoints: &RuntimeEndpointManager,
     environment: &QaEnvironmentSpec,
 ) -> Result<Vec<AllocatedQaService>> {
-    let mut allocated = BTreeSet::new();
+    let mut allocated = Vec::<u16>::new();
     let mut services = Vec::new();
 
     for service in &environment.services {
-        let port = match service.port.preferred {
-            Some(port) => {
-                if port < environment.port_range.start || port > environment.port_range.end {
-                    bail!(
-                        "preferred port {} for service '{}' is outside the QA port range",
-                        port,
-                        service.id
-                    );
-                }
-                if allocated.contains(&port) || !port_available(port) {
-                    bail!(
-                        "preferred port {} for service '{}' is unavailable",
-                        port,
-                        service.id
-                    );
-                }
-                port
+        if let Some(port) = service.port.preferred {
+            if port < environment.port_range.start || port > environment.port_range.end {
+                bail!(
+                    "preferred port {} for service '{}' is outside the QA port range",
+                    port,
+                    service.id
+                );
             }
-            None => find_available_port(
-                environment.port_range.start,
-                environment.port_range.end,
-                &allocated,
-            )?,
-        };
+        }
 
-        allocated.insert(port);
+        let endpoint = endpoints.allocate(
+            NetworkExposure::Localhost,
+            service.port.preferred,
+            Some((environment.port_range.start, environment.port_range.end)),
+            allocated.as_slice(),
+        )?;
+        let port = endpoint.port;
+        allocated.push(port);
 
         let public_url = Some(format!("http://localhost:{}", port));
 
@@ -900,20 +895,6 @@ fn allocate_services(
     }
 
     Ok(services)
-}
-
-fn find_available_port(start: u16, end: u16, allocated: &BTreeSet<u16>) -> Result<u16> {
-    for port in start..=end {
-        if !allocated.contains(&port) && port_available(port) {
-            return Ok(port);
-        }
-    }
-
-    bail!("no available QA ports in range {}-{}", start, end)
-}
-
-fn port_available(port: u16) -> bool {
-    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).is_ok()
 }
 
 fn qa_session_id(ctx: &CapabilityContext<'_>) -> String {

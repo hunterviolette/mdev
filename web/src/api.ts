@@ -632,6 +632,74 @@ export type WorkflowRunActionResult = {
   capability_results?: Array<Record<string, unknown>>;
 };
 
+export type RepoSyncDirection = 'send' | 'receive' | 'both';
+
+export type RepoSyncMode = 'manual' | 'auto_apply';
+
+export type RepoSyncMapping = {
+  id: string;
+  workflow_run_id: string;
+  peer_ipv4: string;
+  peer_port?: number | null;
+  direction: RepoSyncDirection;
+  peer_certificate_pem: string;
+  enabled: boolean;
+  sync_mode: RepoSyncMode;
+  connected: boolean;
+};
+
+export type RepoSyncPairingSession = {
+  id: string;
+  mapping_id: string;
+  verification_code: string;
+  peer_ipv4: string;
+  local_port: number;
+  peer_port?: number | null;
+  expires_at_unix_ms: number;
+  local_certificate_pem: string;
+  peer_certificate_pem: string;
+  local_confirmed: boolean;
+  remote_confirmed: boolean;
+  complete: boolean;
+};
+
+export type RepoSyncStatus = {
+  identity_ready: boolean;
+  certificate_fingerprint: string;
+  local_certificate_pem?: string;
+  local_ipv4?: string | null;
+  pairings: RepoSyncPairingSession[];
+  mappings: RepoSyncMapping[];
+};
+
+export type RepoSyncPeerMessageBlock =
+  | { type: 'text'; text: string }
+  | { type: 'code'; language: string; text: string }
+  | { type: 'file'; name: string; mime_type: string; data_base64: string }
+  | { type: 'image'; name: string; mime_type: string; data_base64: string };
+
+export type RepoSyncPeerMessage = {
+  id: string;
+  sent_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  author: 'self' | 'peer';
+  blocks: RepoSyncPeerMessageBlock[];
+};
+
+export type RepoSyncManualPreview = {
+  ok: boolean;
+  file_count: number;
+  total_bytes: number;
+};
+
+export type RepoSyncManualResult = {
+  ok: boolean;
+  sync_id: string;
+  file_count: number;
+  total_bytes: number;
+  remote_response: string;
+};
+
 export type RepoTreeEntry = {
   name: string;
   path: string;
@@ -704,15 +772,108 @@ export function buildWorkflowBuilderInferencePanel(body: {
   });
 }
 
+export function getRepoSyncStatus(workflowRunId: string) {
+  const params = new URLSearchParams({ workflow_run_id: workflowRunId });
+  return fetchJson<RepoSyncStatus>(`/api/repo-sync/status?${params.toString()}`);
+}
+
+export function upsertRepoSyncMapping(mapping: {
+  id?: string;
+  workflow_run_id: string;
+  peer_ipv4: string;
+  direction: RepoSyncDirection;
+  enabled: boolean;
+  sync_mode: RepoSyncMode;
+}) {
+  return fetchJson<RepoSyncMapping>('/api/repo-sync/mappings', {
+    method: 'PUT',
+    body: JSON.stringify(mapping),
+  });
+}
+
+export function startRepoSyncPairing(mappingId: string, passphrase: string) {
+  return fetchJson<RepoSyncPairingSession>(
+    `/api/repo-sync/mappings/${encodeURIComponent(mappingId)}/pairing/start`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ passphrase }),
+    }
+  );
+}
+
+export function confirmRepoSyncPairing(sessionId: string) {
+  return fetchJson<RepoSyncPairingSession>(
+    `/api/repo-sync/pairing/${encodeURIComponent(sessionId)}/confirm`,
+    {
+      method: 'POST',
+      body: '{}',
+    }
+  );
+}
+
+export function reconnectRepoSyncMapping(mappingId: string) {
+  return fetchJson<RepoSyncMapping>(
+    `/api/repo-sync/mappings/${encodeURIComponent(mappingId)}/reconnect`,
+    { method: 'POST', body: '{}' }
+  );
+}
+
+export function unpairRepoSyncMapping(mappingId: string) {
+  return fetchJson<{ ok: boolean }>(
+    `/api/repo-sync/mappings/${encodeURIComponent(mappingId)}`,
+    { method: 'DELETE' }
+  );
+}
+
+export function getRepoSyncPeerMessages(mappingId: string) {
+  return fetchJson<RepoSyncPeerMessage[]>(
+    `/api/repo-sync/mappings/${encodeURIComponent(mappingId)}/messages`
+  );
+}
+
+export function sendRepoSyncPeerMessage(
+  mappingId: string,
+  blocks: RepoSyncPeerMessageBlock[]
+) {
+  return fetchJson<RepoSyncPeerMessage>(
+    `/api/repo-sync/mappings/${encodeURIComponent(mappingId)}/messages`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ blocks }),
+    }
+  );
+}
+
+export function previewRepoSyncManual(workflowRunId: string) {
+  return fetchJson<RepoSyncManualPreview>('/api/repo-sync/manual-sync', {
+    method: 'POST',
+    body: JSON.stringify({
+      workflow_run_id: workflowRunId,
+      preview: true,
+    }),
+  });
+}
+
+export function sendRepoSyncManual(workflowRunId: string) {
+  return fetchJson<RepoSyncManualResult>('/api/repo-sync/manual-sync', {
+    method: 'POST',
+    body: JSON.stringify({
+      workflow_run_id: workflowRunId,
+      preview: false,
+    }),
+  });
+}
+
 export function listRepoTree(
   repoRef: string,
   gitRef = 'WORKTREE',
-  options?: { basePath?: string; skipBinary?: boolean; skipGitignore?: boolean }
+  options?: { basePath?: string; recursive?: boolean; skipBinary?: boolean; skipGitignore?: boolean }
 ) {
   const params = new URLSearchParams({
     repo_ref: repoRef,
     git_ref: gitRef,
     base_path: options?.basePath ?? '',
+    recursive: String(Boolean(options?.recursive)),
     skip_binary: String(Boolean(options?.skipBinary)),
     skip_gitignore: String(Boolean(options?.skipGitignore))
   });
@@ -1072,11 +1233,12 @@ export function executeWorkflowCapability(runId: string, capabilityId: string, i
 export function listWorkflowRepoTree(
   runId: string,
   gitRef = 'WORKTREE',
-  options?: { basePath?: string; skipBinary?: boolean; skipGitignore?: boolean }
+  options?: { basePath?: string; recursive?: boolean; skipBinary?: boolean; skipGitignore?: boolean }
 ) {
   const params = new URLSearchParams({
     git_ref: gitRef || 'WORKTREE',
     base_path: options?.basePath ?? '',
+    recursive: String(Boolean(options?.recursive)),
     skip_binary: String(Boolean(options?.skipBinary)),
     skip_gitignore: String(Boolean(options?.skipGitignore))
   });

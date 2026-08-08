@@ -3,6 +3,7 @@ pub(crate) mod governance;
 pub(crate) mod orchestration_inputs;
 mod runtime;
 pub(crate) mod runtime_tools;
+pub(crate) mod runtime_endpoints;
 
 pub(crate) mod stages;
 mod transitions;

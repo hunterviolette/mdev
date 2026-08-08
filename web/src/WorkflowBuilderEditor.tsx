@@ -666,6 +666,12 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                             }
 
                             const configKey = canonicalCapabilityConfigKey(item.key);
+
+                            if (configKey === 'context_export') {
+                              onOpenCapabilityConfig?.(configKey);
+                              return;
+                            }
+
                             const currentConfig = editableGlobals.capabilities?.[configKey] ?? {};
 
                             setCapabilityConfigKey(configKey);
