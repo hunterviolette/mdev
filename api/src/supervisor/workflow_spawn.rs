@@ -399,14 +399,6 @@ fn integration_definition() -> WorkflowTemplateDefinition {
                     "kind": "merge_patches_stage_policy",
                     "automation": {
                         "apply_patches": true
-                    },
-                    "on_success": {
-                        "disposition": "move_next",
-                        "message": "Patches merged successfully."
-                    },
-                    "on_error": {
-                        "disposition": "stay",
-                        "message": "Patch merge failed."
                     }
                 }),
                 execution_plan: Vec::new(),

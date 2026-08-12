@@ -120,7 +120,8 @@ fn prepare_code_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "move_next",
+                "status": "success",
+                "transition": "move_next",
                 "message": "Code stage completed successfully through backend workflow engine."
             }),
         );
@@ -131,7 +132,8 @@ fn prepare_code_state(
             "on_error".to_string(),
             if auto_apply {
                 json!({
-                    "disposition": "retry_stage",
+                    "status": "error",
+                    "transition": "retry_stage",
                     "message": "Code stage apply failed; retry the code stage with the apply error included in the prompt.",
                     "patch_from_capability": {
                         "capability": "changeset",
@@ -140,7 +142,8 @@ fn prepare_code_state(
                 })
             } else {
                 json!({
-                    "disposition": "retry_stage",
+                    "status": "error",
+                    "transition": "retry_stage",
                     "message": "Code stage failed during backend workflow execution."
                 })
             },

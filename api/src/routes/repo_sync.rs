@@ -79,7 +79,7 @@ pub fn router() -> Router<AppState> {
             "/api/repo-sync/mappings/:mapping_id/messages",
             get(peer_messages)
                 .post(send_peer_message)
-                .layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(1536 * 1024 * 1024)),
         )
 }
 

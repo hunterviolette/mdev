@@ -155,7 +155,8 @@ fn prepare_design_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "move_next",
+                "status": "success",
+                "transition": "move_next",
                 "message": "Design stage completed successfully through backend workflow engine."
             }),
         );
@@ -165,7 +166,8 @@ fn prepare_design_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "stay",
+                "status": "error",
+                "transition": "stay",
                 "message": "Design stage failed during backend workflow execution."
             }),
         );

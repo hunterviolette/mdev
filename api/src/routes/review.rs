@@ -1186,11 +1186,11 @@ async fn review_commit_options(
     let repo = repo_path_for_commit_history(&req.repo_ref);
     let mut refs = Vec::new();
 
-    let raw_refs = String::from_utf8(
+    let raw_remote_refs = String::from_utf8(
         run_git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/remotes"]).map_err(internal)?
     ).map_err(internal)?;
 
-    for value in raw_refs.lines().map(str::trim).filter(|value| !value.is_empty()) {
+    for value in raw_remote_refs.lines().map(str::trim).filter(|value| !value.is_empty()) {
         if value.ends_with("/HEAD") {
             continue;
         }
@@ -1211,12 +1211,30 @@ async fn review_commit_options(
         })
         .filter(|value| !value.is_empty());
 
-    let default_ref = remote_head_ref
-        .filter(|value| refs.iter().any(|item| item.value == *value))
-        .or_else(|| refs.iter().find(|item| item.value.ends_with("/main")).map(|item| item.value.clone()))
-        .or_else(|| refs.iter().find(|item| item.value.ends_with("/master")).map(|item| item.value.clone()))
-        .or_else(|| refs.first().map(|item| item.value.clone()))
-        .unwrap_or_default();
+    let default_ref = if refs.is_empty() {
+        refs.push(ReviewCommitRefOption {
+            value: "HEAD".to_string(),
+            label: "HEAD".to_string(),
+        });
+
+        let raw_local_refs = String::from_utf8(
+            run_git(&repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).map_err(internal)?
+        ).map_err(internal)?;
+
+        for value in raw_local_refs.lines().map(str::trim).filter(|value| !value.is_empty()) {
+            refs.push(ReviewCommitRefOption { value: value.to_string(), label: value.to_string() });
+        }
+
+        refs.dedup_by(|a, b| a.value == b.value);
+        "HEAD".to_string()
+    } else {
+        remote_head_ref
+            .filter(|value| refs.iter().any(|item| item.value == *value))
+            .or_else(|| refs.iter().find(|item| item.value.ends_with("/main")).map(|item| item.value.clone()))
+            .or_else(|| refs.iter().find(|item| item.value.ends_with("/master")).map(|item| item.value.clone()))
+            .or_else(|| refs.first().map(|item| item.value.clone()))
+            .unwrap_or_default()
+    };
 
     let default_since = if default_ref.is_empty() {
         None

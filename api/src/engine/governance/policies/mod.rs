@@ -72,5 +72,18 @@ pub async fn after_capability(
     let mut decisions = Vec::new();
     decisions.extend(changeset_file_failures::after_capability(run, step, result, prior_results)?);
     decisions.extend(compile_failures::after_capability(run, step, result, prior_results)?);
+
+    if result.capability == "repo_sync_changeset" && !result.ok {
+        let reason = result
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Repo Sync Auto Apply failed");
+        decisions.push(GovernanceDecision::Pause {
+            reason: format!("Repo Sync Auto Apply failed: {}", reason),
+        });
+    }
+
     Ok(decisions)
 }

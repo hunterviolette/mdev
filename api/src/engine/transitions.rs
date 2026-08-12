@@ -6,7 +6,7 @@ use crate::{
     models::{WorkflowRun, WorkflowStepDefinition, WorkflowTemplateDefinition},
 };
 
-use super::stages::{StageDisposition, StageOutcome};
+use super::stages::{StageOutcome, StageStatus, StageTransition};
 
 pub async fn transition_to_step(
     state: &AppState,
@@ -61,22 +61,18 @@ pub fn resolve_next_target(
     step: &WorkflowStepDefinition,
     outcome: &StageOutcome,
 ) -> Option<String> {
-    match &outcome.disposition {
-        StageDisposition::MoveNext => next_step_id(definition, Some(step.id.as_str())),
-        StageDisposition::MoveBack => previous_step_id(definition, Some(step.id.as_str())),
-        StageDisposition::RetryStage => Some(step.id.clone()),
-        StageDisposition::Stay => Some(step.id.clone()),
-        _ => None,
+    match &outcome.transition {
+        StageTransition::MoveNext => next_step_id(definition, Some(step.id.as_str())),
+        StageTransition::MoveBack => previous_step_id(definition, Some(step.id.as_str())),
+        StageTransition::RetryStage | StageTransition::Stay => Some(step.id.clone()),
+        StageTransition::Stop => None,
+        StageTransition::Target(target) => Some(target.clone()),
     }
 }
 
-pub fn should_auto_advance(step: &WorkflowStepDefinition, outcome: &StageOutcome) -> bool {
-    match outcome.disposition {
-        StageDisposition::Success => step.advancement.auto_advance_on_success,
-        StageDisposition::Error | StageDisposition::ErrorCode(_) => step.advancement.auto_advance_on_error,
-        StageDisposition::Paused => step.advancement.auto_advance_on_paused,
-        StageDisposition::RetryStage => false,
-        StageDisposition::MoveNext | StageDisposition::MoveBack => true,
-        StageDisposition::Outcome(_) | StageDisposition::Stay => false,
+pub fn should_auto_advance(_step: &WorkflowStepDefinition, outcome: &StageOutcome) -> bool {
+    match (&outcome.status, &outcome.transition) {
+        (_, StageTransition::MoveNext | StageTransition::MoveBack | StageTransition::RetryStage | StageTransition::Target(_)) => true,
+        (StageStatus::Success | StageStatus::Error | StageStatus::ErrorCode(_) | StageStatus::Paused | StageStatus::Outcome(_) | StageStatus::Stay, StageTransition::Stay | StageTransition::Stop) => false,
     }
 }

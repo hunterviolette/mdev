@@ -224,14 +224,16 @@ fn prepare_qa_state(
     execution_logic
         .entry("on_success".to_string())
         .or_insert_with(|| json!({
-            "disposition": "paused",
+            "status": "paused",
+            "transition": "stay",
             "message": "QA environment is running and requires operator approval."
         }));
 
     execution_logic
         .entry("on_error".to_string())
         .or_insert_with(|| json!({
-            "disposition": "stay",
+            "status": "error",
+            "transition": "stay",
             "message": "QA environment failed to start or become ready."
         }));
 

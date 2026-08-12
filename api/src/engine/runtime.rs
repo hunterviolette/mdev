@@ -20,7 +20,7 @@ use super::{
     select_step,
     set_run_status,
 };
-use super::stages::{execute_stage, StageDisposition};
+use super::stages::{execute_stage, StageStatus, StageTransition};
 use super::transitions::{next_step_id, resolve_next_target, should_auto_advance, transition_to_step};
 
 pub async fn patch_transient_stage_user_input(
@@ -651,7 +651,7 @@ pub(crate) async fn fail_runtime_workflow(
     Ok(())
 }
 
-pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposition: &str, selected_step_id: Option<&str>) -> Result<serde_json::Value> {
+pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposition: &str, _selected_step_id: Option<&str>) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
     let blocked_on = run
         .context
@@ -715,15 +715,14 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
 
     let normalized_disposition = match disposition {
         "continue_auto" | "auto" | "autonomous" | "move_next" | "continue" => "continue_auto",
-        "select_stage" | "select" | "continue_manual" | "manual" => "select_stage",
+        "complete" => "complete",
         "pause_error" | "pause" | "paused" => "pause_error",
         other => return Err(anyhow!("unsupported operator checkpoint disposition {}", other)),
     };
 
     let resume_mode = match normalized_disposition {
         "continue_auto" => "autonomous".to_string(),
-        "select_stage" => "manual".to_string(),
-        "pause_error" => "none".to_string(),
+        "complete" | "pause_error" => "none".to_string(),
         _ => resume_mode,
     };
 
@@ -821,17 +820,38 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
                 "continue_workflow": false
             }))
         }
-        "continue_auto" | "select_stage" => {
+        "complete" => {
+            if checkpoint_phase != "before_stage" {
+                append_disposition_stage_completion_event(
+                    state,
+                    run_id,
+                    stage_id.as_str(),
+                    stage_execution_id.as_deref(),
+                    true,
+                    "complete",
+                    "Stage completed after operator checkpoint.",
+                    None,
+                )
+                .await?;
+            }
+
+            set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
+
+            Ok(json!({
+                "ok": true,
+                "accepted": true,
+                "status": "paused",
+                "disposition": "complete",
+                "current_step_id": stage_id,
+                "followup_action": "pause",
+                "continue_workflow": false
+            }))
+        }
+        "continue_auto" => {
             let definition = load_template_definition(state, &run).await?
                 .ok_or_else(|| anyhow!("run has no template definition"))?;
             let target = if checkpoint_phase == "before_stage" {
                 Some(stage_id.clone())
-            } else if normalized_disposition == "select_stage" {
-                selected_step_id
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow!("selected_step_id is required for select_stage checkpoint disposition"))?
-                    .into()
             } else {
                 next_target.or_else(|| next_step_id(&definition, Some(stage_id.as_str())))
             };
@@ -1486,6 +1506,7 @@ pub(crate) async fn run_workflow_runtime(
                         WorkflowRuntimeCommand::MoveTo { step_id } => {
                             select_step(state, run_id, step_id.as_str()).await?;
                             requested_step_id = Some(step_id);
+                            paused = true;
                         }
                         WorkflowRuntimeCommand::Cancel { reason } => {
                             fail_runtime_workflow(state, run_id, reason.as_str(), "Workflow execution was cancelled.").await?;
@@ -1501,8 +1522,18 @@ pub(crate) async fn run_workflow_runtime(
                             set_run_status(state, run_id, RunStatus::Paused, run.current_step_id.as_deref()).await?;
                         }
                         WorkflowRuntimeCommand::ResolveCheckpoint { disposition, selected_step_id } => {
-                            resolve_operator_checkpoint(state, run_id, disposition.as_str(), selected_step_id.as_deref()).await?;
-                            paused = disposition == "pause_error" || disposition == "pause" || disposition == "paused";
+                            if matches!(disposition.as_str(), "select_stage" | "select" | "continue_manual" | "manual") {
+                                let step_id = selected_step_id
+                                    .filter(|value| !value.trim().is_empty())
+                                    .ok_or_else(|| anyhow!("selected_step_id is required when selecting a workflow stage"))?;
+                                resolve_operator_checkpoint(state, run_id, "complete", None).await?;
+                                select_step(state, run_id, step_id.as_str()).await?;
+                                requested_step_id = Some(step_id);
+                                paused = true;
+                            } else {
+                                resolve_operator_checkpoint(state, run_id, disposition.as_str(), None).await?;
+                                paused = disposition == "pause_error" || disposition == "pause" || disposition == "paused";
+                            }
                         }
                     }
                 }
@@ -1543,11 +1574,22 @@ pub(crate) async fn run_workflow_runtime(
                             cancellation.cancel();
                         }
                         WorkflowRuntimeCommand::ResolveCheckpoint { disposition, selected_step_id } => {
-                            resolve_operator_checkpoint(state, run_id, disposition.as_str(), selected_step_id.as_deref()).await?;
+                            if matches!(disposition.as_str(), "select_stage" | "select" | "continue_manual" | "manual") {
+                                let step_id = selected_step_id
+                                    .filter(|value| !value.trim().is_empty())
+                                    .ok_or_else(|| anyhow!("selected_step_id is required when selecting a workflow stage"))?;
+                                resolve_operator_checkpoint(state, run_id, "complete", None).await?;
+                                select_step(state, run_id, step_id.as_str()).await?;
+                                requested_step_id = Some(step_id);
+                                paused = true;
+                            } else {
+                                resolve_operator_checkpoint(state, run_id, disposition.as_str(), None).await?;
+                            }
                         }
                         WorkflowRuntimeCommand::MoveTo { step_id } => {
                             select_step(state, run_id, step_id.as_str()).await?;
                             requested_step_id = Some(step_id);
+                            paused = true;
                         }
                         WorkflowRuntimeCommand::Start { mode, step_id } => {
                             active_mode = Some(mode);
@@ -1721,16 +1763,6 @@ async fn run_stages(
             }));
         }
 
-        if matches!(
-            outcome.disposition,
-            StageDisposition::Success
-                | StageDisposition::MoveNext
-                | StageDisposition::MoveBack
-                | StageDisposition::Outcome(_)
-                | StageDisposition::Stay
-        ) {
-        }
-
         let pending_capability_user_input = capability_user_input_result(&outcome).is_some();
 
         if pending_capability_user_input {
@@ -1750,7 +1782,8 @@ async fn run_stages(
                     "execution_state": "awaiting_user_input",
                     "stage_id": step.id,
                     "stage_type": step.step_type,
-                    "recommended_disposition": format_disposition(&outcome.disposition),
+                    "recommended_status": format_stage_status(&outcome.status),
+                    "recommended_transition": format_stage_transition(&outcome.transition),
                     "available_dispositions": capability_user_input_options(&outcome),
                     "next_step_id": next_target.clone(),
                     "resume_mode": disposition_resume_mode,
@@ -1764,7 +1797,8 @@ async fn run_stages(
                     "step_id": step.id,
                     "next_step_id": next_target,
                     "message": outcome.message,
-                    "disposition": format_disposition(&outcome.disposition),
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "capability_results": outcome.capability_results,
                     "local_state": outcome.local_state,
                 }));
@@ -1777,7 +1811,8 @@ async fn run_stages(
                 "step_id": step.id,
                 "next_step_id": next_target,
                 "message": outcome.message,
-                "disposition": format_disposition(&outcome.disposition),
+                "stage_status": format_stage_status(&outcome.status),
+                "transition": format_stage_transition(&outcome.transition),
                 "capability_results": outcome.capability_results,
                 "local_state": outcome.local_state,
             }));
@@ -1791,7 +1826,8 @@ async fn run_stages(
             "stage_executed",
             &outcome.message,
             json!({
-                "disposition": format_disposition(&outcome.disposition),
+                "stage_status": format_stage_status(&outcome.status),
+            "transition": format_stage_transition(&outcome.transition),
                 "capability_results": outcome.capability_results,
                 "local_state": outcome.local_state,
                 "final_context": run.context.clone(),
@@ -1844,17 +1880,21 @@ async fn run_stages(
         persist_context(state, run_id, &run.context).await?;
 
         if matches!(mode, RunMode::Manual) {
-            let status = match outcome.disposition {
-                StageDisposition::Paused => RunStatus::Paused,
-                StageDisposition::Error | StageDisposition::ErrorCode(_) => RunStatus::Error,
-                StageDisposition::Success
-                | StageDisposition::RetryStage
-                | StageDisposition::MoveNext
-                | StageDisposition::MoveBack
-                | StageDisposition::Outcome(_)
-                | StageDisposition::Stay => RunStatus::Waiting,
+            let status = match &outcome.transition {
+                StageTransition::Stop => terminal_run_status(&outcome.status),
+                StageTransition::Stay
+                | StageTransition::RetryStage
+                | StageTransition::MoveNext
+                | StageTransition::MoveBack
+                | StageTransition::Target(_) => RunStatus::Waiting,
             };
-            let current_step_id = next_target.as_deref().or(Some(step.id.as_str()));
+            let current_step_id = match &outcome.transition {
+                StageTransition::Stop | StageTransition::Stay => Some(step.id.as_str()),
+                StageTransition::RetryStage
+                | StageTransition::MoveNext
+                | StageTransition::MoveBack
+                | StageTransition::Target(_) => next_target.as_deref().or(Some(step.id.as_str())),
+            };
             run_stage_exit_hook_if_transitioning(
                 state,
                 run_id,
@@ -1870,18 +1910,11 @@ async fn run_stages(
                 current_step_id,
                 "info",
                 "run_status_changed",
-                "Workflow run advanced after stage completion.",
+                "Workflow run updated after stage completion.",
                 json!({
-                    "status": match status {
-                        RunStatus::Draft => "waiting",
-                        RunStatus::Queued => "queued",
-                        RunStatus::Running => "running",
-                        RunStatus::Waiting => "waiting",
-                        RunStatus::Paused => "paused",
-                        RunStatus::Success => "complete",
-                        RunStatus::Error => "error",
-                        RunStatus::Cancelled => "cancelled",
-                    },
+                    "status": format_run_status(&status),
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "completed_step_id": step.id,
                     "current_step_id": current_step_id,
                     "next_step_id": next_target,
@@ -1894,20 +1927,12 @@ async fn run_stages(
 
             return Ok(json!({
                 "ok": outcome.ok,
-                "status": match status {
-                    RunStatus::Draft => "waiting",
-                    RunStatus::Queued => "queued",
-                    RunStatus::Running => "running",
-                    RunStatus::Waiting => "waiting",
-                    RunStatus::Paused => "paused",
-                    RunStatus::Success => "complete",
-                    RunStatus::Error => "error",
-                    RunStatus::Cancelled => "cancelled",
-                },
+                "status": format_run_status(&status),
+                "stage_status": format_stage_status(&outcome.status),
+                "transition": format_stage_transition(&outcome.transition),
                 "step_id": step.id,
                 "next_step_id": next_target,
                 "message": outcome.message,
-                "disposition": format_disposition(&outcome.disposition),
                 "capability_results": outcome.capability_results,
                 "local_state": outcome.local_state,
             }));
@@ -1922,144 +1947,89 @@ async fn run_stages(
         )
         .await?;
 
-        match (&outcome.disposition, next_target.clone(), auto_advance) {
-            (StageDisposition::Success, Some(target), true) => {
-                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
-                last_payload = json!({
-                    "ok": true,
-                    "status": "running",
-                    "step_id": step.id,
-                    "next_step_id": target,
-                    "message": outcome.message,
-                });
-                requested = next_target;
-                continue;
-            }
-            (StageDisposition::RetryStage, Some(target), _) => {
+        match (&outcome.transition, next_target.clone(), auto_advance) {
+            (StageTransition::MoveNext, Some(target), true)
+            | (StageTransition::MoveBack, Some(target), true)
+            | (StageTransition::RetryStage, Some(target), true)
+            | (StageTransition::Target(_), Some(target), true) => {
                 set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
                 last_payload = json!({
                     "ok": outcome.ok,
                     "status": "running",
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "step_id": step.id,
                     "next_step_id": target,
                     "message": outcome.message,
-                    "disposition": "retry_stage"
                 });
                 requested = Some(target);
                 continue;
             }
-            (StageDisposition::MoveNext, Some(target), _) | (StageDisposition::MoveBack, Some(target), _) => {
-                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
-                last_payload = json!({
-                    "ok": outcome.ok,
-                    "status": "running",
-                    "step_id": step.id,
-                    "next_step_id": target,
-                    "message": outcome.message,
-                });
-                requested = next_target;
-                continue;
-            }
-            (StageDisposition::MoveNext, None, _) => {
-                set_run_status(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
-                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
-                return Ok(json!({
-                    "ok": outcome.ok,
-                    "status": "complete",
-                    "step_id": step.id,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Success, Some(target), false) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "waiting",
-                    "step_id": step.id,
-                    "next_step_id": target,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Success, None, _) => {
-                set_run_status(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
-                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(step.id.as_str())).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "complete",
-                    "step_id": step.id,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Paused, Some(target), false) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "waiting",
-                    "step_id": step.id,
-                    "next_step_id": target,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Paused, _, _) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "waiting",
-                    "step_id": step.id,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Error, Some(target), true) | (StageDisposition::ErrorCode(_), Some(target), true) => {
-                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
-                last_payload = json!({
-                    "ok": false,
-                    "status": "running",
-                    "step_id": step.id,
-                    "next_step_id": target,
-                    "message": outcome.message,
-                });
-                requested = next_target;
-                continue;
-            }
-            (StageDisposition::Error, _, _) | (StageDisposition::ErrorCode(_), _, _) => {
-                set_run_status(state, run_id, RunStatus::Error, Some(step.id.as_str())).await?;
-                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Error, Some(step.id.as_str())).await?;
-                return Ok(json!({
-                    "ok": false,
-                    "status": "error",
-                    "step_id": step.id,
-                    "message": outcome.message,
-                }));
-            }
-            (StageDisposition::Outcome(_), Some(target), false) => {
+            (StageTransition::MoveNext, Some(target), false)
+            | (StageTransition::MoveBack, Some(target), false)
+            | (StageTransition::RetryStage, Some(target), false)
+            | (StageTransition::Target(_), Some(target), false) => {
                 set_run_status(state, run_id, RunStatus::Waiting, Some(target.as_str())).await?;
                 return Ok(json!({
                     "ok": outcome.ok,
                     "status": "waiting",
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "step_id": step.id,
                     "next_step_id": target,
                     "message": outcome.message,
                 }));
             }
-            (StageDisposition::Outcome(_), Some(target), true) => {
-                set_run_status(state, run_id, RunStatus::Running, Some(target.as_str())).await?;
-                requested = Some(target);
-                continue;
-            }
-            (StageDisposition::Stay, _, _) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+            (StageTransition::MoveNext, None, _)
+            | (StageTransition::Target(_), None, _) => {
+                let status = terminal_run_status(&outcome.status);
+                set_run_status(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+                if matches!(status, RunStatus::Success | RunStatus::Error) {
+                    crate::supervisor::handle_workflow_terminal_event(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+                }
                 return Ok(json!({
                     "ok": outcome.ok,
-                    "status": "waiting",
+                    "status": format_run_status(&status),
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "step_id": step.id,
                     "message": outcome.message,
                 }));
             }
-            _ => {
+            (StageTransition::MoveBack, None, _)
+            | (StageTransition::RetryStage, None, _) => {
                 set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": outcome.ok,
                     "status": "waiting",
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
+                    "step_id": step.id,
+                    "message": outcome.message,
+                }));
+            }
+            (StageTransition::Stay, _, _) => {
+                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+                return Ok(json!({
+                    "ok": outcome.ok,
+                    "status": "waiting",
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
+                    "step_id": step.id,
+                    "message": outcome.message,
+                }));
+            }
+            (StageTransition::Stop, _, _) => {
+                let status = terminal_run_status(&outcome.status);
+                set_run_status(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+                if matches!(status, RunStatus::Success | RunStatus::Error) {
+                    crate::supervisor::handle_workflow_terminal_event(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+                }
+                return Ok(json!({
+                    "ok": outcome.ok,
+                    "status": format_run_status(&status),
+                    "stage_status": format_stage_status(&outcome.status),
+                    "transition": format_stage_transition(&outcome.transition),
                     "step_id": step.id,
                     "message": outcome.message,
                 }));
@@ -2068,16 +2038,46 @@ async fn run_stages(
     }
 }
 
-fn format_disposition(disposition: &StageDisposition) -> String {
-    match disposition {
-        StageDisposition::Success => "success".to_string(),
-        StageDisposition::Error => "error".to_string(),
-        StageDisposition::ErrorCode(code) => format!("error_code:{}", code),
-        StageDisposition::Paused => "paused".to_string(),
-        StageDisposition::RetryStage => "retry_stage".to_string(),
-        StageDisposition::MoveNext => "move_next".to_string(),
-        StageDisposition::MoveBack => "move_back".to_string(),
-        StageDisposition::Outcome(name) => format!("outcome:{}", name),
-        StageDisposition::Stay => "stay".to_string(),
+fn format_stage_status(status: &StageStatus) -> String {
+    match status {
+        StageStatus::Success => "success".to_string(),
+        StageStatus::Error => "error".to_string(),
+        StageStatus::ErrorCode(code) => format!("error_code:{}", code),
+        StageStatus::Paused => "paused".to_string(),
+        StageStatus::Outcome(name) => format!("outcome:{}", name),
+        StageStatus::Stay => "stay".to_string(),
+    }
+}
+
+fn format_stage_transition(transition: &StageTransition) -> String {
+    match transition {
+        StageTransition::MoveNext => "move_next".to_string(),
+        StageTransition::MoveBack => "move_back".to_string(),
+        StageTransition::RetryStage => "retry_stage".to_string(),
+        StageTransition::Stay => "stay".to_string(),
+        StageTransition::Stop => "stop".to_string(),
+        StageTransition::Target(target) => format!("target:{}", target),
+    }
+}
+
+fn terminal_run_status(status: &StageStatus) -> RunStatus {
+    match status {
+        StageStatus::Success | StageStatus::Outcome(_) => RunStatus::Success,
+        StageStatus::Error | StageStatus::ErrorCode(_) => RunStatus::Error,
+        StageStatus::Paused => RunStatus::Paused,
+        StageStatus::Stay => RunStatus::Waiting,
+    }
+}
+
+fn format_run_status(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Draft => "waiting",
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Waiting => "waiting",
+        RunStatus::Paused => "paused",
+        RunStatus::Success => "complete",
+        RunStatus::Error => "error",
+        RunStatus::Cancelled => "cancelled",
     }
 }

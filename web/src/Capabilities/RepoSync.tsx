@@ -319,8 +319,8 @@ export function RepoSync({ opened, onClose }: RepoSyncProps) {
     try {
       const blocks = await Promise.all(
         files.map(async (file): Promise<RepoSyncPeerMessageBlock> => {
-          if (file.size > 8 * 1024 * 1024) {
-            throw new Error(`${file.name} exceeds the 8 MiB attachment limit.`);
+          if (file.size > 1024 * 1024 * 1024) {
+            throw new Error(`${file.name} exceeds the 1 GiB attachment limit.`);
           }
 
           const data_base64 = await fileAsBase64(file);
@@ -444,15 +444,15 @@ export function RepoSync({ opened, onClose }: RepoSyncProps) {
     setError(null);
     setMessage(null);
     try {
-      const saved = await upsertRepoSyncMapping({
-        id: mapping.id.trim() || undefined,
-        workflow_run_id: workflowRunId,
-        peer_ipv4: mapping.peer_ipv4.trim(),
-        direction: mapping.direction,
-        enabled: true,
-        sync_mode: 'manual',
-      });
-      setMapping(saved);
+      const saved = mapping.id.trim()
+        ? mapping
+        : await upsertRepoSyncMapping({
+            workflow_run_id: workflowRunId,
+            peer_ipv4: mapping.peer_ipv4.trim(),
+            direction: mapping.direction,
+            enabled: mapping.enabled,
+            sync_mode: mapping.sync_mode,
+          });
       const session = await startRepoSyncPairing(saved.id, phrase);
       setPairing(session);
       setMessage('Pairing started. Enter the same passphrase on the other computer.');
@@ -485,10 +485,9 @@ export function RepoSync({ opened, onClose }: RepoSyncProps) {
     setError(null);
     setMessage(null);
     try {
-      const connected = await reconnectRepoSyncMapping(mapping.id);
-      setMapping(connected);
-      setMessage('Connected to trusted peer.');
+      await reconnectRepoSyncMapping(mapping.id);
       await refresh();
+      setMessage('Connected to trusted peer.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {

@@ -158,7 +158,8 @@ fn prepare_review_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": if require_checkpoint { "move_next" } else if require_manual_approval && !approved { "paused" } else { "success" },
+                "status": if require_checkpoint { "success" } else if require_manual_approval && !approved { "paused" } else { "success" },
+                "transition": if require_checkpoint { "move_next" } else if require_manual_approval && !approved { "stay" } else { "stop" },
                 "message": if require_checkpoint && should_run_ai_review {
                     "AI review passed. Continue to the next stage or pause to realign."
                 } else if require_checkpoint {
@@ -176,7 +177,8 @@ fn prepare_review_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "paused",
+                "status": "error",
+                "transition": "stay",
                 "message": "Supervisor review failed. The workflow is paused so the loop can be realigned.",
                 "patch_from_capability": {
                     "capability": "review_validation",

@@ -149,16 +149,15 @@ pub fn parse_context_export_payload(payload: Value) -> Result<ContextExportPaylo
 }
 
 pub fn build_context_sync_snapshot(payload: Value) -> Result<ContextSyncSnapshot> {
-    build_context_sync_snapshot_inner(payload, false)
+    build_context_sync_snapshot_inner(payload)
 }
 
 pub fn build_existing_context_sync_snapshot(payload: Value) -> Result<ContextSyncSnapshot> {
-    build_context_sync_snapshot_inner(payload, true)
+    build_context_sync_snapshot_inner(payload)
 }
 
 fn build_context_sync_snapshot_inner(
     payload: Value,
-    tolerate_missing_worktree_files: bool,
 ) -> Result<ContextSyncSnapshot> {
     let req = parse_context_export_payload(payload)?;
     let repo = PathBuf::from(&req.repo_ref);
@@ -219,10 +218,7 @@ fn build_context_sync_snapshot_inner(
         }
 
         let full = repo.join(&rel);
-        if tolerate_missing_worktree_files
-            && effective_ref(&req.git_ref) == "WORKTREE"
-            && !full.is_file()
-        {
+        if effective_ref(&req.git_ref) == "WORKTREE" && !full.is_file() {
             continue;
         }
 
@@ -230,8 +226,7 @@ fn build_context_sync_snapshot_inner(
         let bytes = match read_file_bytes(&repo, effective_ref(&req.git_ref), &rel) {
             Ok(bytes) => bytes,
             Err(error)
-                if tolerate_missing_worktree_files
-                    && effective_ref(&req.git_ref) == "WORKTREE"
+                if effective_ref(&req.git_ref) == "WORKTREE"
                     && !full.exists() =>
             {
                 continue;

@@ -345,9 +345,20 @@ fn collect_worktree_tracked_files_flat(
     let mut out = Vec::new();
 
     for rel in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let path = repo.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+
         if skip_binary {
-            let bytes = fs::read(repo.join(rel))
-                .with_context(|| format!("failed to read {}", rel))?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {}", rel));
+                }
+            };
             if is_probably_binary(&bytes) {
                 continue;
             }

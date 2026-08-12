@@ -632,12 +632,12 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
     )
     .await?;
 
-    run.status = RunStatus::Waiting;
+    run.status = RunStatus::Paused;
     update_run_context(&state.db, run_id, &run.context).await?;
     set_run_status(
         state,
         run_id,
-        RunStatus::Waiting,
+        RunStatus::Paused,
         Some(step.id.as_str()),
     )
     .await?;
@@ -646,7 +646,7 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
         "ok": true,
         "run_id": run_id,
         "current_step_id": step.id,
-        "status": "waiting",
+        "status": "paused",
         "run": run
     }))
 }

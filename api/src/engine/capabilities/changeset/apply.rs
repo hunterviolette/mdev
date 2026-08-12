@@ -15,6 +15,7 @@ use crate::engine::capabilities::{
 use crate::engine::capabilities::registry::{
     find_result,
     CapabilityContext,
+    CapabilityInvocation,
     CapabilityInvocationRequest,
     CapabilityResult,
 };
@@ -86,7 +87,7 @@ fn resolve_apply_changeset_target(ctx: &CapabilityContext<'_>, config: Value) ->
     parse_apply_changeset_target(payload)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChangeSetPayload {
     version: u32,
     #[serde(default)]
@@ -102,7 +103,7 @@ struct FailingFileReport {
     failed_actions: Vec<EditActionFailure>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Operation {
     Write { path: String, contents: String },
@@ -111,7 +112,7 @@ enum Operation {
     Edit { path: String, changes: Vec<EditAction> },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct EditAction {
     action: String,
     #[serde(rename = "match")]
@@ -122,7 +123,7 @@ struct EditAction {
     replacement: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LiteralMatch {
     #[serde(rename = "type")]
     match_type: String,
@@ -247,33 +248,6 @@ pub async fn execute(
     };
 
     let mut result = result;
-    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        let normalized_changeset = normalize_changeset_payload_text(&payload_text)?;
-        match crate::engine::capabilities::repo_sync::mirror_changeset(
-            &ctx.state.repo_sync,
-            normalized_changeset.as_str(),
-        )
-        .await
-        {
-            Ok(Some(sync)) => {
-                if let Some(object) = result.as_object_mut() {
-                    object.insert("repo_sync".to_string(), sync);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                if let Some(object) = result.as_object_mut() {
-                    object.insert(
-                        "repo_sync".to_string(),
-                        json!({
-                            "state": "failed",
-                            "error": format!("{:#}", error)
-                        }),
-                    );
-                }
-            }
-        }
-    }
     if let Some(obj) = result.as_object_mut() {
         obj.insert("target".to_string(), json!({
             "repo_ref": target.repo_ref,
@@ -332,11 +306,24 @@ pub async fn execute(
         );
     }
 
+    let successful_actions = result
+        .get("stats")
+        .and_then(|stats| stats.get("successful_actions"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
     Ok(CapabilityResult {
         ok,
         capability: "changeset".to_string(),
         payload: result,
-        follow_ups: CapabilityInvocationRequest::None,
+        follow_ups: if successful_actions > 0 {
+            CapabilityInvocationRequest::One(CapabilityInvocation {
+                capability: "repo_sync_changeset".to_string(),
+                config: json!({}),
+            })
+        } else {
+            CapabilityInvocationRequest::None
+        },
     })
 }
 
@@ -358,6 +345,7 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
     let mut lines = Vec::new();
     let mut successful_operations = 0usize;
     let mut successful_actions = 0usize;
+    let mut applied_operations = Vec::<Operation>::new();
     let mut first_error = None::<String>;
 
     for (idx, op) in payload.operations.iter().enumerate() {
@@ -370,6 +358,25 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
                 let report = apply_edit_sequence(repo, path, changes)?;
                 successful_actions += report.successful_actions;
                 lines.extend(report.lines.clone());
+
+                let applied_changes = changes
+                    .iter()
+                    .enumerate()
+                    .filter(|(change_index, _)| {
+                        !report
+                            .failed
+                            .iter()
+                            .any(|failure| failure.index == change_index + 1)
+                    })
+                    .map(|(_, change)| change.clone())
+                    .collect::<Vec<_>>();
+
+                if !applied_changes.is_empty() {
+                    applied_operations.push(Operation::Edit {
+                        path: path.clone(),
+                        changes: applied_changes,
+                    });
+                }
 
                 if report.failed.is_empty() {
                     successful_operations += 1;
@@ -398,6 +405,7 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
                 Ok(report) => {
                     successful_operations += 1;
                     successful_actions += report.successful_actions;
+                    applied_operations.push(op.clone());
                     lines.extend(report.lines.clone());
                     lines.push(format!("[{}] ok", index));
                 }
@@ -508,6 +516,12 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
         })
         .collect::<Vec<_>>();
 
+    let applied_payload = serde_json::to_string_pretty(&ChangeSetPayload {
+        version: payload.version,
+        description: payload.description.clone(),
+        operations: applied_operations,
+    })?;
+
     Ok(json!({
         "ok": failed_operations == 0,
         "mode": "changeset_apply",
@@ -530,6 +544,7 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
         "touched_files": touched_files,
         "failing_files": failing_files,
         "normalized_payload": normalized,
+        "applied_payload": applied_payload,
     }))
 }
 

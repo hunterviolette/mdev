@@ -104,7 +104,9 @@ pub async fn reconcile_browser_session_rearm(
         serde_json::to_value(&inference_cfg)?,
     );
 
-    crate::engine::stages::rearm_session_scoped_inference_inputs(run, step);
+    if !browser_session_is_live {
+        crate::engine::stages::rearm_session_scoped_inference_inputs(run, step);
+    }
 
     Ok(true)
 }

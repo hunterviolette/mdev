@@ -16,10 +16,11 @@ use crate::{
 use super::{
     Stage,
     StageCapabilities,
-    StageDisposition,
     StageOutcome,
     StagePlanContext,
     StagePrepareContext,
+    StageStatus,
+    StageTransition,
 };
 
 pub struct MergePatchesStage;
@@ -398,7 +399,8 @@ pub async fn execute_stage(
 
     Ok(StageOutcome {
         ok,
-        disposition: if ok { StageDisposition::MoveNext } else { StageDisposition::Stay },
+        status: if ok { StageStatus::Success } else { StageStatus::Error },
+        transition: if ok { StageTransition::MoveNext } else { StageTransition::Stay },
         message: format!("merge_patches stage {}", status),
         capability_results,
         local_state,

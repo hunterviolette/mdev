@@ -142,6 +142,19 @@ async fn get_run(
     engine::preprocess_run_for_current_stage(&state, &mut run, None)
         .await
         .map_err(internal)?;
+
+    if let Err(error) = state
+        .repo_sync
+        .activate_workflow(&state.db, run.id.to_string().as_str())
+        .await
+    {
+        tracing::warn!(
+            run_id = %run.id,
+            error = %format!("{:#}", error),
+            "workflow opened while Repo Sync runtime activation failed"
+        );
+    }
+
     Ok(Json(run))
 }
 
@@ -162,6 +175,19 @@ async fn open_run(
     engine::preprocess_run_for_current_stage(&state, &mut run, None)
         .await
         .map_err(internal)?;
+
+    if let Err(error) = state
+        .repo_sync
+        .activate_workflow(&state.db, run.id.to_string().as_str())
+        .await
+    {
+        tracing::warn!(
+            run_id = %run.id,
+            error = %format!("{:#}", error),
+            "workflow opened while Repo Sync runtime activation failed"
+        );
+    }
+
     Ok(Json(run))
 }
 

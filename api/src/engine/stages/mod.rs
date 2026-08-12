@@ -110,24 +110,31 @@ fn stage_for_step(step: &WorkflowStepDefinition) -> &'static dyn Stage {
         .expect("design stage must be registered")
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub enum StageDisposition {
+pub enum StageStatus {
     Success,
     Error,
     ErrorCode(String),
     Paused,
-    RetryStage,
-    MoveNext,
-    MoveBack,
     Outcome(String),
     Stay,
 }
 
 #[derive(Debug, Clone)]
+pub enum StageTransition {
+    MoveNext,
+    MoveBack,
+    RetryStage,
+    Stay,
+    Stop,
+    Target(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct StageOutcome {
     pub ok: bool,
-    pub disposition: StageDisposition,
+    pub status: StageStatus,
+    pub transition: StageTransition,
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
@@ -648,7 +655,8 @@ pub async fn execute_stage(
         persist_context(state, run_id, &run.context).await?;
         return Ok(StageOutcome {
             ok: false,
-            disposition: StageDisposition::Paused,
+            status: StageStatus::Paused,
+            transition: StageTransition::Stay,
             message,
             capability_results,
             local_state: Value::Object(prepared_local_state_obj.clone()),
@@ -688,7 +696,8 @@ pub async fn execute_stage(
 
     let outcome = StageOutcome {
         ok: !capability_failed,
-        disposition: branch.disposition.clone(),
+        status: branch.status.clone(),
+        transition: branch.transition.clone(),
         message: branch.message.clone(),
         capability_results: capability_results.clone(),
         local_state: prepared_local_state,
@@ -721,7 +730,8 @@ pub async fn execute_stage(
             "execution_state": if pending_capability_user_input { "awaiting_user_input" } else { "completed" },
             "user_input": user_input_payload,
             "message": outcome.message,
-            "disposition": format_disposition(&outcome.disposition),
+            "status": format_stage_status(&outcome.status),
+            "transition": format_stage_transition(&outcome.transition),
             "duration_ms": if pending_capability_user_input {
                 Value::Null
             } else {
@@ -754,7 +764,8 @@ fn prepare_stage_local_state(
 
 #[derive(Debug, Clone)]
 struct StageBranch {
-    disposition: StageDisposition,
+    status: StageStatus,
+    transition: StageTransition,
     message: String,
     patch: Option<Value>,
 }
@@ -777,16 +788,18 @@ fn resolve_stage_branch(
         .unwrap_or_else(|| Value::Object(Map::new()));
 
     let patch = build_branch_patch(step, &branch, capability_results);
-    let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
+    let status = parse_stage_status(&branch, capability_failed);
+    let transition = parse_stage_transition(&branch, &status, capability_failed);
 
     StageBranch {
-        disposition: disposition.clone(),
+        status: status.clone(),
+        transition: transition.clone(),
         message: branch
             .get("message")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| default_branch_message(step, capability_failed, &disposition)),
+            .unwrap_or_else(|| default_branch_message(step, capability_failed, &status, &transition)),
         patch,
     }
 }
@@ -818,72 +831,108 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
     }
 }
 
-fn parse_stage_disposition(
-    step: &WorkflowStepDefinition,
-    branch_key: &str,
+fn parse_stage_status(
     branch: &Value,
     capability_failed: bool,
-) -> StageDisposition {
-    let disposition = branch
-        .get("disposition")
+) -> StageStatus {
+    let explicit = branch
+        .get("status")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if capability_failed {
-                "error"
-            } else {
-                "success"
-            }
+        .or_else(|| {
+            branch
+                .get("disposition")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "success" | "error" | "paused" | "stay" | "outcome" | "error_code"))
         });
 
-    match disposition {
-        "success" => StageDisposition::Success,
-        "error" => StageDisposition::Error,
-        "paused" => StageDisposition::Paused,
-        "retry_stage" => StageDisposition::RetryStage,
-        "stay" => StageDisposition::Stay,
-        "move_next" => StageDisposition::MoveNext,
-        "move_back" => StageDisposition::MoveBack,
+    match explicit.unwrap_or(if capability_failed { "error" } else { "success" }) {
+        "success" => StageStatus::Success,
+        "error" => StageStatus::Error,
+        "paused" => StageStatus::Paused,
+        "stay" => StageStatus::Stay,
         "outcome" => branch
             .get("name")
             .and_then(Value::as_str)
-            .map(|value| StageDisposition::Outcome(value.to_string()))
-            .unwrap_or(StageDisposition::Stay),
+            .map(|value| StageStatus::Outcome(value.to_string()))
+            .unwrap_or(StageStatus::Stay),
         "error_code" => branch
             .get("code")
             .and_then(Value::as_str)
-            .map(|value| StageDisposition::ErrorCode(value.to_string()))
-            .unwrap_or(StageDisposition::Error),
+            .map(|value| StageStatus::ErrorCode(value.to_string()))
+            .unwrap_or(StageStatus::Error),
         _ => {
             if capability_failed {
-                StageDisposition::Error
+                StageStatus::Error
             } else {
-                StageDisposition::Success
+                StageStatus::Success
             }
         }
+    }
+}
+
+fn parse_stage_transition(
+    branch: &Value,
+    status: &StageStatus,
+    capability_failed: bool,
+) -> StageTransition {
+    let explicit = branch
+        .get("transition")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            branch
+                .get("disposition")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "move_next" | "move_back" | "retry_stage" | "stay"))
+        });
+
+    match explicit {
+        Some("move_next") => StageTransition::MoveNext,
+        Some("move_back") => StageTransition::MoveBack,
+        Some("retry_stage") => StageTransition::RetryStage,
+        Some("stay") => StageTransition::Stay,
+        Some("stop") => StageTransition::Stop,
+        Some("target") => branch
+            .get("target_step_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| StageTransition::Target(value.to_string()))
+            .unwrap_or(StageTransition::Stay),
+        _ => match status {
+            StageStatus::Paused | StageStatus::Stay => StageTransition::Stay,
+            StageStatus::Error | StageStatus::ErrorCode(_) if capability_failed => StageTransition::Stop,
+            StageStatus::Success | StageStatus::Outcome(_) | StageStatus::Error | StageStatus::ErrorCode(_) => StageTransition::Stop,
+        },
     }
 }
 
 fn default_branch_message(
     step: &WorkflowStepDefinition,
     capability_failed: bool,
-    disposition: &StageDisposition,
+    status: &StageStatus,
+    transition: &StageTransition,
 ) -> String {
-    match disposition {
-        StageDisposition::Paused => format!("{} stage completed and is paused.", step.name),
-        StageDisposition::RetryStage => format!("{} stage requires a retry.", step.name),
-        StageDisposition::MoveNext => format!("{} stage requested move next.", step.name),
-        StageDisposition::MoveBack => format!("{} stage requested move back.", step.name),
-        StageDisposition::Outcome(name) => format!("{} stage completed with outcome '{}'.", step.name, name),
-        StageDisposition::Stay => format!("{} stage completed and remains active.", step.name),
-        StageDisposition::ErrorCode(code) => format!("{} stage failed with code '{}'.", step.name, code),
-        StageDisposition::Error => format!("{} stage failed during backend workflow execution.", step.name),
-        StageDisposition::Success => {
+    let status_message = match status {
+        StageStatus::Success => {
             if capability_failed {
                 format!("{} stage failed during backend workflow execution.", step.name)
             } else {
-                format!("{} stage completed successfully through backend workflow engine.", step.name)
+                format!("{} stage completed successfully.", step.name)
             }
         }
+        StageStatus::Error => format!("{} stage failed during backend workflow execution.", step.name),
+        StageStatus::ErrorCode(code) => format!("{} stage failed with code '{}'.", step.name, code),
+        StageStatus::Paused => format!("{} stage completed with paused status.", step.name),
+        StageStatus::Outcome(name) => format!("{} stage completed with outcome '{}'.", step.name, name),
+        StageStatus::Stay => format!("{} stage completed with stay status.", step.name),
+    };
+
+    match transition {
+        StageTransition::MoveNext => format!("{} Transition: move next.", status_message),
+        StageTransition::MoveBack => format!("{} Transition: move back.", status_message),
+        StageTransition::RetryStage => format!("{} Transition: retry stage.", status_message),
+        StageTransition::Stay => format!("{} Transition: stay on current stage.", status_message),
+        StageTransition::Stop => format!("{} Transition: stop.", status_message),
+        StageTransition::Target(target) => format!("{} Transition: route to '{}'.", status_message, target),
     }
 }
 
@@ -1029,16 +1078,24 @@ pub(crate) fn compose_prompt_from_state(
     parts.join("\n\n")
 }
 
-fn format_disposition(disposition: &StageDisposition) -> String {
-    match disposition {
-        StageDisposition::Success => "success".to_string(),
-        StageDisposition::Error => "error".to_string(),
-        StageDisposition::ErrorCode(code) => format!("error_code:{}", code),
-        StageDisposition::Paused => "paused".to_string(),
-        StageDisposition::RetryStage => "retry_stage".to_string(),
-        StageDisposition::MoveNext => "move_next".to_string(),
-        StageDisposition::MoveBack => "move_back".to_string(),
-        StageDisposition::Outcome(name) => format!("outcome:{}", name),
-        StageDisposition::Stay => "stay".to_string(),
+fn format_stage_status(status: &StageStatus) -> String {
+    match status {
+        StageStatus::Success => "success".to_string(),
+        StageStatus::Error => "error".to_string(),
+        StageStatus::ErrorCode(code) => format!("error_code:{}", code),
+        StageStatus::Paused => "paused".to_string(),
+        StageStatus::Outcome(name) => format!("outcome:{}", name),
+        StageStatus::Stay => "stay".to_string(),
+    }
+}
+
+fn format_stage_transition(transition: &StageTransition) -> String {
+    match transition {
+        StageTransition::MoveNext => "move_next".to_string(),
+        StageTransition::MoveBack => "move_back".to_string(),
+        StageTransition::RetryStage => "retry_stage".to_string(),
+        StageTransition::Stay => "stay".to_string(),
+        StageTransition::Stop => "stop".to_string(),
+        StageTransition::Target(target) => format!("target:{}", target),
     }
 }

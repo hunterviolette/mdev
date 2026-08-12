@@ -69,7 +69,8 @@ fn prepare_sap_syntax_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "move_next",
+                "status": "success",
+                "transition": "move_next",
                 "message": "SAP syntax stage completed successfully.",
                 "patch_from_capability": {
                     "capability": "sap/export",
@@ -83,7 +84,8 @@ fn prepare_sap_syntax_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "move_back",
+                "status": "error",
+                "transition": "move_back",
                 "message": "SAP syntax stage failed. Return to code and fix the SAP syntax errors.",
                 "patch_from_capability": {
                     "capability": "sap/export",

@@ -123,12 +123,14 @@ fn prepare_compile_state(
             "on_success".to_string(),
             if is_automatic && !has_compile_commands {
                 json!({
-                    "disposition": "paused",
+                    "status": "paused",
+                    "transition": "stay",
                     "message": "Compile stage reached with no compile commands configured. Paused for manual intervention."
                 })
             } else {
                 json!({
-                    "disposition": "move_next",
+                    "status": "success",
+                    "transition": "move_next",
                     "message": "Compile stage completed successfully through backend workflow engine."
                 })
             },
@@ -139,7 +141,8 @@ fn prepare_compile_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "move_back",
+                "status": "error",
+                "transition": "move_back",
                 "message": "Compile stage failed during backend workflow execution."
             }),
         );

@@ -1021,14 +1021,6 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             "preserve_rough_definition": true,
             "schema_id": "planner_feature_refinement_v1",
             "apply_handler": "planner_apply"
-        },
-        "on_success": {
-            "disposition": "move_next",
-            "message": "Design stage completed successfully through backend workflow engine."
-        },
-        "on_error": {
-            "disposition": "stay",
-            "message": "Design stage failed during backend workflow execution."
         }
     });
     template.execution_plan = vec![
@@ -1330,14 +1322,6 @@ fn merge_patches_descriptor() -> WorkflowStageDescriptor {
         "kind": "merge_patches_stage_policy",
         "automation": {
             "apply_patches": true
-        },
-        "on_success": {
-            "disposition": "move_next",
-            "message": "Patches merged successfully."
-        },
-        "on_error": {
-            "disposition": "stay",
-            "message": "Patch merge failed."
         }
     });
     template.execution_plan = Vec::<StageExecutionNode>::new();

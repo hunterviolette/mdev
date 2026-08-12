@@ -79,7 +79,8 @@ fn prepare_sap_export_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "move_next",
+                "status": "success",
+                "transition": "move_next",
                 "message": "SAP export stage completed successfully.",
                 "patch_from_capability": {
                     "capability": "sap/export",
@@ -93,7 +94,8 @@ fn prepare_sap_export_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "error",
+                "status": "error",
+                "transition": "stop",
                 "message": "SAP export stage failed.",
                 "patch_from_capability": {
                     "capability": "sap/export",

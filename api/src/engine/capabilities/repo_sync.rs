@@ -38,6 +38,7 @@ use crate::engine::{
         changeset::apply::execute_changeset_apply,
         context_export::{build_existing_context_sync_snapshot, ContextSyncSnapshot},
         filesystem,
+        registry::{find_result, CapabilityContext, CapabilityInvocationRequest, CapabilityResult},
     },
     runtime_endpoints::{NetworkExposure, RuntimeEndpointManager},
 };
@@ -94,9 +95,10 @@ pub struct SyncMapping {
 const PAIRING_CONTROL_PORT: u16 = 47831;
 const PAIRING_TTL_SECONDS: u64 = 300;
 const PEER_MESSAGE_TTL_MS: u64 = 15 * 60 * 1000;
-const PEER_MESSAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
-const PEER_MESSAGE_MAX_RETAINED_BYTES: usize = 50 * 1024 * 1024;
+const PEER_MESSAGE_MAX_BYTES: usize = 1536 * 1024 * 1024;
+const PEER_MESSAGE_MAX_RETAINED_BYTES: usize = 2048 * 1024 * 1024;
 const PEER_MESSAGE_MAX_COUNT: usize = 200;
+const CONNECTION_LEASE_MS: u64 = 4 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingSession {
@@ -220,6 +222,7 @@ struct RepoSyncState {
     reserved_sync_listeners: HashMap<String, StdTcpListener>,
     sync_server_ports: HashMap<String, u16>,
     peer_messages: HashMap<String, Vec<PeerMessage>>,
+    connection_expires_at_unix_ms: HashMap<String, u64>,
     db: Option<SqlitePool>,
     mappings_loaded: bool,
     pairing_server_started: bool,
@@ -290,6 +293,87 @@ impl RepoSyncRuntime {
         }
     }
 
+    pub async fn activate_workflow(
+        &self,
+        db: &SqlitePool,
+        workflow_run_id: &str,
+    ) -> Result<()> {
+        self.bind_db(db).await;
+        self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
+
+        let has_trusted_mapping = {
+            let state = self.state.read().await;
+            state.mappings.values().any(|mapping| {
+                mapping.workflow_run_id == workflow_run_id
+                    && !mapping.peer_certificate_pem.trim().is_empty()
+            })
+        };
+
+        if has_trusted_mapping {
+            self.ensure_pairing_server().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn expire_connection_leases(&self) -> Result<()> {
+        let now = unix_ms_now();
+        let mut state = self.state.write().await;
+        let expired = state
+            .connection_expires_at_unix_ms
+            .iter()
+            .filter_map(|(mapping_id, expires_at)| {
+                (*expires_at <= now).then_some(mapping_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if expired.is_empty() {
+            return Ok(());
+        }
+
+        for mapping_id in &expired {
+            state.connection_expires_at_unix_ms.remove(mapping_id);
+            state.peer_messages.remove(mapping_id);
+            if let Some(mapping) = state.mappings.get_mut(mapping_id) {
+                mapping.connected = false;
+                mapping.peer_port = None;
+            }
+        }
+
+        persist_mappings(&state.mappings)?;
+
+        for mapping_id in expired {
+            tracing::info!(
+                mapping_id = %mapping_id,
+                "Repo Sync four-hour connection lease expired"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn mark_disconnected(&self, mapping_id: &str, reason: &str) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.connection_expires_at_unix_ms.remove(mapping_id);
+        state.peer_messages.remove(mapping_id);
+
+        if let Some(mapping) = state.mappings.get_mut(mapping_id) {
+            mapping.connected = false;
+            mapping.peer_port = None;
+        }
+
+        persist_mappings(&state.mappings)?;
+
+        tracing::info!(
+            mapping_id = %mapping_id,
+            reason,
+            "Repo Sync peer marked disconnected"
+        );
+
+        Ok(())
+    }
+
     async fn ensure_sync_server(&self, mapping_id: &str) -> Result<()> {
         self.ensure_mappings_loaded().await?;
 
@@ -346,7 +430,7 @@ impl RepoSyncRuntime {
             .route("/sync/v1/changeset", post(sync_changeset))
             .route("/sync/v1/hard-sync", post(sync_hard_sync))
             .route("/sync/v1/message", post(sync_peer_message))
-            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+            .layer(DefaultBodyLimit::max(1536 * 1024 * 1024))
             .with_state(server_state);
 
         self.state
@@ -488,6 +572,10 @@ impl RepoSyncRuntime {
             .context("trusted Repo Sync mapping not found")?;
         mapping.connected = true;
         let mapping = mapping.clone();
+        let expires_at_unix_ms = unix_ms_now().saturating_add(CONNECTION_LEASE_MS);
+        state
+            .connection_expires_at_unix_ms
+            .insert(mapping_id.to_string(), expires_at_unix_ms);
         persist_mappings(&state.mappings)?;
 
         tracing::info!(
@@ -495,6 +583,7 @@ impl RepoSyncRuntime {
             workflow_run_id = %mapping.workflow_run_id,
             peer_ipv4 = %mapping.peer_ipv4,
             peer_port = ?mapping.peer_port,
+            expires_at_unix_ms,
             "Repo Sync peer marked connected"
         );
 
@@ -570,6 +659,35 @@ impl RepoSyncRuntime {
 
     pub async fn status(&self, workflow_run_id: &str) -> Result<RepoSyncStatus> {
         self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
+
+        let connected_mapping_ids = {
+            let state = self.state.read().await;
+            state
+                .mappings
+                .values()
+                .filter(|mapping| {
+                    mapping.workflow_run_id == workflow_run_id && mapping.connected
+                })
+                .map(|mapping| mapping.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        for mapping_id in connected_mapping_ids {
+            if let Err(error) = self.probe_peer_once(mapping_id.as_str()).await {
+                tracing::warn!(
+                    mapping_id = %mapping_id,
+                    error = %format!("{:#}", error),
+                    "Repo Sync status health check failed"
+                );
+                self.mark_disconnected(
+                    mapping_id.as_str(),
+                    "authenticated peer health check failed",
+                )
+                .await?;
+            }
+        }
+
         let mut state = self.state.write().await;
         prune_peer_messages_locked(&mut state);
         Ok(RepoSyncStatus {
@@ -1224,24 +1342,45 @@ impl RepoSyncRuntime {
         Ok(snapshot)
     }
 
-    pub async fn outbound_mapping(&self) -> Option<SyncMapping> {
+    pub async fn outbound_auto_apply_mapping(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Option<SyncMapping>> {
+        self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
+
         let state = self.state.read().await;
-        state
+        let mapping = state
             .mappings
             .values()
             .find(|mapping| {
-                mapping.enabled
-                    && mapping.connected
+                mapping.workflow_run_id == workflow_run_id
+                    && mapping.enabled
                     && mapping.sync_mode == SyncMode::AutoApply
                     && mapping.direction.can_send()
-                    && mapping.peer_port.is_some()
-                    && !mapping.peer_certificate_pem.trim().is_empty()
             })
-            .cloned()
+            .cloned();
+
+        let Some(mapping) = mapping else {
+            return Ok(None);
+        };
+
+        if !mapping.connected {
+            bail!("Repo Sync Auto Apply peer is disconnected");
+        }
+        if mapping.peer_port.is_none() {
+            bail!("Repo Sync Auto Apply peer has no active data port");
+        }
+        if mapping.peer_certificate_pem.trim().is_empty() {
+            bail!("Repo Sync Auto Apply peer has no trusted certificate");
+        }
+
+        Ok(Some(mapping))
     }
 
     async fn inbound_mapping(&self, mapping_id: &str) -> Result<SyncMapping> {
         self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
         let state = self.state.read().await;
         let mapping = state
             .mappings
@@ -1267,6 +1406,7 @@ impl RepoSyncRuntime {
 
     pub async fn manual_send_mapping(&self, workflow_run_id: &str) -> Result<SyncMapping> {
         self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
         let state = self.state.read().await;
         let mapping = state
             .mappings
@@ -1317,7 +1457,7 @@ impl RepoSyncRuntime {
         let client = build_mtls_client(&identity, mapping)?;
         let peer_port = mapping.peer_port.context("paired peer has no sync port")?;
         let url = format!("https://mdev-sync:{}/sync/v1/hard-sync", peer_port);
-        let response = client
+        let response = match client
             .post(url.as_str())
             .header("x-mdev-mapping-id", mapping.id.as_str())
             .header("x-mdev-sync-id", sync_id)
@@ -1325,14 +1465,22 @@ impl RepoSyncRuntime {
             .body(snapshot_json.to_string())
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "failed to send manual repository sync to {}:{} via {}",
-                    mapping.peer_ipv4,
-                    peer_port,
-                    url
-                )
-            })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .mark_disconnected(mapping.id.as_str(), "manual sync transport failed")
+                    .await;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to send manual repository sync to {}:{} via {}",
+                        mapping.peer_ipv4,
+                        peer_port,
+                        url
+                    )
+                });
+            }
+        };
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1353,7 +1501,7 @@ impl RepoSyncRuntime {
         let identity = self.ensure_identity().await?;
         let client = build_mtls_client(&identity, mapping)?;
         let peer_port = mapping.peer_port.context("paired peer has no sync port")?;
-        let response = client
+        let response = match client
             .post(format!(
                 "https://mdev-sync:{}/sync/v1/changeset",
                 peer_port
@@ -1364,7 +1512,15 @@ impl RepoSyncRuntime {
             .body(changeset_json.to_string())
             .send()
             .await
-            .context("failed to send changeset")?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .mark_disconnected(mapping.id.as_str(), "changeset transport failed")
+                    .await;
+                return Err(error).context("failed to send changeset");
+            }
+        };
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1377,6 +1533,7 @@ impl RepoSyncRuntime {
 
     async fn connected_mapping(&self, mapping_id: &str) -> Result<SyncMapping> {
         self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
         let state = self.state.read().await;
         let mapping = state
             .mappings
@@ -1452,12 +1609,20 @@ impl RepoSyncRuntime {
         let identity = self.ensure_identity().await?;
         let client = build_mtls_client(&identity, &mapping)?;
         let peer_port = mapping.peer_port.context("paired peer has no sync port")?;
-        let response = client
+        let response = match client
             .post(format!("https://mdev-sync:{}/sync/v1/message", peer_port))
             .json(&envelope)
             .send()
             .await
-            .context("failed to send peer message")?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .mark_disconnected(mapping_id, "peer message transport failed")
+                    .await;
+                return Err(error).context("failed to send peer message");
+            }
+        };
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -1574,7 +1739,7 @@ fn validate_peer_message_blocks(blocks: &[PeerMessageBlock]) -> Result<()> {
     }
 
     if total > PEER_MESSAGE_MAX_BYTES {
-        bail!("peer message exceeds the 20 MiB limit");
+        bail!("peer message exceeds the 1536 MiB limit");
     }
     Ok(())
 }
@@ -1880,25 +2045,110 @@ fn pairing_proof(passphrase: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub async fn mirror_changeset(
-    runtime: &RepoSyncRuntime,
-    changeset_json: &str,
-) -> Result<Option<serde_json::Value>> {
-    let Some(mapping) = runtime.outbound_mapping().await else {
-        return Ok(None);
+pub async fn execute(
+    ctx: &CapabilityContext<'_>,
+    prior_results: &[CapabilityResult],
+    _config: serde_json::Value,
+) -> Result<CapabilityResult> {
+    let changeset = find_result(prior_results, "changeset")
+        .context("Repo Sync ChangeSet requires a successful ChangeSet result")?;
+
+    let successful_actions = changeset
+        .payload
+        .get("stats")
+        .and_then(|stats| stats.get("successful_actions"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    if successful_actions == 0 {
+        return Ok(CapabilityResult {
+            ok: true,
+            capability: "repo_sync_changeset".to_string(),
+            payload: serde_json::json!({
+                "ok": true,
+                "state": "skipped",
+                "reason": "no_local_changes_applied"
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        });
+    }
+
+    let changeset_json = changeset
+        .payload
+        .get("applied_payload")
+        .and_then(serde_json::Value::as_str)
+        .context("ChangeSet result with applied actions is missing applied_payload")?;
+    let workflow_run_id = ctx.run_id.to_string();
+
+    let mapping = match ctx
+        .state
+        .repo_sync
+        .outbound_auto_apply_mapping(workflow_run_id.as_str())
+        .await
+    {
+        Ok(Some(mapping)) => mapping,
+        Ok(None) => {
+            return Ok(CapabilityResult {
+                ok: true,
+                capability: "repo_sync_changeset".to_string(),
+                payload: serde_json::json!({
+                    "ok": true,
+                    "state": "skipped",
+                    "reason": "auto_apply_not_configured"
+                }),
+                follow_ups: CapabilityInvocationRequest::None,
+            });
+        }
+        Err(error) => {
+            return Ok(CapabilityResult {
+                ok: false,
+                capability: "repo_sync_changeset".to_string(),
+                payload: serde_json::json!({
+                    "ok": false,
+                    "state": "unavailable",
+                    "error": format!("{:#}", error)
+                }),
+                follow_ups: CapabilityInvocationRequest::None,
+            });
+        }
     };
 
     let sync_id = Uuid::new_v4().to_string();
-    let response = runtime
+    match ctx
+        .state
+        .repo_sync
         .send_changeset(&mapping, sync_id.as_str(), changeset_json)
-        .await?;
-
-    Ok(Some(serde_json::json!({
-        "state": "delivered",
-        "sync_id": sync_id,
-        "mapping_id": mapping.id,
-        "remote_response": response
-    })))
+        .await
+    {
+        Ok(response) => Ok(CapabilityResult {
+            ok: true,
+            capability: "repo_sync_changeset".to_string(),
+            payload: serde_json::json!({
+                "ok": true,
+                "state": "delivered",
+                "sync_id": sync_id,
+                "mapping_id": mapping.id,
+                "peer_ipv4": mapping.peer_ipv4,
+                "peer_port": mapping.peer_port,
+                "remote_response": response
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        }),
+        Err(error) => Ok(CapabilityResult {
+            ok: false,
+            capability: "repo_sync_changeset".to_string(),
+            payload: serde_json::json!({
+                "ok": false,
+                "state": "rejected",
+                "sync_id": sync_id,
+                "mapping_id": mapping.id,
+                "peer_ipv4": mapping.peer_ipv4,
+                "peer_port": mapping.peer_port,
+                "error": format!("{:#}", error)
+            }),
+            follow_ups: CapabilityInvocationRequest::None,
+        }),
+    }
 }
 
 fn identity_directory() -> PathBuf {
@@ -2046,7 +2296,7 @@ fn build_mtls_client(
             SocketAddr::new(mapping.peer_ipv4, peer_port),
         )
         .https_only(true)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
         .build()
         .context("failed to build sync client")
 }

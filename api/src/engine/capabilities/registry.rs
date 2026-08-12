@@ -23,7 +23,7 @@ use crate::{
     models::{StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
-use super::{capability_enabled, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, review_validation, sap, shared_dependencies};
+use super::{capability_enabled, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, repo_sync, review_validation, sap, shared_dependencies};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -167,7 +167,10 @@ pub fn stage_capability_policy(step: &WorkflowStepDefinition) -> Result<StageCap
 }
 
 fn ensure_allowed(policy: &StageCapabilityPolicy, capability: &str) -> Result<()> {
-    if capability == "planner_apply" || capability == "operator_checkpoint" {
+    if capability == "planner_apply"
+        || capability == "operator_checkpoint"
+        || capability == "repo_sync_changeset"
+    {
         return Ok(());
     }
 
@@ -460,7 +463,16 @@ pub(crate) async fn execute_capability_chain(
             .chain(results.iter().map(|item| item.capability.clone()))
             .collect();
 
-        let capability_follow_ups = if result.ok {
+        let changeset_applied_actions = result.capability == "changeset"
+            && result
+                .payload
+                .get("stats")
+                .and_then(|stats| stats.get("successful_actions"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0;
+
+        let capability_follow_ups = if result.ok || changeset_applied_actions {
             follow_up_vec(&result.follow_ups)
         } else {
             Vec::new()
@@ -530,6 +542,7 @@ async fn dispatch(
         "context_export" => context_export::execute(ctx, prior_results, invocation.config).await,
         "changeset_schema" => changeset::schema::execute(ctx, prior_results, invocation.config).await,
         "changeset" => changeset::apply::execute(ctx, prior_results, invocation.config).await,
+        "repo_sync_changeset" => repo_sync::execute(ctx, prior_results, invocation.config).await,
         "planner_apply" => planner::apply::execute(ctx, prior_results, invocation.config).await,
         "compile_commands" => compile_commands::execute(ctx, prior_results, invocation.config).await,
         "shared_dependencies" => shared_dependencies::execute(ctx, prior_results, invocation.config).await,
