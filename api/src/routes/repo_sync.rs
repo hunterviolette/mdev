@@ -87,11 +87,6 @@ async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    state
-        .repo_sync
-        .listen_for_reconnects(&state.db)
-        .await
-        .map_err(internal)?;
     let identity = state
         .repo_sync
         .load_identity_if_present()
@@ -101,7 +96,7 @@ async fn status(
     let mut status = serde_json::to_value(
         state
             .repo_sync
-            .status(query.workflow_run_id.trim())
+            .status(query.workflow_run_id.trim(), &state.runtime_endpoints)
             .await
             .map_err(internal)?,
     )
@@ -111,14 +106,6 @@ async fn status(
             "local_certificate_pem".to_string(),
             identity
                 .map(|identity| Value::String(identity.certificate_pem))
-                .unwrap_or(Value::Null),
-        );
-        object.insert(
-            "local_ipv4".to_string(),
-            state
-                .runtime_endpoints
-                .local_lan_ipv4()
-                .map(|address| Value::String(address.to_string()))
                 .unwrap_or(Value::Null),
         );
     }
@@ -134,12 +121,14 @@ async fn upsert_mapping(
         .upsert_mapping(SyncMapping {
             id: req.id,
             workflow_run_id: req.workflow_run_id,
+            link_id: String::new(),
             peer_ipv4: req.peer_ipv4,
             peer_port: None,
             direction: req.direction,
             peer_certificate_pem: String::new(),
             enabled: req.enabled,
             sync_mode: req.sync_mode,
+            state_revision: 0,
             connected: false,
         })
         .await

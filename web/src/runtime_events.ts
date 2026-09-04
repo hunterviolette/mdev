@@ -81,7 +81,6 @@ export function reduceRuntimeSnapshot(previous: RuntimeEventStore, snapshot: Run
   };
 }
 
-const MAX_RUNTIME_EVENTS_PER_WORKFLOW = 250;
 const RUNTIME_GLOBAL_CURSOR_KEY = 'mdev-runtime-global-cursor-v1';
 
 function readRuntimeGlobalCursor(): number {
@@ -109,9 +108,6 @@ export function reduceRuntimeEvent(previous: RuntimeEventStore, envelope: Runtim
     : [...current, event];
 
   nextEvents.sort((a, b) => a.global_sequence_no - b.global_sequence_no);
-  const boundedEvents = nextEvents.length > MAX_RUNTIME_EVENTS_PER_WORKFLOW
-    ? nextEvents.slice(nextEvents.length - MAX_RUNTIME_EVENTS_PER_WORKFLOW)
-    : nextEvents;
   const latestSequenceNo = Math.max(previous.latestSequenceNo, event.global_sequence_no);
   writeRuntimeGlobalCursor(latestSequenceNo);
 
@@ -119,7 +115,7 @@ export function reduceRuntimeEvent(previous: RuntimeEventStore, envelope: Runtim
     ...previous,
     workflowEventsByRunId: {
       ...previous.workflowEventsByRunId,
-      [event.run_id]: boundedEvents
+      [event.run_id]: nextEvents
     },
     latestSequenceNo
   };
@@ -251,10 +247,8 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
     if (disposed || !isLeader) return;
 
     closeSource();
-    const afterCursor = readRuntimeGlobalCursor();
     const nextSource = openRuntimeEventStream({
-      scope: 'all',
-      ...(afterCursor > 0 ? { after_cursor: afterCursor } : {})
+      scope: 'all'
     });
     source = nextSource;
 

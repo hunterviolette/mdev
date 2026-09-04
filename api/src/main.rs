@@ -45,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&db).await?;
 
     let state = AppState::new(db);
+    state
+        .runtime_endpoints
+        .refresh_local_lan_ipv4_in_background();
 
     match crate::engine::fail_stale_running_runs_on_startup(&state).await {
         Ok(failed_runs) if failed_runs > 0 => {

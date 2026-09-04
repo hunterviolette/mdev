@@ -187,7 +187,27 @@ fn bridge_entrypoint(bridge_root: &std::path::Path) -> Result<(String, Vec<Strin
 
 fn ensure_bridge_built(bridge_root: &std::path::Path) -> Result<()> {
     let dist_entry = bridge_root.join("dist").join("index.js");
-    if dist_entry.exists() {
+    let src_dir = bridge_root.join("src");
+
+    let dist_modified = std::fs::metadata(&dist_entry)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+
+    let source_is_newer = if let Some(dist_modified) = dist_modified {
+        std::fs::read_dir(&src_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("ts"))
+            .filter_map(|entry| entry.metadata().ok())
+            .filter_map(|metadata| metadata.modified().ok())
+            .any(|modified| modified > dist_modified)
+    } else {
+        true
+    };
+
+    if dist_entry.exists() && !source_is_newer {
         return Ok(());
     }
 
@@ -201,16 +221,11 @@ fn ensure_bridge_built(bridge_root: &std::path::Path) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     let npm = "npm";
 
-    let install = Command::new(npm)
-        .arg("install")
-        .current_dir(bridge_root)
-        .output()
-        .with_context(|| format!("failed to run npm install in {}", bridge_root.display()))?;
-
-    if !install.status.success() {
+    let node_modules = bridge_root.join("node_modules");
+    if !node_modules.exists() {
         return Err(anyhow!(
-            "npm install failed: {}",
-            String::from_utf8_lossy(&install.stderr)
+            "browser bridge dependencies are missing under {}; install them manually before starting the browser bridge",
+            bridge_root.display()
         ));
     }
 

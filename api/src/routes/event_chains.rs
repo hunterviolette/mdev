@@ -140,6 +140,8 @@ struct RuntimeEventQuery {
     scope: Option<String>,
     #[serde(default)]
     after_cursor: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,7 +236,10 @@ async fn get_runtime_projection(
         let Ok(uuid) = Uuid::parse_str(&run_id) else {
             continue;
         };
-        if let Ok(projection) = build_event_chain_summary(&state, uuid).await {
+        if let Ok(mut projection) = build_event_chain_summary(&state, uuid).await {
+            if let Some(limit) = query.limit {
+                projection.stages.truncate(limit.clamp(1, 500));
+            }
             runs.push(projection);
         }
     }
@@ -677,7 +682,6 @@ async fn build_event_chain_summary(
             .then_with(|| b.latest_sequence_no.cmp(&a.latest_sequence_no))
     });
 
-    stages.truncate(6);
 
     Ok(EventChainSummaryResponse {
         run_id: run_id.to_string(),
@@ -1111,51 +1115,6 @@ async fn stream_runtime_events(
             }
         }
 
-        if let Some(after_cursor) = query.after_cursor {
-            let workflow_rows = runtime_event_rows(
-                &state_for_task,
-                &query,
-                after_cursor,
-            )
-            .await
-            .unwrap_or_default();
-            let mut replayed_run_ids = Vec::<String>::new();
-
-            for row in workflow_rows {
-                if let Ok(item) = row_to_stage_chain_event(row) {
-                    let item_run_id = item.run_id.clone();
-                    last_workflow_sequence_by_run_id
-                        .entry(item_run_id.clone())
-                        .and_modify(|sequence| *sequence = (*sequence).max(item.sequence_no))
-                        .or_insert(item.sequence_no);
-
-                    if !replayed_run_ids.contains(&item_run_id) {
-                        replayed_run_ids.push(item_run_id);
-                    }
-
-                    if let Ok(Some(envelope)) = runtime_event_envelope(&state_for_task, item).await {
-                        if let Some(event) = runtime_event_sse(&envelope) {
-                            if tx.send(Ok(event)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            for run_id in replayed_run_ids {
-                if let Ok(run_id) = Uuid::parse_str(&run_id) {
-                    if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
-                        if let Some(event) = runtime_projection_sse(&projection) {
-                            if tx.send(Ok(event)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-        }
 
         if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
             return;
@@ -1186,15 +1145,6 @@ async fn stream_runtime_events(
                                 if let Some(event) = runtime_event_sse(&envelope) {
                                     if tx.send(Ok(event)).is_err() {
                                         return;
-                                    }
-                                }
-                                if let Some(run_id) = envelope.run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
-                                    if let Ok(projection) = build_event_chain_summary(&state_for_task, run_id).await {
-                                        if let Some(event) = runtime_projection_sse(&projection) {
-                                            if tx.send(Ok(event)).is_err() {
-                                                return;
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -1285,7 +1235,7 @@ async fn build_runtime_snapshot(
         Vec::new()
     } else if run_ids.is_empty() {
         sqlx::query(
-            "SELECT id, status, current_step_id, title, repo_ref, workflow_key, context_json, updated_at FROM workflow_runs ORDER BY updated_at DESC LIMIT 500",
+            "SELECT id, status, current_step_id, title, repo_ref, workflow_key, updated_at FROM workflow_runs ORDER BY updated_at DESC LIMIT 500",
         )
         .fetch_all(&state.db)
         .await
@@ -1294,7 +1244,7 @@ async fn build_runtime_snapshot(
         let mut rows = Vec::new();
         for run_id in &run_ids {
             if let Ok(row) = sqlx::query(
-                "SELECT id, status, current_step_id, title, repo_ref, workflow_key, context_json, updated_at FROM workflow_runs WHERE id = ?",
+                "SELECT id, status, current_step_id, title, repo_ref, workflow_key, updated_at FROM workflow_runs WHERE id = ?",
             )
             .bind(run_id)
             .fetch_one(&state.db)
@@ -1308,8 +1258,6 @@ async fn build_runtime_snapshot(
 
     for row in workflow_rows {
         let id: String = row.get("id");
-        let context_json: String = row.get("context_json");
-        let context = serde_json::from_str::<Value>(&context_json).unwrap_or_else(|_| json!({}));
         nodes.push(RuntimeNode {
             key: workflow_node_key(&id),
             node_type: "workflow_run".to_string(),
@@ -1320,13 +1268,13 @@ async fn build_runtime_snapshot(
             workflow_key: row.get("workflow_key"),
             current_step_id: row.get("current_step_id"),
             updated_at: row.get("updated_at"),
-            payload: json!({ "context": context }),
+            payload: json!({}),
         });
     }
 
     let supervisor_rows = if let Some(supervisor_run_id) = query.supervisor_run_id {
         sqlx::query(
-            "SELECT id, mode, status, title, root_repo_path, context_json, updated_at FROM supervisor_runs WHERE id = ?",
+            "SELECT id, mode, status, title, root_repo_path, updated_at FROM supervisor_runs WHERE id = ?",
         )
         .bind(supervisor_run_id.to_string())
         .fetch_all(&state.db)
@@ -1336,22 +1284,23 @@ async fn build_runtime_snapshot(
         Vec::new()
     } else {
         sqlx::query(
-            "SELECT id, mode, status, title, root_repo_path, context_json, updated_at FROM supervisor_runs ORDER BY updated_at DESC LIMIT 500",
+            "SELECT id, mode, status, title, root_repo_path, updated_at FROM supervisor_runs ORDER BY updated_at DESC LIMIT 500",
         )
         .fetch_all(&state.db)
         .await
         .map_err(internal)?
     };
 
+    let mut supervisor_keys = HashMap::<String, String>::new();
+
     for row in supervisor_rows {
         let id: String = row.get("id");
         let supervisor_key = supervisor_node_key(&id);
-        let context_json: String = row.get("context_json");
-        let context = serde_json::from_str::<Value>(&context_json).unwrap_or_else(|_| json!({}));
+        supervisor_keys.insert(id.clone(), supervisor_key.clone());
         nodes.push(RuntimeNode {
-            key: supervisor_key.clone(),
+            key: supervisor_key,
             node_type: "supervisor_run".to_string(),
-            id: id.clone(),
+            id,
             status: row.get("status"),
             title: row.get("title"),
             repo_ref: row.get("root_repo_path"),
@@ -1359,39 +1308,51 @@ async fn build_runtime_snapshot(
             current_step_id: None,
             updated_at: row.get("updated_at"),
             payload: json!({
-                "mode": row.get::<String, _>("mode"),
-                "context": context
+                "mode": row.get::<String, _>("mode")
             }),
         });
+    }
 
+    if !supervisor_keys.is_empty() {
         let child_rows = sqlx::query(
             r#"
-            SELECT id, title, workflow_run_id, kind, queue_position, updated_at
+            SELECT id, supervisor_run_id, title, workflow_run_id, kind, queue_position, updated_at
             FROM supervisor_work_units
-            WHERE supervisor_run_id = ?
-              AND workflow_run_id IS NOT NULL
+            WHERE workflow_run_id IS NOT NULL
               AND TRIM(COALESCE(workflow_run_id, '')) != ''
               AND archived_at IS NULL
               AND state NOT IN ('deleted', 'archived')
-            ORDER BY CASE kind WHEN 'integration' THEN 10000 ELSE COALESCE(queue_position, 0) END, updated_at ASC
+            ORDER BY supervisor_run_id ASC, CASE kind WHEN 'integration' THEN 10000 ELSE COALESCE(queue_position, 0) END, updated_at ASC
             "#,
         )
-        .bind(&id)
         .fetch_all(&state.db)
         .await
         .map_err(internal)?;
 
-        for (idx, child) in child_rows.iter().enumerate() {
+        let mut child_index_by_supervisor = HashMap::<String, i64>::new();
+
+        for child in child_rows {
+            let supervisor_run_id: String = child.get("supervisor_run_id");
+            let Some(supervisor_key) = supervisor_keys.get(&supervisor_run_id) else {
+                continue;
+            };
+
             let child_run_id: String = child.get("workflow_run_id");
             let child_key = workflow_node_key(&child_run_id);
             let kind: String = child.get("kind");
+            let child_index = child_index_by_supervisor
+                .entry(supervisor_run_id)
+                .or_insert(0);
+            let fallback_sort_order = *child_index;
+            *child_index += 1;
+
             edges.push(RuntimeEdge {
                 key: format!("{}->{}", supervisor_key, child_key),
                 parent_key: supervisor_key.clone(),
                 child_key,
                 edge_type: if kind == "integration" { "supervisor_integration_workflow".to_string() } else { "supervisor_child_workflow".to_string() },
                 label: child.try_get::<String, _>("title").unwrap_or_else(|_| if kind == "integration" { "Integration workflow".to_string() } else { "Feature workflow".to_string() }),
-                sort_order: child.try_get::<Option<i64>, _>("queue_position").ok().flatten().unwrap_or(idx as i64),
+                sort_order: child.try_get::<Option<i64>, _>("queue_position").ok().flatten().unwrap_or(fallback_sort_order),
                 payload: json!({
                     "work_unit_id": child.try_get::<String, _>("id").ok(),
                     "kind": kind,

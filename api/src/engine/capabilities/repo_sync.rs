@@ -78,6 +78,8 @@ impl SyncDirection {
 pub struct SyncMapping {
     pub id: String,
     pub workflow_run_id: String,
+    #[serde(default)]
+    pub link_id: String,
     pub peer_ipv4: IpAddr,
     #[serde(default)]
     pub peer_port: Option<u16>,
@@ -88,6 +90,8 @@ pub struct SyncMapping {
     pub enabled: bool,
     #[serde(default)]
     pub sync_mode: SyncMode,
+    #[serde(default)]
+    pub state_revision: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub connected: bool,
 }
@@ -104,6 +108,8 @@ const CONNECTION_LEASE_MS: u64 = 4 * 60 * 60 * 1000;
 pub struct PairingSession {
     pub id: String,
     pub mapping_id: String,
+    #[serde(default)]
+    pub peer_pairing_id: String,
     pub verification_code: String,
     pub peer_ipv4: IpAddr,
     pub local_port: u16,
@@ -126,6 +132,9 @@ pub struct PairingSession {
 pub struct RepoSyncStatus {
     pub identity_ready: bool,
     pub certificate_fingerprint: String,
+    pub local_ipv4: Option<IpAddr>,
+    pub pairing_listener_running: bool,
+    pub pairing_listener_port: Option<u16>,
     pub pairings: Vec<PairingSession>,
     pub mappings: Vec<SyncMapping>,
 }
@@ -140,6 +149,8 @@ pub struct LocalSyncIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairingJoinRequest {
     proof: String,
+    #[serde(default)]
+    pairing_id: String,
     certificate_pem: String,
     sync_port: u16,
     confirmed: bool,
@@ -148,6 +159,8 @@ struct PairingJoinRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairingJoinResponse {
     matched: bool,
+    #[serde(default)]
+    pairing_id: String,
     #[serde(default)]
     certificate_pem: String,
     #[serde(default)]
@@ -159,13 +172,96 @@ struct PairingJoinResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReconnectRequest {
     certificate_pem: String,
+    #[serde(default)]
+    link_id: String,
     sync_port: u16,
+    sync_mode: SyncMode,
+    state_revision: u64,
+    attempt_id: String,
+    attempt_started_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReconnectResponse {
     certificate_pem: String,
     sync_port: u16,
+    sync_mode: SyncMode,
+    state_revision: u64,
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncStateEnvelope {
+    sync_mode: SyncMode,
+    state_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReconnectAttempt {
+    id: String,
+    mapping_id: String,
+    initiator_fingerprint: String,
+    started_at_unix_ms: u64,
+}
+
+fn reconnect_attempt_wins(incoming: &ReconnectAttempt, current: &ReconnectAttempt) -> bool {
+    if incoming.initiator_fingerprint != current.initiator_fingerprint {
+        return incoming.initiator_fingerprint < current.initiator_fingerprint;
+    }
+    if incoming.started_at_unix_ms != current.started_at_unix_ms {
+        return incoming.started_at_unix_ms > current.started_at_unix_ms;
+    }
+    incoming.id > current.id
+}
+
+fn reconnect_peer_session_key(
+    link_id: &str,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> String {
+    if local_fingerprint <= peer_fingerprint {
+        format!("{}:{}:{}", link_id, local_fingerprint, peer_fingerprint)
+    } else {
+        format!("{}:{}:{}", link_id, peer_fingerprint, local_fingerprint)
+    }
+}
+
+fn pairing_link_id(
+    local_pairing_id: &str,
+    peer_pairing_id: &str,
+    local_certificate_pem: &str,
+    peer_certificate_pem: &str,
+) -> String {
+    let mut pairing_ids = [local_pairing_id, peer_pairing_id];
+    pairing_ids.sort();
+
+    let mut fingerprints = [
+        certificate_fingerprint(local_certificate_pem),
+        certificate_fingerprint(peer_certificate_pem),
+    ];
+    fingerprints.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"mdev-repo-sync-link-v1\0");
+    hasher.update(pairing_ids[0].as_bytes());
+    hasher.update(b"\0");
+    hasher.update(pairing_ids[1].as_bytes());
+    hasher.update(b"\0");
+    hasher.update(fingerprints[0].as_bytes());
+    hasher.update(b"\0");
+    hasher.update(fingerprints[1].as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn incoming_sync_state_wins(
+    incoming_revision: u64,
+    local_revision: u64,
+    incoming_owner_fingerprint: &str,
+    local_owner_fingerprint: &str,
+) -> bool {
+    incoming_revision > local_revision
+        || (incoming_revision == local_revision
+            && incoming_owner_fingerprint > local_owner_fingerprint)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,14 +314,19 @@ struct RepoSyncState {
     identity: Option<LocalSyncIdentity>,
     pairings: HashMap<String, PairingSession>,
     mappings: HashMap<String, SyncMapping>,
+    active_sessions: HashSet<String>,
     reconnect_ports: HashMap<String, u16>,
+    reconnect_attempts_by_peer: HashMap<String, ReconnectAttempt>,
     reserved_sync_listeners: HashMap<String, StdTcpListener>,
     sync_server_ports: HashMap<String, u16>,
+    sync_server_abort_handles: HashMap<String, tokio::task::AbortHandle>,
     peer_messages: HashMap<String, Vec<PeerMessage>>,
     connection_expires_at_unix_ms: HashMap<String, u64>,
     db: Option<SqlitePool>,
     mappings_loaded: bool,
+    local_ipv4: Option<IpAddr>,
     pairing_server_started: bool,
+    pairing_server_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -293,6 +394,75 @@ impl RepoSyncRuntime {
         }
     }
 
+    fn clear_session_locked(state: &mut RepoSyncState, mapping_id: &str) {
+        state.active_sessions.remove(mapping_id);
+        state.connection_expires_at_unix_ms.remove(mapping_id);
+        state.peer_messages.remove(mapping_id);
+        state.reconnect_ports.remove(mapping_id);
+        state
+            .reconnect_attempts_by_peer
+            .retain(|_, attempt| attempt.mapping_id != mapping_id);
+        state.reserved_sync_listeners.remove(mapping_id);
+        state.sync_server_ports.remove(mapping_id);
+
+        if let Some(abort_handle) = state.sync_server_abort_handles.remove(mapping_id) {
+            abort_handle.abort();
+        }
+
+        if let Some(mapping) = state.mappings.get_mut(mapping_id) {
+            mapping.connected = false;
+            mapping.peer_port = None;
+        }
+    }
+
+    async fn reconnect_attempt_is_current(
+        &self,
+        peer_session_key: &str,
+        attempt_id: &str,
+    ) -> bool {
+        let state = self.state.read().await;
+        state
+            .reconnect_attempts_by_peer
+            .get(peer_session_key)
+            .map(|attempt| attempt.id.as_str() == attempt_id)
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_peer_active_session(
+        &self,
+        peer_fingerprint: &str,
+        timeout: Duration,
+    ) -> Result<SyncMapping> {
+        let deadline = SystemTime::now()
+            .checked_add(timeout)
+            .unwrap_or(SystemTime::now());
+
+        loop {
+            {
+                let state = self.state.read().await;
+                if let Some(mapping) = state
+                    .mappings
+                    .values()
+                    .find(|mapping| {
+                        state.active_sessions.contains(mapping.id.as_str())
+                            && !mapping.peer_certificate_pem.trim().is_empty()
+                            && certificate_fingerprint(mapping.peer_certificate_pem.as_str())
+                                == peer_fingerprint
+                    })
+                    .cloned()
+                {
+                    return Ok(mapping);
+                }
+            }
+
+            if SystemTime::now() >= deadline {
+                bail!("timed out waiting for the winning Repo Sync peer session");
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn activate_workflow(
         &self,
         db: &SqlitePool,
@@ -333,15 +503,8 @@ impl RepoSyncRuntime {
         }
 
         for mapping_id in &expired {
-            state.connection_expires_at_unix_ms.remove(mapping_id);
-            state.peer_messages.remove(mapping_id);
-            if let Some(mapping) = state.mappings.get_mut(mapping_id) {
-                mapping.connected = false;
-                mapping.peer_port = None;
-            }
+            Self::clear_session_locked(&mut state, mapping_id);
         }
-
-        persist_mappings(&state.mappings)?;
 
         for mapping_id in expired {
             tracing::info!(
@@ -355,20 +518,12 @@ impl RepoSyncRuntime {
 
     async fn mark_disconnected(&self, mapping_id: &str, reason: &str) -> Result<()> {
         let mut state = self.state.write().await;
-        state.connection_expires_at_unix_ms.remove(mapping_id);
-        state.peer_messages.remove(mapping_id);
-
-        if let Some(mapping) = state.mappings.get_mut(mapping_id) {
-            mapping.connected = false;
-            mapping.peer_port = None;
-        }
-
-        persist_mappings(&state.mappings)?;
+        Self::clear_session_locked(&mut state, mapping_id);
 
         tracing::info!(
             mapping_id = %mapping_id,
             reason,
-            "Repo Sync peer marked disconnected"
+            "Repo Sync session destroyed"
         );
 
         Ok(())
@@ -427,17 +582,12 @@ impl RepoSyncRuntime {
         };
         let app = Router::new()
             .route("/sync/v1/ping", post(sync_ping))
+            .route("/sync/v1/state", post(sync_state))
             .route("/sync/v1/changeset", post(sync_changeset))
             .route("/sync/v1/hard-sync", post(sync_hard_sync))
             .route("/sync/v1/message", post(sync_peer_message))
             .layer(DefaultBodyLimit::max(1536 * 1024 * 1024))
             .with_state(server_state);
-
-        self.state
-            .write()
-            .await
-            .sync_server_ports
-            .insert(mapping.id.clone(), port);
 
         tracing::info!(
             mapping_id = %mapping.id,
@@ -447,7 +597,7 @@ impl RepoSyncRuntime {
             "Repo Sync TLS data listener ready"
         );
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(error) = axum_server::from_tcp_rustls(listener, tls)
                 .serve(app.into_make_service())
                 .await
@@ -459,6 +609,13 @@ impl RepoSyncRuntime {
                 );
             }
         });
+        let abort_handle = task.abort_handle();
+
+        let mut state = self.state.write().await;
+        state.sync_server_ports.insert(mapping.id.clone(), port);
+        state
+            .sync_server_abort_handles
+            .insert(mapping.id.clone(), abort_handle);
 
         Ok(())
     }
@@ -566,6 +723,7 @@ impl RepoSyncRuntime {
     async fn mark_connected(&self, mapping_id: &str) -> Result<SyncMapping> {
         let mut state = self.state.write().await;
         state.peer_messages.remove(mapping_id);
+        state.active_sessions.insert(mapping_id.to_string());
         let mapping = state
             .mappings
             .get_mut(mapping_id)
@@ -576,7 +734,6 @@ impl RepoSyncRuntime {
         state
             .connection_expires_at_unix_ms
             .insert(mapping_id.to_string(), expires_at_unix_ms);
-        persist_mappings(&state.mappings)?;
 
         tracing::info!(
             mapping_id = %mapping.id,
@@ -584,7 +741,7 @@ impl RepoSyncRuntime {
             peer_ipv4 = %mapping.peer_ipv4,
             peer_port = ?mapping.peer_port,
             expires_at_unix_ms,
-            "Repo Sync peer marked connected"
+            "Repo Sync ephemeral session established"
         );
 
         Ok(mapping)
@@ -608,7 +765,7 @@ impl RepoSyncRuntime {
             );
 
             match runtime
-                .wait_for_peer_ready(mapping_id.as_str(), Duration::from_secs(15))
+                .wait_for_peer_ready(mapping_id.as_str(), Duration::from_secs(30))
                 .await
             {
                 Ok(()) => {
@@ -657,39 +814,19 @@ impl RepoSyncRuntime {
         Ok(())
     }
 
-    pub async fn status(&self, workflow_run_id: &str) -> Result<RepoSyncStatus> {
+    pub async fn status(
+        &self,
+        workflow_run_id: &str,
+        endpoints: &RuntimeEndpointManager,
+    ) -> Result<RepoSyncStatus> {
         self.ensure_mappings_loaded().await?;
-        self.expire_connection_leases().await?;
 
-        let connected_mapping_ids = {
-            let state = self.state.read().await;
-            state
-                .mappings
-                .values()
-                .filter(|mapping| {
-                    mapping.workflow_run_id == workflow_run_id && mapping.connected
-                })
-                .map(|mapping| mapping.id.clone())
-                .collect::<Vec<_>>()
-        };
-
-        for mapping_id in connected_mapping_ids {
-            if let Err(error) = self.probe_peer_once(mapping_id.as_str()).await {
-                tracing::warn!(
-                    mapping_id = %mapping_id,
-                    error = %format!("{:#}", error),
-                    "Repo Sync status health check failed"
-                );
-                self.mark_disconnected(
-                    mapping_id.as_str(),
-                    "authenticated peer health check failed",
-                )
-                .await?;
-            }
+        if let Some(address) = endpoints.local_lan_ipv4() {
+            let mut state = self.state.write().await;
+            state.local_ipv4 = Some(IpAddr::V4(address));
         }
 
-        let mut state = self.state.write().await;
-        prune_peer_messages_locked(&mut state);
+        let state = self.state.read().await;
         Ok(RepoSyncStatus {
             identity_ready: state.identity.is_some(),
             certificate_fingerprint: state
@@ -697,6 +834,9 @@ impl RepoSyncRuntime {
                 .as_ref()
                 .map(|identity| identity.fingerprint.clone())
                 .unwrap_or_default(),
+            local_ipv4: state.local_ipv4,
+            pairing_listener_running: state.pairing_server_started,
+            pairing_listener_port: state.pairing_server_port,
             pairings: state
                 .pairings
                 .values()
@@ -708,8 +848,136 @@ impl RepoSyncRuntime {
                 .values()
                 .filter(|mapping| mapping.workflow_run_id == workflow_run_id)
                 .cloned()
+                .map(|mut mapping| {
+                    mapping.connected = state.active_sessions.contains(mapping.id.as_str());
+                    if !mapping.connected {
+                        mapping.peer_port = None;
+                    }
+                    mapping
+                })
                 .collect(),
         })
+    }
+
+    async fn accept_sync_state(
+        &self,
+        mapping_id: &str,
+        incoming: SyncStateEnvelope,
+    ) -> Result<SyncStateEnvelope> {
+        self.ensure_mappings_loaded().await?;
+        let identity = self.ensure_identity().await?;
+
+        let mut state = self.state.write().await;
+        let mapping = state
+            .mappings
+            .get_mut(mapping_id)
+            .context("trusted Repo Sync mapping not found")?;
+        let peer_fingerprint = certificate_fingerprint(mapping.peer_certificate_pem.as_str());
+
+        if incoming_sync_state_wins(
+            incoming.state_revision,
+            mapping.state_revision,
+            peer_fingerprint.as_str(),
+            identity.fingerprint.as_str(),
+        ) {
+            mapping.sync_mode = incoming.sync_mode;
+            mapping.state_revision = incoming.state_revision;
+            persist_mappings(&state.mappings)?;
+        }
+
+        let mapping = state
+            .mappings
+            .get(mapping_id)
+            .context("trusted Repo Sync mapping not found")?;
+
+        Ok(SyncStateEnvelope {
+            sync_mode: mapping.sync_mode.clone(),
+            state_revision: mapping.state_revision,
+        })
+    }
+
+    async fn reconcile_sync_state(
+        &self,
+        mapping_id: &str,
+        incoming: SyncStateEnvelope,
+    ) -> Result<SyncMapping> {
+        self.ensure_mappings_loaded().await?;
+        let identity = self.ensure_identity().await?;
+
+        let mut state = self.state.write().await;
+        let mapping = state
+            .mappings
+            .get_mut(mapping_id)
+            .context("trusted Repo Sync mapping not found")?;
+        let peer_fingerprint = certificate_fingerprint(mapping.peer_certificate_pem.as_str());
+
+        if incoming_sync_state_wins(
+            incoming.state_revision,
+            mapping.state_revision,
+            peer_fingerprint.as_str(),
+            identity.fingerprint.as_str(),
+        ) {
+            mapping.sync_mode = incoming.sync_mode;
+            mapping.state_revision = incoming.state_revision;
+            persist_mappings(&state.mappings)?;
+        }
+
+        state
+            .mappings
+            .get(mapping_id)
+            .cloned()
+            .context("trusted Repo Sync mapping not found")
+    }
+
+    async fn push_sync_state(&self, mapping_id: &str) -> Result<()> {
+        let mapping = {
+            let state = self.state.read().await;
+            state
+                .mappings
+                .get(mapping_id)
+                .cloned()
+                .context("trusted Repo Sync mapping not found")?
+        };
+
+        if !mapping.connected {
+            return Ok(());
+        }
+
+        let identity = self.ensure_identity().await?;
+        let client = build_mtls_client(&identity, &mapping)?;
+        let peer_port = mapping.peer_port.context("paired peer has no sync port")?;
+        let response = match client
+            .post(format!("https://mdev-sync:{}/sync/v1/state", peer_port))
+            .header("x-mdev-mapping-id", mapping.id.as_str())
+            .json(&SyncStateEnvelope {
+                sync_mode: mapping.sync_mode.clone(),
+                state_revision: mapping.state_revision,
+            })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .mark_disconnected(mapping_id, "sync state transport failed")
+                    .await;
+                return Err(error).context("failed to synchronize Repo Sync state");
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("remote Repo Sync state update failed: {} {}", status, body);
+        }
+
+        let remote = response
+            .json::<SyncStateEnvelope>()
+            .await
+            .context("failed to decode remote Repo Sync state")?;
+
+        self.reconcile_sync_state(mapping_id, remote).await?;
+        Ok(())
     }
 
     pub async fn upsert_mapping(&self, mut mapping: SyncMapping) -> Result<SyncMapping> {
@@ -722,20 +990,50 @@ impl RepoSyncRuntime {
             mapping.id = Uuid::new_v4().to_string();
         }
 
-        let mut state = self.state.write().await;
-        if let Some(existing) = state.mappings.get(mapping.id.as_str()) {
-            if mapping.peer_certificate_pem.trim().is_empty() {
-                mapping.peer_certificate_pem = existing.peer_certificate_pem.clone();
+        let (mapping, should_push) = {
+            let mut state = self.state.write().await;
+            let mut should_push = false;
+
+            if let Some(existing) = state.mappings.get(mapping.id.as_str()) {
+                let sync_mode_changed = mapping.sync_mode != existing.sync_mode;
+
+                if mapping.peer_certificate_pem.trim().is_empty() {
+                    mapping.peer_certificate_pem = existing.peer_certificate_pem.clone();
+                }
+                if mapping.link_id.trim().is_empty() {
+                    mapping.link_id = existing.link_id.clone();
+                }
+                if mapping.peer_port.is_none() {
+                    mapping.peer_port = existing.peer_port;
+                }
+
+                let session_active = state.active_sessions.contains(mapping.id.as_str());
+                mapping.connected = session_active;
+                mapping.state_revision = if sync_mode_changed {
+                    existing.state_revision.saturating_add(1)
+                } else {
+                    existing.state_revision
+                };
+                should_push = sync_mode_changed && session_active;
+            } else {
+                mapping.state_revision = 1;
             }
-            if mapping.peer_port.is_none() {
-                mapping.peer_port = existing.peer_port;
-            }
-            mapping.connected = existing.connected;
+
+            state.mappings.insert(mapping.id.clone(), mapping.clone());
+            persist_mappings(&state.mappings)?;
+            (mapping, should_push)
+        };
+
+        if should_push {
+            self.push_sync_state(mapping.id.as_str()).await?;
         }
 
-        state.mappings.insert(mapping.id.clone(), mapping.clone());
-        persist_mappings(&state.mappings)?;
-        Ok(mapping)
+        let state = self.state.read().await;
+        Ok(state
+            .mappings
+            .get(mapping.id.as_str())
+            .cloned()
+            .unwrap_or(mapping))
     }
 
     async fn ensure_pairing_server(&self) -> Result<()> {
@@ -744,16 +1042,21 @@ impl RepoSyncRuntime {
             return Ok(());
         }
 
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, PAIRING_CONTROL_PORT))
-            .await
+        let listener = StdTcpListener::bind((Ipv4Addr::UNSPECIFIED, PAIRING_CONTROL_PORT))
             .with_context(|| {
                 format!(
                     "failed to bind Repo Sync pairing control port {}",
                     PAIRING_CONTROL_PORT
                 )
             })?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure Repo Sync pairing control listener")?;
+        let listener = TcpListener::from_std(listener)
+            .context("failed to create async Repo Sync pairing control listener")?;
 
         state.pairing_server_started = true;
+        state.pairing_server_port = Some(PAIRING_CONTROL_PORT);
         drop(state);
 
         let app = Router::new()
@@ -797,35 +1100,96 @@ impl RepoSyncRuntime {
             bail!("peer is not trusted; pair this workflow first");
         }
 
-        let existing_port = {
+        if mapping.link_id.trim().is_empty() {
+            bail!("this Repo Sync mapping predates workflow link identities; unpair and pair this workflow again before reconnecting");
+        }
+
+        {
             let state = self.state.read().await;
-            state.sync_server_ports.get(mapping.id.as_str()).copied()
+            if state.active_sessions.contains(mapping_id) {
+                return state
+                    .mappings
+                    .get(mapping_id)
+                    .cloned()
+                    .context("trusted Repo Sync mapping not found");
+            }
+        }
+
+        let peer_fingerprint =
+            certificate_fingerprint(mapping.peer_certificate_pem.as_str());
+        let peer_session_key = reconnect_peer_session_key(
+            mapping.link_id.as_str(),
+            identity.fingerprint.as_str(),
+            peer_fingerprint.as_str(),
+        );
+        let attempt = ReconnectAttempt {
+            id: Uuid::new_v4().to_string(),
+            mapping_id: mapping.id.clone(),
+            initiator_fingerprint: identity.fingerprint.clone(),
+            started_at_unix_ms: unix_ms_now(),
         };
 
-        let local_port = if let Some(port) = existing_port {
+        {
             let mut state = self.state.write().await;
-            state.reconnect_ports.insert(mapping.id.clone(), port);
-            if let Some(saved) = state.mappings.get_mut(mapping.id.as_str()) {
-                saved.connected = false;
+
+            if let Some(previous) = state
+                .reconnect_attempts_by_peer
+                .get(peer_session_key.as_str())
+                .cloned()
+            {
+                if previous.mapping_id != mapping.id {
+                    Self::clear_session_locked(&mut state, previous.mapping_id.as_str());
+                }
             }
-            port
-        } else {
-            let (endpoint, listener) = endpoints.reserve(NetworkExposure::Lan, None, None, &[])?;
+
+            Self::clear_session_locked(&mut state, mapping.id.as_str());
+            state
+                .reconnect_attempts_by_peer
+                .insert(peer_session_key.clone(), attempt.clone());
+        }
+
+        let (endpoint, listener) = endpoints.reserve(NetworkExposure::Lan, None, None, &[])?;
+        let local_port = endpoint.port;
+
+        {
             let mut state = self.state.write().await;
+            let current = state
+                .reconnect_attempts_by_peer
+                .get(peer_session_key.as_str())
+                .map(|current| current.id.as_str() == attempt.id.as_str())
+                .unwrap_or(false);
+
+            if !current {
+                drop(state);
+                drop(listener);
+                return self
+                    .wait_for_peer_active_session(
+                        peer_fingerprint.as_str(),
+                        Duration::from_secs(15),
+                    )
+                    .await;
+            }
+
             state
                 .reconnect_ports
-                .insert(mapping.id.clone(), endpoint.port);
+                .insert(mapping.id.clone(), local_port);
             state
                 .reserved_sync_listeners
                 .insert(mapping.id.clone(), listener);
-            if let Some(saved) = state.mappings.get_mut(mapping.id.as_str()) {
-                saved.connected = false;
-            }
-            endpoint.port
-        };
+        }
 
-        if existing_port.is_none() {
-            self.ensure_sync_server(mapping.id.as_str()).await?;
+        self.ensure_sync_server(mapping.id.as_str()).await?;
+
+        if !self
+            .reconnect_attempt_is_current(peer_session_key.as_str(), attempt.id.as_str())
+            .await
+        {
+            return self
+                .wait_for_peer_active_session(
+                    peer_fingerprint.as_str(),
+                    Duration::from_secs(15),
+                )
+                .await;
         }
 
         let client = reqwest::Client::builder()
@@ -839,7 +1203,12 @@ impl RepoSyncRuntime {
         );
         let request = ReconnectRequest {
             certificate_pem: identity.certificate_pem.clone(),
+            link_id: mapping.link_id.clone(),
             sync_port: local_port,
+            sync_mode: mapping.sync_mode.clone(),
+            state_revision: mapping.state_revision,
+            attempt_id: attempt.id.clone(),
+            attempt_started_at_unix_ms: attempt.started_at_unix_ms,
         };
 
         let deadline = SystemTime::now()
@@ -847,6 +1216,21 @@ impl RepoSyncRuntime {
             .unwrap_or(SystemTime::now());
 
         loop {
+            if !self
+                .reconnect_attempt_is_current(
+                    peer_session_key.as_str(),
+                    attempt.id.as_str(),
+                )
+                .await
+            {
+                return self
+                    .wait_for_peer_active_session(
+                        peer_fingerprint.as_str(),
+                        Duration::from_secs(15),
+                    )
+                    .await;
+            }
+
             match client.post(url.as_str()).json(&request).send().await {
                 Ok(response) if response.status().is_success() => {
                     let response: ReconnectResponse = response
@@ -854,14 +1238,40 @@ impl RepoSyncRuntime {
                         .await
                         .context("failed to decode Repo Sync reconnect response")?;
 
+                    if response.attempt_id != attempt.id {
+                        tracing::debug!(
+                            mapping_id = %mapping_id,
+                            expected_attempt_id = %attempt.id,
+                            response_attempt_id = %response.attempt_id,
+                            "Repo Sync ignored stale reconnect response"
+                        );
+                        continue;
+                    }
+
                     if certificate_fingerprint(response.certificate_pem.as_str())
                         != certificate_fingerprint(mapping.peer_certificate_pem.as_str())
                     {
                         bail!("reconnect peer certificate does not match the trusted certificate");
                     }
 
+                    if !self
+                        .reconnect_attempt_is_current(
+                            peer_session_key.as_str(),
+                            attempt.id.as_str(),
+                        )
+                        .await
+                    {
+                        return self
+                            .wait_for_peer_active_session(
+                                peer_fingerprint.as_str(),
+                                Duration::from_secs(15),
+                            )
+                            .await;
+                    }
+
                     tracing::info!(
                         mapping_id = %mapping_id,
+                        attempt_id = %attempt.id,
                         peer_ipv4 = %mapping.peer_ipv4,
                         local_port,
                         peer_port = response.sync_port,
@@ -870,24 +1280,87 @@ impl RepoSyncRuntime {
 
                     {
                         let mut state = self.state.write().await;
+                        let current = state
+                            .reconnect_attempts_by_peer
+                            .get(peer_session_key.as_str())
+                            .map(|current| current.id.as_str() == attempt.id.as_str())
+                            .unwrap_or(false);
+
+                        if !current {
+                            drop(state);
+                            return self
+                                .wait_for_peer_active_session(
+                                    peer_fingerprint.as_str(),
+                                    Duration::from_secs(15),
+                                )
+                                .await;
+                        }
+
                         let updated = state
                             .mappings
                             .get_mut(mapping_id)
                             .context("trusted Repo Sync peer disappeared during reconnect")?;
                         updated.peer_port = Some(response.sync_port);
-                        updated.connected = false;
                         persist_mappings(&state.mappings)?;
                     }
 
-                    self.wait_for_peer_ready(mapping_id, Duration::from_secs(15))
-                        .await?;
+                    self.reconcile_sync_state(
+                        mapping_id,
+                        SyncStateEnvelope {
+                            sync_mode: response.sync_mode,
+                            state_revision: response.state_revision,
+                        },
+                    )
+                    .await?;
+
+                    if let Err(error) = self
+                        .wait_for_peer_ready(mapping_id, Duration::from_secs(15))
+                        .await
+                    {
+                        if self
+                            .reconnect_attempt_is_current(
+                                peer_session_key.as_str(),
+                                attempt.id.as_str(),
+                            )
+                            .await
+                        {
+                            let _ = self
+                                .mark_disconnected(mapping_id, "reconnect peer readiness failed")
+                                .await;
+                            return Err(error);
+                        }
+
+                        return self
+                            .wait_for_peer_active_session(
+                                peer_fingerprint.as_str(),
+                                Duration::from_secs(15),
+                            )
+                            .await;
+                    }
+
+                    if !self
+                        .reconnect_attempt_is_current(
+                            peer_session_key.as_str(),
+                            attempt.id.as_str(),
+                        )
+                        .await
+                    {
+                        return self
+                            .wait_for_peer_active_session(
+                                peer_fingerprint.as_str(),
+                                Duration::from_secs(15),
+                            )
+                            .await;
+                    }
+
                     return self.mark_connected(mapping_id).await;
                 }
                 Ok(response) => {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    tracing::warn!(
+                    tracing::debug!(
                         mapping_id = %mapping_id,
+                        attempt_id = %attempt.id,
                         peer_ipv4 = %mapping.peer_ipv4,
                         status = %status,
                         response = %body,
@@ -897,6 +1370,7 @@ impl RepoSyncRuntime {
                 Err(error) => {
                     tracing::debug!(
                         mapping_id = %mapping_id,
+                        attempt_id = %attempt.id,
                         peer_ipv4 = %mapping.peer_ipv4,
                         error = %format!("{:#}", error),
                         "Repo Sync reconnect control request failed"
@@ -904,9 +1378,28 @@ impl RepoSyncRuntime {
                 }
             }
 
+            if !self
+                .reconnect_attempt_is_current(
+                    peer_session_key.as_str(),
+                    attempt.id.as_str(),
+                )
+                .await
+            {
+                return self
+                    .wait_for_peer_active_session(
+                        peer_fingerprint.as_str(),
+                        Duration::from_secs(15),
+                    )
+                    .await;
+            }
+
             if SystemTime::now() >= deadline {
+                let _ = self
+                    .mark_disconnected(mapping_id, "reconnect control exchange timed out")
+                    .await;
                 bail!("timed out waiting for the trusted peer; inspect Repo Sync logs on both computers");
             }
+
             sleep(Duration::from_millis(750)).await;
         }
     }
@@ -916,7 +1409,22 @@ impl RepoSyncRuntime {
         let identity = self.ensure_identity().await?;
         Certificate::from_pem(request.certificate_pem.as_bytes())
             .context("invalid reconnect certificate")?;
+
+        if request.attempt_id.trim().is_empty() {
+            bail!("reconnect attempt id is required");
+        }
+
+        if request.link_id.trim().is_empty() {
+            bail!("reconnect workflow link id is required; re-pair this workflow on both machines");
+        }
+
         let fingerprint = certificate_fingerprint(request.certificate_pem.as_str());
+        let incoming_attempt = ReconnectAttempt {
+            id: request.attempt_id.clone(),
+            mapping_id: String::new(),
+            initiator_fingerprint: fingerprint.clone(),
+            started_at_unix_ms: request.attempt_started_at_unix_ms,
+        };
 
         let mapping_id = {
             let state = self.state.read().await;
@@ -924,80 +1432,203 @@ impl RepoSyncRuntime {
                 .mappings
                 .values()
                 .find(|mapping| {
-                    !mapping.peer_certificate_pem.trim().is_empty()
+                    mapping.link_id == request.link_id
+                        && !mapping.peer_certificate_pem.trim().is_empty()
                         && certificate_fingerprint(mapping.peer_certificate_pem.as_str())
                             == fingerprint
                 })
                 .map(|mapping| mapping.id.clone())
-                .context("no trusted Repo Sync peer matches this certificate")?
+                .context("no trusted Repo Sync workflow link matches this certificate and link id")?
+        };
+
+        let peer_session_key = reconnect_peer_session_key(
+            request.link_id.as_str(),
+            identity.fingerprint.as_str(),
+            fingerprint.as_str(),
+        );
+        let incoming_attempt = ReconnectAttempt {
+            mapping_id: mapping_id.clone(),
+            ..incoming_attempt
         };
 
         let existing_port = {
-            let state = self.state.read().await;
-            state
-                .sync_server_ports
-                .get(mapping_id.as_str())
-                .copied()
+            let mut state = self.state.write().await;
+            match state
+                .reconnect_attempts_by_peer
+                .get(peer_session_key.as_str())
+                .cloned()
+            {
+                Some(current) if current.id == incoming_attempt.id => state
+                    .reconnect_ports
+                    .get(current.mapping_id.as_str())
+                    .copied(),
+                Some(current) => {
+                    if !reconnect_attempt_wins(&incoming_attempt, &current) {
+                        bail!("simultaneous reconnect resolved in favor of the existing peer attempt");
+                    }
+
+                    tracing::info!(
+                        peer_session_key = %peer_session_key,
+                        previous_mapping_id = %current.mapping_id,
+                        winning_mapping_id = %mapping_id,
+                        previous_attempt_id = %current.id,
+                        winning_attempt_id = %incoming_attempt.id,
+                        "Repo Sync replaced losing simultaneous peer reconnect"
+                    );
+
+                    Self::clear_session_locked(&mut state, current.mapping_id.as_str());
+                    if current.mapping_id != mapping_id {
+                        Self::clear_session_locked(&mut state, mapping_id.as_str());
+                    }
+                    state
+                        .reconnect_attempts_by_peer
+                        .insert(peer_session_key.clone(), incoming_attempt.clone());
+                    None
+                }
+                None => {
+                    Self::clear_session_locked(&mut state, mapping_id.as_str());
+                    state
+                        .reconnect_attempts_by_peer
+                        .insert(peer_session_key.clone(), incoming_attempt.clone());
+                    None
+                }
+            }
         };
 
-        let local_port = if let Some(port) = existing_port {
-            let mut state = self.state.write().await;
-            state.reconnect_ports.insert(mapping_id.clone(), port);
-            port
+        let local_port = if let Some(local_port) = existing_port {
+            local_port
         } else {
             let endpoints = RuntimeEndpointManager::default();
             let (endpoint, listener) =
                 endpoints.reserve(NetworkExposure::Lan, None, None, &[])?;
+            let local_port = endpoint.port;
 
             let mut state = self.state.write().await;
+            let current = state
+                .reconnect_attempts_by_peer
+                .get(peer_session_key.as_str())
+                .map(|current| {
+                    current.id.as_str() == incoming_attempt.id.as_str()
+                        && current.mapping_id.as_str() == mapping_id.as_str()
+                })
+                .unwrap_or(false);
+
+            if !current {
+                drop(state);
+                drop(listener);
+                bail!("reconnect attempt was superseded before listener activation");
+            }
+
             state
                 .reconnect_ports
-                .insert(mapping_id.clone(), endpoint.port);
+                .insert(mapping_id.clone(), local_port);
             state
                 .reserved_sync_listeners
                 .insert(mapping_id.clone(), listener);
-            endpoint.port
+            local_port
         };
 
         {
             let mut state = self.state.write().await;
+            let current = state
+                .reconnect_attempts_by_peer
+                .get(peer_session_key.as_str())
+                .map(|current| {
+                    current.id.as_str() == incoming_attempt.id.as_str()
+                        && current.mapping_id.as_str() == mapping_id.as_str()
+                })
+                .unwrap_or(false);
+
+            if !current {
+                bail!("reconnect attempt was superseded before peer state update");
+            }
+
             let mapping = state
                 .mappings
                 .get_mut(mapping_id.as_str())
                 .context("trusted Repo Sync mapping not found")?;
             mapping.peer_port = Some(request.sync_port);
-            mapping.connected = false;
+            if incoming_sync_state_wins(
+                request.state_revision,
+                mapping.state_revision,
+                fingerprint.as_str(),
+                identity.fingerprint.as_str(),
+            ) {
+                mapping.sync_mode = request.sync_mode.clone();
+                mapping.state_revision = request.state_revision;
+            }
             persist_mappings(&state.mappings)?;
         }
 
-        if existing_port.is_none() {
-            self.ensure_sync_server(mapping_id.as_str()).await?;
+        self.ensure_sync_server(mapping_id.as_str()).await?;
+
+        if !self
+            .reconnect_attempt_is_current(
+                peer_session_key.as_str(),
+                incoming_attempt.id.as_str(),
+            )
+            .await
+        {
+            bail!("reconnect attempt was superseded during listener activation");
         }
 
         tracing::info!(
             mapping_id = %mapping_id,
+            attempt_id = %incoming_attempt.id,
             peer_port = request.sync_port,
             local_port,
-            reused_local_listener = existing_port.is_some(),
             "Repo Sync accepted trusted peer reconnect"
         );
 
-        self.verify_peer_in_background(mapping_id.clone());
+        if let Err(error) = self
+            .wait_for_peer_ready(mapping_id.as_str(), Duration::from_secs(15))
+            .await
+        {
+            if self
+                .reconnect_attempt_is_current(
+                    peer_session_key.as_str(),
+                    incoming_attempt.id.as_str(),
+                )
+                .await
+            {
+                let _ = self
+                    .mark_disconnected(
+                        mapping_id.as_str(),
+                        "inbound reconnect peer readiness failed",
+                    )
+                    .await;
+                return Err(error);
+            }
+
+            bail!("reconnect attempt was superseded during peer readiness verification");
+        }
+
+        if !self
+            .reconnect_attempt_is_current(
+                peer_session_key.as_str(),
+                incoming_attempt.id.as_str(),
+            )
+            .await
+        {
+            bail!("reconnect attempt was superseded before session activation");
+        }
+
+        let mapping = self.mark_connected(mapping_id.as_str()).await?;
 
         Ok(ReconnectResponse {
             certificate_pem: identity.certificate_pem,
             sync_port: local_port,
+            sync_mode: mapping.sync_mode,
+            state_revision: mapping.state_revision,
+            attempt_id: incoming_attempt.id,
         })
     }
 
     pub async fn unpair(&self, mapping_id: &str) -> Result<()> {
         self.ensure_mappings_loaded().await?;
         let mut state = self.state.write().await;
+        Self::clear_session_locked(&mut state, mapping_id);
         state.mappings.remove(mapping_id);
-        state.reconnect_ports.remove(mapping_id);
-        state.reserved_sync_listeners.remove(mapping_id);
-        state.sync_server_ports.remove(mapping_id);
-        state.peer_messages.remove(mapping_id);
         state
             .pairings
             .retain(|_, session| session.mapping_id != mapping_id);
@@ -1041,6 +1672,7 @@ impl RepoSyncRuntime {
         let session = PairingSession {
             id: id.clone(),
             mapping_id: mapping.id,
+            peer_pairing_id: String::new(),
             verification_code: String::new(),
             peer_ipv4: mapping.peer_ipv4,
             local_port: endpoint.port,
@@ -1116,6 +1748,7 @@ impl RepoSyncRuntime {
 
             let request = PairingJoinRequest {
                 proof: session.pairing_proof.clone(),
+                pairing_id: session.id.clone(),
                 certificate_pem: session.local_certificate_pem.clone(),
                 sync_port: session.local_port,
                 confirmed: session.local_confirmed,
@@ -1190,6 +1823,10 @@ impl RepoSyncRuntime {
             return Ok(());
         }
 
+        if response.pairing_id.trim().is_empty() {
+            bail!("peer pairing response is missing pairing id");
+        }
+
         Certificate::from_pem(response.certificate_pem.as_bytes())
             .context("invalid peer certificate")?;
 
@@ -1209,6 +1846,7 @@ impl RepoSyncRuntime {
             response.certificate_pem.as_str(),
         );
         session.peer_certificate_pem = response.certificate_pem;
+        session.peer_pairing_id = response.pairing_id;
         session.peer_port = response.sync_port;
         session.remote_confirmed = response.confirmed;
 
@@ -1236,6 +1874,10 @@ impl RepoSyncRuntime {
         Certificate::from_pem(request.certificate_pem.as_bytes())
             .context("invalid peer certificate")?;
 
+        if request.pairing_id.trim().is_empty() {
+            bail!("peer pairing request is missing pairing id");
+        }
+
         let identity = self.ensure_identity().await?;
         let mut state = self.state.write().await;
 
@@ -1259,6 +1901,7 @@ impl RepoSyncRuntime {
                 );
                 return Ok(PairingJoinResponse {
                     matched: false,
+                    pairing_id: String::new(),
                     certificate_pem: String::new(),
                     sync_port: None,
                     confirmed: false,
@@ -1272,6 +1915,7 @@ impl RepoSyncRuntime {
                 );
                 return Ok(PairingJoinResponse {
                     matched: false,
+                    pairing_id: String::new(),
                     certificate_pem: String::new(),
                     sync_port: None,
                     confirmed: false,
@@ -1290,11 +1934,13 @@ impl RepoSyncRuntime {
                 request.certificate_pem.as_str(),
             );
             session.peer_certificate_pem = request.certificate_pem;
+            session.peer_pairing_id = request.pairing_id;
             session.peer_port = Some(request.sync_port);
             session.remote_confirmed = request.confirmed;
 
             PairingJoinResponse {
                 matched: true,
+                pairing_id: session.id.clone(),
                 certificate_pem: identity.certificate_pem.clone(),
                 sync_port: Some(session.local_port),
                 confirmed: session.local_confirmed,
@@ -1340,6 +1986,23 @@ impl RepoSyncRuntime {
             self.verify_peer_in_background(mapping.id);
         }
         Ok(snapshot)
+    }
+
+    pub async fn outbound_auto_apply_connected(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<bool> {
+        self.ensure_mappings_loaded().await?;
+        self.expire_connection_leases().await?;
+
+        let state = self.state.read().await;
+        Ok(state.mappings.values().any(|mapping| {
+            mapping.workflow_run_id == workflow_run_id
+                && mapping.enabled
+                && mapping.sync_mode == SyncMode::AutoApply
+                && mapping.direction.can_send()
+                && mapping.connected
+        }))
     }
 
     pub async fn outbound_auto_apply_mapping(
@@ -1746,13 +2409,9 @@ fn validate_peer_message_blocks(blocks: &[PeerMessageBlock]) -> Result<()> {
 
 fn prune_peer_messages_locked(state: &mut RepoSyncState) {
     let now = unix_ms_now();
-    let connected = state
-        .mappings
-        .iter()
-        .filter_map(|(id, mapping)| mapping.connected.then_some(id.clone()))
-        .collect::<HashSet<_>>();
+    let active_sessions = state.active_sessions.clone();
     state.peer_messages.retain(|mapping_id, messages| {
-        if !connected.contains(mapping_id) {
+        if !active_sessions.contains(mapping_id) {
             return false;
         }
         messages.retain(|message| message.expires_at_unix_ms > now);
@@ -1762,6 +2421,18 @@ fn prune_peer_messages_locked(state: &mut RepoSyncState) {
 
 async fn sync_ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn sync_state(
+    State(server): State<RepoSyncServerState>,
+    Json(incoming): Json<SyncStateEnvelope>,
+) -> Result<Json<SyncStateEnvelope>, (StatusCode, String)> {
+    server
+        .runtime
+        .accept_sync_state(server.mapping_id.as_str(), incoming)
+        .await
+        .map(Json)
+        .map_err(sync_forbidden)
 }
 
 async fn sync_peer_message(
@@ -1802,6 +2473,86 @@ async fn sync_changeset(
     Ok(Json(result))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncNewlineStyle {
+    None,
+    Lf,
+    CrLf,
+    MixedOrOther,
+}
+
+fn sync_newline_style(value: &str) -> SyncNewlineStyle {
+    let bytes = value.as_bytes();
+    let mut saw_lf = false;
+    let mut saw_crlf = false;
+    let mut saw_lone_cr = false;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                    saw_crlf = true;
+                    index += 2;
+                } else {
+                    saw_lone_cr = true;
+                    index += 1;
+                }
+            }
+            b'\n' => {
+                saw_lf = true;
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    if saw_lone_cr || (saw_lf && saw_crlf) {
+        SyncNewlineStyle::MixedOrOther
+    } else if saw_crlf {
+        SyncNewlineStyle::CrLf
+    } else if saw_lf {
+        SyncNewlineStyle::Lf
+    } else {
+        SyncNewlineStyle::None
+    }
+}
+
+fn normalize_crlf_for_sync_compare(value: &str) -> String {
+    value.replace("\r\n", "\n")
+}
+
+fn sync_text_equivalent(existing: &str, incoming: &str) -> bool {
+    if existing == incoming {
+        return true;
+    }
+
+    if matches!(sync_newline_style(existing), SyncNewlineStyle::MixedOrOther)
+        || matches!(sync_newline_style(incoming), SyncNewlineStyle::MixedOrOther)
+    {
+        return false;
+    }
+
+    normalize_crlf_for_sync_compare(existing) == normalize_crlf_for_sync_compare(incoming)
+}
+
+fn preserve_sync_newline_style(existing: &str, incoming: &str) -> String {
+    let existing_style = sync_newline_style(existing);
+    let incoming_style = sync_newline_style(incoming);
+
+    match (existing_style, incoming_style) {
+        (SyncNewlineStyle::CrLf, SyncNewlineStyle::Lf) => {
+            incoming.replace('\n', "\r\n")
+        }
+        (SyncNewlineStyle::Lf, SyncNewlineStyle::CrLf) => {
+            incoming.replace("\r\n", "\n")
+        }
+        _ => incoming.to_string(),
+    }
+}
+
 async fn sync_hard_sync(
     State(server): State<RepoSyncServerState>,
     headers: HeaderMap,
@@ -1835,7 +2586,30 @@ async fn sync_hard_sync(
         "save_path": "",
         "inline_repo_context_in_prompt": false
     });
-    let local_snapshot = build_existing_context_sync_snapshot(local_scope).map_err(sync_internal)?;
+    let local_snapshot = match build_existing_context_sync_snapshot(local_scope) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                workflow_run_id = %server.workflow_run_id,
+                repo = %repo.display(),
+                repo_exists = repo.exists(),
+                repo_is_dir = repo.is_dir(),
+                error = %format!("{:#}", error),
+                "failed to build receiver Context Exporter snapshot; continuing with empty hard-sync baseline"
+            );
+            ContextSyncSnapshot {
+                files: Vec::new(),
+                include_files: snapshot.include_files.clone(),
+                include_directories: snapshot.include_directories.clone(),
+                exclude_files: snapshot.exclude_files.clone(),
+                exclude_directories: snapshot.exclude_directories.clone(),
+                include_override_regex: snapshot.include_override_regex.clone(),
+                skip_binary: snapshot.skip_binary,
+                skip_gitignore: snapshot.skip_gitignore,
+                exclude_regex: snapshot.exclude_regex.clone(),
+            }
+        }
+    };
 
     let mut incoming = HashMap::<String, String>::new();
     for file in snapshot.files {
@@ -1864,14 +2638,44 @@ async fn sync_hard_sync(
     }
 
     let mut written = 0usize;
+    let mut unchanged = 0usize;
     for (path, contents) in incoming {
-        let full = repo.join(path.as_str());
+        let normalized = validate_sync_path(path.as_str()).map_err(sync_bad_request)?;
+        let mut full = repo.clone();
+        for component in normalized.split('/') {
+            full.push(component);
+        }
+
+        let contents_to_write = if full.is_file() {
+            match fs::read(&full) {
+                Ok(existing_bytes) => match String::from_utf8(existing_bytes) {
+                    Ok(existing) => {
+                        if sync_text_equivalent(existing.as_str(), contents.as_str()) {
+                            unchanged += 1;
+                            continue;
+                        }
+                        preserve_sync_newline_style(existing.as_str(), contents.as_str())
+                    }
+                    Err(_) => contents,
+                },
+                Err(error) => {
+                    return Err(sync_internal(anyhow::anyhow!(
+                        "failed to read {} before hard sync: {}",
+                        full.display(),
+                        error
+                    )));
+                }
+            }
+        } else {
+            contents
+        };
+
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))
                 .map_err(sync_internal)?;
         }
-        fs::write(&full, contents.as_bytes())
+        fs::write(&full, contents_to_write.as_bytes())
             .with_context(|| format!("failed to write {}", full.display()))
             .map_err(sync_internal)?;
         written += 1;
@@ -1881,6 +2685,7 @@ async fn sync_hard_sync(
         "ok": true,
         "sync_id": sync_id,
         "written": written,
+        "unchanged": unchanged,
         "deleted": deleted
     })))
 }
@@ -1901,6 +2706,7 @@ async fn workflow_repo_context(
         .await?
         .context("receiving workflow run not found")?;
     let repo_ref: String = row.get("repo_ref");
+    let repo_ref = repo_ref.trim().to_string();
     let context_json: String = row.get("context_json");
     let context = serde_json::from_str(&context_json).unwrap_or_else(|_| serde_json::json!({}));
     Ok((repo_ref, context))
@@ -2017,6 +2823,17 @@ fn finalize_pairing_if_ready(
         return Ok(None);
     }
 
+    if session.peer_pairing_id.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let link_id = pairing_link_id(
+        session.id.as_str(),
+        session.peer_pairing_id.as_str(),
+        session.local_certificate_pem.as_str(),
+        session.peer_certificate_pem.as_str(),
+    );
+
     let peer_port = session.peer_port.context("peer sync port is missing")?;
     let mapping = state
         .mappings
@@ -2024,9 +2841,9 @@ fn finalize_pairing_if_ready(
         .context("mapping not found")?;
 
     mapping.peer_certificate_pem = session.peer_certificate_pem;
+    mapping.link_id = link_id;
     mapping.peer_port = Some(peer_port);
     mapping.enabled = true;
-    mapping.sync_mode = SyncMode::Manual;
     mapping.connected = false;
     let mapping = mapping.clone();
 

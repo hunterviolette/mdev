@@ -38,9 +38,11 @@ import {
   deleteTemplate,
   getWorkflowChangeset,
   getChangesetSchema,
+  getWorkflowContextExportSummary,
   getRun,
   getRuntimeProjection,
   getRuntimeSnapshot,
+  openRuntimeEventStream,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -1401,7 +1403,6 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   stageCompileError: string;
   stageCompileCommandsText: string;
   stageUserInput: string;
-  onStageUserInputChange: (value: string) => void;
   onStageUserInputDraftChange: (value: string) => void;
   inferenceConnectionStatus: InferenceConnectionStatus;
   inferenceTransport: InferenceTransport;
@@ -1433,7 +1434,6 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     stageCompileError,
     stageCompileCommandsText,
     stageUserInput,
-    onStageUserInputChange,
     onStageUserInputDraftChange,
     inferenceConnectionStatus,
     inferenceTransport,
@@ -1466,38 +1466,10 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     setUserInputDraftState(value);
     onStageUserInputDraftChange(value);
   }, [onStageUserInputDraftChange]);
-  const lastSavedUserInputRef = useRef(stageUserInput);
 
   useEffect(() => {
     setUserInputDraftState(stageUserInput);
-    lastSavedUserInputRef.current = stageUserInput;
   }, [userInputIdentity, stageUserInput]);
-
-  useEffect(() => {
-    if (!selectedRunId || !selectedWorkflowStep?.id) return;
-    if (userInputDraft === lastSavedUserInputRef.current) return;
-
-    const runId = selectedRunId;
-    const stepId = selectedWorkflowStep.id;
-    const valueToSave = userInputDraft;
-    let cancelled = false;
-
-    const timeout = window.setTimeout(() => {
-      void patchWorkflowStageUserInput(runId, stepId, valueToSave)
-        .then((response) => {
-          if (!cancelled) {
-            lastSavedUserInputRef.current = response.text;
-            onStageUserInputChange(response.text);
-          }
-        })
-        .catch(() => undefined);
-    }, 500);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeout);
-    };
-  }, [userInputDraft, selectedRunId, selectedWorkflowStep?.id, onStageUserInputChange]);
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
@@ -2288,6 +2260,7 @@ export function WorkflowShell(props: {
   const [recentEventIds, setRecentEventIds] = useState<Set<string>>(new Set());
   const [eventStreamConnected, setEventStreamConnected] = useState(false);
   const [eventStreamStatusText, setEventStreamStatusText] = useState('Disconnected');
+  const [eventWindow, setEventWindow] = useState(20);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [workflowBuilderCatalog, setWorkflowBuilderCatalog] = useState<WorkflowBuilderCatalog | null>(null);
@@ -2302,6 +2275,8 @@ export function WorkflowShell(props: {
   const runRefreshTimersRef = useRef<Record<string, number>>({});
   const runtimeProjectionInflightRef = useRef<Set<string>>(new Set());
   const runtimeProjectionLastRequestedAtRef = useRef<Record<string, number>>({});
+  const workflowDetailContentRef = useRef<HTMLDivElement | null>(null);
+  const [workflowDetailPanelHeight, setWorkflowDetailPanelHeight] = useState<number | null>(null);
 
 
   function patchRuntimeDeployQAField<K extends keyof DeployQAValues>(
@@ -3225,77 +3200,105 @@ export function WorkflowShell(props: {
   const repoFragmentSummary = useMemo(() => {
     return `${repoFragmentFileCount} file${repoFragmentFileCount === 1 ? '' : 's'} selected`;
   }, [repoFragmentFileCount]);
+
+  const contextExportSelectionKey = JSON.stringify({
+    includeDirectories: Array.from(selectedRepoDirs).sort(),
+    includeFiles: Array.from(new Set(selectedRepoPaths.map((value) => value.trim()).filter(Boolean))).sort(),
+    excludeDirectories: stageRepoContextExcludeDirectoriesText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .sort(),
+    excludeFiles: stageRepoContextExcludeFilesText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .sort(),
+    excludeRegex: stageRepoContextExcludeRegexText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean),
+    includeOverrideRegex: stageRepoContextIncludeOverrideRegexText
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean),
+    gitRef: stageRepoContextGitRef.trim() || 'WORKTREE',
+    skipBinary: stageRepoContextSkipBinary,
+    skipGitignore: stageRepoContextSkipGitignore
+  });
+
   useEffect(() => {
-    const includeDirectories = Array.from(selectedRepoDirs);
-    const includeFiles = Array.from(new Set(selectedRepoPaths.map((value) => value.trim()).filter(Boolean)));
-    const excludeDirectories = stageRepoContextExcludeDirectoriesText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const excludeFiles = stageRepoContextExcludeFilesText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const excludeRegex = stageRepoContextExcludeRegexText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
-    const includeOverrideRegex = stageRepoContextIncludeOverrideRegexText
-      .split('\n')
-      .map((value) => value.trim())
-      .filter(Boolean);
+    const selection = JSON.parse(contextExportSelectionKey) as {
+      includeDirectories: string[];
+      includeFiles: string[];
+      excludeDirectories: string[];
+      excludeFiles: string[];
+      excludeRegex: string[];
+      includeOverrideRegex: string[];
+      gitRef: string;
+      skipBinary: boolean;
+      skipGitignore: boolean;
+    };
 
-    if (includeDirectories.length === 0 && includeFiles.length === 0) {
-      setRepoFragmentFileCount(0);
-      return;
-    }
-
-    const repo = view === 'builder' ? repoRef.trim() : selectedRun?.repo_ref?.trim() ?? '';
-    if (!repo) {
+    if (selection.includeDirectories.length === 0 && selection.includeFiles.length === 0) {
       setRepoFragmentFileCount(0);
       return;
     }
 
     let cancelled = false;
 
-    void listRepoTree(repo, stageRepoContextGitRef.trim() || 'WORKTREE', {
-      recursive: true,
-      skipBinary: stageRepoContextSkipBinary,
-      skipGitignore: stageRepoContextSkipGitignore
-    })
-      .then((response) => {
-        if (cancelled) return;
-        const resolved = resolveContextExport(response.entries, {
-          includeDirectories,
-          includeFiles,
-          excludeDirectories,
-          excludeFiles,
-          excludeRegex,
-          includeOverrideRegex
-        });
-        setRepoFragmentFileCount(resolved.includedFiles.length);
+    if (view === 'builder') {
+      const repo = repoRef.trim();
+      if (!repo) {
+        setRepoFragmentFileCount(0);
+        return;
+      }
+
+      void listRepoTree(repo, selection.gitRef, {
+        recursive: true,
+        skipBinary: selection.skipBinary,
+        skipGitignore: selection.skipGitignore
       })
-      .catch(() => {
-        if (!cancelled) setRepoFragmentFileCount(0);
-      });
+        .then((response) => {
+          if (cancelled) return;
+          const resolved = resolveContextExport(response.entries, selection);
+          setRepoFragmentFileCount(resolved.includedFiles.length);
+        })
+        .catch(() => {
+          if (!cancelled) setRepoFragmentFileCount(0);
+        });
+    } else {
+      const runId = selectedRun?.id ?? '';
+      if (!runId) {
+        setRepoFragmentFileCount(0);
+        return;
+      }
+
+      void getWorkflowContextExportSummary(runId, {
+        git_ref: selection.gitRef,
+        include_files: selection.includeFiles,
+        include_directories: selection.includeDirectories,
+        exclude_files: selection.excludeFiles,
+        exclude_directories: selection.excludeDirectories,
+        exclude_regex: selection.excludeRegex,
+        include_override_regex: selection.includeOverrideRegex,
+        skip_binary: selection.skipBinary,
+        skip_gitignore: selection.skipGitignore
+      })
+        .then((response) => {
+          if (!cancelled) {
+            setRepoFragmentFileCount(response.included_file_count);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setRepoFragmentFileCount(0);
+        });
+    }
 
     return () => {
       cancelled = true;
     };
-  }, [
-    view,
-    repoRef,
-    selectedRun?.repo_ref,
-    stageRepoContextGitRef,
-    stageRepoContextSkipBinary,
-    stageRepoContextSkipGitignore,
-    selectedRepoPaths,
-    selectedRepoDirs,
-    stageRepoContextExcludeDirectoriesText,
-    stageRepoContextExcludeFilesText,
-    stageRepoContextExcludeRegexText,
-    stageRepoContextIncludeOverrideRegexText
-  ]);
+  }, [view, repoRef, selectedRun?.id, contextExportSelectionKey]);
 
   const selectedStageHydrationKey = `${selectedRun?.id ?? ''}:${selectedStepId ?? selectedRun?.current_step_id ?? ''}`;
 
@@ -3391,6 +3394,27 @@ export function WorkflowShell(props: {
     selectedRunIdRef.current = selectedRunId;
   }, [selectedRunId]);
 
+  useEffect(() => {
+    const content = workflowDetailContentRef.current;
+    if (!content) return;
+
+    function updatePanelHeight() {
+      const naturalHeight = content.getBoundingClientRect().height;
+      setWorkflowDetailPanelHeight(Math.ceil(naturalHeight));
+    }
+
+    updatePanelHeight();
+
+    const observer = new ResizeObserver(updatePanelHeight);
+    observer.observe(content);
+    window.addEventListener('resize', updatePanelHeight);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updatePanelHeight);
+    };
+  }, [selectedRunId, selectedRunStepId, activeWorkspaceTab]);
+
 
   useEffect(() => {
     const routedRunId = props.route?.workflowRunId ?? null;
@@ -3461,6 +3485,48 @@ export function WorkflowShell(props: {
 
   useEffect(() => {
     let cancelled = false;
+    const routedRunId = props.route?.workflowRunId?.trim() ?? '';
+
+    if (routedRunId) {
+      const source = openRuntimeEventStream({
+        scope: 'workflow',
+        run_id: routedRunId
+      });
+
+      source.onopen = () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: true }));
+      };
+
+      source.addEventListener('runtime_snapshot', (raw) => {
+        if (cancelled) return;
+        try {
+          const snapshot = JSON.parse((raw as MessageEvent<string>).data) as RuntimeSnapshotResponse;
+          setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
+          hydrateRunsFromRuntimeSnapshot(snapshot.nodes ?? []);
+        } catch {
+        }
+      });
+
+      source.addEventListener('runtime_event', (raw) => {
+        if (cancelled) return;
+        try {
+          const incoming = JSON.parse((raw as MessageEvent<string>).data) as RuntimeEventEnvelope;
+          applyLiveWorkflowEvent(incoming.event);
+        } catch {
+        }
+      });
+
+      source.onerror = () => {
+        if (cancelled) return;
+        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
+      };
+
+      return () => {
+        cancelled = true;
+        source.close();
+      };
+    }
 
     async function loadInitialGraph() {
       try {
@@ -3513,10 +3579,27 @@ export function WorkflowShell(props: {
       cancelled = true;
       unsubscribe();
     };
-  }, []);
+  }, [props.route?.workflowRunId]);
 
   useEffect(() => {
-    void refreshRunsAndTemplates(props.route?.workflowRunId ?? undefined);
+    const routedRunId = props.route?.workflowRunId?.trim() ?? '';
+
+    if (!routedRunId) {
+      void refreshRunsAndTemplates();
+      return;
+    }
+
+    void Promise.all([
+      getRun(routedRunId),
+      listTemplates()
+    ]).then(([run, templatesRes]) => {
+      setRuns([run]);
+      setTemplates(templatesRes);
+      setSelectedRunId(run.id);
+      if (!selectedTemplateId && templatesRes[0]) {
+        setSelectedTemplateId(templatesRes[0].id);
+      }
+    }).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -3524,30 +3607,29 @@ export function WorkflowShell(props: {
 
     const runId = selectedRunId;
 
-    if (!hydratedWorkflowEventRunIds.has(runId)) {
-      let request = workflowEventHydrationByRunId.get(runId);
-      if (!request) {
-        request = hydrateWorkflowEventsFromHistory(runId)
-          .finally(() => {
-            workflowEventHydrationByRunId.delete(runId);
-          });
-        workflowEventHydrationByRunId.set(runId, request);
+    async function hydrateSelectedWorkflowEvents() {
+      const historyRequest = hydrateWorkflowEventsFromHistory(runId, eventWindow)
+        .finally(() => {
+          workflowEventHydrationByRunId.delete(runId);
+        });
+      workflowEventHydrationByRunId.set(runId, historyRequest);
+      await historyRequest;
+
+      if (!hydratedRuntimeProjectionRunIds.has(runId)) {
+        let request = runtimeProjectionHydrationByRunId.get(runId);
+        if (!request) {
+          request = hydrateRuntimeProjection(runId, eventWindow)
+            .finally(() => {
+              runtimeProjectionHydrationByRunId.delete(runId);
+            });
+          runtimeProjectionHydrationByRunId.set(runId, request);
+        }
+        await request;
       }
-      void request.catch(() => undefined);
     }
 
-    if (!hydratedRuntimeProjectionRunIds.has(runId)) {
-      let request = runtimeProjectionHydrationByRunId.get(runId);
-      if (!request) {
-        request = hydrateRuntimeProjection(runId)
-          .finally(() => {
-            runtimeProjectionHydrationByRunId.delete(runId);
-          });
-        runtimeProjectionHydrationByRunId.set(runId, request);
-      }
-      void request.catch(() => undefined);
-    }
-  }, [selectedRunId]);
+    void hydrateSelectedWorkflowEvents().catch(() => undefined);
+  }, [selectedRunId, eventWindow]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -4169,7 +4251,19 @@ export function WorkflowShell(props: {
     if (role === 'input') {
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
-    return objectPayload.output ?? objectPayload.result ?? objectPayload.response ?? objectPayload.error ?? objectPayload.payload ?? objectPayload;
+
+    const output = objectPayload.output ?? objectPayload.result ?? objectPayload.response ?? objectPayload.error ?? objectPayload.payload ?? objectPayload;
+    const outputRecord = output && typeof output === 'object' ? output as Record<string, unknown> : null;
+    if (outputRecord?.mode === 'changeset_apply') {
+      return {
+        summary: typeof outputRecord.summary === 'string' ? outputRecord.summary : '',
+        lines: Array.isArray(outputRecord.lines)
+          ? outputRecord.lines.filter((line): line is string => typeof line === 'string')
+          : []
+      };
+    }
+
+    return output;
   }
 
   function capabilityDisplayMessageFromPayload(payload: unknown, fallback?: string | null): string {
@@ -4730,13 +4824,19 @@ export function WorkflowShell(props: {
     });
   }
 
-  async function hydrateWorkflowEventsFromHistory(runId: string) {
-    const runEvents = await listRunEvents(runId);
-    mergeWorkflowEventsIntoRuntimeStore(runId, runEvents);
+  async function hydrateWorkflowEventsFromHistory(runId: string, limit = eventWindow) {
+    const runEvents = await listRunEvents(runId, limit);
+    setRuntimeEvents((prev) => ({
+      ...prev,
+      workflowEventsByRunId: {
+        ...prev.workflowEventsByRunId,
+        [runId]: runEvents
+      }
+    }));
     hydratedWorkflowEventRunIds.add(runId);
   }
 
-  async function hydrateRuntimeProjection(runId: string) {
+  async function hydrateRuntimeProjection(runId: string, limit = eventWindow) {
     const trimmedRunId = runId.trim();
     if (!trimmedRunId) return;
 
@@ -4754,7 +4854,10 @@ export function WorkflowShell(props: {
     runtimeProjectionInflightRef.current.add(trimmedRunId);
 
     try {
-      const response: RuntimeProjectionResponse = await getRuntimeProjection({ run_id: trimmedRunId });
+      const response: RuntimeProjectionResponse = await getRuntimeProjection({
+        run_id: trimmedRunId,
+        limit
+      });
       const projection = response.runs.find((item) => item.run_id === trimmedRunId) ?? response.runs[0] ?? null;
       if (!projection) return;
       setRuntimeProjectionsByRunId((prev) => {
@@ -4909,18 +5012,12 @@ export function WorkflowShell(props: {
   async function refreshRunDetails(runId: string) {
     const run = await getRun(runId);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-    if (!runtimeProjectionsByRunId[run.id]) {
-      await hydrateRuntimeProjection(run.id);
-    }
   }
 
   async function refreshRunDetailsOnOpen(runId: string) {
     const run = await openWorkflowRun(runId);
     setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
     setSelectedRunId(run.id);
-    if (!runtimeProjectionsByRunId[run.id]) {
-      await hydrateRuntimeProjection(run.id);
-    }
   }
 
 
@@ -5159,12 +5256,26 @@ export function WorkflowShell(props: {
   async function executeWorkflowStage(
     runId: string,
     stepId: string | null,
-    userInput: string
+    userInput: string,
+    mode: 'single' | 'autonomous'
   ) {
     setStageUserInput(userInput);
 
     if (stepId) {
       await patchWorkflowStageUserInput(runId, stepId, userInput);
+
+      const stagePayload = structuredClone(buildInteractiveStagePayload());
+      const prompt = asRecord(stagePayload.prompt);
+      if (prompt && Object.prototype.hasOwnProperty.call(prompt, 'user_input')) {
+        delete prompt.user_input;
+        if (Object.keys(prompt).length === 0) {
+          delete stagePayload.prompt;
+        }
+      }
+
+      if (Object.keys(stagePayload).length > 0) {
+        await patchWorkflowStageState(runId, stepId, stagePayload);
+      }
     }
 
     const prepared = await prepareWorkflowStage(runId, stepId);
@@ -5180,7 +5291,11 @@ export function WorkflowShell(props: {
       await refreshRunDetails(runId);
     }
 
-    return startWorkflowRun(runId, stepId, userInput);
+    if (mode === 'single') {
+      return runCurrentWorkflowStep(runId, stepId);
+    }
+
+    return startWorkflowRun(runId, stepId);
   }
 
   async function handleStartRun() {
@@ -5193,7 +5308,7 @@ export function WorkflowShell(props: {
     try {
       setBusy(true);
       setError(null);
-      await executeWorkflowStage(runId, stepId, latestUserInput);
+      await executeWorkflowStage(runId, stepId, latestUserInput, 'autonomous');
       await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -6539,25 +6654,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     }, 'Patched stage state.');
   }
 
-  async function patchCurrentStageStateBeforeRun() {
-    if (!selectedRun || !selectedRunStepId) return;
-    const payload = buildInteractiveStagePayload();
-    await patchWorkflowStageState(selectedRun.id, selectedRunStepId, payload);
-    await refreshRunDetails(selectedRun.id);
-  }
-
   async function handleManualRunWithPatchedState() {
     if (!selectedRun || !selectedRunStepId || isBackendRunLocked) return;
 
     const runId = selectedRun.id;
     const stepId = selectedRunStepId;
-    const payload = buildInteractiveStagePayload();
+    const latestUserInput = stageUserInputRef.current;
 
     await runManualCapability(async () => {
-      const json = await runCurrentWorkflowStep(runId, stepId, payload);
-      await refreshSelectedRunArtifacts();
+      const json = await executeWorkflowStage(runId, stepId, latestUserInput, 'single');
       return json as Record<string, unknown>;
-    }, 'Executed current stage with interactive local state through backend workflow engine.');
+    }, 'Executed current stage through backend workflow engine.');
   }
 
   async function configureInference() {
@@ -7227,7 +7334,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : (
             <Grid align="start">
               <Grid.Col span={{ base: 12, xl: 7 }}>
-                <Stack>
+                <Stack
+                  ref={workflowDetailContentRef}
+                  style={{
+                    width: '100%'
+                  }}
+                >
                   <Card withBorder>
                     {selectedRun ? (
                       <Stack>
@@ -7420,7 +7532,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                     stageCompileError={stageCompileError}
                                     stageCompileCommandsText={stageCompileCommandsText}
                                     stageUserInput={stageUserInput}
-                                    onStageUserInputChange={setStageUserInput}
                                     onStageUserInputDraftChange={setStageUserInputDraft}
                                     inferenceConnectionStatus={inferenceConnectionStatus}
                                     inferenceTransport={inferenceTransport}
@@ -7462,19 +7573,71 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   </Stack>
                 </Grid.Col>
 
-                <Grid.Col span={{ base: 12, xl: 5 }}>
-                  <Card withBorder style={{ height: '100%' }}>
-                    <Stack h="100%">
-                      <Group justify="space-between">
+                <Grid.Col
+                  span={{ base: 12, xl: 5 }}
+                  style={{
+                    height: workflowDetailPanelHeight ?? undefined,
+                    minHeight: 320,
+                    display: 'flex',
+                    overflow: 'hidden'
+                  }}
+                >
+                  <Card
+                    withBorder
+                    style={{
+                      height: '100%',
+                      width: '100%',
+                      minHeight: 0,
+                      overflow: 'hidden',
+                      display: 'flex',
+                      flexDirection: 'column'
+                    }}
+                  >
+                    <Stack h="100%" gap="sm" style={{ minHeight: 0, flex: 1 }}>
+                      <Group justify="space-between" style={{ flexShrink: 0 }}>
                         <Group gap="xs">
                           <Title order={5}>Live workflow events</Title>
                           <Badge color={eventStreamStatus.color} variant="light">Stream {eventStreamStatus.label}</Badge>
                         </Group>
-                        <Button variant="light" size="xs" onClick={() => selectedRunId && void Promise.all([hydrateWorkflowEventsFromHistory(selectedRunId), hydrateRuntimeProjection(selectedRunId)])}>Refresh events</Button>
+                        <Group gap="xs" align="center">
+                <Text size="xs" c="dimmed">Event window
+                </Text>
+                <Select
+                  value={String(eventWindow)}
+                  onChange={(value) => {
+                    const next = Number(value);
+                    if (Number.isFinite(next) && next > 0) {
+                      setEventWindow(next);
+                    }
+                  }}
+                  data={['20', '50', '100', '200']}
+                  allowDeselect={false}
+                  size="xs"
+                  w={82}
+                />
+              </Group>
+              <Button
+                size="xs"
+                variant="light"
+                leftSection={<IconRefresh size={14} />}
+                onClick={() => {
+                  if (!selectedRunId) return;
+                  void Promise.all([
+                    hydrateWorkflowEventsFromHistory(selectedRunId, eventWindow),
+                    hydrateRuntimeProjection(selectedRunId, eventWindow)
+                  ]);
+                }}
+              >
+                Refresh events</Button>
                       </Group>
-                      {liveExecutionTrails.length > 0 ? (
-                        <Stack gap="xs">
-                          {liveExecutionTrails.map((trail, index) => {
+                      <ScrollArea
+                        type="auto"
+                        offsetScrollbars
+                        style={{ flex: 1, minHeight: 0 }}
+                      >
+                        {liveExecutionTrails.length > 0 ? (
+                          <Stack gap="xs" pr="xs">
+                            {liveExecutionTrails.map((trail, index) => {
                             const trailExpanded = isLiveExecutionExpanded(trail);
                             return (
                               <Box
@@ -7585,12 +7748,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 ) : null}
                               </Box>
                             );
-                          })}
-                        </Stack>
-                      ) : null}
-                      {liveExecutionTrails.length === 0 ? (
-                        <Text c="dimmed">No live executions yet.</Text>
-                      ) : null}
+                            })}
+                          </Stack>
+                        ) : null}
+                        {liveExecutionTrails.length === 0 ? (
+                          <Text c="dimmed">No live executions yet.</Text>
+                        ) : null}
+                      </ScrollArea>
                     </Stack>
                   </Card>
                 </Grid.Col>

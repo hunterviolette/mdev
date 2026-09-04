@@ -1,5 +1,6 @@
-use axum::{extract::{Path, State}, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -8,7 +9,7 @@ use crate::{
     db::new_workflow_key,
     app_state::AppState,
     engine::{self, capabilities::planner},
-    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun, WorkflowTemplateDefinition},
+    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
 };
 
 pub fn router() -> Router<AppState> {
@@ -143,17 +144,21 @@ async fn get_run(
         .await
         .map_err(internal)?;
 
-    if let Err(error) = state
-        .repo_sync
-        .activate_workflow(&state.db, run.id.to_string().as_str())
-        .await
-    {
-        tracing::warn!(
-            run_id = %run.id,
-            error = %format!("{:#}", error),
-            "workflow opened while Repo Sync runtime activation failed"
-        );
-    }
+    let repo_sync = state.repo_sync.clone();
+    let db = state.db.clone();
+    let repo_sync_run_id = run.id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = repo_sync
+            .activate_workflow(&db, repo_sync_run_id.as_str())
+            .await
+        {
+            tracing::warn!(
+                run_id = %repo_sync_run_id,
+                error = %format!("{:#}", error),
+                "workflow opened while Repo Sync runtime activation failed"
+            );
+        }
+    });
 
     Ok(Json(run))
 }
@@ -176,34 +181,85 @@ async fn open_run(
         .await
         .map_err(internal)?;
 
-    if let Err(error) = state
-        .repo_sync
-        .activate_workflow(&state.db, run.id.to_string().as_str())
-        .await
-    {
-        tracing::warn!(
-            run_id = %run.id,
-            error = %format!("{:#}", error),
-            "workflow opened while Repo Sync runtime activation failed"
-        );
-    }
+    let repo_sync = state.repo_sync.clone();
+    let db = state.db.clone();
+    let repo_sync_run_id = run.id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = repo_sync
+            .activate_workflow(&db, repo_sync_run_id.as_str())
+            .await
+        {
+            tracing::warn!(
+                run_id = %repo_sync_run_id,
+                error = %format!("{:#}", error),
+                "workflow opened while Repo Sync runtime activation failed"
+            );
+        }
+    });
 
     Ok(Json(run))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunEventsQuery {
+    limit: Option<i64>,
 }
 
 async fn list_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
-) -> Result<Json<Vec<WorkflowEvent>>, (axum::http::StatusCode, String)> {
+    Query(query): Query<RunEventsQuery>,
+) -> Result<Json<Vec<WorkflowEventStreamItem>>, (axum::http::StatusCode, String)> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 500);
     let rows = sqlx::query(
-        "SELECT id, run_id, step_id, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? ORDER BY sequence_no ASC, created_at ASC"
+        r#"
+        SELECT
+            id,
+            run_id,
+            step_id,
+            stage_execution_id,
+            capability_invocation_id,
+            parent_invocation_id,
+            sequence_no,
+            global_sequence_no,
+            level,
+            kind,
+            message,
+            payload_json,
+            created_at
+        FROM (
+            SELECT
+                id,
+                run_id,
+                step_id,
+                stage_execution_id,
+                capability_invocation_id,
+                parent_invocation_id,
+                sequence_no,
+                global_sequence_no,
+                level,
+                kind,
+                message,
+                payload_json,
+                created_at
+            FROM workflow_events
+            WHERE run_id = ?
+            ORDER BY sequence_no DESC
+            LIMIT ?
+        )
+        ORDER BY sequence_no ASC, created_at ASC
+        "#,
     )
     .bind(run_id.to_string())
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
 
-    let events = rows.into_iter().filter_map(row_to_event_readable).collect::<Vec<_>>();
+    let events = rows
+        .into_iter()
+        .filter_map(row_to_runtime_event_readable)
+        .collect::<Vec<_>>();
     Ok(Json(events))
 }
 
@@ -836,6 +892,29 @@ fn row_to_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEvent> 
             None
         }
     }
+}
+
+fn row_to_runtime_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEventStreamItem> {
+    let id = row.try_get::<String, _>("id").ok()?;
+    let run_id = row.try_get::<String, _>("run_id").ok()?;
+    let payload_raw = row.try_get::<String, _>("payload_json").unwrap_or_else(|_| "{}".to_string());
+    let payload = parse_event_payload_json(id.as_str(), payload_raw.as_str());
+
+    Some(WorkflowEventStreamItem {
+        id,
+        run_id,
+        step_id: row.try_get("step_id").ok().flatten(),
+        stage_execution_id: row.try_get("stage_execution_id").ok().flatten(),
+        capability_invocation_id: row.try_get("capability_invocation_id").ok().flatten(),
+        parent_invocation_id: row.try_get("parent_invocation_id").ok().flatten(),
+        sequence_no: row.try_get("sequence_no").ok()?,
+        global_sequence_no: row.try_get("global_sequence_no").unwrap_or(0),
+        level: row.try_get("level").ok()?,
+        kind: row.try_get("kind").ok()?,
+        message: row.try_get("message").ok()?,
+        payload,
+        created_at: row.try_get("created_at").ok()?,
+    })
 }
 
 fn parse_event_payload_json(event_id: &str, raw: &str) -> Value {

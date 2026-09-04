@@ -312,11 +312,21 @@ pub async fn execute(
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
+    let repo_sync_connected = if successful_actions > 0 {
+        ctx.state
+            .repo_sync
+            .outbound_auto_apply_connected(ctx.run_id.to_string().as_str())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     Ok(CapabilityResult {
         ok,
         capability: "changeset".to_string(),
         payload: result,
-        follow_ups: if successful_actions > 0 {
+        follow_ups: if repo_sync_connected {
             CapabilityInvocationRequest::One(CapabilityInvocation {
                 capability: "repo_sync_changeset".to_string(),
                 config: json!({}),

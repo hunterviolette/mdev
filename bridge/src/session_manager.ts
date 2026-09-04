@@ -468,7 +468,11 @@ export class SessionManager {
       isContentEditable: (el as HTMLElement).isContentEditable
     }));
 
-    await composer.click({ timeout: 20000 });
+    if (info.isContentEditable) {
+      await composer.evaluate((el) => (el as HTMLElement).focus());
+    } else {
+      await composer.focus();
+    }
 
     if (info.isContentEditable) {
       await composer.evaluate((el) => {
@@ -495,7 +499,7 @@ export class SessionManager {
       return;
     }
 
-    await composer.click({ timeout: 20000 });
+    await composer.evaluate((el) => (el as HTMLElement).focus());
     const spacer = text.startsWith('\n') ? '' : '\n\n';
     const value = spacer + text;
 
@@ -508,7 +512,7 @@ export class SessionManager {
   }
 
   private async pasteLargeContextAsClipboardText(page: Page, composer: Locator, text: string): Promise<void> {
-    await composer.click({ timeout: 20000 });
+    await composer.evaluate((el) => (el as HTMLElement).focus());
     await page.context().grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
     await page.evaluate(async (value) => {
       await navigator.clipboard.writeText(value);
@@ -630,7 +634,7 @@ export class SessionManager {
       }
 
       attempts += 1;
-      await submit.click({ timeout: Math.min(remainingMs, 20000) });
+      await submit.evaluate((el) => (el as HTMLButtonElement).click());
 
       const postClick = await this.waitForPostClickSendResult(page, composer, lastText, Math.min(deadline - Date.now(), 20000));
       if (postClick === 'cleared' || postClick === 'changed' || postClick === 'busy') {
@@ -1059,8 +1063,11 @@ export class SessionManager {
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const allVisible = await Promise.all(state.pendingUploads.map((name) => this.hasVisibleText(state.page, name)));
-      if (allVisible.every(Boolean)) {
+      const visibility = await Promise.all(state.pendingUploads.map(async (name) => ({
+        name,
+        visible: await this.hasVisibleText(state.page, name)
+      })));
+      if (visibility.every((item) => item.visible)) {
         return true;
       }
       await state.page.waitForTimeout(250);

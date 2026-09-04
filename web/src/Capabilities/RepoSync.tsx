@@ -582,12 +582,27 @@ export function RepoSync({ opened, onClose }: RepoSyncProps) {
 
         <Card withBorder>
           <Stack gap="xs">
-            <Text size="xs" c="dimmed" tt="uppercase" fw={700}>This computer</Text>
+            <Group justify="space-between">
+              <Text size="xs" c="dimmed" tt="uppercase" fw={700}>This computer</Text>
+              <Badge
+                color={status?.pairing_listener_running ? 'green' : 'gray'}
+                variant="light"
+              >
+                {status?.pairing_listener_running ? 'Pairing listener ready' : 'Pairing listener idle'}
+              </Badge>
+            </Group>
             {status?.local_ipv4 ? (
               <Group justify="space-between" align="center">
-                <Text size="lg" fw={700} ff="monospace">
-                  {status.local_ipv4}
-                </Text>
+                <Stack gap={0}>
+                  <Text size="lg" fw={700} ff="monospace">
+                    {status.local_ipv4}
+                  </Text>
+                  {status.pairing_listener_port ? (
+                    <Text size="xs" c="dimmed" ff="monospace">
+                      Pairing control: {status.local_ipv4}:{status.pairing_listener_port}
+                    </Text>
+                  ) : null}
+                </Stack>
                 <CopyButton value={status.local_ipv4}>
                   {({ copied, copy }) => (
                     <Button size="xs" variant="light" onClick={copy}>
@@ -597,7 +612,7 @@ export function RepoSync({ opened, onClose }: RepoSyncProps) {
                 </CopyButton>
               </Group>
             ) : (
-              <Text size="sm" c="dimmed">No LAN IPv4 address detected.</Text>
+              <Text size="sm" c="dimmed">LAN IPv4 detection is still initializing.</Text>
             )}
           </Stack>
         </Card>

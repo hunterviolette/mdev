@@ -616,6 +616,7 @@ export type RuntimeEventQuery = {
   repo_ref?: string | null;
   scope?: string | null;
   after_cursor?: number | null;
+  limit?: number | null;
 };
 
 export type WorkflowRunActionResult = {
@@ -639,6 +640,7 @@ export type RepoSyncMode = 'manual' | 'auto_apply';
 export type RepoSyncMapping = {
   id: string;
   workflow_run_id: string;
+  link_id?: string;
   peer_ipv4: string;
   peer_port?: number | null;
   direction: RepoSyncDirection;
@@ -667,7 +669,9 @@ export type RepoSyncStatus = {
   identity_ready: boolean;
   certificate_fingerprint: string;
   local_certificate_pem?: string;
-  local_ipv4?: string | null;
+  local_ipv4: string | null;
+  pairing_listener_running: boolean;
+  pairing_listener_port: number | null;
   pairings: RepoSyncPairingSession[];
   mappings: RepoSyncMapping[];
 };
@@ -772,9 +776,23 @@ export function buildWorkflowBuilderInferencePanel(body: {
   });
 }
 
+const repoSyncStatusRequests = new Map<string, Promise<RepoSyncStatus>>();
+
 export function getRepoSyncStatus(workflowRunId: string) {
-  const params = new URLSearchParams({ workflow_run_id: workflowRunId });
-  return fetchJson<RepoSyncStatus>(`/api/repo-sync/status?${params.toString()}`);
+  const key = workflowRunId.trim();
+  const existing = repoSyncStatusRequests.get(key);
+  if (existing) return existing;
+
+  const params = new URLSearchParams({ workflow_run_id: key });
+  const request = fetchJson<RepoSyncStatus>(`/api/repo-sync/status?${params.toString()}`)
+    .finally(() => {
+      if (repoSyncStatusRequests.get(key) === request) {
+        repoSyncStatusRequests.delete(key);
+      }
+    });
+
+  repoSyncStatusRequests.set(key, request);
+  return request;
 }
 
 export function upsertRepoSyncMapping(mapping: {
@@ -995,8 +1013,9 @@ export function deleteRun(runId: string) {
   });
 }
 
-export function listRunEvents(runId: string) {
-  return fetchJson<WorkflowEvent[]>(`/api/workflow-runs/${runId}/events`);
+export function listRunEvents(runId: string, limit = 20) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return fetchJson<StageExecutionEvent[]>(`/api/workflow-runs/${runId}/events?${params.toString()}`);
 }
 
 export function getEventChainSummary(runId: string) {
@@ -1017,6 +1036,7 @@ function runtimeEventQueryString(query: RuntimeEventQuery = {}) {
   if (query.repo_ref) params.set('repo_ref', query.repo_ref);
   if (query.scope) params.set('scope', query.scope);
   if (typeof query.after_cursor === 'number') params.set('after_cursor', String(query.after_cursor));
+  if (typeof query.limit === 'number') params.set('limit', String(query.limit));
   const value = params.toString();
   return value ? `?${value}` : '';
 }
@@ -1223,6 +1243,17 @@ export function listWorkflowCapabilities(runId: string) {
   return fetchJson<Record<string, unknown>>(`/api/workflow-runs/${runId}/capabilities`);
 }
 
+export function getWorkflowContextExportSummary(runId: string, config: Record<string, unknown>) {
+  return fetchJson<{
+    ok: boolean;
+    run_id: string;
+    included_file_count: number;
+  }>(`/api/workflow-runs/${runId}/context-export/summary`, {
+    method: 'POST',
+    body: JSON.stringify({ config })
+  });
+}
+
 export function executeWorkflowCapability(runId: string, capabilityId: string, input: unknown) {
   return fetchJson<Record<string, unknown>>(`/api/workflow-runs/${runId}/capabilities/${encodeURIComponent(capabilityId)}/execute`, {
     method: 'POST',
@@ -1290,9 +1321,11 @@ export type ChangesetAttemptSummary = {
 };
 
 export type ChangesetAttemptDetail = ChangesetAttemptSummary & {
-  payload_text: string;
-  normalized_payload_json: string;
-  result_json: unknown;
+  input: string;
+  output: {
+    summary: string;
+    lines: string[];
+  };
 };
 
 export type ApplyChangesetResponse = Record<string, unknown> & {

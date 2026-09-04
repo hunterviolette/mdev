@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { RepoSync } from './Capabilities/RepoSync';
-import { getRepoSyncStatus, type RepoSyncStatus } from './api';
 import { Badge, Button, Card, Group, SimpleGrid, Stack, Text, Title } from '@mantine/core';
 
 type GlobalCapabilitiesPanelProps = {
@@ -82,46 +81,12 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
   } = props;
 
   const [repoSyncOpen, setRepoSyncOpen] = useState(false);
-  const [repoSyncStatus, setRepoSyncStatus] = useState<RepoSyncStatus | null>(null);
 
-  const workflowRunId = useMemo(() => {
-    const match = window.location.pathname.match(/^\/workflows\/([^/]+)/);
-    return match?.[1] ? decodeURIComponent(match[1]) : '';
-  }, []);
-
-  async function refreshRepoSyncStatus() {
-    if (!workflowRunId) {
-      setRepoSyncStatus(null);
-      return;
-    }
-
-    try {
-      setRepoSyncStatus(await getRepoSyncStatus(workflowRunId));
-    } catch {
-      setRepoSyncStatus(null);
-    }
-  }
-
-  useEffect(() => {
-    if (!repoSyncOpen) {
-      void refreshRepoSyncStatus();
-    }
-  }, [workflowRunId, repoSyncOpen]);
-
-  const repoSyncMapping = repoSyncStatus?.mappings[0] ?? null;
-  const repoSyncTrusted = Boolean(repoSyncMapping?.peer_certificate_pem?.trim());
-  const repoSyncConnected = Boolean(repoSyncTrusted && repoSyncMapping?.connected);
-  const repoSyncAutoApply = Boolean(
-    repoSyncConnected && repoSyncMapping?.sync_mode === 'auto_apply'
-  );
-
-  const repoSyncBadge = repoSyncAutoApply
-    ? { label: 'Active', color: 'green' }
-    : repoSyncConnected
-      ? { label: 'Connected', color: 'green' }
-      : repoSyncTrusted
-        ? { label: 'Paired', color: 'blue' }
-        : { label: 'Unpaired', color: 'gray' };
+  const repoSyncBadge = repoSyncPaired
+    ? { label: repoSyncEnabled ? 'Active' : 'Paired', color: repoSyncEnabled ? 'green' : 'blue' }
+    : repoSyncEnabled
+      ? { label: 'Configured', color: 'blue' }
+      : { label: 'Unpaired', color: 'gray' };
 
   return (
     <Stack gap="md">
@@ -237,10 +202,7 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
 
       <RepoSync
         opened={repoSyncOpen}
-        onClose={() => {
-          setRepoSyncOpen(false);
-          void refreshRepoSyncStatus();
-        }}
+        onClose={() => setRepoSyncOpen(false)}
       />
     </Stack>
   );

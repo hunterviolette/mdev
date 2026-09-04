@@ -156,6 +156,10 @@ pub fn build_existing_context_sync_snapshot(payload: Value) -> Result<ContextSyn
     build_context_sync_snapshot_inner(payload)
 }
 
+pub fn resolve_context_export_file_count(payload: Value) -> Result<usize> {
+    Ok(build_context_sync_snapshot_inner(payload)?.files.len())
+}
+
 fn build_context_sync_snapshot_inner(
     payload: Value,
 ) -> Result<ContextSyncSnapshot> {

@@ -1,6 +1,10 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use anyhow::{bail, Result};
@@ -18,11 +22,46 @@ pub struct RuntimeEndpoint {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RuntimeEndpointManager;
+pub struct RuntimeEndpointManager {
+    local_lan_ipv4: Arc<RwLock<Option<Ipv4Addr>>>,
+    local_lan_ipv4_refreshing: Arc<AtomicBool>,
+}
 
 impl RuntimeEndpointManager {
     pub fn local_lan_ipv4(&self) -> Option<Ipv4Addr> {
-        detect_local_lan_ipv4()
+        self.local_lan_ipv4
+            .read()
+            .ok()
+            .and_then(|address| *address)
+    }
+
+    pub fn refresh_local_lan_ipv4_in_background(&self) {
+        if self.local_lan_ipv4().is_some() {
+            return;
+        }
+
+        if self
+            .local_lan_ipv4_refreshing
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let runtime_endpoints = self.clone();
+        tokio::spawn(async move {
+            let detected = tokio::task::spawn_blocking(detect_local_lan_ipv4)
+                .await
+                .ok()
+                .flatten();
+
+            if let Ok(mut cached) = runtime_endpoints.local_lan_ipv4.write() {
+                *cached = detected;
+            }
+
+            runtime_endpoints
+                .local_lan_ipv4_refreshing
+                .store(false, Ordering::Release);
+        });
     }
 
     pub fn reserve(
