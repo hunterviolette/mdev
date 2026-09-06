@@ -1,13 +1,11 @@
 import {
   Button,
   Card,
-  Checkbox,
   Group,
   Modal,
   NumberInput,
   Select,
   Stack,
-  Switch,
   Text,
   TextInput,
   Textarea,
@@ -15,13 +13,11 @@ import {
 import { IconPlus, IconTrash } from '@tabler/icons-react';
 
 import type {
-  DependencyProviderSpec,
   QaServiceSpec,
   TerminalCommandSpec,
 } from '../api';
 
 export type DeployQAValues = {
-  dependency_providers: string[];
   services: QaServiceSpec[];
   port_start: number;
   port_end: number;
@@ -32,8 +28,7 @@ export type DeployQAValues = {
 export type DeployQAProps = {
   opened: boolean;
   disabled?: boolean;
-  providers: DependencyProviderSpec[];
-  values: DeployQAValues;
+  values: DeployQAValues | null;
   onClose: () => void;
   onChange: <K extends keyof DeployQAValues>(key: K, value: DeployQAValues[K]) => void;
 };
@@ -57,59 +52,6 @@ function serviceCommand(
     timeout_seconds: null,
     continue_on_error: false,
   };
-}
-
-function mdevDefaultServices(): QaServiceSpec[] {
-  return [
-    {
-      id: 'web',
-      label: 'Web',
-      command: serviceCommand(
-        'deploy-qa-web',
-        'npm run dev',
-        'npm run dev -- --host 127.0.0.1 --port {port} --strictPort',
-        'web',
-        {
-          VITE_API_BASE_URL: '{service.api.internal_url}/api',
-        }
-      ),
-      port: {
-        environment_variable: 'WORKFLOW_WEB_PORT',
-        preferred: null,
-      },
-      readiness: {
-        kind: 'http',
-        path: '/',
-        expected_status: 200,
-        timeout_seconds: 60,
-      },
-      public: false,
-    },
-    {
-      id: 'api',
-      label: 'API',
-      command: serviceCommand(
-        'deploy-qa-api',
-        'cargo run',
-        'cargo run',
-        'api',
-        {
-          WORKFLOW_API_HOST: '127.0.0.1',
-        }
-      ),
-      port: {
-        environment_variable: 'WORKFLOW_API_PORT',
-        preferred: null,
-      },
-      readiness: {
-        kind: 'http',
-        path: '/api/health',
-        expected_status: 200,
-        timeout_seconds: 120,
-      },
-      public: false,
-    },
-  ];
 }
 
 function newService(index: number): QaServiceSpec {
@@ -162,26 +104,92 @@ function parseEnvironment(value: string): Record<string, string> {
   return environment;
 }
 
-export const defaultDeployQAValues: DeployQAValues = {
-  dependency_providers: [],
-  services: mdevDefaultServices(),
-  port_start: 24000,
-  port_end: 24999,
-  hostname_template: '{run}.qa.localhost',
-  shutdown_grace_seconds: 5,
-};
+export function deployQAValuesFromCapability(value: unknown): DeployQAValues | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const capability = value as Record<string, unknown>;
+  const environment = capability.environment;
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    return null;
+  }
+
+  const environmentRecord = environment as Record<string, unknown>;
+  const portRange = environmentRecord.port_range;
+  if (!portRange || typeof portRange !== 'object' || Array.isArray(portRange)) {
+    return null;
+  }
+
+  const portRangeRecord = portRange as Record<string, unknown>;
+  const services = environmentRecord.services;
+  const portStart = portRangeRecord.start;
+  const portEnd = portRangeRecord.end;
+  const hostnameTemplate = environmentRecord.hostname_template;
+  const shutdownGraceSeconds = environmentRecord.shutdown_grace_seconds;
+
+  if (
+    !Array.isArray(services)
+    || typeof portStart !== 'number'
+    || typeof portEnd !== 'number'
+    || typeof hostnameTemplate !== 'string'
+    || typeof shutdownGraceSeconds !== 'number'
+  ) {
+    return null;
+  }
+
+  return {
+    services: structuredClone(services) as QaServiceSpec[],
+    port_start: portStart,
+    port_end: portEnd,
+    hostname_template: hostnameTemplate,
+    shutdown_grace_seconds: shutdownGraceSeconds,
+  };
+}
+
+export function deployQACapabilityFromValues(
+  values: DeployQAValues,
+  current: unknown
+): Record<string, unknown> {
+  const capability = current && typeof current === 'object' && !Array.isArray(current)
+    ? structuredClone(current as Record<string, unknown>)
+    : {};
+  const currentEnvironment = capability.environment;
+  const environment = currentEnvironment && typeof currentEnvironment === 'object' && !Array.isArray(currentEnvironment)
+    ? structuredClone(currentEnvironment as Record<string, unknown>)
+    : {};
+
+  const nextCapability: Record<string, unknown> = {
+    ...capability,
+    environment: {
+      ...environment,
+      port_range: {
+        start: values.port_start,
+        end: values.port_end,
+      },
+      hostname_template: values.hostname_template,
+      services: structuredClone(values.services),
+      shutdown_grace_seconds: values.shutdown_grace_seconds,
+    },
+  };
+
+  delete nextCapability.dependency_providers;
+
+  return nextCapability;
+}
 
 export function DeployQA({
   opened,
   disabled = false,
-  providers,
   values,
   onClose,
   onChange,
 }: DeployQAProps) {
-  const sharedDependenciesEnabled = values.dependency_providers.length > 0;
+  if (!values) {
+    return null;
+  }
 
-  function updateService(index: number, next: QaServiceSpec) {
+  const updateService = (index: number, next: QaServiceSpec) => {
     onChange(
       'services',
       values.services.map((service, serviceIndex) =>
@@ -190,7 +198,7 @@ export function DeployQA({
           : { ...service, public: false }
       )
     );
-  }
+  };
 
   return (
     <Modal
@@ -201,51 +209,6 @@ export function DeployQA({
       centered
     >
       <Stack gap="md">
-        <Stack gap="xs">
-          <Group justify="space-between" align="flex-start">
-            <div>
-              <Text fw={600}>Shared dependencies</Text>
-              <Text size="sm" c="dimmed">
-                Optionally reuse trusted dependency providers before starting the deployment.
-              </Text>
-            </div>
-            <Switch
-              disabled={disabled || providers.length === 0}
-              checked={sharedDependenciesEnabled}
-              onChange={(event) =>
-                onChange(
-                  'dependency_providers',
-                  event.currentTarget.checked
-                    ? providers.map((provider) => provider.id)
-                    : []
-                )
-              }
-            />
-          </Group>
-
-          {sharedDependenciesEnabled ? (
-            <Checkbox.Group
-              value={values.dependency_providers}
-              onChange={(next) => onChange('dependency_providers', next)}
-            >
-              <Stack gap={4}>
-                {providers.map((provider) => (
-                  <Checkbox
-                    key={provider.id}
-                    value={provider.id}
-                    label={`${provider.label} · ${provider.ecosystem}`}
-                    disabled={disabled}
-                  />
-                ))}
-              </Stack>
-            </Checkbox.Group>
-          ) : (
-            <Text size="sm" c="dimmed">
-              The deployment will run without shared dependency reuse.
-            </Text>
-          )}
-        </Stack>
-
         <Group justify="space-between">
           <div>
             <Text fw={700}>Services</Text>
@@ -530,21 +493,7 @@ export function DeployQA({
           }
         />
 
-        <Group justify="space-between">
-          <Button
-            variant="default"
-            disabled={disabled}
-            onClick={() => {
-              onChange('dependency_providers', []);
-              onChange('services', mdevDefaultServices());
-              onChange('port_start', 24000);
-              onChange('port_end', 24999);
-              onChange('hostname_template', '{run}.qa.localhost');
-              onChange('shutdown_grace_seconds', 5);
-            }}
-          >
-            Reset MDEV defaults
-          </Button>
+        <Group justify="flex-end">
           <Button onClick={onClose}>Done</Button>
         </Group>
       </Stack>

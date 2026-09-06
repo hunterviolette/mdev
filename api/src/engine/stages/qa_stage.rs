@@ -142,16 +142,6 @@ fn prepare_qa_state(
     step: &WorkflowStepDefinition,
     mut local_state: Value,
 ) -> Result<Value> {
-    let qa = step
-        .execution
-        .qa
-        .as_ref()
-        .ok_or_else(|| anyhow!("QA stage '{}' is missing execution.qa configuration", step.id))?;
-
-    if qa.environment.services.is_empty() {
-        return Err(anyhow!("QA stage '{}' must define at least one service", step.id));
-    }
-
     let state = local_state
         .as_object_mut()
         .ok_or_else(|| anyhow!("QA stage local state must be an object"))?;
@@ -163,10 +153,6 @@ fn prepare_qa_state(
         }
     }));
     state.insert("global_state".to_string(), global_state.clone());
-    state.insert("qa".to_string(), serde_json::to_value(qa)?);
-    state.insert("execution".to_string(), json!({
-        "qa": qa
-    }));
 
     let execution_logic = state
         .entry("execution_logic".to_string())

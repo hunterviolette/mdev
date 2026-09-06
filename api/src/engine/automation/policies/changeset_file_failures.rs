@@ -4,13 +4,13 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::{
-    engine::capabilities::registry::CapabilityResult,
+    engine::{automation, capabilities::registry::CapabilityResult},
     models::{WorkflowRun, WorkflowStepDefinition},
 };
 
 use super::super::{
-    decisions::{ContextMutation, GovernanceDecision},
-    scopes::GovernanceScope,
+    decisions::{AutomationDecision, ContextMutation},
+    scopes::AutomationScope,
 };
 
 pub fn after_capability(
@@ -18,10 +18,34 @@ pub fn after_capability(
     _step: &WorkflowStepDefinition,
     result: &CapabilityResult,
     _prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     if result.capability != "changeset" {
         return Ok(Vec::new());
     }
+
+    let profile = automation::profile(run);
+    let inject_after = profile.inject_file_context_after_changeset_failures;
+    let inject_broad_after = profile.inject_broad_context_after_changeset_failures;
+    let pause_after = profile.pause_after_changeset_failures;
+    let inject_schema_after = profile.inject_changeset_schema_after_errors;
+    let inject_file_enabled = profile.is_selected("inject_file_context_after_changeset_failures");
+    let inject_broad_enabled = profile.is_selected("inject_broad_context_after_changeset_failures");
+    let pause_enabled = profile.is_selected("pause_after_changeset_failures");
+    let inject_schema_enabled = profile.is_selected("inject_changeset_schema_after_errors");
+    let payload_error = result
+        .payload
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "payload");
+    let previous_payload_errors = automation_value(run, "changeset_payload_errors")
+        .and_then(|value| value.get("consecutive"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let consecutive_payload_errors = if payload_error {
+        previous_payload_errors.saturating_add(1)
+    } else {
+        0
+    };
 
     let failing_files = failing_files_from_result(&result.payload);
     let mut next_files = existing_file_counts(run);
@@ -30,7 +54,7 @@ pub fn after_capability(
         for path in touched_files_from_result(&result.payload) {
             next_files.insert(path, Value::Number(0.into()));
         }
-    } else {
+    } else if !payload_error {
         for path in &failing_files {
             let next = next_files
                 .get(path)
@@ -41,37 +65,30 @@ pub fn after_capability(
         }
     }
 
-    let config = policy_config(run);
-    let inject_after = config
-        .get("inject_context_after_consecutive_failures")
-        .and_then(Value::as_u64)
-        .unwrap_or(2);
-    let inject_broad_after = config
-        .get("inject_broad_context_after_consecutive_failures")
-        .and_then(Value::as_u64)
-        .unwrap_or(4);
-    let pause_after = config
-        .get("pause_after_consecutive_failures")
-        .and_then(Value::as_u64)
-        .unwrap_or(6);
-
     let max_count = failing_files
         .iter()
         .filter_map(|path| next_files.get(path).and_then(Value::as_u64))
         .max()
         .unwrap_or(0);
 
-    let pause_reason = if max_count >= pause_after {
+    let pause_triggered = pause_enabled && !payload_error && max_count >= pause_after;
+    let pause_reason = if pause_triggered {
         Some(format!(
-            "ChangeSet file failure threshold exceeded after {} consecutive failures.",
+            "Changeset file failure threshold exceeded after {} consecutive failures.",
             max_count
         ))
     } else {
         None
     };
 
+    if pause_triggered {
+        for count in next_files.values_mut() {
+            *count = Value::Number(0.into());
+        }
+    }
+
     let mut patch = json!({
-        "governance": {
+        "automation": {
             "changeset_file_failures": {
                 "inject_context_after_consecutive_failures": inject_after,
                 "inject_broad_context_after_consecutive_failures": inject_broad_after,
@@ -80,11 +97,23 @@ pub fn after_capability(
                 "state": {
                     "files": Value::Object(next_files.clone())
                 }
+            },
+            "changeset_payload_errors": {
+                "inject_changeset_schema_after_consecutive_errors": inject_schema_after,
+                "consecutive": consecutive_payload_errors
             }
         }
     });
 
-    if !result.ok && max_count >= inject_broad_after {
+    if inject_schema_enabled && payload_error && consecutive_payload_errors >= inject_schema_after {
+        merge_json_values(&mut patch, &json!({
+            "capabilities": {
+                "inference": {
+                    "changeset_schema_armed": true
+                }
+            }
+        }));
+    } else if inject_broad_enabled && !result.ok && max_count >= inject_broad_after {
         merge_json_values(&mut patch, &json!({
             "capabilities": {
                 "inference": {
@@ -95,7 +124,7 @@ pub fn after_capability(
                 }
             }
         }));
-    } else if !result.ok && max_count >= inject_after && !failing_files.is_empty() {
+    } else if inject_file_enabled && !result.ok && max_count >= inject_after && !failing_files.is_empty() {
         merge_json_values(&mut patch, &json!({
             "capabilities": {
                 "inference": {
@@ -115,22 +144,16 @@ pub fn after_capability(
         }));
     }
 
-    Ok(vec![GovernanceDecision::MutateContext {
+    Ok(vec![AutomationDecision::MutateContext {
         mutation: ContextMutation {
-            scope: GovernanceScope::Global,
+            scope: AutomationScope::Global,
             patch,
         },
     }])
 }
 
-fn policy_config(run: &WorkflowRun) -> Value {
-    governance_value(run, "changeset_file_failures")
-        .cloned()
-        .unwrap_or_else(|| json!({}))
-}
-
 fn existing_file_counts(run: &WorkflowRun) -> Map<String, Value> {
-    governance_value(run, "changeset_file_failures")
+    automation_value(run, "changeset_file_failures")
         .and_then(|v| v.get("state"))
         .and_then(|v| v.get("files"))
         .and_then(Value::as_object)
@@ -138,13 +161,12 @@ fn existing_file_counts(run: &WorkflowRun) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn governance_value<'a>(run: &'a WorkflowRun, policy_key: &str) -> Option<&'a Value> {
-    let root = run.context.get("workflow_engine")?;
-
-    root.get("global_state")
-        .and_then(|global| global.get("governance"))
-        .and_then(|gov| gov.get(policy_key))
-        .or_else(|| root.get("governance").and_then(|gov| gov.get(policy_key)))
+fn automation_value<'a>(run: &'a WorkflowRun, policy_key: &str) -> Option<&'a Value> {
+    run.context
+        .get("workflow_engine")?
+        .get("global_state")?
+        .get("automation")?
+        .get(policy_key)
 }
 
 fn failing_files_from_result(result: &Value) -> Vec<String> {

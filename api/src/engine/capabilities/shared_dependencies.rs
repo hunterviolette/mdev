@@ -380,13 +380,6 @@ fn requested_provider_ids(ctx: &CapabilityContext<'_>) -> Vec<String> {
             .as_ref()
             .map(|compile| compile.dependency_providers.clone())
             .unwrap_or_default(),
-        "qa" => ctx
-            .step
-            .execution
-            .qa
-            .as_ref()
-            .map(|qa| qa.dependency_providers.clone())
-            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }

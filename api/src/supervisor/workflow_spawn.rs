@@ -310,10 +310,6 @@ async fn insert_and_start_run(
     let key = new_workflow_key(repo_path);
     let now = Utc::now();
     crate::routes::normalize_shared_dependencies(&mut definition.globals);
-    crate::routes::normalize_qa_environment(
-        &mut definition.globals,
-        &definition.steps,
-    );
     let requested_start_step_id = context
         .get("supervisor")
         .and_then(|value| value.get("workflow_start_step_id"))
@@ -353,8 +349,8 @@ async fn insert_and_start_run(
         updated_at: now,
     };
     if let Some(step) = initial_step {
-        let decisions = engine::governance::before_stage(state, id, &mut seeded_run, step).await?;
-        engine::governance::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)?;
+        let decisions = engine::automation::before_stage(state, id, &mut seeded_run, step).await?;
+        engine::automation::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)?;
         engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
     }
     context = seeded_run.context;

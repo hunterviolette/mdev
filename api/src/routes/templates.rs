@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     models::{CreateTemplateRequest, WorkflowTemplate, WorkflowTemplateDefinition},
-    routes::{normalize_shared_dependencies, workflow_builder::normalize_qa_environment},
+    routes::{normalize_qa_environment, normalize_shared_dependencies},
 };
 
 pub fn router() -> Router<AppState> {
@@ -167,7 +167,13 @@ async fn list_templates(State(state): State<AppState>) -> Result<Json<Vec<Workfl
         )
         .map_err(internal)?;
         normalize_shared_dependencies(&mut definition.globals);
-        normalize_qa_environment(&mut definition.globals, &definition.steps);
+        normalize_qa_environment(
+            &mut definition.globals,
+            definition
+                .steps
+                .iter()
+                .any(|step| step.step_type.trim().eq_ignore_ascii_case("qa")),
+        );
 
         out.push(WorkflowTemplate {
             id: parse_uuid(row.get("id"))?,
@@ -190,7 +196,13 @@ async fn create_template(
     let now = Utc::now();
     let mut definition = req.definition;
     normalize_shared_dependencies(&mut definition.globals);
-    normalize_qa_environment(&mut definition.globals, &definition.steps);
+    normalize_qa_environment(
+        &mut definition.globals,
+        definition
+            .steps
+            .iter()
+            .any(|step| step.step_type.trim().eq_ignore_ascii_case("qa")),
+    );
     let definition_json = serde_json::to_string_pretty(&definition).map_err(internal)?;
 
     let existing = sqlx::query(

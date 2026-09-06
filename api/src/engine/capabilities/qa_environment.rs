@@ -24,12 +24,9 @@ use crate::engine::{
     runtime_tools::{
         QaEnvironmentSpec,
         QaReadinessSpec,
-        QaServicePortSpec,
-        QaServiceSpec,
         QaStageSpec,
         TerminalCommandMode,
         TerminalCommandSpec,
-        TerminalShell,
     },
 };
 
@@ -49,8 +46,7 @@ pub async fn execute(
     prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
-    let mut qa = resolve_qa_spec(ctx, config)?;
-    ensure_default_service(&mut qa);
+    let qa = resolve_qa_spec(ctx, config)?;
     validate_environment(&qa.environment)?;
 
     let repo_ref = ctx
@@ -358,17 +354,11 @@ async fn wait_for_service_readiness(
     }
 }
 
-fn resolve_qa_spec(ctx: &CapabilityContext<'_>, config: Value) -> Result<QaStageSpec> {
-    if !config.is_null() && config != json!({}) {
-        return serde_json::from_value(config)
-            .map_err(|error| anyhow!("invalid QA environment configuration: {}", error));
-    }
-
+fn resolve_qa_spec(ctx: &CapabilityContext<'_>, _config: Value) -> Result<QaStageSpec> {
     let capability = ctx
         .local_state
         .get("capabilities")
         .and_then(|value| value.get("qa_environment"))
-        .filter(|value| value.is_object())
         .cloned()
         .ok_or_else(|| {
             anyhow!(
@@ -377,113 +367,8 @@ fn resolve_qa_spec(ctx: &CapabilityContext<'_>, config: Value) -> Result<QaStage
             )
         })?;
 
-    compact_qa_capability_to_stage_spec(capability)
-}
-
-fn compact_qa_capability_to_stage_spec(value: Value) -> Result<QaStageSpec> {
-    if value.get("environment").is_some() {
-        return serde_json::from_value(value)
-            .map_err(|error| anyhow!("invalid legacy QA environment configuration: {}", error));
-    }
-
-    let port_range = value
-        .get("port_range")
-        .cloned()
-        .unwrap_or_else(|| json!({ "start": 24000, "end": 24999 }));
-
-    let services = value
-        .get("services")
-        .and_then(Value::as_array)
-        .map(|services| {
-            services
-                .iter()
-                .enumerate()
-                .map(|(index, service)| {
-                    let id = service
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("service");
-                    let label = service
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id);
-                    let command = service
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let working_directory = service
-                        .get("working_directory")
-                        .and_then(Value::as_str)
-                        .unwrap_or(".");
-                    let environment = service
-                        .get("environment")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let readiness = service
-                        .get("readiness")
-                        .cloned()
-                        .unwrap_or_else(|| json!({
-                            "kind": "http",
-                            "path": "/",
-                            "timeout_seconds": 60
-                        }));
-
-                    json!({
-                        "id": id,
-                        "label": label,
-                        "command": {
-                            "id": format!("qa-service-{}", index + 1),
-                            "label": label,
-                            "command": command,
-                            "arguments": [],
-                            "working_directory": working_directory,
-                            "environment": environment,
-                            "shell": "system",
-                            "mode": "service",
-                            "timeout_seconds": null,
-                            "continue_on_error": false
-                        },
-                        "port": {
-                            "environment_variable": service
-                                .get("port_environment_variable")
-                                .and_then(Value::as_str)
-                                .unwrap_or("PORT"),
-                            "preferred": service
-                                .get("preferred_port")
-                                .cloned()
-                                .unwrap_or(Value::Null)
-                        },
-                        "readiness": readiness,
-                        "public": service
-                            .get("public")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    serde_json::from_value(json!({
-        "dependency_providers": [],
-        "environment": {
-            "port_range": port_range,
-            "hostname_template": value
-                .get("hostname_template")
-                .and_then(Value::as_str)
-                .unwrap_or("{run}.qa.localhost"),
-            "prepare": {
-                "commands": [],
-                "stop_on_failure": true
-            },
-            "services": services,
-            "shutdown_grace_seconds": value
-                .get("shutdown_grace_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(5)
-        }
-    }))
-    .map_err(|error| anyhow!("invalid compact QA environment capability configuration: {}", error))
+    serde_json::from_value(capability)
+        .map_err(|error| anyhow!("invalid QA environment configuration: {}", error))
 }
 
 fn shared_dependency_environment(
@@ -512,78 +397,6 @@ fn shared_dependency_environment(
     }
 
     environment
-}
-
-fn ensure_default_service(qa: &mut QaStageSpec) {
-    if !qa.environment.services.is_empty() {
-        return;
-    }
-
-    let mut web_environment = BTreeMap::new();
-    web_environment.insert(
-        "VITE_API_BASE_URL".to_string(),
-        "{service.api.internal_url}/api".to_string(),
-    );
-
-    qa.environment.services.push(QaServiceSpec {
-        id: "web".to_string(),
-        label: "Web".to_string(),
-        command: TerminalCommandSpec {
-            id: "deploy-qa-web".to_string(),
-            label: "npm run dev".to_string(),
-            command: "npm --prefix web run dev -- --host 127.0.0.1 --port {port} --strictPort --force".to_string(),
-            arguments: Vec::new(),
-            working_directory: ".".to_string(),
-            environment: web_environment,
-            shell: TerminalShell::System,
-            mode: TerminalCommandMode::Service,
-            timeout_seconds: None,
-            continue_on_error: false,
-        },
-        port: QaServicePortSpec {
-            environment_variable: "WORKFLOW_WEB_PORT".to_string(),
-            preferred: None,
-        },
-        readiness: QaReadinessSpec::Http {
-            path: "/".to_string(),
-            expected_status: Some(200),
-            timeout_seconds: 60,
-        },
-        public: false,
-    });
-
-    let mut api_environment = BTreeMap::new();
-    api_environment.insert(
-        "WORKFLOW_API_HOST".to_string(),
-        "127.0.0.1".to_string(),
-    );
-
-    qa.environment.services.push(QaServiceSpec {
-        id: "api".to_string(),
-        label: "API".to_string(),
-        command: TerminalCommandSpec {
-            id: "deploy-qa-api".to_string(),
-            label: "cargo run".to_string(),
-            command: "cargo run --manifest-path api/Cargo.toml".to_string(),
-            arguments: Vec::new(),
-            working_directory: ".".to_string(),
-            environment: api_environment,
-            shell: TerminalShell::System,
-            mode: TerminalCommandMode::Service,
-            timeout_seconds: None,
-            continue_on_error: false,
-        },
-        port: QaServicePortSpec {
-            environment_variable: "WORKFLOW_API_PORT".to_string(),
-            preferred: None,
-        },
-        readiness: QaReadinessSpec::Http {
-            path: "/api/health".to_string(),
-            expected_status: Some(200),
-            timeout_seconds: 120,
-        },
-        public: false,
-    });
 }
 
 fn root_scoped_service_command(command: &str, working_directory: &str) -> String {

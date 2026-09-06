@@ -205,6 +205,7 @@ pub async fn execute(
             capability: "changeset".to_string(),
             payload: json!({
                 "ok": false,
+                "error_kind": "payload",
                 "summary": "Inference returned an empty ChangeSet payload.",
                 "payload_text": payload_text,
             }),
@@ -220,31 +221,54 @@ pub async fn execute(
     let target = resolve_apply_changeset_target(ctx, config)?;
     let started = Instant::now();
 
-    let result = match execute_changeset_apply(
-        PathBuf::from(&target.repo_ref).as_path(),
-        &payload_text,
-        &target.git_ref,
-    ) {
-        Ok(result) => result,
+    let result = match normalize_changeset_payload_text(&payload_text) {
         Err(err) => json!({
             "ok": false,
+            "error_kind": "payload",
             "mode": "changeset_apply",
-            "summary": format!("ChangeSet apply failed: {:#}", err),
+            "summary": format!("Invalid ChangeSet payload: {:#}", err),
             "payload_text": payload_text,
-            "lines": [format!("ChangeSet parse/apply error :: {:#}", err)],
+            "lines": [format!("ChangeSet payload error :: {:#}", err)],
             "target": {
                 "repo_ref": target.repo_ref,
                 "git_ref": target.git_ref,
             },
             "stats": {
                 "successful_operations": 0,
-                "failed_operations": 1,
+                "failed_operations": 0,
                 "total_operations": 0,
                 "successful_actions": 0,
-                "failed_actions": 1,
-                "total_actions": 1
+                "failed_actions": 0,
+                "total_actions": 0
             }
         }),
+        Ok(_) => match execute_changeset_apply(
+            PathBuf::from(&target.repo_ref).as_path(),
+            &payload_text,
+            &target.git_ref,
+        ) {
+            Ok(result) => result,
+            Err(err) => json!({
+                "ok": false,
+                "error_kind": "apply",
+                "mode": "changeset_apply",
+                "summary": format!("ChangeSet apply failed: {:#}", err),
+                "payload_text": payload_text,
+                "lines": [format!("ChangeSet apply error :: {:#}", err)],
+                "target": {
+                    "repo_ref": target.repo_ref,
+                    "git_ref": target.git_ref,
+                },
+                "stats": {
+                    "successful_operations": 0,
+                    "failed_operations": 1,
+                    "total_operations": 0,
+                    "successful_actions": 0,
+                    "failed_actions": 1,
+                    "total_actions": 1
+                }
+            }),
+        },
     };
 
     let mut result = result;

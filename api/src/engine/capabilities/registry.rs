@@ -12,7 +12,7 @@ use crate::{
         append_engine_event,
         ensure_engine_root,
         event_meta,
-        governance,
+        automation,
         load_run,
         orchestration_inputs::{
             AttachmentRole,
@@ -352,27 +352,27 @@ pub(crate) async fn execute_capability_chain(
         queue.remove(0);
         ensure_allowed(policy, invocation.capability.as_str())?;
 
-        let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
-        let before_decisions = governance::before_capability(
+        let mut automation_run = load_run(ctx.state, ctx.run_id).await?;
+        let before_decisions = automation::before_capability(
             ctx.state,
             ctx.run_id,
-            &governance_run,
+            &automation_run,
             ctx.step,
             stage_execution_id.as_deref(),
             &invocation,
             &results,
         )
         .await?;
-        governance::apply_context_mutations(
-            &mut governance_run,
+        automation::apply_context_mutations(
+            &mut automation_run,
             &before_decisions,
             Some(ctx.step.id.as_str()),
             Some(invocation.capability.as_str()),
         )?;
         if !before_decisions.is_empty() {
-            persist_context(ctx.state, ctx.run_id, &governance_run.context).await?;
+            persist_context(ctx.state, ctx.run_id, &automation_run.context).await?;
         }
-        for injected in governance::injected_capabilities(&before_decisions).into_iter().rev() {
+        for injected in automation::injected_capabilities(&before_decisions).into_iter().rev() {
             if injected.capability != invocation.capability && !queue.iter().any(|item| item.capability == injected.capability) {
                 queue.insert(0, injected);
             }
@@ -502,31 +502,31 @@ pub(crate) async fn execute_capability_chain(
 
         ctx.ensure_active()?;
 
-        let mut governance_run = load_run(ctx.state, ctx.run_id).await?;
-        let after_decisions = governance::after_capability(
+        let mut automation_run = load_run(ctx.state, ctx.run_id).await?;
+        let after_decisions = automation::after_capability(
             ctx.state,
             ctx.run_id,
-            &governance_run,
+            &automation_run,
             ctx.step,
             stage_execution_id.as_deref(),
             &result,
             &results,
         )
         .await?;
-        governance::apply_context_mutations(
-            &mut governance_run,
+        automation::apply_context_mutations(
+            &mut automation_run,
             &after_decisions,
             Some(ctx.step.id.as_str()),
             Some(result.capability.as_str()),
         )?;
         if !after_decisions.is_empty() {
-            persist_context(ctx.state, ctx.run_id, &governance_run.context).await?;
+            persist_context(ctx.state, ctx.run_id, &automation_run.context).await?;
         }
-        let governance_pause_requested = governance::pause_message(&after_decisions).is_some();
-        let governance_follow_ups = if governance_pause_requested {
+        let automation_pause_requested = automation::pause_message(&after_decisions).is_some();
+        let automation_follow_ups = if automation_pause_requested {
             Vec::new()
         } else {
-            governance::injected_capabilities(&after_decisions)
+            automation::injected_capabilities(&after_decisions)
         };
 
         if let Some(payload) = result.payload.as_object_mut() {
@@ -594,7 +594,7 @@ pub(crate) async fn execute_capability_chain(
 
         let mut follow_ups = capability_follow_ups
             .into_iter()
-            .chain(governance_follow_ups.into_iter())
+            .chain(automation_follow_ups.into_iter())
             .filter(|item| !existing_capabilities.contains(&item.capability))
             .collect::<Vec<_>>();
 
@@ -619,7 +619,7 @@ pub(crate) async fn execute_capability_chain(
 
         queue.extend(follow_ups);
         results.push(result);
-        if governance_pause_requested || checkpoint_stops_chain {
+        if automation_pause_requested || checkpoint_stops_chain {
             break;
         }
     }

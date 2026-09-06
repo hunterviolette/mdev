@@ -639,16 +639,6 @@ fn seed_missing_browser_session_rearm(context: &mut Value) {
     inference_obj.remove("active_prompt_fragments");
 }
 
-fn seed_governance_context_from_definition(context: &mut Value, definition: &WorkflowTemplateDefinition) {
-    let root = engine::ensure_engine_root(context);
-    let governance = root.entry("governance".to_string()).or_insert_with(|| json!({}));
-    if !governance.is_object() {
-        *governance = json!({});
-    }
-
-    engine::merge_json_values(governance, &definition.governance);
-}
-
 async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
@@ -664,7 +654,7 @@ async fn create_run(
         .unwrap_or_else(|| new_workflow_key(&req.repo_ref));
     let status = RunStatus::Waiting;
 
-    let definition = if let Some(definition) = req.definition.clone() {
+    let mut definition = if let Some(definition) = req.definition.clone() {
         definition
     } else if let Some(template_id) = req.template_id {
         let template_row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
@@ -678,6 +668,15 @@ async fn create_run(
     } else {
         return Err((axum::http::StatusCode::BAD_REQUEST, "definition or template_id is required".to_string()));
     };
+
+    crate::routes::normalize_shared_dependencies(&mut definition.globals);
+    crate::routes::normalize_qa_environment(
+        &mut definition.globals,
+        definition
+            .steps
+            .iter()
+            .any(|step| step.step_type.trim().eq_ignore_ascii_case("qa")),
+    );
 
     let mut run_context = req.context.clone();
     let current_step_id = definition.steps.first().map(|step| step.id.clone());
@@ -730,13 +729,12 @@ async fn create_run(
         updated_at: now,
     };
     seed_missing_browser_session_rearm(&mut seeded_run.context);
-    seed_governance_context_from_definition(&mut seeded_run.context, &definition);
     seed_compile_command_context_from_definition(&mut seeded_run.context, &definition);
     if let Some(step) = initial_step {
-        let decisions = engine::governance::before_stage(&state, id, &mut seeded_run, step)
+        let decisions = engine::automation::before_stage(&state, id, &mut seeded_run, step)
             .await
             .map_err(internal)?;
-        engine::governance::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)
+        engine::automation::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)
             .map_err(internal)?;
         engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
     }

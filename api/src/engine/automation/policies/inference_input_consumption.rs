@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::super::{
-    decisions::{ContextMutation, GovernanceDecision},
-    scopes::GovernanceScope,
+    decisions::{AutomationDecision, ContextMutation},
+    scopes::AutomationScope,
 };
 
 pub fn after_stage(
@@ -16,7 +16,7 @@ pub fn after_stage(
     step: &WorkflowStepDefinition,
     _stage_execution_id: &str,
     capability_results: &[Value],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     let contract = stages::capability_contract_for_stage(step);
     if !contract.contains("inference") {
         return Ok(Vec::new());
@@ -114,9 +114,9 @@ pub fn after_stage(
         capabilities_patch.insert("planner".to_string(), Value::Object(planner_patch));
     }
 
-    Ok(vec![GovernanceDecision::MutateContext {
+    Ok(vec![AutomationDecision::MutateContext {
         mutation: ContextMutation {
-            scope: GovernanceScope::Global,
+            scope: AutomationScope::Global,
             patch: json!({
                 "capabilities": Value::Object(capabilities_patch)
             }),

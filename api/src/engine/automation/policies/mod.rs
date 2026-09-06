@@ -8,7 +8,7 @@ use crate::{
     models::{WorkflowRun, WorkflowStepDefinition},
 };
 
-use super::decisions::GovernanceDecision;
+use super::decisions::AutomationDecision;
 
 pub mod changeset_file_failures;
 pub mod compile_failures;
@@ -20,7 +20,7 @@ pub async fn before_stage(
     _run_id: Uuid,
     _run: &mut WorkflowRun,
     _step: &WorkflowStepDefinition,
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     Ok(Vec::new())
 }
 
@@ -31,7 +31,7 @@ pub async fn after_stage(
     step: &WorkflowStepDefinition,
     stage_execution_id: &str,
     capability_results: &[Value],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     let latest_run = crate::engine::load_run(state, run_id)
         .await
         .unwrap_or_else(|_| run.clone());
@@ -56,7 +56,7 @@ pub async fn before_capability(
     _stage_execution_id: Option<&str>,
     _invocation: &CapabilityInvocation,
     _prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     Ok(Vec::new())
 }
 
@@ -68,7 +68,7 @@ pub async fn after_capability(
     _stage_execution_id: Option<&str>,
     result: &CapabilityResult,
     prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     let mut decisions = Vec::new();
     decisions.extend(crate::engine::stages::automation_after_capability(
         run,
@@ -84,7 +84,7 @@ pub async fn after_capability(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("Repo Sync Auto Apply failed");
-        decisions.push(GovernanceDecision::Pause {
+        decisions.push(AutomationDecision::Pause {
             reason: format!("Repo Sync Auto Apply failed: {}", reason),
         });
     }

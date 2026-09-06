@@ -4,7 +4,7 @@ use crate::engine::capabilities::inference::panel::{build_inference_config_panel
 
 use crate::{
     app_state::AppState,
-    engine::stages,
+    engine::{automation, stages},
     engine::capabilities::planner,
     engine::capabilities::inference::stage_support::{
         build_inference_execution_plan,
@@ -22,7 +22,6 @@ use crate::{
         WorkflowCapabilityBinding,
         WorkflowCapabilitySummaryItem,
         WorkflowGlobalConfig,
-        WorkflowGovernancePolicyDescriptor,
         WorkflowStageDescriptor,
         WorkflowStageField,
         WorkflowStageFieldGroup,
@@ -114,6 +113,14 @@ async fn compile_document(
 
     normalize_global_planner_fragment(state, &mut globals).await.map_err(internal)?;
     normalize_shared_dependencies(&mut globals);
+    normalize_qa_environment(
+        &mut globals,
+        document
+            .stages
+            .iter()
+            .any(|stage| stage.step_type.trim().eq_ignore_ascii_case("qa")),
+    )
+    .map_err(|message| (axum::http::StatusCode::BAD_REQUEST, message))?;
 
     let global_state = serde_json::to_value(&globals).map_err(internal)?;
     let repo_ref = globals
@@ -143,8 +150,6 @@ async fn compile_document(
         warnings.push("Builder document has no stages.".to_string());
     }
 
-    normalize_qa_environment(&mut globals, &steps);
-
     let capability_summary = compile_workflow_capability_summary(&globals, &steps).map_err(internal)?;
 
     Ok(CompileWorkflowBuilderResponse {
@@ -152,8 +157,7 @@ async fn compile_document(
         definition: WorkflowTemplateDefinition {
             version: 1,
             globals,
-            governance: compile_governance(&catalog, &steps, &document.governance)
-                .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err))?,
+            governance: json!({}),
             steps,
         },
         capability_summary,
@@ -224,43 +228,10 @@ fn compile_stage(
         }
     }
 
-    normalize_qa_readiness_discriminators(&mut step_value);
-
     let mut step: WorkflowStepDefinition = serde_json::from_value(step_value).map_err(|err| err.to_string())?;
     planner::normalize_planner_features(&mut step, global_state, repo_ref);
     normalize_compile_commands_from_text(&mut step);
     Ok(step)
-}
-
-fn normalize_qa_readiness_discriminators(step: &mut Value) {
-    let Some(services) = step
-        .get_mut("execution")
-        .and_then(|value| value.get_mut("qa"))
-        .and_then(|value| value.get_mut("environment"))
-        .and_then(|value| value.get_mut("services"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-
-    for service in services {
-        let Some(readiness) = service
-            .get_mut("readiness")
-            .and_then(Value::as_object_mut)
-        else {
-            continue;
-        };
-
-        if !readiness.contains_key("kind") {
-            if let Some(value) = readiness.remove("type") {
-                readiness.insert("kind".to_string(), value);
-            } else {
-                readiness.insert("kind".to_string(), Value::String("http".to_string()));
-            }
-        } else {
-            readiness.remove("type");
-        }
-    }
 }
 
 async fn normalize_global_planner_fragment(
@@ -349,14 +320,6 @@ fn compile_workflow_capability_summary(
             stage_keys.dedup();
         }
 
-        if builder_stage_uses_automation(&global_state, step)
-            && !stage_keys.iter().any(|key| key == "automation")
-        {
-            stage_keys.push("automation".to_string());
-            stage_keys.sort();
-            stage_keys.dedup();
-        }
-
         for key in stage_keys {
             let entry = by_key.entry(key.clone()).or_insert_with(|| WorkflowCapabilitySummaryItem {
                 key: key.clone(),
@@ -385,18 +348,6 @@ fn builder_stage_uses_inference(step: &WorkflowStepDefinition) -> bool {
             .get("connections")
             .and_then(|v| v.get("inference"))
             .is_some()
-}
-
-fn builder_stage_uses_automation(
-    global_state: &Value,
-    step: &WorkflowStepDefinition,
-) -> bool {
-    let profile = crate::engine::capabilities::automation::profile_from_global_state(global_state);
-
-    profile.enabled
-        && profile.new_session.iter().any(|capability| {
-            crate::engine::stages::stage_supports_capability(step, capability)
-        })
 }
 
 fn materialize_builder_stage_state(step: &WorkflowStepDefinition) -> Value {
@@ -504,47 +455,6 @@ fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<Stag
         .collect()
 }
 
-
-fn compile_governance(
-    catalog: &WorkflowBuilderCatalog,
-    steps: &[WorkflowStepDefinition],
-    governance: &Value,
-) -> Result<Value, String> {
-    let mut available = std::collections::BTreeMap::new();
-    for descriptor in &catalog.stage_descriptors {
-        if !steps.iter().any(|step| step.step_type == descriptor.step_type) {
-            continue;
-        }
-
-        for policy in &descriptor.available_governance_policies {
-            available.entry(policy.key.clone()).or_insert_with(|| policy.clone());
-        }
-    }
-
-    let Some(governance_obj) = governance.as_object() else {
-        return Ok(json!({}));
-    };
-
-    let mut compiled = json!({});
-    for (policy_key, selected_config) in governance_obj {
-        let Some(policy_descriptor) = available.get(policy_key) else {
-            return Err(format!("governance policy '{}' is not available", policy_key));
-        };
-
-        let mut config = json!({});
-        for field in &policy_descriptor.fields {
-            let selected_value = selected_config
-                .get(&field.key)
-                .cloned()
-                .unwrap_or_else(|| field.default.clone());
-            set_path(&mut config, &field.key, selected_value)
-                .map_err(|err| format!("governance policy '{}': {}", policy_key, err))?;
-        }
-        set_path(&mut compiled, policy_key, config)?;
-    }
-
-    Ok(compiled)
-}
 
 pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) {
     let capability_value = globals
@@ -660,227 +570,55 @@ pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) 
     globals.shared_dependencies = Default::default();
 }
 
+fn default_builder_catalog() -> WorkflowBuilderCatalog {
+    WorkflowBuilderCatalog {
+        version: 2,
+        stage_descriptors: stages::registered_stage_descriptors(),
+        automation_controls: automation::control_descriptors(),
+    }
+}
+
 pub(crate) fn normalize_qa_environment(
     globals: &mut WorkflowGlobalConfig,
-    steps: &[WorkflowStepDefinition],
-) {
+    has_qa_stage: bool,
+) -> Result<(), String> {
+    if !has_qa_stage {
+        return Ok(());
+    }
+
     if !globals.capabilities.is_object() {
         globals.capabilities = json!({});
     }
 
-    let source = globals
+    let capabilities = globals
         .capabilities
+        .as_object_mut()
+        .expect("workflow capabilities must be an object");
+
+    let normalized = capabilities
         .get("qa_environment")
         .cloned()
-        .or_else(|| {
-            steps
-                .iter()
-                .find(|step| step.step_type == "qa")
-                .and_then(|step| step.execution.qa.as_ref())
-                .and_then(|qa| serde_json::to_value(qa).ok())
-        });
+        .and_then(|value| {
+            let has_environment = value
+                .get("environment")
+                .map(Value::is_object)
+                .unwrap_or(false);
 
-    let Some(source) = source else {
-        if let Some(capabilities) = globals.capabilities.as_object_mut() {
-            capabilities.remove("qa_environment");
-        }
-        return;
-    };
+            if !has_environment {
+                return None;
+            }
 
-    let environment = source.get("environment").unwrap_or(&source);
-    let port_range = environment
-        .get("port_range")
-        .cloned()
-        .unwrap_or_else(|| json!({ "start": 24000, "end": 24999 }));
-    let hostname_template = environment
-        .get("hostname_template")
-        .and_then(Value::as_str)
-        .unwrap_or("{run}.qa.localhost");
-    let shutdown_grace_seconds = environment
-        .get("shutdown_grace_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(5);
-
-    let services = environment
-        .get("services")
-        .and_then(Value::as_array)
-        .map(|services| {
-            services
-                .iter()
-                .filter_map(|service| {
-                    let id = service.get("id")?.as_str()?;
-                    let label = service
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id);
-                    let command_value = service.get("command")?;
-                    let command = command_value
-                        .as_str()
-                        .or_else(|| command_value.get("command").and_then(Value::as_str))?;
-                    let working_directory = service
-                        .get("working_directory")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            command_value
-                                .get("working_directory")
-                                .and_then(Value::as_str)
-                        })
-                        .unwrap_or(".");
-                    let command_environment = command_value
-                        .get("environment")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let service_environment = service
-                        .get("environment")
-                        .cloned()
-                        .unwrap_or(command_environment);
-                    let port = service.get("port").cloned().unwrap_or_else(|| json!({}));
-                    let readiness = service
-                        .get("readiness")
-                        .cloned()
-                        .unwrap_or_else(|| json!({
-                            "kind": "http",
-                            "path": "/",
-                            "timeout_seconds": 60
-                        }));
-
-                    Some(json!({
-                        "id": id,
-                        "label": label,
-                        "command": command,
-                        "working_directory": working_directory,
-                        "environment": service_environment,
-                        "port_environment_variable": port
-                            .get("environment_variable")
-                            .and_then(Value::as_str)
-                            .or_else(|| {
-                                service
-                                    .get("port_environment_variable")
-                                    .and_then(Value::as_str)
-                            })
-                            .unwrap_or("PORT"),
-                        "preferred_port": port
-                            .get("preferred")
-                            .cloned()
-                            .or_else(|| service.get("preferred_port").cloned())
-                            .unwrap_or(Value::Null),
-                        "readiness": readiness,
-                        "public": service
-                            .get("public")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    }))
-                })
-                .collect::<Vec<_>>()
+            serde_json::from_value::<crate::engine::runtime_tools::QaStageSpec>(value).ok()
         })
         .unwrap_or_default();
 
-    if let Some(capabilities) = globals.capabilities.as_object_mut() {
-        capabilities.insert(
-            "qa_environment".to_string(),
-            json!({
-                "enabled": true,
-                "port_range": port_range,
-                "hostname_template": hostname_template,
-                "services": services,
-                "shutdown_grace_seconds": shutdown_grace_seconds
-            }),
-        );
-    }
-}
+    capabilities.insert(
+        "qa_environment".to_string(),
+        serde_json::to_value(normalized)
+            .expect("QA environment must serialize"),
+    );
 
-fn governance_policy_descriptor(key: &str) -> Option<WorkflowGovernancePolicyDescriptor> {
-    match key {
-        "changeset_file_failures" => Some(changeset_governance_policy_descriptor()),
-        "compile_failures" => Some(compile_governance_policy_descriptor()),
-        _ => None,
-    }
-}
-
-fn default_builder_catalog() -> WorkflowBuilderCatalog {
-    let mut stage_descriptors = stages::registered_stage_descriptors();
-
-    for descriptor in &mut stage_descriptors {
-        descriptor.available_governance_policies = stages::automation_policy_keys_for_stage_type(&descriptor.step_type)
-            .iter()
-            .filter_map(|key| governance_policy_descriptor(key))
-            .collect();
-    }
-
-    WorkflowBuilderCatalog {
-        version: 2,
-        stage_descriptors,
-    }
-}
-
-fn changeset_governance_policy_descriptor() -> WorkflowGovernancePolicyDescriptor {
-    WorkflowGovernancePolicyDescriptor {
-        key: "changeset_file_failures".to_string(),
-        label: "Changeset file failure guardrail".to_string(),
-        description: "Inject targeted file context after repeated changeset failures, escalate to broad context if failures continue, and pause after too many consecutive failures for the same file.".to_string(),
-        capability: "changeset".to_string(),
-        required_capabilities: vec!["gateway_model/changeset".to_string()],
-        fields: vec![
-            WorkflowStageField {
-                key: "inject_context_after_consecutive_failures".to_string(),
-                label: "Inject file context after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "inject_context_after_consecutive_failures".to_string(),
-                default: json!(4),
-                description: "Number of consecutive failures for the same file before generating and uploading a targeted context_export for that file.".to_string(),
-                required: false,
-                options: Vec::new(),
-                visible_when: Vec::new(),
-                ui: field_ui("number"),
-            },
-            WorkflowStageField {
-                key: "inject_broad_context_after_consecutive_failures".to_string(),
-                label: "Inject broad context after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "inject_broad_context_after_consecutive_failures".to_string(),
-                default: json!(5),
-                description: "Number of consecutive failures for the same file before escalating from targeted file context to a broader context_export.".to_string(),
-                required: false,
-                options: Vec::new(),
-                visible_when: Vec::new(),
-                ui: field_ui("number"),
-            },
-            WorkflowStageField {
-                key: "pause_after_consecutive_failures".to_string(),
-                label: "Pause after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "pause_after_consecutive_failures".to_string(),
-                default: json!(8),
-                description: "Number of consecutive failures for the same file before pausing the workflow.".to_string(),
-                required: false,
-                options: Vec::new(),
-                visible_when: Vec::new(),
-                ui: field_ui("number"),
-            },
-        ],
-    }
-}
-
-fn compile_governance_policy_descriptor() -> WorkflowGovernancePolicyDescriptor {
-    WorkflowGovernancePolicyDescriptor {
-        key: "compile_failures".to_string(),
-        label: "Compile failure guardrail".to_string(),
-        description: "Pause after repeated consecutive compile failures.".to_string(),
-        capability: "compile_commands".to_string(),
-        required_capabilities: vec!["compile_commands".to_string()],
-        fields: vec![WorkflowStageField {
-            key: "pause_after_consecutive_failures".to_string(),
-            label: "Pause after failures".to_string(),
-            field_type: "integer".to_string(),
-            bind_to: "pause_after_consecutive_failures".to_string(),
-            default: json!(5),
-            description: "Number of consecutive compile failures before pausing the workflow.".to_string(),
-            required: false,
-            options: Vec::new(),
-            visible_when: Vec::new(),
-            ui: field_ui("number"),
-        }],
-    }
+    Ok(())
 }
 
 fn default_globals() -> WorkflowGlobalConfig {
@@ -933,7 +671,8 @@ fn default_globals() -> WorkflowGlobalConfig {
                 "auto_apply_armed": false
             },
             "sap/import": {},
-            "sap/export": {}
+            "sap/export": {},
+            "qa_environment": crate::engine::runtime_tools::QaStageSpec::default()
         }),
         automation: json!({}),
         shared_dependencies: crate::engine::runtime_tools::SharedDependenciesConfig::default(),
@@ -1145,47 +884,7 @@ pub(crate) fn qa_descriptor() -> WorkflowStageDescriptor {
         name: "DeployQA".to_string(),
         step_type: "qa".to_string(),
         automation_mode: AutomationMode::Manual,
-        execution: WorkflowStepExecutionConfig {
-            qa: Some(crate::engine::runtime_tools::QaStageSpec {
-                dependency_providers: Vec::new(),
-                environment: crate::engine::runtime_tools::QaEnvironmentSpec {
-                    port_range: crate::engine::runtime_tools::PortRangeSpec {
-                        start: 24000,
-                        end: 24999,
-                    },
-                    hostname_template: "{run}.qa.localhost".to_string(),
-                    prepare: crate::engine::runtime_tools::TerminalSequenceSpec::default(),
-                    services: vec![crate::engine::runtime_tools::QaServiceSpec {
-                        id: "application".to_string(),
-                        label: "Application".to_string(),
-                        command: crate::engine::runtime_tools::TerminalCommandSpec {
-                            id: "application-dev".to_string(),
-                            label: "npm run dev".to_string(),
-                            command: "npm run dev".to_string(),
-                            arguments: Vec::new(),
-                            working_directory: ".".to_string(),
-                            environment: Default::default(),
-                            shell: crate::engine::runtime_tools::TerminalShell::System,
-                            mode: crate::engine::runtime_tools::TerminalCommandMode::Service,
-                            timeout_seconds: None,
-                            continue_on_error: false,
-                        },
-                        port: crate::engine::runtime_tools::QaServicePortSpec {
-                            environment_variable: "PORT".to_string(),
-                            preferred: None,
-                        },
-                        readiness: crate::engine::runtime_tools::QaReadinessSpec::Http {
-                            path: "/".to_string(),
-                            expected_status: Some(200),
-                            timeout_seconds: 60,
-                        },
-                        public: true,
-                    }],
-                    shutdown_grace_seconds: 5,
-                },
-            }),
-            ..WorkflowStepExecutionConfig::default()
-        },
+        execution: WorkflowStepExecutionConfig::default(),
         prompt: WorkflowStepPromptConfig::default(),
         config: json!({}),
         capabilities: vec![WorkflowCapabilityBinding {
@@ -1216,68 +915,7 @@ pub(crate) fn qa_descriptor() -> WorkflowStageDescriptor {
         category: "validation".to_string(),
         description: "Deploy and manage a QA application with optional shared dependencies, allocated ports, readiness checks, and temporary routing.".to_string(),
         definition_template: template.clone(),
-        editable_fields: vec![
-            WorkflowStageFieldGroup {
-                key: "dependencies".to_string(),
-                label: "Dependencies".to_string(),
-                fields: vec![WorkflowStageField {
-                    key: "dependency_providers".to_string(),
-                    label: "Dependency providers".to_string(),
-                    field_type: "dependency_providers".to_string(),
-                    bind_to: "execution.qa.dependency_providers".to_string(),
-                    default: json!([]),
-                    description: "Trusted dependency providers resolved before the QA environment starts.".to_string(),
-                    required: false,
-                    options: Vec::new(),
-                    visible_when: Vec::new(),
-                    ui: WorkflowStageFieldUi {
-                        control: "dependency_providers".to_string(),
-                        placeholder: "node-root, cargo-root".to_string(),
-                        min_rows: 0,
-                        format: String::new(),
-                    },
-                }],
-            },
-            WorkflowStageFieldGroup {
-                key: "services".to_string(),
-                label: "Services".to_string(),
-                fields: vec![WorkflowStageField {
-                    key: "services".to_string(),
-                    label: "Deployment services".to_string(),
-                    field_type: "qa_services".to_string(),
-                    bind_to: "execution.qa.environment.services".to_string(),
-                    default: serde_json::to_value(
-                        template
-                            .execution
-                            .qa
-                            .as_ref()
-                            .map(|qa| qa.environment.services.clone())
-                            .unwrap_or_default(),
-                    )
-                    .unwrap_or_else(|_| json!([])),
-                    description: "Commands, environments, ports, readiness checks, and routing for every deployed service.".to_string(),
-                    required: true,
-                    options: Vec::new(),
-                    visible_when: Vec::new(),
-                    ui: WorkflowStageFieldUi {
-                        control: "qa_services".to_string(),
-                        placeholder: String::new(),
-                        min_rows: 0,
-                        format: "json".to_string(),
-                    },
-                }],
-            },
-            WorkflowStageFieldGroup {
-                key: "routing".to_string(),
-                label: "Routing".to_string(),
-                fields: vec![
-                    int_field("port_start", "Port range start", "execution.qa.environment.port_range.start", 24000),
-                    int_field("port_end", "Port range end", "execution.qa.environment.port_range.end", 24999),
-                    text_field("hostname_template", "Hostname template", "execution.qa.environment.hostname_template", "{run}.qa.localhost"),
-                    int_field("shutdown_grace_seconds", "Shutdown grace seconds", "execution.qa.environment.shutdown_grace_seconds", 5),
-                ],
-            },
-        ],
+        editable_fields: vec![],
         available_governance_policies: Vec::new(),
         routes: default_routes("", "qa", "qa"),
     }

@@ -82,6 +82,7 @@ import {
   type StageExecutionChain,
   type StageExecutionEvent,
   type WorkflowBuilderCatalog,
+  type WorkflowAutomationControlDescriptor,
   type WorkflowEvent,
   type WorkflowRun,
   type WorkflowRunStatus,
@@ -100,10 +101,11 @@ import type { DiffPanelState } from './DiffPanel';
 import { PlannerModal } from './PlannerModal';
 import { getPlanner, getPlannerFeature } from './planner_api';
 import { WorkflowBuilderEditor } from './WorkflowBuilderEditor';
-import { DeployQA, defaultDeployQAValues, type DeployQAValues } from './Capabilities/DeployQA';
+import { DeployQA, deployQACapabilityFromValues, deployQAValuesFromCapability, type DeployQAValues } from './Capabilities/DeployQA';
 import { DeployQARuntime } from './Capabilities/DeployQARuntime';
 import { RuntimeAdmin } from './Capabilities/RuntimeAdmin';
 import { SharedDependencies } from './Capabilities/SharedDependencies';
+import { Automation, type AutomationProfile } from './Capabilities/Automation';
 import { FlightDeckPanel } from './FlightDeckPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
@@ -2287,7 +2289,7 @@ export function WorkflowShell(props: {
     key: K,
     value: DeployQAValues[K]
   ) {
-    if (!selectedRunId) return;
+    if (!selectedRunId || !runtimeDeployQAValues) return;
 
     const nextValues: DeployQAValues = {
       ...runtimeDeployQAValues,
@@ -2301,18 +2303,10 @@ export function WorkflowShell(props: {
       ...currentGlobalState,
       capabilities: {
         ...currentCapabilities,
-        qa_environment: {
-          dependency_providers: nextValues.dependency_providers,
-          environment: {
-            services: nextValues.services,
-            port_range: {
-              start: nextValues.port_start,
-              end: nextValues.port_end,
-            },
-            hostname_template: nextValues.hostname_template,
-            shutdown_grace_seconds: nextValues.shutdown_grace_seconds,
-          },
-        },
+        qa_environment: deployQACapabilityFromValues(
+          nextValues,
+          currentCapabilities.qa_environment
+        ),
       },
     })
       .then(() => refreshRunDetails(selectedRunId))
@@ -2412,6 +2406,13 @@ export function WorkflowShell(props: {
   const [repoRef, setRepoRef] = useState('');
   const [jsonDraft, setJsonDraft] = useState('');
   const [compiledBuilderDefinition, setCompiledBuilderDefinition] = useState<WorkflowTemplateDefinition | null>(null);
+  const compiledBuilderDefinitionRef = useRef<WorkflowTemplateDefinition | null>(null);
+
+  function updateCompiledBuilderDefinition(definition: WorkflowTemplateDefinition | null) {
+    const nextDefinition = definition ? structuredClone(definition) : null;
+    compiledBuilderDefinitionRef.current = nextDefinition;
+    setCompiledBuilderDefinition(nextDefinition);
+  }
   const [loadedTemplateDefinition, setLoadedTemplateDefinition] = useState<WorkflowTemplateDefinition | null>(null);
   const [builderLoadRevision, setBuilderLoadRevision] = useState(0);
   const [builderGlobals, setBuilderGlobals] = useState<WorkflowTemplateDefinition['globals'] | null>(null);
@@ -2420,6 +2421,9 @@ export function WorkflowShell(props: {
   const [loadTemplateOpen, setLoadTemplateOpen] = useState(false);
   const [globalCapabilitiesOpen, setGlobalCapabilitiesOpen] = useState(false);
   const [deployQAOpen, setDeployQAOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const [automationSaving, setAutomationSaving] = useState(false);
+  const [automationStatus, setAutomationStatus] = useState<string | null>(null);
   const [sharedDependenciesOpen, setSharedDependenciesOpen] = useState(false);
   const [sharedDependenciesDraft, setSharedDependenciesDraft] = useState<SharedDependenciesConfig>({
     enabled: false,
@@ -2573,6 +2577,76 @@ export function WorkflowShell(props: {
   const selectedRunDefinition = useMemo<WorkflowTemplateDefinition | null>(() => {
     return selectedRun?.definition ?? null;
   }, [selectedRun?.definition]);
+
+  const selectedRunAutomation = useMemo<Partial<AutomationProfile>>(() => {
+    const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+    const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+    const runtimeAutomation = globalState.automation;
+
+    if (runtimeAutomation && typeof runtimeAutomation === 'object' && !Array.isArray(runtimeAutomation)) {
+      return runtimeAutomation as Partial<AutomationProfile>;
+    }
+
+    const definitionAutomation = selectedRunDefinition?.globals?.automation;
+    if (definitionAutomation && typeof definitionAutomation === 'object' && !Array.isArray(definitionAutomation)) {
+      return definitionAutomation as Partial<AutomationProfile>;
+    }
+
+    return {};
+  }, [selectedRun?.context, selectedRunDefinition]);
+
+  const selectedRunAutomationControls = useMemo<WorkflowAutomationControlDescriptor[]>(
+    () => workflowBuilderCatalog?.automation_controls ?? [],
+    [workflowBuilderCatalog]
+  );
+
+  const selectedRunInvokedCapabilities = useMemo(() => {
+    const capabilities = new Set<string>();
+
+    for (const step of selectedRunDefinition?.steps ?? []) {
+      for (const node of step.execution_plan ?? []) {
+        if (node.kind !== 'capability' || node.enabled === false) {
+          continue;
+        }
+
+        const key = node.key.trim().toLowerCase();
+        if (key === 'gateway_model/changeset' || key === 'changeset_apply') {
+          capabilities.add('changeset');
+        } else {
+          capabilities.add(key);
+        }
+      }
+    }
+
+    return Array.from(capabilities);
+  }, [selectedRunDefinition]);
+
+
+  async function saveRuntimeAutomation(profile: AutomationProfile) {
+    if (!selectedRunId) {
+      return;
+    }
+
+    setAutomationSaving(true);
+    setAutomationStatus(null);
+
+    try {
+      const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
+      const currentGlobalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
+
+      await patchWorkflowGlobalState(selectedRunId, {
+        ...currentGlobalState,
+        automation: structuredClone(profile),
+      });
+      await refreshRunDetails(selectedRunId);
+      setAutomationStatus('Saved');
+      setAutomationOpen(false);
+    } catch (err) {
+      setAutomationStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutomationSaving(false);
+    }
+  }
 
   const selectedRunSharedDependencies = useMemo<SharedDependenciesConfig>(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
@@ -2783,46 +2857,11 @@ export function WorkflowShell(props: {
     return selectedRunDefinition?.steps.find((step) => step.id === selectedRunStepId) ?? null;
   }, [selectedRunDefinition, selectedRunStepId]);
 
-  const runtimeDeployQAValues = useMemo<DeployQAValues>(() => {
+  const runtimeDeployQAValues = useMemo(() => {
     const workflowEngine = (selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine as Record<string, unknown> | undefined;
     const globalState = (workflowEngine?.global_state ?? {}) as Record<string, unknown>;
     const capabilities = (globalState.capabilities ?? {}) as Record<string, unknown>;
-    const capabilityQa = (capabilities.qa_environment ?? {}) as Record<string, unknown>;
-    const capabilityEnvironment = (capabilityQa.environment ?? {}) as Record<string, unknown>;
-    const capabilityPortRange = (capabilityEnvironment.port_range ?? {}) as Record<string, unknown>;
-    const dependencyProviders = capabilityQa.dependency_providers;
-    const services = capabilityEnvironment.services;
-    const portStart = capabilityPortRange.start;
-    const portEnd = capabilityPortRange.end;
-    const hostnameTemplate = capabilityEnvironment.hostname_template;
-    const shutdownGraceSeconds = capabilityEnvironment.shutdown_grace_seconds;
-
-    return {
-      dependency_providers: Array.isArray(dependencyProviders)
-        ? dependencyProviders.filter(
-            (value): value is string => typeof value === 'string'
-          )
-        : defaultDeployQAValues.dependency_providers,
-      services: Array.isArray(services)
-        ? structuredClone(services as DeployQAValues['services'])
-        : structuredClone(defaultDeployQAValues.services),
-      port_start:
-        typeof portStart === 'number'
-          ? portStart
-          : defaultDeployQAValues.port_start,
-      port_end:
-        typeof portEnd === 'number'
-          ? portEnd
-          : defaultDeployQAValues.port_end,
-      hostname_template:
-        typeof hostnameTemplate === 'string'
-          ? hostnameTemplate
-          : defaultDeployQAValues.hostname_template,
-      shutdown_grace_seconds:
-        typeof shutdownGraceSeconds === 'number'
-          ? shutdownGraceSeconds
-          : defaultDeployQAValues.shutdown_grace_seconds,
-    };
+    return deployQAValuesFromCapability(capabilities.qa_environment);
   }, [selectedRun?.context]);
 
 
@@ -3303,8 +3342,10 @@ export function WorkflowShell(props: {
     if (!contentElement) return;
 
     function updatePanelHeight(element: HTMLDivElement) {
-      const naturalHeight = element.getBoundingClientRect().height;
-      setWorkflowDetailPanelHeight(Math.ceil(naturalHeight));
+      const rect = element.getBoundingClientRect();
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+      const availableHeight = Math.max(0, viewportHeight - rect.top - 16);
+      setWorkflowDetailPanelHeight(Math.ceil(Math.max(rect.height, availableHeight)));
     }
 
     const updateCurrentPanelHeight = () => updatePanelHeight(contentElement);
@@ -3314,10 +3355,12 @@ export function WorkflowShell(props: {
     const observer = new ResizeObserver(updateCurrentPanelHeight);
     observer.observe(contentElement);
     window.addEventListener('resize', updateCurrentPanelHeight);
+    window.visualViewport?.addEventListener('resize', updateCurrentPanelHeight);
 
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', updateCurrentPanelHeight);
+      window.visualViewport?.removeEventListener('resize', updateCurrentPanelHeight);
     };
   }, [selectedRunId, selectedRunStepId, activeWorkspaceTab]);
 
@@ -4981,9 +5024,11 @@ export function WorkflowShell(props: {
       setError(null);
       const parsed = builderMode === 'json'
         ? (JSON.parse(jsonDraft) as WorkflowTemplateDefinition)
-        : compiledBuilderDefinition
-          ? structuredClone(compiledBuilderDefinition)
-          : null;
+        : compiledBuilderDefinitionRef.current
+          ? structuredClone(compiledBuilderDefinitionRef.current)
+          : compiledBuilderDefinition
+            ? structuredClone(compiledBuilderDefinition)
+            : null;
       if (!parsed) {
         throw new Error('Builder has not produced a compiled workflow definition yet.');
       }
@@ -5090,7 +5135,7 @@ export function WorkflowShell(props: {
     setWorkflowName(template.name);
     setWorkflowDescription(template.description);
     setRepoRef(template.repo_ref);
-    setCompiledBuilderDefinition(template.definition);
+    updateCompiledBuilderDefinition(template.definition);
     setLoadedTemplateDefinition(template.definition);
     setBuilderLoadRevision((prev) => prev + 1);
     setBuilderGlobals(normalizeBuilderGlobals(template.definition?.globals ?? null));
@@ -6637,8 +6682,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
       const base = normalizeBuilderGlobals(prev ?? compiledBuilderDefinition?.globals ?? loadedTemplateDefinition?.globals ?? null);
       const next = deepMergeRecords(base as Record<string, unknown>, patch) as WorkflowTemplateDefinition['globals'];
 
-      setCompiledBuilderDefinition((current) => applyBuilderGlobalsToDefinition(current, next));
-      setLoadedTemplateDefinition((current) => applyBuilderGlobalsToDefinition(current, next));
+      const nextDefinition = applyBuilderGlobalsToDefinition(
+        compiledBuilderDefinitionRef.current ?? compiledBuilderDefinition,
+        next
+      );
+      if (nextDefinition) {
+        updateCompiledBuilderDefinition(nextDefinition);
+      }
       setJsonDraft((currentDraft) => {
         try {
           if (!currentDraft.trim()) {
@@ -6942,14 +6992,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   <WorkflowBuilderEditor
                     key={`builder-load-${builderLoadRevision}`}
                     initialDefinition={loadedTemplateDefinition}
+              loadRevision={builderLoadRevision}
                     builderGlobals={builderGlobals}
                     onCompiledDefinitionChange={(next) => {
-                      const withGlobals = applyBuilderGlobalsToDefinition(next, builderGlobals);
-                      if (!withGlobals) {
-                        return;
-                      }
-                      setCompiledBuilderDefinition(withGlobals);
-                      setJsonDraft(JSON.stringify(withGlobals, null, 2));
+                      const nextDefinition = structuredClone(next);
+                      updateCompiledBuilderDefinition(nextDefinition);
+                      setBuilderGlobals(normalizeBuilderGlobals(nextDefinition.globals ?? null));
+                      setJsonDraft(JSON.stringify(nextDefinition, null, 2));
                     }}
                     onError={setError}
                     onOpenCapabilityConfig={(capabilityKey) => {
@@ -8107,7 +8156,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         opened={deployQAOpen && selectedWorkflowStep?.step_type === 'qa'}
         onClose={() => setDeployQAOpen(false)}
         disabled={!selectedRunId || !selectedWorkflowStep}
-        providers={selectedRun?.definition?.globals?.shared_dependencies?.providers ?? []}
         values={runtimeDeployQAValues}
         onChange={patchRuntimeDeployQAField}
       />

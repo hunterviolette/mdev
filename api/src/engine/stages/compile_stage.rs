@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use crate::{
     engine::{
         capabilities::registry::CapabilityResult,
-        governance::{policies::compile_failures, GovernanceDecision},
+        automation::{policies::compile_failures, AutomationDecision},
         stages::{
             Stage,
             StageCapabilities,
@@ -46,7 +46,7 @@ impl Stage for CompileStage {
         step: &WorkflowStepDefinition,
         result: &CapabilityResult,
         prior_results: &[CapabilityResult],
-    ) -> Result<Vec<GovernanceDecision>> {
+    ) -> Result<Vec<AutomationDecision>> {
         compile_failures::after_capability(run, step, result, prior_results)
     }
 

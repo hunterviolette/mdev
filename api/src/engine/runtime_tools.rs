@@ -301,10 +301,79 @@ pub struct QaEnvironmentSpec {
     pub hostname_template: String,
     #[serde(default)]
     pub prepare: TerminalSequenceSpec,
-    #[serde(default)]
+    #[serde(default = "default_qa_services")]
     pub services: Vec<QaServiceSpec>,
     #[serde(default = "default_shutdown_grace_seconds")]
     pub shutdown_grace_seconds: u64,
+}
+
+fn default_qa_services() -> Vec<QaServiceSpec> {
+    let mut web_environment = BTreeMap::new();
+    web_environment.insert(
+        "VITE_API_BASE_URL".to_string(),
+        "{service.api.internal_url}/api".to_string(),
+    );
+
+    let mut api_environment = BTreeMap::new();
+    api_environment.insert(
+        "WORKFLOW_API_HOST".to_string(),
+        "127.0.0.1".to_string(),
+    );
+
+    vec![
+        QaServiceSpec {
+            id: "web".to_string(),
+            label: "Web".to_string(),
+            command: TerminalCommandSpec {
+                id: "deploy-qa-web".to_string(),
+                label: "npm run dev".to_string(),
+                command: "npm run dev -- --host 127.0.0.1 --port {port} --strictPort".to_string(),
+                arguments: Vec::new(),
+                working_directory: "web".to_string(),
+                environment: web_environment,
+                shell: TerminalShell::System,
+                mode: TerminalCommandMode::Service,
+                timeout_seconds: None,
+                continue_on_error: false,
+            },
+            port: QaServicePortSpec {
+                environment_variable: "WORKFLOW_WEB_PORT".to_string(),
+                preferred: None,
+            },
+            readiness: QaReadinessSpec::Http {
+                path: "/".to_string(),
+                expected_status: Some(200),
+                timeout_seconds: 60,
+            },
+            public: false,
+        },
+        QaServiceSpec {
+            id: "api".to_string(),
+            label: "API".to_string(),
+            command: TerminalCommandSpec {
+                id: "deploy-qa-api".to_string(),
+                label: "cargo run".to_string(),
+                command: "cargo run".to_string(),
+                arguments: Vec::new(),
+                working_directory: "api".to_string(),
+                environment: api_environment,
+                shell: TerminalShell::System,
+                mode: TerminalCommandMode::Service,
+                timeout_seconds: None,
+                continue_on_error: false,
+            },
+            port: QaServicePortSpec {
+                environment_variable: "WORKFLOW_API_PORT".to_string(),
+                preferred: None,
+            },
+            readiness: QaReadinessSpec::Http {
+                path: "/api/health".to_string(),
+                expected_status: Some(200),
+                timeout_seconds: 120,
+            },
+            public: false,
+        },
+    ]
 }
 
 impl Default for QaEnvironmentSpec {
@@ -313,7 +382,7 @@ impl Default for QaEnvironmentSpec {
             port_range: PortRangeSpec::default(),
             hostname_template: default_hostname_template(),
             prepare: TerminalSequenceSpec::default(),
-            services: Vec::new(),
+            services: default_qa_services(),
             shutdown_grace_seconds: default_shutdown_grace_seconds(),
         }
     }
@@ -329,8 +398,6 @@ pub struct CompileStageSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QaStageSpec {
-    #[serde(default)]
-    pub dependency_providers: Vec<String>,
     #[serde(default)]
     pub environment: QaEnvironmentSpec,
 }

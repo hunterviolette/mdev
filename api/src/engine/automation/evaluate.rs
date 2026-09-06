@@ -8,15 +8,15 @@ use crate::{
     models::{WorkflowRun, WorkflowStepDefinition},
 };
 
-use super::{ensure_governance_slots, CapabilityInjection, GovernanceDecision};
+use super::{ensure_automation_slots, AutomationDecision, CapabilityInjection};
 
 pub async fn before_stage(
     state: &AppState,
     run_id: Uuid,
     run: &mut WorkflowRun,
     step: &WorkflowStepDefinition,
-) -> Result<Vec<GovernanceDecision>> {
-    ensure_governance_slots(run);
+) -> Result<Vec<AutomationDecision>> {
+    ensure_automation_slots(run);
     super::policies::before_stage(state, run_id, run, step).await
 }
 
@@ -27,8 +27,8 @@ pub async fn after_stage(
     step: &WorkflowStepDefinition,
     stage_execution_id: &str,
     capability_results: &[Value],
-) -> Result<Vec<GovernanceDecision>> {
-    ensure_governance_slots(run);
+) -> Result<Vec<AutomationDecision>> {
+    ensure_automation_slots(run);
     super::policies::after_stage(state, run_id, run, step, stage_execution_id, capability_results).await
 }
 
@@ -40,7 +40,7 @@ pub async fn before_capability(
     stage_execution_id: Option<&str>,
     invocation: &CapabilityInvocation,
     prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     super::policies::before_capability(
         state,
         run_id,
@@ -61,7 +61,7 @@ pub async fn after_capability(
     stage_execution_id: Option<&str>,
     result: &CapabilityResult,
     prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     super::policies::after_capability(
         state,
         run_id,
@@ -74,22 +74,22 @@ pub async fn after_capability(
     .await
 }
 
-pub fn pause_message(decisions: &[GovernanceDecision]) -> Option<String> {
+pub fn pause_message(decisions: &[AutomationDecision]) -> Option<String> {
     for decision in decisions {
         match decision {
-            GovernanceDecision::Pause { reason } => return Some(reason.clone()),
-            GovernanceDecision::RequireApproval { reason } => return Some(reason.clone()),
+            AutomationDecision::Pause { reason } => return Some(reason.clone()),
+            AutomationDecision::RequireApproval { reason } => return Some(reason.clone()),
             _ => {}
         }
     }
     None
 }
 
-pub fn injected_capabilities(decisions: &[GovernanceDecision]) -> Vec<CapabilityInvocation> {
+pub fn injected_capabilities(decisions: &[AutomationDecision]) -> Vec<CapabilityInvocation> {
     decisions
         .iter()
         .filter_map(|decision| match decision {
-            GovernanceDecision::InjectCapability {
+            AutomationDecision::InjectCapability {
                 capability:
                     CapabilityInjection {
                         capability,

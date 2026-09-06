@@ -1,5 +1,5 @@
 pub(crate) mod capabilities;
-pub(crate) mod governance;
+pub(crate) mod automation;
 pub(crate) mod orchestration_inputs;
 mod runtime;
 pub(crate) mod runtime_tools;
@@ -685,7 +685,7 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
     Ok(json!({ "ok": true, "global_state": global_state_snapshot }))
 }
 
-fn strip_governance_owned_inference_enabled_flags(payload: &mut Map<String, Value>) {
+fn strip_automation_owned_inference_enabled_flags(payload: &mut Map<String, Value>) {
     let Some(execution_logic) = payload.get_mut("execution_logic") else {
         return;
     };
@@ -736,8 +736,8 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
             .find(|item| item.id == step_id)
             .ok_or_else(|| anyhow!("unknown step_id {}", step_id))?;
 
-        let decisions = governance::before_stage(state, run_id, &mut run, step).await?;
-        governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
+        let decisions = automation::before_stage(state, run_id, &mut run, step).await?;
+        automation::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)?;
     }
 
     let selected_step = run
@@ -753,7 +753,7 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
         Value::Object(map) => map,
         _ => return Err(anyhow!("stage payload must be object")),
     };
-    strip_governance_owned_inference_enabled_flags(&mut stage_payload);
+    strip_automation_owned_inference_enabled_flags(&mut stage_payload);
 
     {
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));

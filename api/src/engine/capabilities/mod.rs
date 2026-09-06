@@ -1,5 +1,4 @@
 pub mod registry;
-pub mod automation;
 pub mod context_export;
 pub mod repo_sync;
 pub mod changeset;

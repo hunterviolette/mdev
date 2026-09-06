@@ -13,7 +13,7 @@ use crate::{
             },
             registry::CapabilityResult,
         },
-        governance::{policies::changeset_file_failures, GovernanceDecision},
+        automation::{policies::changeset_file_failures, AutomationDecision},
         stages::{
             Stage,
             StageCapabilities,
@@ -60,7 +60,7 @@ impl Stage for CodeStage {
         step: &WorkflowStepDefinition,
         result: &CapabilityResult,
         prior_results: &[CapabilityResult],
-    ) -> Result<Vec<GovernanceDecision>> {
+    ) -> Result<Vec<AutomationDecision>> {
         changeset_file_failures::after_capability(run, step, result, prior_results)
     }
 

@@ -1,9 +1,20 @@
+pub mod config;
 pub mod decisions;
 pub mod evaluate;
 pub mod policies;
 pub mod scopes;
 
-pub use decisions::{CapabilityInjection, GovernanceDecision};
+pub use config::{
+    apply_trigger,
+    arm_capabilities,
+    can_arm,
+    control_descriptors,
+    profile,
+    profile_from_global_state,
+    AutomationProfile,
+    AutomationTrigger,
+};
+pub use decisions::{AutomationDecision, CapabilityInjection};
 pub use evaluate::{
     after_capability,
     after_stage,
@@ -12,13 +23,13 @@ pub use evaluate::{
     injected_capabilities,
     pause_message,
 };
-pub use scopes::GovernanceScope;
+pub use scopes::AutomationScope;
 
 use serde_json::{json, Value};
 
 use crate::models::WorkflowRun;
 
-pub fn ensure_governance_slots(run: &mut WorkflowRun) {
+pub fn ensure_automation_slots(run: &mut WorkflowRun) {
     let root = crate::engine::ensure_engine_root(&mut run.context);
     ensure_object_slot(root, "global_state");
     let global_state = root
@@ -28,13 +39,13 @@ pub fn ensure_governance_slots(run: &mut WorkflowRun) {
         *global_state = json!({});
     }
     if let Some(obj) = global_state.as_object_mut() {
-        obj.entry("governance".to_string()).or_insert_with(|| json!({}));
+        obj.entry("automation".to_string()).or_insert_with(|| json!({}));
     }
 }
 
 pub fn apply_context_mutations(
     run: &mut WorkflowRun,
-    decisions: &[GovernanceDecision],
+    decisions: &[AutomationDecision],
     _step_id: Option<&str>,
     _capability: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -48,7 +59,7 @@ pub fn apply_context_mutations(
     }
 
     for decision in decisions {
-        if let GovernanceDecision::MutateContext { mutation } = decision {
+        if let AutomationDecision::MutateContext { mutation } = decision {
             merge_json_values(global_state, &mutation.patch);
         }
     }

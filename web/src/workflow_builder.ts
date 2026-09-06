@@ -4,10 +4,8 @@ import type {
   WorkflowBuilderStageDocument,
   WorkflowGlobalConfig,
   SharedDependenciesConfig,
-  WorkflowGovernancePolicyDescriptor,
   WorkflowStageDescriptor,
   WorkflowStageField,
-  WorkflowGovernanceConfig,
   WorkflowTemplateDefinition,
 } from './api';
 
@@ -20,8 +18,6 @@ export type BuilderStep = {
 
 export function capabilityDisplayLabel(capabilityKey: string): string {
   switch (capabilityKey) {
-    case 'automation':
-      return 'Automation';
     case 'context_export':
       return 'Context export';
     case 'inference':
@@ -49,40 +45,6 @@ export function capabilityDisplayLabel(capabilityKey: string): string {
 
 export function flattenStageFields(descriptor: WorkflowStageDescriptor): WorkflowStageField[] {
   return descriptor.editable_fields.flatMap((group) => group.fields);
-}
-
-export function governancePolicyMap(descriptor: WorkflowStageDescriptor): Record<string, WorkflowGovernancePolicyDescriptor> {
-  return Object.fromEntries((descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy]));
-}
-
-export function ensureGovernanceConfig(
-  catalog: WorkflowBuilderCatalog,
-  selected: WorkflowGovernanceConfig | undefined,
-): WorkflowGovernanceConfig {
-  const byKey = governancePolicyMapFromCatalog(catalog);
-  const selectedConfig = selected ?? {};
-  return Object.fromEntries(
-    Object.entries(selectedConfig)
-      .filter(([key]) => Boolean(byKey[key]))
-      .map(([key, config]) => {
-        const descriptor = byKey[key];
-        return [
-          key,
-          Object.fromEntries(
-            descriptor.fields.map((field) => [
-              field.key,
-              (config as Record<string, unknown> | undefined)?.[field.key] ?? field.default,
-            ])
-          ),
-        ];
-      })
-  );
-}
-
-export function governancePolicyMapFromCatalog(catalog: WorkflowBuilderCatalog): Record<string, WorkflowGovernancePolicyDescriptor> {
-  return Object.fromEntries(
-    catalog.stage_descriptors.flatMap((descriptor) => descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy])
-  );
 }
 
 export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, id?: string): BuilderStep {
@@ -173,7 +135,6 @@ export function defaultGlobals(): WorkflowGlobalConfig {
         },
       },
       shared_dependencies: defaultSharedDependencies(),
-      qa_environment: {},
     },
     automation: {
     },
@@ -205,11 +166,10 @@ export function inferenceSessionNames(globals: WorkflowGlobalConfig): string[] {
   return Object.keys(sessions);
 }
 
-export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig, governance?: WorkflowGovernanceConfig): WorkflowBuilderDocument {
+export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig): WorkflowBuilderDocument {
   return {
     version: 1,
     globals: globals ?? defaultGlobals(),
-    governance: governance ?? {},
     stages: steps.map((step) => buildStageDocument(step)),
   };
 }

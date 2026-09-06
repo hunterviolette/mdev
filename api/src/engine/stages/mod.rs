@@ -29,7 +29,7 @@ use super::capabilities::{
     CapabilityContext,
     CapabilityInvocation,
 };
-use super::governance::{self, GovernanceDecision};
+use super::automation::{self, AutomationDecision};
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
 pub struct StageRegistration {
@@ -107,7 +107,7 @@ pub trait Stage: Send + Sync {
         _step: &WorkflowStepDefinition,
         _result: &CapabilityResult,
         _prior_results: &[CapabilityResult],
-    ) -> Result<Vec<GovernanceDecision>> {
+    ) -> Result<Vec<AutomationDecision>> {
         Ok(Vec::new())
     }
 
@@ -149,7 +149,7 @@ pub(crate) fn automation_after_capability(
     step: &WorkflowStepDefinition,
     result: &CapabilityResult,
     prior_results: &[CapabilityResult],
-) -> Result<Vec<GovernanceDecision>> {
+) -> Result<Vec<AutomationDecision>> {
     stage_for_step(step).automation_after_capability(run, step, result, prior_results)
 }
 
@@ -292,9 +292,9 @@ pub fn rearm_session_scoped_inference_inputs(
     _step: &WorkflowStepDefinition,
 ) {
     normalize_inference_arm_state(run);
-    crate::engine::capabilities::automation::apply_trigger(
+    crate::engine::automation::apply_trigger(
         run,
-        crate::engine::capabilities::automation::AutomationTrigger::NewInferenceSession,
+        crate::engine::automation::AutomationTrigger::NewInferenceSession,
     );
 }
 
@@ -668,7 +668,7 @@ pub async fn execute_stage(
         .iter()
         .any(|item| item.get("ok").and_then(Value::as_bool) == Some(false));
 
-    let after_decisions = governance::after_stage(
+    let after_decisions = automation::after_stage(
         state,
         run_id,
         run,
@@ -683,7 +683,7 @@ pub async fn execute_stage(
         .unwrap_or_else(|_| run.clone());
     run.context = latest_persisted_run.context;
 
-    governance::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
+    automation::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
 
     let mut branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
 
@@ -724,16 +724,8 @@ pub async fn execute_stage(
         }
     }
 
-    if let Some(message) = governance::pause_message(&after_decisions) {
-        persist_context(state, run_id, &run.context).await?;
-        return Ok(StageOutcome {
-            ok: false,
-            status: StageStatus::Paused,
-            transition: StageTransition::Stay,
-            message,
-            capability_results,
-            local_state: Value::Object(prepared_local_state_obj.clone()),
-        });
+    if automation::pause_message(&after_decisions).is_some() {
+        super::runtime::request_run_pause_after_stage(run)?;
     }
 
     {

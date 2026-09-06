@@ -20,14 +20,12 @@ export type QaEnvironmentSpec = {
 };
 
 export type QaStageSpec = {
-  dependency_providers: string[];
   environment: QaEnvironmentSpec;
 };
 
 export type WorkflowStepExecutionConfig = {
   changeset_apply: Record<string, unknown>;
   compile_checks: Record<string, unknown>;
-  qa?: QaStageSpec;
 };
 
 export type WorkflowStepPromptConfig = {
@@ -391,9 +389,20 @@ export type WorkflowStageDescriptor = {
   routes: WorkflowStageRoute[];
 };
 
+export type WorkflowAutomationControlDescriptor = {
+  key: string;
+  label: string;
+  description: string;
+  section: string;
+  field_type: 'integer' | 'boolean';
+  default: number | boolean;
+  required_capabilities: string[];
+};
+
 export type WorkflowBuilderCatalog = {
   version: number;
   stage_descriptors: WorkflowStageDescriptor[];
+  automation_controls?: WorkflowAutomationControlDescriptor[];
 };
 
 export type WorkflowBuilderStageDocument = {

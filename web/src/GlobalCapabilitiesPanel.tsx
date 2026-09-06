@@ -1,10 +1,17 @@
 import { useState, type ReactNode } from 'react';
 import { RepoSync } from './Capabilities/RepoSync';
-import { Badge, Button, Card, Group, SimpleGrid, Stack, Text, Title } from '@mantine/core';
+import { Automation, type AutomationProfile } from './Capabilities/Automation';
+import {
+  getRun,
+  getWorkflowBuilderCatalog,
+  patchWorkflowGlobalState,
+  type WorkflowAutomationControlDescriptor,
+  type WorkflowTemplateDefinition,
+} from './api';
+import { Badge, Button, Card, Group, Modal, SimpleGrid, Stack, Text, Title } from '@mantine/core';
 
 type GlobalCapabilitiesPanelProps = {
   onOpenInference: () => void;
-  onOpenAutomation?: () => void;
   onOpenRepoFragment: () => void;
   onOpenChangesetSchema: () => void;
   onOpenPlanner: () => void;
@@ -19,7 +26,6 @@ type GlobalCapabilitiesPanelProps = {
   deployQAAvailable: boolean;
   repoSyncEnabled?: boolean;
   repoSyncPaired?: boolean;
-  automationEnabled?: boolean;
 };
 
 type CapabilityCardProps = {
@@ -62,7 +68,6 @@ function ArmedBadge(props: { armed: boolean }) {
 export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
   const {
     onOpenInference,
-    onOpenAutomation = () => {},
     onOpenRepoFragment,
     onOpenChangesetSchema,
     onOpenPlanner,
@@ -75,12 +80,110 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
     plannerArmed,
     sharedDependenciesEnabled,
     deployQAAvailable,
-    automationEnabled = true,
     repoSyncEnabled = false,
     repoSyncPaired = false,
   } = props;
 
   const [repoSyncOpen, setRepoSyncOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const [automationSaving, setAutomationSaving] = useState(false);
+  const [automationStatus, setAutomationStatus] = useState<string | null>(null);
+  const [automationValue, setAutomationValue] = useState<Partial<AutomationProfile>>({});
+  const [automationControls, setAutomationControls] = useState<WorkflowAutomationControlDescriptor[]>([]);
+  const [automationCapabilities, setAutomationCapabilities] = useState<string[]>([]);
+
+  function currentWorkflowRunId(): string | null {
+    const match = window.location.pathname.match(/^\/workflows\/([^/]+)\/capabilities\/?$/);
+    if (!match?.[1]) return null;
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return match[1];
+    }
+  }
+
+  function invokedAutomationCapabilities(definition: WorkflowTemplateDefinition): string[] {
+    const capabilities = new Set<string>();
+
+    for (const step of definition.steps ?? []) {
+      for (const node of step.execution_plan ?? []) {
+        if (node.kind !== 'capability' || node.enabled === false) continue;
+
+        const key = node.key.trim().toLowerCase();
+        if (key === 'gateway_model/changeset' || key === 'changeset_apply') {
+          capabilities.add('changeset');
+        } else {
+          capabilities.add(key);
+        }
+      }
+    }
+
+    return Array.from(capabilities);
+  }
+
+  async function openAutomation() {
+    const runId = currentWorkflowRunId();
+    setAutomationStatus(null);
+    setAutomationOpen(true);
+
+    if (!runId) {
+      setAutomationStatus('Unable to resolve the current workflow run.');
+      return;
+    }
+
+    try {
+      const [run, catalog] = await Promise.all([
+        getRun(runId),
+        getWorkflowBuilderCatalog(),
+      ]);
+      const workflowEngine = (run.context?.workflow_engine ?? {}) as Record<string, unknown>;
+      const globalState = (workflowEngine.global_state ?? {}) as Record<string, unknown>;
+      const runtimeAutomation = globalState.automation;
+      const definitionAutomation = run.definition?.globals?.automation;
+
+      setAutomationValue(
+        runtimeAutomation && typeof runtimeAutomation === 'object' && !Array.isArray(runtimeAutomation)
+          ? runtimeAutomation as Partial<AutomationProfile>
+          : definitionAutomation && typeof definitionAutomation === 'object' && !Array.isArray(definitionAutomation)
+            ? definitionAutomation as Partial<AutomationProfile>
+            : {}
+      );
+      setAutomationControls(catalog.automation_controls ?? []);
+      setAutomationCapabilities(invokedAutomationCapabilities(run.definition));
+    } catch (error) {
+      setAutomationStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function saveAutomation(profile: AutomationProfile) {
+    const runId = currentWorkflowRunId();
+    if (!runId) {
+      setAutomationStatus('Unable to resolve the current workflow run.');
+      return;
+    }
+
+    setAutomationSaving(true);
+    setAutomationStatus(null);
+
+    try {
+      const run = await getRun(runId);
+      const workflowEngine = (run.context?.workflow_engine ?? {}) as Record<string, unknown>;
+      const globalState = (workflowEngine.global_state ?? {}) as Record<string, unknown>;
+
+      await patchWorkflowGlobalState(runId, {
+        ...globalState,
+        automation: structuredClone(profile),
+      });
+
+      setAutomationValue(structuredClone(profile));
+      setAutomationStatus('Saved');
+      setAutomationOpen(false);
+    } catch (error) {
+      setAutomationStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAutomationSaving(false);
+    }
+  }
 
   const repoSyncBadge = repoSyncPaired
     ? { label: repoSyncEnabled ? 'Active' : 'Paired', color: repoSyncEnabled ? 'green' : 'blue' }
@@ -101,6 +204,45 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
         </Group>
       </Group>
 
+      <Modal
+        opened={automationOpen}
+        onClose={() => {
+          if (!automationSaving) {
+            setAutomationOpen(false);
+            setAutomationStatus(null);
+          }
+        }}
+        title={
+          <Group gap="sm" wrap="nowrap">
+            <Text fw={600}>Automation</Text>
+            <Text size="sm" c="dimmed" fw={400}>
+              Choose which behaviors run automatically and when they should activate.
+            </Text>
+          </Group>
+        }
+        size="min(1120px, 94vw)"
+        centered
+        styles={{
+          content: { maxHeight: '92dvh' },
+          body: { overflow: 'hidden' },
+        }}
+      >
+        <Automation
+          value={automationValue}
+          controls={automationControls}
+          invokedCapabilities={automationCapabilities}
+          busy={automationSaving}
+          status={automationStatus}
+          onCancel={() => {
+            if (!automationSaving) {
+              setAutomationOpen(false);
+              setAutomationStatus(null);
+            }
+          }}
+          onSave={saveAutomation}
+        />
+      </Modal>
+
       <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="md">
         <CapabilityCard
           eyebrow="Inference"
@@ -113,14 +255,9 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
         <CapabilityCard
           eyebrow="Lifecycle"
           title="Automation"
-          description="Configure stage-entry and new-session rearming for connected single-use inference capabilities."
+          description="Choose which workflow behaviors should run automatically and configure their thresholds."
           buttonLabel="Configure automation"
-          onClick={onOpenAutomation}
-          badge={
-            <Badge color={automationEnabled ? 'green' : 'gray'} variant="light">
-              {automationEnabled ? 'Enabled' : 'Disabled'}
-            </Badge>
-          }
+          onClick={() => void openAutomation()}
         />
         <CapabilityCard
           eyebrow="Context"

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    engine::{governance, refresh_inference_arm_state},
+    engine::{automation, refresh_inference_arm_state},
     models::RunStatus,
 };
 
@@ -309,10 +309,7 @@ pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Val
         }));
     }
 
-    let root = ensure_engine_root(&mut run.context);
-    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
-    let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
-    run_state_obj.insert("pause_requested".to_string(), json!(true));
+    request_run_pause_after_stage(&mut run)?;
     persist_context(state, run_id, &run.context).await?;
 
     append_engine_event(
@@ -765,15 +762,15 @@ async fn prepare_stage_for_execution(
     )
     .await?;
 
-    let decisions = governance::before_stage(state, run_id, &mut run, &step).await?;
-    governance::apply_context_mutations(
+    let decisions = automation::before_stage(state, run_id, &mut run, &step).await?;
+    automation::apply_context_mutations(
         &mut run,
         &decisions,
         Some(step.id.as_str()),
         None,
     )?;
 
-    let pause_message = governance::pause_message(&decisions);
+    let pause_message = automation::pause_message(&decisions);
     let prepared_status = match mode {
         RunMode::Manual | RunMode::Autonomous => RunStatus::Running,
         RunMode::PrepareOnly => RunStatus::Waiting,
@@ -804,7 +801,7 @@ async fn prepare_stage_for_execution(
         Some(step.id.as_str()),
         "info",
         "stage_prepared_for_execution",
-        "Governance prepared stage before execution.",
+        "Automation prepared stage before execution.",
         json!({
             "step_id": step.id,
             "step_type": step.step_type,
@@ -816,7 +813,7 @@ async fn prepare_stage_for_execution(
                 RunMode::Autonomous => "autonomous",
                 RunMode::PrepareOnly => "prepare_only",
             },
-            "paused_by_governance": pause_message.is_some(),
+            "paused_by_automation": pause_message.is_some(),
             "prepared_context": refreshed_run.context.clone(),
             "prepared_global_state": prepared_global_state,
             "prepared_stage_overrides": prepared_stage_overrides
@@ -994,6 +991,14 @@ fn run_pause_requested(run: &super::WorkflowRun) -> bool {
         .and_then(|v| v.get("pause_requested"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+pub(crate) fn request_run_pause_after_stage(run: &mut super::WorkflowRun) -> Result<()> {
+    let root = ensure_engine_root(&mut run.context);
+    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
+    let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
+    run_state_obj.insert("pause_requested".to_string(), json!(true));
+    Ok(())
 }
 
 fn clear_run_pause_requested(run: &mut super::WorkflowRun) {

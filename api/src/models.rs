@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::engine::runtime_tools::{CompileStageSpec, QaStageSpec, SharedDependenciesConfig};
+use crate::engine::runtime_tools::{CompileStageSpec, SharedDependenciesConfig};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -84,8 +84,6 @@ pub struct WorkflowStepExecutionConfig {
     pub compile_checks: Value,
     #[serde(default)]
     pub compile: Option<CompileStageSpec>,
-    #[serde(default)]
-    pub qa: Option<QaStageSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -183,6 +181,21 @@ pub struct WorkflowBuilderCatalog {
     pub version: u32,
     #[serde(default)]
     pub stage_descriptors: Vec<WorkflowStageDescriptor>,
+    #[serde(default)]
+    pub automation_controls: Vec<WorkflowAutomationControlDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowAutomationControlDescriptor {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    pub section: String,
+    pub field_type: String,
+    pub default: Value,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
