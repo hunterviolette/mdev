@@ -27,7 +27,7 @@ import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
 import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
 import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
-import { subscribeRuntimeEventBus } from './runtime_events';
+import { executionTone as tone, subscribeRuntimeEventBus } from './runtime_events';
 
 type FlightDeckPanelProps = {
   navigate?: (path: string) => void;
@@ -42,14 +42,14 @@ type OpenPlannerOptions = {
 
 type TemplateOption = { value: string; label: string };
 
-type FlightDeckPoolSetting = {
+type SupervisorPoolConfig = {
   template_id?: string | null;
   mode?: string | null;
   concurrency?: number | null;
 };
 
-type FlightDeckSettings = {
-  pools?: Record<string, FlightDeckPoolSetting>;
+type SupervisorConfig = {
+  pools?: Record<string, SupervisorPoolConfig>;
   execution_event_limit?: number;
 };
 
@@ -121,24 +121,28 @@ function workflowTemplateOptions(templates: WorkflowTemplate[]): TemplateOption[
   return templates.map((template) => ({ value: template.id, label: template.name }));
 }
 
-function supervisorFlightDeckSettings(supervisor: FlightDeckSupervisor): FlightDeckSettings {
-  const raw = supervisor.context?.flight_deck_settings;
-  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as FlightDeckSettings : {};
+function supervisorConfig(supervisor: FlightDeckSupervisor): SupervisorConfig {
+  const pools = supervisor.context?.pools;
+  const executionEventLimit = supervisor.context?.execution_event_limit;
+  return {
+    pools: pools && typeof pools === 'object' && !Array.isArray(pools) ? pools as Record<string, SupervisorPoolConfig> : {},
+    execution_event_limit: typeof executionEventLimit === 'number' ? executionEventLimit : undefined,
+  };
 }
 
 function supervisorExecutionEventLimit(supervisor: FlightDeckSupervisor): number {
-  const value = supervisorFlightDeckSettings(supervisor).execution_event_limit;
+  const value = supervisorConfig(supervisor).execution_event_limit;
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.max(10, Math.min(1000, Math.floor(value)))
     : 100;
 }
 
-function poolSetting(supervisor: FlightDeckSupervisor, groupKey: string): FlightDeckPoolSetting {
-  return supervisorFlightDeckSettings(supervisor).pools?.[groupKey] ?? {};
+function poolSetting(supervisor: FlightDeckSupervisor, groupKey: string): SupervisorPoolConfig {
+  return supervisorConfig(supervisor).pools?.[groupKey] ?? {};
 }
 
-function nextFlightDeckSettings(supervisor: FlightDeckSupervisor, groupKey: string, patch: FlightDeckPoolSetting): FlightDeckSettings {
-  const current = supervisorFlightDeckSettings(supervisor);
+function nextSupervisorConfig(supervisor: FlightDeckSupervisor, groupKey: string, patch: SupervisorPoolConfig): SupervisorConfig {
+  const current = supervisorConfig(supervisor);
   return {
     ...current,
     pools: {
@@ -163,15 +167,6 @@ const INTEGRATION_MODE_OPTIONS = [
 
 function normalize(value: string | null | undefined): string {
   return (value ?? '').trim().toLowerCase();
-}
-
-function tone(value: string | null | undefined): string {
-  const normalized = normalize(value);
-  if (['success', 'complete', 'completed', 'done', 'applied', 'integrated'].includes(normalized)) return 'green';
-  if (['active', 'running', 'integrating', 'ready_for_integration', 'patch_ready'].includes(normalized)) return 'cyan';
-  if (['waiting', 'waiting_user', 'paused', 'up_next', 'draft'].includes(normalized)) return 'yellow';
-  if (['failed', 'blocked', 'error', 'cancelled', 'deleted'].includes(normalized)) return 'red';
-  return 'gray';
 }
 
 function titleCase(value: string | null | undefined): string {
@@ -1265,7 +1260,7 @@ function PoolNumberControl(props: { label: string; ariaLabel: string; value: num
   );
 }
 
-function PoolControls(props: { groupKey: string; templateOptions: TemplateOption[]; settings: FlightDeckPoolSetting; onSettingsChange: (patch: FlightDeckPoolSetting) => void }) {
+function PoolControls(props: { groupKey: string; templateOptions: TemplateOption[]; settings: SupervisorPoolConfig; onSettingsChange: (patch: SupervisorPoolConfig) => void }) {
   const templateValue = props.settings.template_id ?? null;
   const modeValue = props.settings.mode ?? (props.groupKey === 'integration' ? 'manual' : 'series');
   const concurrencyValue = Math.max(1, Math.min(64, props.settings.concurrency ?? 1));
@@ -1603,9 +1598,9 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
   const [featurePoolBusy, setFeaturePoolBusy] = useState(false);
   const [manualNameOpen, setManualNameOpen] = useState(false);
   const [manualName, setManualName] = useState('');
-  async function updateSettings(patch: FlightDeckPoolSetting) {
-    const flightDeckSettings = nextFlightDeckSettings(props.supervisor, props.groupKey, patch);
-    await runSupervisorAction(props.supervisor.id, { action: 'update_flight_deck_settings', flight_deck_settings: flightDeckSettings as Record<string, unknown> });
+  async function updateSettings(patch: SupervisorPoolConfig) {
+    const config = nextSupervisorConfig(props.supervisor, props.groupKey, patch);
+    await runSupervisorAction(props.supervisor.id, { action: 'update_supervisor_config', config: config as Record<string, unknown> });
     props.onActionComplete?.();
   }
   const poolControls = <PoolControls groupKey={props.groupKey} templateOptions={props.templateOptions} settings={settings} onSettingsChange={(patch) => void updateSettings(patch)} />;
@@ -1876,13 +1871,9 @@ function SupervisorPlannerOptionsModal(props: {
     if (!supervisor || !selectedPlannerId) return;
     setLoading(true);
     try {
-      const settings = {
-        ...supervisorFlightDeckSettings(supervisor),
-        selected_planner_id: selectedPlannerId,
-      } as Record<string, unknown>;
       await runSupervisorAction(supervisor.id, {
-        action: 'update_flight_deck_settings',
-        flight_deck_settings: settings,
+        action: 'select_planner',
+        planner_id: selectedPlannerId,
       });
       await props.onApplied();
       props.onClose();
@@ -2243,8 +2234,6 @@ function FeatureQueueModal(props: {
   async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
     if (!supervisor) return;
     const activePlannerId = selectedPlannerId;
-    const featureSettings = poolSetting(supervisor, 'feature_development');
-    const integrationSettings = poolSetting(supervisor, 'integration');
     const uniqueQueuedFeatures = nextQueuedFeatures.filter((item, index, rows) => item.feature_id && rows.findIndex((candidate) => candidate.feature_id === item.feature_id) === index);
     updateQueuedFeatures(uniqueQueuedFeatures);
     setQueueLoading(true);
@@ -2252,13 +2241,7 @@ function FeatureQueueModal(props: {
 
     const write = async () => {
       try {
-        await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures, {
-          workflow_template_id: featureSettings.template_id ?? null,
-          integration_template_id: integrationSettings.template_id ?? null,
-          feature_concurrency: featureSettings.concurrency ?? null,
-          integration_policy: integrationSettings.mode === 'auto' ? 'auto' : 'manual',
-          auto_start: false,
-        });
+        await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures);
         const next = await getSupervisorQueue(supervisor.id);
         setQueue(next);
         updateQueuedFeatures(next.queued_features ?? []);
@@ -2478,9 +2461,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     setSavingExecutionEventLimit(true);
     try {
       await runSupervisorAction(settingsSupervisor.id, {
-        action: 'update_flight_deck_settings',
-        flight_deck_settings: {
-          ...supervisorFlightDeckSettings(settingsSupervisor),
+        action: 'update_supervisor_config',
+        config: {
+          ...supervisorConfig(settingsSupervisor),
           execution_event_limit: limit,
         },
       });
@@ -2568,8 +2551,6 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         title,
         root_repo_path: rootRepoPath,
         strategy: 'series',
-        workflow_template_id: null,
-        integration_template_id: null,
         feature_plan_items: [],
         execution_plan_items: [],
         context: {}

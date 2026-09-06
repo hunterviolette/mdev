@@ -15,7 +15,19 @@ mod processes;
 mod supervisor;
 mod templates;
 mod workflow_builder;
-pub(crate) use workflow_builder::{normalize_qa_environment, normalize_shared_dependencies};
+pub(crate) use workflow_builder::{
+    code_descriptor,
+    compile_descriptor,
+    design_descriptor,
+    merge_patches_descriptor,
+    normalize_qa_environment,
+    normalize_shared_dependencies,
+    qa_descriptor,
+    review_descriptor,
+    sap_export_descriptor,
+    sap_import_descriptor,
+    sap_syntax_descriptor,
+};
 mod workflow_scope;
 
 use axum::Router;

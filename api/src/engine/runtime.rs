@@ -94,15 +94,14 @@ fn run_status_label(status: &RunStatus) -> &'static str {
 }
 
 fn run_is_waiting_on_operator_checkpoint(run: &super::WorkflowRun) -> bool {
-    matches!(run.status, RunStatus::Waiting)
-        && run
-            .context
-            .get("workflow_engine")
-            .and_then(|value| value.get("run_state"))
-            .and_then(|value| value.get("blocked_on"))
-            .and_then(|value| value.get("kind"))
-            .and_then(Value::as_str)
-            == Some("operator_checkpoint")
+    run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("operator_checkpoint")
 }
 
 fn run_is_blocked_by_user_control(run: &super::WorkflowRun) -> bool {
@@ -244,7 +243,7 @@ pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Va
     if let Some(blocked_on) = operator_checkpoint {
         return Ok(json!({
             "ok": false,
-            "status": "waiting",
+            "status": "running",
             "blocked_on": "operator_checkpoint",
             "current_step_id": run.current_step_id,
             "checkpoint": blocked_on,
@@ -277,15 +276,7 @@ pub async fn resume_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Va
 
 pub async fn pause_run(state: &AppState, run_id: Uuid) -> Result<serde_json::Value> {
     let mut run = load_run(state, run_id).await?;
-    let disposition_review_waiting = matches!(run.status, RunStatus::Waiting)
-        && run
-            .context
-            .get("workflow_engine")
-            .and_then(|v| v.get("run_state"))
-            .and_then(|v| v.get("blocked_on"))
-            .and_then(|v| v.get("kind"))
-            .and_then(Value::as_str)
-            == Some("operator_checkpoint");
+    let disposition_review_waiting = run_is_waiting_on_operator_checkpoint(&run);
     let autonomous_pause_eligible = if matches!(run.status, RunStatus::Waiting) {
         load_template_definition(state, &run)
             .await?
@@ -450,6 +441,23 @@ fn action_is_read_only(action: &str) -> bool {
     matches!(action, "get_transient_stage_user_input")
 }
 
+fn action_allows_completed_workflow(action: &str) -> bool {
+    matches!(
+        action,
+        "select_step"
+            | "patch_transient_stage_user_input"
+            | "patch_stage_state"
+            | "patch_global_state"
+            | "prepare_stage"
+            | "prepare_current_stage"
+            | "start_run"
+            | "restart_stage"
+            | "restart_current_stage"
+            | "run_step"
+            | "run_current_step"
+    )
+}
+
 fn action_allows_running_workflow(action: &str) -> bool {
     matches!(
         action,
@@ -458,10 +466,11 @@ fn action_allows_running_workflow(action: &str) -> bool {
             | "force_wait_run"
             | "force_unlock_run"
             | "force_complete_stage"
+            | "resolve_operator_checkpoint"
     )
 }
 
-fn action_requires_waiting_workflow(action: &str) -> bool {
+fn action_requires_operator_checkpoint(action: &str) -> bool {
     matches!(action, "resolve_operator_checkpoint")
 }
 
@@ -508,7 +517,9 @@ pub async fn validate_workflow_action_request(
         return Ok(());
     }
 
-    if matches!(run.status, RunStatus::Cancelled | RunStatus::Success) {
+    if matches!(run.status, RunStatus::Cancelled)
+        || matches!(run.status, RunStatus::Success) && !action_allows_completed_workflow(action)
+    {
         return Err(anyhow!(
             "workflow action {} is not allowed while workflow status is {}",
             action,
@@ -523,11 +534,10 @@ pub async fn validate_workflow_action_request(
         ));
     }
 
-    if action_requires_waiting_workflow(action) && !matches!(run.status, RunStatus::Waiting) {
+    if action_requires_operator_checkpoint(action) && !run_is_waiting_on_operator_checkpoint(&run) {
         return Err(anyhow!(
-            "stale workflow action: {} requires waiting status, current status is {}",
-            action,
-            current_status
+            "stale workflow action: {} requires an active operator checkpoint",
+            action
         ));
     }
 
@@ -651,29 +661,23 @@ pub(crate) async fn fail_runtime_workflow(
     Ok(())
 }
 
-pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposition: &str, _selected_step_id: Option<&str>) -> Result<serde_json::Value> {
-    let mut run = load_run(state, run_id).await?;
+pub async fn resolve_operator_checkpoint(
+    state: &AppState,
+    run_id: Uuid,
+    disposition: &str,
+    selected_step_id: Option<&str>,
+) -> Result<serde_json::Value> {
+    let run = load_run(state, run_id).await?;
     let blocked_on = run
         .context
         .get("workflow_engine")
-        .and_then(|v| v.get("run_state"))
-        .and_then(|v| v.get("blocked_on"))
-        .cloned()
-        .ok_or_else(|| anyhow!("workflow is not waiting on operator checkpoint"))?;
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+        .ok_or_else(|| anyhow!("workflow is not waiting on operator input"))?;
 
-    let blocked_kind = blocked_on
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if blocked_kind != "capability_user_input" && blocked_kind != "operator_checkpoint" {
-        return Err(anyhow!("workflow is blocked on {}, not capability user input", blocked_kind));
+    if blocked_on.get("kind").and_then(Value::as_str) != Some("operator_checkpoint") {
+        return Err(anyhow!("workflow is not waiting on an operator checkpoint"));
     }
-
-    let blocked_capability = blocked_on
-        .get("capability")
-        .and_then(Value::as_str)
-        .unwrap_or("operator_checkpoint")
-        .to_string();
 
     let stage_id = blocked_on
         .get("stage_id")
@@ -681,351 +685,44 @@ pub async fn resolve_operator_checkpoint(state: &AppState, run_id: Uuid, disposi
         .or(run.current_step_id.as_deref())
         .ok_or_else(|| anyhow!("operator checkpoint is missing stage_id"))?
         .to_string();
-    let next_target = blocked_on
-        .get("next_step_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| value.to_string());
-    let resume_mode = blocked_on
-        .get("resume_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("manual")
-        .to_string();
-    let checkpoint_phase = blocked_on
-        .get("phase")
-        .and_then(Value::as_str)
-        .unwrap_or("after_stage")
-        .to_string();
-    let stage_execution_id = match blocked_on
-        .get("stage_execution_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-    {
-        Some(value) => Some(value),
-        None => latest_stage_execution_id_for_step(state, run_id, stage_id.as_str()).await?,
-    };
-
-    let capability_invocation_id = blocked_on
-        .get("capability_invocation_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-
 
     let normalized_disposition = match disposition {
         "continue_auto" | "auto" | "autonomous" | "move_next" | "continue" => "continue_auto",
-        "complete" => "complete",
-        "pause_error" | "pause" | "paused" => "pause_error",
+        "select_stage" | "select" | "continue_manual" | "manual" => "select_stage",
+        "pause_error" | "pause" | "paused" | "complete" => "pause_error",
         other => return Err(anyhow!("unsupported operator checkpoint disposition {}", other)),
     };
 
-    let resume_mode = match normalized_disposition {
-        "continue_auto" => "autonomous".to_string(),
-        "complete" | "pause_error" => "none".to_string(),
-        _ => resume_mode,
+    let selected_step_id = if normalized_disposition == "select_stage" {
+        Some(
+            selected_step_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("selected_step_id is required when selecting a workflow stage"))?
+                .to_string(),
+        )
+    } else {
+        None
     };
 
-    {
-        let root = ensure_engine_root(&mut run.context);
-        let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
-        let run_state_obj = run_state.as_object_mut().ok_or_else(|| anyhow!("run_state must be object"))?;
-        run_state_obj.remove("blocked_on");
-    }
-    persist_context(state, run_id, &run.context).await?;
-
-    let checkpoint_ok = normalized_disposition != "pause_error";
-    let checkpoint_status = if checkpoint_ok { "success" } else { "paused" };
-    append_engine_event(
-        state,
+    if !state.operator_inputs.resolve(
         run_id,
-        Some(stage_id.as_str()),
-        if checkpoint_ok { "info" } else { "warn" },
-        format!("{}_completed", blocked_capability).as_str(),
-        if checkpoint_ok { "Capability user input resolved." } else { "Capability user input paused workflow." },
-        json!({
-            "capability": blocked_capability,
-            "ok": checkpoint_ok,
-            "execution_state": "completed",
-            "disposition": normalized_disposition,
-            "result": {
-                "ok": checkpoint_ok,
-                "mode": "operator_checkpoint",
-                "status": checkpoint_status,
-                "needs_user_response": false,
-                "summary": if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
-                "message": if checkpoint_ok { "Operator checkpoint approved." } else { "Operator checkpoint paused workflow." },
-                "stage_id": stage_id,
-                "disposition": normalized_disposition
-            },
-            "event_meta": event_meta(stage_execution_id.as_deref(), capability_invocation_id.as_deref(), None, false)
-        }),
-    ).await?;
-
-    match normalized_disposition {
-        "pause_error" => {
-            if checkpoint_phase != "before_stage" {
-                let definition = load_template_definition(state, &run)
-                    .await?
-                    .ok_or_else(|| anyhow!("run has no template definition"))?;
-                run_stage_exit_hook_if_transitioning(
-                    state,
-                    run_id,
-                    &definition,
-                    Some(stage_id.as_str()),
-                    None,
-                )
-                .await?;
-            }
-
-            append_disposition_stage_completion_event(
-                state,
-                run_id,
-                stage_id.as_str(),
-                stage_execution_id.as_deref(),
-                true,
-                "paused",
-                if checkpoint_phase == "before_stage" {
-                    "Stage paused before execution by operator checkpoint."
-                } else {
-                    "Stage paused by operator checkpoint."
-                },
-                None,
-            )
-            .await?;
-
-            set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
-            append_engine_event(
-                state,
-                run_id,
-                Some(stage_id.as_str()),
-                "info",
-                "operator_checkpoint_resolved",
-                "Operator paused workflow at checkpoint.",
-                json!({
-                    "disposition": "pause_error",
-                    "stage_id": stage_id,
-                    "phase": checkpoint_phase,
-                    "status": "paused"
-                }),
-            )
-            .await?;
-
-            Ok(json!({
-                "ok": true,
-                "status": "paused",
-                "disposition": "pause_error",
-                "current_step_id": stage_id,
-                "followup_action": "pause",
-                "continue_workflow": false
-            }))
-        }
-        "complete" => {
-            if checkpoint_phase != "before_stage" {
-                append_disposition_stage_completion_event(
-                    state,
-                    run_id,
-                    stage_id.as_str(),
-                    stage_execution_id.as_deref(),
-                    true,
-                    "complete",
-                    "Stage completed after operator checkpoint.",
-                    None,
-                )
-                .await?;
-            }
-
-            set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
-
-            Ok(json!({
-                "ok": true,
-                "accepted": true,
-                "status": "paused",
-                "disposition": "complete",
-                "current_step_id": stage_id,
-                "followup_action": "pause",
-                "continue_workflow": false
-            }))
-        }
-        "continue_auto" => {
-            let definition = load_template_definition(state, &run).await?
-                .ok_or_else(|| anyhow!("run has no template definition"))?;
-            let target = if checkpoint_phase == "before_stage" {
-                Some(stage_id.clone())
-            } else {
-                next_target.or_else(|| next_step_id(&definition, Some(stage_id.as_str())))
-            };
-
-            if target.is_none() {
-                append_engine_event(
-                    state,
-                    run_id,
-                    Some(stage_id.as_str()),
-                    "info",
-                    "operator_checkpoint_resolved",
-                    "Operator checkpoint approved the final workflow stage; workflow completed successfully.",
-                    json!({ "disposition": normalized_disposition, "stage_id": stage_id, "next_step_id": Value::Null }),
-                ).await?;
-
-                append_disposition_stage_completion_event(
-                    state,
-                    run_id,
-                    stage_id.as_str(),
-                    stage_execution_id.as_deref(),
-                    true,
-                    "complete",
-                    "Final workflow stage completed successfully after operator checkpoint.",
-                    None,
-                ).await?;
-
-                set_run_status(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
-                crate::supervisor::handle_workflow_terminal_event(state, run_id, RunStatus::Success, Some(stage_id.as_str())).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "complete",
-                    "disposition": normalized_disposition,
-                    "current_step_id": stage_id,
-                    "next_step_id": Value::Null,
-                    "followup_action": "complete_workflow"
-                }));
-            }
-
-            let target = target.expect("target checked above");
-            let target_step = current_step(&definition, &run, Some(target.as_str()))?.clone();
-
-            if checkpoint_phase == "before_stage" {
-                crate::engine::stages::record_stage_checkpoint_continue(
-                    &mut run,
-                    &target_step,
-                    checkpoint_phase.as_str(),
-                )?;
-                persist_context(state, run_id, &run.context).await?;
-
-                append_disposition_stage_completion_event(
-                    state,
-                    run_id,
-                    stage_id.as_str(),
-                    stage_execution_id.as_deref(),
-                    true,
-                    "continue_auto",
-                    "QA entry checkpoint approved.",
-                    Some(stage_id.as_str()),
-                )
-                .await?;
-
-                set_current_step_waiting(state, run_id, stage_id.as_str()).await?;
-                append_engine_event(
-                    state,
-                    run_id,
-                    Some(stage_id.as_str()),
-                    "info",
-                    "operator_checkpoint_resolved",
-                    "Operator approved starting the QA stage.",
-                    json!({
-                        "disposition": normalized_disposition,
-                        "stage_id": stage_id,
-                        "next_step_id": stage_id,
-                        "phase": "before_stage"
-                    }),
-                )
-                .await?;
-
-                return Ok(json!({
-                "ok": true,
-                "accepted": true,
-                "status": "waiting",
-                "disposition": normalized_disposition,
-                "current_step_id": stage_id,
-                "next_step_id": stage_id,
-                "followup_action": "continue_existing_runtime"
-            }));
-            }
-
-            let source_step = current_step(&definition, &run, Some(stage_id.as_str()))?.clone();
-            run_stage_exit_hook_if_transitioning(
-                state,
-                run_id,
-                &definition,
-                Some(source_step.id.as_str()),
-                Some(target.as_str()),
-            )
-            .await?;
-            append_engine_event(
-                state,
-                run_id,
-                Some(stage_id.as_str()),
-                "info",
-                "operator_checkpoint_resolved",
-                "Operator approved moving to the next stage after checkpoint.",
-                json!({ "disposition": normalized_disposition, "stage_id": stage_id, "next_step_id": target.as_str() }),
-            ).await?;
-
-            let latest_run = load_run(state, run_id).await?;
-            if run_pause_requested(&latest_run) {
-                let mut paused_run = latest_run;
-                clear_run_pause_requested(&mut paused_run);
-                persist_context(state, run_id, &paused_run.context).await?;
-                set_run_status(state, run_id, RunStatus::Paused, Some(stage_id.as_str())).await?;
-                append_engine_event(
-                    state,
-                    run_id,
-                    Some(stage_id.as_str()),
-                    "info",
-                    "run_paused_after_stage",
-                    "Workflow run paused after the current stage completed.",
-                    json!({}),
-                ).await?;
-                return Ok(json!({
-                    "ok": true,
-                    "status": "paused",
-                    "disposition": "pause_error",
-                    "current_step_id": stage_id,
-                    "next_step_id": target,
-                }));
-            }
-
-            append_disposition_stage_completion_event(
-                state,
-                run_id,
-                stage_id.as_str(),
-                stage_execution_id.as_deref(),
-                true,
-                normalized_disposition,
-                "Stage completed after operator checkpoint.",
-                Some(target.as_str()),
-            ).await?;
-
-            set_current_step_waiting(state, run_id, target.as_str()).await?;
-
-            append_engine_event(
-                state,
-                run_id,
-                Some(target.as_str()),
-                "info",
-                "operator_checkpoint_transition_committed",
-                "Operator checkpoint transition committed before backend continuation.",
-                json!({
-                    "disposition": normalized_disposition,
-                    "from_step_id": stage_id,
-                    "current_step_id": target,
-                    "resume_mode": resume_mode,
-                    "auto_runnable": step_is_auto_runnable(&target_step),
-                }),
-            ).await?;
-
-            Ok(json!({
-                "ok": true,
-                "accepted": true,
-                "status": "waiting",
-                "disposition": normalized_disposition,
-                "current_step_id": target,
-                "next_step_id": target,
-                "resume_mode": resume_mode,
-                "followup_action": "continue_existing_runtime"
-            }))
-        }
-        other => Err(anyhow!("unsupported disposition {}", other)),
+        crate::engine::capabilities::operator_checkpoint::OperatorInputResponse {
+            disposition: normalized_disposition.to_string(),
+            selected_step_id: selected_step_id.clone(),
+        },
+    ) {
+        return Err(anyhow!("operator checkpoint runtime is not active; restart the stage"));
     }
+
+    Ok(json!({
+        "ok": true,
+        "accepted": true,
+        "status": "running",
+        "disposition": normalized_disposition,
+        "current_step_id": stage_id,
+        "next_step_id": selected_step_id,
+        "followup_action": "continue_existing_runtime"
+    }))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1217,34 +914,14 @@ pub async fn restart_stage(
         .ok_or_else(|| anyhow!("run has no template definition"))?;
     let step = current_step(&definition, &run, requested_step_id)?.clone();
 
-    let blocked_checkpoint = run
-        .context
-        .get("workflow_engine")
-        .and_then(|value| value.get("run_state"))
-        .and_then(|value| value.get("blocked_on"))
-        .filter(|blocked| {
-            blocked.get("kind").and_then(Value::as_str)
-                == Some("operator_checkpoint")
-                && blocked.get("stage_id").and_then(Value::as_str)
-                    == Some(step.id.as_str())
-                && blocked.get("phase").and_then(Value::as_str)
-                    == Some("after_stage")
-        })
-        .is_some();
-
-    if run_is_waiting_on_operator_checkpoint(&run) && !blocked_checkpoint {
+    if run_is_waiting_on_operator_checkpoint(&run) {
         return Ok(json!({
             "ok": false,
             "status": "waiting",
             "blocked_on": "operator_checkpoint",
             "current_step_id": run.current_step_id,
-            "message": "The active operator checkpoint does not belong to this stage runtime."
+            "message": "Resolve or cancel the active operator checkpoint before restarting the stage."
         }));
-    }
-
-    if blocked_checkpoint {
-        clear_pending_capability_user_input(&mut run);
-        persist_context(state, run_id, &run.context).await?;
     }
 
     super::stages::invoke_stage_restart_hook(state, run_id, &step).await?;
@@ -1343,126 +1020,6 @@ fn clear_run_cancel_requested(run: &mut super::WorkflowRun) {
     }
 }
 
-fn capability_user_input_result(outcome: &super::stages::StageOutcome) -> Option<Value> {
-    outcome.capability_results.iter().find_map(|item| {
-        let capability = item
-            .get("key")
-            .or_else(|| item.get("capability"))
-            .and_then(Value::as_str)?;
-        let mut result = item
-            .get("result")
-            .or_else(|| item.get("payload"))?
-            .clone();
-
-        if result.get("needs_user_response").and_then(Value::as_bool) != Some(true) {
-            return None;
-        }
-
-        if let Some(result_obj) = result.as_object_mut() {
-            result_obj
-                .entry("capability".to_string())
-                .or_insert_with(|| Value::String(capability.to_string()));
-        }
-
-        Some(result)
-    })
-}
-
-fn capability_user_input_options(
-    outcome: &super::stages::StageOutcome,
-) -> Value {
-    normalize_capability_user_input_options(
-        capability_user_input_result(outcome)
-            .and_then(|user_input| user_input.get("available_dispositions").cloned()),
-    )
-}
-
-fn normalize_capability_user_input_options(configured: Option<Value>) -> Value {
-    let options = configured
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| match value.as_str() {
-            Some("continue_auto") | Some("auto") | Some("autonomous") | Some("move_next") | Some("continue") => Some(json!("continue_auto")),
-            Some("select_stage") | Some("select") | Some("continue_manual") | Some("manual") => Some(json!("select_stage")),
-            Some("pause_error") | Some("pause") | Some("paused") => Some(json!("pause_error")),
-            _ => None,
-        })
-        .collect::<Vec<Value>>();
-
-    if options.is_empty() {
-        json!(["continue_auto", "pause_error", "select_stage"])
-    } else {
-        Value::Array(options)
-    }
-}
-
-fn clear_pending_capability_user_input(run: &mut super::WorkflowRun) {
-    let root = ensure_engine_root(&mut run.context);
-    if let Some(run_state) = root.get_mut("run_state").and_then(|v| v.as_object_mut()) {
-        run_state.remove("blocked_on");
-    }
-}
-
-async fn set_current_step_waiting(state: &AppState, run_id: Uuid, step_id: &str) -> Result<()> {
-    let mut run = load_run(state, run_id).await?;
-    let definition = load_template_definition(state, &run).await?
-        .ok_or_else(|| anyhow!("run has no template definition"))?;
-    let step = current_step(&definition, &run, Some(step_id))?;
-
-    run.current_step_id = Some(step.id.clone());
-    run.status = RunStatus::Waiting;
-
-    persist_context(state, run_id, &run.context).await?;
-    set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
-
-    Ok(())
-}
-
-fn set_pending_capability_user_input(
-    run: &mut super::WorkflowRun,
-    step: &super::WorkflowStepDefinition,
-    outcome: &super::stages::StageOutcome,
-    next_target: Option<String>,
-    resume_mode: &str,
-    process_session_id: &str,
-) {
-    let root = ensure_engine_root(&mut run.context);
-    let run_state = root.entry("run_state".to_string()).or_insert_with(|| json!({}));
-    let run_state_obj = run_state.as_object_mut().expect("run_state must be object");
-    let stage_execution_id = outcome
-        .local_state
-        .get("_stage_execution_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    let user_input = capability_user_input_result(outcome).unwrap_or_else(|| json!({}));
-    run_state_obj.insert("blocked_on".to_string(), json!({
-        "kind": "capability_user_input",
-        "capability": user_input
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or("operator_checkpoint"),
-        "process_session_id": process_session_id,
-        "stage_id": step.id,
-        "stage_type": step.step_type,
-        "stage_execution_id": stage_execution_id,
-        "capability_invocation_id": user_input.get("_capability_invocation_id").and_then(Value::as_str).unwrap_or(""),
-        "phase": user_input.get("phase").and_then(Value::as_str).unwrap_or("after_stage"),
-        "recommended_disposition": user_input
-            .get("recommended_disposition")
-            .and_then(Value::as_str)
-            .unwrap_or("continue_auto"),
-        "available_dispositions": capability_user_input_options(outcome),
-        "next_step_id": next_target,
-        "message": user_input
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or(outcome.message.as_str()),
-        "resume_mode": resume_mode
-    }));
-}
-
 pub(crate) async fn run_workflow_runtime(
     state: &AppState,
     run_id: Uuid,
@@ -1522,18 +1079,13 @@ pub(crate) async fn run_workflow_runtime(
                             set_run_status(state, run_id, RunStatus::Paused, run.current_step_id.as_deref()).await?;
                         }
                         WorkflowRuntimeCommand::ResolveCheckpoint { disposition, selected_step_id } => {
-                            if matches!(disposition.as_str(), "select_stage" | "select" | "continue_manual" | "manual") {
-                                let step_id = selected_step_id
-                                    .filter(|value| !value.trim().is_empty())
-                                    .ok_or_else(|| anyhow!("selected_step_id is required when selecting a workflow stage"))?;
-                                resolve_operator_checkpoint(state, run_id, "complete", None).await?;
-                                select_step(state, run_id, step_id.as_str()).await?;
-                                requested_step_id = Some(step_id);
-                                paused = true;
-                            } else {
-                                resolve_operator_checkpoint(state, run_id, disposition.as_str(), None).await?;
-                                paused = disposition == "pause_error" || disposition == "pause" || disposition == "paused";
-                            }
+                            resolve_operator_checkpoint(
+                                state,
+                                run_id,
+                                disposition.as_str(),
+                                selected_step_id.as_deref(),
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1574,17 +1126,13 @@ pub(crate) async fn run_workflow_runtime(
                             cancellation.cancel();
                         }
                         WorkflowRuntimeCommand::ResolveCheckpoint { disposition, selected_step_id } => {
-                            if matches!(disposition.as_str(), "select_stage" | "select" | "continue_manual" | "manual") {
-                                let step_id = selected_step_id
-                                    .filter(|value| !value.trim().is_empty())
-                                    .ok_or_else(|| anyhow!("selected_step_id is required when selecting a workflow stage"))?;
-                                resolve_operator_checkpoint(state, run_id, "complete", None).await?;
-                                select_step(state, run_id, step_id.as_str()).await?;
-                                requested_step_id = Some(step_id);
-                                paused = true;
-                            } else {
-                                resolve_operator_checkpoint(state, run_id, disposition.as_str(), None).await?;
-                            }
+                            resolve_operator_checkpoint(
+                                state,
+                                run_id,
+                                disposition.as_str(),
+                                selected_step_id.as_deref(),
+                            )
+                            .await?;
                         }
                         WorkflowRuntimeCommand::MoveTo { step_id } => {
                             select_step(state, run_id, step_id.as_str()).await?;
@@ -1606,6 +1154,12 @@ pub(crate) async fn run_workflow_runtime(
             }
         }?;
 
+        let run = load_run(state, run_id).await?;
+        if run_is_waiting_on_operator_checkpoint(&run) {
+            paused = true;
+            continue;
+        }
+
         let status = result.get("status").and_then(Value::as_str).unwrap_or("waiting");
         match status {
             "complete" | "success" | "error" | "cancelled" => return Ok(()),
@@ -1614,18 +1168,7 @@ pub(crate) async fn run_workflow_runtime(
                 if execution_mode == WorkflowExecutionMode::SingleStage {
                     active_mode = None;
                 } else {
-                    let run = load_run(state, run_id).await?;
-                    let blocked_on_checkpoint = run
-                        .context
-                        .get("workflow_engine")
-                        .and_then(|value| value.get("run_state"))
-                        .and_then(|value| value.get("blocked_on"))
-                        .is_some();
-                    if blocked_on_checkpoint {
-                        paused = true;
-                    } else {
-                        requested_step_id = run.current_step_id;
-                    }
+                    requested_step_id = run.current_step_id;
                 }
             }
             _ => {
@@ -1684,7 +1227,7 @@ async fn run_stages(
         if run_cancel_requested(&latest_run) {
             let mut cancelled_run = latest_run;
             clear_run_cancel_requested(&mut cancelled_run);
-            clear_pending_capability_user_input(&mut cancelled_run);
+            state.operator_inputs.clear(run_id);
             persist_context(state, run_id, &cancelled_run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
             append_engine_event(
@@ -1701,6 +1244,15 @@ async fn run_stages(
                 "status": "waiting",
                 "cancelled": true,
                 "current_step_id": cancelled_run.current_step_id
+            }));
+        }
+
+        if run_is_waiting_on_operator_checkpoint(&latest_run) {
+            return Ok(json!({
+                "ok": true,
+                "status": "running",
+                "blocked_on": "operator_checkpoint",
+                "current_step_id": latest_run.current_step_id
             }));
         }
 
@@ -1739,7 +1291,7 @@ async fn run_stages(
         if run_cancel_requested(&latest_run) {
             let mut cancelled_run = latest_run;
             clear_run_cancel_requested(&mut cancelled_run);
-            clear_pending_capability_user_input(&mut cancelled_run);
+            state.operator_inputs.clear(run_id);
             persist_context(state, run_id, &cancelled_run.context).await?;
             set_run_status(state, run_id, RunStatus::Waiting, cancelled_run.current_step_id.as_deref()).await?;
             append_engine_event(
@@ -1763,61 +1315,6 @@ async fn run_stages(
             }));
         }
 
-        let pending_capability_user_input = capability_user_input_result(&outcome).is_some();
-
-        if pending_capability_user_input {
-            clear_pending_capability_user_input(&mut run);
-            let disposition_resume_mode = if automatic { "autonomous" } else { "manual" };
-            set_pending_capability_user_input(&mut run, &step, &outcome, next_target.clone(), disposition_resume_mode, state.process_session_id());
-            persist_context(state, run_id, &run.context).await?;
-            set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
-            append_engine_event(
-                state,
-                run_id,
-                Some(step.id.as_str()),
-                "info",
-                "workflow_execution_state_changed",
-                "Workflow is awaiting capability user input.",
-                json!({
-                    "execution_state": "awaiting_user_input",
-                    "stage_id": step.id,
-                    "stage_type": step.step_type,
-                    "recommended_status": format_stage_status(&outcome.status),
-                    "recommended_transition": format_stage_transition(&outcome.transition),
-                    "available_dispositions": capability_user_input_options(&outcome),
-                    "next_step_id": next_target.clone(),
-                    "resume_mode": disposition_resume_mode,
-                }),
-            ).await?;
-            if !automatic {
-                return Ok(json!({
-                    "ok": outcome.ok,
-                    "status": "waiting",
-                    "blocked_on": "capability_user_input",
-                    "step_id": step.id,
-                    "next_step_id": next_target,
-                    "message": outcome.message,
-                    "stage_status": format_stage_status(&outcome.status),
-                    "transition": format_stage_transition(&outcome.transition),
-                    "capability_results": outcome.capability_results,
-                    "local_state": outcome.local_state,
-                }));
-            }
-
-            return Ok(json!({
-                "ok": outcome.ok,
-                "status": "waiting",
-                "blocked_on": "capability_user_input",
-                "step_id": step.id,
-                "next_step_id": next_target,
-                "message": outcome.message,
-                "stage_status": format_stage_status(&outcome.status),
-                "transition": format_stage_transition(&outcome.transition),
-                "capability_results": outcome.capability_results,
-                "local_state": outcome.local_state,
-            }));
-        }
-
         append_engine_event(
             state,
             run_id,
@@ -1834,7 +1331,6 @@ async fn run_stages(
             }),
         ).await?;
 
-        clear_pending_capability_user_input(&mut run);
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
@@ -2009,10 +1505,15 @@ async fn run_stages(
                 }));
             }
             (StageTransition::Stay, _, _) => {
-                set_run_status(state, run_id, RunStatus::Waiting, Some(step.id.as_str())).await?;
+                let status = if matches!(outcome.status, StageStatus::Paused) {
+                    RunStatus::Paused
+                } else {
+                    RunStatus::Waiting
+                };
+                set_run_status(state, run_id, status.clone(), Some(step.id.as_str())).await?;
                 return Ok(json!({
                     "ok": outcome.ok,
-                    "status": "waiting",
+                    "status": format_run_status(&status),
                     "stage_status": format_stage_status(&outcome.status),
                     "transition": format_stage_transition(&outcome.transition),
                     "step_id": step.id,

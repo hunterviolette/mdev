@@ -4,6 +4,7 @@ use crate::engine::capabilities::inference::panel::{build_inference_config_panel
 
 use crate::{
     app_state::AppState,
+    engine::stages,
     engine::capabilities::planner,
     engine::capabilities::inference::stage_support::{
         build_inference_execution_plan,
@@ -151,7 +152,7 @@ async fn compile_document(
         definition: WorkflowTemplateDefinition {
             version: 1,
             globals,
-            governance: compile_governance(&catalog, &document.governance)
+            governance: compile_governance(&catalog, &steps, &document.governance)
                 .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err))?,
             steps,
         },
@@ -504,50 +505,17 @@ fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<Stag
 }
 
 
-fn capability_keys_for_stage_definition(step: &WorkflowStepDefinition) -> Vec<String> {
-    let mut out: Vec<String> = step
-        .execution_plan
-        .iter()
-        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
-        .map(|node| node.key.clone())
-        .collect();
-
-    if out.is_empty() {
-        out = step
-            .capabilities
-            .iter()
-            .filter(|binding| binding.enabled)
-            .map(|binding| binding.capability.clone())
-            .collect();
-    }
-
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn applicable_governance_policies(
-    descriptor: &WorkflowStageDescriptor,
-    step: &WorkflowStepDefinition,
-) -> Vec<WorkflowGovernancePolicyDescriptor> {
-    let capabilities = capability_keys_for_stage_definition(step);
-    descriptor
-        .available_governance_policies
-        .iter()
-        .filter(|policy| {
-            policy.required_capabilities.is_empty()
-                || policy
-                    .required_capabilities
-                    .iter()
-                    .all(|required| capabilities.iter().any(|item| item == required))
-        })
-        .cloned()
-        .collect()
-}
-
-fn compile_governance(catalog: &WorkflowBuilderCatalog, governance: &Value) -> Result<Value, String> {
+fn compile_governance(
+    catalog: &WorkflowBuilderCatalog,
+    steps: &[WorkflowStepDefinition],
+    governance: &Value,
+) -> Result<Value, String> {
     let mut available = std::collections::BTreeMap::new();
     for descriptor in &catalog.stage_descriptors {
+        if !steps.iter().any(|step| step.step_type == descriptor.step_type) {
+            continue;
+        }
+
         for policy in &descriptor.available_governance_policies {
             available.entry(policy.key.clone()).or_insert_with(|| policy.clone());
         }
@@ -821,20 +789,27 @@ pub(crate) fn normalize_qa_environment(
     }
 }
 
+fn governance_policy_descriptor(key: &str) -> Option<WorkflowGovernancePolicyDescriptor> {
+    match key {
+        "changeset_file_failures" => Some(changeset_governance_policy_descriptor()),
+        "compile_failures" => Some(compile_governance_policy_descriptor()),
+        _ => None,
+    }
+}
+
 fn default_builder_catalog() -> WorkflowBuilderCatalog {
+    let mut stage_descriptors = stages::registered_stage_descriptors();
+
+    for descriptor in &mut stage_descriptors {
+        descriptor.available_governance_policies = stages::automation_policy_keys_for_stage_type(&descriptor.step_type)
+            .iter()
+            .filter_map(|key| governance_policy_descriptor(key))
+            .collect();
+    }
+
     WorkflowBuilderCatalog {
         version: 2,
-        stage_descriptors: vec![
-            design_descriptor(),
-            code_descriptor(),
-            compile_descriptor(),
-            qa_descriptor(),
-            merge_patches_descriptor(),
-            review_descriptor(),
-            sap_import_descriptor(),
-            sap_syntax_descriptor(),
-            sap_export_descriptor(),
-        ],
+        stage_descriptors,
     }
 }
 
@@ -941,7 +916,7 @@ fn default_globals() -> WorkflowGlobalConfig {
             },
             "context_export": {
                 "enabled": false,
-                "save_path": "/tmp/repo_context.txt"
+                "save_path": "broad_context_file.txt"
             },
             "changeset_schema": {
                 "enabled": false
@@ -996,7 +971,7 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
     }
 }
 
-fn design_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn design_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("design", "Design", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: true,
@@ -1060,7 +1035,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn code_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn code_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("code", "Code", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: true,
@@ -1121,14 +1096,12 @@ fn code_descriptor() -> WorkflowStageDescriptor {
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
             ],
         }],
-        available_governance_policies: vec![
-            changeset_governance_policy_descriptor(),
-        ],
+        available_governance_policies: vec![],
         routes: default_routes("compile", "code", "code"),
     }
 }
 
-fn compile_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn compile_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("compile", "Compile", AutomationMode::Automatic);
     template.execution = WorkflowStepExecutionConfig {
         changeset_apply: json!({}),
@@ -1161,12 +1134,12 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
                 text_field("execution.compile_checks.commands_text", "Compile commands", "execution.compile_checks.commands_text", ""),
             ],
         }],
-        available_governance_policies: vec![compile_governance_policy_descriptor()],
+        available_governance_policies: vec![],
         routes: default_routes("review", "compile", "compile"),
     }
 }
 
-fn qa_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn qa_descriptor() -> WorkflowStageDescriptor {
     let template = WorkflowStepDefinition {
         id: "qa-preview".to_string(),
         name: "DeployQA".to_string(),
@@ -1310,7 +1283,7 @@ fn qa_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn merge_patches_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn merge_patches_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("merge_patches", "Merge patches", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: false,
@@ -1338,7 +1311,7 @@ fn merge_patches_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn review_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn review_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("review", "Review", AutomationMode::Manual);
     template.execution_logic = json!({
         "kind": "review_stage_policy",
@@ -1368,7 +1341,7 @@ fn review_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn sap_import_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_import_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_import", "SAP Import", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_import_stage_policy"
@@ -1404,7 +1377,7 @@ fn sap_import_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_syntax", "SAP Syntax", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_syntax_stage_policy"
@@ -1438,7 +1411,7 @@ fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn sap_export_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_export_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_export", "SAP Export", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_export_stage_policy"

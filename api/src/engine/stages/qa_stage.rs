@@ -7,6 +7,7 @@ use crate::models::WorkflowStepDefinition;
 
 use super::{
     configured_execution_plan,
+    user_input_node,
     Stage,
     StageCapabilities,
     StageExecutionNode,
@@ -28,6 +29,10 @@ inventory::submit! {
 impl Stage for QaStage {
     fn stage_type(&self) -> &'static str {
         "qa"
+    }
+
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::qa_descriptor()
     }
 
     fn capabilities(&self) -> StageCapabilities {
@@ -52,7 +57,6 @@ impl Stage for QaStage {
         context: StagePlanContext<'_>,
     ) -> Result<Vec<StageExecutionNode>> {
         Ok(build_qa_execution_plan(
-            context.run,
             context.step,
             context.automatic_execution,
         ))
@@ -64,51 +68,6 @@ impl Stage for QaStage {
 }
 
 pub struct QaStageLifecycleHook;
-
-fn qa_entry_approved(run: &crate::models::WorkflowRun, step_id: &str) -> bool {
-    run.context
-        .get("workflow_engine")
-        .and_then(|value| value.get("run_state"))
-        .and_then(|value| value.get("stage_checkpoint_approval"))
-        .and_then(|value| value.get("step_id"))
-        .and_then(Value::as_str)
-        == Some(step_id)
-}
-
-fn consume_qa_entry_approval(run: &mut crate::models::WorkflowRun, step_id: &str) -> bool {
-    if !qa_entry_approved(run, step_id) {
-        return false;
-    }
-
-    if let Some(run_state) = run
-        .context
-        .get_mut("workflow_engine")
-        .and_then(|value| value.get_mut("run_state"))
-        .and_then(Value::as_object_mut)
-    {
-        run_state.remove("stage_checkpoint_approval");
-    }
-
-    true
-}
-
-fn checkpoint_node(phase: &str, message: &str, run_after: Vec<String>) -> StageExecutionNode {
-    StageExecutionNode {
-        kind: StageExecutionNodeKind::Capability,
-        key: "operator_checkpoint".to_string(),
-        enabled: true,
-        config: json!({
-            "phase": phase,
-            "message": message,
-            "recommended_disposition": "continue_auto",
-            "available_dispositions": ["continue_auto", "pause_error"]
-        }),
-        input_mapping: json!({}),
-        output_mapping: json!({}),
-        run_after,
-        condition: Value::Null,
-    }
-}
 
 impl StageLifecycleHook for QaStageLifecycleHook {
     fn on_exit<'a>(
@@ -144,7 +103,6 @@ impl StageLifecycleHook for QaStageLifecycleHook {
 }
 
 fn build_qa_execution_plan(
-    run: &mut crate::models::WorkflowRun,
     step: &WorkflowStepDefinition,
     automatic_execution: bool,
 ) -> Vec<StageExecutionNode> {
@@ -154,12 +112,14 @@ fn build_qa_execution_plan(
             || node.key != "operator_checkpoint"
     });
 
-    if automatic_execution && !consume_qa_entry_approval(run, step.id.as_str()) {
-        return vec![checkpoint_node(
-            "before_stage",
-            "QA is ready to start. Continue to launch the QA environment.",
-            vec![],
-        )];
+    if automatic_execution {
+        plan.insert(
+            0,
+            user_input_node(
+                "QA is ready to start. Continue, select another stage, or pause.",
+                vec![],
+            ),
+        );
     }
 
     let run_after = plan
@@ -168,9 +128,8 @@ fn build_qa_execution_plan(
         .map(|node| node.key.clone())
         .collect::<Vec<_>>();
 
-    plan.push(checkpoint_node(
-        "after_stage",
-        "QA is running and ready for testing. Continue when QA validation is complete.",
+    plan.push(user_input_node(
+        "QA is running and ready for testing. Continue, select another stage, or pause.",
         run_after,
     ));
 
@@ -221,13 +180,14 @@ fn prepare_qa_state(
         .as_object_mut()
         .ok_or_else(|| anyhow!("QA execution logic must be an object"))?;
 
-    execution_logic
-        .entry("on_success".to_string())
-        .or_insert_with(|| json!({
-            "status": "paused",
-            "transition": "stay",
-            "message": "QA environment is running and requires operator approval."
-        }));
+    execution_logic.insert(
+        "on_success".to_string(),
+        json!({
+            "status": "success",
+            "transition": "move_next",
+            "message": "QA validation completed successfully."
+        }),
+    );
 
     execution_logic
         .entry("on_error".to_string())

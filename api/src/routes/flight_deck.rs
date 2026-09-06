@@ -173,8 +173,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         for seed in seeds {
             let execution_event_limit = supervisor
                 .context
-                .get("flight_deck_settings")
-                .and_then(|settings| settings.get("execution_event_limit"))
+                .get("execution_event_limit")
                 .and_then(Value::as_u64)
                 .unwrap_or(100)
                 .clamp(10, 1000) as usize;
@@ -461,10 +460,7 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
                 'workflow_type', 'feature_development',
                 'pool_key', 'feature_development',
                 'planned_workflow', 1,
-                'planned_workflow_template_id', COALESCE(
-                    json_extract(sr.context_json, '$.flight_deck_settings.pools.feature_development.template_id'),
-                    json_extract(sr.context_json, '$.workflow_template_id')
-                ),
+                'planned_workflow_template_id', json_extract(sr.context_json, '$.pools.feature_development.template_id'),
                 'development_state', pf.development_state,
                 'feature_status', pf.status
             ),
@@ -560,10 +556,7 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
                 'workflow_type', 'feature_development',
                 'pool_key', 'feature_development',
                 'planned_workflow', CASE WHEN sf.current_workflow_run_id IS NULL THEN 1 ELSE 0 END,
-                'planned_workflow_template_id', COALESCE(
-                    json_extract(sr.context_json, '$.flight_deck_settings.pools.feature_development.template_id'),
-                    json_extract(sr.context_json, '$.workflow_template_id')
-                ),
+                'planned_workflow_template_id', json_extract(sr.context_json, '$.pools.feature_development.template_id'),
                 'feature_status', sf.status,
                 'development_state', sf.development_state,
                 'integration_skipped', COALESCE(sf.integration_skipped, 0)
@@ -883,7 +876,7 @@ async fn workflow_telemetry(
             let stage_projection = json!({
                 "stage_execution_id": stage_id,
                 "step_id": step_id,
-                "status": event_state(&level, &kind, &message),
+                "status": event_state(&level, &kind, &message, &payload),
                 "level": level,
                 "kind": kind,
                 "message": message,
@@ -916,7 +909,7 @@ async fn workflow_telemetry(
                         "stage_execution_id": stage_execution_id,
                         "step_id": step_id,
                         "capability": payload.get("capability").and_then(Value::as_str).unwrap_or("capability"),
-                        "status": event_state(&level, &kind, &message),
+                        "status": event_state(&level, &kind, &message, &payload),
                         "level": level,
                         "kind": kind,
                         "message": message,
@@ -1005,20 +998,12 @@ fn context_string(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn pool_template_ref(value: &Value) -> Option<String> {
-    ["template_id", "workflow_template_id", "template"]
-        .iter()
-        .find_map(|key| context_string(value, key))
-}
-
-fn supervisor_pool_template_id(supervisor: &SupervisorRow, pool_key: &str, direct_key: &str) -> Option<String> {
+fn supervisor_pool_template_id(supervisor: &SupervisorRow, pool_key: &str) -> Option<String> {
     supervisor
         .context
-        .get("flight_deck_settings")
-        .and_then(|value| value.get("pools"))
+        .get("pools")
         .and_then(|value| value.get(pool_key))
-        .and_then(pool_template_ref)
-        .or_else(|| context_string(&supervisor.context, direct_key))
+        .and_then(|value| context_string(value, "template_id"))
 }
 
 async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::Result<Value> {
@@ -1093,7 +1078,7 @@ async fn integration_draft_work_unit(state: &AppState, supervisor: &SupervisorRo
         "workflow_type": "integration",
         "pool_key": "integration",
         "planned_workflow": true,
-        "planned_workflow_template_id": supervisor_pool_template_id(supervisor, "integration", "integration_template_id")
+        "planned_workflow_template_id": supervisor_pool_template_id(supervisor, "integration")
     });
 
     Ok(FlightDeckWorkUnit {
@@ -1197,49 +1182,69 @@ fn integration_state(status: &str) -> String {
     }
 }
 
-fn event_state(level: &str, kind: &str, message: &str) -> String {
+fn event_state(level: &str, kind: &str, message: &str, payload: &Value) -> String {
     let normalized_kind = kind.trim().to_ascii_lowercase();
     let normalized_level = level.trim().to_ascii_lowercase();
+    let payload_status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("result").and_then(|value| value.get("status")).and_then(Value::as_str));
+    let payload_disposition = payload
+        .get("disposition")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("result").and_then(|value| value.get("disposition")).and_then(Value::as_str));
+    let execution_state = payload
+        .get("execution_state")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("result").and_then(|value| value.get("execution_state")).and_then(Value::as_str));
 
-    if normalized_kind.ends_with("_failed")
+    if payload_status == Some("paused") || payload_disposition == Some("pause_error") {
+        return "paused".to_string();
+    }
+    if execution_state == Some("awaiting_user_input") {
+        return "user_input".to_string();
+    }
+    if payload_status == Some("error")
+        || payload_status.is_some_and(|status| status.starts_with("error_code:"))
+        || normalized_kind.ends_with("_failed")
         || normalized_kind.ends_with("_error")
         || normalized_level == "error"
     {
         return "failed".to_string();
     }
-
+    if matches!(payload_status, Some("success") | Some("complete") | Some("completed")) {
+        return "completed".to_string();
+    }
     if normalized_kind.ends_with("_completed")
         || normalized_kind.ends_with("_complete")
         || normalized_kind.ends_with("_succeeded")
         || normalized_kind.ends_with("_success")
     {
-        return "success".to_string();
+        return "completed".to_string();
     }
-
-    if normalized_kind.ends_with("_started")
-        || normalized_kind.ends_with("_running")
-    {
+    if normalized_kind.ends_with("_started") || normalized_kind.ends_with("_running") {
         return "running".to_string();
     }
-
-    if normalized_kind.contains("waiting")
-        || normalized_kind.contains("checkpoint_required")
-        || normalized_kind.contains("input_required")
-    {
-        return "waiting_user".to_string();
+    if normalized_kind.contains("input_required") || normalized_kind.contains("checkpoint_required") {
+        return "user_input".to_string();
+    }
+    if normalized_kind.contains("waiting") {
+        return "waiting".to_string();
     }
 
     let haystack = format!("{} {}", level, message).to_ascii_lowercase();
     if haystack.contains("fail") || haystack.contains("error") {
         "failed".to_string()
+    } else if haystack.contains("pause") {
+        "paused".to_string()
     } else if haystack.contains("success") || haystack.contains("complete") {
-        "success".to_string()
+        "completed".to_string()
     } else if haystack.contains("start") || haystack.contains("running") {
         "running".to_string()
-    } else if haystack.contains("wait") || haystack.contains("pause") {
-        "waiting_user".to_string()
+    } else if haystack.contains("wait") {
+        "waiting".to_string()
     } else {
-        "event".to_string()
+        "unknown".to_string()
     }
 }
 

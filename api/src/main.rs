@@ -1,4 +1,5 @@
 mod app_state;
+mod auth;
 mod db;
 mod engine;
 mod models;
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let db = db::connect(&db_url).await?;
     db::migrate(&db).await?;
 
+    let auth = auth::initialize(&db).await?;
     let state = AppState::new(db);
     state
         .runtime_endpoints
@@ -65,10 +67,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let shutdown_state = state.clone();
-    let app = build_router(state, &layout.web_dist);
-
     let addr = crate::runtime_env::workflow_api_bind_addr()?;
+
+    let shutdown_state = state.clone();
+    let app = build_router(state, auth, &layout.web_dist);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
@@ -136,12 +138,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_router(state: AppState, web_dist: &Path) -> Router {
-    let api = Router::new()
+fn build_router(state: AppState, auth_state: auth::AuthState, web_dist: &Path) -> Router {
+    let auth_enabled = auth_state.enabled();
+    let auth_middleware_state = auth_state.clone();
+    let mut api = Router::new()
         .merge(routes::router())
+        .merge(auth::router())
+        .route_layer(axum::middleware::from_fn_with_state(auth_middleware_state, auth::authorize))
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(axum::Extension(auth_state))
         .layer(TraceLayer::new_for_http());
+
+    if !auth_enabled {
+        api = api.layer(CorsLayer::permissive());
+    }
 
     if web_dist.exists() {
         let index_html = web_dist.join("index.html");

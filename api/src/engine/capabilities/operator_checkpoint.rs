@@ -1,7 +1,45 @@
+use std::sync::Arc;
+
 use anyhow::Result;
+use dashmap::DashMap;
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use super::registry::{CapabilityContext, CapabilityInvocationRequest, CapabilityResult};
+
+#[derive(Debug, Clone)]
+pub struct OperatorInputResponse {
+    pub disposition: String,
+    pub selected_step_id: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct OperatorInputRegistry {
+    waiters: Arc<DashMap<Uuid, oneshot::Sender<OperatorInputResponse>>>,
+}
+
+impl OperatorInputRegistry {
+    pub fn register(&self, run_id: Uuid) -> Option<oneshot::Receiver<OperatorInputResponse>> {
+        if self.waiters.contains_key(&run_id) {
+            return None;
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        self.waiters.insert(run_id, sender);
+        Some(receiver)
+    }
+
+    pub fn resolve(&self, run_id: Uuid, response: OperatorInputResponse) -> bool {
+        self.waiters
+            .remove(&run_id)
+            .is_some_and(|(_, sender)| sender.send(response).is_ok())
+    }
+
+    pub fn clear(&self, run_id: Uuid) {
+        self.waiters.remove(&run_id);
+    }
+}
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str).filter(|item| !item.trim().is_empty())
@@ -87,44 +125,32 @@ pub async fn execute(
             .to_string()
     };
 
+    let response = ctx
+        .request_user_input(message.clone(), recommended.clone(), options.clone())
+        .await?;
+
     Ok(CapabilityResult {
         ok: true,
         capability: "operator_checkpoint".to_string(),
         payload: json!({
             "ok": true,
             "mode": "operator_checkpoint",
-            "status": "waiting",
-            "needs_user_response": true,
-            "summary": if previous_failed {
-                "Operator action is required after a capability failure."
+            "status": if response.disposition == "pause_error" { "paused" } else { "success" },
+            "needs_user_response": false,
+            "summary": if response.disposition == "pause_error" {
+                "Operator paused the workflow."
             } else {
-                "Operator checkpoint is waiting for user input."
+                "Operator checkpoint resolved."
             },
             "message": message,
             "previous_capability_failed": previous_failed,
             "stage_id": ctx.step.id,
             "stage_type": ctx.step.step_type,
-            "phase": string_field(&config, "phase").unwrap_or("after_stage"),
             "recommended_disposition": recommended,
             "available_dispositions": options,
-            "prior_result": latest_payload,
-            "response_options": {
-                "continue_auto": {
-                    "ok": true,
-                    "resume_mode": "autonomous",
-                    "label": "Continue automatically"
-                },
-                "select_stage": {
-                    "ok": true,
-                    "resume_mode": "manual",
-                    "label": "Select stage"
-                },
-                "pause_error": {
-                    "ok": false,
-                    "resume_mode": "none",
-                    "label": "Pause"
-                }
-            }
+            "disposition": response.disposition,
+            "selected_step_id": response.selected_step_id,
+            "prior_result": latest_payload
         }),
         follow_ups: CapabilityInvocationRequest::None,
     })

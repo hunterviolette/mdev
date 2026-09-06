@@ -70,8 +70,12 @@ pub async fn after_capability(
     prior_results: &[CapabilityResult],
 ) -> Result<Vec<GovernanceDecision>> {
     let mut decisions = Vec::new();
-    decisions.extend(changeset_file_failures::after_capability(run, step, result, prior_results)?);
-    decisions.extend(compile_failures::after_capability(run, step, result, prior_results)?);
+    decisions.extend(crate::engine::stages::automation_after_capability(
+        run,
+        step,
+        result,
+        prior_results,
+    )?);
 
     if result.capability == "repo_sync_changeset" && !result.ok {
         let reason = result

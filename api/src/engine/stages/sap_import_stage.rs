@@ -24,6 +24,10 @@ impl Stage for SapImportStage {
         "sap_import"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::sap_import_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new(["sap/import"])
     }

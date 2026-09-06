@@ -33,7 +33,7 @@ pub struct ContextExportPayload {
     #[serde(default)]
     pub exclude_regex: Vec<String>,
     #[serde(default)]
-    pub save_path: String,
+    pub artifact_kind: String,
     #[serde(default)]
     pub inline_repo_context_in_prompt: bool,
 }
@@ -72,7 +72,20 @@ pub async fn execute(
     _prior_results: &[CapabilityResult],
     config: Value,
 ) -> Result<CapabilityResult> {
-    let result = execute_context_export(ctx.run_id, resolve_context_export_payload(ctx, config)?)?;
+    let workflow_key = sqlx::query_scalar::<_, String>(
+        "SELECT workflow_key FROM workflow_runs WHERE id = ? LIMIT 1",
+    )
+    .bind(ctx.run_id.to_string())
+    .fetch_optional(&ctx.state.db)
+    .await?
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| ctx.run_id.to_string());
+
+    let result = execute_context_export(
+        ctx.run_id,
+        workflow_key.as_str(),
+        resolve_context_export_payload(ctx, config)?,
+    )?;
 
     Ok(CapabilityResult {
         ok: result.get("ok").and_then(Value::as_bool).unwrap_or(true),
@@ -139,7 +152,8 @@ pub fn normalize_context_export_payload(payload: Value, repo_resource: Option<Va
     obj.entry("include_unstaged_diff".to_string()).or_insert_with(|| Value::Bool(false));
     obj.entry("skip_binary".to_string()).or_insert_with(|| Value::Bool(true));
     obj.entry("skip_gitignore".to_string()).or_insert_with(|| Value::Bool(true));
-    obj.entry("save_path".to_string()).or_insert_with(|| Value::String("/tmp/repo_context.txt".to_string()));
+    obj.remove("save_path");
+    obj.entry("artifact_kind".to_string()).or_insert_with(|| Value::String("broad".to_string()));
     obj.entry("inline_repo_context_in_prompt".to_string()).or_insert_with(|| Value::Bool(false));
     Value::Object(obj.clone())
 }
@@ -267,13 +281,17 @@ pub fn render_context_export_text(payload: Value) -> Result<String> {
     build_context_export_text(&repo, &req)
 }
 
-pub fn execute_context_export(run_id: uuid::Uuid, payload: Value) -> Result<Value> {
+pub fn execute_context_export(
+    run_id: uuid::Uuid,
+    workflow_key: &str,
+    payload: Value,
+) -> Result<Value> {
     let req = parse_context_export_payload(payload)?;
 
-    tracing::info!(%run_id, repo = %req.repo_ref, git_ref = %req.git_ref, save_path = %req.save_path, "context export started");
-
     let repo = PathBuf::from(&req.repo_ref);
-    let out_path = resolve_context_export_save_path(&req);
+    let out_path = resolve_context_export_save_path(&repo, workflow_key, &req.artifact_kind);
+
+    tracing::info!(%run_id, repo = %req.repo_ref, git_ref = %req.git_ref, output_path = %out_path.display(), "context export started");
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("failed to create parent dir {}", parent.display()))?;
     }
@@ -292,24 +310,42 @@ pub fn execute_context_export(run_id: uuid::Uuid, payload: Value) -> Result<Valu
     Ok(result)
 }
 
-fn default_context_export_save_path() -> PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn normalize_context_workflow_key(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
 
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let mut p = std::env::temp_dir();
-    p.push(format!("repo_context_{ts}.txt"));
-    p
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() {
+        "workflow".to_string()
+    } else {
+        normalized.to_string()
+    }
 }
 
-fn resolve_context_export_save_path(req: &ContextExportPayload) -> PathBuf {
-    if req.save_path.trim().is_empty() {
-        default_context_export_save_path()
+fn resolve_context_export_save_path(
+    repo: &Path,
+    workflow_key: &str,
+    artifact_kind: &str,
+) -> PathBuf {
+    let filename = if artifact_kind == "targeted" {
+        "targeted_context_file.txt"
     } else {
-        PathBuf::from(&req.save_path)
-    }
+        "broad_context_file.txt"
+    };
+
+    repo.join(".mdev")
+        .join("context_files")
+        .join(normalize_context_workflow_key(workflow_key))
+        .join(filename)
 }
 
 fn build_context_export_text(repo: &Path, req: &ContextExportPayload) -> Result<String> {

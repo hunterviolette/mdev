@@ -458,7 +458,7 @@ export type WorkflowTemplate = {
   updated_at: string;
 };
 
-export type WorkflowRunStatus = 'draft' | 'queued' | 'running' | 'waiting' | 'paused' | 'success' | 'error' | 'cancelled';
+export type WorkflowRunStatus = 'draft' | 'queued' | 'running' | 'waiting' | 'paused' | 'success' | 'complete' | 'error' | 'cancelled';
 
 export type InferenceTransport = 'api' | 'browser';
 
@@ -503,8 +503,7 @@ export type EventChainCapabilitySummaryItem = {
   key: string;
   capability_id: string;
   name: string;
-  status_color: string;
-  status_label: string;
+  status: string;
   message: string;
   started_at: string | null;
   completed_at?: string | null;
@@ -526,6 +525,7 @@ export type EventChainSummaryItem = {
   step_id: string;
   label: string;
   stage_execution_id: string;
+  status: string;
   latest_kind: string;
   latest_message: string;
   latest_level: string;

@@ -11,6 +11,7 @@ use crate::{
 };
 
 use super::{
+    user_input_node,
     stage_utility,
     Stage,
     StageCapabilities,
@@ -29,6 +30,10 @@ inventory::submit! {
 impl Stage for ReviewStage {
     fn stage_type(&self) -> &'static str {
         "review"
+    }
+
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::review_descriptor()
     }
 
     fn capabilities(&self) -> StageCapabilities {
@@ -246,25 +251,14 @@ fn build_review_plan(
         });
     }
 
-    plan.push(StageExecutionNode {
-        kind: StageExecutionNodeKind::Capability,
-        key: "operator_checkpoint".to_string(),
-        enabled: true,
-        config: json!({
-            "phase": "after_stage",
-            "message": "Review is ready for human approval.",
-            "recommended_disposition": "continue_auto",
-            "available_dispositions": ["continue_auto", "select_stage", "pause_error"]
-        }),
-        input_mapping: json!({}),
-        output_mapping: json!({}),
-        run_after: if ai_review {
+    plan.push(user_input_node(
+        "Review is ready for human approval. Continue, select another stage, or pause.",
+        if ai_review {
             vec!["review_validation".to_string()]
         } else {
             Vec::new()
         },
-        condition: Value::Null,
-    });
+    ));
 
     Ok(plan)
 }

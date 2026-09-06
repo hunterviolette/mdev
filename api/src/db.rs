@@ -238,6 +238,25 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS app_users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            display_name TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_app_users_enabled_email ON app_users (enabled, email)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS supervisor_runs (
             id TEXT PRIMARY KEY,
             mode TEXT NOT NULL,
@@ -245,7 +264,6 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             title TEXT NOT NULL,
             root_repo_path TEXT NOT NULL,
             selected_planner_id TEXT,
-            flight_deck_json TEXT NOT NULL DEFAULT '{}',
             context_json TEXT NOT NULL DEFAULT '{}',
             archived_at TEXT,
             archived_reason TEXT,
@@ -310,118 +328,6 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     ensure_column(db, "supervisor_runs", "archived_at", "TEXT").await?;
     ensure_column(db, "supervisor_runs", "archived_reason", "TEXT").await?;
     ensure_column(db, "supervisor_runs", "selected_planner_id", "TEXT").await?;
-    ensure_column(db, "supervisor_runs", "flight_deck_json", "TEXT NOT NULL DEFAULT '{}'").await?;
-
-    let supervisor_run_columns = sqlx::query("PRAGMA table_info(supervisor_runs)")
-        .fetch_all(db)
-        .await?;
-    let supervisor_runs_needs_rebuild = supervisor_run_columns.iter().any(|row| {
-        matches!(
-            row.get::<String, _>("name").as_str(),
-            "snapshot_path"
-                | "integration_path"
-                | "features_json"
-                | "child_runs_json"
-                | "integration_run_id"
-                | "final_patch_path"
-                | "merge_report_json"
-                | "validation_report_json"
-        )
-    });
-
-    if supervisor_runs_needs_rebuild {
-        sqlx::query(
-            r#"
-            CREATE TABLE supervisor_runs_next (
-                id TEXT PRIMARY KEY,
-                mode TEXT NOT NULL,
-                status TEXT NOT NULL,
-                title TEXT NOT NULL,
-                root_repo_path TEXT NOT NULL,
-                selected_planner_id TEXT,
-                flight_deck_json TEXT NOT NULL DEFAULT '{}',
-                context_json TEXT NOT NULL DEFAULT '{}',
-                archived_at TEXT,
-                archived_reason TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(db)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO supervisor_runs_next (
-                id,
-                mode,
-                status,
-                title,
-                root_repo_path,
-                selected_planner_id,
-                flight_deck_json,
-                context_json,
-                archived_at,
-                archived_reason,
-                created_at,
-                updated_at
-            )
-            SELECT
-                id,
-                mode,
-                status,
-                title,
-                root_repo_path,
-                COALESCE(
-                    NULLIF(selected_planner_id, ''),
-                    NULLIF(json_extract(context_json, '$.queue_planner_id'), ''),
-                    NULLIF(json_extract(context_json, '$.selected_planner_id'), ''),
-                    NULLIF(json_extract(context_json, '$.planner_workspace_id'), ''),
-                    NULLIF(json_extract(context_json, '$.planner_id'), '')
-                ),
-                CASE
-                    WHEN TRIM(COALESCE(flight_deck_json, '')) = '' OR flight_deck_json = '{}' THEN COALESCE(json_extract(context_json, '$.flight_deck_settings'), '{}')
-                    ELSE flight_deck_json
-                END,
-                context_json,
-                archived_at,
-                archived_reason,
-                created_at,
-                updated_at
-            FROM supervisor_runs
-            "#,
-        )
-        .execute(db)
-        .await?;
-
-        sqlx::query("DROP TABLE supervisor_runs")
-            .execute(db)
-            .await?;
-        sqlx::query("ALTER TABLE supervisor_runs_next RENAME TO supervisor_runs")
-            .execute(db)
-            .await?;
-    }
-
-    sqlx::query(
-        r#"
-        UPDATE supervisor_runs
-        SET selected_planner_id = COALESCE(
-                NULLIF(selected_planner_id, ''),
-                NULLIF(json_extract(context_json, '$.queue_planner_id'), ''),
-                NULLIF(json_extract(context_json, '$.selected_planner_id'), ''),
-                NULLIF(json_extract(context_json, '$.planner_workspace_id'), ''),
-                NULLIF(json_extract(context_json, '$.planner_id'), '')
-            ),
-            flight_deck_json = CASE
-                WHEN TRIM(COALESCE(flight_deck_json, '')) = '' OR flight_deck_json = '{}' THEN COALESCE(json_extract(context_json, '$.flight_deck_settings'), '{}')
-                ELSE flight_deck_json
-            END
-        WHERE json_valid(context_json)
-        "#,
-    )
-    .execute(db)
-    .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_supervisor_runs_status_updated ON supervisor_runs (status, updated_at)")
         .execute(db)

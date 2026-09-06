@@ -55,9 +55,9 @@ pub fn after_capability(
         .and_then(Value::as_u64)
         .unwrap_or(6);
 
-    let max_count = next_files
-        .values()
-        .filter_map(Value::as_u64)
+    let max_count = failing_files
+        .iter()
+        .filter_map(|path| next_files.get(path).and_then(Value::as_u64))
         .max()
         .unwrap_or(0);
 
@@ -84,13 +84,18 @@ pub fn after_capability(
         }
     });
 
-    if !result.ok && max_count >= inject_after {
-        let include_files = if max_count >= inject_broad_after {
-            Vec::<String>::new()
-        } else {
-            failing_files
-        };
-
+    if !result.ok && max_count >= inject_broad_after {
+        merge_json_values(&mut patch, &json!({
+            "capabilities": {
+                "inference": {
+                    "repo_context_armed": true
+                },
+                "context_export": {
+                    "single_use_override": Value::Null
+                }
+            }
+        }));
+    } else if !result.ok && max_count >= inject_after && !failing_files.is_empty() {
         merge_json_values(&mut patch, &json!({
             "capabilities": {
                 "inference": {
@@ -98,11 +103,12 @@ pub fn after_capability(
                 },
                 "context_export": {
                     "single_use_override": {
-                        "include_files": include_files,
+                        "include_files": failing_files,
+                        "include_directories": [],
                         "include_staged_diff": false,
                         "include_unstaged_diff": false,
                         "git_ref": "WORKTREE",
-                        "save_path": "/tmp/repo_context.txt"
+                        "artifact_kind": "targeted"
                     }
                 }
             }

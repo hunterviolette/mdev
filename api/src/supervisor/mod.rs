@@ -67,14 +67,6 @@ pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunReq
     if !context.is_object() {
         context = json!({});
     }
-    if let Some(obj) = context.as_object_mut() {
-        if let Some(template_id) = req.workflow_template_id {
-            obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(template_id) = req.integration_template_id {
-            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-    }
     let execution_plan_items = req.execution_plan_items;
     let run = SupervisorRun {
         id,
@@ -128,8 +120,6 @@ pub async fn ensure_supervisor_planner_run(state: &AppState, req: EnsureSupervis
         title: req.title.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| repo_planner_title(&normalized_root)),
         root_repo_path: normalized_root,
         strategy: SupervisorExecutionStrategy::Series,
-        workflow_template_id: None,
-        integration_template_id: None,
         feature_plan_items: persisted_features,
         execution_plan_items: Vec::new(),
         context,
@@ -282,31 +272,21 @@ async fn save_repo_feature_plan_items(state: &AppState, root: &str, items: &[Fea
 }
 
 fn sync_execution_plan_from_scheduled_features(run: &mut SupervisorRun) -> bool {
-    let existing_by_feature_id = run
-        .execution_plan_items
-        .iter()
-        .map(|item| (item.feature_plan_item_id.as_str(), item))
-        .collect::<HashMap<_, _>>();
-
     let next = run
         .feature_plan_items
         .iter()
         .enumerate()
         .filter(|(_, item)| matches!(item.status, FeaturePlanItemStatus::Scheduled))
-        .map(|(index, item)| {
-            let existing = existing_by_feature_id.get(item.id.as_str()).copied();
-            ExecutionPlanItem {
-                feature_plan_item_id: item.id.clone(),
-                workflow_template_id: existing.and_then(|value| value.workflow_template_id),
-                order_index: existing.and_then(|value| value.order_index).or(Some(index as i64)),
-            }
+        .map(|(index, item)| ExecutionPlanItem {
+            feature_plan_item_id: item.id.clone(),
+            workflow_template_id: None,
+            order_index: Some(index as i64),
         })
         .collect::<Vec<_>>();
 
     let changed = run.execution_plan_items.len() != next.len()
         || run.execution_plan_items.iter().zip(next.iter()).any(|(left, right)| {
             left.feature_plan_item_id != right.feature_plan_item_id
-                || left.workflow_template_id != right.workflow_template_id
                 || left.order_index != right.order_index
         });
 
@@ -848,31 +828,10 @@ pub async fn update_supervisor_plan(state: &AppState, id: Uuid, payload: Value) 
         run.context = json!({});
     }
     if let Some(obj) = run.context.as_object_mut() {
-        if let Some(template_id) = payload.get("workflow_template_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-            obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
-        } else if payload.get("workflow_template_id").is_some() {
-            obj.remove("workflow_template_id");
-        }
         if let Some(start_step_id) = payload.get("workflow_start_step_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
             obj.insert("workflow_start_step_id".to_string(), Value::String(start_step_id.to_string()));
         } else if payload.get("workflow_start_step_id").is_some() {
             obj.remove("workflow_start_step_id");
-        }
-        if let Some(template_id) = payload.get("planner_refinement_template_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-            obj.insert("planner_refinement_template_id".to_string(), Value::String(template_id.to_string()));
-        } else if payload.get("planner_refinement_template_id").is_some() {
-            obj.remove("planner_refinement_template_id");
-        }
-        if let Some(template_id) = payload.get("integration_template_id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-        } else if payload.get("integration_template_id").is_some() {
-            obj.remove("integration_template_id");
-        }
-        if let Some(feature_concurrency) = payload.get("feature_concurrency").and_then(Value::as_u64) {
-            obj.insert("feature_concurrency".to_string(), Value::Number(feature_concurrency.max(1).min(64).into()));
-        }
-        if let Some(integration_policy) = payload.get("integration_policy").and_then(Value::as_str).filter(|value| matches!(*value, "auto" | "manual")) {
-            obj.insert("integration_policy".to_string(), Value::String(integration_policy.to_string()));
         }
     }
     for sprint_item in &sprint_items {
@@ -1291,23 +1250,24 @@ async fn kick_feature_pool_if_running(state: &AppState, run: &mut SupervisorRun)
     Ok(())
 }
 
-fn workflow_template_ref_from_object(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| {
-            value
-                .get(*key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-}
-
-fn flight_deck_pool_template_ref(settings: &Value, pool_key: &str) -> Option<String> {
-    settings
+fn supervisor_pool_config<'a>(context: &'a Value, pool_key: &str) -> Option<&'a Value> {
+    context
         .get("pools")
         .and_then(|value| value.get(pool_key))
-        .and_then(|value| workflow_template_ref_from_object(value, &["template_id", "workflow_template_id", "template"]))
+}
+
+fn supervisor_pool_template_ref(context: &Value, pool_key: &str) -> Option<String> {
+    supervisor_pool_config(context, pool_key)
+        .and_then(|value| value.get("template_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn supervisor_pool_template_uuid(context: &Value, pool_key: &str) -> Option<Uuid> {
+    supervisor_pool_template_ref(context, pool_key)
+        .and_then(|value| Uuid::parse_str(&value).ok())
 }
 
 async fn resolve_workflow_template_ref_id(state: &AppState, value: &str) -> Result<Option<Uuid>> {
@@ -1327,152 +1287,72 @@ async fn resolve_workflow_template_ref_id(state: &AppState, value: &str) -> Resu
         .transpose()
 }
 
-async fn resolve_flight_deck_pool_template_id(state: &AppState, payload: &Value, settings: &Value, pool_key: &str, top_level_keys: &[&str]) -> Result<Option<Uuid>> {
-    let candidate = workflow_template_ref_from_object(payload, top_level_keys)
-        .or_else(|| workflow_template_ref_from_object(settings, top_level_keys))
-        .or_else(|| flight_deck_pool_template_ref(settings, pool_key));
-    match candidate {
-        Some(value) => resolve_workflow_template_ref_id(state, &value).await,
-        None => Ok(None),
-    }
-}
-
 async fn resolve_supervisor_integration_template_id(state: &AppState, run: &SupervisorRun) -> Result<Option<Uuid>> {
-    if let Some(template_id) = context_uuid(&run.context, "integration_template_id") {
-        return Ok(Some(template_id));
-    }
-    let candidate = run
-        .context
-        .get("flight_deck_settings")
-        .and_then(|settings| flight_deck_pool_template_ref(settings, "integration"));
-    match candidate {
+    match supervisor_pool_template_ref(&run.context, "integration") {
         Some(value) => resolve_workflow_template_ref_id(state, &value).await,
         None => Ok(None),
     }
 }
 
-pub async fn update_supervisor_flight_deck_settings(state: &AppState, id: Uuid, payload: Value) -> Result<Value> {
+pub async fn update_supervisor_config(state: &AppState, id: Uuid, mut config: Value) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
+    if !config.is_object() {
+        return Err(anyhow!("supervisor config must be an object"));
+    }
     if !run.context.is_object() {
         run.context = json!({});
     }
 
-    let mut settings = payload
-        .get("flight_deck_settings")
-        .or_else(|| payload.get("settings"))
-        .cloned()
-        .unwrap_or_else(|| payload.clone());
-    let selected_planner_id = payload
-        .get("selected_planner_id")
-        .or_else(|| settings.get("selected_planner_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let feature_pool_settings = settings
-        .get("pools")
-        .and_then(|value| value.get("feature_development"))
-        .cloned();
-    let integration_pool_settings = settings
-        .get("pools")
-        .and_then(|value| value.get("integration"))
-        .cloned();
-    let feature_concurrency = payload
-        .get("feature_concurrency")
+    let execution_event_limit = config
+        .get("execution_event_limit")
         .and_then(Value::as_u64)
-        .or_else(|| settings.get("feature_concurrency").and_then(Value::as_u64))
-        .or_else(|| feature_pool_settings.as_ref().and_then(|value| value.get("feature_concurrency")).and_then(Value::as_u64))
-        .or_else(|| feature_pool_settings.as_ref().and_then(|value| value.get("concurrency")).and_then(Value::as_u64))
-        .or_else(|| feature_pool_settings.as_ref().and_then(|value| value.get("max_concurrency")).and_then(Value::as_u64));
-    let integration_policy = payload
-        .get("integration_policy")
-        .and_then(Value::as_str)
-        .or_else(|| settings.get("integration_policy").and_then(Value::as_str))
-        .or_else(|| integration_pool_settings.as_ref().and_then(|value| value.get("integration_policy")).and_then(Value::as_str))
-        .or_else(|| integration_pool_settings.as_ref().and_then(|value| value.get("mode")).and_then(Value::as_str))
-        .filter(|value| matches!(*value, "auto" | "manual"))
-        .map(str::to_string);
-    let feature_template_id = resolve_flight_deck_pool_template_id(
-        state,
-        &payload,
-        &settings,
-        "feature_development",
-        &["workflow_template_id", "template_id"],
-    ).await?;
-    let integration_template_id = resolve_flight_deck_pool_template_id(
-        state,
-        &payload,
-        &settings,
-        "integration",
-        &["integration_template_id", "template_id"],
-    ).await?;
-    let refinement_template_id = resolve_flight_deck_pool_template_id(
-        state,
-        &payload,
-        &settings,
-        "refine",
-        &["planner_refinement_template_id"],
-    ).await?;
-
-    if let Some(obj) = settings.as_object_mut() {
-        let execution_event_limit = obj
-            .get("execution_event_limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100)
-            .clamp(10, 1000);
-        obj.insert(
-            "execution_event_limit".to_string(),
-            Value::Number(execution_event_limit.into()),
-        );
-    }
-
-    if let Some(obj) = settings.as_object_mut() {
-        obj.remove("selected_planner_id");
-        obj.remove("queue_planner_id");
-        obj.remove("planner_workspace_id");
-        obj.remove("planner_id");
-        obj.remove("active_planner_id");
+        .unwrap_or(100)
+        .clamp(10, 1000);
+    let pools = config
+        .get_mut("pools")
+        .map(std::mem::take)
+        .unwrap_or_else(|| json!({}));
+    if !pools.is_object() {
+        return Err(anyhow!("supervisor pools config must be an object"));
     }
 
     if let Some(obj) = run.context.as_object_mut() {
-        obj.insert("flight_deck_settings".to_string(), settings.clone());
-        obj.remove("queue_planner_id");
-        obj.remove("selected_planner_id");
-        obj.remove("planner_workspace_id");
-        obj.remove("planner_id");
-        obj.remove("active_planner_id");
-        if let Some(template_id) = feature_template_id {
-            obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(template_id) = integration_template_id {
-            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(template_id) = refinement_template_id {
-            obj.insert("planner_refinement_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(feature_concurrency) = feature_concurrency {
-            obj.insert("feature_concurrency".to_string(), Value::Number(feature_concurrency.max(1).min(64).into()));
-        }
-        if let Some(integration_policy) = integration_policy {
-            obj.insert("integration_policy".to_string(), Value::String(integration_policy.to_string()));
-        }
+        obj.insert("execution_event_limit".to_string(), Value::Number(execution_event_limit.into()));
+        obj.insert("pools".to_string(), pools);
     }
 
     kick_feature_pool_if_running(state, &mut run).await?;
     run.updated_at = Utc::now();
     update_supervisor_run(state, &run).await?;
+    let run = load_supervisor_run(state, id).await?;
+    Ok(json!({ "ok": true, "supervisor_run": run }))
+}
 
-    if let Some(planner_id) = selected_planner_id.as_deref() {
-        sqlx::query(
-            "UPDATE supervisor_runs SET selected_planner_id = ?, updated_at = ? WHERE id = ?",
-        )
+pub async fn select_supervisor_planner(state: &AppState, id: Uuid, planner_id: String) -> Result<Value> {
+    let run = load_supervisor_run(state, id).await?;
+    let planner_id = planner_id.trim();
+    if planner_id.is_empty() {
+        return Err(anyhow!("planner_id is required"));
+    }
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM planner_workspaces WHERE id = ? AND root_repo_path = ?",
+    )
+    .bind(planner_id)
+    .bind(&run.root_repo_path)
+    .fetch_one(&state.db)
+    .await?;
+    if exists == 0 {
+        return Err(anyhow!("planner does not belong to this supervisor repository"));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE supervisor_runs SET selected_planner_id = ?, updated_at = ? WHERE id = ?")
         .bind(planner_id)
-        .bind(run.updated_at.to_rfc3339())
+        .bind(&now)
         .bind(id.to_string())
         .execute(&state.db)
         .await?;
-    }
 
     let run = load_supervisor_run(state, id).await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
@@ -1500,9 +1380,7 @@ async fn resolve_feature_pool_template_id(
     state: &AppState,
     run: &SupervisorRun,
 ) -> Result<Uuid> {
-    let candidate = context_uuid(&run.context, "workflow_template_id")
-        .map(|value| value.to_string())
-        .or_else(|| run.context.get("flight_deck_settings").and_then(|settings| flight_deck_pool_template_ref(settings, "feature_development")))
+    let candidate = supervisor_pool_template_ref(&run.context, "feature_development")
         .ok_or_else(|| anyhow!("feature pool template is not configured"))?;
 
     resolve_workflow_template_ref_id(state, &candidate)
@@ -1707,30 +1585,12 @@ pub async fn select_supervisor_feature_pool(state: &AppState, id: Uuid, payload:
         Some(resolve_feature_pool_template_id(state, &run).await?)
     };
 
-    if !run.context.is_object() {
-        run.context = json!({});
-    }
-    if let Some(obj) = run.context.as_object_mut() {
-        if let Some(template_id) = requested_template_id {
-            obj.insert("workflow_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(template_id) = payload.get("integration_template_id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) {
-            obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-        }
-        if let Some(feature_concurrency) = payload.get("feature_concurrency").and_then(Value::as_u64) {
-            obj.insert("feature_concurrency".to_string(), Value::Number(feature_concurrency.max(1).min(64).into()));
-        }
-        if let Some(integration_policy) = payload.get("integration_policy").and_then(Value::as_str).filter(|value| matches!(*value, "auto" | "manual")) {
-            obj.insert("integration_policy".to_string(), Value::String(integration_policy.to_string()));
-        }
-    }
-
     run.execution_plan_items = selected_feature_ids
         .iter()
         .enumerate()
         .map(|(index, feature_id)| ExecutionPlanItem {
             feature_plan_item_id: feature_id.clone(),
-            workflow_template_id: requested_template_id,
+            workflow_template_id: None,
             order_index: Some(index as i64),
         })
         .collect();
@@ -2203,8 +2063,7 @@ pub async fn refine_supervisor_feature(state: &AppState, id: Uuid, payload: Valu
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| Uuid::parse_str(value).ok())
-        .or_else(|| context_uuid(&run.context, "planner_refinement_template_id"))
-        .or_else(|| context_uuid(&run.context, "workflow_template_id"));
+        .or_else(|| supervisor_pool_template_uuid(&run.context, "refine"));
     let workflow_template_id = match workflow_template_id {
         Some(value) => value,
         None => default_refinement_workflow_template_id(state)
@@ -2446,7 +2305,7 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
     };
     let workspace = repo_snapshot::refresh_integration_from_worktree(&run.root_repo_path, run.id)?;
     patches::create_baseline(&workspace.integration)?;
-    let workflow_template_id = context_uuid(&run.context, "workflow_template_id");
+    let workflow_template_id = supervisor_pool_template_uuid(&run.context, "feature_development");
     let integration_template_id = match run.strategy {
         SupervisorExecutionStrategy::Parallel => resolve_supervisor_integration_template_id(state, &run).await?,
         SupervisorExecutionStrategy::Series => None,
@@ -2457,11 +2316,7 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
         let shard = repo_snapshot::refresh_shard_from_worktree(&run.root_repo_path, run.id, shard_id)?;
         patches::create_baseline(&shard)?;
         let shard_path = shard.to_string_lossy().to_string();
-        let template_id = run.execution_plan_items
-            .iter()
-            .find(|execution_item| execution_item.feature_plan_item_id == item.id)
-            .and_then(|execution_item| execution_item.workflow_template_id)
-            .or(workflow_template_id);
+        let template_id = workflow_template_id;
         let workflow_run_id = workflow_spawn::spawn_feature_plan_item_workflow(
             state,
             item,
@@ -2481,14 +2336,6 @@ pub async fn start_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
         upsert_supervisor_work_unit_for_feature(state, run.id, &sprint_id, &item.id).await?;
     }
     run.status = SupervisorStatus::RunningChildren;
-
-    if matches!(run.strategy, SupervisorExecutionStrategy::Parallel) {
-        if let Some(template_id) = integration_template_id {
-            if let Some(obj) = run.context.as_object_mut() {
-                obj.insert("integration_template_id".to_string(), Value::String(template_id.to_string()));
-            }
-        }
-    }
 
     run.snapshot_path = None;
     run.integration_path = Some(workspace.integration.to_string_lossy().to_string());
@@ -2794,7 +2641,7 @@ async fn resolve_manual_shard_template_id(state: &AppState, run: &SupervisorRun,
         }
     }
 
-    context_uuid(&run.context, "workflow_template_id")
+    supervisor_pool_template_uuid(&run.context, "manual_shard")
         .ok_or_else(|| anyhow!("manual shard workflow template is required"))
 }
 
@@ -3089,11 +2936,11 @@ async fn load_supervisor_work_unit_row(state: &AppState, supervisor_id: Uuid, wo
 
 pub async fn create_supervisor_work_unit(state: &AppState, id: Uuid, request: CreateSupervisorWorkUnitRequest) -> Result<Value> {
     let mut run = load_supervisor_run(state, id).await?;
+    let pool_key = pool_key_from_action_kind(request.pool_kind);
     let template_id = request
         .template_id
-        .or_else(|| context_uuid(&run.context, "workflow_template_id"))
+        .or_else(|| supervisor_pool_template_uuid(&run.context, pool_key))
         .ok_or_else(|| anyhow!("work unit workflow template is required"))?;
-    let pool_key = pool_key_from_action_kind(request.pool_kind);
     let feature_id = request
         .feature_id
         .filter(|value| !value.trim().is_empty())
@@ -3469,8 +3316,7 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
 
             let workflow_template_id = context_uuid(&work_unit_context, "template_id")
                 .or_else(|| context_uuid(&work_unit_context, "planned_workflow_template_id"))
-                .or_else(|| context_uuid(&run.context, "planner_refinement_template_id"))
-                .or_else(|| context_uuid(&run.context, "workflow_template_id"));
+                .or_else(|| supervisor_pool_template_uuid(&run.context, "refine"));
 
             let refine_result = refine_supervisor_feature(state, id, json!({
                 "feature_id": feature_id,
@@ -3493,7 +3339,7 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
         if kind == "manual_shard" {
             let template_id = context_uuid(&work_unit_context, "planned_workflow_template_id")
                 .or_else(|| context_uuid(&work_unit_context, "template_id"))
-                .or_else(|| context_uuid(&run.context, "workflow_template_id"))
+                .or_else(|| supervisor_pool_template_uuid(&run.context, "manual_shard"))
                 .ok_or_else(|| anyhow!("manual shard work unit template_id is missing"))?;
             let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
             let feature = FeaturePlanItem {
@@ -3563,7 +3409,7 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
         } else         if kind == "feature_development" {
             let template_id = context_uuid(&work_unit_context, "planned_workflow_template_id")
                 .or_else(|| context_uuid(&work_unit_context, "template_id"))
-                .or_else(|| context_uuid(&run.context, "workflow_template_id"))
+                .or_else(|| supervisor_pool_template_uuid(&run.context, "feature_development"))
                 .ok_or_else(|| anyhow!("feature work unit template_id is missing"))?;
             let feature = run
                 .feature_plan_items
@@ -3748,7 +3594,7 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
                 .ok_or_else(|| anyhow!("feature work unit has no feature_id"))?;
             let template_id = context_uuid(&work_unit_context, "planned_workflow_template_id")
                 .or_else(|| context_uuid(&work_unit_context, "template_id"))
-                .or_else(|| context_uuid(&run.context, "workflow_template_id"))
+                .or_else(|| supervisor_pool_template_uuid(&run.context, "feature_development"))
                 .ok_or_else(|| anyhow!("feature work unit template_id is missing"))?;
             let feature = run
                 .feature_plan_items

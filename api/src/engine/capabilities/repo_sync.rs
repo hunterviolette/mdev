@@ -23,6 +23,7 @@ use rustls::{
     server::WebPkiClientVerifier,
     RootCertStore, ServerConfig,
 };
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -598,10 +599,19 @@ impl RepoSyncRuntime {
         );
 
         let task = tokio::spawn(async move {
-            if let Err(error) = axum_server::from_tcp_rustls(listener, tls)
-                .serve(app.into_make_service())
-                .await
-            {
+            let server = match axum_server::from_tcp_rustls(listener, tls) {
+                Ok(server) => server,
+                Err(error) => {
+                    tracing::error!(
+                        port,
+                        error = %format!("{:#}", error),
+                        "failed to create Repo Sync TLS data server"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = server.serve(app.into_make_service()).await {
                 tracing::error!(
                     port,
                     error = %format!("{:#}", error),
@@ -3122,21 +3132,18 @@ fn build_mtls_server_config(
     identity: &LocalSyncIdentity,
     peer_certificate_pem: &str,
 ) -> Result<RustlsConfig> {
-    let mut cert_reader = BufReader::new(identity.certificate_pem.as_bytes());
-    let certificates = rustls_pemfile::certs(&mut cert_reader)
+    let certificates = CertificateDer::pem_slice_iter(identity.certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("failed to parse Repo Sync server certificate")?;
     if certificates.is_empty() {
         bail!("Repo Sync server certificate is empty");
     }
 
-    let mut key_reader = BufReader::new(identity.private_key_pem.as_bytes());
-    let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse Repo Sync private key")?
-        .context("Repo Sync private key is missing")?;
+    let private_key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+            .context("failed to parse Repo Sync private key")?;
 
-    let mut peer_reader = BufReader::new(peer_certificate_pem.as_bytes());
-    let peer_certificates = rustls_pemfile::certs(&mut peer_reader)
+    let peer_certificates = CertificateDer::pem_slice_iter(peer_certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .context("failed to parse trusted peer certificate")?;
     if peer_certificates.is_empty() {

@@ -3,13 +3,17 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::inference::stage_support::{
-            auto_apply_enabled,
-            build_inference_execution_plan,
-            prepare_inference_stage_state_with_hooks,
-            InferenceStageHooks,
-            InferenceStageSettings,
+        capabilities::{
+            inference::stage_support::{
+                auto_apply_enabled,
+                build_inference_execution_plan,
+                prepare_inference_stage_state_with_hooks,
+                InferenceStageHooks,
+                InferenceStageSettings,
+            },
+            registry::CapabilityResult,
         },
+        governance::{policies::changeset_file_failures, GovernanceDecision},
         stages::{
             Stage,
             StageCapabilities,
@@ -17,7 +21,7 @@ use crate::{
             StagePrepareContext,
         },
     },
-    models::{StageExecutionNode, WorkflowStepDefinition},
+    models::{StageExecutionNode, WorkflowRun, WorkflowStepDefinition},
 };
 
 pub struct CodeStage;
@@ -33,6 +37,10 @@ impl Stage for CodeStage {
         "code"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::code_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new([
             "inference",
@@ -40,6 +48,20 @@ impl Stage for CodeStage {
             "changeset_schema",
             "changeset",
         ])
+    }
+
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &["changeset_file_failures"]
+    }
+
+    fn automation_after_capability(
+        &self,
+        run: &WorkflowRun,
+        step: &WorkflowStepDefinition,
+        result: &CapabilityResult,
+        prior_results: &[CapabilityResult],
+    ) -> Result<Vec<GovernanceDecision>> {
+        changeset_file_failures::after_capability(run, step, result, prior_results)
     }
 
     fn prepare_state(

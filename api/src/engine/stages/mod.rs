@@ -19,16 +19,17 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     engine::normalize_inference_arm_state,
     app_state::AppState,
-    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStageDescriptor, WorkflowStepDefinition},
 };
 
 use super::capabilities::{
     execute_capability_invocations,
     planner,
+    registry::CapabilityResult,
     CapabilityContext,
     CapabilityInvocation,
 };
-use super::governance;
+use super::governance::{self, GovernanceDecision};
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
 pub struct StageRegistration {
@@ -64,6 +65,16 @@ fn stage_registry() -> &'static std::collections::HashMap<&'static str, &'static
     })
 }
 
+pub(crate) fn registered_stage_descriptors() -> Vec<WorkflowStageDescriptor> {
+    let _ = stage_registry();
+    let mut descriptors = inventory::iter::<StageRegistration>
+        .into_iter()
+        .map(|registration| registration.implementation.descriptor())
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|left, right| left.step_type.cmp(&right.step_type));
+    descriptors
+}
+
 pub struct StagePrepareContext<'a> {
     pub repo_ref: &'a str,
     pub global_state: &'a Value,
@@ -82,7 +93,23 @@ pub struct StagePlanContext<'a> {
 pub trait Stage: Send + Sync {
     fn stage_type(&self) -> &'static str;
 
+    fn descriptor(&self) -> WorkflowStageDescriptor;
+
     fn capabilities(&self) -> StageCapabilities;
+
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn automation_after_capability(
+        &self,
+        _run: &WorkflowRun,
+        _step: &WorkflowStepDefinition,
+        _result: &CapabilityResult,
+        _prior_results: &[CapabilityResult],
+    ) -> Result<Vec<GovernanceDecision>> {
+        Ok(Vec::new())
+    }
 
     fn prepare_state(
         &self,
@@ -108,6 +135,22 @@ fn stage_for_step(step: &WorkflowStepDefinition) -> &'static dyn Stage {
         .copied()
         .or_else(|| registry.get("design").copied())
         .expect("design stage must be registered")
+}
+
+pub(crate) fn automation_policy_keys_for_stage_type(stage_type: &str) -> &'static [&'static str] {
+    stage_registry()
+        .get(stage_type)
+        .map(|stage| stage.automation_policy_keys())
+        .unwrap_or(&[])
+}
+
+pub(crate) fn automation_after_capability(
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+    result: &CapabilityResult,
+    prior_results: &[CapabilityResult],
+) -> Result<Vec<GovernanceDecision>> {
+    stage_for_step(step).automation_after_capability(run, step, result, prior_results)
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +225,46 @@ pub fn configured_execution_plan(step: &WorkflowStepDefinition) -> Vec<StageExec
             output_mapping: binding.output_mapping.clone(),
             run_after: Vec::new(),
             condition: Value::Null,
+        })
+        .collect()
+}
+
+pub fn user_input_node(
+    message: &str,
+    run_after: Vec<String>,
+) -> StageExecutionNode {
+    StageExecutionNode {
+        kind: StageExecutionNodeKind::Capability,
+        key: "operator_checkpoint".to_string(),
+        enabled: true,
+        config: json!({
+            "message": message,
+            "recommended_disposition": "continue_auto",
+            "available_dispositions": ["continue_auto", "pause_error", "select_stage"]
+        }),
+        input_mapping: json!({}),
+        output_mapping: json!({}),
+        run_after,
+        condition: Value::Null,
+    }
+}
+
+fn capability_results_to_values(results: Vec<CapabilityResult>) -> Vec<Value> {
+    results
+        .into_iter()
+        .map(|item| {
+            let consumed_capabilities = item
+                .payload
+                .get("consumed_capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+
+            json!({
+                "key": item.capability,
+                "ok": item.ok,
+                "result": item.payload,
+                "consumed_capabilities": consumed_capabilities
+            })
         })
         .collect()
 }
@@ -315,31 +398,6 @@ fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
     }
 }
 
-fn capability_user_input_result(capability_results: &[Value]) -> Option<Value> {
-    capability_results.iter().find_map(|item| {
-        let capability = item
-            .get("key")
-            .or_else(|| item.get("capability"))
-            .and_then(Value::as_str)?;
-        let mut result = item
-            .get("result")
-            .or_else(|| item.get("payload"))?
-            .clone();
-
-        if result.get("needs_user_response").and_then(Value::as_bool) != Some(true) {
-            return None;
-        }
-
-        if let Some(result_obj) = result.as_object_mut() {
-            result_obj
-                .entry("capability".to_string())
-                .or_insert_with(|| Value::String(capability.to_string()));
-        }
-
-        Some(result)
-    })
-}
-
 pub struct StageExitContext<'a> {
     pub state: &'a AppState,
     pub run_id: Uuid,
@@ -376,32 +434,6 @@ pub fn lifecycle_hook_for_step(step: &WorkflowStepDefinition) -> Box<dyn StageLi
     stage_for_step(step).lifecycle_hook()
 }
 
-pub fn record_stage_checkpoint_continue(
-    run: &mut WorkflowRun,
-    step: &WorkflowStepDefinition,
-    phase: &str,
-) -> Result<()> {
-    if phase != "before_stage" {
-        return Ok(());
-    }
-
-    let root = ensure_engine_root(&mut run.context);
-    let run_state = root
-        .entry("run_state".to_string())
-        .or_insert_with(|| json!({}));
-    let run_state = run_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("run_state must be object"))?;
-    run_state.insert(
-        "stage_checkpoint_approval".to_string(),
-        json!({
-            "step_id": step.id,
-            "phase": phase
-        }),
-    );
-
-    Ok(())
-}
 
 pub async fn invoke_stage_restart_hook(
     state: &AppState,
@@ -445,7 +477,11 @@ pub async fn execute_stage(
     if cancellation.is_cancelled() {
         return Err(anyhow!("workflow execution was cancelled"));
     }
-    let stage_execution_id = format!("{}-{}", sanitize_stage_execution_prefix(&step.step_type), Uuid::new_v4());
+    let stage_execution_id = format!(
+        "{}-{}",
+        sanitize_stage_execution_prefix(&step.step_type),
+        Uuid::new_v4()
+    );
     let stage_started_at = Instant::now();
 
     reset_session_scoped_inference_state(state, run);
@@ -649,7 +685,44 @@ pub async fn execute_stage(
 
     governance::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
 
-    let branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
+    let mut branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
+
+    if let Some(checkpoint) = capability_results
+        .iter()
+        .rev()
+        .find(|item| item.get("key").and_then(Value::as_str) == Some("operator_checkpoint"))
+        .and_then(|item| item.get("result"))
+    {
+        match checkpoint.get("disposition").and_then(Value::as_str) {
+            Some("pause_error") => {
+                branch = StageBranch {
+                    status: StageStatus::Paused,
+                    transition: StageTransition::Stay,
+                    message: checkpoint
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Workflow paused at operator checkpoint.")
+                        .to_string(),
+                    patch: None,
+                };
+            }
+            Some("select_stage") => {
+                if let Some(target) = checkpoint
+                    .get("selected_step_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    branch = StageBranch {
+                        status: StageStatus::Paused,
+                        transition: StageTransition::Target(target.to_string()),
+                        message: format!("Operator selected workflow stage '{}' and paused the workflow.", target),
+                        patch: None,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
 
     if let Some(message) = governance::pause_message(&after_decisions) {
         persist_context(state, run_id, &run.context).await?;
@@ -703,40 +776,22 @@ pub async fn execute_stage(
         local_state: prepared_local_state,
     };
 
-    let pending_capability_user_input = outcome.ok
-        && capability_user_input_result(&outcome.capability_results).is_some();
-    let user_input_payload = capability_user_input_result(&outcome.capability_results)
-        .unwrap_or_else(|| json!({}));
-
     append_engine_event(
         state,
         run_id,
         Some(step.id.as_str()),
         if outcome.ok { "info" } else { "error" },
-        if pending_capability_user_input {
-            "stage_execution_state_changed"
-        } else {
-            "stage_execution_completed"
-        },
-        if pending_capability_user_input {
-            "Stage execution is awaiting capability user input."
-        } else {
-            "Stage executed through backend workflow engine"
-        },
+        "stage_execution_completed",
+        "Stage executed through backend workflow engine",
         json!({
             "step_id": step.id,
             "step_type": step.step_type,
             "ok": outcome.ok,
-            "execution_state": if pending_capability_user_input { "awaiting_user_input" } else { "completed" },
-            "user_input": user_input_payload,
+            "execution_state": "completed",
             "message": outcome.message,
             "status": format_stage_status(&outcome.status),
             "transition": format_stage_transition(&outcome.transition),
-            "duration_ms": if pending_capability_user_input {
-                Value::Null
-            } else {
-                json!(i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX))
-            },
+            "duration_ms": json!(i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX)),
             "capability_results": outcome.capability_results,
             "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
         }),
@@ -948,6 +1003,7 @@ async fn run_capability_plan(
     if cancellation.is_cancelled() {
         return Err(anyhow!("workflow execution was cancelled"));
     }
+
     let queue = plan
         .iter()
         .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
@@ -968,26 +1024,11 @@ async fn run_capability_plan(
         step,
         local_state,
         cancellation,
+        capability_invocation_id: None,
     };
 
     let results = execute_capability_invocations(ctx, queue).await?;
-    Ok(results
-        .into_iter()
-        .map(|item| {
-            let consumed_capabilities = item
-                .payload
-                .get("consumed_capabilities")
-                .cloned()
-                .unwrap_or_else(|| json!([]));
-
-            json!({
-                "key": item.capability,
-                "ok": item.ok,
-                "result": item.payload,
-                "consumed_capabilities": consumed_capabilities
-            })
-        })
-        .collect())
+    Ok(capability_results_to_values(results))
 }
 
 fn materialize_capability_runtime_state(stage_state: Value, global_state: &Value, repo_ref: &str) -> Value {

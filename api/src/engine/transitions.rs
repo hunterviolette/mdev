@@ -72,7 +72,8 @@ pub fn resolve_next_target(
 
 pub fn should_auto_advance(_step: &WorkflowStepDefinition, outcome: &StageOutcome) -> bool {
     match (&outcome.status, &outcome.transition) {
+        (StageStatus::Paused, _) => false,
         (_, StageTransition::MoveNext | StageTransition::MoveBack | StageTransition::RetryStage | StageTransition::Target(_)) => true,
-        (StageStatus::Success | StageStatus::Error | StageStatus::ErrorCode(_) | StageStatus::Paused | StageStatus::Outcome(_) | StageStatus::Stay, StageTransition::Stay | StageTransition::Stop) => false,
+        (_, StageTransition::Stay | StageTransition::Stop) => false,
     }
 }

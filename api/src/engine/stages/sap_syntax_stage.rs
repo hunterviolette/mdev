@@ -24,6 +24,10 @@ impl Stage for SapSyntaxStage {
         "sap_syntax"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::sap_syntax_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new(["sap/export"])
     }

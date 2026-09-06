@@ -326,7 +326,18 @@ impl WorkflowCoordinator {
         let run = engine::load_run(state, envelope.workflow_run_id).await?;
         let outcome = match &envelope.command {
             WorkflowCommand::Start { mode, step_id } => {
-                if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                let blocked_on_operator_checkpoint = run
+                    .context
+                    .get("workflow_engine")
+                    .and_then(|value| value.get("run_state"))
+                    .and_then(|value| value.get("blocked_on"))
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "operator_checkpoint" || kind == "capability_user_input");
+
+                if matches!(run.status, RunStatus::Queued | RunStatus::Running)
+                    || blocked_on_operator_checkpoint
+                {
                     WorkflowCommandOutcome::AlreadyActive {
                         workflow: WorkflowSnapshot::from(&run),
                     }

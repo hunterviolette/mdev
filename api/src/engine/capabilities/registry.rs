@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -9,6 +10,7 @@ use crate::{
     app_state::AppState,
     engine::{
         append_engine_event,
+        ensure_engine_root,
         event_meta,
         governance,
         load_run,
@@ -19,11 +21,12 @@ use crate::{
             OrchestrationInputScope,
         },
         persist_context,
+        set_run_status,
     },
-    models::{StageExecutionNodeKind, WorkflowStepDefinition},
+    models::{RunStatus, StageExecutionNodeKind, WorkflowStepDefinition},
 };
 
-use super::{capability_enabled, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint, planner, qa_environment, repo_sync, review_validation, sap, shared_dependencies};
+use super::{capability_enabled, changeset, compile_commands, context_export, git_patch_payload, inference, operator_checkpoint::{self, OperatorInputResponse}, planner, qa_environment, repo_sync, review_validation, sap, shared_dependencies};
 
 #[derive(Debug, Clone)]
 pub struct StageCapabilityPolicy {
@@ -39,6 +42,7 @@ pub struct CapabilityContext<'a> {
     pub step: &'a WorkflowStepDefinition,
     pub local_state: &'a Value,
     pub cancellation: CancellationToken,
+    pub capability_invocation_id: Option<String>,
 }
 
 impl CapabilityContext<'_> {
@@ -47,6 +51,132 @@ impl CapabilityContext<'_> {
             return Err(anyhow!("workflow execution was cancelled"));
         }
         Ok(())
+    }
+
+    pub async fn request_user_input(
+        &self,
+        message: impl Into<String>,
+        recommended_disposition: impl Into<String>,
+        available_dispositions: Vec<String>,
+    ) -> Result<OperatorInputResponse> {
+        self.ensure_active()?;
+
+        let message = message.into();
+        let recommended_disposition = recommended_disposition.into();
+        let receiver = self
+            .state
+            .operator_inputs
+            .register(self.run_id)
+            .ok_or_else(|| anyhow!("workflow already has an active operator input request"))?;
+
+        let mut run = load_run(self.state, self.run_id).await?;
+        let stage_execution_id = self
+            .local_state
+            .get("_stage_execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        {
+            let root = ensure_engine_root(&mut run.context);
+            let run_state = root
+                .entry("run_state".to_string())
+                .or_insert_with(|| json!({}));
+            let run_state = run_state
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("run_state must be object"))?;
+
+            run_state.insert(
+                "blocked_on".to_string(),
+                json!({
+                    "kind": "operator_checkpoint",
+                    "capability": "operator_checkpoint",
+                    "process_session_id": self.state.process_session_id(),
+                    "stage_id": self.step.id,
+                    "stage_type": self.step.step_type,
+                    "stage_execution_id": stage_execution_id,
+                    "capability_invocation_id": self.capability_invocation_id,
+                    "recommended_disposition": recommended_disposition,
+                    "available_dispositions": available_dispositions,
+                    "next_step_id": self.step.id,
+                    "message": message
+                }),
+            );
+        }
+
+        if let Err(error) = persist_context(self.state, self.run_id, &run.context).await {
+            self.state.operator_inputs.clear(self.run_id);
+            return Err(error);
+        }
+
+        if let Err(error) = set_run_status(
+            self.state,
+            self.run_id,
+            RunStatus::Running,
+            Some(self.step.id.as_str()),
+        )
+        .await
+        {
+            self.state.operator_inputs.clear(self.run_id);
+            return Err(error);
+        }
+
+        append_engine_event(
+            self.state,
+            self.run_id,
+            Some(self.step.id.as_str()),
+            "info",
+            "capability_execution_state_changed",
+            message.as_str(),
+            json!({
+                "capability": "operator_checkpoint",
+                "execution_state": "awaiting_user_input",
+                "message": message,
+                "recommended_disposition": recommended_disposition,
+                "available_dispositions": available_dispositions,
+                "run_context": run.context,
+                "status": "running",
+                "current_step_id": self.step.id,
+                "event_meta": event_meta(
+                    Some(stage_execution_id.as_str()),
+                    self.capability_invocation_id.as_deref(),
+                    None,
+                    false
+                )
+            }),
+        )
+        .await?;
+
+        let response = tokio::select! {
+            _ = self.cancellation.cancelled() => {
+                self.state.operator_inputs.clear(self.run_id);
+                Err(anyhow!("workflow execution was cancelled"))
+            }
+            response = receiver => {
+                response.map_err(|_| anyhow!("operator input request was cancelled"))
+            }
+        };
+
+        let mut run = load_run(self.state, self.run_id).await?;
+        {
+            let root = ensure_engine_root(&mut run.context);
+            if let Some(run_state) = root.get_mut("run_state").and_then(Value::as_object_mut) {
+                run_state.remove("blocked_on");
+            }
+        }
+        persist_context(self.state, self.run_id, &run.context).await?;
+
+        if response.is_ok() {
+            set_run_status(
+                self.state,
+                self.run_id,
+                RunStatus::Running,
+                Some(self.step.id.as_str()),
+            )
+            .await?;
+        }
+
+        response
     }
 
     pub fn provide_prompt_text(
@@ -100,20 +230,20 @@ impl CapabilityContext<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityInvocation {
     pub capability: String,
     pub config: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CapabilityInvocationRequest {
     None,
     One(CapabilityInvocation),
     Many(Vec<CapabilityInvocation>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityResult {
     pub ok: bool,
     pub capability: String,
@@ -197,6 +327,10 @@ pub async fn execute_capability_invocations(
     ctx: CapabilityContext<'_>,
     queue: Vec<CapabilityInvocation>,
 ) -> Result<Vec<CapabilityResult>> {
+    if queue.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let policy = stage_capability_policy_from_queue(&queue)?;
     execute_capability_chain(ctx, &policy, queue).await
 }
@@ -295,7 +429,13 @@ pub(crate) async fn execute_capability_chain(
                 .await?;
                 return Err(anyhow!("workflow execution was cancelled"));
             }
-            result = dispatch(&ctx, policy, &results, invocation.clone()) => result,
+            result = async {
+                let invocation_ctx = CapabilityContext {
+                    capability_invocation_id: Some(capability_invocation_id.clone()),
+                    ..ctx.clone()
+                };
+                dispatch(&invocation_ctx, policy, &results, invocation.clone()).await
+            } => result,
         };
 
         ctx.ensure_active()?;
@@ -389,36 +529,15 @@ pub(crate) async fn execute_capability_chain(
             governance::injected_capabilities(&after_decisions)
         };
 
-        let capability_waiting_for_user = result
-            .payload
-            .get("needs_user_response")
-            .and_then(Value::as_bool)
-            == Some(true);
-
         if let Some(payload) = result.payload.as_object_mut() {
             payload.insert(
                 "execution_state".to_string(),
-                Value::String(
-                    if capability_waiting_for_user {
-                        "awaiting_user_input"
-                    } else {
-                        "completed"
-                    }
-                    .to_string(),
-                ),
+                Value::String("completed".to_string()),
             );
         }
 
-        let capability_event_kind = if capability_waiting_for_user {
-            "capability_execution_state_changed".to_string()
-        } else {
-            format!("{}_completed", result.capability)
-        };
-        let capability_event_message = if capability_waiting_for_user {
-            format!("{} is awaiting user input", result.capability.replace('_', " "))
-        } else {
-            format!("{} completed", result.capability.replace('_', " "))
-        };
+        let capability_event_kind = format!("{}_completed", result.capability);
+        let capability_event_message = format!("{} completed", result.capability.replace('_', " "));
 
         append_engine_event(
             ctx.state,
@@ -430,12 +549,8 @@ pub(crate) async fn execute_capability_chain(
             json!({
                 "capability": result.capability,
                 "ok": result.ok,
-                "execution_state": if capability_waiting_for_user { "awaiting_user_input" } else { "completed" },
-                "duration_ms": if capability_waiting_for_user {
-                    Value::Null
-                } else {
-                    json!(i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX))
-                },
+                "execution_state": "completed",
+                "duration_ms": json!(i64::try_from(capability_started_at.elapsed().as_millis()).unwrap_or(i64::MAX)),
                 "result": result.payload,
                 "event_meta": event_meta(stage_execution_id.as_deref(), Some(capability_invocation_id.as_str()), None, false)
             }),
@@ -452,11 +567,6 @@ pub(crate) async fn execute_capability_chain(
             "capability result recorded"
         );
 
-        if capability_waiting_for_user {
-            results.push(result);
-            break;
-        }
-
         let existing_capabilities: std::collections::HashSet<String> = queue
             .iter()
             .map(|item| item.capability.clone())
@@ -472,10 +582,14 @@ pub(crate) async fn execute_capability_chain(
                 .unwrap_or(0)
                 > 0;
 
+        let requested_follow_ups = follow_up_vec(&result.follow_ups);
         let capability_follow_ups = if result.ok || changeset_applied_actions {
-            follow_up_vec(&result.follow_ups)
+            requested_follow_ups
         } else {
-            Vec::new()
+            requested_follow_ups
+                .into_iter()
+                .filter(|item| item.capability == "operator_checkpoint")
+                .collect()
         };
 
         let mut follow_ups = capability_follow_ups
@@ -497,9 +611,15 @@ pub(crate) async fn execute_capability_chain(
             }
         }
 
+        let checkpoint_stops_chain = result.capability == "operator_checkpoint"
+            && matches!(
+                result.payload.get("disposition").and_then(Value::as_str),
+                Some("pause_error" | "select_stage")
+            );
+
         queue.extend(follow_ups);
         results.push(result);
-        if governance_pause_requested {
+        if governance_pause_requested || checkpoint_stops_chain {
             break;
         }
     }

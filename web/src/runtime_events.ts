@@ -29,6 +29,126 @@ export const emptyRuntimeEventStore: RuntimeEventStore = {
   connected: false
 };
 
+export type ExecutionSemanticStatus =
+  | 'running'
+  | 'user_input'
+  | 'paused'
+  | 'waiting'
+  | 'completed'
+  | 'failed'
+  | 'future'
+  | 'unknown';
+
+export type ExecutionPresentation = {
+  status: ExecutionSemanticStatus;
+  tone: 'blue' | 'yellow' | 'green' | 'red' | 'gray';
+  label: string;
+};
+
+export function normalizeExecutionStatus(value: string | null | undefined): ExecutionSemanticStatus {
+  const normalized = (value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+
+  if (['running', 'active', 'integrating', 'ready_for_integration', 'patch_ready'].includes(normalized)) {
+    return 'running';
+  }
+  if (['user_input', 'awaiting_user_input', 'waiting_user', 'input_required'].includes(normalized)) {
+    return 'user_input';
+  }
+  if (normalized === 'paused' || normalized === 'pause_error') {
+    return 'paused';
+  }
+  if (normalized === 'waiting') {
+    return 'waiting';
+  }
+  if (['success', 'complete', 'completed', 'done', 'applied', 'integrated', 'succeeded'].includes(normalized)) {
+    return 'completed';
+  }
+  if (['failed', 'blocked', 'error', 'cancelled', 'deleted'].includes(normalized) || normalized.startsWith('error_code:')) {
+    return 'failed';
+  }
+  if (['future', 'up_next', 'draft'].includes(normalized)) {
+    return 'future';
+  }
+  return 'unknown';
+}
+
+export function executionPresentation(value: string | null | undefined): ExecutionPresentation {
+  const status = normalizeExecutionStatus(value);
+  switch (status) {
+    case 'running':
+      return { status, tone: 'blue', label: 'RUNNING' };
+    case 'user_input':
+      return { status, tone: 'blue', label: 'USER INPUT' };
+    case 'paused':
+      return { status, tone: 'yellow', label: 'PAUSED' };
+    case 'waiting':
+      return { status, tone: 'yellow', label: 'WAITING' };
+    case 'completed':
+      return { status, tone: 'green', label: 'COMPLETE' };
+    case 'failed':
+      return { status, tone: 'red', label: 'FAILED' };
+    case 'future':
+      return { status, tone: 'gray', label: 'UP NEXT' };
+    default:
+      return { status, tone: 'gray', label: 'UNKNOWN' };
+  }
+}
+
+export function executionTone(value: string | null | undefined) {
+  return executionPresentation(value).tone;
+}
+
+export function executionStatusFromPayload(
+  payload: unknown,
+  fallback?: string | null
+): ExecutionSemanticStatus {
+  const record = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : {};
+  const result = record.result && typeof record.result === 'object' && !Array.isArray(record.result)
+    ? record.result as Record<string, unknown>
+    : {};
+  const executionState = typeof result.execution_state === 'string'
+    ? result.execution_state
+    : typeof record.execution_state === 'string'
+      ? record.execution_state
+      : '';
+  if (executionState === 'awaiting_user_input') return 'user_input';
+
+  const disposition = typeof result.disposition === 'string'
+    ? result.disposition
+    : typeof record.disposition === 'string'
+      ? record.disposition
+      : '';
+  if (disposition === 'pause_error') return 'paused';
+
+  const statusValue = typeof result.status === 'string'
+    ? result.status
+    : typeof record.status === 'string'
+      ? record.status
+      : '';
+  const status = normalizeExecutionStatus(statusValue);
+  return status === 'unknown' ? normalizeExecutionStatus(fallback) : status;
+}
+
+export function runtimeEventExecutionStatus(
+  event: StageExecutionEvent | null | undefined
+): ExecutionSemanticStatus {
+  if (!event) return 'unknown';
+
+  const payloadStatus = executionStatusFromPayload(event.payload);
+  if (payloadStatus !== 'unknown') return payloadStatus;
+  if (event.level === 'error' || event.kind.endsWith('_failed')) return 'failed';
+  if (event.kind.endsWith('_completed')) return 'completed';
+  if (event.kind.endsWith('_started') || event.kind.endsWith('_running')) return 'running';
+  if (event.kind.includes('waiting_for_operator_checkpoint') || event.kind.includes('input_required')) return 'user_input';
+  if (event.kind.includes('waiting')) return 'waiting';
+  return 'unknown';
+}
+
 export function workflowNodeKey(runId: string) {
   return `workflow_run:${runId}`;
 }

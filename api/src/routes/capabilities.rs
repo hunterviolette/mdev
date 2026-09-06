@@ -162,6 +162,7 @@ async fn execute_workflow_capability(
         step: &scope.step,
         local_state: &scope.local_state,
         cancellation,
+        capability_invocation_id: None,
     };
     let results = execute_capability_invocations(ctx, vec![CapabilityInvocation { capability: capability_id, config }])
         .await

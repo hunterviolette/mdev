@@ -69,10 +69,6 @@ pub struct CreateSupervisorRunRequest {
     pub root_repo_path: String,
     pub strategy: SupervisorExecutionStrategy,
     #[serde(default)]
-    pub workflow_template_id: Option<Uuid>,
-    #[serde(default)]
-    pub integration_template_id: Option<Uuid>,
-    #[serde(default)]
     pub feature_plan_items: Vec<FeaturePlanItem>,
     #[serde(default)]
     pub execution_plan_items: Vec<ExecutionPlanItem>,
@@ -121,7 +117,8 @@ pub enum SupervisorActionRequest {
     StartWorkUnit { work_unit_id: String },
     PauseWorkUnit { work_unit_id: String },
     StageWorkUnit { work_unit_id: String, #[serde(default = "default_stage_work_unit")] staged: bool },
-    UpdateFlightDeckSettings { flight_deck_settings: Value },
+    UpdateSupervisorConfig { config: Value },
+    SelectPlanner { planner_id: String },
     PauseFeaturePool,
     ResumeFeaturePool,
     SkipIntegrationInput { work_unit_id: String },
@@ -143,7 +140,8 @@ impl SupervisorActionRequest {
             Self::StartWorkUnit { .. } => "start_work_unit",
             Self::PauseWorkUnit { .. } => "pause_work_unit",
             Self::StageWorkUnit { .. } => "stage_work_unit",
-            Self::UpdateFlightDeckSettings { .. } => "update_flight_deck_settings",
+            Self::UpdateSupervisorConfig { .. } => "update_supervisor_config",
+            Self::SelectPlanner { .. } => "select_planner",
             Self::PauseFeaturePool => "pause_feature_pool",
             Self::ResumeFeaturePool => "resume_feature_pool",
             Self::SkipIntegrationInput { .. } => "skip_integration_input",

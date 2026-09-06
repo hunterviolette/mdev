@@ -24,6 +24,10 @@ impl Stage for SapExportStage {
         "sap_export"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::sap_export_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new(["sap/export"])
     }

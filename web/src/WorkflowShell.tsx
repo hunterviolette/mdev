@@ -73,6 +73,7 @@ import {
   type InferenceTransport,
   type EventChainSummaryResponse,
   type RuntimeEventEnvelope,
+  type RuntimeSnapshotResponse,
   type RuntimeProjectionResponse,
   type RepoTreeResponse,
   type SharedDependenciesConfig,
@@ -107,8 +108,11 @@ import { FlightDeckPanel } from './FlightDeckPanel';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
   emptyRuntimeEventStore,
+  executionPresentation,
+  executionStatusFromPayload,
   reduceRuntimeEvent,
   reduceRuntimeSnapshot,
+  runtimeEventExecutionStatus,
   subscribeRuntimeEventBus,
   type RuntimeEventStore
 } from './runtime_events';
@@ -197,8 +201,7 @@ type LiveCapabilityTrail = {
   key: string;
   capabilityId: string;
   name: string;
-  statusColor: string;
-  statusLabel: string;
+  status: string;
   message: string;
   startedAtText: string;
   startedAtRaw: string | null;
@@ -220,6 +223,7 @@ type LiveStageTrail = {
   stepId: string;
   label: string;
   stageExecutionId: string;
+  status: string;
   latestCreatedAt: string;
   durationMs: number | null;
   isActive: boolean;
@@ -2424,7 +2428,6 @@ export function WorkflowShell(props: {
 
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [pendingStageSelectionId, setPendingStageSelectionId] = useState<string | null>(null);
-  const [pendingDispositionAutoRun, setPendingDispositionAutoRun] = useState<{ runId: string; stepId: string; runAutomatically: boolean } | null>(null);
   const [pauseRequestBusy, setPauseRequestBusy] = useState(false);
   const [manualCapabilityStatus, setManualCapabilityStatus] = useState<string | null>(null);
   const [manualCapabilityBusy, setManualCapabilityBusy] = useState(false);
@@ -2454,7 +2457,7 @@ export function WorkflowShell(props: {
   const [stageRepoContextExcludeFilesText, setStageRepoContextExcludeFilesText] = useState('');
   const [stageRepoContextExcludeRegexText, setStageRepoContextExcludeRegexText] = useState('');
   const [stageRepoContextIncludeOverrideRegexText, setStageRepoContextIncludeOverrideRegexText] = useState('');
-  const [stageRepoContextSavePath, setStageRepoContextSavePath] = useState('/tmp/repo_context.txt');
+
   const [stageRepoContextSkipBinary, setStageRepoContextSkipBinary] = useState(true);
   const [stageRepoContextSkipGitignore, setStageRepoContextSkipGitignore] = useState(true);
   const [stageRepoContextIncludeStagedDiff, setStageRepoContextIncludeStagedDiff] = useState(false);
@@ -2544,6 +2547,7 @@ export function WorkflowShell(props: {
     || selectedRun?.status === 'waiting'
     || selectedRun?.status === 'draft'
     || selectedRun?.status === 'success'
+    || selectedRun?.status === 'complete'
     || selectedRun?.status === 'error'
     || selectedRun?.status === 'cancelled';
   const isManualMode = isInteractiveMode;
@@ -2665,7 +2669,7 @@ export function WorkflowShell(props: {
       case 'continue_auto':
         return 'Continue';
       case 'select_stage':
-        return 'Select';
+        return 'Select stage';
       case 'pause_error':
         return 'Pause';
       default:
@@ -2687,94 +2691,32 @@ export function WorkflowShell(props: {
   }
 
   const pendingDispositionReview = useMemo(() => {
-    const normalizeCheckpoint = (value: Record<string, unknown> | null) => {
-      if (!value) return null;
-
-      const kind = typeof value.kind === 'string' ? value.kind : '';
-      if (
-        kind
-        && kind !== 'capability_user_input'
-        && kind !== 'operator_checkpoint'
-        && kind !== 'disposition_review'
-      ) return null;
-
-      return {
-        stageId: typeof value.stage_id === 'string' ? value.stage_id : selectedRun?.current_step_id ?? '',
-        stageType: typeof value.stage_type === 'string' ? value.stage_type : '',
-        stageExecutionId:
-          typeof value.stage_execution_id === 'string'
-            ? value.stage_execution_id
-            : typeof value._stage_execution_id === 'string'
-              ? value._stage_execution_id
-              : '',
-        capabilityInvocationId:
-          typeof value.capability_invocation_id === 'string'
-            ? value.capability_invocation_id
-            : typeof value._capability_invocation_id === 'string'
-              ? value._capability_invocation_id
-              : '',
-        recommendedDisposition: typeof value.recommended_disposition === 'string' ? value.recommended_disposition : '',
-        nextStepId: typeof value.next_step_id === 'string' ? value.next_step_id : '',
-        message: typeof value.message === 'string' ? value.message : '',
-        availableDispositions: ['continue_auto', 'pause_error', 'select_stage']
-      };
-    };
-
     const workflowEngine = ((selectedRun?.context as Record<string, unknown> | undefined)?.workflow_engine ?? undefined) as Record<string, unknown> | undefined;
     const runState = (workflowEngine?.run_state ?? {}) as Record<string, unknown>;
     const blockedOn = (runState.blocked_on ?? null) as Record<string, unknown> | null;
-    const persistedCheckpoint = normalizeCheckpoint(blockedOn);
 
-    if (persistedCheckpoint) return persistedCheckpoint;
-    if (!selectedRunId) return null;
+    if (!blockedOn) return null;
 
-    const events = runtimeEvents.workflowEventsByRunId[selectedRunId] ?? [];
+    const kind = typeof blockedOn.kind === 'string' ? blockedOn.kind : '';
+    if (kind !== 'capability_user_input' && kind !== 'operator_checkpoint') return null;
 
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index];
+    const availableDispositions = Array.isArray(blockedOn.available_dispositions)
+      ? blockedOn.available_dispositions.filter(
+          (value): value is string => typeof value === 'string' && value.trim().length > 0
+        )
+      : [];
 
-      if (
-        event.kind === 'operator_checkpoint_completed'
-        || event.kind === 'operator_checkpoint_resolved'
-        || event.kind === 'stage_execution_completed'
-        || event.kind === 'workflow_completed'
-        || event.kind === 'workflow_process_stopped'
-      ) {
-        return null;
-      }
-
-      const eventPayload = asRecord(event.payload) ?? {};
-      if (eventPayload.execution_state !== 'awaiting_user_input') {
-        continue;
-      }
-
-      const payload = (event.payload ?? {}) as Record<string, unknown>;
-      const result = (payload.result ?? null) as Record<string, unknown> | null;
-      const checkpoint = (payload.checkpoint ?? null) as Record<string, unknown> | null;
-      const blocked = (payload.blocked_on ?? null) as Record<string, unknown> | null;
-
-      const checkpointIdentity = {
-        stage_execution_id: event.stage_execution_id ?? '',
-        capability_invocation_id: event.capability_invocation_id ?? ''
-      };
-
-      const candidate = normalizeCheckpoint(result ? { ...checkpointIdentity, ...result } : null)
-        ?? normalizeCheckpoint(checkpoint ? { ...checkpointIdentity, ...checkpoint } : null)
-        ?? normalizeCheckpoint(blocked ? { ...checkpointIdentity, ...blocked } : null)
-        ?? normalizeCheckpoint({ ...checkpointIdentity, ...payload });
-
-      if (candidate?.stageExecutionId && candidate.capabilityInvocationId) {
-        return candidate;
-      }
-    }
-
-    return null;
-  }, [
-    selectedRun?.context,
-    selectedRun?.current_step_id,
-    selectedRunId,
-    runtimeEvents.workflowEventsByRunId
-  ]);
+    return {
+      stageId: typeof blockedOn.stage_id === 'string' ? blockedOn.stage_id : '',
+      stageType: typeof blockedOn.stage_type === 'string' ? blockedOn.stage_type : '',
+      stageExecutionId: typeof blockedOn.stage_execution_id === 'string' ? blockedOn.stage_execution_id : '',
+      capabilityInvocationId: typeof blockedOn.capability_invocation_id === 'string' ? blockedOn.capability_invocation_id : '',
+      recommendedDisposition: typeof blockedOn.recommended_disposition === 'string' ? blockedOn.recommended_disposition : '',
+      nextStepId: typeof blockedOn.next_step_id === 'string' ? blockedOn.next_step_id : '',
+      message: typeof blockedOn.message === 'string' ? blockedOn.message : '',
+      availableDispositions
+    };
+  }, [selectedRun?.context]);
 
   const hasPendingDispositionReview = Boolean(pendingDispositionReview);
 
@@ -2817,26 +2759,15 @@ export function WorkflowShell(props: {
     try {
       setBusy(true);
       setError(null);
-      const result = await resolveWorkflowDispositionReview(
+      await resolveWorkflowDispositionReview(
         runId,
         normalizedDisposition,
         selectedStepId
       );
       await refreshRunDetails(runId);
 
-      const resultRecord = asRecord(result) ?? {};
-      const nextStepId = typeof resultRecord.next_step_id === 'string'
-        ? resultRecord.next_step_id
-        : null;
-      const runAutomatically = resultRecord.run_automatically === true;
-
-      if (nextStepId) {
-        setSelectedStepId(nextStepId);
-        setPendingDispositionAutoRun({
-          runId,
-          stepId: nextStepId,
-          runAutomatically
-        });
+      if (normalizedDisposition === 'select_stage' && selectedStepId) {
+        setSelectedStepId(selectedStepId);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -3141,31 +3072,6 @@ export function WorkflowShell(props: {
     } as Record<string, unknown>;
   }, [selectedRun?.context, selectedRun?.current_step_id, selectedStepId, sharedInferenceState]);
 
-  useEffect(() => {
-    if (!pendingDispositionAutoRun) return;
-    if (!selectedRun || selectedRun.id !== pendingDispositionAutoRun.runId) return;
-    if (selectedRun.current_step_id !== pendingDispositionAutoRun.stepId) return;
-    if (selectedRunStepId !== pendingDispositionAutoRun.stepId) return;
-    if (!selectedWorkflowStep || selectedWorkflowStep.id !== pendingDispositionAutoRun.stepId) return;
-    if (hasPendingDispositionReview || isBackendRunLocked) return;
-
-    const pending = pendingDispositionAutoRun;
-    setPendingDispositionAutoRun(null);
-    window.setTimeout(() => {
-      void executeWorkflowStage(
-        pending.runId,
-        pending.stepId,
-        stageUserInputRef.current
-      )
-        .catch((err) => {
-          setError(err instanceof Error ? err.message : String(err));
-        })
-        .finally(() => {
-          void refreshRunDetails(pending.runId);
-        });
-    }, 0);
-  }, [pendingDispositionAutoRun, selectedRun?.id, selectedRun?.current_step_id, selectedRunStepId, selectedWorkflowStep?.id, hasPendingDispositionReview, isBackendRunLocked]);
-
   const persistedDiffPanelState = useMemo<DiffPanelState>(() => {
     const review = (selectedStageState?.review ?? {}) as Record<string, unknown>;
     const sourceControl = (review.source_control ?? {}) as Record<string, unknown>;
@@ -3313,9 +3219,7 @@ export function WorkflowShell(props: {
       },
       capabilities: {
         inference: {},
-        context_export: {
-          save_path: '/tmp/repo_context.txt'
-        },
+        context_export: {},
         changeset_schema: {},
         'gateway_model/changeset': {},
         compile_commands: {},
@@ -3395,23 +3299,25 @@ export function WorkflowShell(props: {
   }, [selectedRunId]);
 
   useEffect(() => {
-    const content = workflowDetailContentRef.current;
-    if (!content) return;
+    const contentElement = workflowDetailContentRef.current;
+    if (!contentElement) return;
 
-    function updatePanelHeight() {
-      const naturalHeight = content.getBoundingClientRect().height;
+    function updatePanelHeight(element: HTMLDivElement) {
+      const naturalHeight = element.getBoundingClientRect().height;
       setWorkflowDetailPanelHeight(Math.ceil(naturalHeight));
     }
 
-    updatePanelHeight();
+    const updateCurrentPanelHeight = () => updatePanelHeight(contentElement);
 
-    const observer = new ResizeObserver(updatePanelHeight);
-    observer.observe(content);
-    window.addEventListener('resize', updatePanelHeight);
+    updateCurrentPanelHeight();
+
+    const observer = new ResizeObserver(updateCurrentPanelHeight);
+    observer.observe(contentElement);
+    window.addEventListener('resize', updateCurrentPanelHeight);
 
     return () => {
       observer.disconnect();
-      window.removeEventListener('resize', updatePanelHeight);
+      window.removeEventListener('resize', updateCurrentPanelHeight);
     };
   }, [selectedRunId, selectedRunStepId, activeWorkspaceTab]);
 
@@ -3593,7 +3499,18 @@ export function WorkflowShell(props: {
       getRun(routedRunId),
       listTemplates()
     ]).then(([run, templatesRes]) => {
-      setRuns([run]);
+      setRuns((prev) => {
+        const existing = prev.find((item) => item.id === run.id);
+        if (!existing) return [run];
+
+        const existingUpdatedAt = Date.parse(existing.updated_at);
+        const fetchedUpdatedAt = Date.parse(run.updated_at);
+        const existingIsNewer = Number.isFinite(existingUpdatedAt)
+          && Number.isFinite(fetchedUpdatedAt)
+          && existingUpdatedAt > fetchedUpdatedAt;
+
+        return [existingIsNewer ? existing : run];
+      });
       setTemplates(templatesRes);
       setSelectedRunId(run.id);
       if (!selectedTemplateId && templatesRes[0]) {
@@ -3826,11 +3743,6 @@ export function WorkflowShell(props: {
         : ''
     );
     setStageRepoContextIncludeOverrideRegexText(includeOverrideRegex.join('\n'));
-    setStageRepoContextSavePath(
-      typeof repoContext.save_path === 'string' && repoContext.save_path.trim()
-        ? repoContext.save_path
-        : '/tmp/repo_context.txt'
-    );
     setStageRepoContextSkipBinary(typeof repoContext.skip_binary === 'boolean' ? repoContext.skip_binary : true);
     setStageRepoContextSkipGitignore(typeof repoContext.skip_gitignore === 'boolean' ? repoContext.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(repoContext.include_staged_diff));
@@ -3911,7 +3823,6 @@ export function WorkflowShell(props: {
           include_files: includeFiles,
           include_directories: Array.from(selectedRepoDirs),
           exclude_regex: excludeRegex,
-          save_path: stageRepoContextSavePath || '/tmp/repo_context.txt',
           skip_binary: stageRepoContextSkipBinary,
           skip_gitignore: stageRepoContextSkipGitignore,
           include_staged_diff: stageRepoContextIncludeStagedDiff,
@@ -4148,21 +4059,6 @@ export function WorkflowShell(props: {
     return { color: 'gray', label: 'Idle' };
   }, [eventStreamConnected, eventStreamStatusText, selectedRunId]);
 
-  function liveStageTone(trail: LiveStageTrail): string {
-    const latestCapability = trail.capabilities[0] ?? null;
-    if (trail.isCurrent && trail.isActive) return 'blue';
-    if (trail.isActive) return 'yellow';
-    if (!latestCapability) return 'gray';
-    return capabilityTone(latestCapability);
-  }
-
-  function capabilityTone(capability: LiveCapabilityTrail): string {
-    if (capability.isActive) return 'blue';
-    if (capability.statusColor === 'red' || capability.latestLevel === 'error') return 'red';
-    if (capability.statusColor === 'yellow' || capability.latestLevel === 'warn') return 'yellow';
-    return 'green';
-  }
-
   function livePulseStyle(active: boolean, recent: boolean): React.CSSProperties {
     return {
       position: 'relative',
@@ -4212,37 +4108,12 @@ export function WorkflowShell(props: {
     return {
       capability_id: capability.capabilityId,
       name: capability.name,
-      status: capability.statusLabel,
+      status: capability.status,
       latest_kind: capability.latestKind,
       latest_level: capability.latestLevel,
       input: capability.inputPayload ?? null,
       output: capability.outputPayload ?? capability.latestPayload ?? null
     };
-  }
-
-  function eventIndicatesUserInputWait(event: StageExecutionEvent | null): boolean {
-    if (!event) return false;
-    const payload = asRecord(event.payload) ?? {};
-    return payload.execution_state === 'awaiting_user_input';
-  }
-
-  function deriveCapabilityStatusLabel(event: StageExecutionEvent | null, fallback: string): string {
-    if (!event) return fallback;
-    if (eventIndicatesUserInputWait(event)) return 'USER INPUT';
-    if (event.level === 'error' || event.kind.endsWith('_failed')) return 'FAILED';
-    if (event.kind.endsWith('_completed')) return 'COMPLETE';
-    if (event.kind.endsWith('_started')) return 'RUNNING';
-    return fallback;
-  }
-
-  function deriveCapabilityStatusColor(event: StageExecutionEvent | null, fallback: string): string {
-    if (!event) return fallback;
-    if (eventIndicatesUserInputWait(event)) return 'yellow';
-    if (event.level === 'error' || event.kind.endsWith('_failed')) return 'red';
-    if (event.level === 'warn') return 'yellow';
-    if (event.kind.endsWith('_started')) return 'blue';
-    if (event.kind.endsWith('_completed')) return 'green';
-    return fallback;
   }
 
   function deriveCapabilityPayload(role: 'input' | 'output', payload: unknown): unknown {
@@ -4456,8 +4327,7 @@ export function WorkflowShell(props: {
         key: capabilityId,
         capabilityId,
         name: capabilityName,
-        statusColor: deriveCapabilityStatusColor(statusEvent, 'gray'),
-        statusLabel: deriveCapabilityStatusLabel(statusEvent, 'INFO'),
+        status: runtimeEventExecutionStatus(statusEvent),
         message: capabilityDisplayMessageFromPayload(
           capabilitySpecificPayload(completedEvent) ?? capabilitySpecificPayload(statusEvent),
           statusEvent?.message ?? capabilityName
@@ -4500,12 +4370,11 @@ export function WorkflowShell(props: {
       const existing = mapped.find((capability) => capability.name.toLowerCase() === resultLabel.toLowerCase());
       const ok = result.ok !== false;
       const resultPayload = capabilityResultSpecificPayload(result);
-      const resultRecord = asRecord(resultPayload) ?? {};
-      const resultWaitingForUser = asRecord(resultPayload)?.execution_state === 'awaiting_user_input';
+      const resultStatus = executionStatusFromPayload(resultPayload, ok ? 'completed' : 'failed');
+      const resultWaitingForUser = resultStatus === 'user_input';
       if (existing) {
         const resultClosesCapability = existing.outputPayload == null && !resultWaitingForUser;
-        existing.statusColor = resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red';
-        existing.statusLabel = resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR';
+        existing.status = resultStatus;
         existing.isActive = resultWaitingForUser;
         existing.outputPayload = resultWaitingForUser ? existing.outputPayload : existing.outputPayload ?? resultPayload;
         existing.latestPayload = resultPayload ?? existing.latestPayload;
@@ -4524,8 +4393,7 @@ export function WorkflowShell(props: {
         key: capabilityId,
         capabilityId,
         name: resultLabel,
-        statusColor: resultWaitingForUser ? 'yellow' : ok ? 'green' : 'red',
-        statusLabel: resultWaitingForUser ? 'USER INPUT' : ok ? 'SUCCESS' : 'ERROR',
+        status: resultStatus,
         message: capabilityDisplayMessageFromPayload(resultPayload, resultLabel),
         startedAtText: resultStageEvent ? formatTimestamp(resultStageEvent.created_at) : '—',
         startedAtRaw: resultStageEvent?.created_at ?? null,
@@ -4629,6 +4497,7 @@ export function WorkflowShell(props: {
         step_id: stepId,
         label: labelFromCapabilityKey(stepId) || stepId,
         stage_execution_id: stageExecutionId,
+        status: 'running',
         latest_kind: event.kind,
         latest_message: event.message,
         latest_level: event.level,
@@ -4654,15 +4523,17 @@ export function WorkflowShell(props: {
       }
       stage.is_active = true;
       stage.is_current = true;
+      stage.status = 'running';
       stage.duration_ms = null;
     }
 
-    if (eventIndicatesUserInputWait(event)) {
+    if (runtimeEventExecutionStatus(event) === 'user_input') {
       for (const item of projection.stages) {
         item.is_current = item.stage_execution_id === stageExecutionId;
       }
       stage.is_active = true;
       stage.is_current = true;
+      stage.status = 'user_input';
       stage.duration_ms = null;
     }
 
@@ -4674,6 +4545,8 @@ export function WorkflowShell(props: {
         ));
       stage.is_active = false;
       stage.is_current = false;
+      const terminalStatus = runtimeEventExecutionStatus(event);
+      stage.status = terminalStatus === 'unknown' ? 'completed' : terminalStatus;
       stage.duration_ms = runtimeEventDurationMs(stageStart?.created_at, event.created_at);
     }
 
@@ -4683,36 +4556,40 @@ export function WorkflowShell(props: {
         (item) => item.capability_id === capabilityInvocationId
       );
       const isStarted = event.kind.endsWith('_started');
-      const isFailed = event.kind.endsWith('_failed') || event.level === 'error';
       const isCompleted = event.kind.endsWith('_completed');
-      const isWaitingForUser = eventIndicatesUserInputWait(event);
+      const capabilityStatus = runtimeEventExecutionStatus(event);
+      const isFailed = capabilityStatus === 'failed';
+      const isWaitingForUser = capabilityStatus === 'user_input';
+      const isTerminal = isCompleted || isFailed || capabilityStatus === 'paused';
+      const eventPayload = asRecord(event.payload) ?? {};
+      const eventResult = asRecord(eventPayload.result) ?? {};
+      const capabilityMessage = stringFrom(eventPayload.message) || stringFrom(eventResult.message) || event.message;
 
       if (!capability) {
         capability = {
           key: capabilityInvocationId,
           capability_id: capabilityInvocationId,
           name: runtimeEventCapabilityName(event),
-          status_color: isWaitingForUser ? 'yellow' : isFailed ? 'red' : isCompleted ? 'green' : 'blue',
-          status_label: isWaitingForUser ? 'User input' : isFailed ? 'Failed' : isCompleted ? 'Completed' : 'Running',
-          message: event.message,
+          status: capabilityStatus === 'unknown' ? 'running' : capabilityStatus,
+          message: capabilityMessage,
           started_at: isStarted ? event.created_at : null,
-          completed_at: isCompleted || isFailed ? event.created_at : null,
+          completed_at: isTerminal ? event.created_at : null,
           duration_ms: null,
           latest_created_at: event.created_at,
           latest_kind: event.kind,
           latest_level: event.level,
-          is_active: isWaitingForUser || isStarted && !isCompleted && !isFailed,
+          is_active: isWaitingForUser || isStarted && !isTerminal,
           event_count: 0,
           start_event_id: isStarted ? event.id : null,
-          end_event_id: isCompleted || isFailed ? event.id : null,
+          end_event_id: isTerminal ? event.id : null,
           start_payload: isStarted ? event.payload : null,
-          end_payload: isCompleted || isFailed ? event.payload : null,
+          end_payload: isTerminal ? event.payload : null,
           latest_payload: event.payload
         };
         stage.capabilities = [capability, ...stage.capabilities];
       }
 
-      capability.message = event.message;
+      capability.message = capabilityMessage;
       capability.latest_created_at = event.created_at;
       capability.latest_kind = event.kind;
       capability.latest_level = event.level;
@@ -4726,8 +4603,7 @@ export function WorkflowShell(props: {
         capability.completed_at = null;
         capability.duration_ms = null;
         capability.is_active = true;
-        capability.status_color = 'blue';
-        capability.status_label = 'Running';
+        capability.status = 'running';
       }
 
       if (isWaitingForUser) {
@@ -4736,8 +4612,7 @@ export function WorkflowShell(props: {
         capability.end_payload = null;
         capability.duration_ms = null;
         capability.is_active = true;
-        capability.status_color = 'yellow';
-        capability.status_label = 'User input';
+        capability.status = 'user_input';
       }
 
       if (isCompleted || isFailed) {
@@ -4749,8 +4624,7 @@ export function WorkflowShell(props: {
           event.created_at
         );
         capability.is_active = false;
-        capability.status_color = isFailed ? 'red' : 'green';
-        capability.status_label = isFailed ? 'Failed' : 'Completed';
+        capability.status = capabilityStatus === 'unknown' ? 'completed' : capabilityStatus;
       }
     }
 
@@ -4768,6 +4642,7 @@ export function WorkflowShell(props: {
       stepId: stage.step_id,
       label: stage.label,
       stageExecutionId: stage.stage_execution_id,
+      status: stage.status,
       latestCreatedAt: stage.latest_created_at,
       durationMs: stage.duration_ms,
       isActive: stage.is_active,
@@ -4776,9 +4651,11 @@ export function WorkflowShell(props: {
         key: capability.key,
         capabilityId: capability.capability_id,
         name: capability.name,
-        statusColor: capability.status_color,
-        statusLabel: capability.status_label,
-        message: capability.message,
+        status: capability.status,
+        message: stringFrom(asRecord(capability.latest_payload)?.message)
+          || stringFrom(asRecord(capability.start_payload)?.message)
+          || stringFrom(asRecord(asRecord(capability.start_payload)?.config)?.message)
+          || capability.message,
         startedAtText: capability.started_at ? formatTimestamp(capability.started_at) : '—',
         startedAtRaw: capability.started_at ?? null,
         durationText: formatDurationMs(capability.duration_ms ?? null, capability.started_at ?? null, capability.completed_at ?? null),
@@ -4788,7 +4665,7 @@ export function WorkflowShell(props: {
         isNew: Boolean(capability.start_event_id && recentEventIds.has(capability.start_event_id))
           || Boolean(capability.end_event_id && recentEventIds.has(capability.end_event_id)),
         eventCount: capability.event_count,
-        latestLevel: capability.latest_level ?? capability.status_label.toLowerCase(),
+        latestLevel: capability.latest_level ?? capability.status,
         latestKind: capability.latest_kind ?? '',
         latestPayload: capability.latest_payload ?? capability.end_payload ?? capability.start_payload ?? null,
         inputPayload: capability.start_payload ?? null,
@@ -4908,30 +4785,6 @@ export function WorkflowShell(props: {
       };
     }
 
-    if (incoming.kind === 'stage_execution_waiting_for_operator_checkpoint' || incoming.kind === 'stage_execution_waiting_for_disposition_review') {
-      const stepId = stringFrom(payload.step_id) || incoming.step_id || run.current_step_id || '';
-      const stepType = stringFrom(payload.step_type);
-      const disposition = stringFrom(payload.disposition) || 'move_next';
-      const message = stringFrom(payload.message) || incoming.message;
-      return {
-        ...run,
-        status: 'waiting',
-        current_step_id: stepId || run.current_step_id,
-        updated_at: incoming.created_at,
-        context: mergeWorkflowEngineRunState(run.context as Record<string, unknown>, {
-          blocked_on: {
-            kind: 'operator_checkpoint',
-            stage_id: stepId,
-            stage_type: stepType,
-            recommended_disposition: disposition === 'paused' || disposition === 'pause' || disposition === 'pause_error' ? 'pause_error' : 'continue_manual',
-            next_step_id: '',
-            message,
-            available_dispositions: ['continue_auto', 'continue_manual', 'pause_error']
-          }
-        })
-      };
-    }
-
     if (isTerminalStageEvent(incoming)) {
       const workflowEngine = asRecord((run.context as Record<string, unknown>).workflow_engine) ?? {};
       const runState = asRecord(workflowEngine.run_state) ?? {};
@@ -4967,7 +4820,7 @@ export function WorkflowShell(props: {
 
     const payload = incoming.payload as Record<string, unknown>;
     const snapshotContext = payload.final_context ?? payload.run_context ?? payload.prepared_context;
-    if (incoming.kind !== 'stage_execution_waiting_for_operator_checkpoint' && incoming.kind !== 'stage_execution_waiting_for_disposition_review' && snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
+    if (snapshotContext && typeof snapshotContext === 'object' && !Array.isArray(snapshotContext)) {
       const snapshotStatus = typeof payload.prepared_status === 'string'
         ? payload.prepared_status as WorkflowRunStatus
         : typeof payload.status === 'string'
@@ -5009,14 +4862,22 @@ export function WorkflowShell(props: {
     });
   }
 
+  function mergeAuthoritativeRun(prev: WorkflowRun[], incoming: WorkflowRun): WorkflowRun[] {
+    const existing = prev.find((item) => item.id === incoming.id);
+    const nextRun = existing && existing.updated_at.localeCompare(incoming.updated_at) > 0
+      ? existing
+      : incoming;
+    return [nextRun, ...prev.filter((item) => item.id !== incoming.id)];
+  }
+
   async function refreshRunDetails(runId: string) {
     const run = await getRun(runId);
-    setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+    setRuns((prev) => mergeAuthoritativeRun(prev, run));
   }
 
   async function refreshRunDetailsOnOpen(runId: string) {
     const run = await openWorkflowRun(runId);
-    setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+    setRuns((prev) => mergeAuthoritativeRun(prev, run));
     setSelectedRunId(run.id);
   }
 
@@ -5456,11 +5317,6 @@ export function WorkflowShell(props: {
     setStageRepoContextExcludeFilesText(excludeFiles.join('\n'));
     setStageRepoContextExcludeRegexText(excludeRegex.join('\n'));
     setStageRepoContextIncludeOverrideRegexText(includeOverrideRegex.join('\n'));
-    setStageRepoContextSavePath(
-      typeof contextExport.save_path === 'string' && contextExport.save_path.trim()
-        ? contextExport.save_path
-        : '/tmp/repo_context.txt'
-    );
     setStageRepoContextSkipBinary(typeof contextExport.skip_binary === 'boolean' ? contextExport.skip_binary : true);
     setStageRepoContextSkipGitignore(typeof contextExport.skip_gitignore === 'boolean' ? contextExport.skip_gitignore : true);
     setStageRepoContextIncludeStagedDiff(Boolean(contextExport.include_staged_diff));
@@ -5605,8 +5461,11 @@ export function WorkflowShell(props: {
     try {
       setGlobalApplyChangesetHistoryBusy(true);
       const detail = await getWorkflowChangeset(workflowKey, item.id);
-      setGlobalApplyChangesetText(detail.normalized_payload_json || detail.payload_text || '');
-      setGlobalApplyChangesetResult(changesetOutputWithoutPayload(detail.result_json));
+      setGlobalApplyChangesetText(detail.input || '');
+      setGlobalApplyChangesetResult({
+        summary: detail.output.summary,
+        lines: detail.output.lines
+      });
       setManualCapabilityResponse('');
       setGlobalApplyChangesetPanelMode(mode);
       setManualCapabilityStatus(mode === 'input' ? 'Loaded changeset input.' : 'Loaded changeset output.');
@@ -6855,7 +6714,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         exclude_files: excludeFiles,
         exclude_regex: excludeRegex,
         include_override_regex: includeOverrideRegex,
-        save_path: stageRepoContextSavePath.trim() || '/tmp/repo_context.txt',
         skip_binary: stageRepoContextSkipBinary,
         skip_gitignore: stageRepoContextSkipGitignore,
         include_staged_diff: stageRepoContextIncludeStagedDiff,
@@ -7358,7 +7216,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Stack gap="md">
                           <Group justify="space-between" align="flex-start" wrap="wrap">
                             <Group>
-                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || (!canRunCurrentStageAutomatically && selectedRun?.status !== 'success') || isBackendRunLocked}>Run autonomously</Button>
+                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !['paused', 'waiting', 'error', 'success', 'complete'].includes(selectedRun?.status ?? '') || isBackendRunLocked}>Run autonomously</Button>
                               <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
                               <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
                               <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Cancel run</Button>
@@ -7446,35 +7304,20 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       <Grid align="stretch">
                         <Grid.Col span={{ base: 12, xl: 4 }}>
                           <Stack>
-                            {!inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
-                              <>
-                                {pendingDispositionReview ? (
-                                  <Card withBorder>
-                                    <Stack gap="sm">
-                                      <Alert color="yellow" title="User input required">
-                                        <Text size="sm">Choose how the workflow should continue.</Text>
-                                      </Alert>
-                                      <Group gap="xs" wrap="wrap">
-                                        {pendingDispositionReview.availableDispositions.map((disposition) => {
+                            {pendingDispositionReview && pendingDispositionReview.stageId === selectedWorkflowStep?.id ? (
+                              <Card withBorder>
+                                <Stack gap="sm">
+                                  <Alert color="yellow" title="User input required">
+                                    <Text size="sm">
+                                      {pendingDispositionReview.message || 'Choose how the workflow should continue.'}
+                                    </Text>
+                                  </Alert>
+                                  <Group justify="space-between" align="center" wrap="nowrap">
+                                    <Group gap="xs" wrap="nowrap">
+                                      {pendingDispositionReview.availableDispositions
+                                        .filter((disposition) => normalizeCheckpointDisposition(disposition) !== 'select_stage')
+                                        .map((disposition) => {
                                           const normalizedDisposition = normalizeCheckpointDisposition(disposition);
-                                          if (normalizedDisposition === 'select_stage') {
-                                            return (
-                                              <Select
-                                                key={normalizedDisposition}
-                                                size="xs"
-                                                placeholder="Select stage"
-                                                data={(selectedRun?.definition?.steps ?? []).map((step, index) => ({
-                                                  value: step.id,
-                                                  label: `${index + 1}. ${step.name || step.id}`
-                                                }))}
-                                                disabled={busy || manualCapabilityBusy}
-                                                onChange={(stepId) => {
-                                                  if (stepId) void handleDispositionReview('select_stage', stepId);
-                                                }}
-                                                w={150}
-                                              />
-                                            );
-                                          }
                                           return (
                                             <Button
                                               key={normalizedDisposition}
@@ -7488,10 +7331,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                             </Button>
                                           );
                                         })}
-                                      </Group>
-                                    </Stack>
-                                  </Card>
-                                ) : null}
+                                    </Group>
+                                    {pendingDispositionReview.availableDispositions.some(
+                                      (disposition) => normalizeCheckpointDisposition(disposition) === 'select_stage'
+                                    ) ? (
+                                      <Select
+                                        size="xs"
+                                        placeholder="Select stage"
+                                        data={(selectedRun?.definition?.steps ?? []).map((step, index) => ({
+                                          value: step.id,
+                                          label: `${index + 1}. ${step.name || step.id}`
+                                        }))}
+                                        disabled={busy || manualCapabilityBusy}
+                                        onChange={(stepId) => {
+                                          if (stepId) void handleDispositionReview('select_stage', stepId);
+                                        }}
+                                        w={165}
+                                      />
+                                    ) : null}
+                                  </Group>
+                                </Stack>
+                              </Card>
+                            ) : !inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
+                              <>
                                 {selectedWorkflowStep?.step_type === 'sap_import' ? (
                                   <SapImportStageControlsPanel
                                     status={sapImportStatus}
@@ -7644,25 +7506,25 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                 key={trail.key}
                                 p="sm"
                                 style={{
-                                  border: `1px solid var(--mantine-color-${liveStageTone(trail)}-4)`,
+                                  border: `1px solid var(--mantine-color-${executionPresentation(trail.status).tone}-4)`,
                                   borderRadius: 10,
                                   background: trail.isCurrent
                                     ? 'rgba(34, 139, 230, 0.08)'
                                     : trail.isActive
                                       ? 'rgba(250, 176, 5, 0.08)'
-                                      : liveStageTone(trail) === 'green'
+                                      : executionPresentation(trail.status).tone === 'green'
                                         ? 'rgba(64, 192, 87, 0.08)'
-                                        : liveStageTone(trail) === 'red'
+                                        : executionPresentation(trail.status).tone === 'red'
                                           ? 'rgba(250, 82, 82, 0.08)'
-                                          : liveStageTone(trail) === 'yellow'
+                                          : executionPresentation(trail.status).tone === 'yellow'
                                             ? 'rgba(250, 176, 5, 0.08)'
                                             : 'rgba(255,255,255,0.02)'
                                 }}
                               >
                                 <Group justify="space-between" align="center" wrap="nowrap">
                                   <Group gap="xs" wrap="wrap" style={{ flex: 1 }}>
-                                    <Badge color={trail.isCurrent ? 'blue' : trail.isActive ? 'yellow' : liveStageTone(trail)}>
-                                      {trail.isCurrent ? 'RUNNING' : trail.isActive ? 'ACTIVE' : liveStageTone(trail) === 'red' ? 'FAILED' : liveStageTone(trail) === 'yellow' ? 'WARN' : 'COMPLETE'}
+                                    <Badge color={executionPresentation(trail.status).tone}>
+                                      {executionPresentation(trail.status).label}
                                     </Badge>
                                     <Badge variant="light">{trail.stepId !== '__ungrouped__' ? trail.stepId : trail.label}</Badge>
                                   </Group>
@@ -7702,25 +7564,25 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                             p="sm"
                                             style={{
                                               ...livePulseStyle(capability.isActive, capability.isNew),
-                                              border: `1px solid var(--mantine-color-${capabilityTone(capability)}-4)`,
+                                              border: `1px solid var(--mantine-color-${executionPresentation(capability.status).tone}-4)`,
                                               borderRadius: 8,
                                               background: capability.isActive
                                                 ? 'rgba(34, 139, 230, 0.08)'
-                                                : capabilityTone(capability) === 'green'
+                                                : executionPresentation(capability.status).tone === 'green'
                                                   ? 'rgba(64, 192, 87, 0.08)'
-                                                  : capabilityTone(capability) === 'red'
+                                                  : executionPresentation(capability.status).tone === 'red'
                                                     ? 'rgba(250, 82, 82, 0.08)'
-                                                    : capabilityTone(capability) === 'yellow'
+                                                    : executionPresentation(capability.status).tone === 'yellow'
                                                       ? 'rgba(250, 176, 5, 0.08)'
                                                       : 'rgba(255,255,255,0.02)'
                                             }}
                                           >
-                                            <Box style={liveProgressBar(capability.isActive, capabilityTone(capability))} />
+                                            <Box style={liveProgressBar(capability.isActive, executionPresentation(capability.status).tone)} />
                                             <Group justify="space-between" align="flex-start" wrap="nowrap" style={{ position: 'relative', zIndex: 1 }}>
                                               <Group align="flex-start" justify="space-between" wrap="nowrap" style={{ flex: 1 }}>
                                                 <Stack gap={4} style={{ flex: 1 }}>
                                                   <Group gap="xs" wrap="wrap">
-                                                    <Badge color={capabilityTone(capability)}>{capability.statusLabel}</Badge>
+                                                    <Badge color={executionPresentation(capability.status).tone}>{executionPresentation(capability.status).label}</Badge>
                                                     <Badge variant="light">{capability.name}</Badge>
                                                     <Text size="xs" c="dimmed">events {capability.eventCount}</Text>
                                                   </Group>
@@ -7780,7 +7642,6 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             <ScrollArea style={{ flex: '0 0 430px' }} offsetScrollbars>
               <Stack gap="md" pr="sm">
                 <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(event) => setStageRepoContextGitRef(event.currentTarget.value)} placeholder="WORKTREE" />
-                <TextInput label="Save path" value={stageRepoContextSavePath} onChange={(event) => setStageRepoContextSavePath(event.currentTarget.value)} placeholder="/tmp/repo_context.txt" />
                 <SimpleGrid cols={2}>
                   <Switch label="Skip binary" checked={stageRepoContextSkipBinary} onChange={(event) => setStageRepoContextSkipBinary(event.currentTarget.checked)} />
                   <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(event) => setStageRepoContextSkipGitignore(event.currentTarget.checked)} />

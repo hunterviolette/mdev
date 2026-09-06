@@ -14,6 +14,7 @@ use crate::{
             planner,
         },
         stages::{
+            user_input_node,
             Stage,
             StageCapabilities,
             StageExecutionNode,
@@ -36,6 +37,10 @@ inventory::submit! {
 impl Stage for DesignStage {
     fn stage_type(&self) -> &'static str {
         "design"
+    }
+
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::design_descriptor()
     }
 
     fn capabilities(&self) -> StageCapabilities {
@@ -93,21 +98,10 @@ fn build_design_execution_plan(
     )?;
 
     if automatic_execution {
-        plan.push(StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "operator_checkpoint".to_string(),
-            enabled: true,
-            config: json!({
-                "phase": "after_stage",
-                "message": "Design is complete. Continue automatically or pause to realign.",
-                "recommended_disposition": "continue_auto",
-                "available_dispositions": ["continue_auto", "pause_error"]
-            }),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec!["inference".to_string()],
-            condition: Value::Null,
-        });
+        plan.push(user_input_node(
+            "Design is complete. Continue, select another stage, or pause to realign.",
+            vec!["inference".to_string()],
+        ));
     }
 
     Ok(plan)

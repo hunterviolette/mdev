@@ -2,13 +2,17 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::stages::{
-        Stage,
-        StageCapabilities,
-        StagePlanContext,
-        StagePrepareContext,
+    engine::{
+        capabilities::registry::CapabilityResult,
+        governance::{policies::compile_failures, GovernanceDecision},
+        stages::{
+            Stage,
+            StageCapabilities,
+            StagePlanContext,
+            StagePrepareContext,
+        },
     },
-    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
 };
 
 pub struct CompileStage;
@@ -24,8 +28,26 @@ impl Stage for CompileStage {
         "compile"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::compile_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new(["shared_dependencies", "compile_commands"])
+    }
+
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &["compile_failures"]
+    }
+
+    fn automation_after_capability(
+        &self,
+        run: &WorkflowRun,
+        step: &WorkflowStepDefinition,
+        result: &CapabilityResult,
+        prior_results: &[CapabilityResult],
+    ) -> Result<Vec<GovernanceDecision>> {
+        compile_failures::after_capability(run, step, result, prior_results)
     }
 
     fn prepare_state(

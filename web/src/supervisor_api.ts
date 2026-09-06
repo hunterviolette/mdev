@@ -72,8 +72,6 @@ export type CreateSupervisorRunRequest = {
   title: string;
   root_repo_path: string;
   strategy: SupervisorExecutionStrategy;
-  workflow_template_id?: string | null;
-  integration_template_id?: string | null;
   feature_plan_items: FeaturePlanItem[];
   execution_plan_items?: ExecutionPlanItem[];
   context?: Record<string, unknown>;
@@ -679,23 +677,13 @@ export async function getSupervisorQueue(id: string): Promise<SupervisorQueuePro
 
 export async function setSupervisorQueue(
   id: string,
-  queuedFeatures: SupervisorQueuedFeature[],
-  config: {
-    workflow_template_id?: string | null;
-    integration_template_id?: string | null;
-    feature_concurrency?: number | null;
-    integration_policy?: 'auto' | 'manual' | null;
-    auto_start?: boolean;
-    planner_id?: string | null;
-    selected_planner_id?: string | null;
-  } = {}
+  queuedFeatures: SupervisorQueuedFeature[]
 ): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
   const response = await fetch(`/api/supervisor-runs/${id}/queue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      queued_features: queuedFeatures,
-      ...config
+      queued_features: queuedFeatures
     })
   });
   if (!response.ok) throw new Error(await response.text());
@@ -714,7 +702,8 @@ export type SupervisorActionRequest =
   | { action: 'start_work_unit'; work_unit_id: string }
   | { action: 'pause_work_unit'; work_unit_id: string }
   | { action: 'stage_work_unit'; work_unit_id: string; staged?: boolean }
-  | { action: 'update_flight_deck_settings'; flight_deck_settings: Record<string, unknown> }
+  | { action: 'update_supervisor_config'; config: Record<string, unknown> }
+  | { action: 'select_planner'; planner_id: string }
   | { action: 'pause_feature_pool' }
   | { action: 'resume_feature_pool' }
   | { action: 'skip_integration_input'; work_unit_id: string }

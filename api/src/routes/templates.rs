@@ -69,8 +69,7 @@ fn default_refinement_definition() -> WorkflowTemplateDefinition {
             "capabilities": {
                 "inference": {},
                 "context_export": {
-                    "enabled": true,
-                    "save_path": "/tmp/repo_context.txt"
+                    "enabled": true
                 },
                 "changeset_schema": {},
                 "gateway_model/changeset": {},

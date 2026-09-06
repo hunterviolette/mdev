@@ -36,6 +36,10 @@ impl Stage for MergePatchesStage {
         "merge_patches"
     }
 
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::merge_patches_descriptor()
+    }
+
     fn capabilities(&self) -> StageCapabilities {
         StageCapabilities::new(["git_patch_payload"])
     }
