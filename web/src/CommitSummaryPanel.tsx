@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -146,8 +146,18 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
   const [hoveredMonth, setHoveredMonth] = useState<string | null>(null);
   const [tooltipPosition, setTooltipPosition] = useState({ x: 0, y: 0 });
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const chartSvgRef = useRef<SVGSVGElement | null>(null);
   const [chartContainerWidth, setChartContainerWidth] = useState(0);
   const [chartContainerHeight, setChartContainerHeight] = useState(0);
+  const [zoomRange, setZoomRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  const [zoomDrag, setZoomDrag] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+
+  const visibleMonths = useMemo(() => {
+    if (!zoomRange) return months;
+    const startIndex = Math.max(0, Math.min(months.length - 1, zoomRange.startIndex));
+    const endIndex = Math.max(startIndex, Math.min(months.length - 1, zoomRange.endIndex));
+    return months.slice(startIndex, endIndex + 1);
+  }, [months, zoomRange]);
 
   const chart = useMemo(() => {
     const extensions = new Map<string, number>();
@@ -168,7 +178,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
 
     const maxPositive = Math.max(
       1,
-      ...months.map((month) => {
+      ...visibleMonths.map((month) => {
         const groups = commitAnalyticsGroups(month);
         if (groups.length === 0) return 1;
         return groups.reduce((sum, group) => {
@@ -179,7 +189,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
 
     const maxNegative = Math.max(
       1,
-      ...months.map((month) => {
+      ...visibleMonths.map((month) => {
         const groups = commitAnalyticsGroups(month);
         if (groups.length === 0) return 0;
         return groups.reduce((sum, group) => {
@@ -199,7 +209,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
       .filter((value, index, values) => values.indexOf(value) === index);
 
     return { orderedExtensions, domainMin, domainMax, ticks };
-  }, [months, mode]);
+  }, [months, visibleMonths, mode]);
 
   const colorForExtension = (extension: string) => {
     const palette = [
@@ -224,7 +234,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
     return palette[index % palette.length];
   };
 
-  const hoveredMonthData = hoveredMonth ? months.find((month) => month.month === hoveredMonth) ?? null : null;
+  const hoveredMonthData = hoveredMonth ? visibleMonths.find((month) => month.month === hoveredMonth) ?? null : null;
   const hoveredRows = hoveredMonthData
     ? [...commitAnalyticsGroups(hoveredMonthData)]
       .sort((a, b) => {
@@ -234,27 +244,42 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
       })
     : [];
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = chartContainerRef.current;
     if (!node) return;
 
-    const updateWidth = () => {
+    let animationFrame = 0;
+    let followupFrame = 0;
+    const updateSize = () => {
       const rect = node.getBoundingClientRect();
-      setChartContainerWidth(Math.floor(rect.width));
-      setChartContainerHeight(Math.floor(rect.height));
+      const nextWidth = Math.floor(rect.width);
+      const nextHeight = Math.floor(rect.height);
+      if (nextWidth > 0) setChartContainerWidth(nextWidth);
+      if (nextHeight > 0) setChartContainerHeight(nextHeight);
     };
 
-    updateWidth();
+    updateSize();
+    animationFrame = window.requestAnimationFrame(() => {
+      updateSize();
+      followupFrame = window.requestAnimationFrame(updateSize);
+    });
 
-    if (typeof ResizeObserver === 'undefined') {
-      window.addEventListener('resize', updateWidth);
-      return () => window.removeEventListener('resize', updateWidth);
-    }
+    window.addEventListener('resize', updateSize);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateSize);
+    observer?.observe(node);
 
-    const observer = new ResizeObserver(updateWidth);
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.cancelAnimationFrame(followupFrame);
+      window.removeEventListener('resize', updateSize);
+      observer?.disconnect();
+    };
+  }, [months.length]);
+
+  useEffect(() => {
+    setZoomRange(null);
+    setZoomDrag(null);
+  }, [report, mode, displayMode, aggregationPreset, aggregationDays]);
 
   if (months.length === 0) {
     return <Text size="sm" c="dimmed">No commit analytics available for the selected filters.</Text>;
@@ -271,7 +296,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
   const totalCommits = report?.totals?.commits ?? months.reduce((sum, month) => sum + month.commits, 0);
 
   const availableWidth = Math.max(420, chartContainerWidth - 8);
-  const naturalWidth = Math.max(1280, months.length * 190 + 160);
+  const naturalWidth = Math.max(1280, visibleMonths.length * 190 + 160);
   const width = displayMode === 'fit' ? availableWidth : naturalWidth;
   const fallbackHeight = displayMode === 'fit'
     ? Math.max(500, Math.min(720, Math.round(availableWidth * 0.4)))
@@ -285,28 +310,70 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
     bottom: displayMode === 'fit' ? 112 : 88,
     left: 92,
   };
-  const compactFitLabels = displayMode === 'fit' && months.length > 14;
+  const compactFitLabels = displayMode === 'fit' && visibleMonths.length > 14;
   const xLabelEvery = compactFitLabels
-    ? Math.max(1, Math.ceil(months.length / 10))
+    ? Math.max(1, Math.ceil(visibleMonths.length / 10))
     : 1;
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
   const domainSpan = Math.max(1, chart.domainMax - chart.domainMin);
   const yScale = (value: number) => margin.top + ((chart.domainMax - value) / domainSpan) * plotHeight;
   const zeroY = yScale(0);
-  const barBand = plotWidth / Math.max(1, months.length);
+  const barBand = plotWidth / Math.max(1, visibleMonths.length);
   const barWidth = displayMode === 'fit'
     ? Math.max(18, Math.min(barBand * 0.82, 150))
     : Math.max(72, Math.min(180, barBand * 0.58));
+  const selectionRect = zoomDrag
+    ? {
+      x: Math.min(zoomDrag.startX, zoomDrag.currentX),
+      y: Math.min(zoomDrag.startY, zoomDrag.currentY),
+      width: Math.abs(zoomDrag.currentX - zoomDrag.startX),
+      height: Math.abs(zoomDrag.currentY - zoomDrag.startY),
+    }
+    : null;
+
+  const pointerToSvgPoint = (event: ReactPointerEvent<SVGSVGElement>) => {
+    const rect = chartSvgRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: Math.max(0, Math.min(width, ((event.clientX - rect.left) / rect.width) * width)),
+      y: Math.max(0, Math.min(height, ((event.clientY - rect.top) / rect.height) * height)),
+    };
+  };
+
+  const finishZoomDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!zoomDrag) return;
+    const point = pointerToSvgPoint(event);
+    const nextDrag = point ? { ...zoomDrag, currentX: point.x, currentY: point.y } : zoomDrag;
+    setZoomDrag(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    const selectionLeft = Math.max(margin.left, Math.min(nextDrag.startX, nextDrag.currentX));
+    const selectionRight = Math.min(width - margin.right, Math.max(nextDrag.startX, nextDrag.currentX));
+    const selectionTop = Math.max(margin.top, Math.min(nextDrag.startY, nextDrag.currentY));
+    const selectionBottom = Math.min(height - margin.bottom, Math.max(nextDrag.startY, nextDrag.currentY));
+    if (selectionRight - selectionLeft < 6 || selectionBottom - selectionTop < 6) return;
+
+    const firstVisibleIndex = Math.max(0, Math.min(visibleMonths.length - 1, Math.floor((selectionLeft - margin.left) / barBand)));
+    const lastVisibleIndex = Math.max(firstVisibleIndex, Math.min(visibleMonths.length - 1, Math.floor((Math.max(selectionLeft, selectionRight - 0.001) - margin.left) / barBand)));
+    const currentStartIndex = zoomRange?.startIndex ?? 0;
+    const nextStartIndex = currentStartIndex + firstVisibleIndex;
+    const nextEndIndex = currentStartIndex + lastVisibleIndex;
+
+    setZoomRange({ startIndex: nextStartIndex, endIndex: nextEndIndex });
+    setHoveredMonth(null);
+  };
 
   return (
-    <Stack gap="sm" style={{ height: '100%', minHeight: 0 }}>
+    <Stack gap="sm" style={{ height: '100%', minHeight: 0, userSelect: 'none', WebkitUserSelect: 'none' }}>
       <Group justify="space-between" align="center" gap="xs">
         <Group gap="xs">
           <Badge variant="light">{totalCommits} commits</Badge>
           <Badge color="green" variant="light">+{months.reduce((sum, month) => sum + month.additions, 0)}</Badge>
           <Badge color="red" variant="light">-{months.reduce((sum, month) => sum + month.deletions, 0)}</Badge>
-          <Badge variant="light">{months.length} {bucketLabel}</Badge>
+          <Badge variant="light">{visibleMonths.length}{zoomRange ? ` / ${months.length}` : ''} {bucketLabel}</Badge>
           <Badge variant="light">{mode === 'net' ? 'Net change' : 'Total change'}</Badge>
         </Group>
         <Group gap="xs">
@@ -331,9 +398,42 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
         </Group>
       </Group>
 
-      <Box ref={chartContainerRef} style={{ position: 'relative', flex: 1, minHeight: 500, width: '100%', alignSelf: 'stretch' }}>
+      <Box ref={chartContainerRef} style={{ position: 'relative', flex: 1, minHeight: 500, width: '100%', alignSelf: 'stretch', userSelect: 'none', WebkitUserSelect: 'none' }}>
         <ScrollArea type="auto" style={{ height: '100%', minHeight: 500, width: '100%' }}>
-          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Commit LOC analytics" preserveAspectRatio="none" style={{ display: 'block', minWidth: displayMode === 'fit' ? '100%' : undefined }}>
+          <svg
+            ref={chartSvgRef}
+            width={width}
+            height={height}
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label="Commit LOC analytics"
+            preserveAspectRatio="none"
+            onPointerDown={(event) => {
+              if (event.button !== 0) return;
+              event.preventDefault();
+              window.getSelection()?.removeAllRanges();
+              const point = pointerToSvgPoint(event);
+              if (!point) return;
+              event.currentTarget.setPointerCapture(event.pointerId);
+              setZoomDrag({ startX: point.x, startY: point.y, currentX: point.x, currentY: point.y });
+            }}
+            onPointerMove={(event) => {
+              if (!zoomDrag) return;
+              const point = pointerToSvgPoint(event);
+              if (!point) return;
+              setZoomDrag((current) => current ? { ...current, currentX: point.x, currentY: point.y } : current);
+            }}
+            onPointerUp={finishZoomDrag}
+            onPointerCancel={() => setZoomDrag(null)}
+            onDragStart={(event) => event.preventDefault()}
+            onDoubleClick={(event) => {
+              event.preventDefault();
+              setZoomDrag(null);
+              setZoomRange(null);
+              setHoveredMonth(null);
+            }}
+            style={{ display: 'block', minWidth: displayMode === 'fit' ? '100%' : undefined, cursor: 'crosshair', touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
+          >
             <rect x={margin.left} y={margin.top} width={plotWidth} height={plotHeight} fill="rgba(255,255,255,0.015)" />
             <line x1={margin.left} y1={zeroY} x2={width - margin.right} y2={zeroY} stroke="rgba(255,255,255,0.5)" strokeWidth="1.4" />
             <line x1={margin.left} y1={margin.top} x2={margin.left} y2={height - margin.bottom} stroke="rgba(255,255,255,0.32)" strokeWidth="1.2" />
@@ -350,7 +450,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
 
             <text x={22} y={margin.top + plotHeight / 2} textAnchor="middle" fontSize="14" fill="rgba(255,255,255,0.78)" transform={`rotate(-90 22 ${margin.top + plotHeight / 2})`}>LOC</text>
 
-            {months.map((month, monthIndex) => {
+            {visibleMonths.map((month, monthIndex) => {
               const x = margin.left + monthIndex * barBand + (barBand - barWidth) / 2;
               let positiveBase = 0;
               let negativeBase = 0;
@@ -448,6 +548,19 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
                 </g>
               );
             })}
+            {selectionRect ? (
+              <rect
+                x={selectionRect.x}
+                y={selectionRect.y}
+                width={selectionRect.width}
+                height={selectionRect.height}
+                fill="rgba(77,171,247,0.16)"
+                stroke="rgba(116,192,252,0.95)"
+                strokeWidth="1.25"
+                strokeDasharray="6 4"
+                pointerEvents="none"
+              />
+            ) : null}
           </svg>
         </ScrollArea>
 
@@ -489,7 +602,7 @@ function CommitAnalyticsChart(props: { report: ReviewCommitAnalyticsResponse | n
                     <Text size="xs" fw={700} truncate title={extension.label}>{extension.label}</Text>
                     <Text size="xs" c="dimmed">+{extension.additions} / -{extension.deletions}</Text>
                     <Text size="xs" fw={700} ta="right" c={extension.net >= 0 ? 'green' : 'red'}>
-                      {mode === 'net' ? `${extension.net >= 0 ? '+' : ''}${extension.net}` : `+${positiveValue} / -${negativeValue}`}
+                      {`${extension.net >= 0 ? '+' : ''}${extension.net}`}
                     </Text>
                   </Box>
                 );
