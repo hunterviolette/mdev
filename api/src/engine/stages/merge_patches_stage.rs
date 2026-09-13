@@ -207,13 +207,17 @@ pub async fn execute_stage(
             json!({}),
         ).await?;
 
-        let patch_text = match patches::generate_patch_text(Path::new(&shard_path)) {
+        let patch_text = match if workflow_type == "manual_shard" {
+            patches::generate_staged_patch_text(Path::new(&shard_path))
+        } else {
+            patches::generate_patch_text(Path::new(&shard_path))
+        } {
             Ok(value) => value,
             Err(err) => {
                 let result = json!({
                     "ok": false,
-                    "mode": "generate_patch_text",
-                    "source": "sprint_features",
+                    "mode": if workflow_type == "manual_shard" { "generate_staged_patch_text" } else { "generate_patch_text" },
+                    "source": patch_source,
                     "sprint_id": sprint_id,
                     "feature_id": feature_id,
                     "shard_path": shard_path,
@@ -247,8 +251,8 @@ pub async fn execute_stage(
         if patch_text.trim().is_empty() {
             let result = json!({
                 "ok": true,
-                "mode": "generate_patch_text",
-                "source": "sprint_features",
+                "mode": if workflow_type == "manual_shard" { "generate_staged_patch_text" } else { "generate_patch_text" },
+                "source": patch_source,
                 "sprint_id": sprint_id,
                 "feature_id": feature_id,
                 "shard_path": shard_path,
@@ -404,7 +408,7 @@ pub async fn execute_stage(
     Ok(StageOutcome {
         ok,
         status: if ok { StageStatus::Success } else { StageStatus::Error },
-        transition: if ok { StageTransition::MoveNext } else { StageTransition::Stay },
+        transition: if ok { StageTransition::MoveNext } else { StageTransition::Stop },
         message: format!("merge_patches stage {}", status),
         capability_results,
         local_state,
@@ -689,19 +693,14 @@ async fn resolve_supervisor_integration_pool_patches(state: &AppState, superviso
         SELECT feature_id, title, workflow_run_id, patch_id, shard_path, kind, state, context_json
         FROM supervisor_work_units
         WHERE supervisor_run_id = ?
-          AND (
-              (kind = 'feature_development' AND state IN ('patch_ready', 'ready_for_integration'))
-              OR (
-                  kind = 'manual_shard'
-                  AND state IN ('ready_for_integration', 'integrating', 'integrated')
-                  AND (
-                      COALESCE(json_extract(context_json, '$.integration_input'), 0) = 1
-                      OR COALESCE(json_extract(context_json, '$.staged_to_integration'), 0) = 1
-                  )
-              )
-          )
+          AND kind IN ('feature_development', 'manual_shard')
+          AND state NOT IN ('deleted', 'archived')
           AND TRIM(COALESCE(shard_path, '')) != ''
           AND COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 0
+          AND (
+              COALESCE(json_extract(context_json, '$.integration_input'), 0) = 1
+              OR COALESCE(json_extract(context_json, '$.staged_to_integration'), 0) = 1
+          )
         ORDER BY CASE kind WHEN 'feature_development' THEN 0 ELSE 1 END, queue_position ASC, updated_at ASC
         "#,
     )

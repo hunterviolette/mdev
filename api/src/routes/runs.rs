@@ -6,7 +6,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    db::new_workflow_key,
+    db::{new_workflow_key, normalize_repo_ref},
     app_state::AppState,
     engine::{self, capabilities::planner},
     models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
@@ -645,13 +645,17 @@ async fn create_run(
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
     let id = Uuid::new_v4();
+    let repo_ref = normalize_repo_ref(&req.repo_ref);
+    if repo_ref.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "repo_ref is required".to_string()));
+    }
     let workflow_key = req
         .workflow_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| new_workflow_key(&req.repo_ref));
+        .unwrap_or_else(|| new_workflow_key(&repo_ref));
     let status = RunStatus::Waiting;
 
     let mut definition = if let Some(definition) = req.definition.clone() {
@@ -704,10 +708,10 @@ async fn create_run(
         *repo = json!({});
     }
     let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
-    repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
+    repo_obj.insert("repo_ref".to_string(), json!(repo_ref.clone()));
     repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
 
-    planner::apply_repo_planner_capability(&state.db, global_state, &req.repo_ref)
+    planner::apply_repo_planner_capability(&state.db, global_state, &repo_ref)
         .await
         .map_err(internal)?;
 
@@ -722,7 +726,7 @@ async fn create_run(
         status: status.clone(),
         current_step_id: current_step_id.clone(),
         title: req.title.clone(),
-        repo_ref: req.repo_ref.clone(),
+        repo_ref: repo_ref.clone(),
         workflow_key: workflow_key.clone(),
         context: run_context.clone(),
         created_at: now,
@@ -749,7 +753,7 @@ async fn create_run(
     .bind("waiting")
     .bind(current_step_id.clone())
     .bind(&req.title)
-    .bind(&req.repo_ref)
+    .bind(&repo_ref)
     .bind(&workflow_key)
     .bind(serde_json::to_string(&run_context).map_err(internal)?)
     .bind(now.to_rfc3339())
@@ -777,7 +781,7 @@ async fn create_run(
         status,
         current_step_id: current_step_id.clone(),
         title: req.title,
-        repo_ref: req.repo_ref,
+        repo_ref,
         workflow_key,
         context: run_context,
         created_at: now,

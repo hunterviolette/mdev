@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
+use dashmap::DashMap;
 use sqlx::SqlitePool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::engine::capabilities::{
@@ -17,6 +20,22 @@ use crate::{
     models::{SprintEventStreamItem, WorkflowEventStreamItem},
 };
 
+#[derive(Clone, Default)]
+pub struct SupervisorCoordinator {
+    supervisors: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
+}
+
+impl SupervisorCoordinator {
+    pub async fn lock(&self, supervisor_id: Uuid) -> OwnedMutexGuard<()> {
+        let guard = self
+            .supervisors
+            .entry(supervisor_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        guard.lock_owned().await
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
@@ -24,6 +43,7 @@ pub struct AppState {
     sprint_events_tx: broadcast::Sender<SprintEventStreamItem>,
     process_session_id: String,
     pub workflow_coordinator: WorkflowCoordinator,
+    pub supervisor_coordinator: SupervisorCoordinator,
     pub process_registry: ProcessRegistry,
     pub orchestration_inputs: OrchestrationInputStore,
     pub operator_inputs: OperatorInputRegistry,
@@ -41,6 +61,7 @@ impl AppState {
             sprint_events_tx,
             process_session_id: Uuid::new_v4().to_string(),
             workflow_coordinator: WorkflowCoordinator::default(),
+            supervisor_coordinator: SupervisorCoordinator::default(),
             process_registry: ProcessRegistry::default(),
             orchestration_inputs: OrchestrationInputStore::default(),
             operator_inputs: OperatorInputRegistry::default(),

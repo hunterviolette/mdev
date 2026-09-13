@@ -4519,9 +4519,13 @@ async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result
         FROM supervisor_work_units wu
         WHERE wu.supervisor_run_id = ?
           AND wu.kind = 'feature_development'
-          AND wu.state IN ('patch_ready', 'ready_for_integration', 'development_succeeded')
+          AND wu.state NOT IN ('deleted', 'archived')
           AND TRIM(COALESCE(wu.shard_path, '')) != ''
           AND COALESCE(json_extract(wu.context_json, '$.integration_skipped'), 0) = 0
+          AND (
+              COALESCE(json_extract(wu.context_json, '$.integration_input'), 0) = 1
+              OR COALESCE(json_extract(wu.context_json, '$.staged_to_integration'), 0) = 1
+          )
         ORDER BY wu.queue_position ASC, wu.updated_at ASC
         "#,
     )
@@ -4552,7 +4556,7 @@ async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result
         FROM supervisor_work_units
         WHERE supervisor_run_id = ?
           AND kind = 'manual_shard'
-          AND state IN ('ready_for_integration', 'integrating', 'integrated')
+          AND state NOT IN ('deleted', 'archived')
           AND TRIM(COALESCE(shard_path, '')) != ''
           AND COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 0
           AND (
@@ -4567,6 +4571,13 @@ async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result
     .await?;
 
     for row in manual_rows {
+        let shard_path = row
+            .get::<Option<String>, _>("shard_path")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("staged manual integration input has no shard_path"))?;
+        if !manual_shard_has_staged_changes(&shard_path)? {
+            continue;
+        }
         let manual_id = row
             .get::<Option<String>, _>("feature_id")
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -4577,7 +4588,7 @@ async fn supervisor_patch_paths(state: &AppState, run: &SupervisorRun) -> Result
             "title": row.get::<String, _>("title"),
             "patch_path": null,
             "patch_id": row.get::<Option<String>, _>("patch_id"),
-            "shard_path": row.get::<Option<String>, _>("shard_path"),
+            "shard_path": shard_path,
             "workflow_run_id": row.get::<Option<String>, _>("workflow_run_id"),
             "workflow_type": "manual_shard",
             "patch_owner": "supervisor_manual_shard",
@@ -4619,7 +4630,7 @@ async fn mark_manual_integration_inputs_running(state: &AppState, run: &Supervis
         WHERE supervisor_run_id = ?
           AND kind = 'manual_shard'
           AND feature_id IN (SELECT value FROM json_each(?))
-          AND state IN ('ready_for_integration', 'patch_ready', 'integrating')
+          AND state NOT IN ('deleted', 'archived')
         "#,
     )
     .bind(&now)

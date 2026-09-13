@@ -308,6 +308,7 @@ struct RepoSyncServerState {
     db: SqlitePool,
     mapping_id: String,
     workflow_run_id: String,
+    link_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -431,6 +432,7 @@ impl RepoSyncRuntime {
 
     async fn wait_for_peer_active_session(
         &self,
+        link_id: &str,
         peer_fingerprint: &str,
         timeout: Duration,
     ) -> Result<SyncMapping> {
@@ -446,6 +448,7 @@ impl RepoSyncRuntime {
                     .values()
                     .find(|mapping| {
                         state.active_sessions.contains(mapping.id.as_str())
+                            && mapping.link_id == link_id
                             && !mapping.peer_certificate_pem.trim().is_empty()
                             && certificate_fingerprint(mapping.peer_certificate_pem.as_str())
                                 == peer_fingerprint
@@ -457,7 +460,7 @@ impl RepoSyncRuntime {
             }
 
             if SystemTime::now() >= deadline {
-                bail!("timed out waiting for the winning Repo Sync peer session");
+                bail!("timed out waiting for the winning Repo Sync workflow link session");
             }
 
             sleep(Duration::from_millis(100)).await;
@@ -580,6 +583,7 @@ impl RepoSyncRuntime {
             db,
             mapping_id: mapping.id.clone(),
             workflow_run_id: mapping.workflow_run_id.clone(),
+            link_id: mapping.link_id.clone(),
         };
         let app = Router::new()
             .route("/sync/v1/ping", post(sync_ping))
@@ -675,6 +679,7 @@ impl RepoSyncRuntime {
             client
                 .post(format!("https://mdev-sync:{}/sync/v1/ping", peer_port))
                 .header("x-mdev-mapping-id", mapping.id.as_str())
+                .header("x-mdev-repo-sync-link-id", mapping.link_id.as_str())
                 .send(),
         )
         .await
@@ -959,6 +964,7 @@ impl RepoSyncRuntime {
         let response = match client
             .post(format!("https://mdev-sync:{}/sync/v1/state", peer_port))
             .header("x-mdev-mapping-id", mapping.id.as_str())
+            .header("x-mdev-repo-sync-link-id", mapping.link_id.as_str())
             .json(&SyncStateEnvelope {
                 sync_mode: mapping.sync_mode.clone(),
                 state_revision: mapping.state_revision,
@@ -1005,6 +1011,9 @@ impl RepoSyncRuntime {
             let mut should_push = false;
 
             if let Some(existing) = state.mappings.get(mapping.id.as_str()) {
+                if existing.workflow_run_id != mapping.workflow_run_id {
+                    bail!("Repo Sync mapping cannot be moved between workflows");
+                }
                 let sync_mode_changed = mapping.sync_mode != existing.sync_mode;
 
                 if mapping.peer_certificate_pem.trim().is_empty() {
@@ -1174,6 +1183,7 @@ impl RepoSyncRuntime {
                 drop(listener);
                 return self
                     .wait_for_peer_active_session(
+                        mapping.link_id.as_str(),
                         peer_fingerprint.as_str(),
                         Duration::from_secs(15),
                     )
@@ -1196,6 +1206,7 @@ impl RepoSyncRuntime {
         {
             return self
                 .wait_for_peer_active_session(
+                    mapping.link_id.as_str(),
                     peer_fingerprint.as_str(),
                     Duration::from_secs(15),
                 )
@@ -1235,6 +1246,7 @@ impl RepoSyncRuntime {
             {
                 return self
                     .wait_for_peer_active_session(
+                        mapping.link_id.as_str(),
                         peer_fingerprint.as_str(),
                         Duration::from_secs(15),
                     )
@@ -1273,6 +1285,7 @@ impl RepoSyncRuntime {
                     {
                         return self
                             .wait_for_peer_active_session(
+                                mapping.link_id.as_str(),
                                 peer_fingerprint.as_str(),
                                 Duration::from_secs(15),
                             )
@@ -1300,6 +1313,7 @@ impl RepoSyncRuntime {
                             drop(state);
                             return self
                                 .wait_for_peer_active_session(
+                                    mapping.link_id.as_str(),
                                     peer_fingerprint.as_str(),
                                     Duration::from_secs(15),
                                 )
@@ -1342,6 +1356,7 @@ impl RepoSyncRuntime {
 
                         return self
                             .wait_for_peer_active_session(
+                                mapping.link_id.as_str(),
                                 peer_fingerprint.as_str(),
                                 Duration::from_secs(15),
                             )
@@ -1357,6 +1372,7 @@ impl RepoSyncRuntime {
                     {
                         return self
                             .wait_for_peer_active_session(
+                                mapping.link_id.as_str(),
                                 peer_fingerprint.as_str(),
                                 Duration::from_secs(15),
                             )
@@ -1397,6 +1413,7 @@ impl RepoSyncRuntime {
             {
                 return self
                     .wait_for_peer_active_session(
+                        mapping.link_id.as_str(),
                         peer_fingerprint.as_str(),
                         Duration::from_secs(15),
                     )
@@ -2133,6 +2150,7 @@ impl RepoSyncRuntime {
         let response = match client
             .post(url.as_str())
             .header("x-mdev-mapping-id", mapping.id.as_str())
+            .header("x-mdev-repo-sync-link-id", mapping.link_id.as_str())
             .header("x-mdev-sync-id", sync_id)
             .header("content-type", "application/json")
             .body(snapshot_json.to_string())
@@ -2180,6 +2198,7 @@ impl RepoSyncRuntime {
                 peer_port
             ))
             .header("x-mdev-mapping-id", mapping.id.as_str())
+            .header("x-mdev-repo-sync-link-id", mapping.link_id.as_str())
             .header("x-mdev-sync-id", sync_id)
             .header("content-type", "application/json")
             .body(changeset_json.to_string())
@@ -2284,6 +2303,7 @@ impl RepoSyncRuntime {
         let peer_port = mapping.peer_port.context("paired peer has no sync port")?;
         let response = match client
             .post(format!("https://mdev-sync:{}/sync/v1/message", peer_port))
+            .header("x-mdev-repo-sync-link-id", mapping.link_id.as_str())
             .json(&envelope)
             .send()
             .await
@@ -2429,14 +2449,20 @@ fn prune_peer_messages_locked(state: &mut RepoSyncState) {
     });
 }
 
-async fn sync_ping() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+async fn sync_ping(
+    State(server): State<RepoSyncServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_sync_link_id(&headers, server.link_id.as_str()).map_err(sync_forbidden)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn sync_state(
     State(server): State<RepoSyncServerState>,
+    headers: HeaderMap,
     Json(incoming): Json<SyncStateEnvelope>,
 ) -> Result<Json<SyncStateEnvelope>, (StatusCode, String)> {
+    require_sync_link_id(&headers, server.link_id.as_str()).map_err(sync_forbidden)?;
     server
         .runtime
         .accept_sync_state(server.mapping_id.as_str(), incoming)
@@ -2447,8 +2473,10 @@ async fn sync_state(
 
 async fn sync_peer_message(
     State(server): State<RepoSyncServerState>,
+    headers: HeaderMap,
     Json(envelope): Json<PeerMessageEnvelope>,
 ) -> Result<Json<PeerMessage>, (StatusCode, String)> {
+    require_sync_link_id(&headers, server.link_id.as_str()).map_err(sync_forbidden)?;
     let message = server
         .runtime
         .accept_peer_message(server.mapping_id.as_str(), envelope)
@@ -2463,6 +2491,7 @@ async fn sync_changeset(
     body: String,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_sync_id(&headers).map_err(sync_bad_request)?;
+    require_sync_link_id(&headers, server.link_id.as_str()).map_err(sync_forbidden)?;
     server
         .runtime
         .inbound_mapping(server.mapping_id.as_str())
@@ -2569,6 +2598,7 @@ async fn sync_hard_sync(
     Json(snapshot): Json<ContextSyncSnapshot>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sync_id = require_sync_id(&headers).map_err(sync_bad_request)?;
+    require_sync_link_id(&headers, server.link_id.as_str()).map_err(sync_forbidden)?;
     server
         .runtime
         .inbound_mapping(server.mapping_id.as_str())
@@ -2716,10 +2746,25 @@ async fn workflow_repo_context(
         .await?
         .context("receiving workflow run not found")?;
     let repo_ref: String = row.get("repo_ref");
-    let repo_ref = repo_ref.trim().to_string();
     let context_json: String = row.get("context_json");
     let context = serde_json::from_str(&context_json).unwrap_or_else(|_| serde_json::json!({}));
     Ok((repo_ref, context))
+}
+
+fn require_sync_link_id(headers: &HeaderMap, expected_link_id: &str) -> Result<()> {
+    let link_id = headers
+        .get("x-mdev-repo-sync-link-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("x-mdev-repo-sync-link-id is required")?;
+    if expected_link_id.trim().is_empty() {
+        bail!("Repo Sync server workflow link id is missing");
+    }
+    if link_id != expected_link_id {
+        bail!("Repo Sync workflow link does not match this repository mapping");
+    }
+    Ok(())
 }
 
 fn require_sync_id(headers: &HeaderMap) -> Result<String> {

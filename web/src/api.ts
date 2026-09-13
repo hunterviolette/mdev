@@ -891,36 +891,6 @@ export function sendRepoSyncManual(workflowRunId: string) {
   });
 }
 
-export function listRepoTree(
-  repoRef: string,
-  gitRef = 'WORKTREE',
-  options?: { basePath?: string; recursive?: boolean; skipBinary?: boolean; skipGitignore?: boolean }
-) {
-  const params = new URLSearchParams({
-    repo_ref: repoRef,
-    git_ref: gitRef,
-    base_path: options?.basePath ?? '',
-    recursive: String(Boolean(options?.recursive)),
-    skip_binary: String(Boolean(options?.skipBinary)),
-    skip_gitignore: String(Boolean(options?.skipGitignore))
-  });
-  return fetchJson<RepoTreeResponse>(`/api/repo-tree?${params.toString()}`);
-}
-
-export function listRepoFiles(
-  repoRef: string,
-  gitRef = 'WORKTREE',
-  options?: { skipBinary?: boolean; skipGitignore?: boolean }
-) {
-  const params = new URLSearchParams({
-    repo_ref: repoRef,
-    git_ref: gitRef,
-    skip_binary: String(Boolean(options?.skipBinary)),
-    skip_gitignore: String(Boolean(options?.skipGitignore))
-  });
-  return fetchJson<RepoFilesResponse>(`/api/repo-files?${params.toString()}`);
-}
-
 export function validateRepoRef(repoRef: string) {
   const params = new URLSearchParams({
     repo_ref: repoRef,
@@ -942,45 +912,6 @@ export type MutatePathResponse = {
   kind: string;
   bytes: number;
 };
-
-export function readWorkspaceFile(repoRef: string, path: string) {
-  const params = new URLSearchParams({
-    repo_ref: repoRef,
-    path,
-  });
-  return fetchJson<FileContentsResponse>(`/api/file?${params.toString()}`);
-}
-
-export function writeWorkspaceFile(body: { repo_ref: string; path: string; contents: string }) {
-  return fetchJson<MutatePathResponse>('/api/file', {
-    method: 'PUT',
-    body: JSON.stringify(body),
-  });
-}
-
-export function createWorkspaceFile(body: { repo_ref: string; path: string; contents?: string }) {
-  return fetchJson<MutatePathResponse>('/api/file', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
-}
-
-export function createWorkspaceFolder(body: { repo_ref: string; path: string }) {
-  return fetchJson<MutatePathResponse>('/api/folder', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
-}
-
-export function deleteWorkspacePath(repoRef: string, path: string) {
-  const params = new URLSearchParams({
-    repo_ref: repoRef,
-    path,
-  });
-  return fetchJson<{ ok: boolean; repo_ref: string; path: string }>(`/api/file?${params.toString()}`, {
-    method: 'DELETE',
-  });
-}
 
 export function createTemplate(body: { name: string; description: string; repo_ref: string; definition: WorkflowTemplateDefinition }) {
   return fetchJson<WorkflowTemplate>('/api/workflow-templates', {
@@ -1285,6 +1216,19 @@ export function listWorkflowRepoTree(
   return fetchJson<RepoTreeResponse>(`/api/workflow-runs/${runId}/repository/tree?${params.toString()}`);
 }
 
+export function listWorkflowRepoFiles(
+  runId: string,
+  gitRef = 'WORKTREE',
+  options?: { skipBinary?: boolean; skipGitignore?: boolean }
+) {
+  const params = new URLSearchParams({
+    git_ref: gitRef || 'WORKTREE',
+    skip_binary: String(Boolean(options?.skipBinary)),
+    skip_gitignore: String(Boolean(options?.skipGitignore))
+  });
+  return fetchJson<RepoFilesResponse>(`/api/workflow-runs/${runId}/repository/files?${params.toString()}`);
+}
+
 export function readWorkflowFile(runId: string, path: string) {
   const params = new URLSearchParams({ path });
   return fetchJson<FileContentsResponse>(`/api/workflow-runs/${runId}/filesystem/read?${params.toString()}`);
@@ -1294,6 +1238,27 @@ export function writeWorkflowFile(runId: string, body: { path: string; contents:
   return fetchJson<MutatePathResponse>(`/api/workflow-runs/${runId}/filesystem/write`, {
     method: 'POST',
     body: JSON.stringify(body)
+  });
+}
+
+export function createWorkflowFile(runId: string, body: { path: string; contents?: string }) {
+  return fetchJson<MutatePathResponse>(`/api/workflow-runs/${runId}/filesystem/create-file`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function createWorkflowFolder(runId: string, body: { path: string }) {
+  return fetchJson<MutatePathResponse>(`/api/workflow-runs/${runId}/filesystem/create-folder`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
+export function deleteWorkflowPath(runId: string, path: string) {
+  return fetchJson<{ ok: boolean; repo_ref: string; path: string }>(`/api/workflow-runs/${runId}/filesystem/delete`, {
+    method: 'POST',
+    body: JSON.stringify({ path })
   });
 }
 

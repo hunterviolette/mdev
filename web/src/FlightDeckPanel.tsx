@@ -1303,20 +1303,13 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
   return null;
 }
 
-function isIntegrationReadyState(state: string | null | undefined): boolean {
-  return ['patch_ready', 'ready_for_integration', 'integrating', 'integrated'].includes(normalize(state));
-}
-
-function unitHasPatch(unit: FlightDeckWorkUnit): boolean {
-  return Boolean(unit.patch_id || unit.telemetry?.patch_id || unit.telemetry?.current_patch_id);
-}
-
 function manualShardIsStaged(unit: FlightDeckWorkUnit): boolean {
   return manualShardIsIntegrationInput(unit);
 }
 
 function featureIsIntegrationReady(unit: FlightDeckWorkUnit): boolean {
-  return unitHasPatch(unit) || isIntegrationReadyState(unit.state);
+  return ['patch_ready', 'ready_for_integration', 'development_succeeded'].includes(normalize(unit.state))
+    && Boolean(unit.shard_path?.trim());
 }
 
 function integrationInputIsSkipped(unit: FlightDeckWorkUnit): boolean {
@@ -1332,12 +1325,13 @@ function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
   const includedFeatures = features.filter((unit) => !integrationInputIsSkipped(unit));
   const skippedManualStaged = manualStaged.filter(integrationInputIsSkipped);
   const includedManualStaged = manualStaged.filter((unit) => !integrationInputIsSkipped(unit));
+  const readyManualStaged = includedManualStaged.filter(manualShardHasStagedChanges);
   const readyFeatures = includedFeatures.filter(featureIsIntegrationReady);
   const pendingFeatures = includedFeatures.filter((unit) => !featureIsIntegrationReady(unit));
   const blockedFeatures = includedFeatures.filter((unit) => ['blocked', 'failed'].includes(normalize(unit.state)));
   const skippedTotal = skippedFeatures.length + skippedManualStaged.length;
   const relevantTotal = includedFeatures.length + includedManualStaged.length;
-  const readyTotal = readyFeatures.length + includedManualStaged.length;
+  const readyTotal = readyFeatures.length + readyManualStaged.length;
   const readyPct = relevantTotal > 0 ? Math.round((readyTotal / relevantTotal) * 100) : 0;
 
   return {

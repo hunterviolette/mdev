@@ -576,7 +576,7 @@ pub async fn execute_stage(
         step,
         local_state,
     )?;
-    if stage_for_step(step).stage_type() == "merge_patches" {
+    if step.step_type == "merge_patches" {
         return merge_patches_stage::execute_stage(
             state,
             run_id,

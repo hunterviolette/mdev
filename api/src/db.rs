@@ -6,6 +6,10 @@ use uuid::Uuid;
 
 use crate::engine::capabilities::changeset::persistence::{CHANGESET_ATTEMPTS_TABLE_SQL, CHANGESET_FILE_EFFECTS_TABLE_SQL};
 
+pub fn normalize_repo_ref(repo_ref: &str) -> String {
+    repo_ref.trim().to_string()
+}
+
 pub fn repo_basename_for_workflow_key(repo_ref: &str) -> String {
     let normalized = repo_ref.trim().replace('\\', "/");
     let raw = normalized

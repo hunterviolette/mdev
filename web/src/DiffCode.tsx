@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Badge, Box, Button, Group, Loader, Progress, Text } from '@mantine/core';
-import { createHighlighter } from 'shiki';
+import { bundledLanguagesInfo, createHighlighter } from 'shiki';
 
 export type DiffCodeStyle = 'unified' | 'split';
 
@@ -100,18 +100,17 @@ function pathFromDiffGit(line: string): { oldPath: string; newPath: string; path
 }
 
 function languageForPath(path: string): string {
-  const lower = path.toLowerCase();
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) return 'tsx';
-  if (lower.endsWith('.js') || lower.endsWith('.jsx')) return 'jsx';
-  if (lower.endsWith('.rs')) return 'rust';
-  if (lower.endsWith('.json')) return 'json';
-  if (lower.endsWith('.css')) return 'css';
-  if (lower.endsWith('.html')) return 'html';
-  if (lower.endsWith('.md')) return 'markdown';
-  if (lower.endsWith('.sql')) return 'sql';
-  if (lower.endsWith('.toml')) return 'toml';
-  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return 'yaml';
-  return 'text';
+  const fileName = path.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? '';
+  const extension = fileName.includes('.')
+    ? fileName.slice(fileName.lastIndexOf('.') + 1)
+    : fileName;
+
+  const match = bundledLanguagesInfo.find((language) =>
+    language.id === extension ||
+    (language.aliases ?? []).some((alias) => alias.toLowerCase() === extension)
+  );
+
+  return match?.id ?? 'text';
 }
 
 function isPatchMetadataLine(rawLine: string) {

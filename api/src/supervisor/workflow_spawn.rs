@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    db::new_workflow_key,
+    db::{new_workflow_key, normalize_repo_ref},
     engine,
     engine::capabilities::planner::FeaturePlanItem,
     models::{AutomationMode, RunStatus, WorkflowGlobalConfig, WorkflowRun, WorkflowStepDefinition, WorkflowStepExecutionConfig, WorkflowStepPromptConfig, WorkflowStepAdvancementConfig, WorkflowTemplateDefinition},
@@ -306,8 +306,12 @@ async fn insert_and_start_run(
     mut definition: WorkflowTemplateDefinition,
     mut context: Value,
 ) -> Result<Uuid> {
+    let repo_path = normalize_repo_ref(repo_path);
+    if repo_path.is_empty() {
+        return Err(anyhow!("repo path is required"));
+    }
     let id = Uuid::new_v4();
-    let key = new_workflow_key(repo_path);
+    let key = new_workflow_key(&repo_path);
     let now = Utc::now();
     crate::routes::normalize_shared_dependencies(&mut definition.globals);
     let requested_start_step_id = context
@@ -323,11 +327,11 @@ async fn insert_and_start_run(
     if let Some(obj) = definition.globals.resources.as_object_mut() {
         let repo = obj.entry("repo").or_insert_with(|| json!({}));
         if let Some(repo_obj) = repo.as_object_mut() {
-            repo_obj.insert("repo_ref".to_string(), Value::String(repo_path.to_string()));
+            repo_obj.insert("repo_ref".to_string(), Value::String(repo_path.clone()));
             repo_obj.insert("git_ref".to_string(), Value::String("WORKTREE".to_string()));
         }
     }
-    seed_template_globals_into_context(&mut context, &definition, repo_path)?;
+    seed_template_globals_into_context(&mut context, &definition, &repo_path)?;
     if let Some(context_obj) = context.as_object_mut() {
         context_obj.remove("workflow_input");
     }
@@ -342,7 +346,7 @@ async fn insert_and_start_run(
         status: RunStatus::Draft,
         current_step_id: current_step_id.clone(),
         title: title.to_string(),
-        repo_ref: repo_path.to_string(),
+        repo_ref: repo_path.clone(),
         workflow_key: key.clone(),
         context,
         created_at: now,
@@ -362,7 +366,7 @@ async fn insert_and_start_run(
         .bind("draft")
         .bind(current_step_id)
         .bind(title)
-        .bind(repo_path)
+        .bind(&repo_path)
         .bind(key)
         .bind(serde_json::to_string(&context)?)
         .bind(now.to_rfc3339())

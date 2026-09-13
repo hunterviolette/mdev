@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
+    db::normalize_repo_ref,
     models::{CreateTemplateRequest, WorkflowTemplate, WorkflowTemplateDefinition},
     routes::{normalize_qa_environment, normalize_shared_dependencies},
 };
@@ -195,6 +196,7 @@ async fn create_template(
 ) -> Result<Json<WorkflowTemplate>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
     let mut definition = req.definition;
+    let repo_ref = normalize_repo_ref(&req.repo_ref);
     normalize_shared_dependencies(&mut definition.globals);
     normalize_qa_environment(
         &mut definition.globals,
@@ -221,7 +223,7 @@ async fn create_template(
             "UPDATE workflow_templates SET description = ?, repo_ref = ?, definition_json = ?, updated_at = ? WHERE id = ?"
         )
         .bind(&req.description)
-        .bind(&req.repo_ref)
+        .bind(&repo_ref)
         .bind(&definition_json)
         .bind(now.to_rfc3339())
         .bind(id.to_string())
@@ -239,7 +241,7 @@ async fn create_template(
         .bind(id.to_string())
         .bind(&req.name)
         .bind(&req.description)
-        .bind(&req.repo_ref)
+        .bind(&repo_ref)
         .bind(&definition_json)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
@@ -254,7 +256,7 @@ async fn create_template(
         id,
         name: req.name,
         description: req.description,
-        repo_ref: req.repo_ref,
+        repo_ref,
         definition,
         created_at,
         updated_at: now,

@@ -34,6 +34,23 @@ pub fn generate_patch_text(repo_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+pub fn generate_staged_patch_text(repo_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--binary")
+        .arg("HEAD")
+        .current_dir(repo_path)
+        .output()
+        .with_context(|| format!("failed to diff staged changes in {}", repo_path.display()))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(String::from_utf8_lossy(&output.stderr).to_string()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 pub fn generate_patch(repo_path: &Path, patch_path: &Path) -> Result<()> {
     let patch_text = generate_patch_text(repo_path)?;
     if let Some(parent) = patch_path.parent() {

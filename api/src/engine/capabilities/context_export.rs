@@ -130,18 +130,20 @@ pub fn normalize_context_export_payload(payload: Value, repo_resource: Option<Va
     };
 
     let obj = normalized.as_object_mut().expect("context export payload must be object");
-    obj.entry("repo_ref".to_string()).or_insert_with(|| {
+    obj.insert(
+        "repo_ref".to_string(),
         repo_resource
             .get("repo_ref")
             .cloned()
-            .unwrap_or_else(|| Value::String(fallback_repo_ref.to_string()))
-    });
-    obj.entry("git_ref".to_string()).or_insert_with(|| {
+            .unwrap_or_else(|| Value::String(fallback_repo_ref.to_string())),
+    );
+    obj.insert(
+        "git_ref".to_string(),
         repo_resource
             .get("git_ref")
             .cloned()
-            .unwrap_or_else(|| Value::String("WORKTREE".to_string()))
-    });
+            .unwrap_or_else(|| Value::String("WORKTREE".to_string())),
+    );
     obj.entry("exclude_regex".to_string()).or_insert_with(|| json!([]));
     obj.entry("include_files".to_string()).or_insert_with(|| json!([]));
     obj.entry("include_directories".to_string()).or_insert_with(|| json!([]));

@@ -27,6 +27,7 @@ async fn delete_supervisor_run(
     State(state): State<AppState>,
     Path(supervisor_id): Path<Uuid>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let _supervisor_guard = state.supervisor_coordinator.lock(supervisor_id).await;
     supervisor::delete_supervisor_run(&state, supervisor_id).await.map(|_| Json(json!({ "ok": true }))).map_err(internal)
 }
 
@@ -42,6 +43,7 @@ async fn set_supervisor_queue(
     Path(supervisor_id): Path<Uuid>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let _supervisor_guard = state.supervisor_coordinator.lock(supervisor_id).await;
     supervisor::select_supervisor_feature_pool(&state, supervisor_id, payload).await.map(Json).map_err(internal)
 }
 
@@ -53,32 +55,14 @@ async fn supervisor_action(
     let action = req.action_name();
     tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action requested");
 
+    let _supervisor_guard = state.supervisor_coordinator.lock(supervisor_id).await;
+    tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action acquired mutation lock");
+
     let response = match req {
         SupervisorActionRequest::CreateWorkUnit(request) => supervisor::create_supervisor_work_unit(&state, supervisor_id, request).await,
         SupervisorActionRequest::DeleteWorkUnit { work_unit_id } => supervisor::delete_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::RegenerateWorkUnit { work_unit_id } => supervisor::regenerate_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
-        SupervisorActionRequest::StartWorkUnit { work_unit_id } => {
-            let background_state = state.clone();
-            let background_work_unit_id = work_unit_id.clone();
-
-            tokio::spawn(async move {
-                let _ = supervisor::start_supervisor_work_unit(
-                    &background_state,
-                    supervisor_id,
-                    background_work_unit_id,
-                )
-                .await;
-            });
-
-            Ok(json!({
-                "ok": true,
-                "accepted": true,
-                "background": true,
-                "action": "start_work_unit",
-                "supervisor_id": supervisor_id,
-                "work_unit_id": work_unit_id
-            }))
-        },
+        SupervisorActionRequest::StartWorkUnit { work_unit_id } => supervisor::start_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::PauseWorkUnit { work_unit_id } => supervisor::pause_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::StageWorkUnit { work_unit_id, staged } => supervisor::stage_supervisor_work_unit(&state, supervisor_id, work_unit_id, staged).await,
         SupervisorActionRequest::UpdateSupervisorConfig { config } => supervisor::update_supervisor_config(&state, supervisor_id, config).await,

@@ -46,7 +46,6 @@ import {
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
-  listRepoTree,
   listWorkflowRepoTree,
   listRunEvents,
   validateRepoRef,
@@ -3193,33 +3192,17 @@ export function WorkflowShell(props: {
     let cancelled = false;
 
     if (view === 'builder') {
-      const repo = repoRef.trim();
-      if (!repo) {
-        setRepoFragmentFileCount(0);
-        return;
-      }
+      setRepoFragmentFileCount(0);
+      return;
+    }
 
-      void listRepoTree(repo, selection.gitRef, {
-        recursive: true,
-        skipBinary: selection.skipBinary,
-        skipGitignore: selection.skipGitignore
-      })
-        .then((response) => {
-          if (cancelled) return;
-          const resolved = resolveContextExport(response.entries, selection);
-          setRepoFragmentFileCount(resolved.includedFiles.length);
-        })
-        .catch(() => {
-          if (!cancelled) setRepoFragmentFileCount(0);
-        });
-    } else {
-      const runId = selectedRun?.id ?? '';
-      if (!runId) {
-        setRepoFragmentFileCount(0);
-        return;
-      }
+    const runId = selectedRun?.id ?? '';
+    if (!runId) {
+      setRepoFragmentFileCount(0);
+      return;
+    }
 
-      void getWorkflowContextExportSummary(runId, {
+    void getWorkflowContextExportSummary(runId, {
         git_ref: selection.gitRef,
         include_files: selection.includeFiles,
         include_directories: selection.includeDirectories,
@@ -3229,16 +3212,15 @@ export function WorkflowShell(props: {
         include_override_regex: selection.includeOverrideRegex,
         skip_binary: selection.skipBinary,
         skip_gitignore: selection.skipGitignore
+    })
+      .then((response) => {
+        if (!cancelled) {
+          setRepoFragmentFileCount(response.included_file_count);
+        }
       })
-        .then((response) => {
-          if (!cancelled) {
-            setRepoFragmentFileCount(response.included_file_count);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setRepoFragmentFileCount(0);
-        });
-    }
+      .catch(() => {
+        if (!cancelled) setRepoFragmentFileCount(0);
+      });
 
     return () => {
       cancelled = true;
@@ -4680,7 +4662,16 @@ export function WorkflowShell(props: {
   }
 
   function mapLiveExecutionTrailsFromProjection(projection: EventChainSummaryResponse): LiveStageTrail[] {
-    return projection.stages.map((stage) => ({
+    const stagesByExecutionId = new Map<string, EventChainSummaryResponse['stages'][number]>();
+    for (const stage of projection.stages) {
+      const executionId = stage.stage_execution_id || stage.key;
+      const existing = stagesByExecutionId.get(executionId);
+      if (!existing || stage.latest_created_at >= existing.latest_created_at) {
+        stagesByExecutionId.set(executionId, stage);
+      }
+    }
+
+    return Array.from(stagesByExecutionId.values()).map((stage) => ({
       key: stage.key,
       stepId: stage.step_id,
       label: stage.label,
@@ -5698,7 +5689,11 @@ export function WorkflowShell(props: {
       throw new Error('Set a repo path to browse files.');
     }
 
-    return listRepoTree(activeRepoRef, gitRef, options);
+    const runId = selectedRun?.id ?? '';
+    if (!runId) {
+      return Promise.reject(new Error('Workflow run is required for repository access'));
+    }
+    return listWorkflowRepoTree(runId, gitRef, options);
   }
 
   async function loadRepoTreeForActiveRef(basePath: string, replaceRoot = false) {
@@ -7054,7 +7049,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Suspense>
           ) : activeWorkspaceTab === 'files' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
-              <RepoMonacoFileEditorPanel repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()} />
+              <RepoMonacoFileEditorPanel runId={selectedRun?.id ?? ''} />
             </Suspense>
           ) : activeWorkspaceTab === 'capabilities' ? (
             <Card withBorder>
