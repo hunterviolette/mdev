@@ -1,6 +1,10 @@
 pub mod api;
 pub mod browser;
+pub mod panel;
+pub mod prompting;
+pub mod session;
 pub mod stage_support;
+pub mod model_output;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -80,10 +84,16 @@ impl Default for BrowserConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
     pub transport: InferenceTransport,
+    #[serde(default)]
+    pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub runtime: Value,
     #[serde(default)]
     pub browser: BrowserConfig,
 }
@@ -92,8 +102,11 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             transport: InferenceTransport::Api,
+            provider: "openai".to_string(),
             model: default_model(),
+            endpoint: String::new(),
             conversation_id: None,
+            runtime: json!({}),
             browser: BrowserConfig::default(),
         }
     }
@@ -123,102 +136,46 @@ pub struct BrowserProbeResult {
     pub ready: bool,
 }
 
-pub async fn persist_inference_config(ctx: &CapabilityContext<'_>, cfg: &InferenceConfig) -> Result<()> {
-    let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    let root = crate::engine::ensure_engine_root(&mut run.context);
-    let global_state = ensure_object_slot(root, "global_state");
-    let capabilities = ensure_object_slot(global_state, "capabilities");
-
-    let existing_inference = capabilities
-        .get("inference")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let next_inference = serde_json::to_value(cfg)?;
-
-    let mut merged = match existing_inference {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-
-    if let Value::Object(next_map) = next_inference {
-        for (key, value) in next_map {
-            merged.insert(key, value);
-        }
-    }
-
-    capabilities.insert("inference".to_string(), Value::Object(merged));
-    crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
-}
+pub use session::persist_inference_config;
 
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
     prior_results: &[CapabilityResult],
     _config: Value,
 ) -> Result<CapabilityResult> {
-    let policy = super::registry::stage_capability_policy(ctx.step)?;
-    let include_changeset_schema = ctx
-        .local_state
-        .get("prompt_fragment_enabled")
-        .and_then(|v| v.get("changeset_schema"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let policy = super::registry::stage_capability_policy(ctx.step).ok();
+    let consumed_capabilities = consumed_inference_capabilities(ctx.local_state);
 
     let mut follow_ups = Vec::new();
-    if include_changeset_schema && policy.allowed_invocations.iter().any(|item| *item == "changeset_schema") {
+    let changeset_allowed = policy
+        .as_ref()
+        .map(|policy| policy.allowed_invocations.iter().any(|item| item == "changeset"))
+        .unwrap_or(false);
+    if ctx.step.step_type == "code" && changeset_allowed {
         follow_ups.push(CapabilityInvocation {
-            capability: "changeset_schema".to_string(),
+            capability: "changeset".to_string(),
             config: json!({}),
         });
     }
 
-    if ctx.step.step_type == "code" && policy.allowed_invocations.iter().any(|item| item == "gateway_model/changeset") {
-        follow_ups.push(CapabilityInvocation {
-            capability: "gateway_model/changeset".to_string(),
-            config: json!({}),
-        });
-    }
+    let resolved_session = session::resolve_inference_session(ctx).await?;
+    let selected_transport = resolved_session.config.transport.clone();
+    let selected_provider = resolved_session.config.provider.clone();
+    let selected_model = resolved_session.config.model.clone();
 
-    let runtime_transport = ctx
-        .local_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .or_else(|| ctx.local_state.get("inference").cloned())
-        .and_then(|v| serde_json::from_value::<InferenceConfig>(v).ok())
-        .map(|cfg| cfg.transport);
+    let model_input = prompting::build_model_input(ctx, prior_results)?;
+    let sent_prompt = model_input.text.clone();
 
-    let configured_transport = ctx
-        .step
-        .config
-        .get("inference_transport")
-        .and_then(Value::as_str)
-        .and_then(|value| match value {
-            "browser" => Some(InferenceTransport::Browser),
-            "api" => Some(InferenceTransport::Api),
-            _ => None,
-        });
-
-    let selected_transport = runtime_transport
-        .or(configured_transport)
-        .unwrap_or(InferenceTransport::Api);
-
-    let sent_prompt = ctx
-        .local_state
-        .get("composed_prompt")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    if selected_transport == InferenceTransport::Browser && sent_prompt.trim().is_empty() {
+    if sent_prompt.trim().is_empty() {
         return Ok(CapabilityResult {
             ok: false,
             capability: "inference".to_string(),
             payload: json!({
-                "message": "Browser inference prompt is empty before send_chat",
+                "message": "Central prompting produced an empty model input.",
                 "prompt": sent_prompt,
                 "result": {
                     "ok": false,
-                    "message": "Browser inference prompt is empty before send_chat"
+                    "message": "Central prompting produced an empty model input."
                 }
             }),
             follow_ups: CapabilityInvocationRequest::None,
@@ -226,9 +183,13 @@ pub async fn execute(
     }
 
     let response = match selected_transport {
-        InferenceTransport::Browser => browser::execute(ctx, prior_results).await?,
-        InferenceTransport::Api => api::execute(ctx).await?,
+        InferenceTransport::Browser => browser::execute(ctx, &model_input).await?,
+        InferenceTransport::Api => api::execute(ctx, &model_input).await?,
     };
+
+    ctx.state
+        .orchestration_inputs
+        .acknowledge(ctx.run_id, &model_input.consumed_input_ids);
 
     let response_ok = response
         .get("ok")
@@ -241,7 +202,9 @@ pub async fn execute(
         .unwrap_or("")
         .to_string();
 
-    let capability_ok = response_ok && (!sent_prompt.trim().is_empty() || response_text.trim().is_empty() || selected_transport != InferenceTransport::Browser);
+    let capability_ok = response_ok
+        && !sent_prompt.trim().is_empty()
+        && (ctx.step.step_type != "code" || !response_text.trim().is_empty());
 
     let message = if capability_ok {
         "Inference capability executed.".to_string()
@@ -254,6 +217,11 @@ pub async fn execute(
             .to_string()
     };
 
+    let prompt_blocks = serde_json::to_value(&model_input.input_blocks)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+
     Ok(CapabilityResult {
         ok: capability_ok,
         capability: "inference".to_string(),
@@ -261,6 +229,22 @@ pub async fn execute(
             "message": message,
             "prompt": sent_prompt,
             "result": response,
+            "model_io": {
+                "provider": selected_provider,
+                "model": selected_model,
+                "transport": selected_transport,
+                "capability_key": "inference",
+                "block_label": "Inference model call",
+                "input": sent_prompt,
+                "output": response_text,
+                "content_format": "markdown",
+                "status": if capability_ok { "completed" } else { "failed" },
+                "step_id": ctx.step.id,
+                "stage_type": ctx.step.step_type,
+                "input_blocks": prompt_blocks,
+                "output_blocks": []
+            },
+            "consumed_capabilities": consumed_capabilities,
         }),
         follow_ups: if capability_ok {
             if follow_ups.is_empty() {
@@ -272,6 +256,73 @@ pub async fn execute(
             CapabilityInvocationRequest::None
         },
     })
+}
+
+fn model_input_blocks(local_state: &Value) -> Vec<Value> {
+    if let Some(items) = local_state
+        .get("model_input_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    if let Some(items) = local_state
+        .get("prompt_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    if let Some(items) = local_state
+        .get("composed_prompt_blocks")
+        .and_then(Value::as_array)
+    {
+        return items.clone();
+    }
+
+    Vec::new()
+}
+
+fn consumed_inference_capabilities(local_state: &Value) -> Vec<String> {
+    let enabled = local_state
+        .get("prompt_fragment_enabled")
+        .and_then(Value::as_object);
+
+    let mut consumed = Vec::new();
+
+    if enabled
+        .and_then(|items| items.get("repo_context"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("repo_context".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("changeset_schema"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("changeset_schema".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("planning_fragment"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("planner_fragment".to_string());
+    }
+
+    if enabled
+        .and_then(|items| items.get("planner_schema"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        consumed.push("planner_schema".to_string());
+    }
+
+    consumed
 }
 
 fn default_profile() -> String {

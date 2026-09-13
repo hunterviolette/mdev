@@ -66,8 +66,8 @@ fn resolve_repo_ref(ctx: &CapabilityContext<'_>, repo_ref: &str) -> String {
 
     ctx.local_state
         .get("resources")
-        .and_then(|value| value.get("repo"))
-        .and_then(|value| value.get("repo_ref"))
+        .and_then(|v| v.get("repo"))
+        .and_then(|v| v.get("repo_ref"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(ctx.repo_ref)
@@ -87,31 +87,21 @@ pub async fn execute(
     match cfg.mode.as_str() {
         "generate" => {
             let (scope, from_ref, to_ref) = parse_scope(&cfg.scope)?;
-            let paths = if cfg.paths.is_empty() {
-                None
-            } else {
-                Some(cfg.paths.as_slice())
-            };
-            let context_lines = cfg.context_lines.map(|value| value.min(1000));
-            let patch = generate_git_apply_patch(&repo, scope, paths, context_lines)?;
-            let base_head = String::from_utf8(run_git(&repo, &["rev-parse", "HEAD"])?)
-                .context("HEAD was not valid UTF-8")?
-                .trim()
-                .to_string();
-
+            let paths = if cfg.paths.is_empty() { None } else { Some(cfg.paths.as_slice()) };
+            let patch = generate_git_apply_patch(&repo, scope, paths, cfg.context_lines)?;
+            let head = String::from_utf8(run_git(&repo, &["rev-parse", "HEAD"])?).context("git HEAD was not valid UTF-8")?;
             let envelope = GitPatchPayloadEnvelope {
                 version: 1,
                 kind: "git_apply_patch".to_string(),
-                scope: cfg.scope,
+                scope: cfg.scope.clone(),
                 from_ref: from_ref.to_string(),
                 to_ref: to_ref.to_string(),
-                base_head,
-                paths: cfg.paths,
-                context_lines,
+                base_head: head.trim().to_string(),
+                paths: cfg.paths.clone(),
+                context_lines: cfg.context_lines,
                 patch,
             };
             let payload_text = serde_json::to_string_pretty(&envelope)?;
-
             Ok(CapabilityResult {
                 ok: true,
                 capability: "git_patch_payload".to_string(),
@@ -119,30 +109,33 @@ pub async fn execute(
                     "ok": true,
                     "mode": "generate",
                     "repo_ref": repo_ref,
-                    "payload_text": payload_text,
-                    "envelope": envelope,
+                    "scope": envelope.scope,
+                    "from_ref": envelope.from_ref,
+                    "to_ref": envelope.to_ref,
+                    "base_head": envelope.base_head,
+                    "paths": envelope.paths,
+                    "context_lines": envelope.context_lines,
+                    "patch_bytes": envelope.patch.len(),
+                    "payload_text": payload_text
                 }),
                 follow_ups: CapabilityInvocationRequest::None,
             })
         }
         "apply" => {
-            if cfg.payload_text.trim().is_empty() {
-                bail!("payload_text is required for git_patch_payload apply");
+            let payload_text = cfg.payload_text.trim();
+            if payload_text.is_empty() {
+                bail!("git_patch_payload apply requires payload_text");
             }
-
-            let envelope: GitPatchPayloadEnvelope =
-                serde_json::from_str(&cfg.payload_text).context("invalid git patch payload envelope")?;
-
+            let envelope: GitPatchPayloadEnvelope = serde_json::from_str(payload_text)
+                .context("failed to parse git patch payload envelope")?;
             if envelope.version != 1 || envelope.kind != "git_apply_patch" {
                 bail!("unsupported git patch payload envelope");
             }
-
             if cfg.reverse {
                 apply_git_patch_reverse(&repo, &envelope.patch)?;
             } else {
                 apply_git_patch(&repo, &envelope.patch)?;
             }
-
             Ok(CapabilityResult {
                 ok: true,
                 capability: "git_patch_payload".to_string(),
@@ -151,9 +144,13 @@ pub async fn execute(
                     "mode": "apply",
                     "repo_ref": repo_ref,
                     "reverse": cfg.reverse,
-                    "source_base_head": envelope.base_head,
                     "scope": envelope.scope,
+                    "from_ref": envelope.from_ref,
+                    "to_ref": envelope.to_ref,
+                    "base_head": envelope.base_head,
                     "paths": envelope.paths,
+                    "context_lines": envelope.context_lines,
+                    "patch_bytes": envelope.patch.len()
                 }),
                 follow_ups: CapabilityInvocationRequest::None,
             })

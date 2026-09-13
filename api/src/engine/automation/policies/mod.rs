@@ -1,0 +1,93 @@
+use anyhow::Result;
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::{
+    app_state::AppState,
+    engine::capabilities::registry::{CapabilityInvocation, CapabilityResult},
+    models::{WorkflowRun, WorkflowStepDefinition},
+};
+
+use super::decisions::AutomationDecision;
+
+pub mod changeset_file_failures;
+pub mod compile_failures;
+pub mod inference_input_consumption;
+pub mod pause;
+
+pub async fn before_stage(
+    _state: &AppState,
+    _run_id: Uuid,
+    _run: &mut WorkflowRun,
+    _step: &WorkflowStepDefinition,
+) -> Result<Vec<AutomationDecision>> {
+    Ok(Vec::new())
+}
+
+pub async fn after_stage(
+    state: &AppState,
+    run_id: Uuid,
+    run: &mut WorkflowRun,
+    step: &WorkflowStepDefinition,
+    stage_execution_id: &str,
+    capability_results: &[Value],
+) -> Result<Vec<AutomationDecision>> {
+    let latest_run = crate::engine::load_run(state, run_id)
+        .await
+        .unwrap_or_else(|_| run.clone());
+
+    let mut decisions = Vec::new();
+    decisions.extend(inference_input_consumption::after_stage(
+        &latest_run,
+        step,
+        stage_execution_id,
+        capability_results,
+    )?);
+    decisions.extend(pause::after_stage(&latest_run)?);
+
+    Ok(decisions)
+}
+
+pub async fn before_capability(
+    _state: &AppState,
+    _run_id: Uuid,
+    _run: &WorkflowRun,
+    _step: &WorkflowStepDefinition,
+    _stage_execution_id: Option<&str>,
+    _invocation: &CapabilityInvocation,
+    _prior_results: &[CapabilityResult],
+) -> Result<Vec<AutomationDecision>> {
+    Ok(Vec::new())
+}
+
+pub async fn after_capability(
+    _state: &AppState,
+    _run_id: Uuid,
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+    _stage_execution_id: Option<&str>,
+    result: &CapabilityResult,
+    prior_results: &[CapabilityResult],
+) -> Result<Vec<AutomationDecision>> {
+    let mut decisions = Vec::new();
+    decisions.extend(crate::engine::stages::automation_after_capability(
+        run,
+        step,
+        result,
+        prior_results,
+    )?);
+
+    if result.capability == "repo_sync_changeset" && !result.ok {
+        let reason = result
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Repo Sync Auto Apply failed");
+        decisions.push(AutomationDecision::Pause {
+            reason: format!("Repo Sync Auto Apply failed: {}", reason),
+        });
+    }
+
+    Ok(decisions)
+}

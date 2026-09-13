@@ -10,23 +10,32 @@ export type InteractionProfile = {
 
 const profiles: Record<string, InteractionProfile> = {
   auto: {
-    responseSelector: '[data-message-author-role="assistant"]',
+    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',
-    chatSubmitSelector: 'button[data-testid="send-button"], button[type="submit"], [aria-label*="send" i]'
+    chatSubmitSelector: 'button[data-testid="send-button"], button[type="submit"], [aria-label*="send" i], button[aria-label*="Send message" i]'
   }
 };
 
-const autoCandidates: InteractionProfile[] = [
+const candidateProfiles: InteractionProfile[] = [
   {
-    responseSelector: '[data-message-author-role="assistant"], article[data-testid^="conversation-turn-"][data-message-author-role="assistant"], [data-testid^="conversation-turn-"] [data-message-author-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container, [data-role="assistant"]',
+    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',
-    chatSubmitSelector: 'button[data-testid="send-button"], button[type="submit"], [aria-label*="send" i]'
+    chatSubmitSelector: 'button[data-testid="send-button"], button[type="submit"], [aria-label*="send" i], button[aria-label*="Send message" i]'
+  },
+  {
+    responseSelector: '[class*="font-claude-message"]',
+    uploadInputSelector: 'input[type="file"]',
+    uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
+    chatInputSelector: 'div[contenteditable="true"], textarea, [role="textbox"]',
+    chatSubmitSelector: 'button[type="submit"], [aria-label*="send" i], button[aria-label*="Use voice mode" i]'
   }
 ];
+
+const autoCandidates: InteractionProfile[] = candidateProfiles;
 
 export function getInteractionProfile(name?: string): InteractionProfile {
   const key = (name ?? 'auto').trim().toLowerCase();

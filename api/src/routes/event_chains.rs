@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 
 use axum::{
     extract::{Path, Query, State},
@@ -6,9 +6,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sqlx::Row;
+use serde_json::{json, Value};
+use sqlx::{QueryBuilder, Row};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine::{load_run, load_template_definition},
-    models::WorkflowEventStreamItem,
+    models::{SprintEventStreamItem, WorkflowEventStreamItem},
 };
 
 type StageChainEvent = WorkflowEventStreamItem;
@@ -34,14 +35,21 @@ struct CapabilityChainSummary {
     key: String,
     capability_id: String,
     name: String,
-    status_color: String,
-    status_label: String,
+    status: String,
     message: String,
     started_at: Option<String>,
+    completed_at: Option<String>,
     duration_ms: Option<i64>,
     latest_created_at: String,
+    latest_kind: String,
+    latest_level: String,
     is_active: bool,
     event_count: usize,
+    start_event_id: Option<String>,
+    end_event_id: Option<String>,
+    start_payload: Value,
+    end_payload: Value,
+    latest_payload: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,10 +58,12 @@ struct StageChainSummary {
     step_id: String,
     label: String,
     stage_execution_id: String,
+    status: String,
     latest_kind: String,
     latest_message: String,
     latest_level: String,
     latest_created_at: String,
+    latest_sequence_no: i64,
     is_current: bool,
     is_active: bool,
     event_count: usize,
@@ -67,15 +77,135 @@ struct EventChainSummaryResponse {
     stages: Vec<StageChainSummary>,
 }
 
+#[derive(Debug, Serialize)]
+struct RuntimeProjectionResponse {
+    runs: Vec<EventChainSummaryResponse>,
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     #[serde(default)]
     after_sequence: Option<i64>,
+    #[serde(default)]
+    live_only: bool,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    stage_execution_id: Option<String>,
+    #[serde(default)]
+    capability_invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct EventHistoryQuery {
+    #[serde(default)]
+    before_sequence: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    stage_execution_id: Option<String>,
+    #[serde(default)]
+    capability_invocation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventHistoryResponse {
+    run_id: String,
+    items: Vec<StageChainEvent>,
+    next_before_sequence: Option<i64>,
+    has_more: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RuntimeEventQuery {
+    #[serde(default)]
+    run_id: Option<Uuid>,
+    #[serde(default)]
+    supervisor_run_id: Option<Uuid>,
+    #[serde(default)]
+    workflow_key: Option<String>,
+    #[serde(default)]
+    repo_ref: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    after_cursor: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeNode {
+    key: String,
+    node_type: String,
+    id: String,
+    status: String,
+    title: String,
+    repo_ref: String,
+    workflow_key: Option<String>,
+    current_step_id: Option<String>,
+    updated_at: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeEdge {
+    key: String,
+    parent_key: String,
+    child_key: String,
+    edge_type: String,
+    label: String,
+    sort_order: i64,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeSnapshotResponse {
+    nodes: Vec<RuntimeNode>,
+    edges: Vec<RuntimeEdge>,
+    latest_sequence_no: i64,
+    server_time: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeEventEnvelope {
+    scope: String,
+    node_key: String,
+    run_id: Option<String>,
+    supervisor_run_id: Option<String>,
+    workflow_key: Option<String>,
+    repo_ref: Option<String>,
+    event: StageChainEvent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SprintEventEnvelope {
+    scope: String,
+    node_key: String,
+    run_id: Option<String>,
+    supervisor_run_id: Option<String>,
+    workflow_key: Option<String>,
+    repo_ref: Option<String>,
+    event: SprintEventStreamItem,
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/events/snapshot", get(get_runtime_snapshot))
+        .route("/api/events/projection", get(get_runtime_projection))
+        .route("/api/events/stream", get(stream_runtime_events))
         .route("/api/workflow-runs/:run_id/event-chain", get(get_event_chain_summary))
+        .route("/api/workflow-runs/:run_id/event-history", get(get_event_history))
         .route("/api/workflow-runs/:run_id/stages/:step_id/executions/:stage_execution_id", get(get_stage_execution_chain))
         .route("/api/workflow-runs/:run_id/events/stream", get(stream_events))
 }
@@ -85,6 +215,129 @@ async fn get_event_chain_summary(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<EventChainSummaryResponse>, (axum::http::StatusCode, String)> {
     Ok(Json(build_event_chain_summary(&state, run_id).await?))
+}
+
+async fn get_runtime_projection(
+    State(state): State<AppState>,
+    Query(query): Query<RuntimeEventQuery>,
+) -> Result<Json<RuntimeProjectionResponse>, (axum::http::StatusCode, String)> {
+    let mut run_ids = runtime_filter_run_ids(&state, &query).await?;
+    if run_ids.is_empty() && runtime_filter_allows_empty_run_set(&query) {
+        run_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM workflow_runs ORDER BY updated_at DESC LIMIT 100",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
+    }
+
+    let mut runs = Vec::new();
+    for run_id in run_ids {
+        let Ok(uuid) = Uuid::parse_str(&run_id) else {
+            continue;
+        };
+        if let Ok(mut projection) = build_event_chain_summary(&state, uuid).await {
+            if let Some(limit) = query.limit {
+                projection.stages.truncate(limit.clamp(1, 500));
+            }
+            runs.push(projection);
+        }
+    }
+
+    Ok(Json(RuntimeProjectionResponse { runs }))
+}
+
+fn strip_runtime_context_from_capability_payload(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return payload.clone();
+    };
+
+    let runtime_keys = [
+        "run_context",
+        "final_context",
+        "prepared_context",
+        "workflow_engine",
+        "global_state",
+        "local_state",
+        "stage_state",
+        "capability_results",
+        "available_transitions",
+        "blocked_on",
+        "next_step_id",
+        "current_step_id",
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (key, value) in object {
+        if runtime_keys.iter().any(|runtime_key| runtime_key == key) {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+
+    Value::Object(out)
+}
+
+fn capability_result_payload(result: &Value) -> Value {
+    result
+        .get("result")
+        .map(strip_runtime_context_from_capability_payload)
+        .unwrap_or_else(|| strip_runtime_context_from_capability_payload(result))
+}
+
+fn event_indicates_user_input_wait(event: &StageChainEvent) -> bool {
+    event
+        .payload
+        .get("execution_state")
+        .and_then(Value::as_str)
+        == Some("awaiting_user_input")
+}
+
+fn capability_result_key(result: &Value) -> Option<String> {
+    result
+        .get("key")
+        .or_else(|| result.get("capability"))
+        .or_else(|| result.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn normalized_capability_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn capability_name_from_event(event: &StageChainEvent) -> String {
+    let payload_name = event
+        .payload
+        .get("capability")
+        .or_else(|| event.payload.get("capability_key"))
+        .or_else(|| event.payload.get("key"))
+        .or_else(|| event.payload.get("name"))
+        .and_then(Value::as_str);
+
+    let raw = payload_name.unwrap_or_else(|| {
+        event.kind
+            .trim_end_matches("_started")
+            .trim_end_matches("_completed")
+            .trim_end_matches("_failed")
+    });
+
+    raw
+        .split(|ch: char| ch == '_' || ch == '-' || ch == '/')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(ch) => format!("{}{}", ch.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 async fn build_event_chain_summary(
@@ -125,12 +378,18 @@ async fn build_event_chain_summary(
                 .map(|(_, name)| name.clone())
                 .unwrap_or_else(|| step_id.clone());
 
-            let completed_stage_event = stage_rows
+            let terminal_stage_event = stage_rows
                 .iter()
                 .rev()
-                .find(|event| event.kind == "stage_execution_completed");
+                .find(|event| {
+                    event.capability_invocation_id.is_none()
+                        && (event.kind == "stage_execution_completed"
+                            || event.kind == "stage_executed"
+                            || event.kind.ends_with("_completed")
+                            || event.kind.ends_with("_failed"))
+                });
 
-            let duration_ms = completed_stage_event.and_then(|event| {
+            let stage_terminal_duration_ms = terminal_stage_event.and_then(|event| {
                 event.payload
                     .get("duration_ms")
                     .and_then(Value::as_i64)
@@ -157,39 +416,42 @@ async fn build_event_chain_summary(
                     let completed = capability_rows
                         .iter()
                         .rev()
-                        .find(|event| event.kind.ends_with("_completed") || event.kind.ends_with("_failed"))
+                        .find(|event| {
+                            event.kind.ends_with("_completed")
+                                || event.kind.ends_with("_failed")
+                                || event
+                                    .payload
+                                    .get("execution_state")
+                                    .and_then(Value::as_str)
+                                    == Some("completed")
+                                || event
+                                    .payload
+                                    .get("execution_state")
+                                    .and_then(Value::as_str)
+                                    == Some("failed")
+                        })
                         .copied();
                     let status_event = completed.unwrap_or(latest_capability);
-                    let capability_name = first
-                        .kind
-                        .trim_end_matches("_started")
-                        .trim_end_matches("_completed")
-                        .trim_end_matches("_failed")
-                        .split('_')
-                        .filter(|part| !part.is_empty())
-                        .map(|part| {
-                            let mut chars = part.chars();
-                            match chars.next() {
-                                Some(ch) => format!("{}{}", ch.to_uppercase(), chars.as_str()),
-                                None => String::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let status_color = if status_event.level == "error" {
-                        "red"
+                    let capability_name = capability_name_from_event(first);
+                    let waiting_for_user = event_indicates_user_input_wait(status_event);
+                    let checkpoint_paused = capability_name == "Operator/Checkpoint"
+                        && status_event
+                            .payload
+                            .get("result")
+                            .and_then(|value| value.get("status"))
+                            .or_else(|| status_event.payload.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("paused");
+                    let status = if waiting_for_user {
+                        "user_input"
+                    } else if checkpoint_paused {
+                        "paused"
+                    } else if status_event.level == "error" || status_event.kind.ends_with("_failed") {
+                        "failed"
                     } else if completed.is_some() {
-                        "green"
+                        "completed"
                     } else {
-                        "blue"
-                    }
-                    .to_string();
-                    let status_label = if status_event.level == "error" {
-                        "ERROR"
-                    } else if completed.is_some() {
-                        "SUCCESS"
-                    } else {
-                        "RUNNING"
+                        "running"
                     }
                     .to_string();
                     let capability_duration_ms = completed.and_then(|event| {
@@ -202,31 +464,269 @@ async fn build_event_chain_summary(
                         key: format!("{}-{}", stage_execution_id, capability_id),
                         capability_id,
                         name: capability_name,
-                        status_color,
-                        status_label,
+                        status,
                         message: status_event.message.clone(),
                         started_at: Some(started.created_at.clone()),
+                        completed_at: completed.map(|event| event.created_at.clone()),
                         duration_ms: capability_duration_ms,
                         latest_created_at: latest_capability.created_at.clone(),
+                        latest_kind: status_event.kind.clone(),
+                        latest_level: status_event.level.clone(),
                         is_active: completed.is_none(),
                         event_count: capability_rows.len(),
+                        start_event_id: Some(started.id.clone()),
+                        end_event_id: completed.map(|event| event.id.clone()),
+                        start_payload: strip_runtime_context_from_capability_payload(&started.payload),
+                        end_payload: completed
+                            .map(|event| strip_runtime_context_from_capability_payload(&event.payload))
+                            .unwrap_or(Value::Null),
+                        latest_payload: strip_runtime_context_from_capability_payload(&status_event.payload),
                     })
                 })
                 .collect::<Vec<_>>();
 
-            capabilities.sort_by(|a, b| a.latest_created_at.cmp(&b.latest_created_at));
+            let result_stage_event = stage_rows
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.capability_invocation_id.is_none()
+                        && (event.kind == "stage_execution_completed"
+                            || event.kind == "stage_execution_state_changed"
+                            || event.kind == "stage_executed"
+                            || event.payload
+                                .get("capability_results")
+                                .and_then(Value::as_array)
+                                .map(|items| !items.is_empty())
+                                .unwrap_or(false))
+                });
+
+            let capability_results = result_stage_event
+                .and_then(|event| event.payload.get("capability_results"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            for (idx, result) in capability_results.iter().enumerate() {
+                let Some(result_key) = capability_result_key(result) else {
+                    continue;
+                };
+                let normalized_result_key = normalized_capability_key(&result_key);
+                let result_payload = capability_result_payload(result);
+                let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                let result_message = result
+                    .get("message")
+                    .or_else(|| result.get("summary"))
+                    .or_else(|| result.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&result_key)
+                    .to_string();
+
+                let result_waiting_for_user = result_payload
+                    .get("execution_state")
+                    .and_then(Value::as_str)
+                    == Some("awaiting_user_input");
+                let result_paused = result_payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    == Some("paused")
+                    || result_payload
+                        .get("disposition")
+                        .and_then(Value::as_str)
+                        == Some("pause_error");
+
+                if let Some(existing) = capabilities.iter_mut().find(|capability| {
+                    normalized_capability_key(&capability.name) == normalized_result_key
+                        || normalized_capability_key(&capability.capability_id) == normalized_result_key
+                }) {
+                    existing.status = if result_waiting_for_user {
+                        "user_input"
+                    } else if result_paused {
+                        "paused"
+                    } else if ok {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                    .to_string();
+                    existing.is_active = result_waiting_for_user;
+                    existing.latest_level = if ok { "info" } else { "error" }.to_string();
+                    existing.message = result_message;
+                    if result_waiting_for_user {
+                        existing.latest_payload = result_payload.clone();
+                    } else {
+                        if existing.end_payload.is_null() {
+                            existing.end_payload = result_payload.clone();
+                        }
+                        if existing.latest_payload.is_null() {
+                            existing.latest_payload = result_payload.clone();
+                        }
+                        if existing.completed_at.is_none() {
+                            if let Some(stage_event) = result_stage_event {
+                                existing.completed_at = Some(stage_event.created_at.clone());
+                                existing.latest_created_at = stage_event.created_at.clone();
+                                existing.latest_kind = stage_event.kind.clone();
+                                existing.end_event_id = Some(stage_event.id.clone());
+                                existing.duration_ms = stage_event
+                                    .payload
+                                    .get("duration_ms")
+                                    .and_then(Value::as_i64)
+                                    .or(existing.duration_ms);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let result_name = result_key
+                    .split(|ch: char| ch == '_' || ch == '-' || ch == '/')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        match chars.next() {
+                            Some(ch) => format!("{}{}", ch.to_uppercase(), chars.as_str()),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let stage_event = result_stage_event;
+                capabilities.push(CapabilityChainSummary {
+                    key: format!("{}-result-{}", stage_execution_id, result_key),
+                    capability_id: format!("{}:result:{}", stage_execution_id, result_key),
+                    name: result_name,
+                    status: if result_waiting_for_user {
+                        "user_input"
+                    } else if result_paused {
+                        "paused"
+                    } else if ok {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                    .to_string(),
+                    message: result_message,
+                    started_at: stage_event.map(|event| event.created_at.clone()),
+                    completed_at: if result_waiting_for_user { None } else { stage_event.map(|event| event.created_at.clone()) },
+                    duration_ms: None,
+                    latest_created_at: stage_event.map(|event| event.created_at.clone()).unwrap_or_else(|| latest.created_at.clone()),
+                    latest_kind: stage_event.map(|event| event.kind.clone()).unwrap_or_else(|| "capability_result".to_string()),
+                    latest_level: if result_waiting_for_user || result_paused { "warn" } else if ok { "info" } else { "error" }.to_string(),
+                    is_active: result_waiting_for_user,
+                    event_count: 1 + idx,
+                    start_event_id: stage_event.map(|event| event.id.clone()),
+                    end_event_id: if result_waiting_for_user { None } else { stage_event.map(|event| event.id.clone()) },
+                    start_payload: Value::Null,
+                    end_payload: if result_waiting_for_user { Value::Null } else { result_payload.clone() },
+                    latest_payload: result_payload,
+                });
+            }
+
+            if let Some(stage_event) = result_stage_event {
+                if !event_indicates_user_input_wait(stage_event) {
+                    for capability in &mut capabilities {
+                        if !capability.is_active {
+                            continue;
+                        }
+                        capability.is_active = false;
+                        if capability.status != "failed" && capability.status != "paused" {
+                            capability.status = "completed".to_string();
+                        }
+                        capability.completed_at = Some(stage_event.created_at.clone());
+                        capability.latest_created_at = stage_event.created_at.clone();
+                        capability.latest_kind = stage_event.kind.clone();
+                        capability.latest_level = if capability.status == "failed" { "error" } else { "info" }.to_string();
+                    }
+                }
+            }
+
+            capabilities.sort_by(|a, b| {
+                if a.is_active != b.is_active {
+                    return b.is_active.cmp(&a.is_active);
+                }
+                b.latest_created_at.cmp(&a.latest_created_at)
+            });
+
+            let capability_terminal = !capabilities.is_empty() && capabilities.iter().all(|capability| !capability.is_active);
+            let capability_failed = capabilities.iter().any(|capability| capability.status == "failed");
+            let capability_paused = capabilities.iter().any(|capability| capability.status == "paused");
+            let stage_is_active = terminal_stage_event.is_none() && !capability_terminal;
+            let stage_status = if stage_is_active {
+                "running".to_string()
+            } else if let Some(status) = terminal_stage_event
+                .and_then(|event| event.payload.get("status"))
+                .and_then(Value::as_str)
+            {
+                if status == "paused" {
+                    "paused".to_string()
+                } else if status == "error" || status.starts_with("error_code:") {
+                    "failed".to_string()
+                } else if matches!(status, "success" | "complete" | "completed") || status.starts_with("outcome:") {
+                    "completed".to_string()
+                } else if status == "waiting" || status == "stay" {
+                    "waiting".to_string()
+                } else {
+                    status.to_string()
+                }
+            } else if capability_paused {
+                "paused".to_string()
+            } else if capability_failed {
+                "failed".to_string()
+            } else if capability_terminal {
+                "completed".to_string()
+            } else {
+                "waiting".to_string()
+            };
+            let inferred_latest_kind = if terminal_stage_event.is_none() && capability_terminal {
+                if capability_paused {
+                    "capability_stage_paused".to_string()
+                } else if capability_failed {
+                    "capability_stage_failed".to_string()
+                } else {
+                    "capability_stage_completed".to_string()
+                }
+            } else {
+                latest.kind.clone()
+            };
+            let inferred_latest_message = if terminal_stage_event.is_none() && capability_terminal {
+                capabilities
+                    .last()
+                    .map(|capability| capability.message.clone())
+                    .unwrap_or_else(|| latest.message.clone())
+            } else {
+                latest.message.clone()
+            };
+            let inferred_latest_level = if terminal_stage_event.is_none() && capability_terminal {
+                if capability_paused {
+                    "warn".to_string()
+                } else if capability_failed {
+                    "error".to_string()
+                } else {
+                    "info".to_string()
+                }
+            } else {
+                latest.level.clone()
+            };
+            let duration_ms = stage_terminal_duration_ms.or_else(|| {
+                if capability_terminal {
+                    capabilities.iter().filter_map(|capability| capability.duration_ms).max()
+                } else {
+                    None
+                }
+            });
 
             Some(StageChainSummary {
                 key: format!("{}-{}", step_id, stage_execution_id),
                 step_id: step_id.clone(),
                 label,
                 stage_execution_id,
-                latest_kind: latest.kind.clone(),
-                latest_message: latest.message.clone(),
-                latest_level: latest.level.clone(),
+                status: stage_status,
+                latest_kind: inferred_latest_kind,
+                latest_message: inferred_latest_message,
+                latest_level: inferred_latest_level,
                 latest_created_at: latest.created_at.clone(),
-                is_current: run.current_step_id.as_deref() == Some(step_id.as_str()) && completed_stage_event.is_none(),
-                is_active: completed_stage_event.is_none(),
+                latest_sequence_no: latest.sequence_no,
+                is_current: run.current_step_id.as_deref() == Some(step_id.as_str()) && stage_is_active,
+                is_active: stage_is_active,
                 event_count: stage_rows.len(),
                 duration_ms,
                 capabilities,
@@ -237,15 +737,122 @@ async fn build_event_chain_summary(
     stages.sort_by(|a, b| {
         let a_rank = if a.is_current && a.is_active { 0 } else if a.is_active { 1 } else { 2 };
         let b_rank = if b.is_current && b.is_active { 0 } else if b.is_active { 1 } else { 2 };
-        a_rank.cmp(&b_rank).then_with(|| b.latest_created_at.cmp(&a.latest_created_at))
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| b.latest_sequence_no.cmp(&a.latest_sequence_no))
     });
 
-    stages.truncate(6);
 
     Ok(EventChainSummaryResponse {
         run_id: run_id.to_string(),
         stages,
     })
+}
+
+fn non_empty_filter(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+}
+
+fn event_matches_history_query(event: &StageChainEvent, query: &StreamQuery) -> bool {
+    if let Some(stage_execution_id) = non_empty_filter(&query.stage_execution_id) {
+        if event.stage_execution_id.as_deref() != Some(stage_execution_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(capability_invocation_id) = non_empty_filter(&query.capability_invocation_id) {
+        if event.capability_invocation_id.as_deref() != Some(capability_invocation_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(stage) = non_empty_filter(&query.stage) {
+        if event.step_id.as_deref() != Some(stage.as_str()) {
+            return false;
+        }
+    }
+    if let Some(capability) = non_empty_filter(&query.capability) {
+        let needle = capability.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {} {}",
+            event.capability_invocation_id.as_deref().unwrap_or_default(),
+            event.kind,
+            event.message,
+            event.payload.get("capability").and_then(Value::as_str).unwrap_or_default(),
+            event.payload.get("capability_key").and_then(Value::as_str).unwrap_or_default()
+        ).to_lowercase();
+        if !haystack.contains(&needle) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn get_event_history(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Query(query): Query<EventHistoryQuery>,
+) -> Result<Json<EventHistoryResponse>, (axum::http::StatusCode, String)> {
+    let limit = query.limit.unwrap_or(100).clamp(25, 500);
+    let mut builder = QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = "
+    );
+    builder.push_bind(run_id.to_string());
+
+    if let Some(before_sequence) = query.before_sequence {
+        builder.push(" AND sequence_no < ");
+        builder.push_bind(before_sequence);
+    }
+    if let Some(start) = non_empty_filter(&query.start) {
+        builder.push(" AND created_at >= ");
+        builder.push_bind(start);
+    }
+    if let Some(end) = non_empty_filter(&query.end) {
+        builder.push(" AND created_at <= ");
+        builder.push_bind(end);
+    }
+    if let Some(stage) = non_empty_filter(&query.stage) {
+        builder.push(" AND step_id = ");
+        builder.push_bind(stage);
+    }
+    if let Some(stage_execution_id) = non_empty_filter(&query.stage_execution_id) {
+        builder.push(" AND stage_execution_id = ");
+        builder.push_bind(stage_execution_id);
+    }
+    if let Some(capability_invocation_id) = non_empty_filter(&query.capability_invocation_id) {
+        builder.push(" AND capability_invocation_id = ");
+        builder.push_bind(capability_invocation_id);
+    }
+    if let Some(capability) = non_empty_filter(&query.capability) {
+        let like = format!("%{}%", capability);
+        builder.push(" AND (capability_invocation_id = ");
+        builder.push_bind(capability.clone());
+        builder.push(" OR kind LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR message LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR payload_json LIKE ");
+        builder.push_bind(like);
+        builder.push(")");
+    }
+
+    builder.push(" ORDER BY sequence_no DESC LIMIT ");
+    builder.push_bind(limit + 1);
+
+    let mut rows = builder.build().fetch_all(&state.db).await.map_err(internal)?;
+    let has_more = rows.len() as i64 > limit;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+
+    let mut items = rows.into_iter().map(row_to_stage_chain_event).collect::<Result<Vec<_>, _>>()?;
+    items.reverse();
+    let next_before_sequence = items.first().map(|item| item.sequence_no);
+
+    Ok(Json(EventHistoryResponse {
+        run_id: run_id.to_string(),
+        items,
+        next_before_sequence,
+        has_more,
+    }))
 }
 
 async fn get_stage_execution_chain(
@@ -272,6 +879,13 @@ async fn get_stage_execution_chain(
     }))
 }
 
+async fn get_runtime_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<RuntimeEventQuery>,
+) -> Result<Json<RuntimeSnapshotResponse>, (axum::http::StatusCode, String)> {
+    Ok(Json(build_runtime_snapshot(&state, &query).await?))
+}
+
 async fn stream_events(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
@@ -284,26 +898,42 @@ async fn stream_events(
     let mut last_sequence = query.after_sequence.unwrap_or(0);
 
     tokio::spawn(async move {
-        let rows = sqlx::query(
-            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
-        )
-        .bind(&run_id_str)
-        .bind(last_sequence)
-        .fetch_all(&state_for_task.db)
-        .await
-        .unwrap_or_default();
+        if query.live_only {
+            last_sequence = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT MAX(sequence_no) FROM workflow_events WHERE run_id = ?"
+            )
+            .bind(&run_id_str)
+            .fetch_one(&state_for_task.db)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0);
+        } else {
+            let rows = sqlx::query(
+                "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND sequence_no > ? ORDER BY sequence_no ASC"
+            )
+            .bind(&run_id_str)
+            .bind(last_sequence)
+            .fetch_all(&state_for_task.db)
+            .await
+            .unwrap_or_default();
 
-        let mut sent_snapshot = false;
-        for row in rows {
-            if let Ok(item) = row_to_stage_chain_event(row) {
-                last_sequence = last_sequence.max(item.sequence_no);
-                if let Some(event) = workflow_event_sse(&item) {
-                    if tx.send(Ok(event)).is_err() {
-                        return;
+            for row in rows {
+                if let Ok(item) = row_to_stage_chain_event(row) {
+                    if !event_matches_history_query(&item, &query) {
+                        last_sequence = last_sequence.max(item.sequence_no);
+                        continue;
+                    }
+                    last_sequence = last_sequence.max(item.sequence_no);
+                    if let Some(event) = workflow_event_sse(&item) {
+                        if tx.send(Ok(event)).is_err() {
+                            return;
+                        }
                     }
                 }
             }
         }
+
+        let mut sent_snapshot = false;
 
         if let Ok(summary) = build_event_chain_summary(&state_for_task, run_id).await {
             if let Some(event) = monitor_snapshot_sse(&summary) {
@@ -317,7 +947,7 @@ async fn stream_events(
         loop {
             match live_rx.recv().await {
                 Ok(item) => {
-                    if item.run_id != run_id_str || item.sequence_no <= last_sequence {
+                    if item.run_id != run_id_str || item.sequence_no <= last_sequence || !event_matches_history_query(&item, &query) {
                         continue;
                     }
                     last_sequence = item.sequence_no;
@@ -348,6 +978,10 @@ async fn stream_events(
                     let mut saw_rows = false;
                     for row in rows {
                         if let Ok(item) = row_to_stage_chain_event(row) {
+                            if !event_matches_history_query(&item, &query) {
+                                last_sequence = last_sequence.max(item.sequence_no);
+                                continue;
+                            }
                             saw_rows = true;
                             last_sequence = last_sequence.max(item.sequence_no);
                             if let Some(event) = workflow_event_sse(&item) {
@@ -377,6 +1011,669 @@ async fn stream_events(
     Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
+fn row_to_sprint_event(row: sqlx::sqlite::SqliteRow) -> Result<SprintEventStreamItem, (axum::http::StatusCode, String)> {
+    let payload_json: String = row.get("payload_json");
+    Ok(SprintEventStreamItem {
+        id: row.get("id"),
+        sprint_id: row.get("sprint_id"),
+        sequence_no: row.get("sequence_no"),
+        event_type: row.get("event_type"),
+        event_time: row.get("event_time"),
+        feature_id: row.get("feature_id"),
+        actor: row.get("actor"),
+        message: row.get("message"),
+        payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
+        created_at: row.get("created_at"),
+    })
+}
+
+async fn runtime_sprint_event_rows(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+    after_sequence: i64,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>, (axum::http::StatusCode, String)> {
+    if matches!(query.scope.as_deref(), Some("workflow") | Some("workflow_run")) || query.run_id.is_some() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(supervisor_run_id) = query.supervisor_run_id {
+        let rows = sqlx::query(
+            "SELECT se.id, se.sprint_id, se.sequence_no, se.event_type, se.event_time, se.feature_id, se.actor, se.message, se.payload_json, se.created_at
+             FROM sprint_events se
+             JOIN sprints s ON s.id = se.sprint_id
+             WHERE s.supervisor_run_id = ? AND se.sequence_no > ?
+             ORDER BY se.sequence_no ASC",
+        )
+        .bind(supervisor_run_id.to_string())
+        .bind(after_sequence)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
+        return Ok(rows);
+    }
+
+    let rows = sqlx::query(
+        "SELECT id, sprint_id, sequence_no, event_type, event_time, feature_id, actor, message, payload_json, created_at
+         FROM sprint_events
+         WHERE sequence_no > ?
+         ORDER BY created_at ASC, sequence_no ASC
+         LIMIT 500",
+    )
+    .bind(after_sequence)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+    Ok(rows)
+}
+
+async fn sprint_event_envelope(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+    event: SprintEventStreamItem,
+) -> Result<Option<SprintEventEnvelope>, (axum::http::StatusCode, String)> {
+    let row = sqlx::query("SELECT supervisor_run_id FROM sprints WHERE id = ?")
+        .bind(&event.sprint_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal)?;
+    let supervisor_run_id: Option<String> = row.and_then(|row| row.get("supervisor_run_id"));
+
+    if let Some(expected) = query.supervisor_run_id {
+        if supervisor_run_id.as_deref() != Some(expected.to_string().as_str()) {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(SprintEventEnvelope {
+        scope: "sprint".to_string(),
+        node_key: supervisor_run_id.as_deref().map(supervisor_node_key).unwrap_or_else(|| format!("sprint:{}", event.sprint_id)),
+        run_id: None,
+        supervisor_run_id,
+        workflow_key: None,
+        repo_ref: query.repo_ref.clone(),
+        event,
+    }))
+}
+
+fn sprint_event_sse(envelope: &SprintEventEnvelope) -> Option<Event> {
+    let name = if envelope.event.event_type == "supervisor_snapshot" {
+        "supervisor_snapshot"
+    } else {
+        "sprint_event"
+    };
+    serde_json::to_string(envelope).ok().map(|payload| {
+        Event::default()
+            .event(name)
+            .retry(std::time::Duration::from_secs(5))
+            .id(format!("sprint:{}:{}", envelope.event.sprint_id, envelope.event.sequence_no))
+            .data(payload)
+    })
+}
+
+async fn send_supervisor_snapshot_sse(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+) -> bool {
+    let Some(supervisor_id) = query.supervisor_run_id else {
+        return true;
+    };
+    let Ok(run) = crate::supervisor::load_supervisor_run(state, supervisor_id).await else {
+        return true;
+    };
+    let snapshot = json!({
+        "scope": "sprint",
+        "node_key": supervisor_node_key(&supervisor_id.to_string()),
+        "run_id": null,
+        "supervisor_run_id": supervisor_id.to_string(),
+        "workflow_key": null,
+        "repo_ref": run.root_repo_path,
+        "event": {
+            "id": format!("snapshot-{}", Utc::now().timestamp_millis()),
+            "sprint_id": run.context.get("current_sprint_id").and_then(Value::as_str).unwrap_or(""),
+            "sequence_no": 0,
+            "event_type": "supervisor_snapshot",
+            "event_time": Utc::now().to_rfc3339(),
+            "feature_id": null,
+            "actor": "system",
+            "message": "current supervisor snapshot",
+            "payload": {
+                "supervisor_run_id": supervisor_id,
+                "supervisor_run": run,
+                "snapshot": true,
+                "synthetic": true
+            },
+            "created_at": Utc::now().to_rfc3339()
+        }
+    });
+    match Event::default()
+        .event("supervisor_snapshot")
+        .retry(std::time::Duration::from_secs(5))
+        .data(snapshot.to_string())
+    {
+        event => tx.send(Ok(event)).is_ok(),
+    }
+}
+
+async fn stream_runtime_events(
+    State(state): State<AppState>,
+    Query(query): Query<RuntimeEventQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let state_for_task = state.clone();
+    let mut workflow_live_rx = state.subscribe_workflow_events();
+    let mut sprint_live_rx = state.subscribe_sprint_events();
+    let mut last_workflow_sequence_by_run_id = HashMap::<String, i64>::new();
+    let mut last_sprint_sequence = 0;
+
+    tokio::spawn(async move {
+        if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
+            if let Some(event) = runtime_snapshot_sse(&snapshot) {
+                if tx.send(Ok(event)).is_err() {
+                    return;
+                }
+            }
+        }
+
+
+        if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                workflow_message = workflow_live_rx.recv() => match workflow_message {
+                    Ok(item) => {
+                        let last_sequence = last_workflow_sequence_by_run_id
+                            .get(&item.run_id)
+                            .copied()
+                            .unwrap_or(0);
+                        if item.sequence_no <= last_sequence {
+                            continue;
+                        }
+                        match runtime_event_allowed(&state_for_task, &query, &item.run_id).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(_) => continue,
+                        }
+                        last_workflow_sequence_by_run_id
+                            .insert(item.run_id.clone(), item.sequence_no);
+                        let item_run_id = item.run_id.clone();
+                        let item_sequence_no = item.sequence_no;
+                        match runtime_event_envelope(&state_for_task, item).await {
+                            Ok(Some(envelope)) => {
+                                if let Some(event) = runtime_event_sse(&envelope) {
+                                    if tx.send(Ok(event)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err((status, message)) => {
+                                tracing::error!(
+                                    run_id = %item_run_id,
+                                    sequence_no = item_sequence_no,
+                                    status = %status,
+                                    error = %message,
+                                    "failed to construct runtime event envelope"
+                                );
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
+                            if let Some(event) = runtime_snapshot_sse(&snapshot) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        let _ = tx.send(Ok(stream_error_sse("workflow event broadcast channel closed")));
+                        return;
+                    },
+                },
+                sprint_message = sprint_live_rx.recv() => match sprint_message {
+                    Ok(item) => {
+                        if item.sequence_no <= last_sprint_sequence {
+                            continue;
+                        }
+                        last_sprint_sequence = item.sequence_no;
+                        if let Ok(Some(envelope)) = sprint_event_envelope(&state_for_task, &query, item).await {
+                            if let Some(event) = sprint_event_sse(&envelope) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                            }
+                            if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        let rows = runtime_sprint_event_rows(&state_for_task, &query, last_sprint_sequence)
+                            .await
+                            .unwrap_or_default();
+                        for row in rows {
+                            if let Ok(item) = row_to_sprint_event(row) {
+                                last_sprint_sequence = last_sprint_sequence.max(item.sequence_no);
+                                if let Ok(Some(envelope)) = sprint_event_envelope(&state_for_task, &query, item).await {
+                                    if let Some(event) = sprint_event_sse(&envelope) {
+                                        if tx.send(Ok(event)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        let _ = tx.send(Ok(stream_error_sse("sprint event broadcast channel closed")));
+                        return;
+                    },
+                },
+            }
+        }
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+}
+
+async fn build_runtime_snapshot(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+) -> Result<RuntimeSnapshotResponse, (axum::http::StatusCode, String)> {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let run_ids = runtime_filter_run_ids(state, query).await?;
+
+    let workflow_rows = if run_ids.is_empty() && !runtime_filter_allows_empty_run_set(query) {
+        Vec::new()
+    } else if run_ids.is_empty() {
+        sqlx::query(
+            "SELECT id, status, current_step_id, title, repo_ref, workflow_key, updated_at FROM workflow_runs ORDER BY updated_at DESC LIMIT 500",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    } else {
+        let mut rows = Vec::new();
+        for run_id in &run_ids {
+            if let Ok(row) = sqlx::query(
+                "SELECT id, status, current_step_id, title, repo_ref, workflow_key, updated_at FROM workflow_runs WHERE id = ?",
+            )
+            .bind(run_id)
+            .fetch_one(&state.db)
+            .await
+            {
+                rows.push(row);
+            }
+        }
+        rows
+    };
+
+    for row in workflow_rows {
+        let id: String = row.get("id");
+        nodes.push(RuntimeNode {
+            key: workflow_node_key(&id),
+            node_type: "workflow_run".to_string(),
+            id,
+            status: row.get("status"),
+            title: row.get("title"),
+            repo_ref: row.get("repo_ref"),
+            workflow_key: row.get("workflow_key"),
+            current_step_id: row.get("current_step_id"),
+            updated_at: row.get("updated_at"),
+            payload: json!({}),
+        });
+    }
+
+    let supervisor_rows = if let Some(supervisor_run_id) = query.supervisor_run_id {
+        sqlx::query(
+            "SELECT id, mode, status, title, root_repo_path, updated_at FROM supervisor_runs WHERE id = ?",
+        )
+        .bind(supervisor_run_id.to_string())
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    } else if matches!(query.scope.as_deref(), Some("workflow") | Some("workflow_run")) || query.run_id.is_some() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT id, mode, status, title, root_repo_path, updated_at FROM supervisor_runs ORDER BY updated_at DESC LIMIT 500",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    };
+
+    let mut supervisor_keys = HashMap::<String, String>::new();
+
+    for row in supervisor_rows {
+        let id: String = row.get("id");
+        let supervisor_key = supervisor_node_key(&id);
+        supervisor_keys.insert(id.clone(), supervisor_key.clone());
+        nodes.push(RuntimeNode {
+            key: supervisor_key,
+            node_type: "supervisor_run".to_string(),
+            id,
+            status: row.get("status"),
+            title: row.get("title"),
+            repo_ref: row.get("root_repo_path"),
+            workflow_key: None,
+            current_step_id: None,
+            updated_at: row.get("updated_at"),
+            payload: json!({
+                "mode": row.get::<String, _>("mode")
+            }),
+        });
+    }
+
+    if !supervisor_keys.is_empty() {
+        let child_rows = sqlx::query(
+            r#"
+            SELECT id, supervisor_run_id, title, workflow_run_id, kind, queue_position, updated_at
+            FROM supervisor_work_units
+            WHERE workflow_run_id IS NOT NULL
+              AND TRIM(COALESCE(workflow_run_id, '')) != ''
+              AND archived_at IS NULL
+              AND state NOT IN ('deleted', 'archived')
+            ORDER BY supervisor_run_id ASC, CASE kind WHEN 'integration' THEN 10000 ELSE COALESCE(queue_position, 0) END, updated_at ASC
+            "#,
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
+
+        let mut child_index_by_supervisor = HashMap::<String, i64>::new();
+
+        for child in child_rows {
+            let supervisor_run_id: String = child.get("supervisor_run_id");
+            let Some(supervisor_key) = supervisor_keys.get(&supervisor_run_id) else {
+                continue;
+            };
+
+            let child_run_id: String = child.get("workflow_run_id");
+            let child_key = workflow_node_key(&child_run_id);
+            let kind: String = child.get("kind");
+            let child_index = child_index_by_supervisor
+                .entry(supervisor_run_id)
+                .or_insert(0);
+            let fallback_sort_order = *child_index;
+            *child_index += 1;
+
+            edges.push(RuntimeEdge {
+                key: format!("{}->{}", supervisor_key, child_key),
+                parent_key: supervisor_key.clone(),
+                child_key,
+                edge_type: if kind == "integration" { "supervisor_integration_workflow".to_string() } else { "supervisor_child_workflow".to_string() },
+                label: child.try_get::<String, _>("title").unwrap_or_else(|_| if kind == "integration" { "Integration workflow".to_string() } else { "Feature workflow".to_string() }),
+                sort_order: child.try_get::<Option<i64>, _>("queue_position").ok().flatten().unwrap_or(fallback_sort_order),
+                payload: json!({
+                    "work_unit_id": child.try_get::<String, _>("id").ok(),
+                    "kind": kind,
+                }),
+            });
+        }
+    }
+
+    let latest_sequence_no = latest_runtime_sequence(state, &run_ids).await.unwrap_or(0);
+
+    Ok(RuntimeSnapshotResponse {
+        nodes,
+        edges,
+        latest_sequence_no,
+        server_time: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+async fn runtime_event_rows(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+    after_cursor: i64,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>, (axum::http::StatusCode, String)> {
+    let run_ids = runtime_filter_run_ids(state, query).await?;
+    if run_ids.is_empty() && !runtime_filter_allows_empty_run_set(query) {
+        return Ok(Vec::new());
+    }
+
+    if run_ids.is_empty() {
+        return sqlx::query(
+            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, global_sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE global_sequence_no > ? ORDER BY global_sequence_no ASC LIMIT 1000",
+        )
+        .bind(after_cursor)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal);
+    }
+
+    let mut rows = Vec::new();
+    for run_id in run_ids {
+        let mut run_rows = sqlx::query(
+            "SELECT id, run_id, step_id, stage_execution_id, capability_invocation_id, parent_invocation_id, sequence_no, global_sequence_no, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? AND global_sequence_no > ? ORDER BY global_sequence_no ASC LIMIT 1000",
+        )
+        .bind(run_id)
+        .bind(after_cursor)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?;
+        rows.append(&mut run_rows);
+    }
+
+    rows.sort_by_key(|row| row.get::<i64, _>("global_sequence_no"));
+    Ok(rows)
+}
+
+async fn runtime_filter_run_ids(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
+    if let Some(run_id) = query.run_id {
+        return Ok(vec![run_id.to_string()]);
+    }
+
+    if let Some(supervisor_run_id) = query.supervisor_run_id {
+        return supervisor_child_workflow_run_ids(state, supervisor_run_id).await;
+    }
+
+    if let Some(workflow_key) = query.workflow_key.as_deref().filter(|value| !value.trim().is_empty()) {
+        return sqlx::query_scalar::<_, String>(
+            "SELECT id FROM workflow_runs WHERE workflow_key = ? ORDER BY updated_at DESC LIMIT 500",
+        )
+        .bind(workflow_key)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal);
+    }
+
+    if let Some(repo_ref) = query.repo_ref.as_deref().filter(|value| !value.trim().is_empty()) {
+        return sqlx::query_scalar::<_, String>(
+            "SELECT id FROM workflow_runs WHERE repo_ref = ? ORDER BY updated_at DESC LIMIT 500",
+        )
+        .bind(repo_ref)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal);
+    }
+
+    if matches!(query.scope.as_deref(), Some("active")) {
+        return sqlx::query_scalar::<_, String>(
+            "SELECT id FROM workflow_runs WHERE status IN ('queued', 'running', 'waiting', 'paused') ORDER BY updated_at DESC LIMIT 500",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal);
+    }
+
+    Ok(Vec::new())
+}
+
+fn runtime_filter_allows_empty_run_set(query: &RuntimeEventQuery) -> bool {
+    query.run_id.is_none()
+        && query.supervisor_run_id.is_none()
+        && query.workflow_key.as_deref().unwrap_or("").trim().is_empty()
+        && query.repo_ref.as_deref().unwrap_or("").trim().is_empty()
+        && !matches!(query.scope.as_deref(), Some("active") | Some("workflow") | Some("workflow_run"))
+}
+
+async fn supervisor_child_workflow_run_ids(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
+    let mut run_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT sf.current_workflow_run_id
+         FROM sprint_features sf
+         JOIN sprints s ON s.id = sf.sprint_id
+         WHERE s.supervisor_run_id = ?
+           AND TRIM(COALESCE(sf.current_workflow_run_id, '')) != ''",
+    )
+    .bind(supervisor_run_id.to_string())
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+
+    if let Some(integration_run_id) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT integration_run_id FROM supervisor_runs WHERE id = ?",
+    )
+    .bind(supervisor_run_id.to_string())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
+    {
+        run_ids.push(integration_run_id);
+    }
+
+    run_ids.sort();
+    run_ids.dedup();
+    Ok(run_ids)
+}
+
+async fn runtime_event_allowed(
+    state: &AppState,
+    query: &RuntimeEventQuery,
+    run_id: &str,
+) -> Result<bool, (axum::http::StatusCode, String)> {
+    let run_ids = runtime_filter_run_ids(state, query).await?;
+    if run_ids.is_empty() {
+        return Ok(runtime_filter_allows_empty_run_set(query));
+    }
+    Ok(run_ids.iter().any(|id| id == run_id))
+}
+
+async fn runtime_event_envelope(
+    state: &AppState,
+    item: StageChainEvent,
+) -> Result<Option<RuntimeEventEnvelope>, (axum::http::StatusCode, String)> {
+    let row = sqlx::query(
+        "SELECT repo_ref, workflow_key FROM workflow_runs WHERE id = ?",
+    )
+    .bind(&item.run_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let supervisor_run_id = sqlx::query_scalar::<_, String>(
+        "SELECT supervisor_run_id
+         FROM supervisor_work_units
+         WHERE workflow_run_id = ?
+           AND archived_at IS NULL
+           AND TRIM(COALESCE(supervisor_run_id, '')) != ''
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind(&item.run_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?;
+
+    let scope = if item.capability_invocation_id.is_some() {
+        "capability_invocation"
+    } else if item.stage_execution_id.is_some() {
+        "stage_execution"
+    } else {
+        "workflow_run"
+    };
+
+    Ok(Some(RuntimeEventEnvelope {
+        scope: scope.to_string(),
+        node_key: workflow_node_key(&item.run_id),
+        run_id: Some(item.run_id.clone()),
+        supervisor_run_id,
+        workflow_key: row.get("workflow_key"),
+        repo_ref: row.get("repo_ref"),
+        event: item,
+    }))
+}
+
+async fn latest_runtime_sequence(
+    state: &AppState,
+    run_ids: &[String],
+) -> Result<i64, (axum::http::StatusCode, String)> {
+    if run_ids.is_empty() {
+        return sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(global_sequence_no), 0) FROM workflow_events",
+        )
+        .fetch_one(&state.db)
+        .await
+        .map_err(internal);
+    }
+
+    let mut latest = 0;
+    for run_id in run_ids {
+        let value = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(global_sequence_no), 0) FROM workflow_events WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(internal)?;
+        latest = latest.max(value);
+    }
+    Ok(latest)
+}
+
+fn stream_error_sse(message: impl Into<String>) -> Event {
+    Event::default()
+        .event("stream_error")
+        .data(json!({ "message": message.into() }).to_string())
+}
+
+fn runtime_snapshot_sse(snapshot: &RuntimeSnapshotResponse) -> Option<Event> {
+    serde_json::to_string(snapshot)
+        .ok()
+        .map(|text| Event::default().event("runtime_snapshot").retry(std::time::Duration::from_secs(5)).data(text))
+}
+
+fn runtime_event_sse(envelope: &RuntimeEventEnvelope) -> Option<Event> {
+    serde_json::to_string(envelope)
+        .ok()
+        .map(|text| Event::default().event("runtime_event").retry(std::time::Duration::from_secs(5)).data(text))
+}
+
+fn runtime_projection_sse(projection: &EventChainSummaryResponse) -> Option<Event> {
+    serde_json::to_string(projection)
+        .ok()
+        .map(|text| Event::default().event("runtime_projection").retry(std::time::Duration::from_secs(5)).data(text))
+}
+
+fn workflow_node_key(id: &str) -> String {
+    format!("workflow_run:{}", id)
+}
+
+fn supervisor_node_key(id: &str) -> String {
+    format!("supervisor_run:{}", id)
+}
+
 fn workflow_event_sse(item: &StageChainEvent) -> Option<Event> {
     serde_json::to_string(item)
         .ok()
@@ -398,6 +1695,9 @@ fn row_to_stage_chain_event(row: sqlx::sqlite::SqliteRow) -> Result<StageChainEv
         capability_invocation_id: row.get("capability_invocation_id"),
         parent_invocation_id: row.get("parent_invocation_id"),
         sequence_no: row.get("sequence_no"),
+        global_sequence_no: row
+            .try_get("global_sequence_no")
+            .unwrap_or_else(|_| row.get("sequence_no")),
         level: row.get("level"),
         kind: row.get("kind"),
         message: row.get("message"),

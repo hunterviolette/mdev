@@ -1,8 +1,11 @@
 use axum::{extract::State, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
+use crate::engine::capabilities::inference::panel::{build_inference_config_panel, inference_config_from_panel, InferenceConfigPanel};
 
 use crate::{
     app_state::AppState,
+    engine::{automation, stages},
+    engine::capabilities::planner,
     engine::capabilities::inference::stage_support::{
         build_inference_execution_plan,
         InferenceStageSettings,
@@ -19,11 +22,12 @@ use crate::{
         WorkflowCapabilityBinding,
         WorkflowCapabilitySummaryItem,
         WorkflowGlobalConfig,
-        WorkflowGovernancePolicyDescriptor,
         WorkflowStageDescriptor,
         WorkflowStageField,
         WorkflowStageFieldGroup,
+        WorkflowStageFieldOption,
         WorkflowStageFieldUi,
+        WorkflowStageFieldVisibility,
         WorkflowStageRoute,
         WorkflowStepAdvancementConfig,
         WorkflowStepDefinition,
@@ -38,6 +42,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-builder-catalog", get(get_workflow_builder_catalog))
         .route("/api/workflow-builder/compile", post(compile_workflow_builder))
+        .route("/api/workflow-builder/inference-panel", post(build_workflow_builder_inference_panel))
 }
 
 async fn get_workflow_builder_catalog(
@@ -47,29 +52,95 @@ async fn get_workflow_builder_catalog(
 }
 
 async fn compile_workflow_builder(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<CompileWorkflowBuilderRequest>,
 ) -> Result<Json<CompileWorkflowBuilderResponse>, (axum::http::StatusCode, String)> {
     let catalog = default_builder_catalog();
-    let compiled = compile_document(&catalog, req.document)?;
+    let compiled = compile_document(&state, &catalog, req.document).await?;
     Ok(Json(compiled))
 }
 
-fn compile_document(
+#[derive(Debug, Clone, serde::Deserialize)]
+struct InferencePanelRequest {
+    definition: WorkflowTemplateDefinition,
+    #[serde(default)]
+    globals: WorkflowGlobalConfig,
+    #[serde(default)]
+    panel: Option<InferenceConfigPanel>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct InferencePanelResponse {
+    ok: bool,
+    panel: InferenceConfigPanel,
+    inference: Value,
+}
+
+async fn build_workflow_builder_inference_panel(
+    Json(req): Json<InferencePanelRequest>,
+) -> Result<Json<InferencePanelResponse>, (axum::http::StatusCode, String)> {
+    let inference = req
+        .panel
+        .clone()
+        .map(|panel| inference_config_from_panel(&req.globals, panel))
+        .unwrap_or_else(|| req.globals.capabilities.get("inference").cloned().unwrap_or_else(|| json!({})));
+    let panel = req
+        .panel
+        .unwrap_or_else(|| build_inference_config_panel(&req.definition, &req.globals));
+
+    Ok(Json(InferencePanelResponse {
+        ok: true,
+        panel,
+        inference,
+    }))
+}
+
+async fn compile_document(
+    state: &AppState,
     catalog: &WorkflowBuilderCatalog,
     document: WorkflowBuilderDocument,
 ) -> Result<CompileWorkflowBuilderResponse, (axum::http::StatusCode, String)> {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+
+    let mut globals = if is_empty_object(&document.globals.resources)
+        && is_empty_object(&document.globals.capabilities)
+    {
+        default_globals()
+    } else {
+        document.globals
+    };
+
+    normalize_global_planner_fragment(state, &mut globals).await.map_err(internal)?;
+    normalize_shared_dependencies(&mut globals);
+    normalize_qa_environment(
+        &mut globals,
+        document
+            .stages
+            .iter()
+            .any(|stage| stage.step_type.trim().eq_ignore_ascii_case("qa")),
+    )
+    .map_err(|message| (axum::http::StatusCode::BAD_REQUEST, message))?;
+
+    let global_state = serde_json::to_value(&globals).map_err(internal)?;
+    let repo_ref = globals
+        .resources
+        .get("repo")
+        .and_then(|value| value.get("repo_ref"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     let mut steps = Vec::with_capacity(document.stages.len());
 
     for stage in &document.stages {
-        let Some(descriptor) = catalog.stage_descriptors.iter().find(|d| d.step_type == stage.step_type) else {
+        let normalized_stage_type = stage.step_type.trim().to_lowercase();
+        let Some(descriptor) = catalog.stage_descriptors.iter().find(|d| d.step_type == stage.step_type || d.step_type == normalized_stage_type) else {
             errors.push(format!("Unknown stage type '{}'", stage.step_type));
             continue;
         };
 
-        match compile_stage(descriptor, stage, &document.stages) {
+        match compile_stage(descriptor, stage, &document.stages, &global_state, &repo_ref) {
             Ok(step) => steps.push(step),
             Err(err) => errors.push(err),
         }
@@ -79,14 +150,6 @@ fn compile_document(
         warnings.push("Builder document has no stages.".to_string());
     }
 
-    let globals = if is_empty_object(&document.globals.resources)
-        && is_empty_object(&document.globals.capabilities)
-    {
-        default_globals()
-    } else {
-        document.globals
-    };
-
     let capability_summary = compile_workflow_capability_summary(&globals, &steps).map_err(internal)?;
 
     Ok(CompileWorkflowBuilderResponse {
@@ -94,8 +157,7 @@ fn compile_document(
         definition: WorkflowTemplateDefinition {
             version: 1,
             globals,
-            governance: compile_governance(&catalog, &document.governance)
-                .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err))?,
+            governance: json!({}),
             steps,
         },
         capability_summary,
@@ -104,10 +166,48 @@ fn compile_document(
     })
 }
 
+fn field_visibility_value(
+    descriptor: &WorkflowStageDescriptor,
+    stage: &WorkflowBuilderStageDocument,
+    path: &str,
+) -> Option<Value> {
+    if let Some(value) = stage.field_values.get(path) {
+        return Some(value.clone());
+    }
+
+    for group in &descriptor.editable_fields {
+        for field in &group.fields {
+            if field.key == path || field.bind_to == path {
+                return stage
+                    .field_values
+                    .get(&field.key)
+                    .cloned()
+                    .or_else(|| Some(field.default.clone()));
+            }
+        }
+    }
+
+    None
+}
+
+fn field_is_visible(
+    descriptor: &WorkflowStageDescriptor,
+    stage: &WorkflowBuilderStageDocument,
+    field: &WorkflowStageField,
+) -> bool {
+    field.visible_when.iter().all(|condition| {
+        field_visibility_value(descriptor, stage, &condition.path)
+            .map(|value| value == condition.equals)
+            .unwrap_or(false)
+    })
+}
+
 fn compile_stage(
     descriptor: &WorkflowStageDescriptor,
     stage: &WorkflowBuilderStageDocument,
     _all_stages: &[WorkflowBuilderStageDocument],
+    global_state: &Value,
+    repo_ref: &str,
 ) -> Result<WorkflowStepDefinition, String> {
     let mut step_value = serde_json::to_value(&descriptor.definition_template).map_err(|err| err.to_string())?;
     set_path(&mut step_value, "id", Value::String(stage.id.clone()))?;
@@ -115,6 +215,10 @@ fn compile_stage(
 
     for group in &descriptor.editable_fields {
         for field in &group.fields {
+            if !field_is_visible(descriptor, stage, field) {
+                continue;
+            }
+
             let value = stage
                 .field_values
                 .get(&field.key)
@@ -125,8 +229,33 @@ fn compile_stage(
     }
 
     let mut step: WorkflowStepDefinition = serde_json::from_value(step_value).map_err(|err| err.to_string())?;
+    planner::normalize_planner_features(&mut step, global_state, repo_ref);
     normalize_compile_commands_from_text(&mut step);
     Ok(step)
+}
+
+async fn normalize_global_planner_fragment(
+    state: &AppState,
+    globals: &mut WorkflowGlobalConfig,
+) -> Result<(), String> {
+    let repo_ref = globals
+        .resources
+        .get("repo")
+        .and_then(|value| value.get("repo_ref"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut global_state = serde_json::to_value(&*globals).map_err(|err| err.to_string())?;
+    planner::apply_repo_planner_capability(&state.db, &mut global_state, &repo_ref)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if let Some(capabilities) = global_state.get("capabilities").cloned() {
+        globals.capabilities = capabilities;
+    }
+
+    Ok(())
 }
 
 fn normalize_compile_commands_from_text(step: &mut WorkflowStepDefinition) {
@@ -255,16 +384,50 @@ fn resolve_builder_effective_execution_plan(
                 include_changeset_schema: false,
             },
         ),
-        "compile" => Ok(vec![StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "compile_commands".to_string(),
-            enabled: true,
-            config: json!({}),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec![],
-            condition: Value::Null,
-        }]),
+        "compile" => Ok(vec![
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "shared_dependencies".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec![],
+                condition: Value::Null,
+            },
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "compile_commands".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec!["shared_dependencies".to_string()],
+                condition: Value::Null,
+            },
+        ]),
+        "qa" => Ok(vec![
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "shared_dependencies".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec![],
+                condition: Value::Null,
+            },
+            StageExecutionNode {
+                kind: StageExecutionNodeKind::Capability,
+                key: "qa_environment".to_string(),
+                enabled: true,
+                config: json!({}),
+                input_mapping: json!({}),
+                output_mapping: json!({}),
+                run_after: vec!["shared_dependencies".to_string()],
+                condition: Value::Null,
+            },
+        ]),
         _ => {
             if !step.execution_plan.is_empty() {
                 Ok(step.execution_plan.clone())
@@ -293,159 +456,169 @@ fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<Stag
 }
 
 
-fn capability_keys_for_stage_definition(step: &WorkflowStepDefinition) -> Vec<String> {
-    let mut out: Vec<String> = step
-        .execution_plan
-        .iter()
-        .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
-        .map(|node| node.key.clone())
-        .collect();
+pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) {
+    let capability_value = globals
+        .capabilities
+        .get("shared_dependencies")
+        .cloned();
 
-    if out.is_empty() {
-        out = step
-            .capabilities
-            .iter()
-            .filter(|binding| binding.enabled)
-            .map(|binding| binding.capability.clone())
-            .collect();
-    }
+    let source = capability_value
+        .or_else(|| serde_json::to_value(&globals.shared_dependencies).ok())
+        .unwrap_or_else(|| json!({
+            "enabled": false,
+            "providers": []
+        }));
 
-    out.sort();
-    out.dedup();
-    out
-}
+    let enabled = source
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
 
-fn applicable_governance_policies(
-    descriptor: &WorkflowStageDescriptor,
-    step: &WorkflowStepDefinition,
-) -> Vec<WorkflowGovernancePolicyDescriptor> {
-    let capabilities = capability_keys_for_stage_definition(step);
-    descriptor
-        .available_governance_policies
-        .iter()
-        .filter(|policy| {
-            policy.required_capabilities.is_empty()
-                || policy
-                    .required_capabilities
-                    .iter()
-                    .all(|required| capabilities.iter().any(|item| item == required))
+    let providers = source
+        .get("providers")
+        .and_then(|value| value.as_array())
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|provider| {
+                    let provider = provider.as_object()?;
+                    let id = provider.get("id")?.as_str()?.trim();
+                    let ecosystem = provider.get("ecosystem")?.as_str()?.trim();
+                    let root = provider
+                        .get("root")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(".")
+                        .trim();
+
+                    if id.is_empty() || ecosystem != "node" {
+                        return None;
+                    }
+
+                    let label = provider
+                        .get("label")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(id);
+
+                    let manifests = provider
+                        .get("manifests")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|values| !values.is_empty())
+                        .unwrap_or_else(|| vec!["package-lock.json".to_string()]);
+
+                    let isolated = provider
+                        .get("isolated")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "storage_path": "node_modules",
+                            "seed_from_trusted": true,
+                            "install": {
+                                "commands": [],
+                                "stop_on_failure": true
+                            }
+                        }));
+
+                    let mismatch = provider
+                        .get("mismatch")
+                        .cloned()
+                        .unwrap_or_else(|| json!({
+                            "disposition": "operator_checkpoint",
+                            "allowed_dispositions": [
+                                "create_isolated_dependencies",
+                                "continue_trusted_with_warning",
+                                "skip_stage"
+                            ]
+                        }));
+
+                    Some(json!({
+                        "id": id,
+                        "label": label,
+                        "ecosystem": ecosystem,
+                        "root": if root.is_empty() { "." } else { root },
+                        "manifests": manifests,
+                        "isolated": isolated,
+                        "mismatch": mismatch
+                    }))
+                })
+                .collect::<Vec<_>>()
         })
-        .cloned()
-        .collect()
-}
+        .unwrap_or_default();
 
-fn compile_governance(catalog: &WorkflowBuilderCatalog, governance: &Value) -> Result<Value, String> {
-    let mut available = std::collections::BTreeMap::new();
-    for descriptor in &catalog.stage_descriptors {
-        for policy in &descriptor.available_governance_policies {
-            available.entry(policy.key.clone()).or_insert_with(|| policy.clone());
-        }
+    if !globals.capabilities.is_object() {
+        globals.capabilities = json!({});
     }
 
-    let Some(governance_obj) = governance.as_object() else {
-        return Ok(json!({}));
-    };
-
-    let mut compiled = json!({});
-    for (policy_key, selected_config) in governance_obj {
-        let Some(policy_descriptor) = available.get(policy_key) else {
-            return Err(format!("governance policy '{}' is not available", policy_key));
-        };
-
-        let mut config = json!({});
-        for field in &policy_descriptor.fields {
-            let selected_value = selected_config
-                .get(&field.key)
-                .cloned()
-                .unwrap_or_else(|| field.default.clone());
-            set_path(&mut config, &field.key, selected_value)
-                .map_err(|err| format!("governance policy '{}': {}", policy_key, err))?;
-        }
-        set_path(&mut compiled, policy_key, config)?;
+    if let Some(capabilities) = globals.capabilities.as_object_mut() {
+        capabilities.insert(
+            "shared_dependencies".to_string(),
+            json!({
+                "enabled": enabled,
+                "providers": providers
+            }),
+        );
     }
 
-    Ok(compiled)
+    globals.shared_dependencies = Default::default();
 }
 
 fn default_builder_catalog() -> WorkflowBuilderCatalog {
     WorkflowBuilderCatalog {
         version: 2,
-        stage_descriptors: vec![
-            design_descriptor(),
-            code_descriptor(),
-            compile_descriptor(),
-            review_descriptor(),
-            sap_import_descriptor(),
-            sap_syntax_descriptor(),
-            sap_export_descriptor(),
-        ],
+        stage_descriptors: stages::registered_stage_descriptors(),
+        automation_controls: automation::control_descriptors(),
     }
 }
 
-fn changeset_governance_policy_descriptor() -> WorkflowGovernancePolicyDescriptor {
-    WorkflowGovernancePolicyDescriptor {
-        key: "changeset_file_failures".to_string(),
-        label: "Changeset file failure guardrail".to_string(),
-        description: "Inject targeted file context after repeated changeset failures, escalate to broad context if failures continue, and pause after too many consecutive failures for the same file.".to_string(),
-        capability: "gateway_model/changeset".to_string(),
-        required_capabilities: vec!["gateway_model/changeset".to_string()],
-        fields: vec![
-            WorkflowStageField {
-                key: "inject_context_after_consecutive_failures".to_string(),
-                label: "Inject file context after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "inject_context_after_consecutive_failures".to_string(),
-                default: json!(4),
-                description: "Number of consecutive failures for the same file before generating and uploading a targeted context_export for that file.".to_string(),
-                required: false,
-                options: Vec::new(),
-                ui: field_ui("number"),
-            },
-            WorkflowStageField {
-                key: "inject_broad_context_after_consecutive_failures".to_string(),
-                label: "Inject broad context after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "inject_broad_context_after_consecutive_failures".to_string(),
-                default: json!(5),
-                description: "Number of consecutive failures for the same file before escalating from targeted file context to a broader context_export.".to_string(),
-                required: false,
-                options: Vec::new(),
-                ui: field_ui("number"),
-            },
-            WorkflowStageField {
-                key: "pause_after_consecutive_failures".to_string(),
-                label: "Pause after failures".to_string(),
-                field_type: "integer".to_string(),
-                bind_to: "pause_after_consecutive_failures".to_string(),
-                default: json!(8),
-                description: "Number of consecutive failures for the same file before pausing the workflow.".to_string(),
-                required: false,
-                options: Vec::new(),
-                ui: field_ui("number"),
-            },
-        ],
+pub(crate) fn normalize_qa_environment(
+    globals: &mut WorkflowGlobalConfig,
+    has_qa_stage: bool,
+) -> Result<(), String> {
+    if !has_qa_stage {
+        return Ok(());
     }
-}
 
-fn compile_governance_policy_descriptor() -> WorkflowGovernancePolicyDescriptor {
-    WorkflowGovernancePolicyDescriptor {
-        key: "compile_failures".to_string(),
-        label: "Compile failure guardrail".to_string(),
-        description: "Pause after repeated consecutive compile failures.".to_string(),
-        capability: "compile_commands".to_string(),
-        required_capabilities: vec!["compile_commands".to_string()],
-        fields: vec![WorkflowStageField {
-            key: "pause_after_consecutive_failures".to_string(),
-            label: "Pause after failures".to_string(),
-            field_type: "integer".to_string(),
-            bind_to: "pause_after_consecutive_failures".to_string(),
-            default: json!(5),
-            description: "Number of consecutive compile failures before pausing the workflow.".to_string(),
-            required: false,
-            options: Vec::new(),
-            ui: field_ui("number"),
-        }],
+    if !globals.capabilities.is_object() {
+        globals.capabilities = json!({});
     }
+
+    let capabilities = globals
+        .capabilities
+        .as_object_mut()
+        .expect("workflow capabilities must be an object");
+
+    let normalized = capabilities
+        .get("qa_environment")
+        .cloned()
+        .and_then(|value| {
+            let has_environment = value
+                .get("environment")
+                .map(Value::is_object)
+                .unwrap_or(false);
+
+            if !has_environment {
+                return None;
+            }
+
+            serde_json::from_value::<crate::engine::runtime_tools::QaStageSpec>(value).ok()
+        })
+        .unwrap_or_default();
+
+    capabilities.insert(
+        "qa_environment".to_string(),
+        serde_json::to_value(normalized)
+            .expect("QA environment must serialize"),
+    );
+
+    Ok(())
 }
 
 fn default_globals() -> WorkflowGlobalConfig {
@@ -458,10 +631,30 @@ fn default_globals() -> WorkflowGlobalConfig {
         }),
         capabilities: json!({
             "inference": {
+                "default_session": "coding",
+                "stage_sessions": {
+                    "design": "coding",
+                    "code": "coding",
+                    "review": "review"
+                },
+                "sessions": {
+                    "coding": {
+                        "provider": "openai",
+                        "transport": "api",
+                        "model": "gpt-4.1",
+                        "runtime": {}
+                    },
+                    "review": {
+                        "provider": "openai",
+                        "transport": "api",
+                        "model": "gpt-4.1",
+                        "runtime": {}
+                    }
+                }
             },
             "context_export": {
                 "enabled": false,
-                "save_path": "/tmp/repo_context.txt"
+                "save_path": "broad_context_file.txt"
             },
             "changeset_schema": {
                 "enabled": false
@@ -470,10 +663,19 @@ fn default_globals() -> WorkflowGlobalConfig {
             "compile_commands": {
                 "commands": []
             },
+            "planner": {
+                "planner_id": "",
+                "feature_id": "",
+                "fragment_armed": false,
+                "schema_armed": false,
+                "auto_apply_armed": false
+            },
             "sap/import": {},
-            "sap/export": {}
+            "sap/export": {},
+            "qa_environment": crate::engine::runtime_tools::QaStageSpec::default()
         }),
         automation: json!({}),
+        shared_dependencies: crate::engine::runtime_tools::SharedDependenciesConfig::default(),
     }
 }
 
@@ -508,13 +710,14 @@ fn base_stage_template(step_type: &str, label: &str, automation_mode: Automation
     }
 }
 
-fn design_descriptor() -> WorkflowStageDescriptor {
-    let mut template = base_stage_template("design", "Design", AutomationMode::Manual);
+pub(crate) fn design_descriptor() -> WorkflowStageDescriptor {
+    let mut template = base_stage_template("design", "Design", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: true,
         include_changeset_schema: false,
         include_user_context: true,
     };
+    template.config = json!({});
     template.execution_logic = json!({
         "kind": "design_stage_policy",
         "connection_bundles": ["design_code_inference_default"],
@@ -522,6 +725,16 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             "inference": {
                 "repo_context": {}
             }
+        },
+        "automation": {
+            "empty_user_input_default": ""
+        },
+        "structured_output": {
+            "fine_feature_format_armed": false,
+            "auto_normalize_and_apply_to_planner": false,
+            "preserve_rough_definition": true,
+            "schema_id": "planner_feature_refinement_v1",
+            "apply_handler": "planner_apply"
         }
     });
     template.execution_plan = vec![
@@ -553,6 +766,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
             label: "Design".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
+                text_field("automation.empty_user_input_default", "Empty user input default", "execution_logic.automation.empty_user_input_default", ""),
             ],
         }],
         available_governance_policies: vec![],
@@ -560,7 +774,7 @@ fn design_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn code_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn code_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("code", "Code", AutomationMode::Automatic);
     template.prompt = WorkflowStepPromptConfig {
         include_repo_context: true,
@@ -572,6 +786,7 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             "enabled": true
         }),
         compile_checks: json!({}),
+        ..WorkflowStepExecutionConfig::default()
     };
     template.execution_logic = json!({
         "kind": "code_stage_policy",
@@ -583,7 +798,8 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             }
         },
         "automation": {
-            "auto_apply_changeset": true
+            "auto_apply_changeset": true,
+            "empty_user_input_default": ""
         }
     });
     template.execution_plan = vec![
@@ -615,23 +831,23 @@ fn code_descriptor() -> WorkflowStageDescriptor {
             label: "Code".to_string(),
             fields: vec![
                 text_field("prompt.user_input", "User input", "prompt.user_input", ""),
+                text_field("automation.empty_user_input_default", "Empty user input default", "execution_logic.automation.empty_user_input_default", ""),
                 bool_field("automation.auto_apply_changeset", "Auto apply changeset", "execution_logic.automation.auto_apply_changeset", true),
             ],
         }],
-        available_governance_policies: vec![
-            changeset_governance_policy_descriptor(),
-        ],
+        available_governance_policies: vec![],
         routes: default_routes("compile", "code", "code"),
     }
 }
 
-fn compile_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn compile_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("compile", "Compile", AutomationMode::Automatic);
     template.execution = WorkflowStepExecutionConfig {
         changeset_apply: json!({}),
         compile_checks: json!({
             "commands": []
         }),
+        ..WorkflowStepExecutionConfig::default()
     };
     template.execution_logic = json!({
         "kind": "compile_stage_policy",
@@ -639,7 +855,10 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
             "run_compile_checks": true
         }
     });
-    template.execution_plan = vec![capability_node("compile_commands")];
+    template.execution_plan = vec![
+        capability_node("shared_dependencies"),
+        capability_node_after("compile_commands", vec!["shared_dependencies"]),
+    ];
 
     WorkflowStageDescriptor {
         step_type: "compile".to_string(),
@@ -654,16 +873,90 @@ fn compile_descriptor() -> WorkflowStageDescriptor {
                 text_field("execution.compile_checks.commands_text", "Compile commands", "execution.compile_checks.commands_text", ""),
             ],
         }],
-        available_governance_policies: vec![compile_governance_policy_descriptor()],
+        available_governance_policies: vec![],
         routes: default_routes("review", "compile", "compile"),
     }
 }
 
-fn review_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn qa_descriptor() -> WorkflowStageDescriptor {
+    let template = WorkflowStepDefinition {
+        id: "qa-preview".to_string(),
+        name: "DeployQA".to_string(),
+        step_type: "qa".to_string(),
+        automation_mode: AutomationMode::Manual,
+        execution: WorkflowStepExecutionConfig::default(),
+        prompt: WorkflowStepPromptConfig::default(),
+        config: json!({}),
+        capabilities: vec![WorkflowCapabilityBinding {
+            capability: "qa_environment".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+        }],
+        execution_logic: json!({}),
+        execution_plan: vec![
+            capability_node("shared_dependencies"),
+            capability_node_after("qa_environment", vec!["shared_dependencies"]),
+        ],
+        transitions: Vec::new(),
+        advancement: WorkflowStepAdvancementConfig {
+            mode: Some("manual".to_string()),
+            auto_run_on_enter: false,
+            auto_advance_on_success: false,
+            auto_advance_on_error: false,
+            auto_advance_on_paused: false,
+        },
+    };
+
+    WorkflowStageDescriptor {
+        step_type: "qa".to_string(),
+        label: "DeployQA".to_string(),
+        category: "validation".to_string(),
+        description: "Deploy and manage a QA application with optional shared dependencies, allocated ports, readiness checks, and temporary routing.".to_string(),
+        definition_template: template.clone(),
+        editable_fields: vec![],
+        available_governance_policies: Vec::new(),
+        routes: default_routes("", "qa", "qa"),
+    }
+}
+
+pub(crate) fn merge_patches_descriptor() -> WorkflowStageDescriptor {
+    let mut template = base_stage_template("merge_patches", "Merge patches", AutomationMode::Automatic);
+    template.prompt = WorkflowStepPromptConfig {
+        include_repo_context: false,
+        include_changeset_schema: false,
+        include_user_context: true,
+    };
+    template.config = json!({});
+    template.execution_logic = json!({
+        "kind": "merge_patches_stage_policy",
+        "automation": {
+            "apply_patches": true
+        }
+    });
+    template.execution_plan = Vec::<StageExecutionNode>::new();
+
+    WorkflowStageDescriptor {
+        step_type: "merge_patches".to_string(),
+        label: "Merge patches".to_string(),
+        category: "core".to_string(),
+        description: "Apply supervisor child workflow patches in order against the integration worktree.".to_string(),
+        definition_template: template,
+        editable_fields: vec![],
+        available_governance_policies: vec![],
+        routes: default_routes("review", "merge_patches", "merge_patches"),
+    }
+}
+
+pub(crate) fn review_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("review", "Review", AutomationMode::Manual);
     template.execution_logic = json!({
         "kind": "review_stage_policy",
-        "require_manual_approval": true
+        "require_manual_approval": true,
+        "ai_review": {
+            "enabled": false
+        }
     });
     template.execution_plan = vec![];
 
@@ -671,21 +964,22 @@ fn review_descriptor() -> WorkflowStageDescriptor {
         step_type: "review".to_string(),
         label: "Review".to_string(),
         category: "core".to_string(),
-        description: "Review stage with backend-owned approval policy.".to_string(),
+        description: "Review stage with backend-owned validation and approval policy.".to_string(),
         definition_template: template,
         editable_fields: vec![WorkflowStageFieldGroup {
             key: "review".to_string(),
             label: "Review".to_string(),
             fields: vec![
-                bool_field("execution_logic.require_manual_approval", "Require manual approval", "execution_logic.require_manual_approval", true),
+                bool_field("execution_logic.require_manual_approval", "Manual approval", "execution_logic.require_manual_approval", true),
+                bool_field("execution_logic.ai_review.enabled", "AI review", "execution_logic.ai_review.enabled", false),
             ],
         }],
         available_governance_policies: vec![],
-        routes: default_routes("", "design", "review"),
+        routes: default_routes("", "code", "review"),
     }
 }
 
-fn sap_import_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_import_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_import", "SAP Import", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_import_stage_policy"
@@ -721,7 +1015,7 @@ fn sap_import_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_syntax", "SAP Syntax", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_syntax_stage_policy"
@@ -755,7 +1049,7 @@ fn sap_syntax_descriptor() -> WorkflowStageDescriptor {
     }
 }
 
-fn sap_export_descriptor() -> WorkflowStageDescriptor {
+pub(crate) fn sap_export_descriptor() -> WorkflowStageDescriptor {
     let mut template = base_stage_template("sap_export", "SAP Export", AutomationMode::Automatic);
     template.execution_logic = json!({
         "kind": "sap_export_stage_policy"
@@ -867,6 +1161,14 @@ fn field_ui(control: &str) -> WorkflowStageFieldUi {
     }
 }
 
+fn visible_when(mut field: WorkflowStageField, path: &str, equals: Value) -> WorkflowStageField {
+    field.visible_when.push(WorkflowStageFieldVisibility {
+        path: path.to_string(),
+        equals,
+    });
+    field
+}
+
 fn bool_field(key: &str, label: &str, bind_to: &str, default: bool) -> WorkflowStageField {
     WorkflowStageField {
         key: key.to_string(),
@@ -877,6 +1179,7 @@ fn bool_field(key: &str, label: &str, bind_to: &str, default: bool) -> WorkflowS
         description: String::new(),
         required: false,
         options: Vec::new(),
+        visible_when: Vec::new(),
         ui: field_ui("switch"),
     }
 }
@@ -891,12 +1194,15 @@ fn int_field(key: &str, label: &str, bind_to: &str, default: i64) -> WorkflowSta
         description: String::new(),
         required: false,
         options: Vec::new(),
+        visible_when: Vec::new(),
         ui: field_ui("number"),
     }
 }
 
 fn text_field(key: &str, label: &str, bind_to: &str, default: &str) -> WorkflowStageField {
-    let multiline = key.ends_with("commands_text") || key.ends_with("manifest_paths_text");
+    let multiline = key.ends_with("commands_text")
+        || key.ends_with("manifest_paths_text")
+        || key.ends_with("empty_user_input_default");
     WorkflowStageField {
         key: key.to_string(),
         label: label.to_string(),
@@ -910,31 +1216,105 @@ fn text_field(key: &str, label: &str, bind_to: &str, default: &str) -> WorkflowS
         description: String::new(),
         required: false,
         options: Vec::new(),
+        visible_when: Vec::new(),
         ui: if multiline { field_ui("textarea") } else { field_ui("text") },
     }
 }
 
+fn select_field(key: &str, label: &str, bind_to: &str, default: &str, options: Vec<(&str, &str)>) -> WorkflowStageField {
+    WorkflowStageField {
+        key: key.to_string(),
+        label: label.to_string(),
+        field_type: "text".to_string(),
+        bind_to: bind_to.to_string(),
+        default: Value::String(default.to_string()),
+        description: String::new(),
+        required: true,
+        options: options.into_iter().map(|(value, label)| WorkflowStageFieldOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        }).collect(),
+        visible_when: Vec::new(),
+        ui: field_ui("select"),
+    }
+}
+
 fn set_path(root: &mut Value, path: &str, value: Value) -> Result<(), String> {
-    let parts: Vec<&str> = path.split('.').filter(|part| !part.trim().is_empty()).collect();
+    let parts: Vec<&str> = path
+        .split('.')
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+
     if parts.is_empty() {
         return Err("path cannot be empty".to_string());
     }
 
-    let mut cursor = root;
-    for part in &parts[..parts.len() - 1] {
+    fn assign(cursor: &mut Value, parts: &[&str], value: Value) -> Result<(), String> {
+        let part = parts[0];
+        let is_last = parts.len() == 1;
+
+        if let Ok(index) = part.parse::<usize>() {
+            if !cursor.is_array() {
+                *cursor = Value::Array(Vec::new());
+            }
+
+            let array = cursor
+                .as_array_mut()
+                .ok_or_else(|| format!("{} is not an array", part))?;
+
+            while array.len() <= index {
+                array.push(Value::Null);
+            }
+
+            if is_last {
+                array[index] = value;
+                return Ok(());
+            }
+
+            let next_is_index = parts[1].parse::<usize>().is_ok();
+            if array[index].is_null() {
+                array[index] = if next_is_index {
+                    Value::Array(Vec::new())
+                } else {
+                    json!({})
+                };
+            }
+
+            return assign(&mut array[index], &parts[1..], value);
+        }
+
         if !cursor.is_object() {
             *cursor = json!({});
         }
-        let obj = cursor.as_object_mut().ok_or_else(|| format!("{} is not an object", part))?;
-        cursor = obj.entry((*part).to_string()).or_insert_with(|| json!({}));
+
+        let object = cursor
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not an object", part))?;
+
+        if is_last {
+            object.insert(part.to_string(), value);
+            return Ok(());
+        }
+
+        let next_is_index = parts[1].parse::<usize>().is_ok();
+        let child = object.entry(part.to_string()).or_insert_with(|| {
+            if next_is_index {
+                Value::Array(Vec::new())
+            } else {
+                json!({})
+            }
+        });
+
+        if next_is_index && !child.is_array() {
+            *child = Value::Array(Vec::new());
+        } else if !next_is_index && !child.is_object() {
+            *child = json!({});
+        }
+
+        assign(child, &parts[1..], value)
     }
 
-    if !cursor.is_object() {
-        *cursor = json!({});
-    }
-    let obj = cursor.as_object_mut().ok_or_else(|| "target is not an object".to_string())?;
-    obj.insert(parts[parts.len() - 1].to_string(), value);
-    Ok(())
+    assign(root, &parts, value)
 }
 
 fn is_empty_object(value: &Value) -> bool {

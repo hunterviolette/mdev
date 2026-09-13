@@ -118,6 +118,12 @@ fn default_app_settings_value() -> Value {
         "git": {
             "poll_enabled": true,
             "poll_interval_ms": 2000
+        },
+        "repo_sync": {
+            "enabled": false,
+            "listen_host": "0.0.0.0",
+            "listen_port": 8787,
+            "mappings": []
         }
     })
 }
@@ -131,7 +137,7 @@ fn normalize_app_settings_value(value: Value) -> Value {
 
     let obj = normalized.as_object_mut().expect("app settings must be object");
 
-    for key in ["browser", "bridges", "git"] {
+    for key in ["browser", "bridges", "git", "repo_sync"] {
         let fallback = defaults.get(key).cloned().unwrap_or_else(|| json!({}));
         let slot = obj.entry(key.to_string()).or_insert_with(|| fallback.clone());
         if !slot.is_object() {

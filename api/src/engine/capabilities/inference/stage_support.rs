@@ -3,11 +3,16 @@ use serde_json::{json, Value};
 
 use crate::{
     engine::{
-        capabilities::{binding_specs, changeset::schema as changeset_schema, context_export},
-        stages::compose_prompt_from_state,
+        capabilities::{capability_enabled, changeset::schema as changeset_schema, context_export, planner},
+        stages::{compose_prompt_from_state, stage_supports_capability},
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
 };
+
+#[derive(Clone, Debug, Default)]
+pub struct InferenceStageHooks {
+    pub empty_user_input_default: Option<String>,
+}
 
 pub struct InferenceStageSettings {
     pub include_changeset_schema: bool,
@@ -19,6 +24,24 @@ pub fn prepare_inference_stage_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
     settings: InferenceStageSettings,
+) -> Result<Value> {
+    prepare_inference_stage_state_with_hooks(
+        repo_ref,
+        global_state,
+        step,
+        local_state,
+        settings,
+        InferenceStageHooks::default(),
+    )
+}
+
+pub fn prepare_inference_stage_state_with_hooks(
+    repo_ref: &str,
+    global_state: &Value,
+    step: &WorkflowStepDefinition,
+    local_state: Value,
+    settings: InferenceStageSettings,
+    hooks: InferenceStageHooks,
 ) -> Result<Value> {
     let mut state = ensure_object(local_state);
 
@@ -34,28 +57,54 @@ pub fn prepare_inference_stage_state(
             .cloned()
             .unwrap_or_else(|| json!({})),
     );
+    let review_failure_fragment = fragments
+        .get("review_failure")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(fragment) = review_failure_fragment.as_deref() {
+        if let Some(obj) = fragments.as_object_mut() {
+            obj.insert("review_failure".to_string(), Value::String(fragment.to_string()));
+        }
+    }
 
-    let include_repo_context = shared_inference_primitive_enabled(
+    let include_repo_context = inference_input_enabled(
         global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = shared_inference_primitive_enabled(
+    let include_changeset_schema = inference_input_enabled(
         global_state,
         step,
         "changeset_schema",
         settings.include_changeset_schema,
     );
 
-    let user_input = state
+    let include_planning_fragment = inference_input_enabled(
+        global_state,
+        step,
+        "planner_fragment",
+        false,
+    ) && planner::planner_fragment_enabled(global_state, step);
+
+    let explicit_user_input = state
         .get("prompt")
         .and_then(|v| v.get("user_input"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+
+    let default_user_input = resolve_empty_user_input_default(
+        step,
+        &state,
+        hooks.empty_user_input_default.as_deref(),
+    );
+
+    let user_input = explicit_user_input.or(default_user_input);
 
     if let Some(user_input_fragment) = user_input.clone() {
         fragments
@@ -67,6 +116,24 @@ pub fn prepare_inference_stage_state(
             .as_object_mut()
             .expect("prompt fragments must be object")
             .remove("user_input");
+    }
+
+    let planning_fragment = if include_planning_fragment {
+        planner::build_planning_fragment(global_state)
+    } else {
+        String::new()
+    };
+
+    if include_planning_fragment && !planning_fragment.trim().is_empty() {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert("planning_fragment".to_string(), Value::String(planning_fragment));
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("planning_fragment");
     }
 
     let repo_context = if include_repo_context {
@@ -120,7 +187,33 @@ pub fn prepare_inference_stage_state(
             .remove("changeset_schema");
     }
 
-    let transient_prompt_fragments = collect_active_transient_prompt_fragments(global_state);
+    let include_planner_schema = inference_input_enabled(
+        global_state,
+        step,
+        "planner_schema",
+        false,
+    ) && planner::planner_schema_enabled(global_state, step);
+
+    let planner_schema_fragment = if include_planner_schema {
+        planner::schema::PLANNER_SCHEMA_PROMPT_FRAGMENT.to_string()
+    } else {
+        String::new()
+    };
+
+    if include_planner_schema {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .insert(
+                "planner_schema".to_string(),
+                Value::String(planner_schema_fragment),
+            );
+    } else {
+        fragments
+            .as_object_mut()
+            .expect("prompt fragments must be object")
+            .remove("planner_schema");
+    }
 
     let mut effective_enabled = json!({});
     let enabled_obj = effective_enabled
@@ -131,23 +224,19 @@ pub fn prepare_inference_stage_state(
         "user_input".to_string(),
         Value::Bool(user_input.is_some()),
     );
+    enabled_obj.insert("planning_fragment".to_string(), Value::Bool(include_planning_fragment && fragments.get("planning_fragment").and_then(Value::as_str).map(|value| !value.trim().is_empty()).unwrap_or(false)));
     enabled_obj.insert("changeset_schema".to_string(), Value::Bool(include_changeset_schema));
+    enabled_obj.insert("review_failure".to_string(), Value::Bool(review_failure_fragment.is_some()));
+    enabled_obj.insert("planner_schema".to_string(), Value::Bool(include_planner_schema));
 
-    let prompt = compose_prompt_from_state(&effective_enabled, &fragments, &transient_prompt_fragments);
+    let prompt = compose_prompt_from_state(&effective_enabled, &fragments);
+    let model_input_blocks = build_model_input_blocks(&effective_enabled, &fragments);
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
-    obj.insert(
-        "transient_prompt_fragments".to_string(),
-        Value::Array(
-            transient_prompt_fragments
-                .iter()
-                .map(|item| Value::String(item.clone()))
-                .collect(),
-        ),
-    );
-
+    obj.insert("model_input_blocks".to_string(), Value::Array(model_input_blocks.clone()));
+    obj.insert("prompt_blocks".to_string(), Value::Array(model_input_blocks));
     if let Some(repo_context) = repo_context {
         obj.insert("repo_context".to_string(), repo_context);
     } else {
@@ -185,22 +274,102 @@ pub fn auto_apply_enabled(step: &WorkflowStepDefinition, state: &Value) -> bool 
         .unwrap_or(false)
 }
 
-fn collect_active_transient_prompt_fragments(global_state: &Value) -> Vec<String> {
-    global_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("active_prompt_fragments"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
+fn resolve_empty_user_input_default(
+    step: &WorkflowStepDefinition,
+    state: &Value,
+    hook_default: Option<&str>,
+) -> Option<String> {
+    state
+        .get("execution_logic")
+        .and_then(|v| v.get("automation"))
+        .and_then(|v| v.get("empty_user_input_default"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            step.execution_logic
+                .get("automation")
+                .and_then(|v| v.get("empty_user_input_default"))
+                .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
+        .or_else(|| {
+            hook_default
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<Value> {
+    let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
+    let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
+    let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
+
+    let mut blocks = Vec::new();
+    for key in order {
+        let is_enabled = enabled_obj.get(key).and_then(Value::as_bool).unwrap_or(false);
+        if !is_enabled {
+            continue;
+        }
+        let content = fragments_obj.get(key).and_then(Value::as_str).unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        blocks.push(prompt_block(blocks.len(), key, prompt_fragment_label(key), prompt_fragment_role(key), prompt_fragment_source(key), content));
+    }
+
+    blocks
+}
+
+fn prompt_block(index: usize, key: &str, label: String, role: &str, source: &str, content: &str) -> Value {
+    json!({
+        "index": index,
+        "id": key,
+        "key": key,
+        "capability_key": key,
+        "label": label,
+        "title": label,
+        "role": role,
+        "source": source,
+        "enabled": true,
+        "default_collapsed": role != "user",
+        "content_format": "markdown",
+        "char_count": content.chars().count(),
+        "content": content
+    })
+}
+
+fn prompt_fragment_role(key: &str) -> &'static str {
+    if key == "user_input" { "user" } else { "capability" }
+}
+
+fn prompt_fragment_source(key: &str) -> &'static str {
+    match key.split('_').next().unwrap_or("") {
+        "user" => "workflow_step",
+        "planning" | "planner" => "planner",
+        "repo" => "repo_context",
+        "changeset" => "changeset_schema",
+        "review" => "review_validation",
+        _ => "inference",
+    }
+}
+
+fn prompt_fragment_label(key: &str) -> String {
+    key.split('_')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn resolve_context_export_state(global_state: &Value) -> Value {
@@ -218,29 +387,26 @@ fn resolve_context_export_state(global_state: &Value) -> Value {
 }
 
 pub fn build_repo_context_prompt_fragment(repo_context: &Value) -> String {
-    let save_path = repo_context
-        .get("save_path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("/tmp/repo_context.txt");
+    let inline = repo_context
+        .get("inline_repo_context_in_prompt")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    format!(
-        "Repo context is attached as a file generated from backend export ({save_path}). Use the uploaded attachment as repository context."
-    )
+    if inline {
+        "Repo context is included inline under ### REPO CONTEXT in this prompt. Use it as repository context.".to_string()
+    } else {
+        "Repo context is attached as a file generated by the backend context export. Use the uploaded attachment as repository context.".to_string()
+    }
 }
 
-fn shared_inference_primitive_enabled(
+fn inference_input_enabled(
     global_state: &Value,
     step: &WorkflowStepDefinition,
     key: &str,
-    _default_enabled: bool,
+    default_enabled: bool,
 ) -> bool {
-    if !binding_specs::stage_supports_shared_capability(step, key) {
-        return false;
-    }
-
-    binding_specs::shared_capability_enabled(global_state, key, false)
+    stage_supports_capability(step, key)
+        && capability_enabled(global_state, key, default_enabled)
 }
 
 pub fn build_inference_execution_plan(
@@ -250,14 +416,14 @@ pub fn build_inference_execution_plan(
     local_state: &Value,
     settings: InferenceStageSettings,
 ) -> Result<Vec<StageExecutionNode>> {
-    let include_repo_context = shared_inference_primitive_enabled(
+    let include_repo_context = inference_input_enabled(
         global_state,
         step,
         "repo_context",
         step.prompt.include_repo_context,
     );
 
-    let include_changeset_schema = shared_inference_primitive_enabled(
+    let include_changeset_schema = inference_input_enabled(
         global_state,
         step,
         "changeset_schema",
@@ -324,7 +490,7 @@ fn build_execution_plan(
     if auto_apply_changeset {
         nodes.push(StageExecutionNode {
             kind: StageExecutionNodeKind::Capability,
-            key: "gateway_model/changeset".to_string(),
+            key: "changeset".to_string(),
             enabled: true,
             config: json!({}),
             input_mapping: json!({

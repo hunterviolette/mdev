@@ -269,10 +269,30 @@ impl ChangesetAttemptRecord {
 
     pub fn detail_response(&self, file_action_summaries: Vec<Value>) -> Value {
         let mut response = self.summary_response(file_action_summaries);
+        let result = self.result_json_value();
+        let summary = result
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or(self.display_summary.as_str())
+            .to_string();
+        let lines = result
+            .get("lines")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
         if let Some(obj) = response.as_object_mut() {
-            obj.insert("payload_text".to_string(), Value::String(self.payload_text.clone().unwrap_or_default()));
-            obj.insert("normalized_payload_json".to_string(), Value::String(self.normalized_payload_json.clone().unwrap_or_default()));
-            obj.insert("result_json".to_string(), self.result_json_value());
+            obj.insert(
+                "input".to_string(),
+                Value::String(self.normalized_payload_json.clone().unwrap_or_default()),
+            );
+            obj.insert(
+                "output".to_string(),
+                json!({
+                    "summary": summary,
+                    "lines": lines
+                }),
+            );
         }
         response
     }

@@ -2,18 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { Alert, Badge, Button, Card, Group, Loader, Stack, Switch, Text, Title, ActionIcon, Modal, TextInput, ScrollArea } from '@mantine/core';
 import { Workspace, lazy as mountModernMonaco } from 'modern-monaco';
 import {
-  createWorkspaceFile,
-  createWorkspaceFolder,
-  deleteWorkspacePath,
-  listRepoFiles,
-  listRepoTree,
-  readWorkspaceFile,
-  writeWorkspaceFile,
+  createWorkflowFile,
+  createWorkflowFolder,
+  deleteWorkflowPath,
+  listWorkflowRepoFiles,
+  listWorkflowRepoTree,
+  readWorkflowFile,
+  writeWorkflowFile,
 } from './api';
 import { RepoExplorerTree, type RepoTreeEntry } from './RepoTree';
 
 type RepoMonacoFileEditorPanelProps = {
-  repoRef: string;
+  runId: string;
   gitRef?: string;
 };
 
@@ -21,7 +21,7 @@ const README_PATH = 'README.virtual.txt';
 const README_CONTENT = '// Select a file from the explorer to open it.\n';
 
 export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps) {
-  const { repoRef, gitRef = 'WORKTREE' } = props;
+  const { runId, gitRef = 'WORKTREE' } = props;
   const [rootEntries, setRootEntries] = useState<RepoTreeEntry[]>([]);
   const [childrenByParent, setChildrenByParent] = useState<Record<string, RepoTreeEntry[]>>({});
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
@@ -46,7 +46,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   const [workspace, setWorkspace] = useState(
     () =>
       new Workspace({
-        name: `repo-editor:${repoRef || 'default'}:0`,
+        name: `repo-editor:${runId || 'default'}:0`,
         initialFiles: {
           [README_PATH]: README_CONTENT,
         },
@@ -55,7 +55,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   );
 
   const workspaceRef = useRef<Workspace | null>(workspace);
-  const workspaceRepoRef = useRef<string>(repoRef);
+  const workspaceRunId = useRef<string>(runId);
   const openRequestSeq = useRef(0);
   const mountRequestSeq = useRef(0);
   const entryPathRef = useRef<string>(README_PATH);
@@ -89,7 +89,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
 
   function nextWorkspaceName() {
     workspaceNameSeq.current += 1;
-    return `repo-editor:${repoRef || 'default'}:${workspaceNameSeq.current}`;
+    return `repo-editor:${runId || 'default'}:${workspaceNameSeq.current}`;
   }
 
   function markTabDirty(path: string, dirty: boolean) {
@@ -218,7 +218,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
 
     entryPathRef.current = resolvedEntry;
     workspaceRef.current = next;
-    workspaceRepoRef.current = repoRef;
+    workspaceRunId.current = runId;
     mountRequestSeq.current += 1;
     setWorkspace(next);
     setWorkspaceVersion((value) => value + 1);
@@ -297,7 +297,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }
 
   async function loadRoot() {
-    if (!repoRef.trim()) {
+    if (!runId.trim()) {
       setRootEntries([]);
       setChildrenByParent({});
       return;
@@ -306,7 +306,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
     setBusy(true);
     setError(null);
     try {
-      const response = await listRepoTree(repoRef, gitRef, {
+      const response = await listWorkflowRepoTree(runId, gitRef, {
         skipBinary: hideBinary,
         skipGitignore: hideGitignored,
       });
@@ -322,10 +322,10 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
 
   useEffect(() => {
     void loadRoot();
-  }, [repoRef, gitRef, hideBinary, hideGitignored]);
+  }, [runId, gitRef, hideBinary, hideGitignored]);
 
   useEffect(() => {
-    if (workspaceRepoRef.current === repoRef) {
+    if (workspaceRunId.current === runId) {
       return;
     }
 
@@ -338,34 +338,34 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
     });
 
     entryPathRef.current = README_PATH;
-    workspaceRepoRef.current = repoRef;
+    workspaceRunId.current = runId;
     workspaceRef.current = next;
     setWorkspace(next);
     setWorkspaceVersion((value) => value + 1);
-  }, [repoRef]);
+  }, [runId]);
 
   useEffect(() => {
     setWorkspaceFiles({});
     setSelectedPath(null);
     setError(null);
     openRequestSeq.current = 0;
-  }, [repoRef]);
+  }, [runId]);
 
   useEffect(() => {
     setSavedFiles({});
-  }, [repoRef]);
+  }, [runId]);
 
   useEffect(() => {
     setOpenTabs([]);
     setDirtyPaths({});
-  }, [repoRef]);
+  }, [runId]);
 
   useEffect(() => {
     setQuickOpenOpen(false);
     setQuickOpenQuery('');
     setQuickOpenIndex([]);
     setQuickOpenActiveIndex(0);
-  }, [repoRef, gitRef, hideBinary, hideGitignored]);
+  }, [runId, gitRef, hideBinary, hideGitignored]);
 
   useEffect(() => {
     if (!quickOpenOpen) {
@@ -375,11 +375,11 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }, [quickOpenQuery, quickOpenOpen]);
 
   async function loadDir(path: string) {
-    if (!repoRef.trim()) return;
+    if (!runId.trim()) return;
 
     setLoadingDirs((prev) => new Set(prev).add(path));
     try {
-      const response = await listRepoTree(repoRef, gitRef, {
+      const response = await listWorkflowRepoTree(runId, gitRef, {
         basePath: path,
         skipBinary: hideBinary,
         skipGitignore: hideGitignored,
@@ -400,14 +400,14 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }
 
   async function openFile(path: string) {
-    if (!repoRef.trim()) return;
+    if (!runId.trim()) return;
 
     const requestId = ++openRequestSeq.current;
     setOpening(true);
     setError(null);
 
     try {
-      const response = await readWorkspaceFile(repoRef, path);
+      const response = await readWorkflowFile(runId, path);
       if (requestId !== openRequestSeq.current) {
         return;
       }
@@ -484,13 +484,13 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
     setQuickOpenOpen(true);
     setError(null);
 
-    if (quickOpenIndex.length > 0 || quickOpenLoading || !repoRef.trim()) {
+    if (quickOpenIndex.length > 0 || quickOpenLoading || !runId.trim()) {
       return;
     }
 
     try {
       setQuickOpenLoading(true);
-      const response = await listRepoFiles(repoRef, gitRef, {
+      const response = await listWorkflowRepoFiles(runId, gitRef, {
         skipBinary: hideBinary,
         skipGitignore: hideGitignored,
       });
@@ -555,7 +555,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedPath, quickOpenOpen, repoRef, gitRef, hideBinary, hideGitignored, quickOpenIndex, quickOpenLoading]);
+  }, [selectedPath, quickOpenOpen, runId, gitRef, hideBinary, hideGitignored, quickOpenIndex, quickOpenLoading]);
 
   useEffect(() => {
     if (!selectedPath) {
@@ -595,7 +595,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }, [selectedPath, savedFiles, workspace]);
 
   async function saveCurrentFile() {
-    if (!repoRef.trim() || !selectedPath) return;
+    if (!runId.trim() || !selectedPath) return;
 
     const currentWorkspace = workspaceRef.current;
     if (!currentWorkspace) return;
@@ -617,8 +617,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
       }));
       markTabDirty(normalizedPath, false);
 
-      await writeWorkspaceFile({
-        repo_ref: repoRef,
+      await writeWorkflowFile(runId, {
         path: normalizedPath,
         contents: text,
       });
@@ -630,14 +629,13 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }
 
   async function handleCreateFile(parentPath: string | null) {
-    if (!repoRef.trim()) return;
+    if (!runId.trim()) return;
     const requested = window.prompt('New file path', parentPath ? `${parentPath}/new_file.txt` : 'new_file.txt');
     if (!requested || !requested.trim()) return;
 
     try {
       setError(null);
-      const created = await createWorkspaceFile({
-        repo_ref: repoRef,
+      const created = await createWorkflowFile(runId, {
         path: requested.trim(),
         contents: '',
       });
@@ -673,14 +671,13 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }
 
   async function handleCreateFolder(parentPath: string | null) {
-    if (!repoRef.trim()) return;
+    if (!runId.trim()) return;
     const requested = window.prompt('New folder path', parentPath ? `${parentPath}/new_folder` : 'new_folder');
     if (!requested || !requested.trim()) return;
 
     try {
       setError(null);
-      await createWorkspaceFolder({
-        repo_ref: repoRef,
+      await createWorkflowFolder(runId, {
         path: requested.trim(),
       });
       await loadRoot();
@@ -690,12 +687,12 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   }
 
   async function handleDeletePath(path: string) {
-    if (!repoRef.trim()) return;
+    if (!runId.trim()) return;
     if (!window.confirm(`Delete ${path}?`)) return;
 
     try {
       setError(null);
-      await deleteWorkspacePath(repoRef, path);
+      await deleteWorkflowPath(runId, path);
 
       const normalizedPath = normalizeWorkspacePath(path);
       const snapshotted = await snapshotCurrentEditorFiles(workspaceFiles);
@@ -821,7 +818,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
               <Badge variant="light">Modern Monaco</Badge>
             </Group>
             <Text size="sm" c="dimmed">Explorer mode uses the shared tree core without fragment-selection checkboxes.</Text>
-            <Text size="xs" c="dimmed">Repo: {repoRef || 'No repo selected'}</Text>
+            <Text size="xs" c="dimmed">Workflow: {runId || 'No workflow selected'}</Text>
           </Stack>
           <Button variant="default" disabled={!selectedPath} onClick={() => void saveCurrentFile()} loading={saving}>
             Save file
@@ -835,8 +832,8 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
           {opening ? <Text size="xs" c="dimmed">Opening…</Text> : null}
         </Group>
 
-        {!repoRef.trim() ? (
-          <Alert color="yellow">Select a workflow or provide a repo path first.</Alert>
+        {!runId.trim() ? (
+          <Alert color="yellow">Select a workflow first.</Alert>
         ) : null}
 
         {error ? <Alert color="red">{error}</Alert> : null}

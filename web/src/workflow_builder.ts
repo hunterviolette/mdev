@@ -3,10 +3,9 @@ import type {
   WorkflowBuilderDocument,
   WorkflowBuilderStageDocument,
   WorkflowGlobalConfig,
-  WorkflowGovernancePolicyDescriptor,
+  SharedDependenciesConfig,
   WorkflowStageDescriptor,
   WorkflowStageField,
-  WorkflowGovernanceConfig,
   WorkflowTemplateDefinition,
 } from './api';
 
@@ -23,8 +22,16 @@ export function capabilityDisplayLabel(capabilityKey: string): string {
       return 'Context export';
     case 'inference':
       return 'Inference';
-    case 'gateway_model/changeset':
+    case 'changeset':
       return 'ChangeSet apply';
+    case 'shared_dependencies':
+      return 'Shared dependencies';
+    case 'terminal_runtime':
+      return 'Terminal runtime';
+    case 'deploy_qa':
+      return 'DeployQA';
+    case 'qa_environment':
+      return 'DeployQA';
     case 'compile_commands':
       return 'Compile commands';
     case 'sap/import':
@@ -38,40 +45,6 @@ export function capabilityDisplayLabel(capabilityKey: string): string {
 
 export function flattenStageFields(descriptor: WorkflowStageDescriptor): WorkflowStageField[] {
   return descriptor.editable_fields.flatMap((group) => group.fields);
-}
-
-export function governancePolicyMap(descriptor: WorkflowStageDescriptor): Record<string, WorkflowGovernancePolicyDescriptor> {
-  return Object.fromEntries((descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy]));
-}
-
-export function ensureGovernanceConfig(
-  catalog: WorkflowBuilderCatalog,
-  selected: WorkflowGovernanceConfig | undefined,
-): WorkflowGovernanceConfig {
-  const byKey = governancePolicyMapFromCatalog(catalog);
-  const selectedConfig = selected ?? {};
-  return Object.fromEntries(
-    Object.entries(selectedConfig)
-      .filter(([key]) => Boolean(byKey[key]))
-      .map(([key, config]) => {
-        const descriptor = byKey[key];
-        return [
-          key,
-          Object.fromEntries(
-            descriptor.fields.map((field) => [
-              field.key,
-              (config as Record<string, unknown> | undefined)?.[field.key] ?? field.default,
-            ])
-          ),
-        ];
-      })
-  );
-}
-
-export function governancePolicyMapFromCatalog(catalog: WorkflowBuilderCatalog): Record<string, WorkflowGovernancePolicyDescriptor> {
-  return Object.fromEntries(
-    catalog.stage_descriptors.flatMap((descriptor) => descriptor.available_governance_policies ?? []).map((policy) => [policy.key, policy])
-  );
 }
 
 export function builderStepFromDescriptor(descriptor: WorkflowStageDescriptor, id?: string): BuilderStep {
@@ -92,6 +65,44 @@ export function buildStageDocument(step: BuilderStep): WorkflowBuilderStageDocum
   };
 }
 
+function defaultSharedDependencies(): SharedDependenciesConfig {
+  return {
+    enabled: true,
+    providers: [
+      {
+        id: 'node-root',
+        label: 'Node root',
+        ecosystem: 'node',
+        root: '.',
+        manifests: ['package.json', 'package-lock.json'],
+        isolated: {
+          storage_path: 'node_modules',
+          seed_from_trusted: true,
+          install: {
+            commands: [],
+            stop_on_failure: true,
+          },
+        },
+        mismatch: {
+          disposition: 'operator_checkpoint',
+          allowed_dispositions: [
+            'create_isolated_dependencies',
+            'continue_trusted_with_warning',
+            'skip_stage',
+          ],
+        },
+      },
+      {
+        id: 'cargo-root',
+        label: 'Cargo root',
+        ecosystem: 'cargo',
+        root: 'api',
+        manifests: ['Cargo.lock'],
+      },
+    ],
+  };
+}
+
 export function defaultGlobals(): WorkflowGlobalConfig {
   return {
     resources: {
@@ -101,23 +112,77 @@ export function defaultGlobals(): WorkflowGlobalConfig {
       },
     },
     capabilities: {
+      inference: {
+        default_session: 'coding',
+        stage_sessions: {
+          design: 'coding',
+          code: 'coding',
+          review: 'review',
+        },
+        sessions: {
+          coding: {
+            provider: 'openai',
+            transport: 'api',
+            model: 'gpt-4.1',
+            runtime: {},
+          },
+          review: {
+            provider: 'openai',
+            transport: 'api',
+            model: 'gpt-4.1',
+            runtime: {},
+          },
+        },
+      },
+      shared_dependencies: defaultSharedDependencies(),
     },
     automation: {
     },
   };
 }
 
-export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig, governance?: WorkflowGovernanceConfig): WorkflowBuilderDocument {
+export function inferenceEnabledStageTypes(catalog: WorkflowBuilderCatalog, steps: BuilderStep[]): string[] {
+  const descriptors = descriptorMap(catalog);
+  const seen = new Set<string>();
+
+  for (const step of steps) {
+    const descriptor = descriptors[step.stepType];
+    const capabilities = descriptor?.definition_template?.capabilities ?? [];
+    const executionPlan = descriptor?.definition_template?.execution_plan ?? [];
+    const hasInference = capabilities.some((item) => item.capability === 'inference' && item.enabled !== false)
+      || executionPlan.some((item) => item.kind === 'capability' && item.key === 'inference' && item.enabled !== false);
+
+    if (hasInference) {
+      seen.add(step.stepType);
+    }
+  }
+
+  return Array.from(seen);
+}
+
+export function inferenceSessionNames(globals: WorkflowGlobalConfig): string[] {
+  const inference = (globals.capabilities?.inference ?? {}) as Record<string, unknown>;
+  const sessions = (inference.sessions ?? {}) as Record<string, unknown>;
+  return Object.keys(sessions);
+}
+
+export function buildBuilderDocument(steps: BuilderStep[], globals?: WorkflowGlobalConfig): WorkflowBuilderDocument {
   return {
     version: 1,
     globals: globals ?? defaultGlobals(),
-    governance: governance ?? {},
     stages: steps.map((step) => buildStageDocument(step)),
   };
 }
 
 export function descriptorMap(catalog: WorkflowBuilderCatalog): Record<string, WorkflowStageDescriptor> {
-  return Object.fromEntries(catalog.stage_descriptors.map((descriptor) => [descriptor.step_type, descriptor]));
+  const out: Record<string, WorkflowStageDescriptor> = {};
+  for (const descriptor of catalog.stage_descriptors) {
+    out[descriptor.step_type] = descriptor;
+    out[descriptor.step_type.trim().toLowerCase()] = descriptor;
+    out[descriptor.label] = descriptor;
+    out[descriptor.label.trim().toLowerCase()] = descriptor;
+  }
+  return out;
 }
 
 export function builderStepsFromDefinition(
