@@ -4,6 +4,7 @@ target/
 tmp/
 .turbo/
 .data/
+.mdev/
 
 .env
 .env.local

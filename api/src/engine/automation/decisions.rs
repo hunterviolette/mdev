@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::GovernanceScope;
+use super::AutomationScope;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMutation {
-    pub scope: GovernanceScope,
+    pub scope: AutomationScope,
     #[serde(default)]
     pub patch: Value,
 }
@@ -19,7 +19,7 @@ pub struct CapabilityInjection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum GovernanceDecision {
+pub enum AutomationDecision {
     Continue,
     MutateContext { mutation: ContextMutation },
     InjectCapability { capability: CapabilityInjection },

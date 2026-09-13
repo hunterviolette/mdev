@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::engine::runtime_tools::{CompileStageSpec, SharedDependenciesConfig};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Draft,
@@ -70,6 +72,8 @@ pub struct WorkflowGlobalConfig {
     pub capabilities: Value,
     #[serde(default)]
     pub automation: Value,
+    #[serde(default, skip_serializing)]
+    pub shared_dependencies: SharedDependenciesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -78,6 +82,8 @@ pub struct WorkflowStepExecutionConfig {
     pub changeset_apply: Value,
     #[serde(default)]
     pub compile_checks: Value,
+    #[serde(default)]
+    pub compile: Option<CompileStageSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -155,11 +161,41 @@ pub struct WorkflowTemplateDefinition {
     pub steps: Vec<WorkflowStepDefinition>,
 }
 
+
+pub use crate::engine::capabilities::planner::{
+    ExecutionPlanItem,
+    FeaturePlanItem,
+    FeaturePlanItemStatus,
+};
+
+pub use crate::supervisor::models::{
+    CreateSupervisorRunRequest,
+    SupervisorActionRequest,
+    SupervisorExecutionStrategy,
+    SupervisorRun,
+    SupervisorStatus,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowBuilderCatalog {
     pub version: u32,
     #[serde(default)]
     pub stage_descriptors: Vec<WorkflowStageDescriptor>,
+    #[serde(default)]
+    pub automation_controls: Vec<WorkflowAutomationControlDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowAutomationControlDescriptor {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    pub section: String,
+    pub field_type: String,
+    pub default: Value,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +260,16 @@ pub struct WorkflowStageField {
     #[serde(default)]
     pub options: Vec<WorkflowStageFieldOption>,
     #[serde(default)]
+    pub visible_when: Vec<WorkflowStageFieldVisibility>,
+    #[serde(default)]
     pub ui: WorkflowStageFieldUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStageFieldVisibility {
+    pub path: String,
+    #[serde(default)]
+    pub equals: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -357,8 +402,24 @@ pub struct WorkflowEventStreamItem {
     pub capability_invocation_id: Option<String>,
     pub parent_invocation_id: Option<String>,
     pub sequence_no: i64,
+    pub global_sequence_no: i64,
     pub level: String,
     pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SprintEventStreamItem {
+    pub id: String,
+    pub sprint_id: String,
+    pub sequence_no: i64,
+    pub event_type: String,
+    pub event_time: String,
+    pub feature_id: Option<String>,
+    pub actor: String,
     pub message: String,
     #[serde(default)]
     pub payload: Value,
@@ -404,6 +465,8 @@ pub struct AppSettings {
     pub bridges: Value,
     #[serde(default)]
     pub git: Value,
+    #[serde(default)]
+    pub repo_sync: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

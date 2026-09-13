@@ -1,21 +1,24 @@
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, process::Command};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}, process::Command};
 
 use anyhow::Context;
 use axum::{extract::{Path as AxumPath, Query, State}, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::app_state::AppState;
+use crate::{
+    app_state::AppState,
+    engine::capabilities::filesystem,
+};
 
 use super::workflow_scope::resolve_workflow_scope;
 
 #[derive(Debug, Deserialize)]
 pub struct RepoTreeQuery {
-    #[serde(default)]
-    pub repo_ref: String,
     #[serde(default = "default_git_ref")]
     pub git_ref: String,
     #[serde(default)]
     pub base_path: String,
+    #[serde(default)]
+    pub recursive: bool,
     #[serde(default)]
     pub skip_binary: bool,
     #[serde(default)]
@@ -68,19 +71,26 @@ fn default_git_ref() -> String {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/repo-tree", get(get_repo_tree))
-        .route("/api/repo-files", get(get_repo_files))
         .route("/api/repo/validate", get(validate_repo_ref))
         .route("/api/workflow-runs/:run_id/repository/tree", get(get_workflow_repo_tree))
+        .route("/api/workflow-runs/:run_id/repository/files", get(get_workflow_repo_files))
 }
 
 async fn get_repo_tree(
-    Query(query): Query<RepoTreeQuery>,
+    repo_ref: String,
+    query: RepoTreeQuery,
 ) -> Result<Json<RepoTreeResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&query.repo_ref);
-    let base_path = normalize_rel_path(&query.base_path);
+    let repo = PathBuf::from(&repo_ref);
+    let base_path = filesystem::normalize_rel_path(&query.base_path).map_err(internal)?;
 
-    let mut entries = if effective_ref(&query.git_ref) == "WORKTREE" {
+    let mut entries = if query.recursive {
+        let files = if effective_ref(&query.git_ref) == "WORKTREE" {
+            collect_worktree_tracked_files_flat(&repo, query.skip_binary).map_err(internal)?
+        } else {
+            collect_git_files_flat(&repo, effective_ref(&query.git_ref), query.skip_binary).map_err(internal)?
+        };
+        complete_tree_entries(files, &base_path)
+    } else if effective_ref(&query.git_ref) == "WORKTREE" {
         collect_worktree_entries(&repo, &base_path, query.skip_binary, query.skip_gitignore).map_err(internal)?
     } else {
         collect_git_entries(&repo, effective_ref(&query.git_ref), &base_path, query.skip_binary).map_err(internal)?
@@ -94,7 +104,7 @@ async fn get_repo_tree(
     });
 
     Ok(Json(RepoTreeResponse {
-        repo_ref: query.repo_ref,
+        repo_ref,
         git_ref: query.git_ref,
         base_path,
         entries,
@@ -103,9 +113,10 @@ async fn get_repo_tree(
 }
 
 async fn get_repo_files(
-    Query(query): Query<RepoTreeQuery>,
+    repo_ref: String,
+    query: RepoTreeQuery,
 ) -> Result<Json<RepoFilesResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&query.repo_ref);
+    let repo = PathBuf::from(&repo_ref);
 
     let mut files = if effective_ref(&query.git_ref) == "WORKTREE" {
         collect_worktree_tracked_files_flat(&repo, query.skip_binary).map_err(internal)?
@@ -117,7 +128,7 @@ async fn get_repo_files(
     files.dedup();
 
     Ok(Json(RepoFilesResponse {
-        repo_ref: query.repo_ref,
+        repo_ref,
         git_ref: query.git_ref,
         files,
         refreshed_at: chrono::Utc::now().to_rfc3339(),
@@ -130,13 +141,70 @@ async fn get_workflow_repo_tree(
     Query(query): Query<RepoTreeQuery>,
 ) -> Result<Json<RepoTreeResponse>, (axum::http::StatusCode, String)> {
     let scope = resolve_workflow_scope(&state, run_id).await?;
-    get_repo_tree(Query(RepoTreeQuery {
-        repo_ref: scope.repo_ref,
-        git_ref: if query.git_ref.trim().is_empty() { scope.git_ref } else { query.git_ref },
-        base_path: query.base_path,
-        skip_binary: query.skip_binary,
-        skip_gitignore: query.skip_gitignore,
-    })).await
+    get_repo_tree(
+        scope.repo_ref,
+        RepoTreeQuery {
+            git_ref: if query.git_ref.trim().is_empty() { scope.git_ref } else { query.git_ref },
+            base_path: query.base_path,
+            recursive: query.recursive,
+            skip_binary: query.skip_binary,
+            skip_gitignore: query.skip_gitignore,
+        },
+    ).await
+}
+
+async fn get_workflow_repo_files(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<uuid::Uuid>,
+    Query(query): Query<RepoTreeQuery>,
+) -> Result<Json<RepoFilesResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    get_repo_files(
+        scope.repo_ref,
+        RepoTreeQuery {
+            git_ref: if query.git_ref.trim().is_empty() { scope.git_ref } else { query.git_ref },
+            base_path: String::new(),
+            recursive: true,
+            skip_binary: query.skip_binary,
+            skip_gitignore: query.skip_gitignore,
+        },
+    ).await
+}
+
+fn complete_tree_entries(files: Vec<String>, base_path: &str) -> Vec<RepoTreeEntry> {
+    let mut directories = BTreeSet::new();
+    let mut normalized_files = BTreeSet::new();
+
+    for file in files {
+        let path = normalize_rel_path(&file);
+        if path.is_empty() || (!base_path.is_empty() && path != base_path && !path.starts_with(&format!("{base_path}/"))) {
+            continue;
+        }
+        normalized_files.insert(path.clone());
+        let components = path.split('/').collect::<Vec<_>>();
+        for index in 1..components.len() {
+            directories.insert(components[..index].join("/"));
+        }
+    }
+
+    let mut entries = directories
+        .into_iter()
+        .map(|path| RepoTreeEntry {
+            name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+            path,
+            kind: "dir".to_string(),
+            has_children: true,
+        })
+        .collect::<Vec<_>>();
+
+    entries.extend(normalized_files.into_iter().map(|path| RepoTreeEntry {
+        name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+        path,
+        kind: "file".to_string(),
+        has_children: false,
+    }));
+
+    entries
 }
 
 async fn validate_repo_ref(
@@ -299,9 +367,20 @@ fn collect_worktree_tracked_files_flat(
     let mut out = Vec::new();
 
     for rel in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let path = repo.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+
         if skip_binary {
-            let bytes = fs::read(repo.join(rel))
-                .with_context(|| format!("failed to read {}", rel))?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {}", rel));
+                }
+            };
             if is_probably_binary(&bytes) {
                 continue;
             }

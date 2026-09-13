@@ -1,9 +1,97 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::models::WorkflowStepDefinition;
+use crate::{
+    engine::{
+        capabilities::registry::CapabilityResult,
+        automation::{policies::compile_failures, AutomationDecision},
+        stages::{
+            Stage,
+            StageCapabilities,
+            StagePlanContext,
+            StagePrepareContext,
+        },
+    },
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
+};
 
-pub fn prepare_stage_state(
+pub struct CompileStage;
+
+pub static STAGE: CompileStage = CompileStage;
+
+inventory::submit! {
+    crate::engine::stages::StageRegistration::new(&STAGE)
+}
+
+impl Stage for CompileStage {
+    fn stage_type(&self) -> &'static str {
+        "compile"
+    }
+
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::compile_descriptor()
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["shared_dependencies", "compile_commands"])
+    }
+
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &["compile_failures"]
+    }
+
+    fn automation_after_capability(
+        &self,
+        run: &WorkflowRun,
+        step: &WorkflowStepDefinition,
+        result: &CapabilityResult,
+        prior_results: &[CapabilityResult],
+    ) -> Result<Vec<AutomationDecision>> {
+        compile_failures::after_capability(run, step, result, prior_results)
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_compile_state(context.step, local_state)
+    }
+
+    fn build_execution_plan(
+        &self,
+        _context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>> {
+        Ok(build_compile_execution_plan())
+    }
+}
+
+fn build_compile_execution_plan() -> Vec<StageExecutionNode> {
+    vec![
+        StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "shared_dependencies".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec![],
+            condition: Value::Null,
+        },
+        StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: "compile_commands".to_string(),
+            enabled: true,
+            config: json!({}),
+            input_mapping: json!({}),
+            output_mapping: json!({}),
+            run_after: vec!["shared_dependencies".to_string()],
+            condition: Value::Null,
+        },
+    ]
+}
+
+fn prepare_compile_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
@@ -57,27 +145,15 @@ pub fn prepare_stage_state(
             "on_success".to_string(),
             if is_automatic && !has_compile_commands {
                 json!({
-                    "disposition": "paused",
+                    "status": "paused",
+                    "transition": "stay",
                     "message": "Compile stage reached with no compile commands configured. Paused for manual intervention."
                 })
             } else {
                 json!({
-                    "disposition": "move_next",
-                    "message": "Compile stage completed successfully through backend workflow engine.",
-                    "patch": {
-                        "global_state": {
-                            "capabilities": {
-                                "inference": {
-                                    "prompt_fragment_enabled": {
-                                        "compile_error": false
-                                    },
-                                    "prompt_fragments": {
-                                        "compile_error": null
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    "status": "success",
+                    "transition": "move_next",
+                    "message": "Compile stage completed successfully through backend workflow engine."
                 })
             },
         );
@@ -87,12 +163,9 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "move_back",
-                "message": "Compile stage failed during backend workflow execution.",
-                "patch_from_capability": {
-                    "capability": "compile_commands",
-                    "mode": "compile_error_to_code_prompt"
-                }
+                "status": "error",
+                "transition": "move_back",
+                "message": "Compile stage failed during backend workflow execution."
             }),
         );
     }
@@ -181,49 +254,6 @@ fn commands_text_to_rows(value: Option<&Value>) -> Option<Value> {
     }
 }
 
-pub fn build_compile_error_patch(capability_results: &[Value]) -> Value {
-    let outputs = capability_results
-        .iter()
-        .filter(|item| item.get("key").and_then(Value::as_str) == Some("compile_commands"))
-        .filter_map(|item| item.get("result"))
-        .filter_map(|result| result.get("results"))
-        .filter_map(Value::as_array)
-        .flat_map(|items| items.iter())
-        .map(|row| {
-            let label = row.get("label").and_then(Value::as_str).unwrap_or("command");
-            let status = row.get("status").and_then(Value::as_i64).unwrap_or(-1);
-            let stdout = row.get("stdout").and_then(Value::as_str).unwrap_or("");
-            let stderr = row.get("stderr").and_then(Value::as_str).unwrap_or("");
-            format!(
-                "COMMAND: {}\nSTATUS: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-                label,
-                status,
-                stdout,
-                stderr
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let compile_fragment = format!(
-        "Postprocess command failed after applying the previous ChangeSet.\n\nPOSTPROCESS OUTPUT:\n{}\n\nPlease provide a NEW ChangeSet JSON (version 1) that fixes the errors.",
-        outputs
-    );
-
-    json!({
-        "global_state": {
-            "capabilities": {
-                "inference": {
-                    "next_prompt_fragments": [
-                        {
-                            "text": compile_fragment
-                        }
-                    ]
-                }
-            }
-        }
-    })
-}
 
 fn ensure_object(value: Value) -> Value {
     match value {

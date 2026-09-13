@@ -3,7 +3,58 @@ use serde_json::{json, Value};
 
 use crate::models::WorkflowStepDefinition;
 
-pub fn prepare_stage_state(
+use super::{
+    configured_execution_plan,
+    Stage,
+    StageCapabilities,
+    StagePlanContext,
+    StagePrepareContext,
+};
+
+pub struct SapExportStage;
+
+pub static STAGE: SapExportStage = SapExportStage;
+
+inventory::submit! {
+    super::StageRegistration::new(&STAGE)
+}
+
+impl Stage for SapExportStage {
+    fn stage_type(&self) -> &'static str {
+        "sap_export"
+    }
+
+    fn descriptor(&self) -> crate::models::WorkflowStageDescriptor {
+        crate::routes::sap_export_descriptor()
+    }
+
+    fn capabilities(&self) -> StageCapabilities {
+        StageCapabilities::new(["sap/export"])
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value> {
+        prepare_sap_export_state(context.step, local_state)
+    }
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<crate::models::StageExecutionNode>> {
+        Ok(build_sap_export_execution_plan(context.step))
+    }
+}
+
+fn build_sap_export_execution_plan(
+    step: &WorkflowStepDefinition,
+) -> Vec<crate::models::StageExecutionNode> {
+    configured_execution_plan(step)
+}
+
+fn prepare_sap_export_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
@@ -32,7 +83,8 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_success".to_string(),
             json!({
-                "disposition": "move_next",
+                "status": "success",
+                "transition": "move_next",
                 "message": "SAP export stage completed successfully.",
                 "patch_from_capability": {
                     "capability": "sap/export",
@@ -46,7 +98,8 @@ pub fn prepare_stage_state(
         exec_obj.insert(
             "on_error".to_string(),
             json!({
-                "disposition": "error",
+                "status": "error",
+                "transition": "stop",
                 "message": "SAP export stage failed.",
                 "patch_from_capability": {
                     "capability": "sap/export",

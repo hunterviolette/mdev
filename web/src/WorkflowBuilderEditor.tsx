@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -8,8 +8,10 @@ import {
   Code,
   Divider,
   Group,
+  JsonInput,
   Loader,
   Menu,
+  Modal,
   ScrollArea,
   Select,
   Stack,
@@ -24,19 +26,37 @@ import {
   getWorkflowBuilderCatalog,
   type CompileWorkflowBuilderResponse,
   type WorkflowCapabilitySummaryItem,
+  type WorkflowAutomationControlDescriptor,
   type WorkflowStageDescriptor,
   type WorkflowStageField,
-  type WorkflowGovernanceConfig,
+  type SharedDependenciesConfig,
+  type WorkflowGlobalConfig,
   type WorkflowTemplateDefinition,
 } from './api';
-import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, ensureGovernanceConfig, governancePolicyMapFromCatalog, type BuilderStep } from './workflow_builder';
+import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, type BuilderStep } from './workflow_builder';
+
+import {
+  DeployQA,
+  deployQACapabilityFromValues,
+  deployQAValuesFromCapability,
+  type DeployQAValues,
+} from './Capabilities/DeployQA';
+import { SharedDependencies } from './Capabilities/SharedDependencies';
+import {
+  Automation,
+  type AutomationProfile,
+} from './Capabilities/Automation';
 
 type WorkflowBuilderEditorProps = {
   initialDefinition?: WorkflowTemplateDefinition | null;
   builderGlobals?: WorkflowTemplateDefinition['globals'] | null;
+  loadRevision?: number;
   onCompiledDefinitionChange: (definition: WorkflowTemplateDefinition) => void;
   onError?: (message: string | null) => void;
-  onOpenCapabilityConfig?: (capabilityKey: string) => void;
+  onOpenCapabilityConfig?: (
+    capabilityKey: string,
+    onChange: (value: Record<string, unknown>) => void
+  ) => void;
 };
 
 type CompileState = 'idle' | 'dirty' | 'compiling' | 'compiled' | 'error';
@@ -92,25 +112,67 @@ function capabilitySummaryDetail(item: WorkflowCapabilitySummaryItem) {
   return `Used by ${item.stage_types.join(', ')}`;
 }
 
+function normalizedCapabilityKey(capabilityKey: string) {
+  return capabilityKey.trim().toLowerCase().replace(/[\s/-]+/g, '_');
+}
+
+function isDeployQACapability(capabilityKey: string) {
+  const normalized = normalizedCapabilityKey(capabilityKey);
+  return normalized === 'qa_environment' || normalized === 'deployqa' || normalized === 'deploy_qa';
+}
+
+function isSharedDependenciesCapability(capabilityKey: string) {
+  const normalized = normalizedCapabilityKey(capabilityKey);
+  return normalized === 'shared_dependencies' || normalized === 'shareddependencies';
+}
+
+function canonicalCapabilityConfigKey(capabilityKey: string) {
+  const normalized = normalizedCapabilityKey(capabilityKey);
+
+  switch (normalized) {
+    case 'changeset':
+    case 'changeset_apply':
+    case 'gateway_model_changeset':
+      return 'changeset';
+    case 'compile':
+    case 'compile_commands':
+      return 'compile_commands';
+    case 'context_export':
+    case 'repo_context':
+      return 'context_export';
+    case 'qa_environment':
+    case 'deployqa':
+    case 'deploy_qa':
+      return 'qa_environment';
+    case 'shareddependencies':
+      return 'shared_dependencies';
+    default:
+      return normalized;
+  }
+}
+
 function isGlobalEditableCapability(capabilityKey: string) {
-  const normalized = capabilityKey.trim().toLowerCase();
-  return [
-    'context_export',
-    'inference',
-    'gateway_model/changeset',
-    'changeset_apply',
-    'changeset apply',
-    'changeset_schema',
-    'browser',
-  ].includes(normalized);
+  const normalized = normalizedCapabilityKey(capabilityKey);
+
+  return normalized === 'context_export'
+    || normalized === 'inference'
+    || isDeployQACapability(capabilityKey)
+    || isSharedDependenciesCapability(capabilityKey);
+}
+
+function workflowBuilderFieldVisible(field: WorkflowStageField, fields: Record<string, unknown>) {
+  return (field.visible_when ?? []).every((condition) => {
+    const value = fields[condition.path];
+    return value === condition.equals;
+  });
 }
 
 
-export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCompiledDefinitionChange, onError, onOpenCapabilityConfig }: WorkflowBuilderEditorProps) {
+export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadRevision = 0, onCompiledDefinitionChange, onError, onOpenCapabilityConfig }: WorkflowBuilderEditorProps) {
   const [catalog, setCatalog] = useState<Record<string, WorkflowStageDescriptor>>({});
   const [stageDescriptors, setStageDescriptors] = useState<WorkflowStageDescriptor[]>([]);
+  const [automationControls, setAutomationControls] = useState<WorkflowAutomationControlDescriptor[]>([]);
   const [steps, setSteps] = useState<BuilderStep[]>([]);
-  const [governance, setGovernance] = useState<WorkflowGovernanceConfig>({});
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [globalsRevision, setGlobalsRevision] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -118,6 +180,36 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   const [compileMessage, setCompileMessage] = useState('');
   const [compileRevision, setCompileRevision] = useState(0);
   const [compiledCapabilitySummary, setCompiledCapabilitySummary] = useState<WorkflowCapabilitySummaryItem[]>([]);
+  const [deployQAOpen, setDeployQAOpen] = useState(false);
+  const [sharedDependenciesOpen, setSharedDependenciesOpen] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const [automationSaving, setAutomationSaving] = useState(false);
+  const [automationStatus, setAutomationStatus] = useState<string | null>(null);
+  const [capabilityConfigKey, setCapabilityConfigKey] = useState<string | null>(null);
+  const [capabilityConfigDraft, setCapabilityConfigDraft] = useState('{}');
+  const [capabilityConfigError, setCapabilityConfigError] = useState<string | null>(null);
+  const [editableGlobals, setEditableGlobals] = useState<WorkflowGlobalConfig>(() =>
+    structuredClone(initialDefinition?.globals ?? builderGlobals ?? defaultGlobals())
+  );
+  const latestCompiledDefinitionRef = useRef<WorkflowTemplateDefinition | null>(
+    initialDefinition ? structuredClone(initialDefinition) : null
+  );
+  const compileRequestRef = useRef(0);
+  const onErrorRef = useRef(onError);
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  useEffect(() => {
+    setEditableGlobals(
+      structuredClone(initialDefinition?.globals ?? builderGlobals ?? defaultGlobals())
+    );
+    latestCompiledDefinitionRef.current = initialDefinition
+      ? structuredClone(initialDefinition)
+      : null;
+    setGlobalsRevision((current) => current + 1);
+  }, [loadRevision]);
 
   const selectedStep = useMemo(
     () => steps.find((step) => step.id === selectedStepId) ?? null,
@@ -128,14 +220,74 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
     [catalog, selectedStep]
   );
 
-  const governancePolicies = useMemo(
-    () => governancePolicyMapFromCatalog({ version: 1, stage_descriptors: stageDescriptors }),
-    [stageDescriptors]
-  );
-
   const selectedStageCapabilitySummary = useMemo(
     () => compiledCapabilitySummary.find((item) => item.stage_ids.includes(selectedStep?.id ?? '')) ?? null,
     [compiledCapabilitySummary, selectedStep?.id]
+  );
+
+  const invokedAutomationCapabilities = useMemo(
+    () => compiledCapabilitySummary.map((item) => item.key),
+    [compiledCapabilitySummary]
+  );
+
+  const sharedDependencies = useMemo<SharedDependenciesConfig>(() => {
+    const capabilities = editableGlobals.capabilities ?? {};
+    const configured = capabilities.shared_dependencies;
+    const legacy = editableGlobals.shared_dependencies;
+
+    if (configured && typeof configured === 'object' && !Array.isArray(configured)) {
+      return configured as SharedDependenciesConfig;
+    }
+
+    return legacy ?? {
+      enabled: false,
+      providers: [],
+    };
+  }, [editableGlobals.capabilities, editableGlobals.shared_dependencies]);
+
+  const automationProfile = useMemo<AutomationProfile>(() => {
+    const configured = editableGlobals.automation;
+    const value = configured && typeof configured === 'object' && !Array.isArray(configured)
+      ? configured as Partial<AutomationProfile>
+      : {};
+    const threshold = (candidate: unknown, fallback: number) =>
+      typeof candidate === 'number' && Number.isFinite(candidate)
+        ? Math.max(1, Math.floor(candidate))
+        : fallback;
+
+    return {
+      new_session: Array.isArray(value.new_session)
+        ? value.new_session.filter((item): item is string => typeof item === 'string')
+        : ['repo_context', 'changeset_schema', 'planner_fragment'],
+      selected: Array.isArray(value.selected)
+        ? value.selected.filter((item): item is string => typeof item === 'string')
+        : automationControls.map((descriptor) => descriptor.key),
+      inject_file_context_after_changeset_failures: threshold(
+        value.inject_file_context_after_changeset_failures,
+        2,
+      ),
+      inject_broad_context_after_changeset_failures: threshold(
+        value.inject_broad_context_after_changeset_failures,
+        4,
+      ),
+      pause_after_changeset_failures: threshold(
+        value.pause_after_changeset_failures,
+        6,
+      ),
+      inject_changeset_schema_after_errors: threshold(
+        value.inject_changeset_schema_after_errors,
+        3,
+      ),
+      pause_after_compile_errors: threshold(
+        value.pause_after_compile_errors,
+        4,
+      ),
+    };
+  }, [editableGlobals.automation, automationControls]);
+
+  const deployQAValues = useMemo(
+    () => deployQAValuesFromCapability(editableGlobals.capabilities?.qa_environment),
+    [editableGlobals.capabilities]
   );
 
   useEffect(() => {
@@ -152,7 +304,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
         const byType = descriptorMap(loadedCatalog);
         setCatalog(byType);
         setStageDescriptors(descriptors);
-        setGovernance(ensureGovernanceConfig(loadedCatalog, initialDefinition?.governance));
+        setAutomationControls(loadedCatalog.automation_controls ?? []);
 
         const hydratedSteps = builderStepsFromDefinition(initialDefinition, loadedCatalog);
         setGlobalsRevision((prev) => prev + 1);
@@ -174,7 +326,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
         }
       } catch (error) {
         if (!cancelled) {
-          onError?.(error instanceof Error ? error.message : String(error));
+          onErrorRef.current?.(error instanceof Error ? error.message : String(error));
         }
       } finally {
         if (!cancelled) {
@@ -187,12 +339,86 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
     return () => {
       cancelled = true;
     };
-  }, [onError]);
+  }, [loadRevision]);
 
   function markDirty(message = 'Unsaved visual changes') {
+    compileRequestRef.current += 1;
     setCompileState('dirty');
     setCompileMessage(message);
     setCompileRevision((prev) => prev + 1);
+  }
+
+  async function updateBuilderGlobals(
+    nextGlobals: WorkflowGlobalConfig,
+    message: string
+  ): Promise<boolean> {
+    const requestId = ++compileRequestRef.current;
+    setEditableGlobals(nextGlobals);
+    setCompileState('compiling');
+    setCompileMessage(message);
+
+    try {
+      const result = await compileWorkflowBuilderDocument(
+        buildBuilderDocument(steps, nextGlobals)
+      );
+
+      if (requestId !== compileRequestRef.current) {
+        return false;
+      }
+
+      if (!result.ok) {
+        const errorMessage = result.errors.length > 0
+          ? result.errors.join('\n')
+          : 'Workflow compilation failed.';
+        setCompiledCapabilitySummary([]);
+        setCompileState('error');
+        setCompileMessage(errorMessage);
+        onErrorRef.current?.(errorMessage);
+        return false;
+      }
+
+      const nextDefinition = structuredClone(result.definition);
+      setCompiledCapabilitySummary(result.capability_summary ?? []);
+      setEditableGlobals(structuredClone(nextDefinition.globals));
+      latestCompiledDefinitionRef.current = structuredClone(nextDefinition);
+      onCompiledDefinitionChange(structuredClone(nextDefinition));
+      setCompileState('compiled');
+      setCompileMessage(
+        result.warnings.length > 0
+          ? result.warnings.join('\n')
+          : 'Compiled successfully'
+      );
+      onErrorRef.current?.(null);
+      return true;
+    } catch (error) {
+      if (requestId !== compileRequestRef.current) {
+        return false;
+      }
+
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      setCompiledCapabilitySummary([]);
+      setCompileState('error');
+      setCompileMessage(errorMessage);
+      onErrorRef.current?.(errorMessage);
+      return false;
+    }
+  }
+
+  function updateCapabilityConfig(
+    capabilityKey: string,
+    value: Record<string, unknown>,
+    message = `${capabilityDisplayLabel(capabilityKey)} capability configuration changed`
+  ) {
+    const configKey = canonicalCapabilityConfigKey(capabilityKey);
+    const nextGlobals: WorkflowGlobalConfig = {
+      ...structuredClone(editableGlobals),
+      capabilities: {
+        ...structuredClone(editableGlobals.capabilities ?? {}),
+        [configKey]: structuredClone(value),
+      },
+    };
+
+    void updateBuilderGlobals(nextGlobals, message);
   }
 
   function addStep(stepType: string) {
@@ -253,20 +479,6 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   }
 
 
-  function updateGovernancePolicy(policyKey: string, nextConfig: Record<string, unknown> | null) {
-    setGovernance((prev) => {
-      const next = { ...prev };
-      if (nextConfig) {
-        next[policyKey] = nextConfig;
-      } else {
-        delete next[policyKey];
-      }
-      return next;
-    });
-    markDirty();
-  }
-
-
   function renderField(field: WorkflowStageField, value: unknown) {
     if (!selectedStep) {
       return null;
@@ -309,6 +521,25 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
         />
       );
     }
+    if (control === 'string_list' || control === 'dependency_providers') {
+      const values = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+      return (
+        <TextInput
+          key={field.key}
+          label={field.label}
+          description={field.description}
+          placeholder={field.ui?.placeholder}
+          value={values.join(', ')}
+          onChange={(event) => {
+            const nextValue = event.currentTarget.value
+              .split(',')
+              .map((item) => item.trim())
+              .filter(Boolean);
+            updateStepField(selectedStep.id, field.key, nextValue);
+          }}
+        />
+      );
+    }
     if (control === 'select') {
       return (
         <Select
@@ -336,33 +567,81 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
   }
 
 
-  async function compileDocument() {
+  async function compileDocument(): Promise<WorkflowTemplateDefinition | null> {
+    const requestId = ++compileRequestRef.current;
+
     try {
       setCompileState('compiling');
       setCompileMessage('Compiling backend-defined workflow');
       const result: CompileWorkflowBuilderResponse = await compileWorkflowBuilderDocument(
-        buildBuilderDocument(steps, builderGlobals ?? initialDefinition?.globals ?? defaultGlobals(), governance)
+        buildBuilderDocument(steps, editableGlobals)
       );
+
+      if (requestId !== compileRequestRef.current) {
+        return null;
+      }
+
       if (!result.ok) {
         const message = result.errors.length > 0 ? result.errors.join('\n') : 'Workflow compilation failed.';
         setCompiledCapabilitySummary([]);
         setCompileState('error');
         setCompileMessage(message);
         onError?.(message);
-        return;
+        return null;
       }
+
       setCompiledCapabilitySummary(result.capability_summary ?? []);
-      onCompiledDefinitionChange(result.definition);
+      setEditableGlobals(structuredClone(result.definition.globals));
+      latestCompiledDefinitionRef.current = structuredClone(result.definition);
+      onCompiledDefinitionChange(structuredClone(result.definition));
       setCompileState('compiled');
       setCompileMessage(result.warnings.length > 0 ? result.warnings.join('\n') : 'Compiled successfully');
       onError?.(null);
+      return result.definition;
     } catch (error) {
+      if (requestId !== compileRequestRef.current) {
+        return null;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       setCompiledCapabilitySummary([]);
       setCompileState('error');
       setCompileMessage(message);
       onError?.(message);
+      return null;
     }
+  }
+
+  async function closeDeployQA() {
+    const definition = await compileDocument();
+    if (!definition) {
+      return;
+    }
+
+    setDeployQAOpen(false);
+  }
+
+  async function openDeployQA() {
+    if (deployQAValues) {
+      setDeployQAOpen(true);
+      return;
+    }
+
+    const definition = await compileDocument();
+    const values = deployQAValuesFromCapability(
+      definition?.globals.capabilities?.qa_environment
+    );
+
+    if (!values) {
+      onError?.(
+        `Invalid DeployQA capability configuration: ${JSON.stringify(
+          definition?.globals.capabilities?.qa_environment ?? null
+        )}`
+      );
+      return;
+    }
+
+    setDeployQAOpen(true);
   }
 
   useEffect(() => {
@@ -370,7 +649,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
       return;
     }
     void compileDocument();
-  }, [compileRevision, globalsRevision, builderGlobals]);
+  }, [compileRevision, globalsRevision]);
 
   if (loading) {
     return (
@@ -403,18 +682,20 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                   {compileState.toUpperCase()}
                 </Badge>
               </Group>
-              <Menu shadow="md" width={260}>
-                <Menu.Target>
-                  <Button variant="light">Add stage</Button>
-                </Menu.Target>
-                <Menu.Dropdown>
-                  {stageDescriptors.map((descriptor) => (
-                    <Menu.Item key={descriptor.step_type} onClick={() => addStep(descriptor.step_type)}>
-                      {descriptor.label}
-                    </Menu.Item>
-                  ))}
-                </Menu.Dropdown>
-              </Menu>
+              <Group gap="xs">
+                <Menu shadow="md" width={260}>
+                  <Menu.Target>
+                    <Button variant="light">Add stage</Button>
+                  </Menu.Target>
+                  <Menu.Dropdown>
+                    {stageDescriptors.map((descriptor) => (
+                      <Menu.Item key={descriptor.step_type} onClick={() => addStep(descriptor.step_type)}>
+                        {descriptor.label}
+                      </Menu.Item>
+                    ))}
+                  </Menu.Dropdown>
+                </Menu>
+              </Group>
             </Group>
 
             {compileMessage ? <Alert color={compileState === 'error' ? 'red' : 'blue'}>{compileMessage}</Alert> : null}
@@ -424,6 +705,17 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                 <Stack gap="xs">
                   <Text fw={600} size="sm">Capabilities invoked</Text>
                   <Group gap="xs">
+                    <Button
+                      variant="light"
+                      size="compact-xs"
+                      title="Configure workflow automation policies"
+                      onClick={() => {
+                        setAutomationStatus(null);
+                        setAutomationOpen(true);
+                      }}
+                    >
+                      Automation
+                    </Button>
                     {compiledCapabilitySummary.map((item) => {
                       const editable = isGlobalEditableCapability(item.key);
                       return (
@@ -436,9 +728,47 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                           onClick={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
-                            if (editable) {
-                              onOpenCapabilityConfig?.(item.key);
+
+                            if (!editable) {
+                              return;
                             }
+
+                            if (isDeployQACapability(item.key)) {
+                              const qaStep = steps.find((step) =>
+                                item.stage_ids.includes(step.id) && step.stepType === 'qa'
+                              ) ?? steps.find((step) => step.stepType === 'qa');
+
+                              if (qaStep) {
+                                setSelectedStepId(qaStep.id);
+                                void openDeployQA();
+                              }
+                              return;
+                            }
+
+                            if (isSharedDependenciesCapability(item.key)) {
+                              setSharedDependenciesOpen(true);
+                              return;
+                            }
+
+                            const configKey = canonicalCapabilityConfigKey(item.key);
+
+                            if (configKey === 'context_export' || configKey === 'inference') {
+                              onOpenCapabilityConfig?.(
+                                configKey,
+                                (value) => updateCapabilityConfig(configKey, value)
+                              );
+                              return;
+                            }
+
+                            const currentConfig = editableGlobals.capabilities?.[configKey] ?? {};
+
+                            setCapabilityConfigKey(configKey);
+                            setCapabilityConfigDraft(JSON.stringify(currentConfig, null, 2));
+                            setCapabilityConfigError(null);
+                            onOpenCapabilityConfig?.(
+                              configKey,
+                              (value) => updateCapabilityConfig(configKey, value)
+                            );
                           }}
                         >
                           {capabilityDisplayLabel(item.key)}
@@ -537,15 +867,22 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                   <Text size="sm" c="dimmed">
                     {selectedDescriptor.description || 'No description provided.'}
                   </Text>
-                  <Divider label="Editable parameters" />
-                  {selectedDescriptor.editable_fields.map((group) => (
+                  {selectedStep.stepType === 'qa' ? (
+                    <Button variant="light" onClick={() => void openDeployQA()}>
+                      Configure DeployQA
+                    </Button>
+                  ) : null}
+                  {selectedStep.stepType !== 'qa' ? <Divider label="Editable parameters" /> : null}
+                  {selectedStep.stepType !== 'qa' ? selectedDescriptor.editable_fields.map((group) => (
                     <Stack key={group.key} gap="xs">
                       <Text fw={600} size="sm">
                         {group.label}
                       </Text>
-                      {group.fields.map((field) => renderField(field, selectedStep.fields[field.key]))}
+                      {group.fields
+                        .filter((field) => workflowBuilderFieldVisible(field, selectedStep.fields))
+                        .map((field) => renderField(field, selectedStep.fields[field.key]))}
                     </Stack>
-                  ))}
+                  )) : null}
 
                   {selectedStageCapabilitySummary ? <Divider label="Execution plan summary" /> : null}
                   {selectedStageCapabilitySummary ? (
@@ -556,59 +893,189 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, onCom
                     </Alert>
                   ) : null}
 
-                  {Object.keys(governancePolicies).length > 0 ? <Divider label="Governance" /> : null}
-                  {Object.values(governancePolicies).map((descriptor) => {
-                    const config = governance[descriptor.key];
-                    const active = Boolean(config);
-                    return (
-                      <Stack key={descriptor.key} gap="xs">
-                        <Switch
-                          label={descriptor.label}
-                          description={descriptor.description}
-                          checked={active}
-                          onChange={(event) => {
-                            if (!event.currentTarget.checked) {
-                              updateGovernancePolicy(descriptor.key, null);
-                              return;
-                            }
-                            updateGovernancePolicy(
-                              descriptor.key,
-                              Object.fromEntries(descriptor.fields.map((field) => [field.key, field.default]))
-                            );
-                          }}
-                        />
-                        {active ? (
-                          <Group grow align="flex-start">
-                            {descriptor.fields.map((field) => {
-                              const currentValue = config?.[field.key] ?? field.default;
-                              return (
-                                <TextInput
-                                  key={`${descriptor.key}:${field.key}`}
-                                  label={field.label}
-                                  description={field.description}
-                                  placeholder={field.ui?.placeholder}
-                                  value={String(typeof currentValue === 'number' ? currentValue : Number(currentValue ?? 0) || 0)}
-                                  onChange={(event) => {
-                                    updateGovernancePolicy(descriptor.key, {
-                                      ...(config ?? {}),
-                                      [field.key]: Number(event.currentTarget.value || '0'),
-                                    });
-                                  }}
-                                />
-                              );
-                            })}
-                          </Group>
-                        ) : null}
-                      </Stack>
-                    );
-                  })}
-
                 </Stack>
               </ScrollArea>
             )}
           </Stack>
         </Card>
       </Box>
+      <Modal
+        opened={capabilityConfigKey !== null}
+        onClose={() => {
+          setCapabilityConfigKey(null);
+          setCapabilityConfigError(null);
+        }}
+        title={capabilityConfigKey
+          ? `${capabilityDisplayLabel(capabilityConfigKey)} capability`
+          : 'Capability'}
+        size="lg"
+        centered
+      >
+        <Stack gap="md">
+          <Text size="sm" c="dimmed">
+            Configure the workflow-level state for this capability. Stage definitions continue to determine which stages invoke or consume it.
+          </Text>
+
+          <JsonInput
+            label="Capability configuration"
+            value={capabilityConfigDraft}
+            onChange={setCapabilityConfigDraft}
+            validationError="Configuration must be valid JSON"
+            formatOnBlur
+            autosize
+            minRows={12}
+          />
+
+          {capabilityConfigError ? (
+            <Alert color="red">{capabilityConfigError}</Alert>
+          ) : null}
+
+          <Group justify="flex-end">
+            <Button
+              size="xs"
+              variant="default"
+              onClick={() => {
+                setCapabilityConfigKey(null);
+                setCapabilityConfigError(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="xs"
+              onClick={() => {
+                if (!capabilityConfigKey) {
+                  return;
+                }
+
+                try {
+                  const parsed = JSON.parse(capabilityConfigDraft) as unknown;
+                  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('Capability configuration must be a JSON object.');
+                  }
+
+                  const nextCapabilityConfig = structuredClone(parsed) as Record<string, unknown>;
+                  const configKey = capabilityConfigKey;
+
+                  updateCapabilityConfig(configKey, nextCapabilityConfig);
+                  setCapabilityConfigKey(null);
+                  setCapabilityConfigError(null);
+                } catch (error) {
+                  setCapabilityConfigError(
+                    error instanceof Error ? error.message : String(error)
+                  );
+                }
+              }}
+            >
+              Save
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={automationOpen}
+        onClose={() => {
+          if (!automationSaving) {
+            setAutomationOpen(false);
+            setAutomationStatus(null);
+          }
+        }}
+        title={
+          <Group gap="sm" wrap="nowrap">
+            <Text fw={600}>Automation</Text>
+            <Text size="sm" c="dimmed" fw={400}>
+              Choose which behaviors run automatically and when they should activate.
+            </Text>
+          </Group>
+        }
+        size="min(1120px, 94vw)"
+        centered
+        styles={{
+          content: { maxHeight: '92dvh' },
+          body: { overflow: 'hidden' },
+        }}
+      >
+        <Automation
+          value={automationProfile}
+          controls={automationControls}
+          invokedCapabilities={invokedAutomationCapabilities}
+          busy={automationSaving}
+          status={automationStatus}
+          onCancel={() => {
+            if (!automationSaving) {
+              setAutomationOpen(false);
+              setAutomationStatus(null);
+            }
+          }}
+          onSave={async (profile) => {
+            setAutomationSaving(true);
+            setAutomationStatus(null);
+
+            try {
+              const nextGlobals: WorkflowGlobalConfig = {
+                ...structuredClone(editableGlobals),
+                automation: structuredClone(profile),
+              };
+
+              const saved = await updateBuilderGlobals(
+                nextGlobals,
+                'Automation configuration changed'
+              );
+
+              if (!saved) {
+                setAutomationStatus('Unable to compile automation configuration.');
+                return;
+              }
+
+              setAutomationStatus('Saved');
+              setAutomationOpen(false);
+            } catch (error) {
+              setAutomationStatus(error instanceof Error ? error.message : String(error));
+            } finally {
+              setAutomationSaving(false);
+            }
+          }}
+        />
+      </Modal>
+
+      <SharedDependencies
+        opened={sharedDependenciesOpen}
+        value={sharedDependencies}
+        onClose={() => setSharedDependenciesOpen(false)}
+        onChange={(next) => {
+          updateCapabilityConfig(
+            'shared_dependencies',
+            structuredClone(next) as unknown as Record<string, unknown>,
+            'Shared dependency configuration changed'
+          );
+        }}
+      />
+
+      {selectedStep?.stepType === 'qa' && deployQAValues ? (
+        <DeployQA
+          opened={deployQAOpen}
+          onClose={() => {
+            void closeDeployQA();
+          }}
+          values={deployQAValues}
+          onChange={(key, value) => {
+            const nextValues: DeployQAValues = {
+              ...deployQAValues,
+              [key]: value,
+            };
+
+            updateCapabilityConfig(
+              'qa_environment',
+              deployQACapabilityFromValues(
+                nextValues,
+                editableGlobals.capabilities?.qa_environment
+              ),
+              'DeployQA capability configuration changed'
+            );
+          }}
+        />
+      ) : null}
     </Box>
   );
 }

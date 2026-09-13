@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -966,6 +967,119 @@ pub fn crawl_object_manifest(
     Ok(manifest)
 }
 
+fn app_root() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+}
+
+fn bundled_node() -> String {
+    if let Ok(value) = std::env::var("MDEV_NODE_EXECUTABLE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Some(root) = app_root() {
+        let candidate = if cfg!(target_os = "windows") {
+            root.join("runtime").join("node.exe")
+        } else {
+            root.join("runtime").join("node")
+        };
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "node".to_string()
+}
+
+fn adt_bridge_entrypoint(bridge_dir: &str) -> Result<(String, Vec<String>)> {
+    let root = Path::new(bridge_dir);
+    let dist_entry = root.join("dist").join("index.js");
+    if dist_entry.exists() {
+        return Ok((bundled_node(), vec![dist_entry.to_string_lossy().to_string()]));
+    }
+
+    let package_json = root.join("package.json");
+    if package_json.exists() {
+        let npm = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
+        return Ok((npm.to_string(), vec!["start".to_string()]));
+    }
+
+    Err(anyhow!("ADT bridge entrypoint not found under {}", root.display()))
+}
+
+fn mdev_data_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("MDEV_DATA_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(value) = std::env::var("LOCALAPPDATA") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(value) = std::env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("Library").join("Application Support").join("mdev");
+            }
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Ok(value) = std::env::var("XDG_DATA_HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("mdev");
+            }
+        }
+        if let Ok(value) = std::env::var("HOME") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join(".local").join("share").join("mdev");
+            }
+        }
+    }
+
+    std::env::temp_dir().join("mdev")
+}
+
+fn bundled_chromium_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(root) = app_root() {
+        let browsers = root.join("browsers");
+        #[cfg(target_os = "windows")]
+        let relative = PathBuf::from("chrome-win").join("chrome.exe");
+        #[cfg(target_os = "macos")]
+        let relative = PathBuf::from("chrome-mac").join("Chromium.app").join("Contents").join("MacOS").join("Chromium");
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let relative = PathBuf::from("chrome-linux").join("chrome");
+
+        if let Ok(entries) = std::fs::read_dir(&browsers) {
+            for entry in entries.flatten() {
+                out.push(entry.path().join(&relative));
+            }
+        }
+
+        out.push(browsers.join(&relative));
+    }
+    out
+}
+
 struct AdtBridgeClient {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -999,11 +1113,12 @@ impl AdtBridgeClient {
         self.stdin = None;
         self.stdout = None;
 
-        let npm = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
-        let mut child = Command::new(npm)
-            .arg("start")
+        let (program, args) = adt_bridge_entrypoint(bridge_dir)?;
+        let mut child = Command::new(&program)
+            .args(&args)
             .current_dir(bridge_dir)
             .env("ADT_HOST_URL", base_url)
+            .env("MDEV_BROWSER_USER_DATA_DIR", mdev_data_dir().join("browser-profile").to_string_lossy().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1117,6 +1232,19 @@ fn browser_profile_for_adt(sap: &SapAdtState) -> String {
 }
 
 fn browser_executable_for_adt() -> String {
+    if let Ok(value) = std::env::var("MDEV_BROWSER_EXECUTABLE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    for candidate in bundled_chromium_candidates() {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
     String::new()
 }
 

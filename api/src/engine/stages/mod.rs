@@ -2,50 +2,282 @@ mod code_stage;
 mod compile_stage;
 mod design_stage;
 mod review_stage;
+mod merge_patches_stage;
+mod qa_stage;
 mod sap_export_stage;
 mod sap_import_stage;
 mod sap_syntax_stage;
+mod stage_utility;
 
-use std::time::Instant;
+use std::{future::Future, pin::Pin, time::Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
+    engine::normalize_inference_arm_state,
     app_state::AppState,
-    engine::capabilities::inference::stage_support::{
-        build_inference_execution_plan,
-        InferenceStageSettings,
-    },
-    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowCapabilityBinding, WorkflowRun, WorkflowStepDefinition},
+    models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStageDescriptor, WorkflowStepDefinition},
 };
 
-use super::capabilities::{execute_capability_invocations, CapabilityContext, CapabilityInvocation};
-use super::governance;
+use super::capabilities::{
+    execute_capability_invocations,
+    planner,
+    registry::CapabilityResult,
+    CapabilityContext,
+    CapabilityInvocation,
+};
+use super::automation::{self, AutomationDecision};
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
-#[allow(dead_code)]
+pub struct StageRegistration {
+    implementation: &'static dyn Stage,
+}
+
+impl StageRegistration {
+    pub const fn new(implementation: &'static dyn Stage) -> Self {
+        Self { implementation }
+    }
+}
+
+inventory::collect!(StageRegistration);
+
+fn stage_registry() -> &'static std::collections::HashMap<&'static str, &'static dyn Stage> {
+    static REGISTRY: std::sync::OnceLock<
+        std::collections::HashMap<&'static str, &'static dyn Stage>,
+    > = std::sync::OnceLock::new();
+
+    REGISTRY.get_or_init(|| {
+        let mut stages = std::collections::HashMap::new();
+
+        for registration in inventory::iter::<StageRegistration> {
+            let stage = registration.implementation;
+            let stage_type = stage.stage_type();
+
+            if stages.insert(stage_type, stage).is_some() {
+                panic!("duplicate stage type registered: {stage_type}");
+            }
+        }
+
+        stages
+    })
+}
+
+pub(crate) fn registered_stage_descriptors() -> Vec<WorkflowStageDescriptor> {
+    let _ = stage_registry();
+    let mut descriptors = inventory::iter::<StageRegistration>
+        .into_iter()
+        .map(|registration| registration.implementation.descriptor())
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|left, right| left.step_type.cmp(&right.step_type));
+    descriptors
+}
+
+pub struct StagePrepareContext<'a> {
+    pub repo_ref: &'a str,
+    pub global_state: &'a Value,
+    pub step: &'a WorkflowStepDefinition,
+}
+
+pub struct StagePlanContext<'a> {
+    pub run: &'a mut WorkflowRun,
+    pub automatic_execution: bool,
+    pub global_state: &'a Value,
+    pub repo_ref: &'a str,
+    pub step: &'a WorkflowStepDefinition,
+    pub local_state: &'a Value,
+}
+
+pub trait Stage: Send + Sync {
+    fn stage_type(&self) -> &'static str;
+
+    fn descriptor(&self) -> WorkflowStageDescriptor;
+
+    fn capabilities(&self) -> StageCapabilities;
+
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn automation_after_capability(
+        &self,
+        _run: &WorkflowRun,
+        _step: &WorkflowStepDefinition,
+        _result: &CapabilityResult,
+        _prior_results: &[CapabilityResult],
+    ) -> Result<Vec<AutomationDecision>> {
+        Ok(Vec::new())
+    }
+
+    fn prepare_state(
+        &self,
+        context: StagePrepareContext<'_>,
+        local_state: Value,
+    ) -> Result<Value>;
+
+    fn build_execution_plan(
+        &self,
+        context: StagePlanContext<'_>,
+    ) -> Result<Vec<StageExecutionNode>>;
+
+    fn lifecycle_hook(&self) -> Box<dyn StageLifecycleHook> {
+        Box::new(NoopStageLifecycleHook)
+    }
+}
+
+fn stage_for_step(step: &WorkflowStepDefinition) -> &'static dyn Stage {
+    let registry = stage_registry();
+
+    registry
+        .get(step.step_type.as_str())
+        .copied()
+        .or_else(|| registry.get("design").copied())
+        .expect("design stage must be registered")
+}
+
+pub(crate) fn automation_policy_keys_for_stage_type(stage_type: &str) -> &'static [&'static str] {
+    stage_registry()
+        .get(stage_type)
+        .map(|stage| stage.automation_policy_keys())
+        .unwrap_or(&[])
+}
+
+pub(crate) fn automation_after_capability(
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+    result: &CapabilityResult,
+    prior_results: &[CapabilityResult],
+) -> Result<Vec<AutomationDecision>> {
+    stage_for_step(step).automation_after_capability(run, step, result, prior_results)
+}
+
 #[derive(Debug, Clone)]
-pub enum StageDisposition {
+pub enum StageStatus {
     Success,
     Error,
     ErrorCode(String),
     Paused,
-    RetryStage,
-    MoveNext,
-    MoveBack,
     Outcome(String),
     Stay,
 }
 
 #[derive(Debug, Clone)]
+pub enum StageTransition {
+    MoveNext,
+    MoveBack,
+    RetryStage,
+    Stay,
+    Stop,
+    Target(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct StageOutcome {
     pub ok: bool,
-    pub disposition: StageDisposition,
+    pub status: StageStatus,
+    pub transition: StageTransition,
     pub message: String,
     pub capability_results: Vec<Value>,
     pub local_state: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct StageCapabilities {
+    keys: Vec<&'static str>,
+}
+
+impl StageCapabilities {
+    pub fn new<const N: usize>(keys: [&'static str; N]) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.iter().any(|item| *item == key)
+    }
+
+    pub fn keys(&self) -> &[&'static str] {
+        &self.keys
+    }
+}
+
+pub fn configured_execution_plan(step: &WorkflowStepDefinition) -> Vec<StageExecutionNode> {
+    if !step.execution_plan.is_empty() {
+        return step.execution_plan.clone();
+    }
+
+    step.capabilities
+        .iter()
+        .filter(|binding| binding.enabled)
+        .map(|binding| StageExecutionNode {
+            kind: StageExecutionNodeKind::Capability,
+            key: binding.capability.clone(),
+            enabled: true,
+            config: binding.config.clone(),
+            input_mapping: binding.input_mapping.clone(),
+            output_mapping: binding.output_mapping.clone(),
+            run_after: Vec::new(),
+            condition: Value::Null,
+        })
+        .collect()
+}
+
+pub fn user_input_node(
+    message: &str,
+    run_after: Vec<String>,
+) -> StageExecutionNode {
+    StageExecutionNode {
+        kind: StageExecutionNodeKind::Capability,
+        key: "operator_checkpoint".to_string(),
+        enabled: true,
+        config: json!({
+            "message": message,
+            "recommended_disposition": "continue_auto",
+            "available_dispositions": ["continue_auto", "pause_error", "select_stage"]
+        }),
+        input_mapping: json!({}),
+        output_mapping: json!({}),
+        run_after,
+        condition: Value::Null,
+    }
+}
+
+fn capability_results_to_values(results: Vec<CapabilityResult>) -> Vec<Value> {
+    results
+        .into_iter()
+        .map(|item| {
+            let consumed_capabilities = item
+                .payload
+                .get("consumed_capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+
+            json!({
+                "key": item.capability,
+                "ok": item.ok,
+                "result": item.payload,
+                "consumed_capabilities": consumed_capabilities
+            })
+        })
+        .collect()
+}
+
+pub fn capability_contract_for_stage(step: &WorkflowStepDefinition) -> StageCapabilities {
+    stage_for_step(step).capabilities()
+}
+
+pub fn stage_supports_capability(
+    step: &WorkflowStepDefinition,
+    capability: &str,
+) -> bool {
+    capability_contract_for_stage(step).contains(capability)
 }
 
 fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -55,7 +287,18 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) {
+pub fn rearm_session_scoped_inference_inputs(
+    run: &mut WorkflowRun,
+    _step: &WorkflowStepDefinition,
+) {
+    normalize_inference_arm_state(run);
+    crate::engine::automation::apply_trigger(
+        run,
+        crate::engine::automation::AutomationTrigger::NewInferenceSession,
+    );
+}
+
+fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) -> bool {
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
     let global_state_obj = ensure_value_object(global_state);
@@ -67,6 +310,32 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         .entry("inference".to_string())
         .or_insert_with(|| json!({}));
     let inference_obj = ensure_value_object(inference);
+
+    inference_obj.remove("next_prompt_fragments");
+    inference_obj.remove("active_prompt_fragments");
+
+    if let Some(enabled) = inference_obj
+        .get_mut("prompt_fragment_enabled")
+        .and_then(Value::as_object_mut)
+    {
+        enabled.remove("apply_error");
+        enabled.remove("compile_error");
+        if enabled.is_empty() {
+            inference_obj.remove("prompt_fragment_enabled");
+        }
+    }
+
+    if let Some(fragments) = inference_obj
+        .get_mut("prompt_fragments")
+        .and_then(Value::as_object_mut)
+    {
+        fragments.remove("apply_error");
+        fragments.remove("compile_error");
+        if fragments.is_empty() {
+            inference_obj.remove("prompt_fragments");
+        }
+    }
+
     let connection_runtime = inference_obj
         .entry("connection_runtime".to_string())
         .or_insert_with(|| json!({}));
@@ -80,7 +349,7 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         .to_string();
 
     if persisted_process_session_id == current_process_session_id {
-        return;
+        return false;
     }
 
     connection_runtime_obj.clear();
@@ -89,45 +358,11 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
         Value::String(current_process_session_id),
     );
 
-    inference_obj.remove("next_prompt_fragments");
-    inference_obj.remove("active_prompt_fragments");
+    true
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
-    let mut run = crate::engine::load_run(state, run_id).await?;
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = global_state
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("global_state must be object"))?;
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = ensure_value_object(inference);
-
-    {
-        let enabled = inference_obj
-            .entry("prompt_fragment_enabled".to_string())
-            .or_insert_with(|| json!({}));
-        let enabled_obj = ensure_value_object(enabled);
-        enabled_obj.insert("apply_error".to_string(), Value::Bool(false));
-        enabled_obj.insert("compile_error".to_string(), Value::Bool(false));
-    }
-
-    {
-        let fragments = inference_obj
-            .entry("prompt_fragments".to_string())
-            .or_insert_with(|| json!({}));
-        let fragments_obj = ensure_value_object(fragments);
-        fragments_obj.remove("apply_error");
-        fragments_obj.remove("compile_error");
-    }
-
-    persist_context(state, run_id, &run.context).await?;
+    state.orchestration_inputs.clear_run(run_id);
     Ok(())
 }
 
@@ -163,17 +398,94 @@ fn record_stage_execution_id(context: &mut Value, stage_execution_id: &str) {
     }
 }
 
+pub struct StageExitContext<'a> {
+    pub state: &'a AppState,
+    pub run_id: Uuid,
+    pub step: &'a WorkflowStepDefinition,
+    pub next_step_id: Option<&'a str>,
+}
+
+pub trait StageLifecycleHook: Send + Sync {
+    fn on_restart<'a>(
+        &'a self,
+        _context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_exit<'a>(
+        &'a self,
+        context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+struct NoopStageLifecycleHook;
+
+impl StageLifecycleHook for NoopStageLifecycleHook {
+    fn on_exit<'a>(
+        &'a self,
+        _context: StageExitContext<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub fn lifecycle_hook_for_step(step: &WorkflowStepDefinition) -> Box<dyn StageLifecycleHook> {
+    stage_for_step(step).lifecycle_hook()
+}
+
+
+pub async fn invoke_stage_restart_hook(
+    state: &AppState,
+    run_id: Uuid,
+    step: &WorkflowStepDefinition,
+) -> Result<()> {
+    lifecycle_hook_for_step(step)
+        .on_restart(StageExitContext {
+            state,
+            run_id,
+            step,
+            next_step_id: Some(step.id.as_str()),
+        })
+        .await
+}
+
+pub async fn invoke_stage_exit_hook(
+    state: &AppState,
+    run_id: Uuid,
+    step: &WorkflowStepDefinition,
+    next_step_id: Option<&str>,
+) -> Result<()> {
+    lifecycle_hook_for_step(step)
+        .on_exit(StageExitContext {
+            state,
+            run_id,
+            step,
+            next_step_id,
+        })
+        .await
+}
+
 pub async fn execute_stage(
     state: &AppState,
     run_id: Uuid,
     run: &mut WorkflowRun,
     step: &WorkflowStepDefinition,
     automatic_execution: bool,
+    cancellation: CancellationToken,
 ) -> Result<StageOutcome> {
-    let stage_execution_id = format!("{}-{}", sanitize_stage_execution_prefix(&step.step_type), Uuid::new_v4());
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
+    let stage_execution_id = format!(
+        "{}-{}",
+        sanitize_stage_execution_prefix(&step.step_type),
+        Uuid::new_v4()
+    );
     let stage_started_at = Instant::now();
 
     reset_session_scoped_inference_state(state, run);
+    crate::engine::clear_prepared_inference_step(run);
 
     append_engine_event(
         state,
@@ -190,21 +502,17 @@ pub async fn execute_stage(
     )
     .await?;
 
-    let before_decisions = governance::before_stage(state, run_id, run, step).await?;
-    governance::apply_context_mutations(run, &before_decisions, Some(step.id.as_str()), None)?;
-    if let Some(message) = governance::pause_message(&before_decisions) {
-        persist_context(state, run_id, &run.context).await?;
-        return Ok(StageOutcome {
-            ok: false,
-            disposition: StageDisposition::Paused,
-            message,
-            capability_results: Vec::new(),
-            local_state: json!({}),
-        });
-    }
-
+    let supervisor_context = run.context.get("supervisor").cloned();
     let root = ensure_engine_root(&mut run.context);
-    let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
+    let mut global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
+    if let Some(supervisor_context) = supervisor_context {
+        if !global_state.is_object() {
+            global_state = json!({});
+        }
+        if let Some(global_obj) = global_state.as_object_mut() {
+            global_obj.insert("supervisor".to_string(), supervisor_context);
+        }
+    }
     let existing_local_state = root
         .get("stage_overrides")
         .and_then(Value::as_object)
@@ -227,6 +535,16 @@ pub async fn execute_stage(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(run.repo_ref.as_str())
         .to_string();
+
+    planner::apply_repo_planner_capability(&state.db, &mut global_state, repo_ref.as_str()).await?;
+    root.insert("global_state".to_string(), global_state.clone());
+
+    let mut execution_global_state = global_state.clone();
+    planner::hydrate_repo_planner_prompt_fragment(
+        &state.db,
+        &mut execution_global_state,
+    )
+    .await?;
 
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
@@ -252,19 +570,105 @@ pub async fn execute_stage(
         }),
     );
 
-    let prepared_local_state = prepare_stage_local_state(repo_ref.as_str(), &global_state, step, local_state)?;
-    let plan = resolve_effective_execution_plan(&global_state, repo_ref.as_str(), step, &prepared_local_state)?;
+    let prepared_local_state = prepare_stage_local_state(
+        repo_ref.as_str(),
+        &execution_global_state,
+        step,
+        local_state,
+    )?;
+    if step.step_type == "merge_patches" {
+        return merge_patches_stage::execute_stage(
+            state,
+            run_id,
+            run,
+            step,
+            repo_ref.as_str(),
+            prepared_local_state,
+        )
+        .await;
+    }
+    let plan = resolve_effective_execution_plan(
+        run,
+        automatic_execution,
+        &execution_global_state,
+        repo_ref.as_str(),
+        step,
+        &prepared_local_state,
+    )?;
+    persist_context(state, run_id, &run.context).await?;
     let prepared_local_state_obj = prepared_local_state
         .as_object()
         .ok_or_else(|| anyhow!("prepared stage local state must be object"))?;
 
     let execution_local_state = materialize_capability_runtime_state(prepared_local_state.clone(), &global_state, repo_ref.as_str());
-    let capability_results = run_capability_plan(state, run_id, repo_ref.as_str(), step, &execution_local_state, &plan).await?;
+    let capability_results = match run_capability_plan(
+        state,
+        run_id,
+        repo_ref.as_str(),
+        step,
+        &execution_local_state,
+        &plan,
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            let cancelled = cancellation.is_cancelled();
+            append_engine_event(
+                state,
+                run_id,
+                Some(step.id.as_str()),
+                "error",
+                "stage_execution_failed",
+                if cancelled {
+                    "Stage execution was cancelled"
+                } else {
+                    "Stage execution failed"
+                },
+                json!({
+                    "step_id": step.id,
+                    "step_type": step.step_type,
+                    "ok": false,
+                    "cancelled": cancelled,
+                    "execution_state": "failed",
+                    "message": error.to_string(),
+                    "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
+                }),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+
+    if cancellation.is_cancelled() {
+        append_engine_event(
+            state,
+            run_id,
+            Some(step.id.as_str()),
+            "error",
+            "stage_execution_failed",
+            "Stage execution was cancelled",
+            json!({
+                "step_id": step.id,
+                "step_type": step.step_type,
+                "ok": false,
+                "cancelled": true,
+                "execution_state": "failed",
+                "message": "workflow execution was cancelled",
+                "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+                "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
+            }),
+        )
+        .await?;
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
     let capability_failed = capability_results
         .iter()
         .any(|item| item.get("ok").and_then(Value::as_bool) == Some(false));
 
-    let after_decisions = governance::after_stage(
+    let after_decisions = automation::after_stage(
         state,
         run_id,
         run,
@@ -279,19 +683,49 @@ pub async fn execute_stage(
         .unwrap_or_else(|_| run.clone());
     run.context = latest_persisted_run.context;
 
-    governance::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
+    automation::apply_context_mutations(run, &after_decisions, Some(step.id.as_str()), None)?;
 
-    let branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
+    let mut branch = resolve_stage_branch(step, &prepared_local_state, capability_failed, &capability_results);
 
-    if let Some(message) = governance::pause_message(&after_decisions) {
-        persist_context(state, run_id, &run.context).await?;
-        return Ok(StageOutcome {
-            ok: false,
-            disposition: StageDisposition::Paused,
-            message,
-            capability_results,
-            local_state: Value::Object(prepared_local_state_obj.clone()),
-        });
+    if let Some(checkpoint) = capability_results
+        .iter()
+        .rev()
+        .find(|item| item.get("key").and_then(Value::as_str) == Some("operator_checkpoint"))
+        .and_then(|item| item.get("result"))
+    {
+        match checkpoint.get("disposition").and_then(Value::as_str) {
+            Some("pause_error") => {
+                branch = StageBranch {
+                    status: StageStatus::Paused,
+                    transition: StageTransition::Stay,
+                    message: checkpoint
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Workflow paused at operator checkpoint.")
+                        .to_string(),
+                    patch: None,
+                };
+            }
+            Some("select_stage") => {
+                if let Some(target) = checkpoint
+                    .get("selected_step_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    branch = StageBranch {
+                        status: StageStatus::Paused,
+                        transition: StageTransition::Target(target.to_string()),
+                        message: format!("Operator selected workflow stage '{}' and paused the workflow.", target),
+                        patch: None,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if automation::pause_message(&after_decisions).is_some() {
+        super::runtime::request_run_pause_after_stage(run)?;
     }
 
     {
@@ -327,7 +761,8 @@ pub async fn execute_stage(
 
     let outcome = StageOutcome {
         ok: !capability_failed,
-        disposition: branch.disposition.clone(),
+        status: branch.status.clone(),
+        transition: branch.transition.clone(),
         message: branch.message.clone(),
         capability_results: capability_results.clone(),
         local_state: prepared_local_state,
@@ -344,9 +779,11 @@ pub async fn execute_stage(
             "step_id": step.id,
             "step_type": step.step_type,
             "ok": outcome.ok,
+            "execution_state": "completed",
             "message": outcome.message,
-            "disposition": format_disposition(&outcome.disposition),
-            "duration_ms": i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "status": format_stage_status(&outcome.status),
+            "transition": format_stage_transition(&outcome.transition),
+            "duration_ms": json!(i64::try_from(stage_started_at.elapsed().as_millis()).unwrap_or(i64::MAX)),
             "capability_results": outcome.capability_results,
             "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
         }),
@@ -362,20 +799,20 @@ fn prepare_stage_local_state(
     step: &WorkflowStepDefinition,
     local_state: Value,
 ) -> Result<Value> {
-    match step.step_type.as_str() {
-        "code" => code_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
-        "compile" => compile_stage::prepare_stage_state(step, local_state),
-        "review" => review_stage::prepare_stage_state(step, local_state),
-        "sap_import" => sap_import_stage::prepare_stage_state(step, local_state),
-        "sap_syntax" => sap_syntax_stage::prepare_stage_state(step, local_state),
-        "sap_export" => sap_export_stage::prepare_stage_state(step, local_state),
-        _ => design_stage::prepare_stage_state(repo_ref, global_state, step, local_state),
-    }
+    stage_for_step(step).prepare_state(
+        StagePrepareContext {
+            repo_ref,
+            global_state,
+            step,
+        },
+        local_state,
+    )
 }
 
 #[derive(Debug, Clone)]
 struct StageBranch {
-    disposition: StageDisposition,
+    status: StageStatus,
+    transition: StageTransition,
     message: String,
     patch: Option<Value>,
 }
@@ -398,17 +835,18 @@ fn resolve_stage_branch(
         .unwrap_or_else(|| Value::Object(Map::new()));
 
     let patch = build_branch_patch(step, &branch, capability_results);
-
-    let disposition = parse_stage_disposition(step, branch_key, &branch, capability_failed);
+    let status = parse_stage_status(&branch, capability_failed);
+    let transition = parse_stage_transition(&branch, &status, capability_failed);
 
     StageBranch {
-        disposition: disposition.clone(),
+        status: status.clone(),
+        transition: transition.clone(),
         message: branch
             .get("message")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| default_branch_message(step, capability_failed, &disposition)),
+            .unwrap_or_else(|| default_branch_message(step, capability_failed, &status, &transition)),
         patch,
     }
 }
@@ -423,11 +861,9 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
     let mode = descriptor.get("mode").and_then(Value::as_str).unwrap_or("");
 
     match (step.step_type.as_str(), capability, mode) {
-        ("compile", "compile_commands", "compile_error_to_code_prompt") => {
-            Some(compile_stage::build_compile_error_patch(capability_results))
-        }
-        ("code", "gateway_model/changeset", "apply_error_to_code_prompt") => {
-            Some(code_stage::build_apply_error_patch(capability_results))
+        ("code", "changeset", "apply_error_to_code_prompt") => None,
+        ("review", "review_validation", "review_failure_to_code_prompt") => {
+            Some(review_stage::build_review_failure_patch(capability_results))
         }
         ("sap_syntax", "sap/export", "sap_syntax_success_state") => {
             Some(sap_syntax_stage::build_sap_syntax_success_patch(capability_results))
@@ -442,72 +878,108 @@ fn build_branch_patch(step: &WorkflowStepDefinition, branch: &Value, capability_
     }
 }
 
-fn parse_stage_disposition(
-    step: &WorkflowStepDefinition,
-    branch_key: &str,
+fn parse_stage_status(
     branch: &Value,
     capability_failed: bool,
-) -> StageDisposition {
-    let disposition = branch
-        .get("disposition")
+) -> StageStatus {
+    let explicit = branch
+        .get("status")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if capability_failed {
-                "error"
-            } else {
-                "success"
-            }
+        .or_else(|| {
+            branch
+                .get("disposition")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "success" | "error" | "paused" | "stay" | "outcome" | "error_code"))
         });
 
-    match disposition {
-        "success" => StageDisposition::Success,
-        "error" => StageDisposition::Error,
-        "paused" => StageDisposition::Paused,
-        "retry_stage" => StageDisposition::RetryStage,
-        "stay" => StageDisposition::Stay,
-        "move_next" => StageDisposition::MoveNext,
-        "move_back" => StageDisposition::MoveBack,
+    match explicit.unwrap_or(if capability_failed { "error" } else { "success" }) {
+        "success" => StageStatus::Success,
+        "error" => StageStatus::Error,
+        "paused" => StageStatus::Paused,
+        "stay" => StageStatus::Stay,
         "outcome" => branch
             .get("name")
             .and_then(Value::as_str)
-            .map(|value| StageDisposition::Outcome(value.to_string()))
-            .unwrap_or(StageDisposition::Stay),
+            .map(|value| StageStatus::Outcome(value.to_string()))
+            .unwrap_or(StageStatus::Stay),
         "error_code" => branch
             .get("code")
             .and_then(Value::as_str)
-            .map(|value| StageDisposition::ErrorCode(value.to_string()))
-            .unwrap_or(StageDisposition::Error),
+            .map(|value| StageStatus::ErrorCode(value.to_string()))
+            .unwrap_or(StageStatus::Error),
         _ => {
             if capability_failed {
-                StageDisposition::Error
+                StageStatus::Error
             } else {
-                StageDisposition::Success
+                StageStatus::Success
             }
         }
+    }
+}
+
+fn parse_stage_transition(
+    branch: &Value,
+    status: &StageStatus,
+    capability_failed: bool,
+) -> StageTransition {
+    let explicit = branch
+        .get("transition")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            branch
+                .get("disposition")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "move_next" | "move_back" | "retry_stage" | "stay"))
+        });
+
+    match explicit {
+        Some("move_next") => StageTransition::MoveNext,
+        Some("move_back") => StageTransition::MoveBack,
+        Some("retry_stage") => StageTransition::RetryStage,
+        Some("stay") => StageTransition::Stay,
+        Some("stop") => StageTransition::Stop,
+        Some("target") => branch
+            .get("target_step_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| StageTransition::Target(value.to_string()))
+            .unwrap_or(StageTransition::Stay),
+        _ => match status {
+            StageStatus::Paused | StageStatus::Stay => StageTransition::Stay,
+            StageStatus::Error | StageStatus::ErrorCode(_) if capability_failed => StageTransition::Stop,
+            StageStatus::Success | StageStatus::Outcome(_) | StageStatus::Error | StageStatus::ErrorCode(_) => StageTransition::Stop,
+        },
     }
 }
 
 fn default_branch_message(
     step: &WorkflowStepDefinition,
     capability_failed: bool,
-    disposition: &StageDisposition,
+    status: &StageStatus,
+    transition: &StageTransition,
 ) -> String {
-    match disposition {
-        StageDisposition::Paused => format!("{} stage completed and is paused.", step.name),
-        StageDisposition::RetryStage => format!("{} stage requires a retry.", step.name),
-        StageDisposition::MoveNext => format!("{} stage requested move next.", step.name),
-        StageDisposition::MoveBack => format!("{} stage requested move back.", step.name),
-        StageDisposition::Outcome(name) => format!("{} stage completed with outcome '{}'.", step.name, name),
-        StageDisposition::Stay => format!("{} stage completed and remains active.", step.name),
-        StageDisposition::ErrorCode(code) => format!("{} stage failed with code '{}'.", step.name, code),
-        StageDisposition::Error => format!("{} stage failed during backend workflow execution.", step.name),
-        StageDisposition::Success => {
+    let status_message = match status {
+        StageStatus::Success => {
             if capability_failed {
                 format!("{} stage failed during backend workflow execution.", step.name)
             } else {
-                format!("{} stage completed successfully through backend workflow engine.", step.name)
+                format!("{} stage completed successfully.", step.name)
             }
         }
+        StageStatus::Error => format!("{} stage failed during backend workflow execution.", step.name),
+        StageStatus::ErrorCode(code) => format!("{} stage failed with code '{}'.", step.name, code),
+        StageStatus::Paused => format!("{} stage completed with paused status.", step.name),
+        StageStatus::Outcome(name) => format!("{} stage completed with outcome '{}'.", step.name, name),
+        StageStatus::Stay => format!("{} stage completed with stay status.", step.name),
+    };
+
+    match transition {
+        StageTransition::MoveNext => format!("{} Transition: move next.", status_message),
+        StageTransition::MoveBack => format!("{} Transition: move back.", status_message),
+        StageTransition::RetryStage => format!("{} Transition: retry stage.", status_message),
+        StageTransition::Stay => format!("{} Transition: stay on current stage.", status_message),
+        StageTransition::Stop => format!("{} Transition: stop.", status_message),
+        StageTransition::Target(target) => format!("{} Transition: route to '{}'.", status_message, target),
     }
 }
 
@@ -518,7 +990,12 @@ async fn run_capability_plan(
     step: &WorkflowStepDefinition,
     local_state: &Value,
     plan: &[StageExecutionNode],
+    cancellation: CancellationToken,
 ) -> Result<Vec<Value>> {
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("workflow execution was cancelled"));
+    }
+
     let queue = plan
         .iter()
         .filter(|node| node.enabled && node.kind == StageExecutionNodeKind::Capability)
@@ -538,19 +1015,12 @@ async fn run_capability_plan(
         repo_ref,
         step,
         local_state,
+        cancellation,
+        capability_invocation_id: None,
     };
 
     let results = execute_capability_invocations(ctx, queue).await?;
-    Ok(results
-        .into_iter()
-        .map(|item| {
-            json!({
-                "key": item.capability,
-                "ok": item.ok,
-                "result": item.payload
-            })
-        })
-        .collect())
+    Ok(capability_results_to_values(results))
 }
 
 fn materialize_capability_runtime_state(stage_state: Value, global_state: &Value, repo_ref: &str) -> Value {
@@ -601,75 +1071,30 @@ fn materialize_capability_runtime_state(stage_state: Value, global_state: &Value
 }
 
 fn resolve_effective_execution_plan(
+    run: &mut WorkflowRun,
+    automatic_execution: bool,
     global_state: &Value,
     repo_ref: &str,
     step: &WorkflowStepDefinition,
     local_state: &Value,
 ) -> Result<Vec<StageExecutionNode>> {
-    match step.step_type.as_str() {
-        "code" => build_inference_execution_plan(
-            repo_ref,
-            global_state,
-            step,
-            local_state,
-            InferenceStageSettings {
-                include_changeset_schema: step.prompt.include_changeset_schema,
-            },
-        ),
-        "design" => build_inference_execution_plan(
-            repo_ref,
-            global_state,
-            step,
-            local_state,
-            InferenceStageSettings {
-                include_changeset_schema: false,
-            },
-        ),
-        "compile" => Ok(vec![StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: "compile_commands".to_string(),
-            enabled: true,
-            config: json!({}),
-            input_mapping: json!({}),
-            output_mapping: json!({}),
-            run_after: vec![],
-            condition: Value::Null,
-        }]),
-        _ => {
-            if !step.execution_plan.is_empty() {
-                Ok(step.execution_plan.clone())
-            } else {
-                Ok(synthesize_execution_plan(&step.capabilities))
-            }
-        }
-    }
-}
-
-fn synthesize_execution_plan(bindings: &[WorkflowCapabilityBinding]) -> Vec<StageExecutionNode> {
-    bindings
-        .iter()
-        .filter(|binding| binding.enabled)
-        .map(|binding| StageExecutionNode {
-            kind: StageExecutionNodeKind::Capability,
-            key: binding.capability.clone(),
-            enabled: true,
-            config: binding.config.clone(),
-            input_mapping: binding.input_mapping.clone(),
-            output_mapping: binding.output_mapping.clone(),
-            run_after: Vec::new(),
-            condition: Value::Null,
-        })
-        .collect()
+    stage_for_step(step).build_execution_plan(StagePlanContext {
+        run,
+        automatic_execution,
+        global_state,
+        repo_ref,
+        step,
+        local_state,
+    })
 }
 
 pub(crate) fn compose_prompt_from_state(
     enabled: &Value,
     fragments: &Value,
-    transient_fragments: &[String],
 ) -> String {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
-    let order = ["user_input", "repo_context", "changeset_schema"];
+    let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
 
     let mut parts = Vec::new();
     for key in order {
@@ -683,26 +1108,27 @@ pub(crate) fn compose_prompt_from_state(
         }
     }
 
-    for value in transient_fragments {
-        let value = value.trim();
-        if !value.is_empty() {
-            parts.push(value.to_string());
-        }
-    }
-
     parts.join("\n\n")
 }
 
-fn format_disposition(disposition: &StageDisposition) -> String {
-    match disposition {
-        StageDisposition::Success => "success".to_string(),
-        StageDisposition::Error => "error".to_string(),
-        StageDisposition::ErrorCode(code) => format!("error_code:{}", code),
-        StageDisposition::Paused => "paused".to_string(),
-        StageDisposition::RetryStage => "retry_stage".to_string(),
-        StageDisposition::MoveNext => "move_next".to_string(),
-        StageDisposition::MoveBack => "move_back".to_string(),
-        StageDisposition::Outcome(name) => format!("outcome:{}", name),
-        StageDisposition::Stay => "stay".to_string(),
+fn format_stage_status(status: &StageStatus) -> String {
+    match status {
+        StageStatus::Success => "success".to_string(),
+        StageStatus::Error => "error".to_string(),
+        StageStatus::ErrorCode(code) => format!("error_code:{}", code),
+        StageStatus::Paused => "paused".to_string(),
+        StageStatus::Outcome(name) => format!("outcome:{}", name),
+        StageStatus::Stay => "stay".to_string(),
+    }
+}
+
+fn format_stage_transition(transition: &StageTransition) -> String {
+    match transition {
+        StageTransition::MoveNext => "move_next".to_string(),
+        StageTransition::MoveBack => "move_back".to_string(),
+        StageTransition::RetryStage => "retry_stage".to_string(),
+        StageTransition::Stay => "stay".to_string(),
+        StageTransition::Stop => "stop".to_string(),
+        StageTransition::Target(target) => format!("target:{}", target),
     }
 }

@@ -27,13 +27,7 @@ pub async fn resolve_workflow_scope(
     let global_state = root.get("global_state").cloned().unwrap_or_else(|| json!({}));
     let repo_resource = global_state.get("resources").and_then(|value| value.get("repo"));
 
-    let repo_ref = repo_resource
-        .and_then(|value| value.get("repo_ref"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(run.repo_ref.as_str())
-        .trim()
-        .to_string();
+    let repo_ref = run.repo_ref.clone();
 
     if repo_ref.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "workflow has no repo resource".to_string()));

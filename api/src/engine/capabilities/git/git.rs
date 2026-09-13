@@ -50,28 +50,107 @@ pub fn generate_git_apply_patch(
 ) -> Result<String> {
     ensure_git_repo(repo)?;
 
-    let mut args: Vec<String> = vec!["diff".to_string(), "--binary".to_string()];
-
-    if let Some(context_lines) = context_lines {
-        args.push(format!("--unified={context_lines}"));
-    }
-
     match scope {
-        GitPatchScope::Staged => args.push("--cached".to_string()),
-        GitPatchScope::Unstaged => {}
-        GitPatchScope::Both => args.push("HEAD".to_string()),
-    }
+        GitPatchScope::Both => generate_git_apply_patch_with_untracked(repo, paths, context_lines),
+        GitPatchScope::Staged | GitPatchScope::Unstaged => {
+            let mut args: Vec<String> = vec!["diff".to_string(), "--binary".to_string()];
 
-    if let Some(paths) = paths {
-        if !paths.is_empty() {
-            args.push("--".to_string());
-            args.extend(paths.iter().cloned());
+            if let Some(context_lines) = context_lines {
+                args.push(format!("--unified={context_lines}"));
+            }
+
+            match scope {
+                GitPatchScope::Staged => args.push("--cached".to_string()),
+                GitPatchScope::Unstaged => {}
+                GitPatchScope::Both => unreachable!(),
+            }
+
+            if let Some(paths) = paths {
+                if !paths.is_empty() {
+                    args.push("--".to_string());
+                    args.extend(paths.iter().cloned());
+                }
+            }
+
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = run_git(repo, &arg_refs)?;
+            String::from_utf8(out).context("git diff output was not valid UTF-8")
         }
     }
+}
 
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_git(repo, &arg_refs)?;
-    String::from_utf8(out).context("git diff output was not valid UTF-8")
+fn generate_git_apply_patch_with_untracked(
+    repo: &Path,
+    paths: Option<&[String]>,
+    context_lines: Option<u32>,
+) -> Result<String> {
+    let git_dir = String::from_utf8(run_git(repo, &["rev-parse", "--git-dir"])?).context("git dir was not valid UTF-8")?;
+    let git_dir = git_dir.trim();
+    let git_dir_path = {
+        let path = PathBuf::from(git_dir);
+        if path.is_absolute() { path } else { repo.join(path) }
+    };
+    let temp_index = git_dir_path.join(format!("mdev_patch_index_{}", std::process::id()));
+    let head_tree = String::from_utf8(run_git(repo, &["rev-parse", "HEAD^{tree}"])?).context("HEAD tree was not valid UTF-8")?;
+    let head_tree = head_tree.trim().to_string();
+
+    let mut read_tree = Command::new("git");
+    read_tree
+        .arg("-C")
+        .arg(repo)
+        .arg("read-tree")
+        .arg(&head_tree)
+        .env("GIT_INDEX_FILE", &temp_index);
+    let read_tree_out = read_tree.output().with_context(|| format!("failed to run git read-tree in {:?}", repo))?;
+    if !read_tree_out.status.success() {
+        let _ = std::fs::remove_file(&temp_index);
+        bail!("git read-tree failed: {}", String::from_utf8_lossy(&read_tree_out.stderr).trim());
+    }
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(repo).arg("add").arg("-A");
+    if let Some(paths) = paths {
+        if !paths.is_empty() {
+            add.arg("--");
+            for path in paths {
+                add.arg(path);
+            }
+        }
+    }
+    add.env("GIT_INDEX_FILE", &temp_index);
+    let add_out = add.output().with_context(|| format!("failed to run git add in {:?}", repo))?;
+    if !add_out.status.success() {
+        let _ = std::fs::remove_file(&temp_index);
+        bail!("git add failed: {}", String::from_utf8_lossy(&add_out.stderr).trim());
+    }
+
+    let mut diff = Command::new("git");
+    diff.arg("-C")
+        .arg(repo)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--binary");
+    if let Some(context_lines) = context_lines {
+        diff.arg(format!("--unified={context_lines}"));
+    }
+    diff.arg("HEAD");
+    if let Some(paths) = paths {
+        if !paths.is_empty() {
+            diff.arg("--");
+            for path in paths {
+                diff.arg(path);
+            }
+        }
+    }
+    diff.env("GIT_INDEX_FILE", &temp_index);
+    let diff_out = diff.output().with_context(|| format!("failed to run git diff in {:?}", repo))?;
+    let _ = std::fs::remove_file(&temp_index);
+
+    if !diff_out.status.success() {
+        bail!("git diff failed: {}", String::from_utf8_lossy(&diff_out.stderr).trim());
+    }
+
+    String::from_utf8(diff_out.stdout).context("git diff output was not valid UTF-8")
 }
 
 pub fn run_git_allow_fail(repo: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
@@ -1254,11 +1333,6 @@ pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
     let has_unified_hunk = patch.contains("\n@@ -") || patch.starts_with("@@ -");
     let has_cr = patch.as_bytes().iter().any(|&b| b == b'\r');
 
-    let debug_path = repo.join(".describe_repo_last_patch.patch");
-    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
-        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
-    }
-
     match run_git_with_input(repo, &["apply", "--whitespace=nowarn", "-"], patch.as_bytes()) {
         Ok(_) => Ok(()),
         Err(e) => {
@@ -1266,33 +1340,26 @@ pub fn apply_git_patch(repo: &Path, patch_text: &str) -> Result<()> {
             preview = preview.replace('\n', "\\n");
             preview = preview.replace('\r', "\\r");
 
-            let check = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["apply", "--check", "--whitespace=nowarn"])
-                .arg(&debug_path)
-                .output();
+            let check = run_git_with_input(
+                repo,
+                &["apply", "--check", "--whitespace=nowarn", "-"],
+                patch.as_bytes(),
+            );
 
-            let mut check_msg = String::new();
-            if let Ok(o) = check {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                check_msg.push_str(&format!(
-                    "git apply --check exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
-                    o.status.code(),
-                    stdout,
-                    stderr
-                ));
-            }
+            let check_msg = match check {
+                Ok(stdout) => format!(
+                    "git apply --check succeeded unexpectedly\nstdout:\n{}\n",
+                    String::from_utf8_lossy(&stdout)
+                ),
+                Err(err) => format!("git apply --check failed: {:#}\n", err),
+            };
 
             bail!(
                 "git apply failed.\n\
                  patch_len={len} nl_count={nl_count} has_diff_git={has_diff_git} has_unified_hunk={has_unified_hunk} has_cr={has_cr}\n\
-                 debug_patch_file={}\n\
                  preview='{}'\n\
                  underlying_error={:#}\n\
                  {}",
-                debug_path.display(),
                 preview,
                 e,
                 check_msg
@@ -1308,11 +1375,6 @@ pub fn apply_git_patch_reverse(repo: &Path, patch_text: &str) -> Result<()> {
         patch.push('\n');
     }
 
-    let debug_path = repo.join(".describe_repo_last_patch_reverse.patch");
-    if let Err(e) = std::fs::write(&debug_path, patch.as_bytes()) {
-        eprintln!("WARNING: failed to write debug patch file {:?}: {}", debug_path, e);
-    }
-
     match run_git_with_input(
         repo,
         &["apply", "--reverse", "--unidiff-zero", "--whitespace=nowarn", "-"],
@@ -1320,37 +1382,31 @@ pub fn apply_git_patch_reverse(repo: &Path, patch_text: &str) -> Result<()> {
     ) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let check = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args([
+            let check = run_git_with_input(
+                repo,
+                &[
                     "apply",
                     "--check",
                     "--reverse",
                     "--unidiff-zero",
                     "--whitespace=nowarn",
-                ])
-                .arg(&debug_path)
-                .output();
+                    "-",
+                ],
+                patch.as_bytes(),
+            );
 
-            let mut check_msg = String::new();
-            if let Ok(o) = check {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                check_msg.push_str(&format!(
-                    "git apply --check --reverse exit={:?}\nstdout:\n{}\nstderr:\n{}\n",
-                    o.status.code(),
-                    stdout,
-                    stderr
-                ));
-            }
+            let check_msg = match check {
+                Ok(stdout) => format!(
+                    "git apply --check --reverse succeeded unexpectedly\nstdout:\n{}\n",
+                    String::from_utf8_lossy(&stdout)
+                ),
+                Err(err) => format!("git apply --check --reverse failed: {:#}\n", err),
+            };
 
             bail!(
                 "git apply --reverse failed.\n\
-                 debug_patch_file={}\n\
                  underlying_error={:#}\n\
                  {}",
-                debug_path.display(),
                 e,
                 check_msg
             );

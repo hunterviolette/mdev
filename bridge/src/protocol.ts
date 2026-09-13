@@ -17,9 +17,15 @@ export type ConnectOverCdpCommand = {
   session_id?: string;
   profile?: string;
   cdp_url: string;
+  url?: string;
   page_url_contains?: string;
   wait_for?: string;
   timeout_ms?: number;
+};
+
+export type ListSessionsCommand = {
+  id: string;
+  cmd: "list_sessions";
 };
 
 export type OpenPageCommand = {
@@ -49,6 +55,7 @@ export type SendChatCommand = {
   cmd: "send_chat";
   session_id: string;
   text: string;
+  pasted_context_text?: string;
   input_selector?: string;
   submit_selector?: string;
   timeout_ms?: number;
@@ -103,6 +110,7 @@ export type CloseSessionCommand = {
 export type BridgeCommand =
   | StartSessionCommand
   | ConnectOverCdpCommand
+  | ListSessionsCommand
   | OpenPageCommand
   | ProbePageCommand
   | ClosePageCommand

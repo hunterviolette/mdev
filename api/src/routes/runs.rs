@@ -1,14 +1,15 @@
-use axum::{extract::{Path, State}, routing::{get, post}, Json, Router};
+use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    db::new_workflow_key,
+    db::{new_workflow_key, normalize_repo_ref},
     app_state::AppState,
-    engine,
-    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowRun, WorkflowTemplateDefinition},
+    engine::{self, capabilities::planner},
+    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
 };
 
 pub fn router() -> Router<AppState> {
@@ -22,15 +23,108 @@ pub fn router() -> Router<AppState> {
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs ORDER BY updated_at DESC"
+        "SELECT id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at FROM workflow_runs WHERE status != 'archived' ORDER BY updated_at DESC"
     )
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
 
-    let runs = rows.into_iter().map(row_to_run).collect::<Result<Vec<_>, _>>()?;
+    let mut runs = rows.into_iter().filter_map(row_to_run_readable).collect::<Vec<_>>();
+    for run in &mut runs {
+        sanitize_run_for_current_process(&state, run);
+    }
     Ok(Json(runs))
 }
+
+fn row_to_run_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowRun> {
+    let id = row.try_get::<String, _>("id").unwrap_or_else(|_| "<unreadable>".to_string());
+    let title = row.try_get::<String, _>("title").unwrap_or_else(|_| "<unreadable>".to_string());
+    let status = row.try_get::<String, _>("status").unwrap_or_else(|_| "<unreadable>".to_string());
+    let workflow_key = row.try_get::<String, _>("workflow_key").unwrap_or_else(|_| "<unreadable>".to_string());
+    let definition_len = row.try_get::<String, _>("definition_json").map(|value| value.len()).unwrap_or(0);
+    let context_len = row.try_get::<String, _>("context_json").map(|value| value.len()).unwrap_or(0);
+
+    match row_to_run(row) {
+        Ok(run) => Some(run),
+        Err(err) => {
+            tracing::error!(
+                run_id = %id,
+                title = %title,
+                status_value = %status,
+                workflow_key = %workflow_key,
+                definition_json_bytes = definition_len,
+                context_json_bytes = context_len,
+                response_status = ?err.0,
+                error = %err.1,
+                "failed to deserialize workflow run row while listing runs"
+            );
+            None
+        }
+    }
+}
+
+fn row_to_run_for_open(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::StatusCode, String)> {
+    let id = row.try_get::<String, _>("id").unwrap_or_else(|_| "<unreadable>".to_string());
+    let title = row.try_get::<String, _>("title").unwrap_or_else(|_| "<unreadable>".to_string());
+    let status = row.try_get::<String, _>("status").unwrap_or_else(|_| "<unreadable>".to_string());
+    let workflow_key = row.try_get::<String, _>("workflow_key").unwrap_or_else(|_| "<unreadable>".to_string());
+    let definition_len = row.try_get::<String, _>("definition_json").map(|value| value.len()).unwrap_or(0);
+    let context_len = row.try_get::<String, _>("context_json").map(|value| value.len()).unwrap_or(0);
+
+    row_to_run(row).map_err(|err| {
+        tracing::error!(
+            run_id = %id,
+            title = %title,
+            status_value = %status,
+            workflow_key = %workflow_key,
+            definition_json_bytes = definition_len,
+            context_json_bytes = context_len,
+            response_status = ?err.0,
+            error = %err.1,
+            "failed to read workflow run row while opening run"
+        );
+        (axum::http::StatusCode::NOT_FOUND, format!("workflow run {} is no longer readable: {}", id, err.1))
+    })
+}
+
+fn run_has_stale_operator_checkpoint(state: &AppState, run: &WorkflowRun) -> bool {
+    let Some(blocked_on) = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("run_state"))
+        .and_then(|value| value.get("blocked_on"))
+    else {
+        return false;
+    };
+
+    let kind = blocked_on
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if kind != "operator_checkpoint" && kind != "disposition_review" {
+        return false;
+    }
+
+    blocked_on
+        .get("process_session_id")
+        .and_then(Value::as_str)
+        .map(|session_id| session_id != state.process_session_id())
+        .unwrap_or(true)
+}
+
+fn sanitize_run_for_current_process(_state: &AppState, _run: &mut WorkflowRun) {}
+
+fn map_workflow_run_query_error(run_id: Uuid, err: sqlx::Error) -> (axum::http::StatusCode, String) {
+    match err {
+        sqlx::Error::RowNotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("workflow run {} not found", run_id),
+        ),
+        other => internal(other),
+    }
+}
+
 
 async fn get_run(
     State(state): State<AppState>,
@@ -42,9 +136,31 @@ async fn get_run(
     .bind(run_id.to_string())
     .fetch_one(&state.db)
     .await
-    .map_err(internal)?;
+    .map_err(|err| map_workflow_run_query_error(run_id, err))?;
 
-    Ok(Json(row_to_run(row)?))
+    let mut run = row_to_run_for_open(row)?;
+    sanitize_run_for_current_process(&state, &mut run);
+    engine::preprocess_run_for_current_stage(&state, &mut run, None)
+        .await
+        .map_err(internal)?;
+
+    let repo_sync = state.repo_sync.clone();
+    let db = state.db.clone();
+    let repo_sync_run_id = run.id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = repo_sync
+            .activate_workflow(&db, repo_sync_run_id.as_str())
+            .await
+        {
+            tracing::warn!(
+                run_id = %repo_sync_run_id,
+                error = %format!("{:#}", error),
+                "workflow opened while Repo Sync runtime activation failed"
+            );
+        }
+    });
+
+    Ok(Json(run))
 }
 
 async fn open_run(
@@ -57,24 +173,93 @@ async fn open_run(
     .bind(run_id.to_string())
     .fetch_one(&state.db)
     .await
-    .map_err(internal)?;
+    .map_err(|err| map_workflow_run_query_error(run_id, err))?;
 
-    Ok(Json(row_to_run(row)?))
+    let mut run = row_to_run_for_open(row)?;
+    sanitize_run_for_current_process(&state, &mut run);
+    engine::preprocess_run_for_current_stage(&state, &mut run, None)
+        .await
+        .map_err(internal)?;
+
+    let repo_sync = state.repo_sync.clone();
+    let db = state.db.clone();
+    let repo_sync_run_id = run.id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = repo_sync
+            .activate_workflow(&db, repo_sync_run_id.as_str())
+            .await
+        {
+            tracing::warn!(
+                run_id = %repo_sync_run_id,
+                error = %format!("{:#}", error),
+                "workflow opened while Repo Sync runtime activation failed"
+            );
+        }
+    });
+
+    Ok(Json(run))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunEventsQuery {
+    limit: Option<i64>,
 }
 
 async fn list_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
-) -> Result<Json<Vec<WorkflowEvent>>, (axum::http::StatusCode, String)> {
+    Query(query): Query<RunEventsQuery>,
+) -> Result<Json<Vec<WorkflowEventStreamItem>>, (axum::http::StatusCode, String)> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 500);
     let rows = sqlx::query(
-        "SELECT id, run_id, step_id, level, kind, message, payload_json, created_at FROM workflow_events WHERE run_id = ? ORDER BY sequence_no ASC, created_at ASC"
+        r#"
+        SELECT
+            id,
+            run_id,
+            step_id,
+            stage_execution_id,
+            capability_invocation_id,
+            parent_invocation_id,
+            sequence_no,
+            global_sequence_no,
+            level,
+            kind,
+            message,
+            payload_json,
+            created_at
+        FROM (
+            SELECT
+                id,
+                run_id,
+                step_id,
+                stage_execution_id,
+                capability_invocation_id,
+                parent_invocation_id,
+                sequence_no,
+                global_sequence_no,
+                level,
+                kind,
+                message,
+                payload_json,
+                created_at
+            FROM workflow_events
+            WHERE run_id = ?
+            ORDER BY sequence_no DESC
+            LIMIT ?
+        )
+        ORDER BY sequence_no ASC, created_at ASC
+        "#,
     )
     .bind(run_id.to_string())
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
 
-    let events = rows.into_iter().map(row_to_event).collect::<Result<Vec<_>, _>>()?;
+    let events = rows
+        .into_iter()
+        .filter_map(row_to_runtime_event_readable)
+        .collect::<Vec<_>>();
     Ok(Json(events))
 }
 
@@ -82,19 +267,40 @@ async fn delete_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let run_id_text = run_id.to_string();
+    let mut tx = state.db.begin().await.map_err(internal)?;
+
     sqlx::query("DELETE FROM workflow_events WHERE run_id = ?")
-        .bind(run_id.to_string())
-        .execute(&state.db)
+        .bind(&run_id_text)
+        .execute(&mut *tx)
         .await
         .map_err(internal)?;
 
-    sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
-        .bind(run_id.to_string())
-        .execute(&state.db)
+    sqlx::query("DELETE FROM changeset_file_effects WHERE attempt_id IN (SELECT id FROM changeset_attempts WHERE run_id = ?)")
+        .bind(&run_id_text)
+        .execute(&mut *tx)
         .await
         .map_err(internal)?;
 
-    Ok(Json(json!({ "ok": true })))
+    sqlx::query("DELETE FROM changeset_attempts WHERE run_id = ?")
+        .bind(&run_id_text)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+
+    let deleted = sqlx::query("DELETE FROM workflow_runs WHERE id = ?")
+        .bind(&run_id_text)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+
+    tx.commit().await.map_err(internal)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "deleted": deleted
+    })))
 }
 
 async fn run_action(
@@ -113,39 +319,80 @@ async fn run_action(
         "workflow run action requested"
     );
 
+    let expected_status = req
+        .payload
+        .get("expected_status")
+        .and_then(serde_json::Value::as_str);
+    let expected_step_id = req
+        .payload
+        .get("expected_step_id")
+        .and_then(serde_json::Value::as_str);
+    let expected_stage_execution_id = req
+        .payload
+        .get("stage_execution_id")
+        .and_then(serde_json::Value::as_str);
+    let expected_capability_invocation_id = req
+        .payload
+        .get("capability_invocation_id")
+        .and_then(serde_json::Value::as_str);
+
+    engine::validate_workflow_action_request(
+        &state,
+        run_id,
+        action,
+        req.step_id.as_deref(),
+        engine::WorkflowActionPreconditions {
+            expected_status,
+            expected_step_id,
+            expected_stage_execution_id,
+            expected_capability_invocation_id,
+        },
+    )
+    .await
+    .map_err(|error| {
+        (
+            axum::http::StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "code": "stale_workflow_action",
+                "action": action,
+                "message": error.to_string()
+            })
+            .to_string(),
+        )
+    })?;
+
     let response = match action {
         "select_step" => {
-            let _ = crate::engine::capabilities::inference::browser::mark_session_rearm_needed_if_browser_session_is_stale(&state, run_id).await;
-            let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "step_id required".to_string(),
+                )
+            })?;
 
-            let mut run = engine::load_run(&state, run_id).await.map_err(internal)?;
-            let definition = engine::load_template_definition(&state, &run)
+            engine::select_step(&state, run_id, step_id)
                 .await
                 .map_err(internal)?
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "run has no template definition".to_string()))?;
-            let step = definition
-                .steps
-                .iter()
-                .find(|item| item.id == step_id)
-                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, format!("unknown step_id {}", step_id)))?;
-
-            run.current_step_id = Some(step.id.clone());
-            let decisions = engine::governance::before_stage(&state, run_id, &mut run, step)
-                .await
-                .map_err(internal)?;
-            engine::governance::apply_context_mutations(&mut run, &decisions, Some(step.id.as_str()), None)
-                .map_err(internal)?;
-            engine::persist_context(&state, run_id, &run.context).await.map_err(internal)?;
-            engine::set_run_status(&state, run_id, RunStatus::Waiting, Some(step.id.as_str()))
-                .await
-                .map_err(internal)?;
-
-            serde_json::json!({
-                "ok": true,
-                "run_id": run_id,
-                "current_step_id": step.id,
-                "status": "waiting"
-            })
+        }
+        "get_transient_stage_user_input" => {
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string())
+            })?;
+            engine::get_transient_stage_user_input(&state, run_id, step_id)
+        }
+        "patch_transient_stage_user_input" => {
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string())
+            })?;
+            engine::patch_transient_stage_user_input(
+                &state,
+                run_id,
+                step_id,
+                req.payload,
+            )
+            .await
+            .map_err(internal)?
         }
         "patch_global_state" => {
             engine::patch_global_state(&state, run_id, req.payload).await.map_err(internal)?
@@ -154,17 +401,118 @@ async fn run_action(
             let step_id = req.step_id.as_deref().ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string()))?;
             engine::patch_stage_state(&state, run_id, step_id, req.payload).await.map_err(internal)?
         }
+        "resolve_operator_checkpoint" => {
+            let disposition = req
+                .payload
+                .get("disposition")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "payload.disposition required".to_string()))?
+                .to_string();
+            let selected_step_id = req
+                .payload
+                .get("selected_step_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+
+            let result = crate::engine::workflow_lifecycle::execute_workflow_command(
+                &state,
+                crate::engine::workflow_lifecycle::WorkflowCommandEnvelope {
+                    command_id: Uuid::new_v4(),
+                    workflow_run_id: run_id,
+                    command: crate::engine::workflow_lifecycle::WorkflowCommand::ResolveCheckpoint {
+                        disposition,
+                        selected_step_id,
+                    },
+                },
+            )
+            .await
+            .map_err(internal)?;
+
+            serde_json::to_value(result).map_err(internal)?
+        }
+        "prepare_stage" | "prepare_current_stage" => {
+            engine::prepare_run_stage_for_execution(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+        }
         "start_run" => {
-            engine::start_run(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+            if let Some(user_input) = req
+                .payload
+                .get("user_input")
+                .and_then(serde_json::Value::as_str)
+            {
+                let step_id = req.step_id.as_deref().ok_or_else(|| {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "step_id required when start_run includes user_input".to_string(),
+                    )
+                })?;
+
+                engine::patch_transient_stage_user_input(
+                    &state,
+                    run_id,
+                    step_id,
+                    serde_json::json!({
+                        "text": user_input,
+                        "client_id": req
+                            .payload
+                            .get("client_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+            }
+
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::MultiStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "resume_run" => {
-            engine::resume_run(&state, run_id).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Resume,
+            )
+            .await
+            .map_err(internal)?
         }
         "pause_run" => {
-            engine::pause_run(&state, run_id).await.map_err(internal)?
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Pause,
+            )
+            .await
+            .map_err(internal)?
         }
-        "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
-            engine::force_wait_run(&state, run_id).await.map_err(internal)?
+        "cancel_run" | "force_wait_run" | "force_unlock_run" | "force_complete_stage" => {
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Cancel,
+            )
+            .await
+            .map_err(internal)?
+        }
+        "restart_stage" | "restart_current_stage" => {
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::SingleStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "run_step" | "run_current_step" => {
             if !req.payload.is_null() {
@@ -175,7 +523,17 @@ async fn run_action(
                     .await
                     .map_err(internal)?;
             }
-            engine::run_step(&state, run_id, req.step_id.as_deref()).await.map_err(internal)?
+
+            crate::engine::workflow_lifecycle::execute_workflow_command_value(
+                &state,
+                run_id,
+                crate::engine::workflow_lifecycle::WorkflowCommand::Start {
+                    mode: crate::engine::workflow_lifecycle::WorkflowExecutionMode::SingleStage,
+                    step_id: req.step_id.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?
         }
         "next_step" => {
             let run = engine::load_run(&state, run_id).await.map_err(internal)?;
@@ -281,32 +639,26 @@ fn seed_missing_browser_session_rearm(context: &mut Value) {
     inference_obj.remove("active_prompt_fragments");
 }
 
-fn seed_governance_context_from_definition(context: &mut Value, definition: &WorkflowTemplateDefinition) {
-    let root = engine::ensure_engine_root(context);
-    let governance = root.entry("governance".to_string()).or_insert_with(|| json!({}));
-    if !governance.is_object() {
-        *governance = json!({});
-    }
-
-    engine::merge_json_values(governance, &definition.governance);
-}
-
 async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<WorkflowRun>, (axum::http::StatusCode, String)> {
     let now = Utc::now();
     let id = Uuid::new_v4();
+    let repo_ref = normalize_repo_ref(&req.repo_ref);
+    if repo_ref.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "repo_ref is required".to_string()));
+    }
     let workflow_key = req
         .workflow_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| new_workflow_key(&req.repo_ref));
+        .unwrap_or_else(|| new_workflow_key(&repo_ref));
     let status = RunStatus::Waiting;
 
-    let definition = if let Some(definition) = req.definition.clone() {
+    let mut definition = if let Some(definition) = req.definition.clone() {
         definition
     } else if let Some(template_id) = req.template_id {
         let template_row = sqlx::query("SELECT definition_json FROM workflow_templates WHERE id = ?")
@@ -321,33 +673,47 @@ async fn create_run(
         return Err((axum::http::StatusCode::BAD_REQUEST, "definition or template_id is required".to_string()));
     };
 
+    crate::routes::normalize_shared_dependencies(&mut definition.globals);
+    crate::routes::normalize_qa_environment(
+        &mut definition.globals,
+        definition
+            .steps
+            .iter()
+            .any(|step| step.step_type.trim().eq_ignore_ascii_case("qa")),
+    );
+
     let mut run_context = req.context.clone();
     let current_step_id = definition.steps.first().map(|step| step.id.clone());
 
     let root = engine::ensure_engine_root(&mut run_context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+    let runtime_global_state = global_state.clone();
     let mut seeded_global_state = serde_json::to_value(definition.globals.clone()).map_err(internal)?;
 
     if !seeded_global_state.is_object() {
         seeded_global_state = json!({});
     }
 
-    if let Some(global_obj) = seeded_global_state.as_object_mut() {
-        let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
-        if !resources.is_object() {
-            *resources = json!({});
-        }
-        let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
-        let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
-        if !repo.is_object() {
-            *repo = json!({});
-        }
-        let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
-        repo_obj.insert("repo_ref".to_string(), json!(req.repo_ref));
-        repo_obj.entry("git_ref".to_string()).or_insert_with(|| json!("WORKTREE"));
-    }
+    engine::merge_json_values(&mut seeded_global_state, &runtime_global_state);
+    *global_state = seeded_global_state;
 
-    engine::merge_json_values(global_state, &seeded_global_state);
+    let global_obj = global_state.as_object_mut().ok_or_else(|| internal("global_state must be object"))?;
+    let resources = global_obj.entry("resources".to_string()).or_insert_with(|| json!({}));
+    if !resources.is_object() {
+        *resources = json!({});
+    }
+    let resources_obj = resources.as_object_mut().ok_or_else(|| internal("resources must be object"))?;
+    let repo = resources_obj.entry("repo".to_string()).or_insert_with(|| json!({}));
+    if !repo.is_object() {
+        *repo = json!({});
+    }
+    let repo_obj = repo.as_object_mut().ok_or_else(|| internal("repo resource must be object"))?;
+    repo_obj.insert("repo_ref".to_string(), json!(repo_ref.clone()));
+    repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
+
+    planner::apply_repo_planner_capability(&state.db, global_state, &repo_ref)
+        .await
+        .map_err(internal)?;
 
     let initial_step = current_step_id
         .as_deref()
@@ -360,15 +726,22 @@ async fn create_run(
         status: status.clone(),
         current_step_id: current_step_id.clone(),
         title: req.title.clone(),
-        repo_ref: req.repo_ref.clone(),
+        repo_ref: repo_ref.clone(),
         workflow_key: workflow_key.clone(),
         context: run_context.clone(),
         created_at: now,
         updated_at: now,
     };
     seed_missing_browser_session_rearm(&mut seeded_run.context);
-    seed_governance_context_from_definition(&mut seeded_run.context, &definition);
     seed_compile_command_context_from_definition(&mut seeded_run.context, &definition);
+    if let Some(step) = initial_step {
+        let decisions = engine::automation::before_stage(&state, id, &mut seeded_run, step)
+            .await
+            .map_err(internal)?;
+        engine::automation::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)
+            .map_err(internal)?;
+        engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
+    }
     run_context = seeded_run.context;
 
     sqlx::query(
@@ -380,7 +753,7 @@ async fn create_run(
     .bind("waiting")
     .bind(current_step_id.clone())
     .bind(&req.title)
-    .bind(&req.repo_ref)
+    .bind(&repo_ref)
     .bind(&workflow_key)
     .bind(serde_json::to_string(&run_context).map_err(internal)?)
     .bind(now.to_rfc3339())
@@ -389,8 +762,8 @@ async fn create_run(
     .await
     .map_err(internal)?;
 
-    engine::append_event(
-        &state.db,
+    engine::append_engine_event(
+        &state,
         id,
         None,
         "info",
@@ -408,7 +781,7 @@ async fn create_run(
         status,
         current_step_id: current_step_id.clone(),
         title: req.title,
-        repo_ref: req.repo_ref,
+        repo_ref,
         workflow_key,
         context: run_context,
         created_at: now,
@@ -494,31 +867,213 @@ fn compile_commands_from_checks(checks: &Value) -> Value {
     Value::Array(commands)
 }
 
-fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowEvent, (axum::http::StatusCode, String)> {
-    Ok(WorkflowEvent {
-        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
-        run_id: Uuid::parse_str(row.get::<String, _>("run_id").as_str()).map_err(internal)?,
-        step_id: row.get("step_id"),
-        level: row.get("level"),
-        kind: row.get("kind"),
-        message: row.get("message"),
-        payload: serde_json::from_str(row.get::<String, _>("payload_json").as_str()).map_err(internal)?,
-        created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
+fn row_to_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEvent> {
+    let id_raw = row.try_get::<String, _>("id").ok()?;
+    let run_id_raw = row.try_get::<String, _>("run_id").ok()?;
+    let payload_raw = row.try_get::<String, _>("payload_json").unwrap_or_else(|_| "{}".to_string());
+    let created_at_raw = row.try_get::<String, _>("created_at").ok()?;
+    let payload = parse_event_payload_json(id_raw.as_str(), payload_raw.as_str());
+
+    match (
+        Uuid::parse_str(id_raw.as_str()),
+        Uuid::parse_str(run_id_raw.as_str()),
+        chrono::DateTime::parse_from_rfc3339(created_at_raw.as_str()),
+    ) {
+        (Ok(id), Ok(run_id), Ok(created_at)) => Some(WorkflowEvent {
+            id,
+            run_id,
+            step_id: row.get("step_id"),
+            level: row.get("level"),
+            kind: row.get("kind"),
+            message: row.get("message"),
+            payload,
+            created_at: created_at.with_timezone(&Utc),
+        }),
+        _ => {
+            tracing::warn!(event_id = %id_raw, run_id = %run_id_raw, "workflow event row is unreadable; omitting event");
+            None
+        }
+    }
+}
+
+fn row_to_runtime_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEventStreamItem> {
+    let id = row.try_get::<String, _>("id").ok()?;
+    let run_id = row.try_get::<String, _>("run_id").ok()?;
+    let payload_raw = row.try_get::<String, _>("payload_json").unwrap_or_else(|_| "{}".to_string());
+    let payload = parse_event_payload_json(id.as_str(), payload_raw.as_str());
+
+    Some(WorkflowEventStreamItem {
+        id,
+        run_id,
+        step_id: row.try_get("step_id").ok().flatten(),
+        stage_execution_id: row.try_get("stage_execution_id").ok().flatten(),
+        capability_invocation_id: row.try_get("capability_invocation_id").ok().flatten(),
+        parent_invocation_id: row.try_get("parent_invocation_id").ok().flatten(),
+        sequence_no: row.try_get("sequence_no").ok()?,
+        global_sequence_no: row.try_get("global_sequence_no").unwrap_or(0),
+        level: row.try_get("level").ok()?,
+        kind: row.try_get("kind").ok()?,
+        message: row.try_get("message").ok()?,
+        payload,
+        created_at: row.try_get("created_at").ok()?,
     })
 }
 
+fn parse_event_payload_json(event_id: &str, raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut value) => {
+            normalize_planner_for_read(&mut value);
+            value
+        },
+        Err(err) => {
+            tracing::warn!(
+                event_id = %event_id,
+                payload_json_bytes = raw.len(),
+                payload_json_preview = %json_preview_for_log(trimmed),
+                error = %err,
+                "workflow event payload_json is malformed; using empty payload"
+            );
+            json!({})
+        }
+    }
+}
+
+fn json_preview_for_log(raw: &str) -> String {
+    raw.chars().take(512).collect::<String>()
+}
+
+fn parse_definition_json_for_run(run_id: &str, raw: &str) -> WorkflowTemplateDefinition {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<WorkflowTemplateDefinition>(trimmed) {
+        Ok(definition) => definition,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run_id,
+                definition_json_bytes = raw.len(),
+                definition_json_trimmed_bytes = trimmed.len(),
+                definition_json_preview = %json_preview_for_log(trimmed),
+                error = %err,
+                "workflow run definition_json is malformed; using empty readable definition"
+            );
+            WorkflowTemplateDefinition {
+                version: 1,
+                globals: Default::default(),
+                governance: json!({}),
+                steps: Vec::new(),
+            }
+        }
+    }
+}
+
+fn parse_context_json_for_run(run_id: &str, raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(run_id = %run_id, "workflow run context_json is empty; using empty context");
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut value) => {
+            normalize_planner_for_read(&mut value);
+            value
+        }
+        Err(err) => {
+            tracing::warn!(run_id = %run_id, error = %err, "workflow run context_json is malformed; using empty context");
+            json!({})
+        }
+    }
+}
+
+fn normalize_planner_for_read(context: &mut Value) {
+    let Some(capabilities) = context
+        .get_mut("workflow_engine")
+        .and_then(|value| value.get_mut("global_state"))
+        .and_then(|value| value.get_mut("capabilities"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    capabilities.remove("planner_fragment");
+
+    if let Some(inference) = capabilities
+        .get_mut("inference")
+        .and_then(Value::as_object_mut)
+    {
+        inference.remove("planner");
+    }
+
+    let Some(planner) = capabilities
+        .get_mut("planner")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    planner.remove("feature_plan_items");
+    planner.remove("selected_feature_ids");
+    planner.remove("selected_feature");
+    planner.remove("planner_title");
+    planner.remove("enabled");
+}
+
+fn parse_optional_uuid_for_run(run_id: &str, field_name: &str, raw: Option<String>) -> Option<Uuid> {
+    let raw = raw?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match Uuid::parse_str(raw.as_str()) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(run_id = %run_id, field = %field_name, value = %raw, error = %err, "workflow run UUID field is malformed; ignoring field");
+            None
+        }
+    }
+}
+
+fn parse_datetime_for_run(run_id: &str, field_name: &str, raw: &str) -> chrono::DateTime<Utc> {
+    let trimmed = raw.trim();
+
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return value.with_timezone(&Utc);
+    }
+
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return chrono::DateTime::<Utc>::from_naive_utc_and_offset(value, Utc);
+    }
+
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+        return chrono::DateTime::<Utc>::from_naive_utc_and_offset(value, Utc);
+    }
+
+    tracing::warn!(run_id = %run_id, field = %field_name, value = %trimmed, "workflow run timestamp is malformed; using current time");
+    Utc::now()
+}
+
 fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::StatusCode, String)> {
+    let id_raw: String = row.get("id");
+    let context_raw: String = row.get("context_json");
+    let created_at_raw: String = row.get("created_at");
+    let updated_at_raw: String = row.get("updated_at");
+    let id = Uuid::parse_str(id_raw.as_str()).map_err(internal)?;
+
     Ok(WorkflowRun {
-        id: Uuid::parse_str(row.get::<String, _>("id").as_str()).map_err(internal)?,
-        template_id: row.get::<Option<String>, _>("template_id").map(|v| Uuid::parse_str(v.as_str())).transpose().map_err(internal)?,
-        definition: serde_json::from_str(row.get::<String, _>("definition_json").as_str()).map_err(internal)?,
+        id,
+        template_id: parse_optional_uuid_for_run(id_raw.as_str(), "template_id", row.get::<Option<String>, _>("template_id")),
+        definition: parse_definition_json_for_run(id_raw.as_str(), row.get::<String, _>("definition_json").as_str()),
         status: match row.get::<String, _>("status").as_str() {
             "draft" => RunStatus::Waiting,
             "queued" => RunStatus::Queued,
             "running" => RunStatus::Running,
             "waiting" => RunStatus::Waiting,
             "paused" => RunStatus::Paused,
-            "success" => RunStatus::Success,
+            "complete" | "success" => RunStatus::Success,
             "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Error,
         },
@@ -526,12 +1081,14 @@ fn row_to_run(row: sqlx::sqlite::SqliteRow) -> Result<WorkflowRun, (axum::http::
         title: row.get("title"),
         repo_ref: row.get("repo_ref"),
         workflow_key: row.get("workflow_key"),
-        context: serde_json::from_str(row.get::<String, _>("context_json").as_str()).map_err(internal)?,
-        created_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).map_err(internal)?.with_timezone(&Utc),
-        updated_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str()).map_err(internal)?.with_timezone(&Utc),
+        context: parse_context_json_for_run(id_raw.as_str(), context_raw.as_str()),
+        created_at: parse_datetime_for_run(id_raw.as_str(), "created_at", created_at_raw.as_str()),
+        updated_at: parse_datetime_for_run(id_raw.as_str(), "updated_at", updated_at_raw.as_str()),
     })
 }
 
 fn internal<E: std::fmt::Display>(err: E) -> (axum::http::StatusCode, String) {
-    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    let message = err.to_string();
+    tracing::error!(error = %message, "workflow route internal error");
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, message)
 }

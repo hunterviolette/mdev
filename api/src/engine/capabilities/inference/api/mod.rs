@@ -3,37 +3,38 @@ pub mod oai;
 use anyhow::Result;
 use serde_json::json;
 
-use super::{persist_inference_config, InferenceConfig, InferenceResult, InferenceTransport};
+use super::{prompting::ModelInput, session, persist_inference_config, InferenceResult, InferenceTransport};
 use super::super::registry::CapabilityContext;
 
-pub async fn execute(ctx: &CapabilityContext<'_>) -> Result<serde_json::Value> {
-    let prompt = ctx
-        .local_state
-        .get("composed_prompt")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
+pub async fn execute(
+    ctx: &CapabilityContext<'_>,
+    input: &ModelInput,
+) -> Result<serde_json::Value> {
 
-    let mut inference_cfg: InferenceConfig = ctx
-        .local_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+    let resolved_session = session::resolve_inference_session(ctx).await?;
+    let mut inference_cfg = resolved_session.config;
+    let current_process_session_id = ctx.state.process_session_id().to_string();
+    let prior_conversation_id = session::runtime_string(&inference_cfg, "conversation_id")
+        .or_else(|| inference_cfg.conversation_id.clone());
 
     let client = oai::OpenAIInferenceClient::from_env();
     let (text, conversation_id) = client
         .chat_in_conversation(
             &inference_cfg.model,
-            inference_cfg.conversation_id.clone(),
+            prior_conversation_id,
             Vec::new(),
-            vec![("user".to_string(), prompt)],
+            vec![("user".to_string(), input.text.clone())],
         )
         .await?;
 
     inference_cfg.conversation_id = Some(conversation_id.clone());
-    persist_inference_config(ctx, &inference_cfg).await?;
+    session::set_runtime_string(&mut inference_cfg, "conversation_id", Some(conversation_id.clone()));
+    session::set_runtime_string(
+        &mut inference_cfg,
+        "process_session_id",
+        Some(current_process_session_id.clone()),
+    );
+    persist_inference_config(ctx, &resolved_session.name, &inference_cfg).await?;
 
     let result = InferenceResult {
         transport: InferenceTransport::Api,

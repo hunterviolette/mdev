@@ -1,48 +1,68 @@
-import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { defineConfig, loadEnv } from 'vite';
 
-function requiredEnv(env: Record<string, string>, key: string): string {
-  const value = env[key]?.trim();
-  if (!value) {
-    throw new Error(`${key} is not set`);
-  }
-  return value;
-}
-
-function httpUrl(host: string, port: string): string {
-  return `http://${host}:${port}`;
-}
+const webDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repoDirectory = path.resolve(webDirectory, '..');
 
 export default defineConfig(({ mode }) => {
-  const repoRoot = path.resolve(__dirname, '..');
-  const env = loadEnv(mode, repoRoot, '');
+  const env = loadEnv(mode, repoDirectory, '');
 
-  const apiHost = requiredEnv(env, 'WORKFLOW_API_HOST');
-  const apiPort = requiredEnv(env, 'WORKFLOW_API_PORT');
-  const webHost = requiredEnv(env, 'WORKFLOW_WEB_HOST');
-  const webPort = requiredEnv(env, 'WORKFLOW_WEB_PORT');
-  const apiUrl = httpUrl(apiHost, apiPort);
+  const webHost =
+    env.WORKFLOW_WEB_HOST?.trim() ||
+    process.env.WORKFLOW_WEB_HOST?.trim() ||
+    '127.0.0.1';
+
+  const webPort = Number.parseInt(
+    env.WORKFLOW_WEB_PORT?.trim() ||
+      process.env.WORKFLOW_WEB_PORT?.trim() ||
+      '5173',
+    10,
+  );
+
+  if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65535) {
+    throw new Error('WORKFLOW_WEB_PORT must be a valid TCP port');
+  }
+
+  const apiHost =
+    env.WORKFLOW_API_HOST?.trim() ||
+    process.env.WORKFLOW_API_HOST?.trim() ||
+    '127.0.0.1';
+
+  const apiPort =
+    env.WORKFLOW_API_PORT?.trim() ||
+    process.env.WORKFLOW_API_PORT?.trim() ||
+    '8788';
+
+  const hostApiUrl =
+    env.WORKFLOW_API_URL?.trim() ||
+    process.env.WORKFLOW_API_URL?.trim() ||
+    `http://${apiHost}:${apiPort}`;
+
+  const apiProxy = {
+    target: hostApiUrl,
+    changeOrigin: true,
+  };
 
   return {
+    envDir: repoDirectory,
     plugins: [react()],
-    envDir: repoRoot,
     server: {
       host: webHost,
-      port: Number.parseInt(webPort, 10),
+      port: webPort,
+      strictPort: true,
       proxy: {
-        '/api': apiUrl,
-        '/events': apiUrl,
-        '/review': apiUrl,
-        '/runs': apiUrl,
-        '/settings': apiUrl,
-        '/templates': apiUrl,
-        '/workflow-builder': apiUrl,
-        '/capabilities': apiUrl,
-        '/filesystem': apiUrl,
-        '/repo-tree': apiUrl,
-        '/sap': apiUrl
-      }
-    }
+        '/api': apiProxy,
+      },
+    },
+    preview: {
+      host: webHost,
+      port: webPort,
+      strictPort: true,
+      proxy: {
+        '/api': apiProxy,
+      },
+    },
   };
 });
