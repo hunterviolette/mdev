@@ -25,8 +25,8 @@ import {
 } from '@mantine/core';
 import { listTemplates, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
-import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
-import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { createPlanner, deletePlanner as deletePlannerApi, listPlanners, type PlannerWorkspace } from './planner_api';
+import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 import { executionTone as tone, subscribeRuntimeEventBus } from './runtime_events';
 
 type FlightDeckPanelProps = {
@@ -104,15 +104,15 @@ const WORK_POOL_GROUPS = [
     empty: 'No refine work is currently active.',
   },
   {
-    key: 'feature_development',
+    key: 'feature',
     title: 'Feature pool',
     description: 'Queued and active feature implementation work.',
     empty: 'No feature work is currently active.',
   },
   {
-    key: 'manual_shard',
+    key: 'manual',
     title: 'Manual pool',
-    description: 'Operator-created shards with template-attached workflows.',
+    description: 'Operator-created workflow work.',
     empty: 'No manual work is currently active.',
   },
 ];
@@ -315,7 +315,7 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   const ordered = [...baseStageOrder, ...[...observedKeys].filter((key) => !baseStageOrder.includes(key))];
   const activeKey = activeStep ? stageKeyFromText(activeStep) : null;
   const activeIndex = activeKey ? ordered.indexOf(activeKey) : -1;
-  const waiting = unit.state === 'waiting_user';
+  const waiting = unit.state === 'waiting';
 
   const latestStageByKey = new Map<string, Record<string, unknown>>();
   for (const stage of recentStages) {
@@ -890,60 +890,52 @@ function workflowType(unit: FlightDeckWorkUnit): string {
   return unit.workflow_type ?? unit.kind;
 }
 
-function manualShardIsIntegrationInput(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard'
-    && (
-      unit.telemetry?.staged_to_integration === true
-      || unit.telemetry?.integration_input === true
-      || normalize(unit.state) === 'ready_for_integration'
-      || normalize(unit.state) === 'integrating'
-      || normalize(unit.state) === 'integrated'
-    );
+function workUnitIsIntegrationInput(unit: FlightDeckWorkUnit): boolean {
+  return workflowType(unit) !== 'integration' && unit.integration_state !== 'available';
 }
 
-function manualShardHasStagedChanges(unit: FlightDeckWorkUnit): boolean {
-  return unit.telemetry?.manual_shard_has_staged_changes === true || unit.telemetry?.manual_shard_stageable === true;
+function workUnitHasStagedChanges(unit: FlightDeckWorkUnit): boolean {
+  return unit.has_staged_changes;
 }
 
 function workflowIsProcessing(unit: FlightDeckWorkUnit): boolean {
-  return unit.state === 'running' || unit.state === 'integrating';
+  return unit.state === 'running';
 }
 
 function workflowCanRun(unit: FlightDeckWorkUnit): boolean {
   if (workflowType(unit) === 'integration') return !unit.workflow_deleted && !workflowIsProcessing(unit);
-  return !manualShardIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id && unit.feature_id);
+  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
 function workflowCanPause(unit: FlightDeckWorkUnit): boolean {
-  if (workflowType(unit) === 'integration') return !unit.workflow_deleted && workflowIsProcessing(unit);
-  return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id && unit.feature_id);
+  return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
 function workflowCanRegenerate(unit: FlightDeckWorkUnit): boolean {
-  const type = workflowType(unit);
-  if (type === 'integration') return !unit.workflow_deleted && Boolean(unit.workflow_run_id);
-  if (type === 'manual_shard') return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
-  return (type === 'feature_development' || type === 'refine') && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
+  return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
 function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
   const type = workflowType(unit);
-  if (type === 'manual_shard') return !manualShardIsIntegrationInput(unit) && !unit.workflow_deleted && Boolean(unit.feature_id);
-  if (type === 'refine') return !unit.workflow_deleted && Boolean(unit.feature_id);
-  if (type === 'feature_development') return !unit.workflow_deleted && Boolean(unit.feature_id);
-  return false;
+  if (type === 'integration') return false;
+  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted;
 }
 
 function workflowDeleteLabel(unit: FlightDeckWorkUnit): string {
-  return workflowType(unit) === 'feature_development' ? 'Unqueue' : 'Delete';
+  return workflowType(unit) === 'feature' ? 'Unqueue' : 'Delete';
 }
 
-function workflowCanStageManual(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard' && !unit.workflow_deleted && Boolean(unit.feature_id) && !manualShardIsIntegrationInput(unit) && manualShardHasStagedChanges(unit);
+function workflowCanStageToIntegration(unit: FlightDeckWorkUnit): boolean {
+  return ['feature', 'manual'].includes(workflowType(unit))
+    && !unit.workflow_deleted
+    && unit.integration_state === 'available'
+    && workUnitHasStagedChanges(unit);
 }
 
-function workflowCanUnstageManual(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard' && !unit.workflow_deleted && Boolean(unit.feature_id) && manualShardIsIntegrationInput(unit);
+function workflowCanUnstageFromIntegration(unit: FlightDeckWorkUnit): boolean {
+  return ['feature', 'manual'].includes(workflowType(unit))
+    && !unit.workflow_deleted
+    && unit.integration_state !== 'available';
 }
 
 function WorkflowProjectionCard(props: {
@@ -960,6 +952,7 @@ function WorkflowProjectionCard(props: {
   const [historyAnchor, setHistoryAnchor] = useState<EventHistoryAnchor | null>(null);
   const [historyHydration, setHistoryHydration] = useState<WorkflowCardHistoryHydration | null>(null);
   const [hydratedRunId, setHydratedRunId] = useState<string | null>(null);
+  const [archiveIntegratedWorkflows, setArchiveIntegratedWorkflows] = useState(false);
   const openCapabilityHistory = (capability: CapabilityProjection) => {
     if (!unit.workflow_run_id) return;
     setHistoryAnchor({
@@ -1013,7 +1006,8 @@ function WorkflowProjectionCard(props: {
   const canApplyFinalPatch = workflowType(unit) === 'integration'
     && !unit.workflow_deleted
     && Boolean(unit.workflow_run_id)
-    && ['patch_ready', 'integrated', 'ready_to_apply'].includes(integrationState);
+    && integrationState === 'completed'
+    && !unit.applied_at;
 
 
   const title = unit.workflow_run_id ? (
@@ -1049,7 +1043,7 @@ function WorkflowProjectionCard(props: {
       if (!confirmed) return;
     }
     if (action === 'stage_work_unit') {
-      const confirmed = window.confirm(`Stage ${unit.title} to the integration pool? Backend validation requires staged git changes for manual shards.`);
+      const confirmed = window.confirm(`Add the staged changes from ${unit.title} to the integration workflow?`);
       if (!confirmed) return;
     }
     if (action === 'unstage_work_unit') {
@@ -1057,7 +1051,10 @@ function WorkflowProjectionCard(props: {
       if (!confirmed) return;
     }
     if (action === 'apply_integration') {
-      const confirmed = window.confirm('Apply the final integration patch to the root repository?');
+      const archiveMessage = archiveIntegratedWorkflows
+        ? ' The integrated Feature/Manual workflows will be archived after the patch is applied successfully.'
+        : ' The integrated Feature/Manual workflows will remain in the integration pool for further iteration.';
+      const confirmed = window.confirm(`Apply the final integration patch to the root repository?${archiveMessage}`);
       if (!confirmed) return;
     }
     if (action === 'cancel') {
@@ -1067,7 +1064,13 @@ function WorkflowProjectionCard(props: {
 
     if (action === 'stage_work_unit' || action === 'unstage_work_unit') {
       await runSupervisorAction(props.supervisor.id, { action: 'stage_work_unit', work_unit_id: unit.id, staged: action === 'stage_work_unit' });
-    } else if (action === 'apply_integration' || action === 'cancel') {
+    } else if (action === 'apply_integration') {
+      await runSupervisorAction(props.supervisor.id, {
+        action,
+        work_unit_id: unit.id,
+        archive_integrated_workflows: archiveIntegratedWorkflows,
+      });
+    } else if (action === 'cancel') {
       await runSupervisorAction(props.supervisor.id, { action });
     } else {
       await runSupervisorAction(props.supervisor.id, { action, work_unit_id: unit.id });
@@ -1076,7 +1079,7 @@ function WorkflowProjectionCard(props: {
   }
 
   const workflowHeaderState = normalize(telemetryString(unit, 'status') || unit.state);
-  const workflowHeaderWaiting = ['waiting', 'waiting_user', 'paused'].includes(workflowHeaderState);
+  const workflowHeaderWaiting = ['waiting', 'paused'].includes(workflowHeaderState);
   const workflowHeaderActive = ['queued', 'running', 'active'].includes(workflowHeaderState);
   const workflowHeaderAnimated = workflowHeaderWaiting || workflowHeaderActive;
   const workflowHeaderColor = workflowHeaderWaiting
@@ -1156,8 +1159,8 @@ function WorkflowProjectionCard(props: {
                   {unit.patch_id ? <Badge color="violet" variant="light">Patch {unit.patch_id.slice(0, 8)}</Badge> : null}
                 </Group>
                 <Group gap={6} wrap="nowrap">
-                  {workflowCanUnstageManual(unit) ? (
-                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Unstage from integration pool</Button>
+                  {workflowCanUnstageFromIntegration(unit) ? (
+                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Remove from integration</Button>
                   ) : null}
                   {workflowCanPause(unit) ? (
                     <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
@@ -1167,8 +1170,8 @@ function WorkflowProjectionCard(props: {
                   {workflowCanRegenerate(unit) ? (
                     <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
                   ) : null}
-                  {workflowCanStageManual(unit) ? (
-                    <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to integration pool</Button>
+                  {workflowCanStageToIntegration(unit) ? (
+                    <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Add staged changes to integration</Button>
                   ) : null}
                   {workflowCanDelete(unit) ? (
                     <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
@@ -1182,7 +1185,15 @@ function WorkflowProjectionCard(props: {
             </Group>
             <StageRail stages={stages} />
             {canApplyFinalPatch ? (
-              <Group justify="center" mt="sm">
+              <Stack gap="xs" align="center" mt="sm">
+                <Checkbox
+                  checked={archiveIntegratedWorkflows}
+                  onChange={(event) => setArchiveIntegratedWorkflows(event.currentTarget.checked)}
+                  label="Archive integrated workflows after successful apply"
+                />
+                <Text size="xs" c="dimmed" ta="center">
+                  Leave unchecked to keep Feature and Manual workflows in the integration pool for iterative development.
+                </Text>
                 <Button
                   size="md"
                   color="green"
@@ -1190,9 +1201,9 @@ function WorkflowProjectionCard(props: {
                   onClick={() => void runWorkflowAction('apply_integration')}
                   style={{ minWidth: 260 }}
                 >
-                  Apply final patch to root
+                  Apply Integration to root
                 </Button>
-              </Group>
+              </Stack>
             ) : null}
           </Stack>
           <Stack gap={6} style={{ minWidth: 0 }}>
@@ -1273,7 +1284,7 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
     );
   }
 
-  if (props.groupKey === 'feature_development') {
+  if (props.groupKey === 'feature') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         <PoolSelectControl label="Template" ariaLabel="Feature template" data={props.templateOptions} value={templateValue} onChange={(value) => props.onSettingsChange({ template_id: value })} width={160} searchable />
@@ -1283,7 +1294,7 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
     );
   }
 
-  if (props.groupKey === 'manual_shard') {
+  if (props.groupKey === 'manual') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         <PoolSelectControl label="Template" ariaLabel="Manual template" data={props.templateOptions} value={templateValue} onChange={(value) => props.onSettingsChange({ template_id: value })} width={160} searchable />
@@ -1304,30 +1315,34 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
 }
 
 function manualShardIsStaged(unit: FlightDeckWorkUnit): boolean {
-  return manualShardIsIntegrationInput(unit);
+  return workUnitIsIntegrationInput(unit);
 }
 
-function featureIsIntegrationReady(unit: FlightDeckWorkUnit): boolean {
-  return ['patch_ready', 'ready_for_integration', 'development_succeeded'].includes(normalize(unit.state))
-    && Boolean(unit.shard_path?.trim());
+function integrationInputIsReady(unit: FlightDeckWorkUnit): boolean {
+  return unit.has_staged_changes && Boolean(unit.workspace_path?.trim());
 }
 
 function integrationInputIsSkipped(unit: FlightDeckWorkUnit): boolean {
-  return unit.telemetry?.integration_skipped === true;
+  return unit.integration_state === 'skipped';
 }
 
 function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
-  const features = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'feature_development' && !unit.workflow_deleted);
-  const manual = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'manual_shard' && !unit.workflow_deleted);
-  const manualStaged = manual.filter(manualShardIsStaged);
-  const manualUnstaged = manual.filter((unit) => !manualShardIsStaged(unit));
-  const skippedFeatures = features.filter(integrationInputIsSkipped);
-  const includedFeatures = features.filter((unit) => !integrationInputIsSkipped(unit));
-  const skippedManualStaged = manualStaged.filter(integrationInputIsSkipped);
-  const includedManualStaged = manualStaged.filter((unit) => !integrationInputIsSkipped(unit));
-  const readyManualStaged = includedManualStaged.filter(manualShardHasStagedChanges);
-  const readyFeatures = includedFeatures.filter(featureIsIntegrationReady);
-  const pendingFeatures = includedFeatures.filter((unit) => !featureIsIntegrationReady(unit));
+  const features = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'feature' && !unit.workflow_deleted);
+  const manual = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'manual' && !unit.workflow_deleted);
+
+  const stagedFeatures = features.filter(workUnitIsIntegrationInput);
+  const unstagedFeatures = features.filter((unit) => !workUnitIsIntegrationInput(unit));
+  const stagedManual = manual.filter(workUnitIsIntegrationInput);
+  const unstagedManual = manual.filter((unit) => !workUnitIsIntegrationInput(unit));
+
+  const skippedFeatures = stagedFeatures.filter(integrationInputIsSkipped);
+  const includedFeatures = stagedFeatures.filter((unit) => !integrationInputIsSkipped(unit));
+  const skippedManualStaged = stagedManual.filter(integrationInputIsSkipped);
+  const includedManualStaged = stagedManual.filter((unit) => !integrationInputIsSkipped(unit));
+
+  const readyManualStaged = includedManualStaged.filter(integrationInputIsReady);
+  const readyFeatures = includedFeatures.filter(integrationInputIsReady);
+  const pendingFeatures = includedFeatures.filter((unit) => !integrationInputIsReady(unit));
   const blockedFeatures = includedFeatures.filter((unit) => ['blocked', 'failed'].includes(normalize(unit.state)));
   const skippedTotal = skippedFeatures.length + skippedManualStaged.length;
   const relevantTotal = includedFeatures.length + includedManualStaged.length;
@@ -1337,8 +1352,10 @@ function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
   return {
     features,
     manual,
-    manualStaged,
-    manualUnstaged,
+    stagedFeatures,
+    unstagedFeatures,
+    manualStaged: stagedManual,
+    manualUnstaged: unstagedManual,
     skippedFeatures,
     includedFeatures,
     skippedManualStaged,
@@ -1466,6 +1483,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
             <Badge size="xs" color="yellow" variant="light">Pending {model.pendingFeatures.length}</Badge>
             <Badge size="xs" color="red" variant="light">Blocked {model.blockedFeatures.length}</Badge>
             <Badge size="xs" color="gray" variant="outline">Skipped {model.skippedTotal}</Badge>
+            <Badge size="xs" color="gray" variant="outline">Unstaged feature {model.unstagedFeatures.length}</Badge>
             <Badge size="xs" color="gray" variant="outline">Unstaged manual {model.manualUnstaged.length}</Badge>
           </Group>
           <Text size="xs" c="gray.4">{model.readyPct}% ready</Text>
@@ -1503,7 +1521,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
                   {model.pendingFeatures.map((unit) => inputRow(unit, 'pending_feature'))}
                   {model.blockedFeatures.map((unit) => inputRow(unit, 'blocked_feature'))}
                   {model.skippedFeatures.map((unit) => inputRow(unit, 'skipped_feature'))}
-                  {model.features.length === 0 ? <Text size="sm" c="dimmed">No feature workflows are scheduled.</Text> : null}
+                  {model.stagedFeatures.length === 0 ? <Text size="sm" c="dimmed">No feature work is staged for integration.</Text> : null}
                 </Stack>
               </ScrollArea>
             </Stack>
@@ -1580,12 +1598,12 @@ function ManualPoolWorkflowList(props: {
 }
 
 function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit[]; supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void; onManualShardCreating?: (name: string | null) => void }) {
-  const childRunning = props.units.some((unit) => unit.state === 'running' || unit.state === 'integrating');
-  const poolRunning = props.groupKey === 'feature_development' && props.supervisor.status === 'running_children';
-  const poolPaused = props.groupKey === 'feature_development' && props.supervisor.status === 'paused';
-  const running = props.groupKey === 'feature_development' ? poolRunning : childRunning;
+  const childRunning = props.units.some((unit) => unit.state === 'running');
+  const poolRunning = props.groupKey === 'feature' && props.supervisor.status === 'running_children';
+  const poolPaused = props.groupKey === 'feature' && props.supervisor.status === 'paused';
+  const running = props.groupKey === 'feature' ? poolRunning : childRunning;
   const queued = props.units.some((unit) => unit.state === 'queued');
-  const waiting = props.units.some((unit) => unit.state === 'waiting_user');
+  const waiting = props.units.some((unit) => unit.state === 'waiting');
   const settings = poolSetting(props.supervisor, props.groupKey);
   const selectedTemplate = settings.template_id ?? null;
   const [manualBusy, setManualBusy] = useState(false);
@@ -1606,7 +1624,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     try {
       await runSupervisorAction(props.supervisor.id, {
         action: 'create_work_unit',
-        pool_kind: 'manual_shard',
+        pool_kind: 'manual',
         name,
         template_id: selectedTemplate
       });
@@ -1645,7 +1663,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     );
   }
 
-  if (props.groupKey === 'feature_development') {
+  if (props.groupKey === 'feature') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
@@ -1680,7 +1698,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     );
   }
 
-  if (props.groupKey === 'manual_shard') {
+  if (props.groupKey === 'manual') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
@@ -1688,7 +1706,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
           <TextInput
             size="xs"
             autoFocus
-            placeholder="Shard name"
+            placeholder="Work unit name"
             value={manualName}
             onChange={(event) => setManualName(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -1704,7 +1722,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
         {manualNameOpen ? (
           <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
         ) : (
-          <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New shard</Button>
+          <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New work unit</Button>
         )}
       </Group>
     );
@@ -1750,7 +1768,7 @@ function WorkPoolProjectionSection(props: {
                 <Group gap="xs">
                   <Text fw={950} size="md" tt="uppercase" c="gray.0">{props.title}</Text>
                   <Badge color={props.units.length > 0 ? 'cyan' : 'gray'} variant="filled">{props.units.length}</Badge>
-                  {props.groupKey === 'feature_development' ? <Badge color={tone(props.supervisor.status)} variant="light">{titleCase(props.supervisor.status)}</Badge> : null}
+                  {props.groupKey === 'feature' ? <Badge color={tone(props.supervisor.status)} variant="light">{titleCase(props.supervisor.status)}</Badge> : null}
                 </Group>
                 {props.groupKey === 'integration' ? null : <Text size="xs" c="gray.4">{props.units.length > 0 ? props.description : props.empty}</Text>}
               </Stack>
@@ -1764,7 +1782,7 @@ function WorkPoolProjectionSection(props: {
         </Stack>
 
         {props.units.length > 0 ? (
-          props.groupKey === 'manual_shard' ? (
+          props.groupKey === 'manual' ? (
             <ManualPoolWorkflowList units={props.units} supervisor={props.supervisor} navigate={props.navigate} onActionComplete={props.onActionComplete} pendingManualShardName={pendingManualShardName} />
           ) : (
             <Stack gap="sm">
@@ -1844,9 +1862,9 @@ function SupervisorPlannerOptionsModal(props: {
     if (!supervisor) return;
     setLoading(true);
     try {
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows);
-      setSelectedPlannerId((current) => current ?? supervisorSelectedPlannerId ?? rows.find((planner) => planner.is_default)?.id ?? rows[0]?.id ?? null);
+      setSelectedPlannerId(supervisorSelectedPlannerId);
       setNewPlannerTitle((current) => current.trim() || `${supervisor.title || 'Supervisor'} Planner`);
     } catch (err) {
       props.onError?.(err instanceof Error ? err.message : String(err));
@@ -1878,18 +1896,18 @@ function SupervisorPlannerOptionsModal(props: {
     }
   }
 
-  async function createPlanner() {
+  async function createSupervisorPlanner() {
     if (!supervisor) return;
     const title = newPlannerTitle.trim() || `${supervisor.title || 'Supervisor'} Planner`;
     setLoading(true);
     try {
-      const planner = await createPlannerForRepo({
-        root_repo_path: supervisor.root_repo_path,
+      const planner = await createPlanner({
+        repo_ref: supervisor.root_repo_path,
         title,
         make_default: false,
         features: [],
       });
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows.some((row) => row.id === planner.id) ? rows : [planner, ...rows]);
       setSelectedPlannerId(planner.id);
       setNewPlannerTitle('');
@@ -1900,7 +1918,7 @@ function SupervisorPlannerOptionsModal(props: {
     }
   }
 
-  async function deletePlanner() {
+  async function deleteSelectedPlanner() {
     if (!supervisor || !selectedPlannerId) return;
     const planner = planners.find((item) => item.id === selectedPlannerId);
     if (!planner) return;
@@ -1908,8 +1926,8 @@ function SupervisorPlannerOptionsModal(props: {
     if (!confirmed) return;
     setLoading(true);
     try {
-      await deletePlannerForRepo(planner.id);
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      await deletePlannerApi(planner.id);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows);
       setSelectedPlannerId(rows.find((row) => row.id === supervisorSelectedPlannerId)?.id ?? rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
       await props.onApplied();
@@ -1949,10 +1967,10 @@ function SupervisorPlannerOptionsModal(props: {
             onChange={(event) => setNewPlannerTitle(event.currentTarget.value)}
             style={{ flex: 1 }}
           />
-          <Button size="xs" variant="light" onClick={() => void createPlanner()} loading={loading} disabled={!supervisor}>Create planner</Button>
+          <Button size="xs" variant="light" onClick={() => void createSupervisorPlanner()} loading={loading} disabled={!supervisor}>Create planner</Button>
         </Group>
         <Group justify="space-between" gap="xs" wrap="nowrap">
-          <Button size="xs" color="red" variant="light" onClick={() => void deletePlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
+          <Button size="xs" color="red" variant="light" onClick={() => void deleteSelectedPlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
             Delete selected planner
           </Button>
           <Group gap="xs" wrap="nowrap">
@@ -1969,9 +1987,8 @@ function SupervisorPlannerOptionsModal(props: {
 
 function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: FlightDeckSupervisor) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
-  const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting_user').length;
-  const failed = supervisor.work_units.filter((unit) => unit.state === 'failed' || unit.state === 'blocked').length;
-  const ready = supervisor.work_units.filter((unit) => unit.state === 'patch_ready' || unit.state === 'ready_for_integration').length;
+  const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting').length;
+  const failed = supervisor.work_units.filter((unit) => unit.state === 'failed').length;
   const integrationState = String(supervisor.integration?.state ?? 'idle');
 
   return (
@@ -1984,7 +2001,6 @@ function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOp
               <Badge variant="outline">{supervisor.work_units.length} work units</Badge>
               <Badge color={waiting > 0 ? 'yellow' : 'gray'} variant="outline">{waiting} waiting</Badge>
               <Badge color={failed > 0 ? 'red' : 'gray'} variant="outline">{failed} blocked</Badge>
-              <Badge color={ready > 0 ? 'cyan' : 'gray'} variant="outline">{ready} ready</Badge>
             </Group>
             <Text size="sm" c="dimmed">{compactPath(supervisor.root_repo_path)}</Text>
           </Stack>
@@ -2017,8 +2033,8 @@ function MissionBar(props: {
   onOpenSupervisorManagement: () => void;
 }) {
   const supervisorOptions = (props.deck?.supervisors ?? []).map((supervisor) => ({ value: supervisor.id, label: supervisor.title || supervisor.id.slice(0, 8) }));
-  const stateOptions = ['queued', 'running', 'waiting_user', 'failed', 'patch_ready', 'ready_for_integration', 'integrating', 'integrated', 'deleted'].map((value) => ({ value, label: titleCase(value) }));
-  const kindOptions = ['refine', 'feature_development', 'manual_shard', 'integration'].map((value) => ({ value, label: value === 'feature_development' ? 'Feature pool' : value === 'manual_shard' ? 'Manual pool' : `${titleCase(value)} pool` }));
+  const stateOptions = ['draft', 'queued', 'running', 'waiting', 'paused', 'completed', 'failed', 'cancelled', 'archived'].map((value) => ({ value, label: titleCase(value) }));
+  const kindOptions = ['refine', 'feature', 'manual', 'integration'].map((value) => ({ value, label: `${titleCase(value)} pool` }));
   const alerts = props.deck?.alerts ?? [];
 
   return (
@@ -2184,7 +2200,16 @@ function FeatureQueueModal(props: {
         setQueue(next);
         updateQueuedFeatures(next.queued_features ?? []);
         const nextPlanners = next.planners ?? [];
-        setPlannerOptions(nextPlanners as PlannerWorkspace[]);
+        setPlannerOptions(nextPlanners.map((planner): PlannerWorkspace => ({
+          id: planner.id,
+          repo_ref: planner.root_repo_path,
+          title: planner.title,
+          is_default: planner.is_default,
+          feature_count: planner.feature_count ?? 0,
+          features: [],
+          created_at: planner.created_at ?? '',
+          updated_at: planner.updated_at ?? '',
+        })));
       })
       .catch((err) => {
         if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
@@ -2227,21 +2252,63 @@ function FeatureQueueModal(props: {
 
   async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
     if (!supervisor) return;
-    const activePlannerId = selectedPlannerId;
-    const uniqueQueuedFeatures = nextQueuedFeatures.filter((item, index, rows) => item.feature_id && rows.findIndex((candidate) => candidate.feature_id === item.feature_id) === index);
+
+    const previousQueuedFeatures = queuedFeaturesRef.current;
+    const uniqueQueuedFeatures = nextQueuedFeatures.filter(
+      (item, index, rows) =>
+        item.feature_id
+        && item.planner_id
+        && rows.findIndex(
+          (candidate) => candidate.feature_id === item.feature_id && candidate.planner_id === item.planner_id,
+        ) === index,
+    );
+
+    const keyOf = (item: SupervisorQueuedFeature) => `${item.planner_id}:${item.feature_id}`;
+    const previousKeys = new Set(previousQueuedFeatures.map(keyOf));
+    const nextKeys = new Set(uniqueQueuedFeatures.map(keyOf));
+    const removed = previousQueuedFeatures.filter((item) => !nextKeys.has(keyOf(item)));
+    const added = uniqueQueuedFeatures.filter((item) => !previousKeys.has(keyOf(item)));
+
     updateQueuedFeatures(uniqueQueuedFeatures);
     setQueueLoading(true);
     setQueueError(null);
 
     const write = async () => {
       try {
-        await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures);
+        for (const item of removed) {
+          await runSupervisorAction(supervisor.id, {
+            action: 'dequeue_feature',
+            planner_id: item.planner_id,
+            feature_id: item.feature_id,
+          });
+        }
+
+        for (const item of added) {
+          await runSupervisorAction(supervisor.id, {
+            action: 'enqueue_feature',
+            planner_id: item.planner_id,
+            feature_id: item.feature_id,
+          });
+        }
+
+        await runSupervisorAction(supervisor.id, {
+          action: 'reorder_feature_pool',
+          feature_ids: uniqueQueuedFeatures.map((item) => item.feature_id),
+        });
+
         const next = await getSupervisorQueue(supervisor.id);
         setQueue(next);
         updateQueuedFeatures(next.queued_features ?? []);
         await props.onApplied();
       } catch (err) {
         setQueueError(err instanceof Error ? err.message : String(err));
+        try {
+          const canonical = await getSupervisorQueue(supervisor.id);
+          setQueue(canonical);
+          updateQueuedFeatures(canonical.queued_features ?? []);
+        } catch {
+          updateQueuedFeatures(previousQueuedFeatures);
+        }
       }
     };
 
@@ -2268,14 +2335,23 @@ function FeatureQueueModal(props: {
       return;
     }
 
-    const planner = uniquePlannerOptions.find((item) => item.id === selectedPlannerId);
-    if (!selectedPlannerId || !planner) return;
+    const item = latestQueueItem(featureId);
+    const plannerId = item?.planner_id ?? selectedPlannerId;
+    if (!plannerId) {
+      setQueueError('Supervisor has no selected planner');
+      return;
+    }
+
+    const plannerTitle = item?.planner_title
+      ?? uniquePlannerOptions.find((planner) => planner.id === plannerId)?.title
+      ?? plannerId;
+
     void persistQueueSelection([
-      ...queuedFeaturesRef.current.filter((item) => item.feature_id !== featureId),
+      ...queuedFeaturesRef.current.filter((queued) => queued.feature_id !== featureId),
       {
         feature_id: featureId,
-        planner_id: latestQueueItem(featureId)?.planner_id ?? selectedPlannerId,
-        planner_title: latestQueueItem(featureId)?.planner_title ?? planner.title
+        planner_id: plannerId,
+        planner_title: plannerTitle
       }
     ]);
   }
@@ -2320,7 +2396,7 @@ function FeatureQueueModal(props: {
           <Text size="sm" c="dimmed">
             {uniquePlannerOptions.find((planner) => planner.id === selectedPlannerId)?.title ?? selectedPlannerId ?? 'No supervisor planner selected'}
           </Text>
-          <Text size="xs" c="dimmed">Selected by supervisor state. The queue cannot override it.</Text>
+          <Text size="xs" c="dimmed">This planner controls which available features are being browsed. Already queued features from other planners remain in the feature pool.</Text>
         </Stack>
         <Group gap="xs">
           <Badge color="blue" variant="light">{selectedIds.length} queued</Badge>
@@ -2445,6 +2521,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }, []);
 
   const settingsSupervisor = (deck?.supervisors ?? []).find((supervisor) => supervisor.id === settingsSupervisorId) ?? null;
+  const activePlannerSupervisor = plannerSupervisor
+    ? (deck?.supervisors.find((supervisor) => supervisor.id === plannerSupervisor.id) ?? plannerSupervisor)
+    : null;
 
   async function saveExecutionEventLimit() {
     if (!settingsSupervisor) return;
@@ -2504,21 +2583,20 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }
 
   async function createRefineWorkflowForFeature(featureId: string) {
-    const supervisor = plannerSupervisor;
+    const supervisor = activePlannerSupervisor;
     const templateId = plannerRefinementTemplateId;
-    const plannerId = supervisor?.selected_planner_id ?? null;
-    if (!supervisor || !templateId || !plannerId) {
-      setError('Supervisor planner and refine template are required before creating a fine workflow.');
+    if (!supervisor || !templateId) {
+      setError('Supervisor and refine template are required before creating a refine workflow.');
       return;
     }
-
     setCreatingRefineFeatureId(featureId);
     try {
       setPlannerSupervisor(null);
       setPlannerCreateFeatureOnOpen(false);
       setPlannerSelectFeatureOnOpen(false);
-      await refinePlannerFeature(plannerId, featureId, {
-        supervisor_id: supervisor.id,
+      await runSupervisorAction(supervisor.id, {
+        action: 'refine_feature',
+        feature_id: featureId,
         workflow_template_id: templateId,
       });
       setPlannerRefinementTemplateId(null);
@@ -2741,11 +2819,11 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         onError={setError}
       />
       <PlannerModal
-        opened={plannerSupervisor !== null}
-        rootRepoPath={plannerSupervisor?.root_repo_path ?? ''}
+        opened={activePlannerSupervisor !== null}
+        repoRef={activePlannerSupervisor?.root_repo_path ?? ''}
         run={null}
         templates={templates}
-        selectedPlannerId={plannerSupervisor?.selected_planner_id ?? null}
+        selectedPlannerId={activePlannerSupervisor?.selected_planner_id ?? null}
         selectedFeatureId={null}
         createFeatureOnOpen={plannerCreateFeatureOnOpen}
         selectionMode={plannerSelectFeatureOnOpen}

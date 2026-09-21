@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     path::{Path, PathBuf},
     sync::Arc,

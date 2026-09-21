@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    engine::{automation, refresh_inference_arm_state},
+    engine::automation,
     models::RunStatus,
 };
 
@@ -21,7 +21,7 @@ use super::{
     set_run_status,
 };
 use super::stages::{execute_stage, StageStatus, StageTransition};
-use super::transitions::{next_step_id, resolve_next_target, should_auto_advance, transition_to_step};
+use super::transitions::{resolve_next_target, should_auto_advance, transition_to_step};
 
 pub async fn patch_transient_stage_user_input(
     state: &AppState,

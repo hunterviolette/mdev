@@ -12,7 +12,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/supervisor-runs", post(create_supervisor_run))
         .route("/api/supervisor-runs/:supervisor_id", axum::routing::delete(delete_supervisor_run))
-        .route("/api/supervisor-runs/:supervisor_id/queue", get(get_supervisor_queue).post(set_supervisor_queue))
+        .route("/api/supervisor-runs/:supervisor_id/queue", get(get_supervisor_queue))
         .route("/api/supervisor-runs/:supervisor_id/actions", post(supervisor_action))
 }
 
@@ -38,15 +38,6 @@ async fn get_supervisor_queue(
     supervisor::supervisor_queue_projection(&state, supervisor_id).await.map(Json).map_err(internal)
 }
 
-async fn set_supervisor_queue(
-    State(state): State<AppState>,
-    Path(supervisor_id): Path<Uuid>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let _supervisor_guard = state.supervisor_coordinator.lock(supervisor_id).await;
-    supervisor::select_supervisor_feature_pool(&state, supervisor_id, payload).await.map(Json).map_err(internal)
-}
-
 async fn supervisor_action(
     State(state): State<AppState>,
     Path(supervisor_id): Path<Uuid>,
@@ -67,11 +58,25 @@ async fn supervisor_action(
         SupervisorActionRequest::StageWorkUnit { work_unit_id, staged } => supervisor::stage_supervisor_work_unit(&state, supervisor_id, work_unit_id, staged).await,
         SupervisorActionRequest::UpdateSupervisorConfig { config } => supervisor::update_supervisor_config(&state, supervisor_id, config).await,
         SupervisorActionRequest::SelectPlanner { planner_id } => supervisor::select_supervisor_planner(&state, supervisor_id, planner_id).await,
+        SupervisorActionRequest::EnqueueFeature { planner_id, feature_id } => supervisor::enqueue_supervisor_feature(&state, supervisor_id, planner_id, feature_id).await,
+        SupervisorActionRequest::DequeueFeature { planner_id, feature_id } => supervisor::dequeue_supervisor_feature(&state, supervisor_id, planner_id, feature_id).await,
+        SupervisorActionRequest::ReorderFeaturePool { feature_ids } => supervisor::reorder_supervisor_feature_pool(&state, supervisor_id, feature_ids).await,
+        SupervisorActionRequest::RefineFeature { feature_id, workflow_template_id } => supervisor::refine_supervisor_feature(
+            &state,
+            supervisor_id,
+            feature_id,
+            workflow_template_id,
+        ).await,
         SupervisorActionRequest::PauseFeaturePool => supervisor::pause_supervisor_feature_pool(&state, supervisor_id, json!({})).await,
         SupervisorActionRequest::ResumeFeaturePool => supervisor::resume_supervisor_feature_pool(&state, supervisor_id, json!({})).await,
         SupervisorActionRequest::SkipIntegrationInput { work_unit_id } => supervisor::set_supervisor_work_unit_integration_skipped(&state, supervisor_id, work_unit_id, true).await,
         SupervisorActionRequest::UnskipIntegrationInput { work_unit_id } => supervisor::set_supervisor_work_unit_integration_skipped(&state, supervisor_id, work_unit_id, false).await,
-        SupervisorActionRequest::ApplyIntegration => supervisor::apply_supervisor_final_patch(&state, supervisor_id).await,
+        SupervisorActionRequest::ApplyIntegration { work_unit_id, archive_integrated_workflows } => supervisor::apply_supervisor_work_unit(
+            &state,
+            supervisor_id,
+            work_unit_id,
+            archive_integrated_workflows,
+        ).await,
         SupervisorActionRequest::Cancel => supervisor::cancel_supervisor_run(&state, supervisor_id).await,
     };
 

@@ -10,7 +10,11 @@ use crate::{
     app_state::AppState,
     engine,
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
-    supervisor::patches,
+    supervisor::{
+        load_supervisor_integration_inputs,
+        models::{SupervisorIntegrationInput, SupervisorWorkPoolKind},
+        patches,
+    },
 };
 
 use super::{
@@ -77,6 +81,38 @@ fn prepare_merge_patches_state(_step: &WorkflowStepDefinition, local_state: Valu
     Ok(local_state)
 }
 
+fn patch_apply_failed_files(error: &str) -> Vec<String> {
+    let mut files = Vec::new();
+
+    for line in error.lines().map(str::trim) {
+        let path = if let Some(rest) = line.strip_prefix("error: patch failed: ") {
+            rest.rsplit_once(':').map(|(path, _)| path.trim())
+        } else if let Some(rest) = line.strip_prefix("error: ") {
+            rest.strip_suffix(": patch does not apply").map(str::trim)
+        } else {
+            None
+        };
+
+        let Some(path) = path.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+
+        if !files.iter().any(|existing| existing == path) {
+            files.push(path.to_string());
+        }
+    }
+
+    files
+}
+
+fn patch_apply_failure_summary(failed_files: &[String]) -> String {
+    match failed_files.len() {
+        0 => "Patch could not be merged into the integration workspace".to_string(),
+        1 => format!("1 file could not be merged: {}", failed_files[0]),
+        count => format!("{count} files could not be merged into the integration workspace"),
+    }
+}
+
 pub async fn execute_stage(
     state: &AppState,
     run_id: Uuid,
@@ -112,12 +148,6 @@ pub async fn execute_stage(
         Some(supervisor_run_id) => load_supervisor_runtime_context(state, supervisor_run_id).await?,
         None => json!({}),
     };
-    let root_repo_path = supervisor_runtime_context
-        .get("root_repo_path")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(repo_ref)
-        .to_string();
     let sprint_id = supervisor_context
         .get("sprint_id")
         .or_else(|| supervisor_runtime_context.get("sprint_id"))
@@ -126,11 +156,16 @@ pub async fn execute_stage(
         .map(str::to_string);
     let integration_batch_id = supervisor_run_id.clone().or_else(|| sprint_id.clone()).unwrap_or_else(|| run_id.to_string());
 
-    let configured_patch_items = step
-        .config
-        .get("patches")
+    let configured_inputs = supervisor_context
+        .get("integration_inputs")
         .and_then(Value::as_array)
         .cloned()
+        .or_else(|| {
+            step.config
+                .get("patches")
+                .and_then(Value::as_array)
+                .cloned()
+        })
         .or_else(|| {
             run.context
                 .get("workflow_engine")
@@ -140,101 +175,97 @@ pub async fn execute_stage(
                 .and_then(Value::as_array)
                 .cloned()
         })
-        .unwrap_or_default();
-    let patch_items = if let Some(supervisor_run_id) = supervisor_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        resolve_supervisor_integration_pool_patches(state, supervisor_run_id).await?
-    } else if !configured_patch_items.is_empty() {
-        configured_patch_items
+        .unwrap_or_default()
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<Vec<SupervisorIntegrationInput>, _>>()?;
+
+    let patch_items = if !configured_inputs.is_empty() {
+        configured_inputs
+    } else if let Some(supervisor_run_id) = supervisor_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        load_supervisor_integration_inputs(state, Uuid::parse_str(supervisor_run_id)?).await?
     } else if let Some(sprint_id) = sprint_id.as_deref() {
-        resolve_sprint_feature_patches(state, sprint_id).await?
+        load_sprint_feature_inputs(state, sprint_id).await?
     } else {
-        return Err(anyhow!("merge_patches requires supervisor_run_id, configured patch inputs, or legacy sprint_id"));
+        return Err(anyhow!("merge_patches requires integration inputs"));
     };
     let mut applied = Vec::new();
+    let mut pending_patches = Vec::new();
     let mut failed = Vec::new();
     let mut capability_results = Vec::new();
 
     if patch_items.is_empty() {
         failed.push(json!({
-            "error": "merge_patches found no dynamic feature-pool or staged manual inputs with shard_path",
+            "error": "merge_patches found no staged integration inputs with workspace_path",
             "sprint_id": sprint_id,
             "integration_batch_id": integration_batch_id
         }));
     }
 
     for patch in patch_items {
-        let shard_path = patch.get("shard_path").and_then(Value::as_str).unwrap_or_default().trim().to_string();
-        let workflow_type = patch.get("workflow_type").and_then(Value::as_str).unwrap_or("feature_development");
-        let execution_item_id = patch.get("execution_item_id").and_then(Value::as_str).unwrap_or_default().trim().to_string();
-        let feature_id = if workflow_type == "manual_shard" { String::new() } else { execution_item_id.clone() };
-        let workflow_run_id = patch.get("workflow_run_id").and_then(Value::as_str).map(str::to_string);
+        let workspace_path = patch.workspace_path.to_string_lossy().trim().to_string();
+        let work_unit_id = patch.work_unit_id.trim().to_string();
+        let feature_id = patch.feature_id.clone().filter(|value| !value.trim().is_empty());
+        let workflow_run_id = patch.workflow_run_id.map(|value| value.to_string());
         let capability_invocation_id = Uuid::new_v4().to_string();
-        let patch_source = patch
-            .get("patch_owner")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| if workflow_type == "manual_shard" { "supervisor_manual_shards" } else { "feature_pool" });
         let capability_config = json!({
-            "mode": "generate_apply_persist_patch_text",
-            "source": patch_source,
-            "sprint_id": sprint_id,
-            "integration_batch_id": integration_batch_id,
-            "execution_item_id": execution_item_id,
-            "feature_id": if feature_id.is_empty() { Value::Null } else { Value::String(feature_id.clone()) },
-            "workflow_type": workflow_type,
-            "shard_path": shard_path,
+            "work_unit_id": work_unit_id,
+            "workspace_path": workspace_path,
             "target_repo_ref": repo_ref
         });
 
-        if shard_path.is_empty() || (workflow_type != "manual_shard" && feature_id.is_empty()) || (workflow_type == "manual_shard" && execution_item_id.is_empty()) {
+        if workspace_path.is_empty() || work_unit_id.is_empty() {
             failed.push(json!({
                 "patch": patch,
-                "error": "integration patch source requires shard_path and either feature_id or manual_shard_id"
+                "error": "integration input requires work_unit_id and workspace_path"
             }));
             break;
         }
 
         append_git_patch_payload_event(
             state,
-            run_id,
-            step,
-            stage_execution_id.as_deref(),
-            capability_invocation_id.as_str(),
-            "info",
-            "git_patch_payload_started",
-            "git patch payload started",
-            capability_config.clone(),
-            json!({}),
-        ).await?;
+            GitPatchPayloadEvent {
+                run_id,
+                step,
+                stage_execution_id: stage_execution_id.as_deref(),
+                capability_invocation_id: capability_invocation_id.as_str(),
+                level: "info",
+                kind: "git_patch_payload_started",
+                message: "git patch payload started",
+                config: capability_config.clone(),
+                result: json!({}),
+            },
+        )
+        .await?;
 
-        let patch_text = match if workflow_type == "manual_shard" {
-            patches::generate_staged_patch_text(Path::new(&shard_path))
-        } else {
-            patches::generate_patch_text(Path::new(&shard_path))
-        } {
+        let patch_text = match patches::generate_staged_patch_text(Path::new(&workspace_path)) {
             Ok(value) => value,
             Err(err) => {
+                let details = format!("{:#}", err);
+                let summary = "Could not read the staged changes from this work unit";
                 let result = json!({
                     "ok": false,
-                    "mode": if workflow_type == "manual_shard" { "generate_staged_patch_text" } else { "generate_patch_text" },
-                    "source": patch_source,
-                    "sprint_id": sprint_id,
-                    "feature_id": feature_id,
-                    "shard_path": shard_path,
-                    "error": format!("{:#}", err)
+                    "error_type": "staged_patch_generation_failed",
+                    "summary": summary,
+                    "work_unit_id": work_unit_id,
+                    "workspace_path": workspace_path,
+                    "details": details
                 });
                 append_git_patch_payload_event(
                     state,
-                    run_id,
-                    step,
-                    stage_execution_id.as_deref(),
-                    capability_invocation_id.as_str(),
-                    "error",
-                    "git_patch_payload_failed",
-                    "git patch payload failed",
-                    capability_config,
-                    result.clone(),
-                ).await?;
+                    GitPatchPayloadEvent {
+                        run_id,
+                        step,
+                        stage_execution_id: stage_execution_id.as_deref(),
+                        capability_invocation_id: capability_invocation_id.as_str(),
+                        level: "error",
+                        kind: "git_patch_payload_failed",
+                        message: summary,
+                        config: capability_config,
+                        result: result.clone(),
+                    },
+                )
+                .await?;
                 capability_results.push(json!({
                     "key": "git_patch_payload",
                     "ok": false,
@@ -242,7 +273,7 @@ pub async fn execute_stage(
                 }));
                 failed.push(json!({
                     "patch": patch,
-                    "error": format!("failed to generate patch text: {:#}", err)
+                    "error": format!("failed to generate staged patch text: {:#}", err)
                 }));
                 break;
             }
@@ -251,34 +282,36 @@ pub async fn execute_stage(
         if patch_text.trim().is_empty() {
             let result = json!({
                 "ok": true,
-                "mode": if workflow_type == "manual_shard" { "generate_staged_patch_text" } else { "generate_patch_text" },
-                "source": patch_source,
-                "sprint_id": sprint_id,
-                "feature_id": feature_id,
-                "shard_path": shard_path,
+                "summary": "No staged changes were present in this integration input",
+                "work_unit_id": work_unit_id,
+                "workspace_path": workspace_path,
                 "patch_bytes": 0,
                 "empty_patch": true
             });
             append_git_patch_payload_event(
                 state,
-                run_id,
-                step,
-                stage_execution_id.as_deref(),
-                capability_invocation_id.as_str(),
-                "info",
-                "git_patch_payload_completed",
-                "git patch payload completed",
-                capability_config,
-                result.clone(),
-            ).await?;
+                GitPatchPayloadEvent {
+                    run_id,
+                    step,
+                    stage_execution_id: stage_execution_id.as_deref(),
+                    capability_invocation_id: capability_invocation_id.as_str(),
+                    level: "info",
+                    kind: "git_patch_payload_completed",
+                    message: "git patch payload completed",
+                    config: capability_config,
+                    result: result.clone(),
+                },
+            )
+            .await?;
             capability_results.push(json!({
                 "key": "git_patch_payload",
                 "ok": true,
                 "result": result
             }));
             applied.push(json!({
-                "execution_item_id": feature_id,
-                "shard_path": shard_path,
+                "work_unit_id": work_unit_id,
+                "feature_id": feature_id,
+                "workspace_path": workspace_path,
                 "workflow_run_id": workflow_run_id,
                 "patch_id": null,
                 "empty_patch": true
@@ -288,93 +321,100 @@ pub async fn execute_stage(
 
         match patches::apply_patch_text(Path::new(repo_ref), &patch_text) {
             Ok(()) => {
-                let patch_id = if workflow_type == "manual_shard" {
-                    persist_integrated_manual_patch(
-                        state,
-                        supervisor_run_id.as_deref(),
-                        &execution_item_id,
-                        workflow_run_id.as_deref(),
-                        &shard_path,
-                        &patch_text,
-                    ).await?
-                } else {
-                    persist_integrated_feature_patch(
-                        state,
-                        &root_repo_path,
-                        supervisor_run_id.as_deref(),
-                        sprint_id.as_deref(),
-                        &feature_id,
-                        workflow_run_id.as_deref(),
-                        &shard_path,
-                        &patch_text,
-                    ).await?
-                };
+                let patch_hash = patches::patch_content_hash(&patch_text);
+                let base_commit = patches::current_head(Path::new(&workspace_path))?;
+
+                pending_patches.push(PendingIntegrationPatch {
+                    id: Uuid::new_v4().to_string(),
+                    source_work_unit_id: work_unit_id.clone(),
+                    source_kind: patch.kind,
+                    source_workflow_run_id: workflow_run_id.clone(),
+                    feature_id: feature_id.clone(),
+                    workspace_path: workspace_path.clone(),
+                    base_commit,
+                    patch_text: patch_text.clone(),
+                    patch_hash,
+                    patch_bytes: patch_text.len() as i64,
+                });
+
                 let result = json!({
                     "ok": true,
-                    "mode": "generate_apply_persist_patch_text",
-                    "source": "sprint_features",
-                    "sprint_id": sprint_id,
-                    "feature_id": feature_id,
-                    "shard_path": shard_path,
-                    "patch_id": patch_id,
+                    "summary": "Staged changes merged into the integration workspace",
+                    "work_unit_id": work_unit_id,
+                    "workspace_path": workspace_path,
                     "patch_bytes": patch_text.len()
                 });
                 append_git_patch_payload_event(
                     state,
-                    run_id,
-                    step,
-                    stage_execution_id.as_deref(),
-                    capability_invocation_id.as_str(),
-                    "info",
-                    "git_patch_payload_completed",
-                    "git patch payload completed",
-                    capability_config,
-                    result.clone(),
-                ).await?;
+                    GitPatchPayloadEvent {
+                        run_id,
+                        step,
+                        stage_execution_id: stage_execution_id.as_deref(),
+                        capability_invocation_id: capability_invocation_id.as_str(),
+                        level: "info",
+                        kind: "git_patch_payload_completed",
+                        message: "git patch payload completed",
+                        config: capability_config,
+                        result: result.clone(),
+                    },
+                )
+                .await?;
                 capability_results.push(json!({
                     "key": "git_patch_payload",
                     "ok": true,
                     "result": result
                 }));
                 applied.push(json!({
-                    "execution_item_id": feature_id,
-                    "shard_path": shard_path,
+                    "work_unit_id": work_unit_id,
+                    "feature_id": feature_id,
+                    "kind": patch.kind,
+                    "workspace_path": workspace_path,
                     "workflow_run_id": workflow_run_id,
-                    "patch_id": patch_id,
                     "patch_bytes": patch_text.len()
                 }));
             }
             Err(err) => {
+                let details = format!("{:#}", err);
+                let failed_files = patch_apply_failed_files(&details);
+                let summary = patch_apply_failure_summary(&failed_files);
+                let error_type = if failed_files.is_empty() {
+                    "patch_apply_failed"
+                } else {
+                    "patch_conflict"
+                };
                 let result = json!({
                     "ok": false,
-                    "mode": "apply_patch_text",
-                    "source": "sprint_features",
-                    "sprint_id": sprint_id,
-                    "feature_id": feature_id,
-                    "shard_path": shard_path,
-                    "error": format!("{:#}", err)
+                    "error_type": error_type,
+                    "summary": summary,
+                    "work_unit_id": work_unit_id,
+                    "workspace_path": workspace_path,
+                    "failed_files": failed_files,
+                    "details": details
                 });
                 append_git_patch_payload_event(
                     state,
-                    run_id,
-                    step,
-                    stage_execution_id.as_deref(),
-                    capability_invocation_id.as_str(),
-                    "error",
-                    "git_patch_payload_failed",
-                    "git patch payload failed",
-                    capability_config,
-                    result.clone(),
-                ).await?;
+                    GitPatchPayloadEvent {
+                        run_id,
+                        step,
+                        stage_execution_id: stage_execution_id.as_deref(),
+                        capability_invocation_id: capability_invocation_id.as_str(),
+                        level: "error",
+                        kind: "git_patch_payload_failed",
+                        message: result
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Patch could not be merged"),
+                        config: capability_config,
+                        result: result.clone(),
+                    },
+                )
+                .await?;
                 capability_results.push(json!({
                     "key": "git_patch_payload",
                     "ok": false,
-                    "result": result
+                    "result": result.clone()
                 }));
-                failed.push(json!({
-                    "patch": patch,
-                    "error": format!("{:#}", err)
-                }));
+                failed.push(result);
                 break;
             }
         }
@@ -383,14 +423,17 @@ pub async fn execute_stage(
     let ok = failed.is_empty();
     let status = if ok { "merged" } else { "merge_failed" };
     let final_patch = if ok {
-        Some(persist_final_integration_patch(
-            state,
-            supervisor_run_id.as_deref(),
-            &root_repo_path,
-            repo_ref,
-            &integration_batch_id,
-            &applied,
-        ).await?)
+        Some(
+            persist_successful_integration_merge(
+                state,
+                supervisor_run_id.as_deref(),
+                run_id,
+                repo_ref,
+                &pending_patches,
+                &applied,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -415,158 +458,160 @@ pub async fn execute_stage(
     })
 }
 
-async fn append_git_patch_payload_event(
-    state: &AppState,
+struct GitPatchPayloadEvent<'a> {
     run_id: Uuid,
-    step: &WorkflowStepDefinition,
-    stage_execution_id: Option<&str>,
-    capability_invocation_id: &str,
-    level: &str,
-    kind: &str,
-    message: &str,
+    step: &'a WorkflowStepDefinition,
+    stage_execution_id: Option<&'a str>,
+    capability_invocation_id: &'a str,
+    level: &'a str,
+    kind: &'a str,
+    message: &'a str,
     config: Value,
     result: Value,
+}
+
+async fn append_git_patch_payload_event(
+    state: &AppState,
+    event: GitPatchPayloadEvent<'_>,
 ) -> Result<()> {
     engine::append_engine_event(
         state,
-        run_id,
-        Some(step.id.as_str()),
-        level,
-        kind,
-        message,
+        event.run_id,
+        Some(event.step.id.as_str()),
+        event.level,
+        event.kind,
+        event.message,
         json!({
             "capability": "git_patch_payload",
-            "config": config,
-            "ok": result.get("ok").and_then(Value::as_bool),
-            "result": result,
-            "event_meta": engine::event_meta(stage_execution_id, Some(capability_invocation_id), None, false)
+            "config": event.config,
+            "ok": event.result.get("ok").and_then(Value::as_bool),
+            "result": event.result,
+            "event_meta": engine::event_meta(
+                event.stage_execution_id,
+                Some(event.capability_invocation_id),
+                None,
+                false,
+            )
         }),
-    ).await
+    )
+    .await
 }
 
-async fn persist_integrated_feature_patch(
-    state: &AppState,
-    root_repo_path: &str,
-    supervisor_run_id: Option<&str>,
-    sprint_id: Option<&str>,
-    feature_id: &str,
-    workflow_run_id: Option<&str>,
-    shard_path: &str,
-    patch_text: &str,
-) -> Result<String> {
-    let repo_id = ensure_planner_repo_id(state, root_repo_path).await?;
-    let patch_id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let base_commit = patches::current_head(Path::new(shard_path))?;
-    let patch_hash = patches::patch_content_hash(patch_text);
-
-    sqlx::query("INSERT INTO planner_feature_patches (id, feature_id, planner_id, supervisor_run_id, workflow_run_id, patch_kind, repo_ref, base_commit, head_commit, patch_text, patch_hash, patch_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(&patch_id)
-        .bind(feature_id)
-        .bind(&repo_id)
-        .bind(supervisor_run_id)
-        .bind(workflow_run_id)
-        .bind("development")
-        .bind(root_repo_path)
-        .bind(base_commit.clone())
-        .bind(base_commit)
-        .bind(patch_text)
-        .bind(patch_hash)
-        .bind(Option::<String>::None)
-        .bind(&now)
-        .execute(&state.db)
-        .await?;
-
-    sqlx::query("UPDATE planner_features SET locked_supervisor_run_id = COALESCE(NULLIF(locked_supervisor_run_id, ''), ?), locked_at = COALESCE(locked_at, ?), updated_at = ? WHERE planner_id = ? AND id = ?")
-        .bind(supervisor_run_id)
-        .bind(&now)
-        .bind(&now)
-        .bind(&repo_id)
-        .bind(feature_id)
-        .execute(&state.db)
-        .await?;
-
-    Ok(patch_id)
+#[derive(Debug, Clone)]
+struct PendingIntegrationPatch {
+    id: String,
+    source_work_unit_id: String,
+    source_kind: SupervisorWorkPoolKind,
+    source_workflow_run_id: Option<String>,
+    feature_id: Option<String>,
+    workspace_path: String,
+    base_commit: Option<String>,
+    patch_text: String,
+    patch_hash: String,
+    patch_bytes: i64,
 }
 
-async fn persist_integrated_manual_patch(
+async fn persist_successful_integration_merge(
     state: &AppState,
     supervisor_run_id: Option<&str>,
-    manual_shard_id: &str,
-    workflow_run_id: Option<&str>,
-    shard_path: &str,
-    patch_text: &str,
-) -> Result<String> {
-    let supervisor_run_id = supervisor_run_id.ok_or_else(|| anyhow!("manual integration patch requires supervisor_run_id"))?;
-    let patch_id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let patch_hash = patches::patch_content_hash(patch_text);
-
-    let row = sqlx::query("SELECT id, context_json FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'manual_shard' AND feature_id = ? LIMIT 1")
-        .bind(supervisor_run_id)
-        .bind(manual_shard_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| anyhow!("manual shard work unit {} is missing", manual_shard_id))?;
-
-    let work_unit_id: String = row.get("id");
-    let mut context = serde_json::from_str::<Value>(&row.get::<String, _>("context_json"))
-        .unwrap_or_else(|_| json!({}));
-    if let Some(obj) = context.as_object_mut() {
-        obj.insert("workflow_type".to_string(), Value::String("manual_shard".to_string()));
-        obj.insert("pool_key".to_string(), Value::String("manual_shard".to_string()));
-        obj.insert("integration_input".to_string(), Value::Bool(true));
-        obj.insert("staged_to_integration".to_string(), Value::Bool(true));
-        obj.insert("integrated_patch_id".to_string(), Value::String(patch_id.clone()));
-        obj.insert("integrated_patch_hash".to_string(), Value::String(patch_hash));
-        obj.insert("integrated_patch_bytes".to_string(), Value::Number((patch_text.len() as u64).into()));
-        obj.insert("integrated_at".to_string(), Value::String(now.clone()));
-    }
-
-    sqlx::query("UPDATE supervisor_work_units SET patch_id = ?, state = 'integrated', context_json = ?, updated_at = ? WHERE id = ?")
-        .bind(&patch_id)
-        .bind(serde_json::to_string(&context)?)
-        .bind(&now)
-        .bind(&work_unit_id)
-        .execute(&state.db)
-        .await?;
-
-    if let Some(workflow_run_id) = workflow_run_id.filter(|value| !value.trim().is_empty()) {
-        tracing::info!(
-            supervisor_run_id,
-            manual_shard_id,
-            workflow_run_id,
-            patch_id = %patch_id,
-            shard_path,
-            "persisted supervisor-owned manual integration patch without planner_feature FK"
-        );
-    }
-
-    Ok(patch_id)
-}
-
-async fn persist_final_integration_patch(
-    state: &AppState,
-    supervisor_run_id: Option<&str>,
-    root_repo_path: &str,
+    integration_workflow_run_id: Uuid,
     integration_repo_path: &str,
-    sprint_id: &str,
+    patches_to_persist: &[PendingIntegrationPatch],
     applied: &[Value],
 ) -> Result<Value> {
-    let supervisor_run_id = supervisor_run_id.ok_or_else(|| anyhow!("merge_patches requires supervisor_run_id to persist final patch"))?;
-    let patch_text = patches::generate_patch_text(Path::new(integration_repo_path))?;
-    let patch_hash = patches::patch_content_hash(&patch_text);
+    let supervisor_run_id = supervisor_run_id
+        .ok_or_else(|| anyhow!("merge_patches requires supervisor_run_id to persist integration results"))?;
+    let final_patch_text = patches::generate_patch_text(Path::new(integration_repo_path))?;
+    let final_patch_hash = patches::patch_content_hash(&final_patch_text);
     let now = Utc::now().to_rfc3339();
-    let final_patch_ref = format!("supervisor_work_units:{}:context_json.final_patch_text", supervisor_run_id);
+    let final_patch_ref = format!(
+        "supervisor_work_units:{}:context_json.final_patch_text",
+        supervisor_run_id
+    );
+
+    let mut tx = state.db.begin().await?;
+
+    let integration_work_unit_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM supervisor_work_units WHERE supervisor_run_id = ? AND kind = 'integration' AND archived_at IS NULL LIMIT 1",
+    )
+    .bind(supervisor_run_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| anyhow!("supervisor integration work unit is missing"))?;
+
+    let mut persisted_inputs = Vec::with_capacity(patches_to_persist.len());
+    for patch in patches_to_persist {
+        sqlx::query(
+            r#"
+            INSERT INTO supervisor_integration_patches (
+                id,
+                supervisor_run_id,
+                integration_work_unit_id,
+                integration_workflow_run_id,
+                source_work_unit_id,
+                source_kind,
+                source_workflow_run_id,
+                feature_id,
+                workspace_path,
+                base_commit,
+                patch_text,
+                patch_hash,
+                patch_bytes,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&patch.id)
+        .bind(supervisor_run_id)
+        .bind(&integration_work_unit_id)
+        .bind(integration_workflow_run_id.to_string())
+        .bind(&patch.source_work_unit_id)
+        .bind(patch.source_kind.as_str())
+        .bind(&patch.source_workflow_run_id)
+        .bind(&patch.feature_id)
+        .bind(&patch.workspace_path)
+        .bind(&patch.base_commit)
+        .bind(&patch.patch_text)
+        .bind(&patch.patch_hash)
+        .bind(patch.patch_bytes)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE supervisor_work_units SET patch_id = ?, updated_at = ? WHERE supervisor_run_id = ? AND id = ? AND archived_at IS NULL",
+        )
+        .bind(&patch.id)
+        .bind(&now)
+        .bind(supervisor_run_id)
+        .bind(&patch.source_work_unit_id)
+        .execute(&mut *tx)
+        .await?;
+
+        persisted_inputs.push(json!({
+            "patch_id": patch.id,
+            "work_unit_id": patch.source_work_unit_id,
+            "kind": patch.source_kind,
+            "feature_id": patch.feature_id,
+            "workflow_run_id": patch.source_workflow_run_id,
+            "workspace_path": patch.workspace_path,
+            "base_commit": patch.base_commit,
+            "patch_hash": patch.patch_hash,
+            "patch_bytes": patch.patch_bytes
+        }));
+    }
+
     let report = json!({
         "ok": true,
         "status": "merged",
         "source": "supervisor_integration_pool",
-        "sprint_id": sprint_id,
+        "integration_work_unit_id": integration_work_unit_id,
+        "integration_workflow_run_id": integration_workflow_run_id,
         "integration_path": integration_repo_path,
         "final_patch_ref": final_patch_ref,
-        "final_patch_hash": patch_hash,
-        "final_patch_bytes": patch_text.len(),
+        "final_patch_hash": final_patch_hash,
+        "final_patch_bytes": final_patch_text.len(),
+        "inputs": persisted_inputs,
         "applied": applied,
         "persisted_at": now
     });
@@ -574,9 +619,7 @@ async fn persist_final_integration_patch(
     sqlx::query(
         r#"
         UPDATE supervisor_work_units
-        SET patch_id = COALESCE(NULLIF(patch_id, ''), ?),
-            integration_path = COALESCE(NULLIF(integration_path, ''), ?),
-            state = CASE WHEN state IN ('deleted', 'archived') THEN state ELSE 'patch_ready' END,
+        SET integration_path = COALESCE(NULLIF(integration_path, ''), ?),
             context_json = json_set(
                 CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
                 '$.final_patch_ref', ?,
@@ -587,75 +630,32 @@ async fn persist_final_integration_patch(
                 '$.integration_path', ?
             ),
             updated_at = ?
-        WHERE supervisor_run_id = ?
-          AND kind = 'integration'
+        WHERE id = ?
+          AND supervisor_run_id = ?
           AND archived_at IS NULL
         "#,
     )
-    .bind(&patch_hash)
     .bind(integration_repo_path)
     .bind(&final_patch_ref)
-    .bind(&patch_text)
-    .bind(&patch_hash)
-    .bind(patch_text.len() as i64)
+    .bind(&final_patch_text)
+    .bind(&final_patch_hash)
+    .bind(final_patch_text.len() as i64)
     .bind(serde_json::to_string(&report)?)
     .bind(integration_repo_path)
     .bind(&now)
+    .bind(&integration_work_unit_id)
     .bind(supervisor_run_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query("UPDATE supervisor_runs SET updated_at = ? WHERE id = ?")
         .bind(&now)
         .bind(supervisor_run_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await?;
     Ok(report)
-}
-
-async fn ensure_planner_repo_id(state: &AppState, root_repo_path: &str) -> Result<String> {
-    let normalized_root = root_repo_path.trim().replace('\\', "/");
-    if let Some(row) = sqlx::query("SELECT id FROM planner_workspaces WHERE root_repo_path = ? ORDER BY is_default DESC, updated_at DESC, created_at DESC LIMIT 1")
-        .bind(&normalized_root)
-        .fetch_optional(&state.db)
-        .await?
-    {
-        return Ok(row.get::<String, _>("id"));
-    }
-
-    let planner_id = Uuid::new_v4().to_string();
-    let repo_key = repo_key_for(&normalized_root);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO planner_workspaces (id, root_repo_path, repo_key, title, is_default, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
-        .bind(&planner_id)
-        .bind(&normalized_root)
-        .bind(&repo_key)
-        .bind(format!("{} Planner", repo_key))
-        .bind(&now)
-        .bind(&now)
-        .execute(&state.db)
-        .await?;
-    Ok(planner_id)
-}
-
-fn repo_key_for(root_repo_path: &str) -> String {
-    let normalized = root_repo_path.trim().replace('\\', "/");
-    let raw = normalized
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("repo");
-    let mut out = raw
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
-        .collect::<String>();
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() { "repo".to_string() } else { out }
 }
 
 async fn load_supervisor_runtime_context(state: &AppState, supervisor_run_id: &str) -> Result<Value> {
@@ -687,55 +687,8 @@ async fn load_supervisor_runtime_context(state: &AppState, supervisor_run_id: &s
     }))
 }
 
-async fn resolve_supervisor_integration_pool_patches(state: &AppState, supervisor_run_id: &str) -> Result<Vec<Value>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT feature_id, title, workflow_run_id, patch_id, shard_path, kind, state, context_json
-        FROM supervisor_work_units
-        WHERE supervisor_run_id = ?
-          AND kind IN ('feature_development', 'manual_shard')
-          AND state NOT IN ('deleted', 'archived')
-          AND TRIM(COALESCE(shard_path, '')) != ''
-          AND COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 0
-          AND (
-              COALESCE(json_extract(context_json, '$.integration_input'), 0) = 1
-              OR COALESCE(json_extract(context_json, '$.staged_to_integration'), 0) = 1
-          )
-        ORDER BY CASE kind WHEN 'feature_development' THEN 0 ELSE 1 END, queue_position ASC, updated_at ASC
-        "#,
-    )
-    .bind(supervisor_run_id)
-    .fetch_all(&state.db)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let kind: String = row.get("kind");
-            let feature_id = row
-                .try_get::<Option<String>, _>("feature_id")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let workflow_type = if kind == "manual_shard" { "manual_shard" } else { "feature_development" };
-            json!({
-                "execution_item_id": feature_id,
-                "feature_id": if kind == "manual_shard" { Value::Null } else { Value::String(feature_id.clone()) },
-                "manual_shard_id": if kind == "manual_shard" { Value::String(feature_id.clone()) } else { Value::Null },
-                "title": row.get::<String, _>("title"),
-                "shard_path": row.get::<String, _>("shard_path"),
-                "workflow_run_id": row.try_get::<Option<String>, _>("workflow_run_id").ok().flatten(),
-                "patch_id": row.try_get::<Option<String>, _>("patch_id").ok().flatten(),
-                "workflow_type": workflow_type,
-                "patch_owner": if kind == "manual_shard" { "staged_manual_pool" } else { "feature_pool" },
-                "pool_state": row.get::<String, _>("state")
-            })
-        })
-        .collect())
-}
-
-async fn resolve_sprint_feature_patches(state: &AppState, sprint_id: &str) -> Result<Vec<Value>> {
-    let rows = sqlx::query("SELECT sf.feature_id, COALESCE(pf.title, sf.feature_id) AS title, sf.shard_path, sf.current_workflow_run_id, sf.current_patch_id FROM sprint_features sf LEFT JOIN planner_features pf ON pf.id = sf.feature_id WHERE sf.sprint_id = ? AND sf.development_state IN ('development_succeeded', 'integrated', 'applied') AND COALESCE(sf.integration_skipped, 0) = 0 AND TRIM(COALESCE(sf.shard_path, '')) != '' ORDER BY sf.sort_order ASC, sf.created_at ASC")
+async fn load_sprint_feature_inputs(state: &AppState, sprint_id: &str) -> Result<Vec<SupervisorIntegrationInput>> {
+    let rows = sqlx::query("SELECT sf.feature_id, sf.shard_path, sf.current_workflow_run_id FROM sprint_features sf WHERE sf.sprint_id = ? AND sf.development_state IN ('development_succeeded', 'integrated', 'applied') AND COALESCE(sf.integration_skipped, 0) = 0 AND TRIM(COALESCE(sf.shard_path, '')) != '' ORDER BY sf.sort_order ASC, sf.created_at ASC")
         .bind(sprint_id)
         .fetch_all(&state.db)
         .await?;
@@ -743,17 +696,19 @@ async fn resolve_sprint_feature_patches(state: &AppState, sprint_id: &str) -> Re
     Ok(rows
         .into_iter()
         .map(|row| {
+            let feature_id = row.get::<String, _>("feature_id");
             let workflow_run_id = row
                 .try_get::<Option<String>, _>("current_workflow_run_id")
                 .ok()
-                .flatten();
-            json!({
-                "execution_item_id": row.get::<String, _>("feature_id"),
-                "title": row.get::<String, _>("title"),
-                "shard_path": row.get::<String, _>("shard_path"),
-                "workflow_run_id": workflow_run_id,
-                "patch_id": row.try_get::<Option<String>, _>("current_patch_id").ok().flatten()
-            })
+                .flatten()
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            SupervisorIntegrationInput {
+                work_unit_id: feature_id.clone(),
+                feature_id: Some(feature_id),
+                workspace_path: row.get::<String, _>("shard_path").into(),
+                workflow_run_id,
+                kind: SupervisorWorkPoolKind::Feature,
+            }
         })
         .collect())
 }

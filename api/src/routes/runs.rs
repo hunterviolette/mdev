@@ -1,7 +1,7 @@
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -9,7 +9,7 @@ use crate::{
     db::{new_workflow_key, normalize_repo_ref},
     app_state::AppState,
     engine::{self, capabilities::planner},
-    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEvent, WorkflowEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
+    models::{CreateRunRequest, RunActionRequest, RunStatus, WorkflowEventStreamItem, WorkflowRun, WorkflowTemplateDefinition},
 };
 
 pub fn router() -> Router<AppState> {
@@ -711,7 +711,9 @@ async fn create_run(
     repo_obj.insert("repo_ref".to_string(), json!(repo_ref.clone()));
     repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
 
-    planner::apply_repo_planner_capability(&state.db, global_state, &repo_ref)
+    state
+        .planner()
+        .apply_repo_capability(global_state, &repo_ref)
         .await
         .map_err(internal)?;
 
@@ -867,34 +869,6 @@ fn compile_commands_from_checks(checks: &Value) -> Value {
     Value::Array(commands)
 }
 
-fn row_to_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEvent> {
-    let id_raw = row.try_get::<String, _>("id").ok()?;
-    let run_id_raw = row.try_get::<String, _>("run_id").ok()?;
-    let payload_raw = row.try_get::<String, _>("payload_json").unwrap_or_else(|_| "{}".to_string());
-    let created_at_raw = row.try_get::<String, _>("created_at").ok()?;
-    let payload = parse_event_payload_json(id_raw.as_str(), payload_raw.as_str());
-
-    match (
-        Uuid::parse_str(id_raw.as_str()),
-        Uuid::parse_str(run_id_raw.as_str()),
-        chrono::DateTime::parse_from_rfc3339(created_at_raw.as_str()),
-    ) {
-        (Ok(id), Ok(run_id), Ok(created_at)) => Some(WorkflowEvent {
-            id,
-            run_id,
-            step_id: row.get("step_id"),
-            level: row.get("level"),
-            kind: row.get("kind"),
-            message: row.get("message"),
-            payload,
-            created_at: created_at.with_timezone(&Utc),
-        }),
-        _ => {
-            tracing::warn!(event_id = %id_raw, run_id = %run_id_raw, "workflow event row is unreadable; omitting event");
-            None
-        }
-    }
-}
 
 fn row_to_runtime_event_readable(row: sqlx::sqlite::SqliteRow) -> Option<WorkflowEventStreamItem> {
     let id = row.try_get::<String, _>("id").ok()?;

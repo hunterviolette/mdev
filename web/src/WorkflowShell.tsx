@@ -4131,20 +4131,27 @@ export function WorkflowShell(props: {
 
   function capabilityIoPayload(capability: LiveCapabilityTrail): Record<string, unknown> {
     return {
-      capability_id: capability.capabilityId,
       name: capability.name,
       status: capability.status,
-      latest_kind: capability.latestKind,
-      latest_level: capability.latestLevel,
-      input: capability.inputPayload ?? null,
-      output: capability.outputPayload ?? capability.latestPayload ?? null
+      message: capability.message,
+      input: deriveCapabilityPayload('input', capability.inputPayload),
+      output: deriveCapabilityPayload('output', capability.outputPayload ?? capability.latestPayload)
     };
   }
 
   function deriveCapabilityPayload(role: 'input' | 'output', payload: unknown): unknown {
     const objectPayload = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
     if (!objectPayload) return payload ?? null;
+
     if (role === 'input') {
+      const config = asRecord(objectPayload.config);
+      if (objectPayload.capability === 'git_patch_payload' && config) {
+        return {
+          work_unit_id: config.work_unit_id ?? null,
+          workspace_path: config.workspace_path ?? null,
+          target_repo_ref: config.target_repo_ref ?? null
+        };
+      }
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
 
@@ -4157,6 +4164,23 @@ export function WorkflowShell(props: {
           ? outputRecord.lines.filter((line): line is string => typeof line === 'string')
           : []
       };
+    }
+
+    if (objectPayload.capability === 'git_patch_payload') {
+      const result = asRecord(objectPayload.result) ?? outputRecord;
+      if (result) {
+        return {
+          ok: result.ok ?? null,
+          summary: result.summary ?? null,
+          error_type: result.error_type ?? null,
+          failed_files: Array.isArray(result.failed_files) ? result.failed_files : [],
+          work_unit_id: result.work_unit_id ?? null,
+          workspace_path: result.workspace_path ?? null,
+          patch_id: result.patch_id ?? null,
+          patch_bytes: result.patch_bytes ?? null,
+          details: result.details ?? null
+        };
+      }
     }
 
     return output;
@@ -4173,14 +4197,15 @@ export function WorkflowShell(props: {
     const nestedError = asRecord(record.error);
 
     const candidates = [
+      record.summary,
+      result?.summary,
+      nestedError?.summary,
       record.error_message,
       record.error,
       nestedError?.message,
-      nestedError?.summary,
       result?.error_message,
       result?.error,
       result?.message,
-      result?.summary,
       result?.status,
       nestedOutput?.error_message,
       nestedOutput?.error,
@@ -7768,7 +7793,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={Boolean(overlayPlanner)}
-          rootRepoPath={overlayPlanner?.rootRepoPath ?? ''}
+          repoRef={overlayPlanner?.rootRepoPath ?? ''}
           onClose={() => setOverlayPlanner(null)}
           onSaved={() => props.navigate?.('/flight-deck')}
           onError={setError}
@@ -7777,7 +7802,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={plannerFragmentConfigOpen}
-          rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+          repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
           selectedPlannerId={selectedPlannerWorkspaceId}
           selectedFeatureId={selectedPlannerFeatureId}
           selectionMode

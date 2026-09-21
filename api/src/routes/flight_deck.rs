@@ -2,10 +2,15 @@ use axum::{extract::{Query, State}, http::StatusCode, routing::get, Json, Router
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::collections::HashSet;
-use std::process::Command;
+use std::{collections::HashSet, path::Path};
 
-use crate::app_state::AppState;
+use crate::{
+    app_state::AppState,
+    supervisor::{
+        models::IntegrationInputState,
+        patches,
+    },
+};
 
 #[derive(Debug, Clone, Deserialize)]
 struct FlightDeckQuery {
@@ -78,8 +83,12 @@ struct FlightDeckWorkUnit {
     title: String,
     state: String,
     root_repo_path: String,
-    shard_path: Option<String>,
+    workspace_path: Option<String>,
     integration_path: Option<String>,
+    has_staged_changes: bool,
+    has_workspace_changes: bool,
+    integration_state: IntegrationInputState,
+    applied_at: Option<String>,
     telemetry: Value,
     alerts: Vec<FlightDeckAlert>,
     created_at: Option<String>,
@@ -131,8 +140,9 @@ struct WorkUnitSeed {
     state: String,
     workflow_status: Option<String>,
     root_repo_path: String,
-    shard_path: Option<String>,
+    workspace_path: Option<String>,
     integration_path: Option<String>,
+    integration_state: IntegrationInputState,
     context: Value,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -183,15 +193,28 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
                 }
                 _ => draft_workflow_telemetry(state, &seed.context).await?,
             };
-            let telemetry = enrich_projection_context_telemetry(telemetry, &seed.context);
-            let telemetry = if seed.workflow_type == "manual_shard" {
-                enrich_manual_shard_telemetry(telemetry, seed.shard_path.as_deref())
-            } else {
-                telemetry
-            };
+            let applied_at = seed
+                .context
+                .get("applied_at")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let change_status = seed
+                .workspace_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .and_then(|path| patches::change_status(Path::new(path)).ok());
+            let has_staged_changes = change_status
+                .as_ref()
+                .is_some_and(|status| status.has_staged_changes());
+            let has_workspace_changes = change_status
+                .as_ref()
+                .is_some_and(|status| status.has_changes());
 
             let mut alerts = Vec::new();
-            if seed.state == "waiting_user" {
+            if seed.state == "waiting" {
                 alerts.push(FlightDeckAlert {
                     id: format!("waiting-user-{}", seed.id),
                     supervisor_id: supervisor.id.clone(),
@@ -242,24 +265,18 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
                 title: seed.title,
                 state: projected_state,
                 root_repo_path: seed.root_repo_path,
-                shard_path: seed.shard_path,
+                workspace_path: seed.workspace_path,
                 integration_path: seed.integration_path,
+                has_staged_changes,
+                has_workspace_changes,
+                integration_state: seed.integration_state,
+                applied_at,
                 telemetry,
                 alerts,
                 created_at: seed.created_at,
                 updated_at: seed.updated_at,
                 workflow_deleted: seed.workflow_deleted,
             });
-        }
-
-        let wants_integration = query.kind.as_deref()
-            .map(|value| value.trim().is_empty() || value == "integration")
-            .unwrap_or(true);
-        let wants_draft = query.state.as_deref()
-            .map(|value| value.trim().is_empty() || value == "draft")
-            .unwrap_or(true);
-        if wants_integration && wants_draft && !work_units.iter().any(|unit| unit.kind == "integration") {
-            work_units.push(integration_draft_work_unit(state, &supervisor).await?);
         }
 
         let topology = build_topology(&supervisor, &work_units);
@@ -284,10 +301,8 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         for unit in &work_units {
             match unit.state.as_str() {
                 "running" => totals.running += 1,
-                "waiting_user" => totals.waiting_user += 1,
-                "failed" | "blocked" => totals.failed += 1,
-                "patch_ready" | "ready_for_integration" => totals.ready_for_integration += 1,
-                "integrating" => totals.integrating += 1,
+                "waiting" => totals.waiting_user += 1,
+                "failed" => totals.failed += 1,
                 _ => {}
             }
         }
@@ -598,8 +613,8 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
         r#"
         SELECT wu.id, wu.supervisor_run_id, wu.repo_id, wu.feature_id, wu.workflow_run_id, wu.patch_id,
                wu.kind, COALESCE(json_extract(wu.context_json, '$.workflow_type'), wu.kind) AS workflow_type,
-               wu.title, wu.state, wr.status AS workflow_status, wu.root_repo_path, wu.shard_path, wu.integration_path,
-               wu.context_json, wu.created_at, wu.updated_at,
+               wu.title, wu.state, wr.status AS workflow_status, wu.root_repo_path, wu.workspace_path, wu.integration_path,
+               wu.integration_state, wu.context_json, wu.created_at, wu.updated_at,
                CASE WHEN wu.workflow_run_id IS NULL OR wr.id IS NOT NULL THEN 1 ELSE 0 END AS workflow_exists
         FROM supervisor_work_units wu
         LEFT JOIN workflow_runs wr ON wr.id = wu.workflow_run_id
@@ -623,6 +638,8 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
                 _ => status,
             });
         let kind_text: String = row.get("kind");
+        let integration_state_text: String = row.get("integration_state");
+        let integration_state = IntegrationInputState::try_from(integration_state_text.as_str()).map_err(anyhow::Error::msg)?;
         let workflow_exists = row.get::<i64, _>("workflow_exists") == 1;
         let persisted_state: String = row.get("state");
         let has_workflow_reference = workflow_run_id
@@ -639,9 +656,6 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
                 .clone()
                 .unwrap_or_else(|| persisted_state)
         };
-        if kind_text == "integration" && workflow_run_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
-            continue;
-        }
         if workflow_run_id.is_some() && !workflow_exists && !include_deleted {
             continue;
         }
@@ -661,42 +675,14 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
             state: state_text,
             workflow_status,
             root_repo_path: row.get("root_repo_path"),
-            shard_path: row.get("shard_path"),
+            workspace_path: row.get("workspace_path"),
             integration_path: row.get("integration_path"),
+            integration_state,
             context: parse_json(row.get::<String, _>("context_json")),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             workflow_deleted: !workflow_exists,
         });
-    }
-
-    let has_integration_work_unit = seeds.iter().any(|seed| seed.kind == "integration");
-    if !has_integration_work_unit {
-        if let Some(integration_run_id) = supervisor.integration_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
-            let workflow_exists = workflow_exists(state, integration_run_id).await?;
-            if workflow_exists || include_deleted {
-                seeds.push(WorkUnitSeed {
-                    id: format!("integration-{}", supervisor.id),
-                    supervisor_id: supervisor.id.clone(),
-                    repo_id: None,
-                    feature_id: None,
-                    workflow_run_id: Some(integration_run_id.to_string()),
-                    patch_id: None,
-                    kind: "integration".to_string(),
-                    workflow_type: "integration".to_string(),
-                    title: "Integration".to_string(),
-                    state: if workflow_exists { integration_state(&supervisor.status) } else { "deleted".to_string() },
-                    workflow_status: None,
-                    root_repo_path: supervisor.root_repo_path.clone(),
-                    shard_path: None,
-                    integration_path: supervisor.integration_path.clone(),
-                    context: json!({ "workflow_type": "integration", "pool_key": "integration" }),
-                    created_at: Some(supervisor.created_at.clone()),
-                    updated_at: Some(supervisor.updated_at.clone()),
-                    workflow_deleted: !workflow_exists,
-                });
-            }
-        }
     }
 
     Ok(seeds)
@@ -944,51 +930,6 @@ async fn workflow_telemetry(
     }))
 }
 
-fn manual_shard_has_staged_changes(shard_path: Option<&str>) -> bool {
-    let Some(shard_path) = shard_path.filter(|value| !value.trim().is_empty()) else {
-        return false;
-    };
-
-    let Ok(output) = Command::new("git")
-        .arg("diff")
-        .arg("--cached")
-        .arg("--quiet")
-        .current_dir(shard_path)
-        .output()
-    else {
-        return false;
-    };
-
-    output.status.code() == Some(1)
-}
-
-fn enrich_manual_shard_telemetry(mut telemetry: Value, shard_path: Option<&str>) -> Value {
-    let has_staged_changes = manual_shard_has_staged_changes(shard_path);
-    if let Some(obj) = telemetry.as_object_mut() {
-        obj.insert("manual_shard_has_staged_changes".to_string(), Value::Bool(has_staged_changes));
-        obj.insert("manual_shard_stageable".to_string(), Value::Bool(has_staged_changes));
-    }
-    telemetry
-}
-
-fn enrich_projection_context_telemetry(mut telemetry: Value, context: &Value) -> Value {
-    if let Some(obj) = telemetry.as_object_mut() {
-        if let Some(value) = context.get("integration_skipped") {
-            let skipped = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
-            obj.insert("integration_skipped".to_string(), Value::Bool(skipped));
-        }
-        if let Some(value) = context.get("integration_input") {
-            let integration_input = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
-            obj.insert("integration_input".to_string(), Value::Bool(integration_input));
-        }
-        if let Some(value) = context.get("staged_to_integration") {
-            let staged = value.as_bool().unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0);
-            obj.insert("staged_to_integration".to_string(), Value::Bool(staged));
-        }
-    }
-    telemetry
-}
-
 fn context_string(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -1073,36 +1014,6 @@ fn empty_telemetry() -> Value {
     })
 }
 
-async fn integration_draft_work_unit(state: &AppState, supervisor: &SupervisorRow) -> anyhow::Result<FlightDeckWorkUnit> {
-    let context = json!({
-        "workflow_type": "integration",
-        "pool_key": "integration",
-        "planned_workflow": true,
-        "planned_workflow_template_id": supervisor_pool_template_id(supervisor, "integration")
-    });
-
-    Ok(FlightDeckWorkUnit {
-        id: format!("{}:integration:draft", supervisor.id),
-        supervisor_id: supervisor.id.clone(),
-        repo_id: None,
-        feature_id: None,
-        workflow_run_id: None,
-        patch_id: None,
-        kind: "integration".to_string(),
-        workflow_type: "integration".to_string(),
-        title: "Draft integration workflow".to_string(),
-        state: "draft".to_string(),
-        root_repo_path: supervisor.root_repo_path.clone(),
-        shard_path: None,
-        integration_path: supervisor.integration_path.clone(),
-        telemetry: draft_workflow_telemetry(state, &context).await?,
-        alerts: Vec::new(),
-        created_at: Some(supervisor.created_at.clone()),
-        updated_at: Some(supervisor.updated_at.clone()),
-        workflow_deleted: false,
-    })
-}
-
 fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit]) -> Vec<FlightDeckTopologyNode> {
     let root_id = format!("root-{}", supervisor.id);
     let supervisor_id = format!("supervisor-{}", supervisor.id);
@@ -1144,30 +1055,14 @@ fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit])
 
 fn flight_deck_work_unit_state(seed: &WorkUnitSeed) -> String {
     let workflow_status = seed.workflow_status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-    if seed.kind == "manual_shard" {
-        return match workflow_status.as_str() {
-            "waiting" | "waiting_user" | "paused" => "waiting_user".to_string(),
-            "running" => "running".to_string(),
-            "failed" | "error" => "failed".to_string(),
-            "cancelled" | "canceled" => "cancelled".to_string(),
-            _ => seed.state.clone(),
-        };
-    }
-
     match workflow_status.as_str() {
-        "waiting" | "waiting_user" | "paused" => "waiting_user".to_string(),
+        "queued" => "queued".to_string(),
         "running" => "running".to_string(),
+        "waiting" => "waiting".to_string(),
+        "paused" => "paused".to_string(),
         "failed" | "error" => "failed".to_string(),
         "cancelled" | "canceled" => "cancelled".to_string(),
-        "completed" | "complete" | "success" => {
-            if seed.kind == "integration" {
-                "integrated".to_string()
-            } else if seed.state == "patch_ready" || seed.state == "ready_for_integration" {
-                seed.state.clone()
-            } else {
-                "patch_ready".to_string()
-            }
-        }
+        "completed" | "complete" | "success" => "completed".to_string(),
         _ => seed.state.clone(),
     }
 }

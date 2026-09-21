@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Badge, Button, ComboboxItem, Group, Modal, ScrollArea, Select, Stack, Table, Text, TextInput, Textarea } from '@mantine/core';
 import type { WorkflowTemplate } from './api';
-import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, setDefaultPlanner, updatePlannerFeatures, type PlannerWorkspace } from './planner_api';
+import { createPlanner, deletePlanner, listPlanners, setDefaultPlanner, updatePlannerFeatures, type PlannerWorkspace } from './planner_api';
 import {
   applyPlannerImport,
   previewPlannerImport,
@@ -14,19 +14,19 @@ import {
 } from './supervisor_api';
 
 type PlannerSelection = {
-  planner: { id: string; root_repo_path: string; title: string } | null;
+  planner: { id: string; repo_ref: string; title: string } | null;
   feature: FeaturePlanItem | null;
 };
 
 type PlannerMultiSelection = {
-  planner: { id: string; root_repo_path: string; title: string } | null;
+  planner: { id: string; repo_ref: string; title: string } | null;
   featureIds: string[];
   features: FeaturePlanItem[];
 };
 
 type Props = {
   opened: boolean;
-  rootRepoPath: string;
+  repoRef: string;
   run?: SupervisorRun | null;
   templates?: WorkflowTemplate[];
   plannerOptions?: PlannerWorkspace[];
@@ -47,26 +47,8 @@ type Props = {
 const FEATURE_STATUSES: FeaturePlanItemStatus[] = ['rough', 'fine', 'completed', 'applied'];
 const IMPORT_ACTIONS: PlannerImportAction[] = ['create', 'create_copy', 'replace_existing', 'skip', 'reject'];
 
-function normalizePlannerRoot(value: string): string {
-  const normalized = value.trim().replace(/\\/g, '/');
-  const supervisorShardMarker = '/.mdev/supervisors/';
-  const supervisorIndex = normalized.indexOf(supervisorShardMarker);
-  if (supervisorIndex > 0) return normalized.slice(0, supervisorIndex);
-  return normalized.replace(/\/+$/g, '');
-}
-
-function plannerRootKey(value: string): string {
-  return normalizePlannerRoot(value).toLowerCase();
-}
-
-function plannerRootMatches(candidate: string, root: string): boolean {
-  const candidateKey = plannerRootKey(candidate);
-  const rootKey = plannerRootKey(root);
-  return !rootKey || candidateKey === rootKey || rootKey.startsWith(`${candidateKey}/`);
-}
-
-function repoPlannerTitle(rootRepoPath: string): string {
-  const parts = normalizePlannerRoot(rootRepoPath).split('/').filter(Boolean);
+function repoPlannerTitle(repoRef: string): string {
+  const parts = repoRef.trim().replace(/\\/g, '/').replace(/\/+$/g, '').split('/').filter(Boolean);
   return `${parts[parts.length - 1] ?? 'Repo'} Planner`;
 }
 
@@ -141,17 +123,21 @@ function defaultFeatureDraft(feature: FeaturePlanItem): FeaturePlanItem {
   };
 }
 
-function normalizePlannerImportPayload(payload: unknown): unknown {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
-  const record = payload as Record<string, unknown>;
-  if (Array.isArray(record.features)) return payload;
-  if (Array.isArray(record.feature_plan_items)) {
-    return {
-      ...record,
-      features: record.feature_plan_items,
-    };
+function requirePlannerImportPayload(payload: unknown): { features: unknown[] } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('planner import must use planner_feature_export_v2');
   }
-  return payload;
+
+  const record = payload as Record<string, unknown>;
+  if (record.schema_id !== 'planner_feature_export_v2' || record.version !== 2 || record.kind !== 'planner_features') {
+    throw new Error('unsupported planner import format; expected planner_feature_export_v2 version 2');
+  }
+
+  if (!Array.isArray(record.features)) {
+    throw new Error('planner_feature_export_v2 requires a features array');
+  }
+
+  return { features: record.features };
 }
 
 function newFeatureId(): string {
@@ -160,41 +146,62 @@ function newFeatureId(): string {
 }
 
 function portableExportFeature(item: FeaturePlanItem): Record<string, unknown> {
-  const { id, ...rest } = item as FeaturePlanItem & Record<string, unknown>;
   return {
-    ...rest,
-    source_feature_id: id,
+    source_feature_id: item.id,
+    title: item.title,
+    status: item.status === 'scheduled' ? 'fine' : item.status,
+    summary: item.summary,
+    rough_summary: item.rough_summary ?? null,
+    requirements: item.requirements ?? [],
+    acceptance_criteria: item.acceptance_criteria ?? [],
+    implementation_notes: item.implementation_notes ?? [],
+    review_expectations: item.review_expectations ?? [],
+    target_files_or_areas: item.target_files_or_areas ?? [],
+    dependencies: item.dependencies ?? [],
   };
 }
 
-function portableImportFeature(item: unknown): FeaturePlanItem | null {
-  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-  const record = item as Record<string, unknown>;
-  if (typeof record.title !== 'string' || !record.title.trim()) return null;
+function portableImportFeature(item: unknown): FeaturePlanItem {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error('planner feature must be an object');
+  }
 
-  const { id: _ignoredId, source_feature_id: _sourceFeatureId, ...rest } = record;
-  return defaultFeatureDraft({
-    ...(rest as Partial<FeaturePlanItem>),
+  const record = item as Record<string, unknown>;
+  if (typeof record.title !== 'string' || !record.title.trim()) {
+    throw new Error('planner feature title is required');
+  }
+
+  const status = record.status;
+  if (status !== 'rough' && status !== 'fine') {
+    throw new Error(`planner feature '${record.title}' has unsupported portable status '${String(status)}'`);
+  }
+
+  const stringArray = (key: string): string[] => {
+    const value = record[key];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+      throw new Error(`planner feature '${record.title}' requires string array '${key}'`);
+    }
+    return value as string[];
+  };
+
+  return {
     id: newFeatureId(),
-    title: record.title,
-    status: (typeof record.status === 'string' ? record.status : 'rough') as FeaturePlanItem['status'],
+    title: record.title.trim(),
+    status,
     summary: typeof record.summary === 'string' ? record.summary : '',
-    rough_summary: typeof record.rough_summary === 'string' ? record.rough_summary : undefined,
-    requirements: Array.isArray(record.requirements) ? record.requirements.filter((value): value is string => typeof value === 'string') : [],
-    acceptance_criteria: Array.isArray(record.acceptance_criteria) ? record.acceptance_criteria.filter((value): value is string => typeof value === 'string') : [],
-    implementation_notes: Array.isArray(record.implementation_notes) ? record.implementation_notes.filter((value): value is string => typeof value === 'string') : [],
-    review_expectations: Array.isArray(record.review_expectations) ? record.review_expectations.filter((value): value is string => typeof value === 'string') : [],
-    target_files_or_areas: Array.isArray(record.target_files_or_areas) ? record.target_files_or_areas.filter((value): value is string => typeof value === 'string') : [],
-    dependencies: [],
-  } as FeaturePlanItem);
+    rough_summary: typeof record.rough_summary === 'string' ? record.rough_summary : '',
+    requirements: stringArray('requirements'),
+    acceptance_criteria: stringArray('acceptance_criteria'),
+    implementation_notes: stringArray('implementation_notes'),
+    review_expectations: stringArray('review_expectations'),
+    target_files_or_areas: stringArray('target_files_or_areas'),
+    dependencies: stringArray('dependencies'),
+  };
 }
 
 function plannerImportFeatures(payload: unknown): FeaturePlanItem[] {
-  const normalized = normalizePlannerImportPayload(payload);
-  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return [];
-  const features = (normalized as Record<string, unknown>).features;
-  if (!Array.isArray(features)) return [];
-  return features.map(portableImportFeature).filter((item): item is FeaturePlanItem => item !== null);
+  const { features } = requirePlannerImportPayload(payload);
+  return features.map(portableImportFeature);
 }
 
 function mergePlannerFeatures(current: FeaturePlanItem[], incoming: FeaturePlanItem[]): FeaturePlanItem[] {
@@ -246,7 +253,7 @@ function mergePlannerWorkspaceRows(apiRows: PlannerWorkspace[], propRows: Planne
 }
 
 export function PlannerModal(props: Props) {
-  const rootRepoPath = normalizePlannerRoot(props.rootRepoPath || props.run?.root_repo_path || '');
+  const repoRef = props.repoRef.trim();
   const [run, setRun] = useState<SupervisorRun | null>(props.run ?? null);
   const [featureSearch, setFeatureSearch] = useState('');
   const [busy, setBusy] = useState(false);
@@ -257,7 +264,7 @@ export function PlannerModal(props: Props) {
   const [createFeatureSummary, setCreateFeatureSummary] = useState('');
   const [plannerSelectionId, setPlannerSelectionId] = useState<string | null>(props.selectedPlannerId ?? null);
   const [appliedPlannerId, setAppliedPlannerId] = useState<string | null>(props.selectedPlannerId ?? null);
-  const [newPlannerTitle, setNewPlannerTitle] = useState(repoPlannerTitle(rootRepoPath));
+  const [newPlannerTitle, setNewPlannerTitle] = useState(repoPlannerTitle(repoRef));
   const [plannerWorkspaces, setPlannerWorkspaces] = useState<PlannerWorkspace[]>(props.plannerOptions ?? []);
   const [busyFeatureId, setBusyFeatureId] = useState<string | null>(null);
   const [stagedFeatureIds, setStagedFeatureIds] = useState<string[]>(props.selectedFeatureIds ?? []);
@@ -272,11 +279,12 @@ export function PlannerModal(props: Props) {
 
   const statusOptions = useMemo(() => FEATURE_STATUSES.map((status) => ({ value: status, label: titleCaseStatus(status) })), []);
   const importActions = useMemo(() => importActionOptions(), []);
-  const plannerOptions = useMemo(() => {
-    return plannerWorkspaces.filter((option) => plannerRootMatches(option.root_repo_path, rootRepoPath));
-  }, [plannerWorkspaces, rootRepoPath]);
+  const plannerOptions = plannerWorkspaces;
   const selectedPlannerWorkspace = useMemo(() => {
-    return plannerOptions.find((option) => option.id === appliedPlannerId) ?? plannerOptions.find((option) => option.is_default) ?? plannerOptions[0] ?? null;
+    return plannerOptions.find((option) => option.id === appliedPlannerId)
+      ?? plannerOptions.find((option) => option.is_default)
+      ?? plannerOptions[0]
+      ?? null;
   }, [plannerOptions, appliedPlannerId]);
   const features = selectedPlannerWorkspace?.features ?? [];
   const multiSelectionMode = Boolean(props.selectionMode && props.onSelectFeatures);
@@ -332,14 +340,18 @@ export function PlannerModal(props: Props) {
   }, [props.selectedPlannerId]);
 
   useEffect(() => {
-    setNewPlannerTitle((current) => current.trim() || repoPlannerTitle(rootRepoPath));
-  }, [rootRepoPath]);
+    setNewPlannerTitle((current) => current.trim() || repoPlannerTitle(repoRef));
+  }, [repoRef]);
 
   useEffect(() => {
+    const requestedId = props.selectedPlannerId ?? null;
     const fallbackId = plannerOptions.find((option) => option.is_default)?.id ?? plannerOptions[0]?.id ?? null;
-    setAppliedPlannerId((current) => current && plannerOptions.some((option) => option.id === current) ? current : fallbackId);
-    setPlannerSelectionId((current) => current && plannerOptions.some((option) => option.id === current) ? current : fallbackId);
-  }, [plannerOptions]);
+    const nextId = requestedId && plannerOptions.some((option) => option.id === requestedId)
+      ? requestedId
+      : fallbackId;
+    setAppliedPlannerId(nextId);
+    setPlannerSelectionId(nextId);
+  }, [plannerOptions, props.selectedPlannerId]);
 
   useEffect(() => {
     if (!props.opened) return;
@@ -358,10 +370,11 @@ export function PlannerModal(props: Props) {
     }
 
     async function load() {
-      if (!rootRepoPath) return;
       try {
         setBusy(true);
-        const plannerRows = await listPlannersForRepo(rootRepoPath);
+
+        if (!repoRef) return;
+        const plannerRows = await listPlanners(repoRef);
         if (cancelled) return;
         setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
         setRun(props.run ?? null);
@@ -376,11 +389,11 @@ export function PlannerModal(props: Props) {
     return () => {
       cancelled = true;
     };
-  }, [props.opened, rootRepoPath]);
+  }, [props.opened, repoRef, props.selectedPlannerId]);
 
   async function reload() {
-    if (rootRepoPath) {
-      const plannerRows = await listPlannersForRepo(rootRepoPath);
+    if (repoRef) {
+      const plannerRows = await listPlanners(repoRef);
       setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
     }
     setRun(props.run ?? run);
@@ -395,7 +408,7 @@ export function PlannerModal(props: Props) {
     try {
       setBusy(true);
       await setDefaultPlanner(selected.id);
-      const plannerRows = rootRepoPath ? await listPlannersForRepo(rootRepoPath) : [];
+      const plannerRows = repoRef ? await listPlanners(repoRef) : [];
       setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows, props.plannerOptions));
       setAppliedPlannerId(selected.id);
       setPlannerSelectionId(selected.id);
@@ -417,8 +430,8 @@ export function PlannerModal(props: Props) {
 
     try {
       setBusy(true);
-      await deletePlannerForRepo(selected.id);
-      const plannerRows = rootRepoPath ? await listPlannersForRepo(rootRepoPath) : [];
+      await deletePlanner(selected.id);
+      const plannerRows = repoRef ? await listPlanners(repoRef) : [];
       setPlannerWorkspaces(() => {
         const byId = new Map(plannerRows.map((item) => [item.id, item]));
         for (const item of props.plannerOptions ?? []) {
@@ -438,21 +451,21 @@ export function PlannerModal(props: Props) {
   }
 
   async function requestCreatePlanner() {
-    if (!rootRepoPath) {
-      props.onError?.('Repo root is required before creating a planner.');
+    if (!repoRef) {
+      props.onError?.('repo_ref is required before creating a planner.');
       return;
     }
 
     try {
       setBusy(true);
-      const planner = await createPlannerForRepo({
-        root_repo_path: rootRepoPath,
-        title: newPlannerTitle.trim() || repoPlannerTitle(rootRepoPath),
+      const planner = await createPlanner({
+        repo_ref: repoRef,
+        title: newPlannerTitle.trim() || repoPlannerTitle(repoRef),
         make_default: plannerOptions.length === 0,
         features: [],
       });
       await setDefaultPlanner(planner.id);
-      const plannerRows = await listPlannersForRepo(rootRepoPath);
+      const plannerRows = await listPlanners(repoRef);
       setPlannerWorkspaces(mergePlannerWorkspaceRows(plannerRows.some((item) => item.id === planner.id) ? plannerRows : [planner, ...plannerRows], props.plannerOptions));
       setAppliedPlannerId(planner.id);
       setPlannerSelectionId(planner.id);
@@ -470,23 +483,23 @@ export function PlannerModal(props: Props) {
     if (!selectedPlannerWorkspace) return;
     const exportedFeatures = (selectedPlannerWorkspace.features ?? []).map(portableExportFeature);
     const payload = {
-      schema_id: 'planner_feature_export_v1',
-      version: 1,
+      schema_id: 'planner_feature_export_v2',
+      version: 2,
       kind: 'planner_features',
       exported_at: new Date().toISOString(),
       source: {
         planner_id: selectedPlannerWorkspace.id,
         planner_title: selectedPlannerWorkspace.title,
-        root_repo_path: selectedPlannerWorkspace.root_repo_path,
+        repo_ref: selectedPlannerWorkspace.repo_ref,
       },
-      root_repo_path: selectedPlannerWorkspace.root_repo_path,
+      repo_ref: selectedPlannerWorkspace.repo_ref,
       features: exportedFeatures,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${repoPlannerTitle(selectedPlannerWorkspace.root_repo_path).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'planner'}-features.json`;
+    link.download = `${repoPlannerTitle(selectedPlannerWorkspace.repo_ref).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'planner'}-features.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -562,7 +575,7 @@ export function PlannerModal(props: Props) {
 
     if (!props.onSelectFeature) return;
     await props.onSelectFeature({
-      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title } : null,
+      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, repo_ref: selectedPlannerWorkspace.repo_ref, title: selectedPlannerWorkspace.title } : null,
       feature,
     });
     props.onClose();
@@ -584,7 +597,7 @@ export function PlannerModal(props: Props) {
     const selectedIds = normalizedFeatureIds(stagedFeatureIds);
     const selectedSet = new Set(selectedIds);
     await props.onSelectFeatures({
-      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title } : null,
+      planner: selectedPlannerWorkspace ? { id: selectedPlannerWorkspace.id, repo_ref: selectedPlannerWorkspace.repo_ref, title: selectedPlannerWorkspace.title } : null,
       featureIds: selectedIds,
       features: features.filter((item) => selectedSet.has(item.id)),
     });
@@ -636,7 +649,7 @@ export function PlannerModal(props: Props) {
       setPlannerWorkspaces((current) => current.map((item) => item.id === planner.id ? planner : item));
       setCreateFeatureOpen(false);
       await props.onFeatureCreated?.({
-        planner: { id: selectedPlannerWorkspace.id, root_repo_path: selectedPlannerWorkspace.root_repo_path, title: selectedPlannerWorkspace.title },
+        planner: { id: selectedPlannerWorkspace.id, repo_ref: selectedPlannerWorkspace.repo_ref, title: selectedPlannerWorkspace.title },
         feature: draft,
       });
       await props.onSaved?.();
@@ -765,7 +778,15 @@ export function PlannerModal(props: Props) {
           >
             Planner options
           </Button>
-          <Button size="xs" variant="light" onClick={() => void reload()} loading={busy} disabled={!rootRepoPath}>Refresh planner</Button>
+          <Button
+            size="xs"
+            variant="light"
+            onClick={() => void reload()}
+            loading={busy}
+            disabled={!repoRef}
+          >
+            Refresh planner
+          </Button>
           <Button size="xs" variant="light" onClick={downloadPlanner} disabled={!selectedPlannerWorkspace}>Download</Button>
           <Button size="xs" variant="light" onClick={() => importInputRef.current?.click()} loading={busy} disabled={!selectedPlannerWorkspace}>Upload</Button>
           <Button size="xs" variant="light" onClick={openCreateFeature} loading={busyFeatureId?.startsWith('feature-')} disabled={!selectedPlannerWorkspace}>Create feature</Button>
@@ -784,7 +805,7 @@ export function PlannerModal(props: Props) {
             <Badge variant="light">{selectedPlannerWorkspace.title}</Badge>
             <Badge variant="light" color="green">Planner</Badge>
             {selectedPlannerWorkspace.is_default ? <Badge variant="light" color="blue">Default</Badge> : null}
-            <Text size="xs" c="dimmed">{selectedPlannerWorkspace.root_repo_path}</Text>
+            <Text size="xs" c="dimmed">{selectedPlannerWorkspace.repo_ref}</Text>
           </Group>
         ) : (
           <Text c="dimmed" size="sm">No planner feature log selected.</Text>
@@ -994,9 +1015,9 @@ export function PlannerModal(props: Props) {
             </Button>
             <Group gap="xs" wrap="nowrap">
               <Button size="xs" variant="light" onClick={() => {
-                setNewPlannerTitle(repoPlannerTitle(rootRepoPath));
+                setNewPlannerTitle(repoPlannerTitle(repoRef));
                 setCreatePlannerOpen(true);
-              }} disabled={!rootRepoPath}>
+              }} disabled={!repoRef}>
                 Create planner
               </Button>
               <Button size="xs" onClick={() => void applyPlannerSelection()} loading={busy} disabled={!plannerSelectionId || plannerSelectionId === appliedPlannerId}>
@@ -1018,14 +1039,14 @@ export function PlannerModal(props: Props) {
         <Stack gap="sm">
           <TextInput
             label="Planner name"
-            placeholder={repoPlannerTitle(rootRepoPath)}
+            placeholder={repoPlannerTitle(repoRef)}
             value={newPlannerTitle}
             onChange={(event) => setNewPlannerTitle(event.currentTarget.value)}
             data-autofocus
           />
           <Group justify="flex-end" gap="xs" wrap="nowrap">
             <Button size="xs" variant="default" onClick={() => setCreatePlannerOpen(false)}>Cancel</Button>
-            <Button size="xs" onClick={() => void requestCreatePlanner()} loading={busy} disabled={!rootRepoPath || !newPlannerTitle.trim()}>Create planner</Button>
+            <Button size="xs" onClick={() => void requestCreatePlanner()} loading={busy} disabled={!repoRef || !newPlannerTitle.trim()}>Create planner</Button>
           </Group>
         </Stack>
       </Modal>

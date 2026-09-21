@@ -24,7 +24,6 @@ use crate::{
 
 use super::capabilities::{
     execute_capability_invocations,
-    planner,
     registry::CapabilityResult,
     CapabilityContext,
     CapabilityInvocation,
@@ -536,15 +535,17 @@ pub async fn execute_stage(
         .unwrap_or(run.repo_ref.as_str())
         .to_string();
 
-    planner::apply_repo_planner_capability(&state.db, &mut global_state, repo_ref.as_str()).await?;
+    state
+        .planner()
+        .apply_repo_capability(&mut global_state, repo_ref.as_str())
+        .await?;
     root.insert("global_state".to_string(), global_state.clone());
 
     let mut execution_global_state = global_state.clone();
-    planner::hydrate_repo_planner_prompt_fragment(
-        &state.db,
-        &mut execution_global_state,
-    )
-    .await?;
+    state
+        .planner()
+        .hydrate_prompt_fragment(&mut execution_global_state)
+        .await?;
 
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),

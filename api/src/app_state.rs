@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::engine::capabilities::{
     operator_checkpoint::OperatorInputRegistry,
+    planner::PlannerService,
     repo_sync::RepoSyncRuntime,
 };
 use crate::engine::runtime_endpoints::RuntimeEndpointManager;
@@ -84,6 +85,10 @@ impl AppState {
 
     pub fn publish_sprint_event(&self, event: SprintEventStreamItem) {
         let _ = self.sprint_events_tx.send(event);
+    }
+
+    pub fn planner(&self) -> PlannerService<'_> {
+        PlannerService::new(&self.db)
     }
 
     pub fn process_session_id(&self) -> &str {

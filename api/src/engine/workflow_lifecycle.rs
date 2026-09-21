@@ -511,31 +511,3 @@ pub async fn execute_workflow_command(
     state.workflow_coordinator.execute(state, envelope).await
 }
 
-pub(crate) fn command_payload(command: &WorkflowRuntimeCommand) -> Value {
-    match command {
-        WorkflowRuntimeCommand::Start { mode, step_id } => serde_json::json!({
-            "kind": "start",
-            "mode": mode,
-            "step_id": step_id
-        }),
-        WorkflowRuntimeCommand::Pause => serde_json::json!({ "kind": "pause" }),
-        WorkflowRuntimeCommand::Resume => serde_json::json!({ "kind": "resume" }),
-        WorkflowRuntimeCommand::ResolveCheckpoint {
-            disposition,
-            selected_step_id,
-        } => serde_json::json!({
-            "kind": "resolve_checkpoint",
-            "disposition": disposition,
-            "selected_step_id": selected_step_id
-        }),
-        WorkflowRuntimeCommand::MoveTo { step_id } => serde_json::json!({
-            "kind": "move_to",
-            "step_id": step_id
-        }),
-        WorkflowRuntimeCommand::Cancel { reason } => serde_json::json!({
-            "kind": "cancel",
-            "reason": reason
-        }),
-        WorkflowRuntimeCommand::Archive => serde_json::json!({ "kind": "archive" }),
-    }
-}

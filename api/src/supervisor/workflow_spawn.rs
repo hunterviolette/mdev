@@ -9,64 +9,8 @@ use crate::{
     db::{new_workflow_key, normalize_repo_ref},
     engine,
     engine::capabilities::planner::FeaturePlanItem,
-    models::{AutomationMode, RunStatus, WorkflowGlobalConfig, WorkflowRun, WorkflowStepDefinition, WorkflowStepExecutionConfig, WorkflowStepPromptConfig, WorkflowStepAdvancementConfig, WorkflowTemplateDefinition},
+    models::{RunStatus, WorkflowRun, WorkflowTemplateDefinition},
 };
-
-pub async fn spawn_series_workflow_on_integration(
-    state: &AppState,
-    title: &str,
-    integration_path: &str,
-    items: &[FeaturePlanItem],
-    template_id: Option<Uuid>,
-    supervisor_context: Value,
-) -> Result<Uuid> {
-    let definition = match template_id {
-        Some(template_id) => load_template_definition(state, template_id).await?,
-        None => return Err(anyhow!("workflow_template_id is required for supervisor series runs")),
-    };
-    let planner_id = supervisor_context
-        .get("planner_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let selected_feature_id = items.first().map(|item| item.id.clone());
-    let planner = match (planner_id, selected_feature_id) {
-        (Some(planner_id), Some(feature_id)) => json!({
-            "fragment_armed": true,
-            "schema_armed": false,
-            "auto_apply_armed": false,
-            "planner_id": planner_id,
-            "feature_id": feature_id
-        }),
-        _ => json!({
-            "fragment_armed": false,
-            "schema_armed": false,
-            "auto_apply_armed": false,
-            "planner_id": "",
-            "feature_id": ""
-        }),
-    };
-
-    insert_and_start_run(state, title, integration_path, template_id, definition, json!({
-        "supervisor": supervisor_context,
-        "input_source": "feature_plan_items",
-        "workflow_engine": {
-            "global_state": {
-                "capabilities": {
-                    "planner": planner
-                }
-            }
-        }
-    })).await
-}
-
-fn is_sprint_feature_context(supervisor_context: &Value) -> bool {
-    supervisor_context
-        .get("input_source")
-        .and_then(Value::as_str)
-        == Some("supervisor_sprint_feature")
-}
 
 pub async fn spawn_feature_plan_item_workflow(
     state: &AppState,
@@ -107,129 +51,38 @@ pub async fn spawn_feature_plan_item_workflow_with_definition(
             None => return Err(anyhow!("workflow_template_id is required for supervisor parallel runs")),
         },
     };
-    let input_source = supervisor_context
-        .get("input_source")
-        .and_then(Value::as_str);
-    let is_supervisor_sprint_feature = is_sprint_feature_context(&supervisor_context);
-    let is_supervisor_manual_shard = input_source == Some("supervisor_manual_shard");
-    let is_planner_refinement = input_source == Some("supervisor_planner_feature");
-    let explicit_planner_id = supervisor_context
+    let planner_id = supervisor_context
         .get("planner_id")
-        .or_else(|| supervisor_context.get("selected_planner_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let planner_id = if explicit_planner_id.is_some() || is_supervisor_manual_shard {
-        explicit_planner_id
-    } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT planner_id FROM planner_features WHERE id = ? AND TRIM(COALESCE(planner_id, '')) != '' AND COALESCE(status, '') != 'deleted' LIMIT 1",
-        )
-        .bind(&item.id)
-        .fetch_optional(&state.db)
-        .await?
-    };
+    let feature_id = supervisor_context
+        .get("feature_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let planner_repo_ref = supervisor_context
+        .get("root_repo_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
-    if is_planner_refinement && planner_id.is_none() {
-        return Err(anyhow!("planner_id is required for planner refinement workflows"));
-    }
-
-    let mut supervisor_context = supervisor_context;
-    if let Some(supervisor_obj) = supervisor_context.as_object_mut() {
-        if is_supervisor_manual_shard {
-            supervisor_obj.insert("manual_shard_id".to_string(), Value::String(item.id.clone()));
-            supervisor_obj.remove("feature_id");
-            supervisor_obj.remove("planner_id");
-        } else {
-            supervisor_obj.insert("feature_id".to_string(), Value::String(item.id.clone()));
-            if let Some(planner_id) = planner_id.as_ref() {
-                supervisor_obj.insert("planner_id".to_string(), Value::String(planner_id.clone()));
-            }
-        }
-    }
-
-    let planner = if is_supervisor_manual_shard {
-        json!({
-            "planner_id": "",
-            "feature_id": "",
-            "fragment_armed": false,
-            "schema_armed": false,
-            "auto_apply_armed": false
-        })
-    } else if let Some(planner_id) = planner_id {
-        json!({
-            "planner_id": planner_id,
-            "feature_id": item.id,
-            "fragment_armed": true,
-            "schema_armed": is_planner_refinement,
-            "auto_apply_armed": is_planner_refinement
-        })
-    } else {
-        json!({
-            "planner_id": "",
-            "feature_id": "",
-            "fragment_armed": false,
-            "schema_armed": false,
-            "auto_apply_armed": false
-        })
-    };
-
-    let context = json!({
-        "supervisor": supervisor_context,
-        "workflow_engine": {
-            "run_state": {
-                "pause_requested": false
-            },
-            "global_state": {
-                "capabilities": {
-                    "planner": planner,
-                    "context_export": {
-                        "enabled": is_supervisor_sprint_feature
-                    }
-                }
-            }
-        }
+    let mut context = json!({
+        "supervisor": supervisor_context
     });
 
-    insert_and_start_run(state, &item.title, shard_path, template_id, definition, context).await
-}
-
-pub async fn spawn_integration_workflow(
-    state: &AppState,
-    title: &str,
-    integration_path: &str,
-    _patch_paths: Vec<Value>,
-    template_id: Option<Uuid>,
-    supervisor_context: Value,
-) -> Result<Uuid> {
-    let mut definition = match template_id {
-        Some(template_id) => load_template_definition(state, template_id).await?,
-        None => integration_definition(),
-    };
-
-    for step in definition.steps.iter_mut() {
-        if step.step_type == "merge_patches" {
-            if !step.config.is_object() {
-                step.config = json!({});
-            }
-            if let Some(obj) = step.config.as_object_mut() {
-                obj.remove("patches");
-                obj.remove("supervisor_run_id");
-            }
+    if let (Some(planner_id), Some(feature_id)) = (planner_id, feature_id) {
+        context["workflow_engine"]["global_state"]["capabilities"]["planner"]["planner_id"] = Value::String(planner_id);
+        context["workflow_engine"]["global_state"]["capabilities"]["planner"]["feature_id"] = Value::String(feature_id);
+        if let Some(repo_ref) = planner_repo_ref {
+            context["workflow_engine"]["global_state"]["capabilities"]["planner"]["repo_ref"] = Value::String(repo_ref);
         }
     }
 
-    insert_and_start_run(state, title, integration_path, template_id, definition, json!({
-        "supervisor": {
-            "supervisor_id": supervisor_context
-                .get("supervisor_id")
-                .or_else(|| supervisor_context.get("supervisor_run_id"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "pool_type": supervisor_context.get("pool_type").cloned().unwrap_or_else(|| Value::String("integration".to_string()))
-        }
-    })).await
+    insert_and_start_run(state, &item.title, shard_path, template_id, definition, context).await
 }
 
 
@@ -270,31 +123,6 @@ fn seed_template_globals_into_context(context: &mut Value, definition: &Workflow
     let repo_obj = repo.as_object_mut().ok_or_else(|| anyhow!("repo resource must be object"))?;
     repo_obj.insert("repo_ref".to_string(), json!(repo_path));
     repo_obj.insert("git_ref".to_string(), json!("WORKTREE"));
-    Ok(())
-}
-
-fn seed_workflow_input_into_start_step(context: &mut Value, step_id: Option<&str>, include_workflow_input: bool) -> Result<()> {
-    let Some(step_id) = step_id else {
-        return Ok(());
-    };
-
-    let root = engine::ensure_engine_root(context);
-    let stage_state = root.entry("stage_state".to_string()).or_insert_with(|| json!({}));
-    if !stage_state.is_object() {
-        *stage_state = json!({});
-    }
-    let stage_state_obj = stage_state.as_object_mut().ok_or_else(|| anyhow!("stage_state must be object"))?;
-    let stage = stage_state_obj.entry(step_id.to_string()).or_insert_with(|| json!({}));
-    if !stage.is_object() {
-        *stage = json!({});
-    }
-    let stage_obj = stage.as_object_mut().ok_or_else(|| anyhow!("stage state must be object"))?;
-    let prompt = stage_obj.entry("prompt".to_string()).or_insert_with(|| json!({}));
-    if !prompt.is_object() {
-        *prompt = json!({});
-    }
-    let prompt_obj = prompt.as_object_mut().ok_or_else(|| anyhow!("stage prompt must be object"))?;
-    prompt_obj.insert("include_workflow_input".to_string(), Value::Bool(include_workflow_input));
     Ok(())
 }
 
@@ -376,77 +204,4 @@ async fn insert_and_start_run(
     Ok(id)
 }
 
-fn integration_definition() -> WorkflowTemplateDefinition {
-    WorkflowTemplateDefinition {
-        version: 1,
-        globals: WorkflowGlobalConfig::default(),
-        governance: json!({}),
-        steps: vec![
-            WorkflowStepDefinition {
-                id: "merge_patches".to_string(),
-                name: "Merge patches".to_string(),
-                step_type: "merge_patches".to_string(),
-                automation_mode: AutomationMode::Automatic,
-                execution: WorkflowStepExecutionConfig::default(),
-                prompt: WorkflowStepPromptConfig {
-                    include_repo_context: false,
-                    include_changeset_schema: false,
-                    include_user_context: true,
-                },
-                config: json!({}),
-                capabilities: Vec::new(),
-                execution_logic: json!({
-                    "kind": "merge_patches_stage_policy",
-                    "automation": {
-                        "apply_patches": true
-                    }
-                }),
-                execution_plan: Vec::new(),
-                transitions: Vec::new(),
-                advancement: WorkflowStepAdvancementConfig {
-                    mode: Some("automatic".to_string()),
-                    auto_run_on_enter: true,
-                    auto_advance_on_success: true,
-                    auto_advance_on_error: false,
-                    auto_advance_on_paused: false,
-                },
-            },
-            WorkflowStepDefinition {
-                id: "review".to_string(),
-                name: "Review".to_string(),
-                step_type: "review".to_string(),
-                automation_mode: AutomationMode::Manual,
-                execution: WorkflowStepExecutionConfig::default(),
-                prompt: WorkflowStepPromptConfig {
-                    include_repo_context: false,
-                    include_changeset_schema: false,
-                    include_user_context: true,
-                },
-                config: json!({}),
-                capabilities: Vec::new(),
-                execution_logic: json!({
-                    "kind": "review_stage_policy",
-                    "require_manual_approval": true,
-                    "ai_review": {
-                        "enabled": false
-                    },
-                    "automation": {
-                        "disposition_review": {
-                            "enabled": true,
-                            "available_dispositions": ["move_next", "pause"]
-                        }
-                    }
-                }),
-                execution_plan: Vec::new(),
-                transitions: Vec::new(),
-                advancement: WorkflowStepAdvancementConfig {
-                    mode: Some("manual".to_string()),
-                    auto_run_on_enter: false,
-                    auto_advance_on_success: false,
-                    auto_advance_on_error: false,
-                    auto_advance_on_paused: false,
-                },
-            }
-        ],
-    }
-}
+

@@ -11,7 +11,6 @@ pub enum FeaturePlanItemStatus {
     Fine,
     Scheduled,
     Applied,
-    #[serde(alias = "applied")]
     Completed,
 }
 
@@ -54,6 +53,18 @@ pub struct FeaturePlanItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerWorkspace {
+    pub id: String,
+    pub repo_ref: String,
+    pub title: String,
+    pub is_default: bool,
+    pub feature_count: i64,
+    pub features: Vec<FeaturePlanItem>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannerCapabilityBinding {
     pub planner_id: String,
     pub feature_id: String,
@@ -65,6 +76,8 @@ pub struct PlannerCapabilityState {
     pub planner_id: String,
     #[serde(default)]
     pub feature_id: String,
+    #[serde(default)]
+    pub repo_ref: String,
     #[serde(default)]
     pub fragment_armed: bool,
     #[serde(default)]
