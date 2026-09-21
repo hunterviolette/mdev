@@ -1030,6 +1030,7 @@ pub(crate) async fn run_workflow_runtime(
     run_id: Uuid,
     mut command_rx: tokio::sync::mpsc::Receiver<crate::engine::workflow_lifecycle::WorkflowRuntimeCommand>,
     cancellation: tokio_util::sync::CancellationToken,
+    execution_state: crate::engine::workflow_lifecycle::WorkflowRuntimeExecutionTracker,
 ) -> Result<()> {
     use crate::engine::workflow_lifecycle::{WorkflowExecutionMode, WorkflowRuntimeCommand};
 
@@ -1100,6 +1101,7 @@ pub(crate) async fn run_workflow_runtime(
         }
 
         let execution_mode = active_mode.expect("active execution mode checked");
+        let _execution_guard = execution_state.begin(execution_mode);
         let mode = match execution_mode {
             WorkflowExecutionMode::SingleStage => RunMode::Manual,
             WorkflowExecutionMode::MultiStage => RunMode::Autonomous,
@@ -1337,6 +1339,47 @@ async fn run_stages(
         ).await?;
 
         let auto_advance = automatic && should_auto_advance(&step, &outcome);
+        let workflow_terminal_status = if matches!(outcome.transition, StageTransition::MoveNext)
+            && next_target.is_none()
+        {
+            Some(terminal_run_status(&outcome.status))
+        } else {
+            None
+        };
+
+        if let Some(status) = workflow_terminal_status {
+            persist_context(state, run_id, &run.context).await?;
+            run_stage_exit_hook_if_transitioning(
+                state,
+                run_id,
+                &definition,
+                Some(step.id.as_str()),
+                None,
+            )
+            .await?;
+            set_run_status(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+            if matches!(status, RunStatus::Success | RunStatus::Error) {
+                crate::supervisor::handle_workflow_terminal_event(
+                    state,
+                    run_id,
+                    status.clone(),
+                    Some(step.id.as_str()),
+                )
+                .await?;
+            }
+            return Ok(json!({
+                "ok": outcome.ok,
+                "status": format_run_status(&status),
+                "stage_status": format_stage_status(&outcome.status),
+                "transition": format_stage_transition(&outcome.transition),
+                "step_id": step.id,
+                "next_step_id": Value::Null,
+                "message": outcome.message,
+                "capability_results": outcome.capability_results,
+                "local_state": outcome.local_state,
+            }));
+        }
+
         let latest_run = load_run(state, run_id).await?;
         if run_pause_requested(&latest_run) {
             clear_run_pause_requested(&mut run);
@@ -1405,6 +1448,15 @@ async fn run_stages(
             )
             .await?;
             set_run_status(state, run_id, status.clone(), current_step_id).await?;
+            if matches!(status, RunStatus::Success | RunStatus::Error) {
+                crate::supervisor::handle_workflow_terminal_event(
+                    state,
+                    run_id,
+                    status.clone(),
+                    current_step_id,
+                )
+                .await?;
+            }
             append_engine_event(
                 state,
                 run_id,
@@ -1481,12 +1533,20 @@ async fn run_stages(
                     "message": outcome.message,
                 }));
             }
-            (StageTransition::MoveNext, None, _)
-            | (StageTransition::Target(_), None, _) => {
+            (StageTransition::MoveNext, None, _) => {
+                unreachable!("terminal MoveNext must be handled before execution-mode progression")
+            }
+            (StageTransition::Target(_), None, _) => {
                 let status = terminal_run_status(&outcome.status);
                 set_run_status(state, run_id, status.clone(), Some(step.id.as_str())).await?;
                 if matches!(status, RunStatus::Success | RunStatus::Error) {
-                    crate::supervisor::handle_workflow_terminal_event(state, run_id, status.clone(), Some(step.id.as_str())).await?;
+                    crate::supervisor::handle_workflow_terminal_event(
+                        state,
+                        run_id,
+                        status.clone(),
+                        Some(step.id.as_str()),
+                    )
+                    .await?;
                 }
                 return Ok(json!({
                     "ok": outcome.ok,

@@ -51,18 +51,18 @@ async fn main() -> anyhow::Result<()> {
         .runtime_endpoints
         .refresh_local_lan_ipv4_in_background();
 
-    match crate::engine::fail_stale_running_runs_on_startup(&state).await {
-        Ok(failed_runs) if failed_runs > 0 => {
-            tracing::warn!(
-                failed_runs,
-                "marked workflows interrupted by the previous API process as failed"
+    match crate::engine::repair_process_interruption_errors_on_startup(&state).await {
+        Ok(repaired_runs) if repaired_runs > 0 => {
+            tracing::info!(
+                repaired_runs,
+                "repaired legacy workflow errors caused by API process interruption"
             );
         }
         Ok(_) => {}
         Err(error) => {
             tracing::error!(
                 error = %format!("{:#}", error),
-                "failed to reconcile workflows interrupted by the previous API process"
+                "failed to repair legacy workflow process-interruption errors"
             );
         }
     }
@@ -88,13 +88,25 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
 
-            let active_run_ids = shutdown_state
+            match shutdown_state
                 .workflow_coordinator
-                .stop_active_executions(
-                    &shutdown_state,
-                    "The API shut down while workflow execution was active.",
-                )
-                .await;
+                .stop_active_executions(&shutdown_state)
+                .await
+            {
+                Ok(short_circuited_run_ids) if !short_circuited_run_ids.is_empty() => {
+                    tracing::warn!(
+                        short_circuited_workflows = short_circuited_run_ids.len(),
+                        "short-circuited active workflow executions during API shutdown"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %format!("{:#}", error),
+                        "failed to short-circuit active workflow executions during API shutdown"
+                    );
+                }
+            }
 
             let terminated = shutdown_state
                 .process_registry
@@ -106,28 +118,6 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(
                         error = %format!("{:#}", error),
                         "failed to terminate a managed process during API shutdown"
-                    );
-                }
-            }
-
-            match crate::engine::fail_active_runs_for_process_stop(
-                &shutdown_state,
-                &active_run_ids,
-                "The server was shut down before the stage execution completed.",
-            )
-            .await
-            {
-                Ok(failed_runs) if failed_runs > 0 => {
-                    tracing::warn!(
-                        failed_runs,
-                        "marked active workflows as failed during API shutdown"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(
-                        error = %format!("{:#}", error),
-                        "failed to mark active workflows as failed during API shutdown"
                     );
                 }
             }

@@ -591,12 +591,27 @@ export type FlightDeckResponse = {
   };
 };
 
+export type SupervisorListItem = {
+  id: string;
+  title: string;
+};
+
 export type FlightDeckFilters = {
   supervisor_id?: string | null;
+  supervisor_ids?: string | null;
   root_repo_path?: string | null;
   state?: string | null;
   kind?: string | null;
   include_deleted?: boolean;
+};
+
+export type FlightDeckHydrationHandlers = {
+  onBegin?: () => void;
+  onSupervisor?: (supervisor: FlightDeckSupervisor) => void;
+  onWorkUnit?: (event: { supervisor_id: string; index: number; work_unit: FlightDeckWorkUnit }) => void;
+  onSupervisorComplete?: (supervisor: FlightDeckSupervisor) => void;
+  onComplete?: () => void;
+  onError?: (error: Error) => void;
 };
 
 export type WorkflowEventHistoryItem = {
@@ -655,7 +670,7 @@ export async function getWorkflowEventHistory(runId: string, query: WorkflowEven
   return response.json();
 }
 
-export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<FlightDeckResponse> {
+function flightDeckFilterParams(filters: FlightDeckFilters): URLSearchParams {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (typeof value === 'boolean') {
@@ -664,8 +679,78 @@ export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<Fl
       params.set(key, value);
     }
   }
+  return params;
+}
+
+export function openFlightDeckHydrationStream(
+  filters: FlightDeckFilters,
+  handlers: FlightDeckHydrationHandlers
+): () => void {
+  const params = flightDeckFilterParams(filters);
+  const query = params.toString();
+  const source = new EventSource(`/api/flight-deck/stream${query ? `?${query}` : ''}`);
+  let closed = false;
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    source.close();
+  };
+
+  source.addEventListener('flight_deck_begin', () => {
+    handlers.onBegin?.();
+  });
+
+  source.addEventListener('flight_deck_supervisor', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onSupervisor?.(JSON.parse(event.data) as FlightDeckSupervisor);
+  });
+
+  source.addEventListener('flight_deck_work_unit', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onWorkUnit?.(JSON.parse(event.data) as {
+      supervisor_id: string;
+      index: number;
+      work_unit: FlightDeckWorkUnit;
+    });
+  });
+
+  source.addEventListener('flight_deck_supervisor_complete', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onSupervisorComplete?.(JSON.parse(event.data) as FlightDeckSupervisor);
+  });
+
+  source.addEventListener('flight_deck_complete', () => {
+    close();
+    handlers.onComplete?.();
+  });
+
+  source.addEventListener('flight_deck_error', (raw) => {
+    const event = raw as MessageEvent<string>;
+    const payload = JSON.parse(event.data) as { message?: string };
+    close();
+    handlers.onError?.(new Error(payload.message || 'Flight Deck hydration failed'));
+  });
+
+  source.onerror = () => {
+    if (closed) return;
+    close();
+    handlers.onError?.(new Error('Flight Deck hydration stream disconnected'));
+  };
+
+  return close;
+}
+
+export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<FlightDeckResponse> {
+  const params = flightDeckFilterParams(filters);
   const query = params.toString();
   const response = await fetch(`/api/flight-deck${query ? `?${query}` : ''}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function listSupervisorRuns(): Promise<SupervisorListItem[]> {
+  const response = await fetch('/api/supervisor-runs');
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -722,19 +807,89 @@ export type SupervisorActionRequest =
   | { action: 'apply_integration'; work_unit_id: string; archive_integrated_workflows: boolean }
   | { action: 'cancel' };
 
+export type PendingSupervisorAction = {
+  id: string;
+  supervisor_id: string;
+  action: SupervisorActionRequest['action'];
+  work_unit_id?: string | null;
+  feature_id?: string | null;
+  planner_id?: string | null;
+  request: SupervisorActionRequest;
+  started_at: number;
+};
+
+let supervisorActionSequence = 0;
+let supervisorActionStateVersion = 0;
+const pendingSupervisorActions = new Map<string, PendingSupervisorAction>();
+const supervisorActionStateListeners = new Set<() => void>();
+
+function emitSupervisorActionState() {
+  supervisorActionStateVersion += 1;
+  for (const listener of supervisorActionStateListeners) listener();
+}
+
+function beginSupervisorAction(supervisorId: string, request: SupervisorActionRequest): PendingSupervisorAction {
+  supervisorActionSequence += 1;
+  const pending: PendingSupervisorAction = {
+    id: `${supervisorId}:${supervisorActionSequence}`,
+    supervisor_id: supervisorId,
+    action: request.action,
+    work_unit_id: 'work_unit_id' in request ? request.work_unit_id : null,
+    feature_id: 'feature_id' in request ? request.feature_id ?? null : null,
+    planner_id: 'planner_id' in request ? request.planner_id : null,
+    request,
+    started_at: Date.now(),
+  };
+  pendingSupervisorActions.set(pending.id, pending);
+  emitSupervisorActionState();
+  return pending;
+}
+
+function finishSupervisorAction(id: string) {
+  if (!pendingSupervisorActions.delete(id)) return;
+  emitSupervisorActionState();
+}
+
+export function subscribeSupervisorActionState(listener: () => void): () => void {
+  supervisorActionStateListeners.add(listener);
+  return () => supervisorActionStateListeners.delete(listener);
+}
+
+export function getSupervisorActionStateVersion(): number {
+  return supervisorActionStateVersion;
+}
+
+export function getPendingSupervisorActions(supervisorId?: string): PendingSupervisorAction[] {
+  const actions = [...pendingSupervisorActions.values()];
+  return supervisorId
+    ? actions.filter((action) => action.supervisor_id === supervisorId)
+    : actions;
+}
+
 export async function runSupervisorAction(id: string, request: SupervisorActionRequest): Promise<Record<string, unknown>> {
-  const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request)
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const result = await response.json();
-  if (result && typeof result === 'object' && result.supervisor_run) {
-    return {
-      ...result,
-      supervisor_run: normalizeSupervisorRun(result.supervisor_run as SupervisorRun)
-    };
+  const pending = beginSupervisorAction(id, request);
+  let succeeded = false;
+  try {
+    const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    succeeded = true;
+    if (result && typeof result === 'object' && result.supervisor_run) {
+      return {
+        ...result,
+        supervisor_run: normalizeSupervisorRun(result.supervisor_run as SupervisorRun)
+      };
+    }
+    return result;
+  } finally {
+    if (succeeded) {
+      window.setTimeout(() => finishSupervisorAction(pending.id), 300);
+    } else {
+      finishSupervisorAction(pending.id);
+    }
   }
-  return result;
 }

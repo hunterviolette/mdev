@@ -1,5 +1,7 @@
 use axum::{extract::{Path, State}, http::StatusCode, routing::{get, post}, Json, Router};
+use serde::Serialize;
 use serde_json::{json, Value};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -10,10 +12,37 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/supervisor-runs", post(create_supervisor_run))
+        .route("/api/supervisor-runs", get(list_supervisor_runs).post(create_supervisor_run))
         .route("/api/supervisor-runs/:supervisor_id", axum::routing::delete(delete_supervisor_run))
         .route("/api/supervisor-runs/:supervisor_id/queue", get(get_supervisor_queue))
         .route("/api/supervisor-runs/:supervisor_id/actions", post(supervisor_action))
+}
+
+#[derive(Debug, Serialize)]
+struct SupervisorListItem {
+    id: String,
+    title: String,
+}
+
+async fn list_supervisor_runs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SupervisorListItem>>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title
+        FROM supervisor_runs
+        WHERE archived_at IS NULL
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+
+    Ok(Json(rows.into_iter().map(|row| SupervisorListItem {
+        id: row.get("id"),
+        title: row.get("title"),
+    }).collect()))
 }
 
 async fn create_supervisor_run(

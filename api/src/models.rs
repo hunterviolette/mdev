@@ -379,18 +379,23 @@ pub struct WorkflowEventStreamItem {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SprintEventStreamItem {
+#[derive(Debug, Clone, Serialize)]
+pub struct SupervisorEventPayload {
+    pub supervisor_run_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<crate::routes::flight_deck::FlightDeckSupervisor>,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SupervisorEventStreamItem {
     pub id: String,
-    pub sprint_id: String,
+    pub supervisor_run_id: String,
     pub sequence_no: i64,
     pub event_type: String,
     pub event_time: String,
-    pub feature_id: Option<String>,
-    pub actor: String,
     pub message: String,
-    #[serde(default)]
-    pub payload: Value,
+    pub payload: SupervisorEventPayload,
     pub created_at: String,
 }
 

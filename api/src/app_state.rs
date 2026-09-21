@@ -18,7 +18,7 @@ use crate::{
         orchestration_inputs::OrchestrationInputStore,
         workflow_lifecycle::WorkflowCoordinator,
     },
-    models::{SprintEventStreamItem, WorkflowEventStreamItem},
+    models::{SupervisorEventStreamItem, WorkflowEventStreamItem},
 };
 
 #[derive(Clone, Default)]
@@ -41,7 +41,7 @@ impl SupervisorCoordinator {
 pub struct AppState {
     pub db: SqlitePool,
     workflow_events_tx: broadcast::Sender<WorkflowEventStreamItem>,
-    sprint_events_tx: broadcast::Sender<SprintEventStreamItem>,
+    supervisor_events_tx: broadcast::Sender<SupervisorEventStreamItem>,
     process_session_id: String,
     pub workflow_coordinator: WorkflowCoordinator,
     pub supervisor_coordinator: SupervisorCoordinator,
@@ -55,11 +55,11 @@ pub struct AppState {
 impl AppState {
     pub fn new(db: SqlitePool) -> Self {
         let (workflow_events_tx, _) = broadcast::channel(4096);
-        let (sprint_events_tx, _) = broadcast::channel(4096);
+        let (supervisor_events_tx, _) = broadcast::channel(4096);
         Self {
             db,
             workflow_events_tx,
-            sprint_events_tx,
+            supervisor_events_tx,
             process_session_id: Uuid::new_v4().to_string(),
             workflow_coordinator: WorkflowCoordinator::default(),
             supervisor_coordinator: SupervisorCoordinator::default(),
@@ -79,12 +79,12 @@ impl AppState {
         let _ = self.workflow_events_tx.send(event);
     }
 
-    pub fn subscribe_sprint_events(&self) -> broadcast::Receiver<SprintEventStreamItem> {
-        self.sprint_events_tx.subscribe()
+    pub fn subscribe_supervisor_events(&self) -> broadcast::Receiver<SupervisorEventStreamItem> {
+        self.supervisor_events_tx.subscribe()
     }
 
-    pub fn publish_sprint_event(&self, event: SprintEventStreamItem) {
-        let _ = self.sprint_events_tx.send(event);
+    pub fn publish_supervisor_event(&self, event: SupervisorEventStreamItem) {
+        let _ = self.supervisor_events_tx.send(event);
     }
 
     pub fn planner(&self) -> PlannerService<'_> {

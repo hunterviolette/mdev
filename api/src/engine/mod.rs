@@ -332,34 +332,100 @@ pub async fn fail_active_runs_for_process_stop(
     Ok(failed_count)
 }
 
-pub async fn fail_stale_running_runs_on_startup(state: &AppState) -> Result<usize> {
+pub async fn repair_process_interruption_errors_on_startup(state: &AppState) -> Result<usize> {
     let rows = sqlx::query(
         r#"
-        SELECT id
+        SELECT id, current_step_id, context_json
         FROM workflow_runs
-        WHERE status = 'running'
+        WHERE status = 'error'
+          AND json_valid(context_json)
+          AND (
+            json_extract(
+              context_json,
+              '$.workflow_engine.run_state.terminal_error.kind'
+            ) = 'api_shutdown'
+            OR (
+              json_extract(
+                context_json,
+                '$.workflow_engine.run_state.terminal_error.kind'
+              ) = 'process_stopped'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM workflow_events interrupted
+                WHERE interrupted.run_id = workflow_runs.id
+                  AND COALESCE(json_extract(interrupted.payload_json, '$.interrupted'), 0) = 1
+                  AND json_extract(interrupted.payload_json, '$.process_session_id') =
+                      json_extract(
+                        workflow_runs.context_json,
+                        '$.workflow_engine.run_state.terminal_error.process_session_id'
+                      )
+              )
+            )
+          )
         ORDER BY created_at ASC
         "#,
     )
     .fetch_all(&state.db)
     .await?;
 
-    let run_ids = rows
-        .into_iter()
-        .map(|row| Uuid::parse_str(row.get::<String, _>("id").as_str()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now = Utc::now().to_rfc3339();
+    let mut repaired_count = 0usize;
 
-    if run_ids.is_empty() {
-        return Ok(0);
+    for row in rows {
+        let run_id = Uuid::parse_str(row.get::<String, _>("id").as_str())?;
+        let current_step_id = row.get::<Option<String>, _>("current_step_id");
+        let context_json = row.get::<String, _>("context_json");
+        let mut context = serde_json::from_str::<Value>(&context_json)
+            .unwrap_or_else(|_| json!({}));
+
+        if let Some(run_state) = context
+            .get_mut("workflow_engine")
+            .and_then(|value| value.get_mut("run_state"))
+            .and_then(Value::as_object_mut)
+        {
+            run_state.remove("terminal_error");
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_runs
+            SET status = 'paused',
+                context_json = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'error'
+            "#,
+        )
+        .bind(serde_json::to_string_pretty(&context)?)
+        .bind(&now)
+        .bind(run_id.to_string())
+        .execute(&state.db)
+        .await?;
+
+        append_engine_event(
+            state,
+            run_id,
+            current_step_id.as_deref(),
+            "info",
+            "run_status_changed",
+            "Workflow run status changed.",
+            json!({
+                "status": "paused",
+                "current_step_id": current_step_id,
+                "event_meta": {
+                    "is_header_event": true
+                }
+            }),
+        )
+        .await?;
+
+        repaired_count += 1;
     }
 
-    fail_active_runs_for_process_stop(
-        state,
-        &run_ids,
-        "The previous API process stopped before the stage execution completed.",
-    )
-    .await
+    Ok(repaired_count)
 }
+
+
 
 pub async fn load_run(state: &AppState, run_id: Uuid) -> Result<WorkflowRun> {
     let row = sqlx::query(

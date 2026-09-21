@@ -6,7 +6,8 @@ import {
   type RuntimeEventEnvelope,
   type RuntimeNode,
   type RuntimeSnapshotResponse,
-  type StageExecutionEvent
+  type StageExecutionEvent,
+  type SupervisorEventEnvelope
 } from './api';
 
 export type RuntimeEventStore = {
@@ -248,7 +249,7 @@ const RUNTIME_EVENT_BUS_LEADER_STALE_MS = 7000;
 
 type RuntimeEventBusBroadcastMessage = {
   sourceId: string;
-  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event';
+  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event' | 'supervisor_event' | 'supervisor_resync';
   payload?: unknown;
 };
 
@@ -302,6 +303,8 @@ type RuntimeEventBusHandlers = {
   onSnapshot?: (snapshot: RuntimeSnapshotResponse) => void;
   onProjection?: (projection: EventChainSummaryResponse) => void;
   onEvent?: (event: RuntimeEventEnvelope) => void;
+  onSupervisorEvent?: (event: SupervisorEventEnvelope) => void;
+  onSupervisorResync?: () => void;
   onError?: () => void;
 };
 
@@ -332,6 +335,12 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
         return;
       case 'runtime_event':
         handlers.onEvent?.(message.payload as RuntimeEventEnvelope);
+        return;
+      case 'supervisor_event':
+        handlers.onSupervisorEvent?.(message.payload as SupervisorEventEnvelope);
+        return;
+      case 'supervisor_resync':
+        handlers.onSupervisorResync?.();
         return;
     }
   }
@@ -408,6 +417,22 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
       } catch {
       }
     });
+
+    nextSource.addEventListener('supervisor_event', (raw) => {
+      if (disposed || !isLeader) return;
+      try {
+        const event = JSON.parse((raw as MessageEvent<string>).data) as SupervisorEventEnvelope;
+        broadcast('supervisor_event', event);
+      } catch {
+      }
+    });
+
+    nextSource.addEventListener('supervisor_resync', () => {
+      if (disposed || !isLeader) return;
+      broadcast('supervisor_resync');
+    });
+
+
 
     nextSource.onerror = () => {
       if (disposed || !isLeader) return;
@@ -498,6 +523,8 @@ function ensureSharedRuntimeEventBus() {
     onSnapshot: (snapshot) => dispatchRuntimeEventBus('onSnapshot', snapshot),
     onProjection: (projection) => dispatchRuntimeEventBus('onProjection', projection),
     onEvent: (event) => dispatchRuntimeEventBus('onEvent', event),
+    onSupervisorEvent: (event) => dispatchRuntimeEventBus('onSupervisorEvent', event),
+    onSupervisorResync: () => dispatchRuntimeEventBus('onSupervisorResync'),
     onError: () => dispatchRuntimeEventBus('onError')
   });
 }

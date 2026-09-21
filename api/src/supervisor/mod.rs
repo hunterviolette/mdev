@@ -21,7 +21,7 @@ use crate::{
         FeaturePlanItem,
         FeaturePlanItemStatus,
     },
-    models::{RunStatus, SprintEventStreamItem},
+    models::{RunStatus, SupervisorEventPayload, SupervisorEventStreamItem},
 };
 use models::{CreateSupervisorRunRequest, CreateSupervisorWorkUnitRequest, IntegrationInputState, SupervisorExecutionStrategy, SupervisorFeatureWorkflow, SupervisorIntegrationCandidate, SupervisorIntegrationInput, SupervisorRun, SupervisorStatus, SupervisorWorkPoolKind, SupervisorWorkUnitRecord, SupervisorWorkUnitState, SupervisorWorkUnitStoredContext};
 use lifecycle::{SupervisorPoolKind, SupervisorWorkUnitPromiseRequest, SupervisorWorkflowSpawnRequest};
@@ -102,6 +102,7 @@ pub async fn create_supervisor_run(state: &AppState, req: CreateSupervisorRunReq
     };
     insert_supervisor_run(state, &run).await?;
     ensure_supervisor_integration_work_unit(state, &run).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_created", "supervisor created").await?;
     Ok(run)
 }
 
@@ -172,20 +173,25 @@ async fn hydrate_supervisor_planner(state: &AppState, run: &mut SupervisorRun) -
 
 
 
-async fn append_sprint_event(state: &AppState, sprint_id: &str, event_type: &str, event_time: &str, feature_id: Option<&str>, message: &str, payload: Value) -> Result<SprintEventStreamItem> {
-    let event = SprintEventStreamItem {
+async fn append_supervisor_event(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+    event_type: &str,
+    message: &str,
+    payload: SupervisorEventPayload,
+) -> Result<SupervisorEventStreamItem> {
+    let event_time = Utc::now();
+    let event = SupervisorEventStreamItem {
         id: Uuid::new_v4().to_string(),
-        sprint_id: sprint_id.to_string(),
-        sequence_no: Utc::now().timestamp_millis(),
+        supervisor_run_id: supervisor_run_id.to_string(),
+        sequence_no: event_time.timestamp_micros(),
         event_type: event_type.to_string(),
-        event_time: event_time.to_string(),
-        feature_id: feature_id.map(str::to_string),
-        actor: "system".to_string(),
+        event_time: event_time.to_rfc3339(),
         message: message.to_string(),
         payload,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: event_time.to_rfc3339(),
     };
-    state.publish_sprint_event(event.clone());
+    state.publish_supervisor_event(event.clone());
     Ok(event)
 }
 
@@ -490,57 +496,6 @@ pub async fn supervisor_queue_projection(state: &AppState, id: Uuid) -> Result<V
     }))
 }
 
-async fn refresh_feature_pool_work_unit_statuses(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, feature_id, workflow_run_id
-        FROM supervisor_work_units
-        WHERE supervisor_run_id = ?
-          AND kind = 'feature'
-          AND archived_at IS NULL
-          AND state != 'cancelled'
-          AND TRIM(COALESCE(workflow_run_id, '')) != ''
-        "#,
-    )
-    .bind(run.id.to_string())
-    .fetch_all(&state.db)
-    .await?;
-
-    let now = Utc::now().to_rfc3339();
-
-    for row in rows {
-        let work_unit_id: String = row.get("id");
-        let workflow_run_id_text: String = row.get("workflow_run_id");
-        let Ok(workflow_run_id) = Uuid::parse_str(&workflow_run_id_text) else {
-            continue;
-        };
-        let Ok(child_run) = engine::load_run(state, workflow_run_id).await else {
-            continue;
-        };
-
-        let work_unit_state = match child_run.status {
-            RunStatus::Draft => SupervisorWorkUnitState::Draft,
-            RunStatus::Queued => SupervisorWorkUnitState::Queued,
-            RunStatus::Running => SupervisorWorkUnitState::Running,
-            RunStatus::Waiting => SupervisorWorkUnitState::Waiting,
-            RunStatus::Paused => SupervisorWorkUnitState::Paused,
-            RunStatus::Success => SupervisorWorkUnitState::Completed,
-            RunStatus::Error => SupervisorWorkUnitState::Failed,
-            RunStatus::Cancelled => SupervisorWorkUnitState::Cancelled,
-        };
-
-        sqlx::query("UPDATE supervisor_work_units SET state = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL")
-            .bind(work_unit_state.as_str())
-            .bind(&now)
-            .bind(&work_unit_id)
-            .execute(&state.db)
-            .await?;
-    }
-
-    *run = load_supervisor_run(state, run.id).await?;
-    Ok(())
-}
-
 async fn start_next_feature_pool_work_units(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
     let feature_concurrency = supervisor_feature_concurrency(run);
     let mut active_count = sqlx::query(
@@ -551,10 +506,7 @@ async fn start_next_feature_pool_work_units(state: &AppState, run: &mut Supervis
         WHERE wu.supervisor_run_id = ?
           AND wu.kind = 'feature'
           AND wu.archived_at IS NULL
-          AND (
-              wu.state IN ('running', 'waiting', 'paused')
-              OR wr.status IN ('running', 'waiting', 'paused')
-          )
+          AND wr.status IN ('running', 'waiting', 'paused')
         "#,
     )
     .bind(run.id.to_string())
@@ -605,7 +557,6 @@ async fn kick_feature_pool_if_running(state: &AppState, run: &mut SupervisorRun)
         return Ok(());
     }
 
-    refresh_feature_pool_work_unit_statuses(state, run).await?;
     start_next_feature_pool_work_units(state, run).await?;
     run.status = SupervisorStatus::RunningChildren;
     run.updated_at = Utc::now();
@@ -1752,6 +1703,20 @@ pub async fn delete_supervisor_run(state: &AppState, id: Uuid) -> Result<()> {
         .bind(id.to_string())
         .execute(&state.db)
         .await?;
+
+    append_supervisor_event(
+        state,
+        id,
+        "supervisor_deleted",
+        "supervisor deleted",
+        SupervisorEventPayload {
+            supervisor_run_id: id,
+            supervisor: None,
+            deleted: true,
+        },
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -1767,15 +1732,6 @@ fn supervisor_context_uuid(context: &Value, key: &str) -> Option<Uuid> {
 }
 
 
-
-fn workflow_terminal_event_type(status: &RunStatus) -> &'static str {
-    match status {
-        RunStatus::Success => "workflow_completed",
-        RunStatus::Error => "workflow_failed",
-        RunStatus::Cancelled => "workflow_cancelled",
-        _ => "workflow_terminal",
-    }
-}
 
 fn workflow_terminal_event_message(status: &RunStatus) -> &'static str {
     match status {
@@ -1821,58 +1777,20 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
     let is_integration_workflow =
         run.integration_run_id == Some(workflow_run_id) || pool_type == "integration";
 
-    let terminal_work_unit_state = match status {
-        RunStatus::Success => Some(SupervisorWorkUnitState::Completed),
-        RunStatus::Error => Some(SupervisorWorkUnitState::Failed),
-        RunStatus::Cancelled => Some(SupervisorWorkUnitState::Cancelled),
-        _ => None,
-    };
-
-    if let Some(next_state) = terminal_work_unit_state {
-        let blocked_reason = match status {
-            RunStatus::Error => Some("workflow failed"),
-            RunStatus::Cancelled => Some("workflow cancelled"),
-            _ => None,
-        };
-
-        let changed = sqlx::query(
-            r#"
-            UPDATE supervisor_work_units
-            SET state = ?,
-                blocked_reason = ?,
-                context_json = json_set(
-                    CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
-                    '$.current_step_id', ?,
-                    '$.workflow_status', ?,
-                    '$.terminal_at', ?
-                ),
-                updated_at = ?
-            WHERE supervisor_run_id = ?
-              AND workflow_run_id = ?
-              AND state != 'archived'
-            "#,
-        )
-        .bind(next_state.as_str())
-        .bind(blocked_reason)
-        .bind(current_step_id)
-        .bind(status_str(&status))
-        .bind(&now)
-        .bind(&now)
-        .bind(supervisor_id.to_string())
-        .bind(workflow_run_id.to_string())
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-
-        if changed > 0 && !is_integration_workflow {
-            if matches!(run.status, SupervisorStatus::RunningChildren) {
-                start_next_feature_pool_work_units(state, &mut run).await?;
-            }
-            run.updated_at = Utc::now();
-            update_supervisor_run(state, &run).await?;
-            publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "supervisor work-unit terminal event processed").await?;
-            return Ok(());
+    if !is_integration_workflow {
+        if matches!(run.status, SupervisorStatus::RunningChildren) {
+            start_next_feature_pool_work_units(state, &mut run).await?;
         }
+        run.updated_at = Utc::now();
+        update_supervisor_run(state, &run).await?;
+        publish_supervisor_snapshot(
+            state,
+            &run,
+            "supervisor_snapshot",
+            "workflow terminal event processed",
+        )
+        .await?;
+        return Ok(());
     }
 
 
@@ -1888,17 +1806,10 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
                         .bind(sprint_id)
                         .execute(&state.db)
                         .await?;
-                    append_sprint_event(state, sprint_id, "integration_completed", &now, None, "integration workflow completed", json!({
-                        "workflow_run_id": workflow_run_id,
-                        "patch_source": "integration_workflow_runtime"
-                    })).await?;
                 }
             }
             RunStatus::Error | RunStatus::Cancelled => {
                 run.status = SupervisorStatus::Failed;
-                if let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str) {
-                    append_sprint_event(state, sprint_id, workflow_terminal_event_type(&status), &now, None, workflow_terminal_event_message(&status), json!({ "workflow_run_id": workflow_run_id })).await?;
-                }
             }
             _ => {}
         }
@@ -2292,6 +2203,15 @@ async fn materialize_supervisor_work_unit(
         }
         return Err(anyhow!("work unit cannot be materialized from its current state"));
     }
+
+    let materializing_run = load_supervisor_run(state, run.id).await?;
+    publish_supervisor_snapshot(
+        state,
+        &materializing_run,
+        "work_unit_materializing",
+        "work unit materialization started",
+    )
+    .await?;
 
     let prepared = async {
         let template_id = supervisor_work_unit_template_id(state, run, work_unit).await?;
@@ -2699,9 +2619,17 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
     update_supervisor_run(state, &run).await?;
 
     let refreshed = load_supervisor_work_unit_row(state, id, &work_unit_id).await?;
+    publish_supervisor_snapshot(
+        state,
+        &run,
+        "work_unit_regeneration_queued",
+        "work unit queued for regeneration",
+    )
+    .await?;
+
     let workflow_run_id = materialize_supervisor_work_unit(state, &mut run, &refreshed).await?;
 
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "work unit regenerated").await?;
+    publish_supervisor_snapshot(state, &run, "work_unit_regenerated", "work unit regenerated").await?;
 
     Ok(json!({
         "ok": true,
@@ -2767,23 +2695,7 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
         .await?
     };
 
-    let now = Utc::now().to_rfc3339();
-    let next_state = if waiting_on_operator_checkpoint {
-        SupervisorWorkUnitState::Waiting
-    } else {
-        SupervisorWorkUnitState::Running
-    };
-    sqlx::query("UPDATE supervisor_work_units SET state = ?, blocked_reason = ?, updated_at = ? WHERE id = ?")
-        .bind(next_state.as_str())
-        .bind(if waiting_on_operator_checkpoint {
-            Some("Waiting on operator checkpoint")
-        } else {
-            None
-        })
-        .bind(&now)
-        .bind(&work_unit_id)
-        .execute(&state.db)
-        .await?;
+    let workflow_status = engine::load_run(state, workflow_run_id).await?.status;
 
     match work_unit.kind {
         SupervisorWorkPoolKind::Integration => {
@@ -2811,7 +2723,7 @@ pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
         "action": "start_work_unit",
         "work_unit_id": work_unit_id,
         "workflow_run_id": workflow_run_id,
-        "state": next_state.as_str(),
+        "workflow_status": status_str(&workflow_status),
         "start_result": start_result,
         "supervisor_run": run
     }))
@@ -2834,13 +2746,15 @@ pub async fn pause_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
         json!({ "ok": true, "paused": true, "workflow_run_id": null })
     };
 
-    let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE supervisor_work_units SET state = ?, updated_at = ? WHERE id = ?")
-        .bind(SupervisorWorkUnitState::Paused.as_str())
-        .bind(&now)
-        .bind(&work_unit_id)
-        .execute(&state.db)
-        .await?;
+    if workflow_run_id.is_none() {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE supervisor_work_units SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(SupervisorWorkUnitState::Paused.as_str())
+            .bind(&now)
+            .bind(&work_unit_id)
+            .execute(&state.db)
+            .await?;
+    }
 
     if kind == SupervisorWorkPoolKind::Integration {
         run.status = SupervisorStatus::DevelopmentComplete;
@@ -3370,24 +3284,24 @@ pub(crate) async fn update_supervisor_run(state: &AppState, run: &SupervisorRun)
 }
 
 async fn publish_supervisor_snapshot(state: &AppState, run: &SupervisorRun, event_type: &str, message: &str) -> Result<()> {
-    let Some(sprint_id) = run
-        .context
-        .get("current_sprint_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(());
-    };
+    let projection = crate::routes::flight_deck::build_supervisor_flight_deck_projection(
+        state,
+        &run.id.to_string(),
+    )
+    .await?;
 
-    let mut snapshot = run.clone();
-    hydrate_supervisor_feature_workflows(state, &mut snapshot).await?;
-    let event_time = Utc::now().to_rfc3339();
-    let payload = json!({
-        "supervisor_run_id": run.id,
-        "supervisor_run": snapshot,
-        "snapshot": true
-    });
-    append_sprint_event(state, sprint_id, event_type, &event_time, None, message, payload).await?;
+    append_supervisor_event(
+        state,
+        run.id,
+        event_type,
+        message,
+        SupervisorEventPayload {
+            supervisor_run_id: run.id,
+            supervisor: projection,
+            deleted: false,
+        },
+    )
+    .await?;
     Ok(())
 }
 

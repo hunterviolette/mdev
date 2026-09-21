@@ -1,7 +1,7 @@
 mod capabilities;
 mod changesets;
 mod event_chains;
-mod flight_deck;
+pub(crate) mod flight_deck;
 mod filesystem;
 mod health;
 mod repo_tree;

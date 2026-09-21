@@ -1,8 +1,17 @@
-use axum::{extract::{Query, State}, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
+    routing::get,
+    Json, Router,
+};
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, convert::Infallible, path::Path, time::Duration};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     app_state::AppState,
@@ -15,6 +24,7 @@ use crate::{
 #[derive(Debug, Clone, Deserialize)]
 struct FlightDeckQuery {
     supervisor_id: Option<String>,
+    supervisor_ids: Option<String>,
     root_repo_path: Option<String>,
     state: Option<String>,
     kind: Option<String>,
@@ -40,7 +50,7 @@ struct FlightDeckResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FlightDeckSupervisor {
+pub(crate) struct FlightDeckSupervisor {
     id: String,
     mode: String,
     status: String,
@@ -150,7 +160,9 @@ struct WorkUnitSeed {
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/flight-deck", get(get_flight_deck))
+    Router::new()
+        .route("/api/flight-deck", get(get_flight_deck))
+        .route("/api/flight-deck/stream", get(stream_flight_deck))
 }
 
 async fn get_flight_deck(
@@ -160,172 +172,362 @@ async fn get_flight_deck(
     build_flight_deck(&state, query).await.map(Json).map_err(internal)
 }
 
+async fn send_flight_deck_stream_event(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    event_name: &'static str,
+    payload: Value,
+) -> bool {
+    tx.send(Ok(Event::default().event(event_name).data(payload.to_string())))
+        .await
+        .is_ok()
+}
+
+async fn stream_flight_deck_projection(
+    state: AppState,
+    query: FlightDeckQuery,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+) -> anyhow::Result<()> {
+    let supervisors = load_supervisors(&state, &query).await?;
+    let include_deleted = query.include_deleted.unwrap_or(false);
+
+    if !send_flight_deck_stream_event(
+        &tx,
+        "flight_deck_begin",
+        json!({ "supervisor_count": supervisors.len() }),
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    for supervisor in supervisors {
+        let mut seeds = load_work_unit_seeds(&state, &supervisor, include_deleted).await?;
+        filter_work_unit_seeds(&mut seeds, &query);
+
+        let placeholders = seeds
+            .iter()
+            .map(|seed| placeholder_work_unit(&supervisor, seed))
+            .collect::<Vec<_>>();
+        let shell = build_supervisor_projection(supervisor.clone(), placeholders);
+
+        if !send_flight_deck_stream_event(
+            &tx,
+            "flight_deck_supervisor",
+            serde_json::to_value(&shell)?,
+        )
+        .await
+        {
+            return Ok(());
+        }
+
+        let work_unit_count = seeds.len();
+        let mut hydrated = vec![None; work_unit_count];
+        let hydration_state = state.clone();
+        let hydration_supervisor = supervisor.clone();
+        let builds = stream::iter(seeds.into_iter().enumerate().map(move |(index, seed)| {
+            let state = hydration_state.clone();
+            let supervisor = hydration_supervisor.clone();
+            async move {
+                let unit = build_work_unit_projection(&state, &supervisor, seed).await?;
+                Ok::<_, anyhow::Error>((index, unit))
+            }
+        }))
+        .buffer_unordered(6);
+
+        tokio::pin!(builds);
+
+        while let Some(result) = builds.next().await {
+            let (index, unit) = result?;
+            hydrated[index] = Some(unit.clone());
+
+            if !send_flight_deck_stream_event(
+                &tx,
+                "flight_deck_work_unit",
+                json!({
+                    "supervisor_id": supervisor.id,
+                    "index": index,
+                    "work_unit": unit,
+                }),
+            )
+            .await
+            {
+                return Ok(());
+            }
+        }
+
+        let work_units = hydrated.into_iter().flatten().collect::<Vec<_>>();
+        let complete = build_supervisor_projection(supervisor, work_units);
+
+        if !send_flight_deck_stream_event(
+            &tx,
+            "flight_deck_supervisor_complete",
+            serde_json::to_value(&complete)?,
+        )
+        .await
+        {
+            return Ok(());
+        }
+    }
+
+    send_flight_deck_stream_event(&tx, "flight_deck_complete", json!({ "ok": true })).await;
+    Ok(())
+}
+
+async fn stream_flight_deck(
+    State(state): State<AppState>,
+    Query(query): Query<FlightDeckQuery>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        let stream_tx = tx.clone();
+        if let Err(error) = stream_flight_deck_projection(state, query, stream_tx).await {
+            let _ = send_flight_deck_stream_event(
+                &tx,
+                "flight_deck_error",
+                json!({ "message": error.to_string() }),
+            )
+            .await;
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("flight-deck"),
+    )
+}
+
+pub(crate) async fn build_supervisor_flight_deck_projection(
+    state: &AppState,
+    supervisor_run_id: &str,
+) -> anyhow::Result<Option<FlightDeckSupervisor>> {
+    let response = build_flight_deck(
+        state,
+        FlightDeckQuery {
+            supervisor_id: Some(supervisor_run_id.to_string()),
+            supervisor_ids: None,
+            root_repo_path: None,
+            state: None,
+            kind: None,
+            include_deleted: Some(false),
+        },
+    )
+    .await?;
+
+    Ok(response.supervisors.into_iter().next())
+}
+
+fn filter_work_unit_seeds(seeds: &mut Vec<WorkUnitSeed>, query: &FlightDeckQuery) {
+    if let Some(kind) = query.kind.as_deref().filter(|value| !value.trim().is_empty()) {
+        seeds.retain(|unit| unit.kind == kind);
+    }
+    if let Some(state_filter) = query.state.as_deref().filter(|value| !value.trim().is_empty()) {
+        seeds.retain(|unit| unit.state == state_filter);
+    }
+}
+
+fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<FlightDeckAlert> {
+    let mut alerts = Vec::new();
+
+    if seed.state == "waiting" {
+        alerts.push(FlightDeckAlert {
+            id: format!("waiting-user-{}", seed.id),
+            supervisor_id: supervisor.id.clone(),
+            work_unit_id: Some(seed.id.clone()),
+            workflow_run_id: seed.workflow_run_id.clone(),
+            level: "warning".to_string(),
+            kind: "waiting_user".to_string(),
+            message: format!("{} is waiting for user input", seed.title),
+            created_at: seed.updated_at.clone(),
+        });
+    }
+
+    if seed.state == "error" || seed.state == "failed" || seed.state == "blocked" {
+        alerts.push(FlightDeckAlert {
+            id: format!("blocked-{}", seed.id),
+            supervisor_id: supervisor.id.clone(),
+            work_unit_id: Some(seed.id.clone()),
+            workflow_run_id: seed.workflow_run_id.clone(),
+            level: "error".to_string(),
+            kind: seed.state.clone(),
+            message: format!("{} is {}", seed.title, seed.state),
+            created_at: seed.updated_at.clone(),
+        });
+    }
+
+    if seed.workflow_deleted {
+        alerts.push(FlightDeckAlert {
+            id: format!("deleted-workflow-{}", seed.id),
+            supervisor_id: supervisor.id.clone(),
+            work_unit_id: Some(seed.id.clone()),
+            workflow_run_id: seed.workflow_run_id.clone(),
+            level: "warning".to_string(),
+            kind: "deleted_workflow".to_string(),
+            message: format!("{} references a deleted workflow", seed.title),
+            created_at: seed.updated_at.clone(),
+        });
+    }
+
+    alerts
+}
+
+fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> FlightDeckWorkUnit {
+    let applied_at = seed
+        .context
+        .get("applied_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    FlightDeckWorkUnit {
+        id: seed.id.clone(),
+        supervisor_id: seed.supervisor_id.clone(),
+        repo_id: seed.repo_id.clone(),
+        feature_id: seed.feature_id.clone(),
+        workflow_run_id: seed.workflow_run_id.clone(),
+        patch_id: seed.patch_id.clone(),
+        kind: seed.kind.clone(),
+        workflow_type: seed.workflow_type.clone(),
+        title: seed.title.clone(),
+        state: seed.state.clone(),
+        root_repo_path: seed.root_repo_path.clone(),
+        workspace_path: seed.workspace_path.clone(),
+        integration_path: seed.integration_path.clone(),
+        has_staged_changes: false,
+        has_workspace_changes: false,
+        integration_state: seed.integration_state.clone(),
+        applied_at,
+        telemetry: json!({ "hydrating": true }),
+        alerts: work_unit_alerts(supervisor, seed),
+        created_at: seed.created_at.clone(),
+        updated_at: seed.updated_at.clone(),
+        workflow_deleted: seed.workflow_deleted,
+    }
+}
+
+async fn build_work_unit_projection(
+    state: &AppState,
+    supervisor: &SupervisorRow,
+    seed: WorkUnitSeed,
+) -> anyhow::Result<FlightDeckWorkUnit> {
+    let execution_event_limit = supervisor
+        .context
+        .get("execution_event_limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(10, 1000) as usize;
+
+    let telemetry = match seed.workflow_run_id.as_deref() {
+        Some(workflow_run_id) if !seed.workflow_deleted => {
+            workflow_telemetry(state, workflow_run_id, execution_event_limit).await?
+        }
+        _ => draft_workflow_telemetry(state, supervisor, &seed.context).await?,
+    };
+
+    let change_status = seed
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .and_then(|path| patches::change_status(Path::new(path)).ok());
+
+    let mut unit = placeholder_work_unit(supervisor, &seed);
+    unit.has_staged_changes = change_status
+        .as_ref()
+        .is_some_and(|status| status.has_staged_changes());
+    unit.has_workspace_changes = change_status
+        .as_ref()
+        .is_some_and(|status| status.has_changes());
+    unit.telemetry = telemetry;
+    Ok(unit)
+}
+
+fn build_supervisor_projection(
+    supervisor: SupervisorRow,
+    work_units: Vec<FlightDeckWorkUnit>,
+) -> FlightDeckSupervisor {
+    let supervisor_alerts = work_units
+        .iter()
+        .flat_map(|unit| unit.alerts.iter().cloned())
+        .collect::<Vec<_>>();
+    let topology = build_topology(&supervisor, &work_units);
+    let pending_patch_count = work_units
+        .iter()
+        .filter(|unit| {
+            unit.patch_id.is_some()
+                && (unit.state == "patch_ready" || unit.state == "ready_for_integration")
+        })
+        .count();
+    let integration_workflow_run_id = work_units
+        .iter()
+        .find(|unit| unit.kind == "integration")
+        .and_then(|unit| unit.workflow_run_id.clone());
+    let integration = json!({
+        "state": integration_state(&supervisor.status),
+        "workflow_run_id": integration_workflow_run_id,
+        "pending_patch_count": pending_patch_count,
+        "merge_summary": null,
+        "validation_summary": null
+    });
+
+    FlightDeckSupervisor {
+        id: supervisor.id,
+        mode: supervisor.mode,
+        status: supervisor.status,
+        title: supervisor.title,
+        root_repo_path: supervisor.root_repo_path,
+        selected_planner_id: supervisor.selected_planner_id,
+        snapshot_path: supervisor.snapshot_path,
+        integration_path: supervisor.integration_path,
+        integration_run_id: supervisor.integration_run_id,
+        topology,
+        work_units,
+        alerts: supervisor_alerts,
+        integration,
+        context: supervisor.context,
+        created_at: supervisor.created_at,
+        updated_at: supervisor.updated_at,
+    }
+}
+
 async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::Result<FlightDeckResponse> {
     let supervisors = load_supervisors(state, &query).await?;
     let mut response_supervisors = Vec::new();
-    let mut response_alerts = Vec::new();
-    let mut totals = FlightDeckTotals::default();
     let include_deleted = query.include_deleted.unwrap_or(false);
 
     for supervisor in supervisors {
         let mut seeds = load_work_unit_seeds(state, &supervisor, include_deleted).await?;
+        filter_work_unit_seeds(&mut seeds, &query);
 
-        if let Some(kind) = query.kind.as_deref().filter(|value| !value.trim().is_empty()) {
-            seeds.retain(|unit| unit.kind == kind);
-        }
-        if let Some(state_filter) = query.state.as_deref().filter(|value| !value.trim().is_empty()) {
-            seeds.retain(|unit| unit.state == state_filter);
-        }
-
-        let mut work_units = Vec::new();
-        let mut supervisor_alerts = Vec::new();
-
+        let mut work_units = Vec::with_capacity(seeds.len());
         for seed in seeds {
-            let execution_event_limit = supervisor
-                .context
-                .get("execution_event_limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(100)
-                .clamp(10, 1000) as usize;
-            let telemetry = match seed.workflow_run_id.as_deref() {
-                Some(workflow_run_id) if !seed.workflow_deleted => {
-                    workflow_telemetry(state, workflow_run_id, execution_event_limit).await?
-                }
-                _ => draft_workflow_telemetry(state, &seed.context).await?,
-            };
-            let applied_at = seed
-                .context
-                .get("applied_at")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let change_status = seed
-                .workspace_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .and_then(|path| patches::change_status(Path::new(path)).ok());
-            let has_staged_changes = change_status
-                .as_ref()
-                .is_some_and(|status| status.has_staged_changes());
-            let has_workspace_changes = change_status
-                .as_ref()
-                .is_some_and(|status| status.has_changes());
-
-            let mut alerts = Vec::new();
-            if seed.state == "waiting" {
-                alerts.push(FlightDeckAlert {
-                    id: format!("waiting-user-{}", seed.id),
-                    supervisor_id: supervisor.id.clone(),
-                    work_unit_id: Some(seed.id.clone()),
-                    workflow_run_id: seed.workflow_run_id.clone(),
-                    level: "warning".to_string(),
-                    kind: "waiting_user".to_string(),
-                    message: format!("{} is waiting for user input", seed.title),
-                    created_at: seed.updated_at.clone(),
-                });
-            }
-            if seed.state == "failed" || seed.state == "blocked" {
-                alerts.push(FlightDeckAlert {
-                    id: format!("blocked-{}", seed.id),
-                    supervisor_id: supervisor.id.clone(),
-                    work_unit_id: Some(seed.id.clone()),
-                    workflow_run_id: seed.workflow_run_id.clone(),
-                    level: "error".to_string(),
-                    kind: seed.state.clone(),
-                    message: format!("{} is {}", seed.title, seed.state),
-                    created_at: seed.updated_at.clone(),
-                });
-            }
-            if seed.workflow_deleted {
-                alerts.push(FlightDeckAlert {
-                    id: format!("deleted-workflow-{}", seed.id),
-                    supervisor_id: supervisor.id.clone(),
-                    work_unit_id: Some(seed.id.clone()),
-                    workflow_run_id: seed.workflow_run_id.clone(),
-                    level: "warning".to_string(),
-                    kind: "deleted_workflow".to_string(),
-                    message: format!("{} references a deleted workflow", seed.title),
-                    created_at: seed.updated_at.clone(),
-                });
-            }
-
-            let projected_state = flight_deck_work_unit_state(&seed);
-            supervisor_alerts.extend(alerts.iter().cloned());
-            work_units.push(FlightDeckWorkUnit {
-                id: seed.id,
-                supervisor_id: seed.supervisor_id,
-                repo_id: seed.repo_id,
-                feature_id: seed.feature_id,
-                workflow_run_id: seed.workflow_run_id,
-                patch_id: seed.patch_id,
-                kind: seed.kind,
-                workflow_type: seed.workflow_type,
-                title: seed.title,
-                state: projected_state,
-                root_repo_path: seed.root_repo_path,
-                workspace_path: seed.workspace_path,
-                integration_path: seed.integration_path,
-                has_staged_changes,
-                has_workspace_changes,
-                integration_state: seed.integration_state,
-                applied_at,
-                telemetry,
-                alerts,
-                created_at: seed.created_at,
-                updated_at: seed.updated_at,
-                workflow_deleted: seed.workflow_deleted,
-            });
+            work_units.push(build_work_unit_projection(state, &supervisor, seed).await?);
         }
 
-        let topology = build_topology(&supervisor, &work_units);
-        let pending_patch_count = work_units.iter().filter(|unit| {
-            unit.patch_id.is_some() && (unit.state == "patch_ready" || unit.state == "ready_for_integration")
-        }).count();
-        let integration_state_value = integration_state(&supervisor.status);
-        let integration_workflow_run_id = work_units
-            .iter()
-            .find(|unit| unit.kind == "integration")
-            .and_then(|unit| unit.workflow_run_id.clone());
-        let integration = json!({
-            "state": integration_state_value,
-            "workflow_run_id": integration_workflow_run_id,
-            "pending_patch_count": pending_patch_count,
-            "merge_summary": null,
-            "validation_summary": null
-        });
+        response_supervisors.push(build_supervisor_projection(supervisor, work_units));
+    }
 
-        totals.supervisors += 1;
-        totals.work_units += work_units.len();
-        for unit in &work_units {
+    let response_alerts = response_supervisors
+        .iter()
+        .flat_map(|supervisor| supervisor.alerts.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut totals = FlightDeckTotals::default();
+    totals.supervisors = response_supervisors.len();
+
+    for supervisor in &response_supervisors {
+        totals.work_units += supervisor.work_units.len();
+        for unit in &supervisor.work_units {
             match unit.state.as_str() {
                 "running" => totals.running += 1,
                 "waiting" => totals.waiting_user += 1,
-                "failed" => totals.failed += 1,
+                "failed" | "error" => totals.failed += 1,
+                "ready_for_integration" => totals.ready_for_integration += 1,
+                "integrating" => totals.integrating += 1,
                 _ => {}
             }
         }
-
-        response_alerts.extend(supervisor_alerts.iter().cloned());
-        response_supervisors.push(FlightDeckSupervisor {
-            id: supervisor.id,
-            mode: supervisor.mode,
-            status: supervisor.status,
-            title: supervisor.title,
-            root_repo_path: supervisor.root_repo_path,
-            selected_planner_id: supervisor.selected_planner_id,
-            snapshot_path: supervisor.snapshot_path,
-            integration_path: supervisor.integration_path,
-            integration_run_id: supervisor.integration_run_id,
-            topology,
-            work_units,
-            alerts: supervisor_alerts,
-            integration,
-            context: supervisor.context,
-            created_at: supervisor.created_at,
-            updated_at: supervisor.updated_at,
-        });
     }
 
     Ok(FlightDeckResponse {
@@ -336,6 +538,14 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
 }
 
 async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::Result<Vec<SupervisorRow>> {
+    let supervisor_ids = query
+        .supervisor_ids
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
     let rows = sqlx::query(
         r#"
         SELECT id, mode, status, title, root_repo_path, selected_planner_id, context_json, created_at, updated_at
@@ -351,6 +561,9 @@ async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::
         let id: String = row.get("id");
         let root_repo_path: String = row.get("root_repo_path");
         if query.supervisor_id.as_deref().is_some_and(|filter| !filter.is_empty() && filter != id) {
+            continue;
+        }
+        if !supervisor_ids.is_empty() && !supervisor_ids.iter().any(|filter| *filter == id) {
             continue;
         }
         if query.root_repo_path.as_deref().is_some_and(|filter| !filter.is_empty() && filter != root_repo_path) {
@@ -619,7 +832,7 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
         FROM supervisor_work_units wu
         LEFT JOIN workflow_runs wr ON wr.id = wu.workflow_run_id
         WHERE wu.supervisor_run_id = ?
-        ORDER BY wu.priority DESC, wu.queue_position ASC, wu.updated_at DESC
+        ORDER BY wu.priority DESC, wu.queue_position ASC, wu.created_at ASC, wu.id ASC
         "#,
     )
     .bind(supervisor.id.as_str())
@@ -654,7 +867,7 @@ async fn load_work_unit_seeds(state: &AppState, supervisor: &SupervisorRow, incl
         } else {
             workflow_status
                 .clone()
-                .unwrap_or_else(|| persisted_state)
+                .ok_or_else(|| anyhow::anyhow!("workflow {} exists without a status", workflow_run_id.as_deref().unwrap_or_default()))?
         };
         if workflow_run_id.is_some() && !workflow_exists && !include_deleted {
             continue;
@@ -947,18 +1160,35 @@ fn supervisor_pool_template_id(supervisor: &SupervisorRow, pool_key: &str) -> Op
         .and_then(|value| context_string(value, "template_id"))
 }
 
-async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::Result<Value> {
+async fn draft_workflow_telemetry(
+    state: &AppState,
+    supervisor: &SupervisorRow,
+    context: &Value,
+) -> anyhow::Result<Value> {
+    let pool_key = context_string(context, "pool_key").unwrap_or_else(|| "workflow".to_string());
     let template_id = context_string(context, "planned_workflow_template_id")
         .or_else(|| context_string(context, "template_id"))
-        .or_else(|| context_string(context, "workflow_template_id"));
-    let pool_key = context_string(context, "pool_key").unwrap_or_else(|| "workflow".to_string());
+        .or_else(|| context_string(context, "workflow_template_id"))
+        .or_else(|| supervisor_pool_template_id(supervisor, &pool_key));
+    let materialization_state = context_string(context, "materialization_state")
+        .unwrap_or_else(|| "pending".to_string());
+    let regenerated_at = context_string(context, "regenerated_at");
+    let materialization_started_at = context_string(context, "materialization_started_at");
+    let status = match materialization_state.as_str() {
+        "materializing" => "running",
+        "failed" => "failed",
+        _ => "queued",
+    };
 
     let Some(template_id) = template_id else {
         return Ok(json!({
-            "status": "draft",
+            "status": status,
             "pool_key": pool_key,
             "planned_workflow": true,
             "planned_workflow_template_id": Value::Null,
+            "materialization_state": materialization_state,
+            "materialization_started_at": materialization_started_at,
+            "regenerated_at": regenerated_at,
             "current_step_id": Value::Null,
             "stage_template": [],
             "stage_template_error": "No workflow template is configured for this supervisor pool.",
@@ -975,10 +1205,13 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
 
     let Some(row) = row else {
         return Ok(json!({
-            "status": "draft",
+            "status": status,
             "pool_key": pool_key,
             "planned_workflow": true,
             "planned_workflow_template_id": template_id,
+            "materialization_state": materialization_state,
+            "materialization_started_at": materialization_started_at,
+            "regenerated_at": regenerated_at,
             "current_step_id": Value::Null,
             "stage_template": [],
             "stage_template_error": "Configured workflow template was not found.",
@@ -992,11 +1225,14 @@ async fn draft_workflow_telemetry(state: &AppState, context: &Value) -> anyhow::
     let (stage_template, stage_template_error) = workflow_stage_template(Some(definition_json.as_str()));
 
     Ok(json!({
-        "status": "draft",
+        "status": status,
         "pool_key": pool_key,
         "planned_workflow": true,
         "planned_workflow_template_id": template_id,
         "planned_workflow_template_name": template_name,
+        "materialization_state": materialization_state,
+        "materialization_started_at": materialization_started_at,
+        "regenerated_at": regenerated_at,
         "current_step_id": Value::Null,
         "stage_template": stage_template,
         "stage_template_error": stage_template_error,
@@ -1051,20 +1287,6 @@ fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit])
     }
 
     nodes
-}
-
-fn flight_deck_work_unit_state(seed: &WorkUnitSeed) -> String {
-    let workflow_status = seed.workflow_status.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-    match workflow_status.as_str() {
-        "queued" => "queued".to_string(),
-        "running" => "running".to_string(),
-        "waiting" => "waiting".to_string(),
-        "paused" => "paused".to_string(),
-        "failed" | "error" => "failed".to_string(),
-        "cancelled" | "canceled" => "cancelled".to_string(),
-        "completed" | "complete" | "success" => "completed".to_string(),
-        _ => seed.state.clone(),
-    }
 }
 
 fn integration_state(status: &str) -> String {
