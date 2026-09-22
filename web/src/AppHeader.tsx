@@ -1,7 +1,7 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { Box, Button, Group, Paper, Stack, Tabs, type ButtonProps, type PaperProps } from '@mantine/core';
 
-export type AppHeaderView = 'workflows' | 'flight_deck' | 'templates' | 'runtime';
+export type AppHeaderView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
 
 export const appSurfaceStyle: CSSProperties = {
   background: 'linear-gradient(135deg, rgba(28,126,214,0.08), rgba(255,255,255,0.025))',
@@ -53,7 +53,7 @@ export function AppHeader(props: {
           <Tabs
             value={props.active}
             onChange={(value) => {
-              if (value === 'workflows' || value === 'flight_deck' || value === 'templates' || value === 'runtime') {
+              if (value === 'workflows' || value === 'supervisor' || value === 'templates' || value === 'runtime') {
                 props.onChange(value);
               }
             }}
@@ -61,12 +61,12 @@ export function AppHeader(props: {
             <Tabs.List style={{ borderBottom: 0 }}>
               <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
               <Tabs.Tab
-                value="flight_deck"
+                value="supervisor"
                 onDoubleClick={() => {
-                  if (props.active === 'flight_deck') props.onActiveDoubleClick?.();
+                  if (props.active === 'supervisor') props.onActiveDoubleClick?.();
                 }}
               >
-                Flight Deck
+                Supervisors
               </Tabs.Tab>
               <Tabs.Tab value="templates">Templates</Tabs.Tab>
               <Tabs.Tab value="runtime">Runtime</Tabs.Tab>

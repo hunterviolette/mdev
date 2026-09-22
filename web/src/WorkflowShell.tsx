@@ -105,7 +105,7 @@ import { DeployQARuntime } from './Capabilities/DeployQARuntime';
 import { RuntimeAdmin } from './Capabilities/RuntimeAdmin';
 import { SharedDependencies } from './Capabilities/SharedDependencies';
 import { Automation, type AutomationProfile } from './Capabilities/Automation';
-import { FlightDeckPanel } from './FlightDeckPanel';
+import { SupervisorPanel } from './SupervisorPanel';
 import { AppHeader, AppHeaderAction, AppSurface } from './AppHeader';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
@@ -177,7 +177,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'flight_deck' | 'templates' | 'runtime';
+type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -2246,7 +2246,7 @@ export function WorkflowShell(props: {
     workflowRunId: string | null;
     workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
     supervisorRunId: string | null;
-    supervisorView?: 'planner' | 'sprint' | null;
+    supervisorView?: 'planner' | null;
   };
   navigate?: (path: string) => void;
 }) {
@@ -3364,14 +3364,11 @@ export function WorkflowShell(props: {
       return;
     }
 
-    if (routedPath === '/flight-deck' || routedSupervisorRunId || routedPath === '/supervisors') {
+    if (routedSupervisorRunId || routedPath === '/supervisors') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
-      setMonitorHomeView((value) => value === 'flight_deck' ? value : 'flight_deck');
+      setMonitorHomeView((value) => value === 'supervisor' ? value : 'supervisor');
       setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
-      if (routedPath !== '/flight-deck') {
-        props.navigate?.('/flight-deck');
-      }
       return;
     }
 
@@ -7173,15 +7170,15 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Card>
           ) : monitorView === 'workflow_list' ? (
             <Stack>
-              {monitorHomeView !== 'flight_deck' ? (
+              {monitorHomeView !== 'supervisor' ? (
                 <AppHeader
                   active={monitorHomeView}
                   onChange={(next) => {
                     setMonitorHomeView((current) => current === next ? current : next);
                     if (next === 'runtime') {
                       props.navigate?.('/runtime');
-                    } else if (next === 'flight_deck') {
-                      props.navigate?.('/flight-deck');
+                    } else if (next === 'supervisor') {
+                      props.navigate?.('/supervisors');
                     } else if (next === 'templates') {
                       props.navigate?.('/templates');
                     } else {
@@ -7202,8 +7199,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
               {monitorHomeView === 'runtime' ? (
                 <RuntimeAdmin />
-              ) : monitorHomeView === 'flight_deck' ? (
-                <FlightDeckPanel
+              ) : monitorHomeView === 'supervisor' ? (
+                <SupervisorPanel
                   navigate={props.navigate}
                 />
               ) : monitorHomeView === 'templates' ? (

@@ -383,7 +383,7 @@ pub struct WorkflowEventStreamItem {
 pub struct SupervisorEventPayload {
     pub supervisor_run_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub supervisor: Option<crate::routes::flight_deck::FlightDeckSupervisor>,
+    pub supervisor: Option<crate::routes::supervisor_projection::SupervisorProjection>,
     pub deleted: bool,
 }
 

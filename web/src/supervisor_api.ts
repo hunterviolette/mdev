@@ -508,7 +508,7 @@ export type SupervisorQueueProjection = {
   items: SupervisorQueueItem[];
 };
 
-export type FlightDeckAlert = {
+export type SupervisorAlert = {
   id: string;
   supervisor_id: string;
   work_unit_id?: string | null;
@@ -521,7 +521,7 @@ export type FlightDeckAlert = {
 
 export type IntegrationInputState = 'available' | 'included' | 'skipped';
 
-export type FlightDeckWorkUnit = {
+export type SupervisorWorkUnitProjection = {
   id: string;
   supervisor_id: string;
   repo_id?: string | null;
@@ -542,13 +542,13 @@ export type FlightDeckWorkUnit = {
   queue_position?: number | null;
   blocked_reason?: string | null;
   telemetry: Record<string, unknown>;
-  alerts: FlightDeckAlert[];
+  alerts: SupervisorAlert[];
   created_at?: string | null;
   updated_at?: string | null;
   workflow_deleted: boolean;
 };
 
-export type FlightDeckTopologyNode = {
+export type SupervisorTopologyNode = {
   id: string;
   parent_id?: string | null;
   kind: string;
@@ -558,7 +558,7 @@ export type FlightDeckTopologyNode = {
   workflow_run_id?: string | null;
 };
 
-export type FlightDeckSupervisor = {
+export type SupervisorProjection = {
   id: string;
   mode: string;
   status: string;
@@ -568,18 +568,18 @@ export type FlightDeckSupervisor = {
   snapshot_path?: string | null;
   integration_path?: string | null;
   integration_run_id?: string | null;
-  topology: FlightDeckTopologyNode[];
-  work_units: FlightDeckWorkUnit[];
-  alerts: FlightDeckAlert[];
+  topology: SupervisorTopologyNode[];
+  work_units: SupervisorWorkUnitProjection[];
+  alerts: SupervisorAlert[];
   integration: Record<string, unknown>;
   context: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 };
 
-export type FlightDeckResponse = {
-  supervisors: FlightDeckSupervisor[];
-  alerts: FlightDeckAlert[];
+export type SupervisorProjectionResponse = {
+  supervisors: SupervisorProjection[];
+  alerts: SupervisorAlert[];
   totals: {
     supervisors: number;
     work_units: number;
@@ -596,7 +596,7 @@ export type SupervisorListItem = {
   title: string;
 };
 
-export type FlightDeckFilters = {
+export type SupervisorProjectionFilters = {
   supervisor_id?: string | null;
   supervisor_ids?: string | null;
   root_repo_path?: string | null;
@@ -605,11 +605,11 @@ export type FlightDeckFilters = {
   include_deleted?: boolean;
 };
 
-export type FlightDeckHydrationHandlers = {
+export type SupervisorHydrationHandlers = {
   onBegin?: () => void;
-  onSupervisor?: (supervisor: FlightDeckSupervisor) => void;
-  onWorkUnit?: (event: { supervisor_id: string; index: number; work_unit: FlightDeckWorkUnit }) => void;
-  onSupervisorComplete?: (supervisor: FlightDeckSupervisor) => void;
+  onSupervisor?: (supervisor: SupervisorProjection) => void;
+  onWorkUnit?: (event: { supervisor_id: string; index: number; work_unit: SupervisorWorkUnitProjection }) => void;
+  onSupervisorComplete?: (supervisor: SupervisorProjection) => void;
   onComplete?: () => void;
   onError?: (error: Error) => void;
 };
@@ -670,7 +670,7 @@ export async function getWorkflowEventHistory(runId: string, query: WorkflowEven
   return response.json();
 }
 
-function flightDeckFilterParams(filters: FlightDeckFilters): URLSearchParams {
+function supervisorProjectionFilterParams(filters: SupervisorProjectionFilters): URLSearchParams {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (typeof value === 'boolean') {
@@ -682,13 +682,13 @@ function flightDeckFilterParams(filters: FlightDeckFilters): URLSearchParams {
   return params;
 }
 
-export function openFlightDeckHydrationStream(
-  filters: FlightDeckFilters,
-  handlers: FlightDeckHydrationHandlers
+export function openSupervisorHydrationStream(
+  filters: SupervisorProjectionFilters,
+  handlers: SupervisorHydrationHandlers
 ): () => void {
-  const params = flightDeckFilterParams(filters);
+  const params = supervisorProjectionFilterParams(filters);
   const query = params.toString();
-  const source = new EventSource(`/api/flight-deck/stream${query ? `?${query}` : ''}`);
+  const source = new EventSource(`/api/supervisors/projection/stream${query ? `?${query}` : ''}`);
   let closed = false;
 
   const close = () => {
@@ -697,54 +697,54 @@ export function openFlightDeckHydrationStream(
     source.close();
   };
 
-  source.addEventListener('flight_deck_begin', () => {
+  source.addEventListener('supervisor_projection_begin', () => {
     handlers.onBegin?.();
   });
 
-  source.addEventListener('flight_deck_supervisor', (raw) => {
+  source.addEventListener('supervisor_projection', (raw) => {
     const event = raw as MessageEvent<string>;
-    handlers.onSupervisor?.(JSON.parse(event.data) as FlightDeckSupervisor);
+    handlers.onSupervisor?.(JSON.parse(event.data) as SupervisorProjection);
   });
 
-  source.addEventListener('flight_deck_work_unit', (raw) => {
+  source.addEventListener('supervisor_work_unit', (raw) => {
     const event = raw as MessageEvent<string>;
     handlers.onWorkUnit?.(JSON.parse(event.data) as {
       supervisor_id: string;
       index: number;
-      work_unit: FlightDeckWorkUnit;
+      work_unit: SupervisorWorkUnitProjection;
     });
   });
 
-  source.addEventListener('flight_deck_supervisor_complete', (raw) => {
+  source.addEventListener('supervisor_projection_complete', (raw) => {
     const event = raw as MessageEvent<string>;
-    handlers.onSupervisorComplete?.(JSON.parse(event.data) as FlightDeckSupervisor);
+    handlers.onSupervisorComplete?.(JSON.parse(event.data) as SupervisorProjection);
   });
 
-  source.addEventListener('flight_deck_complete', () => {
+  source.addEventListener('supervisor_hydration_complete', () => {
     close();
     handlers.onComplete?.();
   });
 
-  source.addEventListener('flight_deck_error', (raw) => {
+  source.addEventListener('supervisor_projection_error', (raw) => {
     const event = raw as MessageEvent<string>;
     const payload = JSON.parse(event.data) as { message?: string };
     close();
-    handlers.onError?.(new Error(payload.message || 'Flight Deck hydration failed'));
+    handlers.onError?.(new Error(payload.message || 'Supervisor hydration failed'));
   });
 
   source.onerror = () => {
     if (closed) return;
     close();
-    handlers.onError?.(new Error('Flight Deck hydration stream disconnected'));
+    handlers.onError?.(new Error('Supervisor hydration stream disconnected'));
   };
 
   return close;
 }
 
-export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<FlightDeckResponse> {
-  const params = flightDeckFilterParams(filters);
+export async function getSupervisorProjection(filters: SupervisorProjectionFilters = {}): Promise<SupervisorProjectionResponse> {
+  const params = supervisorProjectionFilterParams(filters);
   const query = params.toString();
-  const response = await fetch(`/api/flight-deck${query ? `?${query}` : ''}`);
+  const response = await fetch(`/api/supervisors/projection${query ? `?${query}` : ''}`);
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }

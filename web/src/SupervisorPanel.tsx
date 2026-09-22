@@ -18,6 +18,7 @@ import {
   ScrollArea,
   Select,
   SimpleGrid,
+  Skeleton,
   Stack,
   Text,
   TextInput,
@@ -27,13 +28,13 @@ import {
 import { listTemplates, type RuntimeEventEnvelope, type SupervisorEventEnvelope, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
 import { createPlanner, deletePlanner as deletePlannerApi, listPlanners, type PlannerWorkspace } from './planner_api';
-import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getPendingSupervisorActions, getSupervisorActionStateVersion, getSupervisorQueue, getWorkflowEventHistory, listSupervisorRuns, openFlightDeckHydrationStream, runSupervisorAction, subscribeSupervisorActionState, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type PendingSupervisorAction, type SupervisorListItem, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { createSupervisorRun, deleteSupervisorRun, getSupervisorProjection, getPendingSupervisorActions, getSupervisorActionStateVersion, getSupervisorQueue, getWorkflowEventHistory, listSupervisorRuns, openSupervisorHydrationStream, runSupervisorAction, subscribeSupervisorActionState, type SupervisorProjectionResponse, type SupervisorProjection, type SupervisorWorkUnitProjection, type PendingSupervisorAction, type SupervisorListItem, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 import { executionTone as tone, runtimeEventExecutionStatus, subscribeRuntimeEventBus } from './runtime_events';
 import { AppHeader, AppHeaderAction, AppSurface, type AppHeaderView } from './AppHeader';
 
-type FlightDeckPanelProps = {
+type SupervisorPanelProps = {
   navigate?: (path: string) => void;
-  onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void;
+  onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void;
 };
 
 type OpenPlannerOptions = {
@@ -111,7 +112,7 @@ function pendingSupervisorActionTone(pending: PendingSupervisorAction): string {
   }
 }
 
-function pendingActionTargetsWorkUnit(pending: PendingSupervisorAction, unit: FlightDeckWorkUnit): boolean {
+function pendingActionTargetsWorkUnit(pending: PendingSupervisorAction, unit: SupervisorWorkUnitProjection): boolean {
   if (pending.work_unit_id === unit.id) return true;
   return pending.action === 'cancel' && workflowType(unit) === 'integration';
 }
@@ -196,7 +197,7 @@ function workflowTemplateOptions(templates: WorkflowTemplate[]): TemplateOption[
   return templates.map((template) => ({ value: template.id, label: template.name }));
 }
 
-function supervisorConfig(supervisor: FlightDeckSupervisor): SupervisorConfig {
+function supervisorConfig(supervisor: SupervisorProjection): SupervisorConfig {
   const pools = supervisor.context?.pools;
   const executionEventLimit = supervisor.context?.execution_event_limit;
   return {
@@ -205,18 +206,18 @@ function supervisorConfig(supervisor: FlightDeckSupervisor): SupervisorConfig {
   };
 }
 
-function supervisorExecutionEventLimit(supervisor: FlightDeckSupervisor): number {
+function supervisorExecutionEventLimit(supervisor: SupervisorProjection): number {
   const value = supervisorConfig(supervisor).execution_event_limit;
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.max(10, Math.min(1000, Math.floor(value)))
     : 100;
 }
 
-function poolSetting(supervisor: FlightDeckSupervisor, groupKey: string): SupervisorPoolConfig {
+function poolSetting(supervisor: SupervisorProjection, groupKey: string): SupervisorPoolConfig {
   return supervisorConfig(supervisor).pools?.[groupKey] ?? {};
 }
 
-function nextSupervisorConfig(supervisor: FlightDeckSupervisor, groupKey: string, patch: SupervisorPoolConfig): SupervisorConfig {
+function nextSupervisorConfig(supervisor: SupervisorProjection, groupKey: string, patch: SupervisorPoolConfig): SupervisorConfig {
   const current = supervisorConfig(supervisor);
   return {
     ...current,
@@ -269,7 +270,7 @@ function supervisorHref(supervisorId: string): string {
 }
 
 
-function telemetryArray(unit: FlightDeckWorkUnit, key: string): Array<Record<string, unknown>> {
+function telemetryArray(unit: SupervisorWorkUnitProjection, key: string): Array<Record<string, unknown>> {
   const value = unit.telemetry?.[key];
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object') : [];
 }
@@ -331,14 +332,18 @@ function executionDuration(durationMs?: number): string {
     : `${hours}h`;
 }
 
-function telemetryString(unit: FlightDeckWorkUnit, key: string): string {
+function telemetryString(unit: SupervisorWorkUnitProjection, key: string): string {
   const value = unit.telemetry?.[key];
   return typeof value === 'string' && value.trim() ? value : '';
 }
 
-function currentStepId(unit: FlightDeckWorkUnit): string | null {
+function currentStepId(unit: SupervisorWorkUnitProjection): string | null {
   const value = unit.telemetry?.current_step_id;
   return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function workflowTelemetryHydrating(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.telemetry?.hydrating === true;
 }
 
 function stageKeyFromText(value: string): string {
@@ -356,7 +361,7 @@ function stageExecutionDisplayName(stepId: string): string {
 }
 
 
-function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
+function buildStageProjection(unit: SupervisorWorkUnitProjection): StageProjection[] {
   const templateStages = telemetryArray(unit, 'stage_template');
   const recentStages = telemetryArray(unit, 'recent_stage_executions');
   const activeStep = currentStepId(unit);
@@ -379,7 +384,7 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
       }];
     }
 
-    const error = textField(unit.telemetry, 'stage_template_error') || 'Workflow template stages are unavailable; Flight Deck cannot render stage rails.';
+    const error = textField(unit.telemetry, 'stage_template_error') || 'Workflow template stages are unavailable; Supervisor cannot render stage rails.';
     return [{
       key: 'template_error',
       label: 'Template error',
@@ -435,7 +440,7 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   });
 }
 
-function buildCapabilityProjection(unit: FlightDeckWorkUnit): CapabilityProjection[] {
+function buildCapabilityProjection(unit: SupervisorWorkUnitProjection): CapabilityProjection[] {
   const terminalRank: Record<string, number> = {
     failed: 6,
     success: 5,
@@ -714,7 +719,7 @@ function executionStatusFromEvent(item: WorkflowEventHistoryItem): string {
   return item.level || 'event';
 }
 
-function deriveWorkflowCardHistoryHydration(unit: FlightDeckWorkUnit, items: WorkflowEventHistoryItem[]): WorkflowCardHistoryHydration {
+function deriveWorkflowCardHistoryHydration(unit: SupervisorWorkUnitProjection, items: WorkflowEventHistoryItem[]): WorkflowCardHistoryHydration {
   const capabilityByKey = new Map<string, CapabilityProjection>();
   const stageByKey = new Map<string, Record<string, unknown>>();
 
@@ -918,7 +923,7 @@ function CapabilityStrip(props: { capabilities: CapabilityProjection[]; onOpenHi
   );
 }
 
-function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Record<string, unknown>[]; onOpenHistory?: (stage: Record<string, unknown>) => void }) {
+function RecentStageStrip(props: { unit: SupervisorWorkUnitProjection; fallbackStages?: Record<string, unknown>[]; onOpenHistory?: (stage: Record<string, unknown>) => void }) {
   const nativeStages = telemetryArray(props.unit, 'recent_stage_executions');
   const sourceStages = nativeStages.length > 0 ? nativeStages : props.fallbackStages ?? [];
   const stages = sourceStages
@@ -972,37 +977,37 @@ function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Re
   );
 }
 
-function workflowType(unit: FlightDeckWorkUnit): string {
+function workflowType(unit: SupervisorWorkUnitProjection): string {
   return unit.workflow_type ?? unit.kind;
 }
 
-function workUnitIsIntegrationInput(unit: FlightDeckWorkUnit): boolean {
+function workUnitIsIntegrationInput(unit: SupervisorWorkUnitProjection): boolean {
   return workflowType(unit) !== 'integration' && unit.integration_state !== 'available';
 }
 
-function workUnitHasStagedChanges(unit: FlightDeckWorkUnit): boolean {
+function workUnitHasStagedChanges(unit: SupervisorWorkUnitProjection): boolean {
   return unit.has_staged_changes;
 }
 
-function workflowMaterializationState(unit: FlightDeckWorkUnit): string {
+function workflowMaterializationState(unit: SupervisorWorkUnitProjection): string {
   return normalize(telemetryString(unit, 'materialization_state'));
 }
 
-function workflowIsMaterializing(unit: FlightDeckWorkUnit): boolean {
+function workflowIsMaterializing(unit: SupervisorWorkUnitProjection): boolean {
   return !unit.workflow_run_id && workflowMaterializationState(unit) === 'materializing';
 }
 
-function workflowIsMaterializationPending(unit: FlightDeckWorkUnit): boolean {
+function workflowIsMaterializationPending(unit: SupervisorWorkUnitProjection): boolean {
   return !unit.workflow_run_id && workflowMaterializationState(unit) === 'pending';
 }
 
-function workflowIsRegenerating(unit: FlightDeckWorkUnit): boolean {
+function workflowIsRegenerating(unit: SupervisorWorkUnitProjection): boolean {
   return !unit.workflow_run_id
     && Boolean(telemetryString(unit, 'regenerated_at'))
     && ['pending', 'materializing'].includes(workflowMaterializationState(unit));
 }
 
-function workflowMaterializationLabel(unit: FlightDeckWorkUnit): string | null {
+function workflowMaterializationLabel(unit: SupervisorWorkUnitProjection): string | null {
   if (unit.workflow_run_id) return null;
   if (workflowIsRegenerating(unit)) return 'Regenerating';
   if (workflowIsMaterializing(unit)) return 'Starting';
@@ -1011,54 +1016,55 @@ function workflowMaterializationLabel(unit: FlightDeckWorkUnit): string | null {
   return null;
 }
 
-function workflowIsProcessing(unit: FlightDeckWorkUnit): boolean {
+function workflowIsProcessing(unit: SupervisorWorkUnitProjection): boolean {
   return unit.state === 'running' || workflowIsMaterializing(unit) || workflowIsRegenerating(unit);
 }
 
-function workflowCanRun(unit: FlightDeckWorkUnit): boolean {
+function workflowCanRun(unit: SupervisorWorkUnitProjection): boolean {
   if (workflowType(unit) === 'integration') return !unit.workflow_deleted && !workflowIsProcessing(unit);
   return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
-function workflowCanPause(unit: FlightDeckWorkUnit): boolean {
+function workflowCanPause(unit: SupervisorWorkUnitProjection): boolean {
   return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
-function workflowCanRegenerate(unit: FlightDeckWorkUnit): boolean {
+function workflowCanRegenerate(unit: SupervisorWorkUnitProjection): boolean {
   return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
-function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
+function workflowCanDelete(unit: SupervisorWorkUnitProjection): boolean {
   const type = workflowType(unit);
   if (type === 'integration') return false;
   return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted;
 }
 
-function workflowDeleteLabel(unit: FlightDeckWorkUnit): string {
+function workflowDeleteLabel(unit: SupervisorWorkUnitProjection): string {
   return workflowType(unit) === 'feature' ? 'Unqueue' : 'Delete';
 }
 
-function workflowCanStageToIntegration(unit: FlightDeckWorkUnit): boolean {
+function workflowCanStageToIntegration(unit: SupervisorWorkUnitProjection): boolean {
   return ['feature', 'manual'].includes(workflowType(unit))
     && !unit.workflow_deleted
     && unit.integration_state === 'available'
     && workUnitHasStagedChanges(unit);
 }
 
-function workflowCanUnstageFromIntegration(unit: FlightDeckWorkUnit): boolean {
+function workflowCanUnstageFromIntegration(unit: SupervisorWorkUnitProjection): boolean {
   return ['feature', 'manual'].includes(workflowType(unit))
     && !unit.workflow_deleted
     && unit.integration_state !== 'available';
 }
 
 function WorkflowProjectionCard(props: {
-  unit: FlightDeckWorkUnit;
-  supervisor: FlightDeckSupervisor;
+  unit: SupervisorWorkUnitProjection;
+  supervisor: SupervisorProjection;
   compact?: boolean;
   navigate?: (path: string) => void;
   onActionComplete?: () => void;
 }) {
   const { unit, navigate } = props;
+  const telemetryHydrating = workflowTelemetryHydrating(unit);
   const stages = buildStageProjection(unit);
   const capabilities = buildCapabilityProjection(unit);
   const recentStageExecutions = telemetryArray(unit, 'recent_stage_executions');
@@ -1202,14 +1208,16 @@ function WorkflowProjectionCard(props: {
   const workflowHeaderState = normalize(telemetryString(unit, 'status') || unit.state);
   const workflowHeaderWaiting = ['waiting', 'paused'].includes(workflowHeaderState);
   const workflowHeaderActive = actionPending || materializationActive || ['queued', 'running', 'active'].includes(workflowHeaderState);
-  const workflowHeaderAnimated = workflowHeaderWaiting || workflowHeaderActive;
-  const workflowHeaderColor = actionTone === 'red'
-    ? '250, 82, 82'
-    : actionTone === 'yellow' || materializationActive || workflowIsMaterializationPending(unit)
-      ? '250, 176, 5'
-      : workflowHeaderWaiting
+  const workflowHeaderAnimated = telemetryHydrating || workflowHeaderWaiting || workflowHeaderActive;
+  const workflowHeaderColor = telemetryHydrating
+    ? '34, 139, 230'
+    : actionTone === 'red'
+      ? '250, 82, 82'
+      : actionTone === 'yellow' || materializationActive || workflowIsMaterializationPending(unit)
         ? '250, 176, 5'
-        : '34, 139, 230';
+        : workflowHeaderWaiting
+          ? '250, 176, 5'
+          : '34, 139, 230';
 
   return (
     <Card
@@ -1218,15 +1226,30 @@ function WorkflowProjectionCard(props: {
       p="sm"
       style={{
         background: 'linear-gradient(135deg, rgba(39, 42, 48, 0.96), rgba(31, 34, 39, 0.94))',
-        borderColor: `var(--mantine-color-${tone(unit.state)}-7)`,
+        borderColor: telemetryHydrating
+          ? 'var(--mantine-color-blue-7)'
+          : `var(--mantine-color-${tone(unit.state)}-7)`,
         marginLeft: props.compact ? 16 : 0,
+        minHeight: 188,
+        transition: 'border-color 220ms ease, box-shadow 220ms ease, background-color 220ms ease',
       }}
     >
       <Stack gap="sm">
         <style>{`
-          @keyframes flight-deck-workflow-header-flow {
+          @keyframes supervisor-workflow-header-flow {
             0% { background-position: 0% 50%; }
             100% { background-position: 200% 50%; }
+          }
+
+          @keyframes supervisor-work-unit-content-in {
+            0% {
+              opacity: 0;
+              transform: translateY(4px);
+            }
+            100% {
+              opacity: 1;
+              transform: translateY(0);
+            }
           }
         `}</style>
         <div
@@ -1269,19 +1292,19 @@ function WorkflowProjectionCard(props: {
                   ? `inset 2px 0 0 rgba(${workflowHeaderColor}, 0.78)`
                   : 'none',
                 animation: workflowHeaderAnimated
-                  ? 'flight-deck-workflow-header-flow 3.6s linear infinite'
+                  ? 'supervisor-workflow-header-flow 3.6s linear infinite'
                   : undefined,
               }}
             >
               <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
                 <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
                   <Badge
-                    color={actionTone ?? (materializationActive || workflowIsMaterializationPending(unit) ? 'yellow' : tone(actionPending ? 'running' : workflowHeaderState))}
+                    color={telemetryHydrating ? 'blue' : actionTone ?? (materializationActive || workflowIsMaterializationPending(unit) ? 'yellow' : tone(actionPending ? 'running' : workflowHeaderState))}
                     variant="filled"
                   >
                     <Group gap={5} wrap="nowrap">
-                      {actionPending || materializationActive ? <Loader size={10} color="white" /> : null}
-                      <span>{actionLabel ?? materializationLabel ?? titleCase(workflowHeaderState)}</span>
+                      {telemetryHydrating || actionPending || materializationActive ? <Loader size={10} color="white" /> : null}
+                      <span>{telemetryHydrating ? 'Rendering' : actionLabel ?? materializationLabel ?? titleCase(workflowHeaderState)}</span>
                     </Group>
                   </Badge>
                   {title}
@@ -1310,12 +1333,35 @@ function WorkflowProjectionCard(props: {
                 </Group>
               </Group>
             </Box>
-            <Group gap="xs" wrap="nowrap">
-              <Text fw={800} size="sm">Workflow stages</Text>
-              <Badge variant="light" size="xs">Progression</Badge>
-            </Group>
-            <StageRail stages={stages} />
-            {canApplyFinalPatch ? (
+            {telemetryHydrating ? (
+              <Stack gap="xs" mih={104}>
+                <Group gap="xs" wrap="nowrap">
+                  <Text fw={800} size="sm" c="dimmed">Workflow stages</Text>
+                  <Badge variant="light" size="xs" color="gray">Loading</Badge>
+                </Group>
+                <Group gap="sm" wrap="nowrap" align="flex-start">
+                  <Skeleton radius="md" h={74} w={144} />
+                  <Skeleton radius="md" h={74} w={144} />
+                  <Skeleton radius="md" h={74} w={144} />
+                </Group>
+              </Stack>
+            ) : (
+              <Box
+                style={{
+                  minHeight: 104,
+                  animation: 'supervisor-work-unit-content-in 220ms ease-out both',
+                }}
+              >
+                <Stack gap="xs">
+                  <Group gap="xs" wrap="nowrap">
+                    <Text fw={800} size="sm">Workflow stages</Text>
+                    <Badge variant="light" size="xs">Progression</Badge>
+                  </Group>
+                  <StageRail stages={stages} />
+                </Stack>
+              </Box>
+            )}
+            {!telemetryHydrating && canApplyFinalPatch ? (
               <Stack gap="xs" align="center" mt="sm">
                 <Checkbox
                   checked={archiveIntegratedWorkflows}
@@ -1339,18 +1385,50 @@ function WorkflowProjectionCard(props: {
               </Stack>
             ) : null}
           </Stack>
-          <Stack gap={6} style={{ minWidth: 0 }}>
-            <Text fw={800} size="sm">Capability execution</Text>
-            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
-              <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
-            </ScrollArea.Autosize>
-          </Stack>
-          <Stack gap={6} style={{ minWidth: 0 }}>
-            <Text fw={800} size="sm">Stage execution</Text>
-            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
-              <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
-            </ScrollArea.Autosize>
-          </Stack>
+          {telemetryHydrating ? (
+            <Stack gap={8} style={{ minWidth: 0 }} mih={132}>
+              <Text fw={800} size="sm" c="dimmed">Capability execution</Text>
+              <Skeleton h={18} radius="sm" />
+              <Skeleton h={18} radius="sm" w="88%" />
+              <Skeleton h={18} radius="sm" w="72%" />
+            </Stack>
+          ) : (
+            <Stack
+              gap={6}
+              style={{
+                minWidth: 0,
+                minHeight: 132,
+                animation: 'supervisor-work-unit-content-in 240ms ease-out both',
+              }}
+            >
+              <Text fw={800} size="sm">Capability execution</Text>
+              <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+                <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
+              </ScrollArea.Autosize>
+            </Stack>
+          )}
+          {telemetryHydrating ? (
+            <Stack gap={8} style={{ minWidth: 0 }} mih={132}>
+              <Text fw={800} size="sm" c="dimmed">Stage execution</Text>
+              <Skeleton h={18} radius="sm" />
+              <Skeleton h={18} radius="sm" w="84%" />
+              <Skeleton h={18} radius="sm" w="68%" />
+            </Stack>
+          ) : (
+            <Stack
+              gap={6}
+              style={{
+                minWidth: 0,
+                minHeight: 132,
+                animation: 'supervisor-work-unit-content-in 260ms ease-out both',
+              }}
+            >
+              <Text fw={800} size="sm">Stage execution</Text>
+              <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+                <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
+              </ScrollArea.Autosize>
+            </Stack>
+          )}
         </div>
 
         <EventHistoryModal anchor={historyAnchor} onClose={() => setHistoryAnchor(null)} />
@@ -1447,19 +1525,19 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
   return null;
 }
 
-function manualShardIsStaged(unit: FlightDeckWorkUnit): boolean {
+function manualShardIsStaged(unit: SupervisorWorkUnitProjection): boolean {
   return workUnitIsIntegrationInput(unit);
 }
 
-function integrationInputIsReady(unit: FlightDeckWorkUnit): boolean {
+function integrationInputIsReady(unit: SupervisorWorkUnitProjection): boolean {
   return unit.has_staged_changes && Boolean(unit.workspace_path?.trim());
 }
 
-function integrationInputIsSkipped(unit: FlightDeckWorkUnit): boolean {
+function integrationInputIsSkipped(unit: SupervisorWorkUnitProjection): boolean {
   return unit.integration_state === 'skipped';
 }
 
-function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
+function integrationReadinessModel(supervisor: SupervisorProjection) {
   const features = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'feature' && !unit.workflow_deleted);
   const manual = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'manual' && !unit.workflow_deleted);
 
@@ -1503,7 +1581,7 @@ function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
   };
 }
 
-function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onActionComplete?: () => void; expanded?: boolean }) {
+function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onActionComplete?: () => void; expanded?: boolean }) {
   const [opened, setOpened] = useState(false);
   const pendingActions = usePendingSupervisorActions(props.supervisor.id);
   const model = integrationReadinessModel(props.supervisor);
@@ -1511,7 +1589,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
   const pendingWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.pendingFeatures.length / model.relevantTotal) * 100))}%` : '0%';
   const blockedWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.blockedFeatures.length / model.relevantTotal) * 100))}%` : '0%';
 
-  async function skipFeature(unit: FlightDeckWorkUnit) {
+  async function skipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     const confirmed = window.confirm(`Skip ${unit.title} for this integration input set?`);
     if (!confirmed) return;
@@ -1519,13 +1597,13 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     props.onActionComplete?.();
   }
 
-  async function unskipFeature(unit: FlightDeckWorkUnit) {
+  async function unskipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
     props.onActionComplete?.();
   }
 
-  async function skipManualShard(unit: FlightDeckWorkUnit) {
+  async function skipManualShard(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     const confirmed = window.confirm(`Skip manual shard ${unit.title} for this integration input set?`);
     if (!confirmed) return;
@@ -1533,13 +1611,13 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     props.onActionComplete?.();
   }
 
-  async function unskipManualShard(unit: FlightDeckWorkUnit) {
+  async function unskipManualShard(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
     props.onActionComplete?.();
   }
 
-  function inputRow(unit: FlightDeckWorkUnit, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
+  function inputRow(unit: SupervisorWorkUnitProjection, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
     const skipped = bucket === 'skipped_feature' || bucket === 'skipped_manual';
     const ready = bucket === 'ready_feature' || bucket === 'staged_manual' || bucket === 'skipped_manual';
     const blocked = bucket === 'blocked_feature';
@@ -1663,8 +1741,8 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
 }
 
 function ManualPoolWorkflowList(props: {
-  units: FlightDeckWorkUnit[];
-  supervisor: FlightDeckSupervisor;
+  units: SupervisorWorkUnitProjection[];
+  supervisor: SupervisorProjection;
   navigate?: (path: string) => void;
   onActionComplete?: () => void;
 }) {
@@ -1747,7 +1825,7 @@ function ManualPoolWorkflowList(props: {
   );
 }
 
-function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit[]; supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
+function WorkPoolActionRail(props: { groupKey: string; units: SupervisorWorkUnitProjection[]; supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
   const childRunning = props.units.some((unit) => unit.state === 'running');
   const poolRunning = props.groupKey === 'feature' && props.supervisor.status === 'running_children';
   const poolPaused = props.groupKey === 'feature' && props.supervisor.status === 'paused';
@@ -1880,10 +1958,10 @@ function WorkPoolProjectionSection(props: {
   title: string;
   description: string;
   empty: string;
-  units: FlightDeckWorkUnit[];
-  supervisor: FlightDeckSupervisor;
+  units: SupervisorWorkUnitProjection[];
+  supervisor: SupervisorProjection;
   navigate?: (path: string) => void;
-  onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void;
+  onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void;
   onActionComplete?: () => void;
   templateOptions: TemplateOption[];
 }) {
@@ -1934,7 +2012,7 @@ function WorkPoolProjectionSection(props: {
   );
 }
 
-function IntegrationProjectionSection(props: { supervisor: FlightDeckSupervisor; units: FlightDeckWorkUnit[]; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onActionComplete?: () => void }) {
+function IntegrationProjectionSection(props: { supervisor: SupervisorProjection; units: SupervisorWorkUnitProjection[]; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onActionComplete?: () => void }) {
   return (
     <WorkPoolProjectionSection
       groupKey="integration"
@@ -1950,7 +2028,7 @@ function IntegrationProjectionSection(props: { supervisor: FlightDeckSupervisor;
   );
 }
 
-function TopologyMap(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
+function TopologyMap(props: { supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
   const development = supervisor.work_units.filter((unit) => unit.kind !== 'integration');
   const integration = supervisor.work_units.filter((unit) => unit.kind === 'integration');
@@ -1982,7 +2060,7 @@ function TopologyMap(props: { supervisor: FlightDeckSupervisor; templateOptions:
 
 function SupervisorPlannerOptionsModal(props: {
   opened: boolean;
-  supervisor: FlightDeckSupervisor | null;
+  supervisor: SupervisorProjection | null;
   onClose: () => void;
   onApplied: () => Promise<void> | void;
   onError?: (message: string) => void;
@@ -2122,7 +2200,7 @@ function SupervisorPlannerOptionsModal(props: {
   );
 }
 
-function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: FlightDeckSupervisor) => void; onActionComplete?: () => void }) {
+function SupervisorCockpit(props: { supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: SupervisorProjection) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
   const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting').length;
   const failed = supervisor.work_units.filter((unit) => unit.state === 'failed').length;
@@ -2171,16 +2249,16 @@ function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOp
   );
 }
 
-type FlightDeckUrlState = {
+type SupervisorUrlState = {
   supervisorIds: string[];
   stateFilter: string | null;
   kindFilter: string | null;
   includeDeleted: boolean;
 };
 
-function readFlightDeckUrlState(): FlightDeckUrlState {
+function readSupervisorUrlState(): SupervisorUrlState {
   const params = new URLSearchParams(window.location.search);
-  const supervisorIds = (params.get('supervisors') ?? '')
+  const supervisorIds = (params.get('ids') ?? '')
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean);
@@ -2193,11 +2271,11 @@ function readFlightDeckUrlState(): FlightDeckUrlState {
   };
 }
 
-function writeFlightDeckUrlState(state: FlightDeckUrlState) {
+function writeSupervisorUrlState(state: SupervisorUrlState) {
   const url = new URL(window.location.href);
 
-  if (state.supervisorIds.length > 0) url.searchParams.set('supervisors', state.supervisorIds.join(','));
-  else url.searchParams.delete('supervisors');
+  if (state.supervisorIds.length > 0) url.searchParams.set('ids', state.supervisorIds.join(','));
+  else url.searchParams.delete('ids');
 
   if (state.stateFilter) url.searchParams.set('state', state.stateFilter);
   else url.searchParams.delete('state');
@@ -2246,12 +2324,12 @@ function MissionBar(props: {
     if (next === 'workflows') props.navigate?.('/workflows');
     else if (next === 'templates') props.navigate?.('/templates');
     else if (next === 'runtime') props.navigate?.('/runtime');
-    else props.navigate?.('/flight-deck');
+    else props.navigate?.('/supervisors');
   }
 
   return (
     <AppHeader
-      active="flight_deck"
+      active="supervisor"
       onChange={navigate}
       onActiveDoubleClick={() => props.setControlsOpen(!props.controlsOpen)}
       actions={(
@@ -2371,7 +2449,7 @@ function DequeueFeatureModal(props: {
 
 function FeatureQueueModal(props: {
   opened: boolean;
-  supervisor: FlightDeckSupervisor | null;
+  supervisor: SupervisorProjection | null;
   onClose: () => void;
   onApplied: () => Promise<void>;
 }) {
@@ -2697,7 +2775,7 @@ function FeatureQueueModal(props: {
   );
 }
 
-function flightDeckTotals(supervisors: FlightDeckSupervisor[]): FlightDeckResponse['totals'] {
+function supervisorProjectionTotals(supervisors: SupervisorProjection[]): SupervisorProjectionResponse['totals'] {
   const units = supervisors.flatMap((supervisor) => supervisor.work_units);
   return {
     supervisors: supervisors.length,
@@ -2710,32 +2788,32 @@ function flightDeckTotals(supervisors: FlightDeckSupervisor[]): FlightDeckRespon
   };
 }
 
-function rebuildFlightDeck(supervisors: FlightDeckSupervisor[]): FlightDeckResponse {
+function rebuildSupervisorProjection(supervisors: SupervisorProjection[]): SupervisorProjectionResponse {
   return {
     supervisors,
     alerts: supervisors.flatMap((supervisor) => supervisor.alerts),
-    totals: flightDeckTotals(supervisors),
+    totals: supervisorProjectionTotals(supervisors),
   };
 }
 
 function applyHydrationSupervisor(
-  current: FlightDeckResponse | null,
-  supervisor: FlightDeckSupervisor
-): FlightDeckResponse {
+  current: SupervisorProjectionResponse | null,
+  supervisor: SupervisorProjection
+): SupervisorProjectionResponse {
   const supervisors = current?.supervisors ?? [];
   const exists = supervisors.some((item) => item.id === supervisor.id);
   const next = exists
     ? supervisors.map((item) => item.id === supervisor.id ? supervisor : item)
     : [...supervisors, supervisor];
-  return rebuildFlightDeck(next);
+  return rebuildSupervisorProjection(next);
 }
 
 function applyHydrationWorkUnit(
-  current: FlightDeckResponse | null,
+  current: SupervisorProjectionResponse | null,
   supervisorId: string,
   index: number,
-  workUnit: FlightDeckWorkUnit
-): FlightDeckResponse | null {
+  workUnit: SupervisorWorkUnitProjection
+): SupervisorProjectionResponse | null {
   if (!current) return current;
 
   const supervisors = current.supervisors.map((supervisor) => {
@@ -2756,13 +2834,13 @@ function applyHydrationWorkUnit(
     };
   });
 
-  return rebuildFlightDeck(supervisors);
+  return rebuildSupervisorProjection(supervisors);
 }
 
-function reconcileFlightDeckWorkUnits(
-  current: FlightDeckWorkUnit[],
-  next: FlightDeckWorkUnit[]
-): FlightDeckWorkUnit[] {
+function reconcileSupervisorWorkUnitProjections(
+  current: SupervisorWorkUnitProjection[],
+  next: SupervisorWorkUnitProjection[]
+): SupervisorWorkUnitProjection[] {
   const nextById = new Map(next.map((unit) => [unit.id, unit]));
   const currentIds = new Set(current.map((unit) => unit.id));
   const retained = current
@@ -2772,42 +2850,42 @@ function reconcileFlightDeckWorkUnits(
   return [...retained, ...added];
 }
 
-function reconcileFlightDeckSupervisor(
-  current: FlightDeckSupervisor,
-  next: FlightDeckSupervisor
-): FlightDeckSupervisor {
+function reconcileSupervisorProjection(
+  current: SupervisorProjection,
+  next: SupervisorProjection
+): SupervisorProjection {
   return {
     ...current,
     ...next,
-    work_units: reconcileFlightDeckWorkUnits(current.work_units, next.work_units),
+    work_units: reconcileSupervisorWorkUnitProjections(current.work_units, next.work_units),
   };
 }
 
-function applySupervisorEventToFlightDeck(
-  current: FlightDeckResponse | null,
+function applySupervisorEventToProjection(
+  current: SupervisorProjectionResponse | null,
   envelope: SupervisorEventEnvelope
-): FlightDeckResponse | null {
+): SupervisorProjectionResponse | null {
   if (!current) return current;
 
   if (envelope.event.payload?.deleted === true) {
     const supervisors = current.supervisors.filter((item) => item.id !== envelope.event.supervisor_run_id);
-    return supervisors.length === current.supervisors.length ? current : rebuildFlightDeck(supervisors);
+    return supervisors.length === current.supervisors.length ? current : rebuildSupervisorProjection(supervisors);
   }
 
   const projection = envelope.event.payload?.supervisor;
   if (!projection || typeof projection !== 'object' || Array.isArray(projection)) return current;
 
-  const supervisor = projection as FlightDeckSupervisor;
+  const supervisor = projection as SupervisorProjection;
   if (!supervisor.id) return current;
 
   const exists = current.supervisors.some((item) => item.id === supervisor.id);
   const supervisors = exists
     ? current.supervisors.map((item) => item.id === supervisor.id
-      ? reconcileFlightDeckSupervisor(item, supervisor)
+      ? reconcileSupervisorProjection(item, supervisor)
       : item)
     : [supervisor, ...current.supervisors];
 
-  return rebuildFlightDeck(supervisors);
+  return rebuildSupervisorProjection(supervisors);
 }
 
 function workflowEventProjection(event: RuntimeEventEnvelope['event']) {
@@ -2831,10 +2909,10 @@ function workflowEventProjection(event: RuntimeEventEnvelope['event']) {
   };
 }
 
-function applyWorkflowEventToFlightDeck(
-  current: FlightDeckResponse | null,
+function applyWorkflowEventToSupervisorProjection(
+  current: SupervisorProjectionResponse | null,
   envelope: RuntimeEventEnvelope
-): FlightDeckResponse | null {
+): SupervisorProjectionResponse | null {
   if (!current) return current;
 
   let changed = false;
@@ -2899,12 +2977,12 @@ function applyWorkflowEventToFlightDeck(
     return supervisorChanged ? { ...supervisor, work_units } : supervisor;
   });
 
-  return changed ? rebuildFlightDeck(supervisors) : current;
+  return changed ? rebuildSupervisorProjection(supervisors) : current;
 }
 
-export function FlightDeckPanel(props: FlightDeckPanelProps) {
-  const initialUrlState = useMemo(() => readFlightDeckUrlState(), []);
-  const [deck, setDeck] = useState<FlightDeckResponse | null>(null);
+export function SupervisorPanel(props: SupervisorPanelProps) {
+  const initialUrlState = useMemo(() => readSupervisorUrlState(), []);
+  const [deck, setDeck] = useState<SupervisorProjectionResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [supervisorIds, setSupervisorIds] = useState<string[]>(initialUrlState.supervisorIds);
@@ -2914,12 +2992,12 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [supervisorOptions, setSupervisorOptions] = useState<SupervisorListItem[]>([]);
   const [supervisorControlsOpen, setSupervisorControlsOpen] = useState(false);
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
-  const [plannerSupervisor, setPlannerSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [plannerSupervisor, setPlannerSupervisor] = useState<SupervisorProjection | null>(null);
   const [plannerCreateFeatureOnOpen, setPlannerCreateFeatureOnOpen] = useState(false);
   const [plannerSelectFeatureOnOpen, setPlannerSelectFeatureOnOpen] = useState(false);
-  const [queueSupervisor, setQueueSupervisor] = useState<FlightDeckSupervisor | null>(null);
-  const [plannerOptionsSupervisor, setPlannerOptionsSupervisor] = useState<FlightDeckSupervisor | null>(null);
-  const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [queueSupervisor, setQueueSupervisor] = useState<SupervisorProjection | null>(null);
+  const [plannerOptionsSupervisor, setPlannerOptionsSupervisor] = useState<SupervisorProjection | null>(null);
+  const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<SupervisorProjection | null>(null);
   const [plannerRefinementTemplateId, setPlannerRefinementTemplateId] = useState<string | null>(null);
   const [creatingRefineFeatureId, setCreatingRefineFeatureId] = useState<string | null>(null);
   const [supervisorManagementOpen, setSupervisorManagementOpen] = useState(false);
@@ -2940,8 +3018,8 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     | { type: 'workflow'; event: RuntimeEventEnvelope }
     | { type: 'supervisor'; event: SupervisorEventEnvelope }
   >>([]);
-  const flightDeckFiltersRef = useRef({ supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted });
-  flightDeckFiltersRef.current = { supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted };
+  const supervisorFiltersRef = useRef({ supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted });
+  supervisorFiltersRef.current = { supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted };
 
   useEffect(() => {
     let cancelled = false;
@@ -2972,7 +3050,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }, []);
 
   useEffect(() => {
-    writeFlightDeckUrlState({ supervisorIds, stateFilter, kindFilter, includeDeleted });
+    writeSupervisorUrlState({ supervisorIds, stateFilter, kindFilter, includeDeleted });
   }, [supervisorIds, stateFilter, kindFilter, includeDeleted]);
 
   const settingsSupervisor = (deck?.supervisors ?? []).find((supervisor) => supervisor.id === settingsSupervisorId) ?? null;
@@ -3013,7 +3091,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         refreshPendingRef.current = false;
         try {
           setError(null);
-          const next = await getFlightDeck(flightDeckFiltersRef.current);
+          const next = await getSupervisorProjection(supervisorFiltersRef.current);
           setDeck(next);
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err));
@@ -3031,9 +3109,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     hydrationEventBufferRef.current = [];
     setLoading(true);
     setError(null);
-    setDeck(rebuildFlightDeck([]));
+    setDeck(rebuildSupervisorProjection([]));
 
-    const close = openFlightDeckHydrationStream(flightDeckFiltersRef.current, {
+    const close = openSupervisorHydrationStream(supervisorFiltersRef.current, {
       onSupervisor: (supervisor) => {
         setDeck((current) => applyHydrationSupervisor(current, supervisor));
       },
@@ -3051,8 +3129,8 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           let next = current;
           for (const bufferedEvent of buffered) {
             next = bufferedEvent.type === 'workflow'
-              ? applyWorkflowEventToFlightDeck(next, bufferedEvent.event)
-              : applySupervisorEventToFlightDeck(next, bufferedEvent.event);
+              ? applyWorkflowEventToSupervisorProjection(next, bufferedEvent.event)
+              : applySupervisorEventToProjection(next, bufferedEvent.event);
           }
           return next;
         });
@@ -3082,10 +3160,10 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           hydrationEventBufferRef.current.push({ type: 'workflow', event });
           return;
         }
-        setDeck((current) => applyWorkflowEventToFlightDeck(current, event));
+        setDeck((current) => applyWorkflowEventToSupervisorProjection(current, event));
       },
       onSupervisorEvent: (event) => {
-        const selectedSupervisorIds = (flightDeckFiltersRef.current.supervisor_ids ?? '')
+        const selectedSupervisorIds = (supervisorFiltersRef.current.supervisor_ids ?? '')
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean);
@@ -3094,7 +3172,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
           hydrationEventBufferRef.current.push({ type: 'supervisor', event });
           return;
         }
-        setDeck((current) => applySupervisorEventToFlightDeck(current, event));
+        setDeck((current) => applySupervisorEventToProjection(current, event));
       },
       onSupervisorResync: () => {
         hydrationCloseRef.current?.();
@@ -3106,7 +3184,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     });
   }, []);
 
-  function openPlanner(supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) {
+  function openPlanner(supervisor: SupervisorProjection, options?: OpenPlannerOptions) {
     if (options?.selectFeature) {
       setQueueSupervisor(supervisor);
       return;
@@ -3147,7 +3225,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     }
   }
 
-  async function createFlightDeckSupervisor() {
+  async function createSupervisorProjection() {
     const title = newSupervisorTitle.trim() || 'Supervisor';
     const rootRepoPath = newSupervisorRootRepoPath.trim();
     if (!rootRepoPath) {
@@ -3176,8 +3254,8 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     }
   }
 
-  async function removeFlightDeckSupervisor(supervisor: FlightDeckSupervisor) {
-    const confirmed = window.confirm(`Delete supervisor "${supervisor.title}"? This removes the supervisor record and cannot be undone from Flight Deck.`);
+  async function removeSupervisorProjection(supervisor: SupervisorProjection) {
+    const confirmed = window.confirm(`Delete supervisor "${supervisor.title}"? This removes the supervisor record and cannot be undone from Supervisor.`);
     if (!confirmed) return;
 
     setDeletingSupervisorId(supervisor.id);
@@ -3270,7 +3348,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
             <TextInput label="Title" value={newSupervisorTitle} onChange={(event) => setNewSupervisorTitle(event.currentTarget.value)} />
             <TextInput label="Root repo path" value={newSupervisorRootRepoPath} onChange={(event) => setNewSupervisorRootRepoPath(event.currentTarget.value)} />
             <Group justify="flex-end">
-              <Button onClick={() => void createFlightDeckSupervisor()} loading={creatingSupervisor}>Create supervisor</Button>
+              <Button onClick={() => void createSupervisorProjection()} loading={creatingSupervisor}>Create supervisor</Button>
             </Group>
           </Stack>
 
@@ -3293,7 +3371,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
             />
             <NumberInput
               label="Retained execution events per workflow"
-              description="Controls how many recent stage and capability execution events Flight Deck retains in each workflow projection."
+              description="Controls how many recent stage and capability execution events Supervisor retains in each workflow projection."
               value={executionEventLimit}
               onChange={setExecutionEventLimit}
               min={10}
@@ -3337,7 +3415,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
                 loading={deleteSupervisorId ? deletingSupervisorId === deleteSupervisorId : false}
                 onClick={() => {
                   const supervisor = (deck?.supervisors ?? []).find((item) => item.id === deleteSupervisorId);
-                  if (supervisor) void removeFlightDeckSupervisor(supervisor);
+                  if (supervisor) void removeSupervisorProjection(supervisor);
                 }}
               >
                 Delete selected supervisor

@@ -1,7 +1,7 @@
 mod capabilities;
 mod changesets;
 mod event_chains;
-pub(crate) mod flight_deck;
+pub(crate) mod supervisor_projection;
 mod filesystem;
 mod health;
 mod repo_tree;
@@ -48,7 +48,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(sap::router())
         .merge(filesystem::router())
         .merge(event_chains::router())
-        .merge(flight_deck::router())
+        .merge(supervisor_projection::router())
         .merge(capabilities::router())
         .merge(changesets::router())
 }

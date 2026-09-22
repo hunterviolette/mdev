@@ -22,7 +22,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
-struct FlightDeckQuery {
+struct SupervisorProjectionQuery {
     supervisor_id: Option<String>,
     supervisor_ids: Option<String>,
     root_repo_path: Option<String>,
@@ -32,7 +32,7 @@ struct FlightDeckQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-struct FlightDeckTotals {
+struct SupervisorProjectionTotals {
     supervisors: usize,
     work_units: usize,
     running: usize,
@@ -43,14 +43,14 @@ struct FlightDeckTotals {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FlightDeckResponse {
-    supervisors: Vec<FlightDeckSupervisor>,
-    alerts: Vec<FlightDeckAlert>,
-    totals: FlightDeckTotals,
+struct SupervisorProjectionResponse {
+    supervisors: Vec<SupervisorProjection>,
+    alerts: Vec<SupervisorAlert>,
+    totals: SupervisorProjectionTotals,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct FlightDeckSupervisor {
+pub(crate) struct SupervisorProjection {
     id: String,
     mode: String,
     status: String,
@@ -60,9 +60,9 @@ pub(crate) struct FlightDeckSupervisor {
     snapshot_path: Option<String>,
     integration_path: Option<String>,
     integration_run_id: Option<String>,
-    topology: Vec<FlightDeckTopologyNode>,
-    work_units: Vec<FlightDeckWorkUnit>,
-    alerts: Vec<FlightDeckAlert>,
+    topology: Vec<SupervisorTopologyNode>,
+    work_units: Vec<SupervisorWorkUnitProjection>,
+    alerts: Vec<SupervisorAlert>,
     integration: Value,
     context: Value,
     created_at: String,
@@ -70,7 +70,7 @@ pub(crate) struct FlightDeckSupervisor {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FlightDeckTopologyNode {
+struct SupervisorTopologyNode {
     id: String,
     parent_id: Option<String>,
     kind: String,
@@ -81,7 +81,7 @@ struct FlightDeckTopologyNode {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FlightDeckWorkUnit {
+struct SupervisorWorkUnitProjection {
     id: String,
     supervisor_id: String,
     repo_id: Option<String>,
@@ -100,14 +100,14 @@ struct FlightDeckWorkUnit {
     integration_state: IntegrationInputState,
     applied_at: Option<String>,
     telemetry: Value,
-    alerts: Vec<FlightDeckAlert>,
+    alerts: Vec<SupervisorAlert>,
     created_at: Option<String>,
     updated_at: Option<String>,
     workflow_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FlightDeckAlert {
+struct SupervisorAlert {
     id: String,
     supervisor_id: String,
     work_unit_id: Option<String>,
@@ -161,18 +161,18 @@ struct WorkUnitSeed {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/flight-deck", get(get_flight_deck))
-        .route("/api/flight-deck/stream", get(stream_flight_deck))
+        .route("/api/supervisors/projection", get(get_supervisor_projection))
+        .route("/api/supervisors/projection/stream", get(stream_supervisor_projection))
 }
 
-async fn get_flight_deck(
+async fn get_supervisor_projection(
     State(state): State<AppState>,
-    Query(query): Query<FlightDeckQuery>,
-) -> Result<Json<FlightDeckResponse>, (StatusCode, String)> {
-    build_flight_deck(&state, query).await.map(Json).map_err(internal)
+    Query(query): Query<SupervisorProjectionQuery>,
+) -> Result<Json<SupervisorProjectionResponse>, (StatusCode, String)> {
+    build_supervisor_projection_response(&state, query).await.map(Json).map_err(internal)
 }
 
-async fn send_flight_deck_stream_event(
+async fn send_supervisor_stream_event(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     event_name: &'static str,
     payload: Value,
@@ -182,17 +182,17 @@ async fn send_flight_deck_stream_event(
         .is_ok()
 }
 
-async fn stream_flight_deck_projection(
+async fn produce_supervisor_projection_stream(
     state: AppState,
-    query: FlightDeckQuery,
+    query: SupervisorProjectionQuery,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) -> anyhow::Result<()> {
     let supervisors = load_supervisors(&state, &query).await?;
     let include_deleted = query.include_deleted.unwrap_or(false);
 
-    if !send_flight_deck_stream_event(
+    if !send_supervisor_stream_event(
         &tx,
-        "flight_deck_begin",
+        "supervisor_projection_begin",
         json!({ "supervisor_count": supervisors.len() }),
     )
     .await
@@ -210,9 +210,9 @@ async fn stream_flight_deck_projection(
             .collect::<Vec<_>>();
         let shell = build_supervisor_projection(supervisor.clone(), placeholders);
 
-        if !send_flight_deck_stream_event(
+        if !send_supervisor_stream_event(
             &tx,
-            "flight_deck_supervisor",
+            "supervisor_projection",
             serde_json::to_value(&shell)?,
         )
         .await
@@ -240,9 +240,9 @@ async fn stream_flight_deck_projection(
             let (index, unit) = result?;
             hydrated[index] = Some(unit.clone());
 
-            if !send_flight_deck_stream_event(
+            if !send_supervisor_stream_event(
                 &tx,
-                "flight_deck_work_unit",
+                "supervisor_work_unit",
                 json!({
                     "supervisor_id": supervisor.id,
                     "index": index,
@@ -258,9 +258,9 @@ async fn stream_flight_deck_projection(
         let work_units = hydrated.into_iter().flatten().collect::<Vec<_>>();
         let complete = build_supervisor_projection(supervisor, work_units);
 
-        if !send_flight_deck_stream_event(
+        if !send_supervisor_stream_event(
             &tx,
-            "flight_deck_supervisor_complete",
+            "supervisor_projection_complete",
             serde_json::to_value(&complete)?,
         )
         .await
@@ -269,22 +269,22 @@ async fn stream_flight_deck_projection(
         }
     }
 
-    send_flight_deck_stream_event(&tx, "flight_deck_complete", json!({ "ok": true })).await;
+    send_supervisor_stream_event(&tx, "supervisor_hydration_complete", json!({ "ok": true })).await;
     Ok(())
 }
 
-async fn stream_flight_deck(
+async fn stream_supervisor_projection(
     State(state): State<AppState>,
-    Query(query): Query<FlightDeckQuery>,
+    Query(query): Query<SupervisorProjectionQuery>,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(32);
 
     tokio::spawn(async move {
         let stream_tx = tx.clone();
-        if let Err(error) = stream_flight_deck_projection(state, query, stream_tx).await {
-            let _ = send_flight_deck_stream_event(
+        if let Err(error) = produce_supervisor_projection_stream(state, query, stream_tx).await {
+            let _ = send_supervisor_stream_event(
                 &tx,
-                "flight_deck_error",
+                "supervisor_projection_error",
                 json!({ "message": error.to_string() }),
             )
             .await;
@@ -294,17 +294,17 @@ async fn stream_flight_deck(
     Sse::new(ReceiverStream::new(rx)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("flight-deck"),
+            .text("supervisor-projection"),
     )
 }
 
-pub(crate) async fn build_supervisor_flight_deck_projection(
+pub(crate) async fn build_supervisor_projection_by_id(
     state: &AppState,
     supervisor_run_id: &str,
-) -> anyhow::Result<Option<FlightDeckSupervisor>> {
-    let response = build_flight_deck(
+) -> anyhow::Result<Option<SupervisorProjection>> {
+    let response = build_supervisor_projection_response(
         state,
-        FlightDeckQuery {
+        SupervisorProjectionQuery {
             supervisor_id: Some(supervisor_run_id.to_string()),
             supervisor_ids: None,
             root_repo_path: None,
@@ -318,7 +318,7 @@ pub(crate) async fn build_supervisor_flight_deck_projection(
     Ok(response.supervisors.into_iter().next())
 }
 
-fn filter_work_unit_seeds(seeds: &mut Vec<WorkUnitSeed>, query: &FlightDeckQuery) {
+fn filter_work_unit_seeds(seeds: &mut Vec<WorkUnitSeed>, query: &SupervisorProjectionQuery) {
     if let Some(kind) = query.kind.as_deref().filter(|value| !value.trim().is_empty()) {
         seeds.retain(|unit| unit.kind == kind);
     }
@@ -327,11 +327,11 @@ fn filter_work_unit_seeds(seeds: &mut Vec<WorkUnitSeed>, query: &FlightDeckQuery
     }
 }
 
-fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<FlightDeckAlert> {
+fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<SupervisorAlert> {
     let mut alerts = Vec::new();
 
     if seed.state == "waiting" {
-        alerts.push(FlightDeckAlert {
+        alerts.push(SupervisorAlert {
             id: format!("waiting-user-{}", seed.id),
             supervisor_id: supervisor.id.clone(),
             work_unit_id: Some(seed.id.clone()),
@@ -344,7 +344,7 @@ fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<Flig
     }
 
     if seed.state == "error" || seed.state == "failed" || seed.state == "blocked" {
-        alerts.push(FlightDeckAlert {
+        alerts.push(SupervisorAlert {
             id: format!("blocked-{}", seed.id),
             supervisor_id: supervisor.id.clone(),
             work_unit_id: Some(seed.id.clone()),
@@ -357,7 +357,7 @@ fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<Flig
     }
 
     if seed.workflow_deleted {
-        alerts.push(FlightDeckAlert {
+        alerts.push(SupervisorAlert {
             id: format!("deleted-workflow-{}", seed.id),
             supervisor_id: supervisor.id.clone(),
             work_unit_id: Some(seed.id.clone()),
@@ -372,7 +372,7 @@ fn work_unit_alerts(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Vec<Flig
     alerts
 }
 
-fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> FlightDeckWorkUnit {
+fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> SupervisorWorkUnitProjection {
     let applied_at = seed
         .context
         .get("applied_at")
@@ -381,7 +381,7 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Fli
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    FlightDeckWorkUnit {
+    SupervisorWorkUnitProjection {
         id: seed.id.clone(),
         supervisor_id: seed.supervisor_id.clone(),
         repo_id: seed.repo_id.clone(),
@@ -411,7 +411,7 @@ async fn build_work_unit_projection(
     state: &AppState,
     supervisor: &SupervisorRow,
     seed: WorkUnitSeed,
-) -> anyhow::Result<FlightDeckWorkUnit> {
+) -> anyhow::Result<SupervisorWorkUnitProjection> {
     let execution_event_limit = supervisor
         .context
         .get("execution_event_limit")
@@ -446,8 +446,8 @@ async fn build_work_unit_projection(
 
 fn build_supervisor_projection(
     supervisor: SupervisorRow,
-    work_units: Vec<FlightDeckWorkUnit>,
-) -> FlightDeckSupervisor {
+    work_units: Vec<SupervisorWorkUnitProjection>,
+) -> SupervisorProjection {
     let supervisor_alerts = work_units
         .iter()
         .flat_map(|unit| unit.alerts.iter().cloned())
@@ -472,7 +472,7 @@ fn build_supervisor_projection(
         "validation_summary": null
     });
 
-    FlightDeckSupervisor {
+    SupervisorProjection {
         id: supervisor.id,
         mode: supervisor.mode,
         status: supervisor.status,
@@ -492,7 +492,7 @@ fn build_supervisor_projection(
     }
 }
 
-async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::Result<FlightDeckResponse> {
+async fn build_supervisor_projection_response(state: &AppState, query: SupervisorProjectionQuery) -> anyhow::Result<SupervisorProjectionResponse> {
     let supervisors = load_supervisors(state, &query).await?;
     let mut response_supervisors = Vec::new();
     let include_deleted = query.include_deleted.unwrap_or(false);
@@ -513,7 +513,7 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         .iter()
         .flat_map(|supervisor| supervisor.alerts.iter().cloned())
         .collect::<Vec<_>>();
-    let mut totals = FlightDeckTotals::default();
+    let mut totals = SupervisorProjectionTotals::default();
     totals.supervisors = response_supervisors.len();
 
     for supervisor in &response_supervisors {
@@ -530,14 +530,14 @@ async fn build_flight_deck(state: &AppState, query: FlightDeckQuery) -> anyhow::
         }
     }
 
-    Ok(FlightDeckResponse {
+    Ok(SupervisorProjectionResponse {
         supervisors: response_supervisors,
         alerts: response_alerts,
         totals,
     })
 }
 
-async fn load_supervisors(state: &AppState, query: &FlightDeckQuery) -> anyhow::Result<Vec<SupervisorRow>> {
+async fn load_supervisors(state: &AppState, query: &SupervisorProjectionQuery) -> anyhow::Result<Vec<SupervisorRow>> {
     let supervisor_ids = query
         .supervisor_ids
         .as_deref()
@@ -610,7 +610,6 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
         DELETE FROM supervisor_work_units
         WHERE supervisor_run_id = ?
           AND kind = 'feature_development'
-          AND json_extract(context_json, '$.source') = 'flight_deck_projection_sync'
         "#,
     )
     .bind(supervisor.id.as_str())
@@ -683,7 +682,7 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
             NULL,
             '{}',
             json_object(
-                'source', 'flight_deck_projection_sync',
+                'source', 'supervisor_projection_sync',
                 'queue_source', 'supervisor_execution_queue',
                 'workflow_type', 'feature_development',
                 'pool_key', 'feature_development',
@@ -779,7 +778,7 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
             sf.last_error,
             '{}',
             json_object(
-                'source', 'flight_deck_projection_sync',
+                'source', 'supervisor_projection_sync',
                 'sprint_id', sf.sprint_id,
                 'workflow_type', 'feature_development',
                 'pool_key', 'feature_development',
@@ -932,7 +931,7 @@ fn workflow_stage_key(step: &Value, index: usize) -> String {
 
 fn workflow_stage_template(definition_json: Option<&str>) -> (Vec<Value>, Option<String>) {
     let Some(definition_json) = definition_json.filter(|value| !value.trim().is_empty()) else {
-        return (Vec::new(), Some("workflow run is missing definition_json; Flight Deck cannot render template stages".to_string()));
+        return (Vec::new(), Some("workflow run is missing definition_json; Supervisor cannot render template stages".to_string()));
     };
 
     let definition = match serde_json::from_str::<Value>(definition_json) {
@@ -941,11 +940,11 @@ fn workflow_stage_template(definition_json: Option<&str>) -> (Vec<Value>, Option
     };
 
     let Some(steps) = definition.get("steps").and_then(Value::as_array) else {
-        return (Vec::new(), Some("workflow definition_json is missing steps[]; Flight Deck cannot render template stages".to_string()));
+        return (Vec::new(), Some("workflow definition_json is missing steps[]; Supervisor cannot render template stages".to_string()));
     };
 
     if steps.is_empty() {
-        return (Vec::new(), Some("workflow template has no steps; Flight Deck cannot render template stages".to_string()));
+        return (Vec::new(), Some("workflow template has no steps; Supervisor cannot render template stages".to_string()));
     }
 
     let stages = steps
@@ -1250,11 +1249,11 @@ fn empty_telemetry() -> Value {
     })
 }
 
-fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit]) -> Vec<FlightDeckTopologyNode> {
+fn build_topology(supervisor: &SupervisorRow, work_units: &[SupervisorWorkUnitProjection]) -> Vec<SupervisorTopologyNode> {
     let root_id = format!("root-{}", supervisor.id);
     let supervisor_id = format!("supervisor-{}", supervisor.id);
     let mut nodes = vec![
-        FlightDeckTopologyNode {
+        SupervisorTopologyNode {
             id: root_id.clone(),
             parent_id: None,
             kind: "root".to_string(),
@@ -1263,7 +1262,7 @@ fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit])
             work_unit_id: None,
             workflow_run_id: None,
         },
-        FlightDeckTopologyNode {
+        SupervisorTopologyNode {
             id: supervisor_id.clone(),
             parent_id: Some(root_id),
             kind: "supervisor".to_string(),
@@ -1275,7 +1274,7 @@ fn build_topology(supervisor: &SupervisorRow, work_units: &[FlightDeckWorkUnit])
     ];
 
     for unit in work_units {
-        nodes.push(FlightDeckTopologyNode {
+        nodes.push(SupervisorTopologyNode {
             id: format!("work-unit-{}", unit.id),
             parent_id: Some(supervisor_id.clone()),
             kind: unit.kind.clone(),
@@ -1380,6 +1379,6 @@ fn parse_json(value: String) -> Value {
 
 fn internal(err: impl std::fmt::Display) -> (StatusCode, String) {
     let message = err.to_string();
-    tracing::error!(error = %message, "flight deck route error");
+    tracing::error!(error = %message, "supervisor projection route error");
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }

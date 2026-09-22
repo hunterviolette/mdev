@@ -3251,14 +3251,13 @@ fn supervisor_context(run: &SupervisorRun, workspace: &repo_snapshot::Supervisor
 }
 
 async fn insert_supervisor_run(state: &AppState, run: &SupervisorRun) -> Result<()> {
-    sqlx::query("INSERT INTO supervisor_runs (id, mode, status, title, root_repo_path, selected_planner_id, flight_deck_json, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO supervisor_runs (id, mode, status, title, root_repo_path, selected_planner_id, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(run.id.to_string())
         .bind(strategy_str(&run.strategy))
         .bind(status_supervisor_str(&run.status))
         .bind(&run.title)
         .bind(&run.root_repo_path)
         .bind(run.selected_planner_id.as_deref())
-        .bind(serde_json::to_string(run.context.get("flight_deck_settings").unwrap_or(&json!({})))?)
         .bind(serde_json::to_string(&run.context)?)
         .bind(run.created_at.to_rfc3339())
         .bind(run.updated_at.to_rfc3339())
@@ -3268,14 +3267,13 @@ async fn insert_supervisor_run(state: &AppState, run: &SupervisorRun) -> Result<
 }
 
 pub(crate) async fn update_supervisor_run(state: &AppState, run: &SupervisorRun) -> Result<()> {
-    sqlx::query("UPDATE supervisor_runs SET mode = ?, status = ?, title = ?, root_repo_path = ?, context_json = ?, selected_planner_id = ?, flight_deck_json = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE supervisor_runs SET mode = ?, status = ?, title = ?, root_repo_path = ?, context_json = ?, selected_planner_id = ?, updated_at = ? WHERE id = ?")
         .bind(strategy_str(&run.strategy))
         .bind(status_supervisor_str(&run.status))
         .bind(&run.title)
         .bind(&run.root_repo_path)
         .bind(serde_json::to_string(&run.context)?)
         .bind(run.selected_planner_id.as_deref())
-        .bind(serde_json::to_string(run.context.get("flight_deck_settings").unwrap_or(&json!({})))?)
         .bind(run.updated_at.to_rfc3339())
         .bind(run.id.to_string())
         .execute(&state.db)
@@ -3284,7 +3282,7 @@ pub(crate) async fn update_supervisor_run(state: &AppState, run: &SupervisorRun)
 }
 
 async fn publish_supervisor_snapshot(state: &AppState, run: &SupervisorRun, event_type: &str, message: &str) -> Result<()> {
-    let projection = crate::routes::flight_deck::build_supervisor_flight_deck_projection(
+    let projection = crate::routes::supervisor_projection::build_supervisor_projection_by_id(
         state,
         &run.id.to_string(),
     )
