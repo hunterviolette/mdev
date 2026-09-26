@@ -247,7 +247,9 @@ async fn normalize_global_planner_fragment(
         .to_string();
 
     let mut global_state = serde_json::to_value(&*globals).map_err(|err| err.to_string())?;
-    planner::apply_repo_planner_capability(&state.db, &mut global_state, &repo_ref)
+    state
+        .planner()
+        .apply_repo_capability(&mut global_state, &repo_ref)
         .await
         .map_err(|err| err.to_string())?;
 

@@ -9,8 +9,6 @@ export type FeaturePlanItem = {
   summary: string;
   rough_summary?: string | null;
   refinement_workflow_run_id?: string | null;
-  applied_sprint_id?: string | null;
-  applied_sprint_title?: string | null;
   applied_at?: string | null;
   requirements: string[];
   acceptance_criteria: string[];
@@ -53,6 +51,7 @@ export type SupervisorRun = {
   status: string;
   title: string;
   root_repo_path: string;
+  selected_planner_id?: string | null;
   snapshot_path?: string | null;
   integration_path?: string | null;
   feature_plan_items: FeaturePlanItem[];
@@ -166,8 +165,6 @@ function normalizeImportedFeature(value: unknown, index: number): FeaturePlanIte
     summary,
     rough_summary: roughSummary || null,
     refinement_workflow_run_id: importString(item.refinement_workflow_run_id) || null,
-    applied_sprint_id: importString(item.applied_sprint_id) || null,
-    applied_sprint_title: importString(item.applied_sprint_title) || null,
     applied_at: importString(item.applied_at) || null,
     requirements: importStringArray(item.requirements),
     acceptance_criteria: importStringArray(item.acceptance_criteria),
@@ -507,7 +504,7 @@ export type SupervisorQueueProjection = {
   items: SupervisorQueueItem[];
 };
 
-export type FlightDeckAlert = {
+export type SupervisorAlert = {
   id: string;
   supervisor_id: string;
   work_unit_id?: string | null;
@@ -518,7 +515,9 @@ export type FlightDeckAlert = {
   created_at?: string | null;
 };
 
-export type FlightDeckWorkUnit = {
+export type IntegrationInputState = 'available' | 'included' | 'skipped';
+
+export type SupervisorWorkUnitProjection = {
   id: string;
   supervisor_id: string;
   repo_id?: string | null;
@@ -530,18 +529,23 @@ export type FlightDeckWorkUnit = {
   title: string;
   state: string;
   root_repo_path: string;
-  shard_path?: string | null;
+  workspace_path?: string | null;
   integration_path?: string | null;
+  has_staged_changes: boolean;
+  has_workspace_changes: boolean;
+  integration_state: IntegrationInputState;
+  integration_apply_available: boolean;
+  applied_at?: string | null;
   queue_position?: number | null;
   blocked_reason?: string | null;
   telemetry: Record<string, unknown>;
-  alerts: FlightDeckAlert[];
+  alerts: SupervisorAlert[];
   created_at?: string | null;
   updated_at?: string | null;
   workflow_deleted: boolean;
 };
 
-export type FlightDeckTopologyNode = {
+export type SupervisorTopologyNode = {
   id: string;
   parent_id?: string | null;
   kind: string;
@@ -551,7 +555,7 @@ export type FlightDeckTopologyNode = {
   workflow_run_id?: string | null;
 };
 
-export type FlightDeckSupervisor = {
+export type SupervisorProjection = {
   id: string;
   mode: string;
   status: string;
@@ -561,18 +565,18 @@ export type FlightDeckSupervisor = {
   snapshot_path?: string | null;
   integration_path?: string | null;
   integration_run_id?: string | null;
-  topology: FlightDeckTopologyNode[];
-  work_units: FlightDeckWorkUnit[];
-  alerts: FlightDeckAlert[];
+  topology: SupervisorTopologyNode[];
+  work_units: SupervisorWorkUnitProjection[];
+  alerts: SupervisorAlert[];
   integration: Record<string, unknown>;
   context: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 };
 
-export type FlightDeckResponse = {
-  supervisors: FlightDeckSupervisor[];
-  alerts: FlightDeckAlert[];
+export type SupervisorProjectionResponse = {
+  supervisors: SupervisorProjection[];
+  alerts: SupervisorAlert[];
   totals: {
     supervisors: number;
     work_units: number;
@@ -584,12 +588,27 @@ export type FlightDeckResponse = {
   };
 };
 
-export type FlightDeckFilters = {
+export type SupervisorListItem = {
+  id: string;
+  title: string;
+};
+
+export type SupervisorProjectionFilters = {
   supervisor_id?: string | null;
+  supervisor_ids?: string | null;
   root_repo_path?: string | null;
   state?: string | null;
   kind?: string | null;
   include_deleted?: boolean;
+};
+
+export type SupervisorHydrationHandlers = {
+  onBegin?: () => void;
+  onSupervisor?: (supervisor: SupervisorProjection) => void;
+  onWorkUnit?: (event: { supervisor_id: string; index: number; work_unit: SupervisorWorkUnitProjection }) => void;
+  onSupervisorComplete?: (supervisor: SupervisorProjection) => void;
+  onComplete?: () => void;
+  onError?: (error: Error) => void;
 };
 
 export type WorkflowEventHistoryItem = {
@@ -648,7 +667,7 @@ export async function getWorkflowEventHistory(runId: string, query: WorkflowEven
   return response.json();
 }
 
-export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<FlightDeckResponse> {
+function supervisorProjectionFilterParams(filters: SupervisorProjectionFilters): URLSearchParams {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
     if (typeof value === 'boolean') {
@@ -657,8 +676,78 @@ export async function getFlightDeck(filters: FlightDeckFilters = {}): Promise<Fl
       params.set(key, value);
     }
   }
+  return params;
+}
+
+export function openSupervisorHydrationStream(
+  filters: SupervisorProjectionFilters,
+  handlers: SupervisorHydrationHandlers
+): () => void {
+  const params = supervisorProjectionFilterParams(filters);
   const query = params.toString();
-  const response = await fetch(`/api/flight-deck${query ? `?${query}` : ''}`);
+  const source = new EventSource(`/api/supervisors/projection/stream${query ? `?${query}` : ''}`);
+  let closed = false;
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    source.close();
+  };
+
+  source.addEventListener('supervisor_projection_begin', () => {
+    handlers.onBegin?.();
+  });
+
+  source.addEventListener('supervisor_projection', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onSupervisor?.(JSON.parse(event.data) as SupervisorProjection);
+  });
+
+  source.addEventListener('supervisor_work_unit', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onWorkUnit?.(JSON.parse(event.data) as {
+      supervisor_id: string;
+      index: number;
+      work_unit: SupervisorWorkUnitProjection;
+    });
+  });
+
+  source.addEventListener('supervisor_projection_complete', (raw) => {
+    const event = raw as MessageEvent<string>;
+    handlers.onSupervisorComplete?.(JSON.parse(event.data) as SupervisorProjection);
+  });
+
+  source.addEventListener('supervisor_hydration_complete', () => {
+    close();
+    handlers.onComplete?.();
+  });
+
+  source.addEventListener('supervisor_projection_error', (raw) => {
+    const event = raw as MessageEvent<string>;
+    const payload = JSON.parse(event.data) as { message?: string };
+    close();
+    handlers.onError?.(new Error(payload.message || 'Supervisor hydration failed'));
+  });
+
+  source.onerror = () => {
+    if (closed) return;
+    close();
+    handlers.onError?.(new Error('Supervisor hydration stream disconnected'));
+  };
+
+  return close;
+}
+
+export async function getSupervisorProjection(filters: SupervisorProjectionFilters = {}): Promise<SupervisorProjectionResponse> {
+  const params = supervisorProjectionFilterParams(filters);
+  const query = params.toString();
+  const response = await fetch(`/api/supervisors/projection${query ? `?${query}` : ''}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function listSupervisorRuns(): Promise<SupervisorListItem[]> {
+  const response = await fetch('/api/supervisor-runs');
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -677,13 +766,13 @@ export async function getSupervisorQueue(id: string): Promise<SupervisorQueuePro
 
 export async function setSupervisorQueue(
   id: string,
-  queuedFeatures: SupervisorQueuedFeature[]
+  featureIds: string[]
 ): Promise<{ ok: boolean; supervisor_run: SupervisorRun }> {
   const response = await fetch(`/api/supervisor-runs/${id}/queue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      queued_features: queuedFeatures
+      feature_ids: featureIds
     })
   });
   if (!response.ok) throw new Error(await response.text());
@@ -693,7 +782,7 @@ export async function setSupervisorQueue(
     supervisor_run: normalizeSupervisorRun(payload.supervisor_run as SupervisorRun)
   } as { ok: boolean; supervisor_run: SupervisorRun };
 }
-export type SupervisorWorkPoolKind = 'refine' | 'feature_development' | 'manual_shard' | 'integration';
+export type SupervisorWorkPoolKind = 'refine' | 'feature' | 'manual' | 'integration';
 
 export type SupervisorActionRequest =
   | { action: 'create_work_unit'; pool_kind: SupervisorWorkPoolKind; name: string; feature_id?: string | null; template_id?: string | null }
@@ -704,26 +793,100 @@ export type SupervisorActionRequest =
   | { action: 'stage_work_unit'; work_unit_id: string; staged?: boolean }
   | { action: 'update_supervisor_config'; config: Record<string, unknown> }
   | { action: 'select_planner'; planner_id: string }
+  | { action: 'enqueue_feature'; planner_id: string; feature_id: string }
+  | { action: 'dequeue_feature'; planner_id: string; feature_id: string }
+  | { action: 'reorder_feature_pool'; feature_ids: string[] }
+  | { action: 'refine_feature'; feature_id: string; workflow_template_id?: string | null }
   | { action: 'pause_feature_pool' }
   | { action: 'resume_feature_pool' }
   | { action: 'skip_integration_input'; work_unit_id: string }
   | { action: 'unskip_integration_input'; work_unit_id: string }
-  | { action: 'apply_integration' }
+  | { action: 'apply_integration'; work_unit_id: string; archive_integrated_workflows: boolean }
   | { action: 'cancel' };
 
+export type PendingSupervisorAction = {
+  id: string;
+  supervisor_id: string;
+  action: SupervisorActionRequest['action'];
+  work_unit_id?: string | null;
+  feature_id?: string | null;
+  planner_id?: string | null;
+  request: SupervisorActionRequest;
+  started_at: number;
+};
+
+let supervisorActionSequence = 0;
+let supervisorActionStateVersion = 0;
+const pendingSupervisorActions = new Map<string, PendingSupervisorAction>();
+const supervisorActionStateListeners = new Set<() => void>();
+
+function emitSupervisorActionState() {
+  supervisorActionStateVersion += 1;
+  for (const listener of supervisorActionStateListeners) listener();
+}
+
+function beginSupervisorAction(supervisorId: string, request: SupervisorActionRequest): PendingSupervisorAction {
+  supervisorActionSequence += 1;
+  const pending: PendingSupervisorAction = {
+    id: `${supervisorId}:${supervisorActionSequence}`,
+    supervisor_id: supervisorId,
+    action: request.action,
+    work_unit_id: 'work_unit_id' in request ? request.work_unit_id : null,
+    feature_id: 'feature_id' in request ? request.feature_id ?? null : null,
+    planner_id: 'planner_id' in request ? request.planner_id : null,
+    request,
+    started_at: Date.now(),
+  };
+  pendingSupervisorActions.set(pending.id, pending);
+  emitSupervisorActionState();
+  return pending;
+}
+
+function finishSupervisorAction(id: string) {
+  if (!pendingSupervisorActions.delete(id)) return;
+  emitSupervisorActionState();
+}
+
+export function subscribeSupervisorActionState(listener: () => void): () => void {
+  supervisorActionStateListeners.add(listener);
+  return () => supervisorActionStateListeners.delete(listener);
+}
+
+export function getSupervisorActionStateVersion(): number {
+  return supervisorActionStateVersion;
+}
+
+export function getPendingSupervisorActions(supervisorId?: string): PendingSupervisorAction[] {
+  const actions = [...pendingSupervisorActions.values()];
+  return supervisorId
+    ? actions.filter((action) => action.supervisor_id === supervisorId)
+    : actions;
+}
+
 export async function runSupervisorAction(id: string, request: SupervisorActionRequest): Promise<Record<string, unknown>> {
-  const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request)
-  });
-  if (!response.ok) throw new Error(await response.text());
-  const result = await response.json();
-  if (result && typeof result === 'object' && result.supervisor_run) {
-    return {
-      ...result,
-      supervisor_run: normalizeSupervisorRun(result.supervisor_run as SupervisorRun)
-    };
+  const pending = beginSupervisorAction(id, request);
+  let succeeded = false;
+  try {
+    const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    succeeded = true;
+    if (result && typeof result === 'object' && result.supervisor_run) {
+      return {
+        ...result,
+        supervisor_run: normalizeSupervisorRun(result.supervisor_run as SupervisorRun)
+      };
+    }
+    return result;
+  } finally {
+    if (succeeded) {
+      window.setTimeout(() => finishSupervisorAction(pending.id), 300);
+    } else {
+      finishSupervisorAction(pending.id);
+    }
   }
-  return result;
 }

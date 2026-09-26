@@ -215,6 +215,7 @@ async fn create_template(
     .await
     .map_err(internal)?;
 
+    let updated = existing.is_some();
     let (id, created_at) = if let Some(row) = existing {
         let id = parse_uuid(row.get("id"))?;
         let created_at = parse_ts(row.get("created_at"))?;
@@ -252,7 +253,7 @@ async fn create_template(
         (id, now)
     };
 
-    Ok(Json(WorkflowTemplate {
+    let template = WorkflowTemplate {
         id,
         name: req.name,
         description: req.description,
@@ -260,7 +261,13 @@ async fn create_template(
         definition,
         created_at,
         updated_at: now,
-    }))
+    };
+    state.publish_template_event(json!({
+        "event_type": if updated { "template_updated" } else { "template_created" },
+        "template_id": id,
+        "template": &template,
+    }));
+    Ok(Json(template))
 }
 
 async fn delete_template(
@@ -290,6 +297,10 @@ async fn delete_template(
         return Err((axum::http::StatusCode::NOT_FOUND, "Template not found".to_string()));
     }
 
+    state.publish_template_event(json!({
+        "event_type": "template_deleted",
+        "template_id": template_id,
+    }));
     Ok(Json(json!({ "ok": true })))
 }
 

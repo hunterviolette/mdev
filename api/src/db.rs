@@ -299,6 +299,7 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             workspace_path TEXT,
             shard_path TEXT,
             integration_path TEXT,
+            integration_state TEXT NOT NULL DEFAULT 'available',
             archived_at TEXT,
             archived_reason TEXT,
             priority INTEGER NOT NULL DEFAULT 0,
@@ -310,6 +311,47 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             updated_at TEXT NOT NULL
         )
         "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS supervisor_integration_patches (
+            id TEXT PRIMARY KEY,
+            supervisor_run_id TEXT NOT NULL REFERENCES supervisor_runs(id) ON DELETE CASCADE,
+            integration_work_unit_id TEXT NOT NULL REFERENCES supervisor_work_units(id) ON DELETE CASCADE,
+            integration_workflow_run_id TEXT NOT NULL,
+            source_work_unit_id TEXT NOT NULL REFERENCES supervisor_work_units(id) ON DELETE CASCADE,
+            source_kind TEXT NOT NULL,
+            source_workflow_run_id TEXT,
+            feature_id TEXT,
+            workspace_path TEXT NOT NULL,
+            base_commit TEXT,
+            patch_text TEXT NOT NULL,
+            patch_hash TEXT NOT NULL,
+            patch_bytes INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_supervisor ON supervisor_integration_patches (supervisor_run_id, created_at)"
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_integration_run ON supervisor_integration_patches (integration_workflow_run_id, created_at)"
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_source_work_unit ON supervisor_integration_patches (source_work_unit_id, created_at)"
     )
     .execute(db)
     .await?;
@@ -333,13 +375,105 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     ensure_column(db, "supervisor_runs", "archived_reason", "TEXT").await?;
     ensure_column(db, "supervisor_runs", "selected_planner_id", "TEXT").await?;
 
+    sqlx::query(
+        r#"
+        UPDATE supervisor_runs
+        SET selected_planner_id = COALESCE(
+            NULLIF(TRIM(selected_planner_id), ''),
+            NULLIF(TRIM(json_extract(context_json, '$.selected_planner_id')), ''),
+            NULLIF(TRIM(json_extract(context_json, '$.queue_planner_id')), '')
+        )
+        WHERE TRIM(COALESCE(selected_planner_id, '')) = ''
+          AND json_valid(context_json)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_runs
+        SET context_json = json_remove(
+            CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+            '$.selected_planner_id',
+            '$.queue_planner_id'
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_supervisor_runs_status_updated ON supervisor_runs (status, updated_at)")
         .execute(db)
         .await?;
     ensure_column(db, "supervisor_work_units", "workspace_path", "TEXT").await?;
     ensure_column(db, "supervisor_work_units", "shard_id", "TEXT").await?;
+    ensure_column(db, "supervisor_work_units", "integration_state", "TEXT").await?;
     ensure_column(db, "supervisor_work_units", "archived_at", "TEXT").await?;
     ensure_column(db, "supervisor_work_units", "archived_reason", "TEXT").await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET state = CASE state
+            WHEN 'error' THEN 'failed'
+            WHEN 'complete' THEN 'completed'
+            ELSE state
+        END
+        WHERE state IN ('error', 'complete')
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET integration_state = CASE
+            WHEN COALESCE(json_extract(context_json, '$.integration_skipped'), 0) = 1 THEN 'skipped'
+            WHEN COALESCE(json_extract(context_json, '$.staged_to_integration'), json_extract(context_json, '$.integration_input'), 0) = 1 THEN 'included'
+            ELSE 'available'
+        END
+        WHERE integration_state IS NULL OR TRIM(integration_state) = ''
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET state = 'completed',
+            integration_state = 'included',
+            archived_at = NULL,
+            archived_reason = NULL,
+            updated_at = COALESCE(updated_at, created_at)
+        WHERE archived_reason = 'integration applied'
+          AND kind IN ('feature', 'manual')
+          AND EXISTS (
+              SELECT 1
+              FROM supervisor_integration_patches sip
+              WHERE sip.supervisor_run_id = supervisor_work_units.supervisor_run_id
+                AND sip.source_work_unit_id = supervisor_work_units.id
+          )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET context_json = json_remove(
+            CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+            '$.integration_input',
+            '$.staged_to_integration',
+            '$.integration_skipped'
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_work_units_supervisor_state ON supervisor_work_units (supervisor_run_id, state, updated_at)")
         .execute(db)
@@ -363,6 +497,88 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         "UPDATE supervisor_work_units SET workspace_path = COALESCE(NULLIF(workspace_path, ''), NULLIF(shard_path, ''), NULLIF(integration_path, '')) WHERE TRIM(COALESCE(workspace_path, '')) = ''"
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO supervisor_work_units (
+            id,
+            supervisor_run_id,
+            repo_id,
+            feature_id,
+            workflow_run_id,
+            patch_id,
+            kind,
+            title,
+            state,
+            root_repo_path,
+            workspace_path,
+            shard_path,
+            integration_path,
+            integration_state,
+            priority,
+            queue_position,
+            blocked_reason,
+            waiting_user_input_json,
+            context_json,
+            archived_at,
+            archived_reason,
+            created_at,
+            updated_at
+        )
+        SELECT
+            sr.id || ':integration',
+            sr.id,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'integration',
+            'Integration',
+            'queued',
+            sr.root_repo_path,
+            NULL,
+            NULL,
+            NULL,
+            'available',
+            0,
+            NULL,
+            NULL,
+            '{}',
+            json_object(
+                'status', 'queued',
+                'materialization_state', 'pending',
+                'workflow_type', 'integration',
+                'pool_key', 'integration',
+                'work_unit_id', sr.id || ':integration'
+            ),
+            NULL,
+            NULL,
+            sr.created_at,
+            sr.updated_at
+        FROM supervisor_runs sr
+        WHERE sr.archived_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM supervisor_work_units wu
+              WHERE wu.supervisor_run_id = sr.id
+                AND wu.kind = 'integration'
+                AND wu.archived_at IS NULL
+          )
+        ON CONFLICT(id) DO UPDATE SET
+            supervisor_run_id = excluded.supervisor_run_id,
+            feature_id = NULL,
+            kind = 'integration',
+            title = 'Integration',
+            root_repo_path = excluded.root_repo_path,
+            integration_state = 'available',
+            archived_at = NULL,
+            archived_reason = NULL,
+            updated_at = excluded.updated_at
+        WHERE supervisor_work_units.archived_at IS NOT NULL
+        "#,
     )
     .execute(db)
     .await?;
@@ -594,31 +810,30 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE supervisor_work_units
-        SET state = CASE
-                WHEN workflow_run_id IS NULL THEN state
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM workflow_runs wr
-                    WHERE wr.id = supervisor_work_units.workflow_run_id
-                      AND wr.status = 'complete'
-                ) THEN 'complete'
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM workflow_runs wr
-                    WHERE wr.id = supervisor_work_units.workflow_run_id
-                ) THEN (
-                    SELECT wr.status
-                    FROM workflow_runs wr
-                    WHERE wr.id = supervisor_work_units.workflow_run_id
-                )
+        SET state = CASE (
+                SELECT wr.status
+                FROM workflow_runs wr
+                WHERE wr.id = supervisor_work_units.workflow_run_id
+            )
+                WHEN 'draft' THEN 'draft'
+                WHEN 'queued' THEN 'queued'
+                WHEN 'running' THEN 'running'
+                WHEN 'waiting' THEN 'waiting'
+                WHEN 'paused' THEN 'paused'
+                WHEN 'success' THEN 'completed'
+                WHEN 'complete' THEN 'completed'
+                WHEN 'error' THEN 'failed'
+                WHEN 'cancelled' THEN 'cancelled'
                 ELSE state
             END,
-            updated_at = CASE
-                WHEN workflow_run_id IS NOT NULL THEN ?
-                ELSE updated_at
-            END
+            updated_at = ?
         WHERE workflow_run_id IS NOT NULL
           AND archived_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM workflow_runs wr
+              WHERE wr.id = supervisor_work_units.workflow_run_id
+          )
         "#,
     )
     .bind(chrono::Utc::now().to_rfc3339())

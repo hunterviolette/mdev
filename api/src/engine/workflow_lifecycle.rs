@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -19,6 +25,64 @@ use crate::{
 pub enum WorkflowExecutionMode {
     SingleStage,
     MultiStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowRuntimeExecutionState {
+    Idle,
+    SingleStage,
+    Autonomous,
+}
+
+impl From<WorkflowExecutionMode> for WorkflowRuntimeExecutionState {
+    fn from(mode: WorkflowExecutionMode) -> Self {
+        match mode {
+            WorkflowExecutionMode::SingleStage => Self::SingleStage,
+            WorkflowExecutionMode::MultiStage => Self::Autonomous,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct WorkflowRuntimeExecutionTracker {
+    value: Arc<AtomicU8>,
+}
+
+impl WorkflowRuntimeExecutionTracker {
+    pub(crate) fn state(&self) -> WorkflowRuntimeExecutionState {
+        match self.value.load(Ordering::Acquire) {
+            1 => WorkflowRuntimeExecutionState::SingleStage,
+            2 => WorkflowRuntimeExecutionState::Autonomous,
+            _ => WorkflowRuntimeExecutionState::Idle,
+        }
+    }
+
+    pub(crate) fn begin(&self, mode: WorkflowExecutionMode) -> WorkflowRuntimeExecutionGuard {
+        let state = WorkflowRuntimeExecutionState::from(mode);
+        let value = match state {
+            WorkflowRuntimeExecutionState::Idle => 0,
+            WorkflowRuntimeExecutionState::SingleStage => 1,
+            WorkflowRuntimeExecutionState::Autonomous => 2,
+        };
+        self.value.store(value, Ordering::Release);
+        WorkflowRuntimeExecutionGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    fn set_idle(&self) {
+        self.value.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) struct WorkflowRuntimeExecutionGuard {
+    tracker: WorkflowRuntimeExecutionTracker,
+}
+
+impl Drop for WorkflowRuntimeExecutionGuard {
+    fn drop(&mut self) {
+        self.tracker.set_idle();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +192,7 @@ struct WorkflowRuntimeState {
     execution_task: Option<std::thread::JoinHandle<()>>,
     command_tx: Option<mpsc::Sender<WorkflowRuntimeCommand>>,
     cancellation: Option<CancellationToken>,
+    execution_state: WorkflowRuntimeExecutionTracker,
 }
 
 impl Default for WorkflowGuard {
@@ -175,6 +240,9 @@ impl WorkflowCoordinator {
             .unwrap_or_else(CancellationToken::new);
         let task_state = state.clone();
         let task_cancellation = cancellation.clone();
+        let execution_state = runtime.execution_state.clone();
+        execution_state.set_idle();
+        let task_execution_state = execution_state.clone();
 
         let execution_task = std::thread::Builder::new()
             .name(format!("workflow-runtime-{}", workflow_run_id))
@@ -200,6 +268,7 @@ impl WorkflowCoordinator {
                         workflow_run_id,
                         command_rx,
                         task_cancellation,
+                        task_execution_state,
                     )
                     .await
                     {
@@ -256,8 +325,7 @@ impl WorkflowCoordinator {
     pub async fn stop_active_executions(
         &self,
         state: &AppState,
-        reason: &str,
-    ) -> Vec<Uuid> {
+    ) -> Result<Vec<Uuid>> {
         let guards = self
             .workflows
             .iter()
@@ -268,12 +336,10 @@ impl WorkflowCoordinator {
 
         for (workflow_run_id, guard) in guards {
             let runtime = guard.runtime.lock().await;
-            let active = runtime
-                .execution_task
-                .as_ref()
-                .is_some_and(|task| !task.is_finished());
-
-            if !active {
+            if matches!(
+                runtime.execution_state.state(),
+                WorkflowRuntimeExecutionState::Idle
+            ) {
                 continue;
             }
 
@@ -282,27 +348,18 @@ impl WorkflowCoordinator {
             if let Some(cancellation) = runtime.cancellation.as_ref() {
                 cancellation.cancel();
             }
-
-            if let Some(command_tx) = runtime.command_tx.clone() {
-                let _ = command_tx
-                    .send(WorkflowRuntimeCommand::Cancel {
-                        reason: reason.to_string(),
-                    })
-                    .await;
-            }
         }
 
-        for workflow_run_id in &active_run_ids {
-            let _ = engine::fail_runtime_workflow(
+        if !active_run_ids.is_empty() {
+            engine::fail_active_runs_for_process_stop(
                 state,
-                *workflow_run_id,
-                "api_shutdown",
-                reason,
+                &active_run_ids,
+                "The API shut down while workflow execution was active.",
             )
-            .await;
+            .await?;
         }
 
-        active_run_ids
+        Ok(active_run_ids)
     }
 
     pub async fn execute(
@@ -511,31 +568,3 @@ pub async fn execute_workflow_command(
     state.workflow_coordinator.execute(state, envelope).await
 }
 
-pub(crate) fn command_payload(command: &WorkflowRuntimeCommand) -> Value {
-    match command {
-        WorkflowRuntimeCommand::Start { mode, step_id } => serde_json::json!({
-            "kind": "start",
-            "mode": mode,
-            "step_id": step_id
-        }),
-        WorkflowRuntimeCommand::Pause => serde_json::json!({ "kind": "pause" }),
-        WorkflowRuntimeCommand::Resume => serde_json::json!({ "kind": "resume" }),
-        WorkflowRuntimeCommand::ResolveCheckpoint {
-            disposition,
-            selected_step_id,
-        } => serde_json::json!({
-            "kind": "resolve_checkpoint",
-            "disposition": disposition,
-            "selected_step_id": selected_step_id
-        }),
-        WorkflowRuntimeCommand::MoveTo { step_id } => serde_json::json!({
-            "kind": "move_to",
-            "step_id": step_id
-        }),
-        WorkflowRuntimeCommand::Cancel { reason } => serde_json::json!({
-            "kind": "cancel",
-            "reason": reason
-        }),
-        WorkflowRuntimeCommand::Archive => serde_json::json!({ "kind": "archive" }),
-    }
-}

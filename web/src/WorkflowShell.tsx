@@ -105,7 +105,8 @@ import { DeployQARuntime } from './Capabilities/DeployQARuntime';
 import { RuntimeAdmin } from './Capabilities/RuntimeAdmin';
 import { SharedDependencies } from './Capabilities/SharedDependencies';
 import { Automation, type AutomationProfile } from './Capabilities/Automation';
-import { FlightDeckPanel } from './FlightDeckPanel';
+import { SupervisorPanel } from './SupervisorPanel';
+import { AppHeader, AppHeaderAction, AppSurface } from './AppHeader';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
   emptyRuntimeEventStore,
@@ -176,7 +177,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'flight_deck' | 'runtime';
+type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
 type EventTone = { color: string; label: string };
 
@@ -2245,7 +2246,7 @@ export function WorkflowShell(props: {
     workflowRunId: string | null;
     workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
     supervisorRunId: string | null;
-    supervisorView?: 'planner' | 'sprint' | null;
+    supervisorView?: 'planner' | null;
   };
   navigate?: (path: string) => void;
 }) {
@@ -3363,14 +3364,19 @@ export function WorkflowShell(props: {
       return;
     }
 
-    if (routedPath === '/flight-deck' || routedSupervisorRunId || routedPath === '/supervisors') {
+    if (routedSupervisorRunId || routedPath === '/supervisors') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
-      setMonitorHomeView((value) => value === 'flight_deck' ? value : 'flight_deck');
+      setMonitorHomeView((value) => value === 'supervisor' ? value : 'supervisor');
       setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
-      if (routedPath !== '/flight-deck') {
-        props.navigate?.('/flight-deck');
-      }
+      return;
+    }
+
+    if (routedPath === '/templates') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'templates' ? value : 'templates');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
       return;
     }
 
@@ -4131,20 +4137,27 @@ export function WorkflowShell(props: {
 
   function capabilityIoPayload(capability: LiveCapabilityTrail): Record<string, unknown> {
     return {
-      capability_id: capability.capabilityId,
       name: capability.name,
       status: capability.status,
-      latest_kind: capability.latestKind,
-      latest_level: capability.latestLevel,
-      input: capability.inputPayload ?? null,
-      output: capability.outputPayload ?? capability.latestPayload ?? null
+      message: capability.message,
+      input: deriveCapabilityPayload('input', capability.inputPayload),
+      output: deriveCapabilityPayload('output', capability.outputPayload ?? capability.latestPayload)
     };
   }
 
   function deriveCapabilityPayload(role: 'input' | 'output', payload: unknown): unknown {
     const objectPayload = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
     if (!objectPayload) return payload ?? null;
+
     if (role === 'input') {
+      const config = asRecord(objectPayload.config);
+      if (objectPayload.capability === 'git_patch_payload' && config) {
+        return {
+          work_unit_id: config.work_unit_id ?? null,
+          workspace_path: config.workspace_path ?? null,
+          target_repo_ref: config.target_repo_ref ?? null
+        };
+      }
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
 
@@ -4157,6 +4170,23 @@ export function WorkflowShell(props: {
           ? outputRecord.lines.filter((line): line is string => typeof line === 'string')
           : []
       };
+    }
+
+    if (objectPayload.capability === 'git_patch_payload') {
+      const result = asRecord(objectPayload.result) ?? outputRecord;
+      if (result) {
+        return {
+          ok: result.ok ?? null,
+          summary: result.summary ?? null,
+          error_type: result.error_type ?? null,
+          failed_files: Array.isArray(result.failed_files) ? result.failed_files : [],
+          work_unit_id: result.work_unit_id ?? null,
+          workspace_path: result.workspace_path ?? null,
+          patch_id: result.patch_id ?? null,
+          patch_bytes: result.patch_bytes ?? null,
+          details: result.details ?? null
+        };
+      }
     }
 
     return output;
@@ -4173,14 +4203,15 @@ export function WorkflowShell(props: {
     const nestedError = asRecord(record.error);
 
     const candidates = [
+      record.summary,
+      result?.summary,
+      nestedError?.summary,
       record.error_message,
       record.error,
       nestedError?.message,
-      nestedError?.summary,
       result?.error_message,
       result?.error,
       result?.message,
-      result?.summary,
       result?.status,
       nestedOutput?.error_message,
       nestedOutput?.error,
@@ -5002,6 +5033,62 @@ export function WorkflowShell(props: {
       setError(null);
       await refreshRunsAndTemplates();
       setView('builder');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openNewTemplateBuilder() {
+    try {
+      setBusy(true);
+      setError(null);
+      await refreshRunsAndTemplates();
+      setSelectedTemplateId(null);
+      setWorkflowName('New workflow template');
+      setWorkflowDescription('');
+      setRepoRef('');
+      updateCompiledBuilderDefinition(null);
+      setLoadedTemplateDefinition(null);
+      setBuilderGlobals(defaultGlobals());
+      setJsonDraft('');
+      setBuilderLoadRevision((previous) => previous + 1);
+      setBuilderMode('builder');
+      setCreateRunAfterSave(false);
+      setView('builder');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openTemplateBuilder(templateId: string) {
+    handleLoadTemplateMetadata(templateId);
+    setCreateRunAfterSave(false);
+    setView('builder');
+  }
+
+  async function createWorkflowDirectlyFromTemplate(template: WorkflowTemplate) {
+    try {
+      setBusy(true);
+      setError(null);
+      const run = await createRun({
+        template_id: template.id,
+        title: template.name,
+        repo_ref: template.repo_ref,
+        definition: template.definition,
+        context: {
+          workflow_engine: {}
+        }
+      });
+      await refreshRunsAndTemplates(run.id);
+      setSelectedRunId(run.id);
+      setView('monitor');
+      setMonitorView('workflow_detail');
+      setActiveWorkspaceTab('workflows');
+      props.navigate?.(workflowTabRoute(run.id, 'workflows'));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -7083,79 +7170,118 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Card>
           ) : monitorView === 'workflow_list' ? (
             <Stack>
-              <Card withBorder>
-                <Stack gap="sm">
-                  <Group justify="space-between" align="center" wrap="wrap">
-                    <Stack gap={2}>
-                      <Title order={4}>Workspace monitor</Title>
-                    </Stack>
-                    <Group>
-                      <Button
-                        size="xs"
-                        onClick={() => {
-                          if (monitorHomeView === 'workflows') {
-                            void openBuilder();
-                          } else {
-                            props.navigate?.('/flight-deck');
-                          }
-                        }}
-                        loading={monitorHomeView === 'workflows' ? busy : false}
-                      >
-                        {monitorHomeView === 'workflows' ? 'New workflow' : 'Flight Deck'}
-                      </Button>
-                      <Button
-                        size="xs"
-                        variant="default"
-                        leftSection={<IconRefresh size={16} />}
-                        onClick={() => {
-                          if (monitorHomeView === 'workflows') {
-                            void refreshRunsAndTemplates();
-                          } else if (monitorHomeView === 'flight_deck') {
-                            props.navigate?.('/flight-deck');
-                          } else {
-                            props.navigate?.('/runtime');
-                          }
-                        }}
-                      >
-                        Refresh
-                      </Button>
-                    </Group>
-                  </Group>
-                  <Tabs
-                    value={monitorHomeView}
-                    onChange={(value) => {
-                      const next = (value as MonitorHomeView | null) ?? 'workflows';
-                      setMonitorHomeView((current) => current === next ? current : next);
-                      if (next === 'runtime') {
-                        props.navigate?.('/runtime');
-                      } else if (next === 'flight_deck') {
-                        props.navigate?.('/flight-deck');
-                      } else {
-                        props.navigate?.('/workflows');
-                      }
-                    }}
-                  >
-                    <Tabs.List>
-                      <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
-                      <Tabs.Tab value="flight_deck">Flight Deck</Tabs.Tab>
-                      <Tabs.Tab value="runtime">Runtime</Tabs.Tab>
-                    </Tabs.List>
-                  </Tabs>
-                </Stack>
-              </Card>
+              {monitorHomeView !== 'supervisor' ? (
+                <AppHeader
+                  active={monitorHomeView}
+                  onChange={(next) => {
+                    setMonitorHomeView((current) => current === next ? current : next);
+                    if (next === 'runtime') {
+                      props.navigate?.('/runtime');
+                    } else if (next === 'supervisor') {
+                      props.navigate?.('/supervisors');
+                    } else if (next === 'templates') {
+                      props.navigate?.('/templates');
+                    } else {
+                      props.navigate?.('/workflows');
+                    }
+                  }}
+                  actions={monitorHomeView === 'workflows' ? (
+                    <AppHeaderAction onClick={() => void openBuilder()} loading={busy}>
+                      New workflow
+                    </AppHeaderAction>
+                  ) : monitorHomeView === 'templates' ? (
+                    <AppHeaderAction onClick={() => void openNewTemplateBuilder()} loading={busy}>
+                      New template
+                    </AppHeaderAction>
+                  ) : undefined}
+                />
+              ) : null}
 
               {monitorHomeView === 'runtime' ? (
                 <RuntimeAdmin />
-              ) : monitorHomeView === 'flight_deck' ? (
-                <FlightDeckPanel
+              ) : monitorHomeView === 'supervisor' ? (
+                <SupervisorPanel
                   navigate={props.navigate}
                 />
+              ) : monitorHomeView === 'templates' ? (
+                <AppSurface p="md">
+                  <Stack gap="sm">
+                    <Group justify="space-between" align="center" wrap="wrap">
+                      <Group gap="xs">
+                        <Title order={4}>Templates</Title>
+                        <Badge variant="light" color="gray">{templates.length}</Badge>
+                      </Group>
+                    </Group>
+
+                    {templates.length === 0 ? (
+                      <Text size="sm" c="dimmed">No saved templates yet.</Text>
+                    ) : (
+                      <Table striped highlightOnHover>
+                        <Table.Thead>
+                          <Table.Tr>
+                            <Table.Th>Template</Table.Th>
+                            <Table.Th>Description</Table.Th>
+                            <Table.Th>Repo</Table.Th>
+                            <Table.Th>Actions</Table.Th>
+                          </Table.Tr>
+                        </Table.Thead>
+                        <Table.Tbody>
+                          {templates.map((template) => (
+                            <Table.Tr key={template.id}>
+                              <Table.Td>
+                                <Text fw={700}>{template.name}</Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Text size="sm" c="dimmed" lineClamp={2}>
+                                  {template.description || 'No description provided.'}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Code>{template.repo_ref || '—'}</Code>
+                              </Table.Td>
+                              <Table.Td>
+                                <Group gap="xs" wrap="nowrap">
+                                  <Button
+                                    size="compact-xs"
+                                    variant="light"
+                                    onClick={() => openTemplateBuilder(template.id)}
+                                  >
+                                    Edit
+                                  </Button>
+                                  <Button
+                                    size="compact-xs"
+                                    variant="light"
+                                    onClick={() => void createWorkflowDirectlyFromTemplate(template)}
+                                    loading={busy}
+                                  >
+                                    New workflow
+                                  </Button>
+                                  <ActionIcon
+                                    color="red"
+                                    variant="subtle"
+                                    aria-label={`Delete ${template.name}`}
+                                    onClick={() => void handleDeleteTemplate(template.id)}
+                                  >
+                                    <IconTrash size={16} />
+                                  </ActionIcon>
+                                </Group>
+                              </Table.Td>
+                            </Table.Tr>
+                          ))}
+                        </Table.Tbody>
+                      </Table>
+                    )}
+                  </Stack>
+                </AppSurface>
               ) : (
                 <>
-                  <Card withBorder>
-                    <Stack>
+                  <AppSurface p="md">
+                    <Stack gap="sm">
                       <Group justify="space-between" align="center" wrap="wrap">
-                        <Title order={4}>Workflow list</Title>
+                        <Group gap="xs">
+                          <Title order={4}>Workflow list</Title>
+                          <Badge variant="light" color="gray">{runs.length}</Badge>
+                        </Group>
                       </Group>
                       <Table striped highlightOnHover>
                         <Table.Thead>
@@ -7193,7 +7319,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         </Table.Tbody>
                       </Table>
                     </Stack>
-                  </Card>
+                  </AppSurface>
 
                   <Card withBorder>
                     <Stack>
@@ -7768,7 +7894,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={Boolean(overlayPlanner)}
-          rootRepoPath={overlayPlanner?.rootRepoPath ?? ''}
+          repoRef={overlayPlanner?.rootRepoPath ?? ''}
           onClose={() => setOverlayPlanner(null)}
           onSaved={() => props.navigate?.('/flight-deck')}
           onError={setError}
@@ -7777,7 +7903,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={plannerFragmentConfigOpen}
-          rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+          repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
           selectedPlannerId={selectedPlannerWorkspaceId}
           selectedFeatureId={selectedPlannerFeatureId}
           selectionMode

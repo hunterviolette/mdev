@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import {
   Alert,
   Anchor,
@@ -12,26 +12,29 @@ import {
   JsonInput,
   Loader,
   Modal,
+  MultiSelect,
   NumberInput,
   Paper,
   ScrollArea,
   Select,
   SimpleGrid,
+  Skeleton,
   Stack,
   Text,
   TextInput,
   Title,
   Tooltip,
 } from '@mantine/core';
-import { listTemplates, type WorkflowTemplate } from './api';
+import { listTemplates, type RuntimeEventEnvelope, type SupervisorEventEnvelope, type WorkflowTemplate } from './api';
 import { PlannerModal } from './PlannerModal';
-import { createPlannerForRepo, deletePlannerForRepo, listPlannersForRepo, refinePlannerFeature, type PlannerWorkspace } from './planner_api';
-import { createSupervisorRun, deleteSupervisorRun, getFlightDeck, getSupervisorQueue, getWorkflowEventHistory, runSupervisorAction, setSupervisorQueue, type FlightDeckResponse, type FlightDeckSupervisor, type FlightDeckWorkUnit, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
-import { executionTone as tone, subscribeRuntimeEventBus } from './runtime_events';
+import { createPlanner, deletePlanner as deletePlannerApi, listPlanners, type PlannerWorkspace } from './planner_api';
+import { createSupervisorRun, deleteSupervisorRun, getSupervisorProjection, getPendingSupervisorActions, getSupervisorActionStateVersion, getSupervisorQueue, getWorkflowEventHistory, listSupervisorRuns, openSupervisorHydrationStream, runSupervisorAction, subscribeSupervisorActionState, type SupervisorProjectionResponse, type SupervisorProjection, type SupervisorWorkUnitProjection, type PendingSupervisorAction, type SupervisorListItem, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
+import { executionTone as tone, runtimeEventExecutionStatus, subscribeRuntimeEventBus } from './runtime_events';
+import { AppHeader, AppHeaderAction, AppSurface, type AppHeaderView } from './AppHeader';
 
-type FlightDeckPanelProps = {
+type SupervisorPanelProps = {
   navigate?: (path: string) => void;
-  onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void;
+  onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void;
 };
 
 type OpenPlannerOptions = {
@@ -41,6 +44,79 @@ type OpenPlannerOptions = {
 };
 
 type TemplateOption = { value: string; label: string };
+
+function usePendingSupervisorActions(supervisorId: string): PendingSupervisorAction[] {
+  useSyncExternalStore(
+    subscribeSupervisorActionState,
+    getSupervisorActionStateVersion,
+    getSupervisorActionStateVersion
+  );
+  return getPendingSupervisorActions(supervisorId);
+}
+
+function pendingSupervisorActionLabel(pending: PendingSupervisorAction): string {
+
+  switch (pending.action) {
+    case 'create_work_unit':
+      return pending.request.action === 'create_work_unit' && pending.request.pool_kind === 'manual'
+        ? 'Creating manual workflow'
+        : 'Creating workflow';
+    case 'delete_work_unit':
+      return 'Deleting workflow';
+    case 'regenerate_work_unit':
+      return 'Regenerating workflow';
+    case 'start_work_unit':
+      return 'Starting workflow';
+    case 'pause_work_unit':
+      return 'Pausing workflow';
+    case 'stage_work_unit':
+      return pending.request.action === 'stage_work_unit' && pending.request.staged === false
+        ? 'Removing from integration'
+        : 'Adding to integration';
+    case 'update_supervisor_config':
+      return 'Saving supervisor settings';
+    case 'select_planner':
+      return 'Changing planner';
+    case 'enqueue_feature':
+      return 'Queuing feature';
+    case 'dequeue_feature':
+      return 'Unqueuing feature';
+    case 'reorder_feature_pool':
+      return 'Reordering feature queue';
+    case 'refine_feature':
+      return 'Starting refinement';
+    case 'pause_feature_pool':
+      return 'Pausing feature pool';
+    case 'resume_feature_pool':
+      return 'Resuming feature pool';
+    case 'skip_integration_input':
+      return 'Skipping integration input';
+    case 'unskip_integration_input':
+      return 'Restoring integration input';
+    case 'apply_integration':
+      return 'Applying integration';
+    case 'cancel':
+      return 'Pausing integration';
+  }
+}
+
+function pendingSupervisorActionTone(pending: PendingSupervisorAction): string {
+  switch (pending.action) {
+    case 'delete_work_unit':
+      return 'red';
+    case 'create_work_unit':
+    case 'regenerate_work_unit':
+      return 'yellow';
+    default:
+      return 'blue';
+  }
+}
+
+function pendingActionTargetsWorkUnit(pending: PendingSupervisorAction, unit: SupervisorWorkUnitProjection): boolean {
+  if (pending.work_unit_id === unit.id) return true;
+  return pending.action === 'cancel' && workflowType(unit) === 'integration';
+}
+
 
 type SupervisorPoolConfig = {
   template_id?: string | null;
@@ -104,15 +180,15 @@ const WORK_POOL_GROUPS = [
     empty: 'No refine work is currently active.',
   },
   {
-    key: 'feature_development',
+    key: 'feature',
     title: 'Feature pool',
     description: 'Queued and active feature implementation work.',
     empty: 'No feature work is currently active.',
   },
   {
-    key: 'manual_shard',
+    key: 'manual',
     title: 'Manual pool',
-    description: 'Operator-created shards with template-attached workflows.',
+    description: 'Operator-created workflow work.',
     empty: 'No manual work is currently active.',
   },
 ];
@@ -121,7 +197,7 @@ function workflowTemplateOptions(templates: WorkflowTemplate[]): TemplateOption[
   return templates.map((template) => ({ value: template.id, label: template.name }));
 }
 
-function supervisorConfig(supervisor: FlightDeckSupervisor): SupervisorConfig {
+function supervisorConfig(supervisor: SupervisorProjection): SupervisorConfig {
   const pools = supervisor.context?.pools;
   const executionEventLimit = supervisor.context?.execution_event_limit;
   return {
@@ -130,18 +206,18 @@ function supervisorConfig(supervisor: FlightDeckSupervisor): SupervisorConfig {
   };
 }
 
-function supervisorExecutionEventLimit(supervisor: FlightDeckSupervisor): number {
+function supervisorExecutionEventLimit(supervisor: SupervisorProjection): number {
   const value = supervisorConfig(supervisor).execution_event_limit;
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.max(10, Math.min(1000, Math.floor(value)))
     : 100;
 }
 
-function poolSetting(supervisor: FlightDeckSupervisor, groupKey: string): SupervisorPoolConfig {
+function poolSetting(supervisor: SupervisorProjection, groupKey: string): SupervisorPoolConfig {
   return supervisorConfig(supervisor).pools?.[groupKey] ?? {};
 }
 
-function nextSupervisorConfig(supervisor: FlightDeckSupervisor, groupKey: string, patch: SupervisorPoolConfig): SupervisorConfig {
+function nextSupervisorConfig(supervisor: SupervisorProjection, groupKey: string, patch: SupervisorPoolConfig): SupervisorConfig {
   const current = supervisorConfig(supervisor);
   return {
     ...current,
@@ -194,7 +270,7 @@ function supervisorHref(supervisorId: string): string {
 }
 
 
-function telemetryArray(unit: FlightDeckWorkUnit, key: string): Array<Record<string, unknown>> {
+function telemetryArray(unit: SupervisorWorkUnitProjection, key: string): Array<Record<string, unknown>> {
   const value = unit.telemetry?.[key];
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object') : [];
 }
@@ -256,14 +332,18 @@ function executionDuration(durationMs?: number): string {
     : `${hours}h`;
 }
 
-function telemetryString(unit: FlightDeckWorkUnit, key: string): string {
+function telemetryString(unit: SupervisorWorkUnitProjection, key: string): string {
   const value = unit.telemetry?.[key];
   return typeof value === 'string' && value.trim() ? value : '';
 }
 
-function currentStepId(unit: FlightDeckWorkUnit): string | null {
+function currentStepId(unit: SupervisorWorkUnitProjection): string | null {
   const value = unit.telemetry?.current_step_id;
   return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function workflowTelemetryHydrating(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.telemetry?.hydrating === true;
 }
 
 function stageKeyFromText(value: string): string {
@@ -281,7 +361,7 @@ function stageExecutionDisplayName(stepId: string): string {
 }
 
 
-function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
+function buildStageProjection(unit: SupervisorWorkUnitProjection): StageProjection[] {
   const templateStages = telemetryArray(unit, 'stage_template');
   const recentStages = telemetryArray(unit, 'recent_stage_executions');
   const activeStep = currentStepId(unit);
@@ -293,7 +373,11 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   });
   const observedFromHistory = recentStages.map((stage) => stageKeyFromText(textField(stage, 'step_id'))).filter(Boolean);
   if (templateKeys.length === 0) {
-    const error = textField(unit.telemetry, 'stage_template_error') || 'Workflow template stages are unavailable; Flight Deck cannot render stage rails.';
+    if (!unit.workflow_run_id && ['pending', 'materializing'].includes(workflowMaterializationState(unit))) {
+      return [];
+    }
+
+    const error = textField(unit.telemetry, 'stage_template_error') || 'Workflow template stages are unavailable; Supervisor cannot render stage rails.';
     return [{
       key: 'template_error',
       label: 'Template error',
@@ -315,7 +399,7 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   const ordered = [...baseStageOrder, ...[...observedKeys].filter((key) => !baseStageOrder.includes(key))];
   const activeKey = activeStep ? stageKeyFromText(activeStep) : null;
   const activeIndex = activeKey ? ordered.indexOf(activeKey) : -1;
-  const waiting = unit.state === 'waiting_user';
+  const waiting = unit.state === 'waiting';
 
   const latestStageByKey = new Map<string, Record<string, unknown>>();
   for (const stage of recentStages) {
@@ -349,7 +433,7 @@ function buildStageProjection(unit: FlightDeckWorkUnit): StageProjection[] {
   });
 }
 
-function buildCapabilityProjection(unit: FlightDeckWorkUnit): CapabilityProjection[] {
+function buildCapabilityProjection(unit: SupervisorWorkUnitProjection): CapabilityProjection[] {
   const terminalRank: Record<string, number> = {
     failed: 6,
     success: 5,
@@ -628,7 +712,7 @@ function executionStatusFromEvent(item: WorkflowEventHistoryItem): string {
   return item.level || 'event';
 }
 
-function deriveWorkflowCardHistoryHydration(unit: FlightDeckWorkUnit, items: WorkflowEventHistoryItem[]): WorkflowCardHistoryHydration {
+function deriveWorkflowCardHistoryHydration(unit: SupervisorWorkUnitProjection, items: WorkflowEventHistoryItem[]): WorkflowCardHistoryHydration {
   const capabilityByKey = new Map<string, CapabilityProjection>();
   const stageByKey = new Map<string, Record<string, unknown>>();
 
@@ -832,7 +916,7 @@ function CapabilityStrip(props: { capabilities: CapabilityProjection[]; onOpenHi
   );
 }
 
-function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Record<string, unknown>[]; onOpenHistory?: (stage: Record<string, unknown>) => void }) {
+function RecentStageStrip(props: { unit: SupervisorWorkUnitProjection; fallbackStages?: Record<string, unknown>[]; onOpenHistory?: (stage: Record<string, unknown>) => void }) {
   const nativeStages = telemetryArray(props.unit, 'recent_stage_executions');
   const sourceStages = nativeStages.length > 0 ? nativeStages : props.fallbackStages ?? [];
   const stages = sourceStages
@@ -886,80 +970,103 @@ function RecentStageStrip(props: { unit: FlightDeckWorkUnit; fallbackStages?: Re
   );
 }
 
-function workflowType(unit: FlightDeckWorkUnit): string {
+function workflowType(unit: SupervisorWorkUnitProjection): string {
   return unit.workflow_type ?? unit.kind;
 }
 
-function manualShardIsIntegrationInput(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard'
-    && (
-      unit.telemetry?.staged_to_integration === true
-      || unit.telemetry?.integration_input === true
-      || normalize(unit.state) === 'ready_for_integration'
-      || normalize(unit.state) === 'integrating'
-      || normalize(unit.state) === 'integrated'
-    );
+function workUnitIsIntegrationInput(unit: SupervisorWorkUnitProjection): boolean {
+  return workflowType(unit) !== 'integration' && unit.integration_state !== 'available';
 }
 
-function manualShardHasStagedChanges(unit: FlightDeckWorkUnit): boolean {
-  return unit.telemetry?.manual_shard_has_staged_changes === true || unit.telemetry?.manual_shard_stageable === true;
+function workUnitHasStagedChanges(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.has_staged_changes;
 }
 
-function workflowIsProcessing(unit: FlightDeckWorkUnit): boolean {
-  return unit.state === 'running' || unit.state === 'integrating';
+function workflowMaterializationState(unit: SupervisorWorkUnitProjection): string {
+  return normalize(telemetryString(unit, 'materialization_state'));
 }
 
-function workflowCanRun(unit: FlightDeckWorkUnit): boolean {
+function workflowIsMaterializing(unit: SupervisorWorkUnitProjection): boolean {
+  return !unit.workflow_run_id && workflowMaterializationState(unit) === 'materializing';
+}
+
+function workflowIsMaterializationPending(unit: SupervisorWorkUnitProjection): boolean {
+  return !unit.workflow_run_id && workflowMaterializationState(unit) === 'pending';
+}
+
+function workflowIsRegenerating(unit: SupervisorWorkUnitProjection): boolean {
+  return !unit.workflow_run_id
+    && Boolean(telemetryString(unit, 'regenerated_at'))
+    && ['pending', 'materializing'].includes(workflowMaterializationState(unit));
+}
+
+function workflowMaterializationLabel(unit: SupervisorWorkUnitProjection): string | null {
+  if (unit.workflow_run_id) return null;
+  if (workflowIsRegenerating(unit)) return 'Regenerating';
+  if (workflowIsMaterializing(unit)) return 'Starting';
+  if (workflowIsMaterializationPending(unit)) return 'Queued';
+  if (workflowMaterializationState(unit) === 'failed') return 'Failed';
+  return null;
+}
+
+function workflowIsProcessing(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.state === 'running' || workflowIsMaterializing(unit) || workflowIsRegenerating(unit);
+}
+
+function workflowCanRun(unit: SupervisorWorkUnitProjection): boolean {
   if (workflowType(unit) === 'integration') return !unit.workflow_deleted && !workflowIsProcessing(unit);
-  return !manualShardIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id && unit.feature_id);
+  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
-function workflowCanPause(unit: FlightDeckWorkUnit): boolean {
-  if (workflowType(unit) === 'integration') return !unit.workflow_deleted && workflowIsProcessing(unit);
-  return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id && unit.feature_id);
+function workflowCanPause(unit: SupervisorWorkUnitProjection): boolean {
+  return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
 }
 
-function workflowCanRegenerate(unit: FlightDeckWorkUnit): boolean {
+function workflowCanRegenerate(unit: SupervisorWorkUnitProjection): boolean {
+  return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
+}
+
+function workflowCanDelete(unit: SupervisorWorkUnitProjection): boolean {
   const type = workflowType(unit);
-  if (type === 'integration') return !unit.workflow_deleted && Boolean(unit.workflow_run_id);
-  if (type === 'manual_shard') return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
-  return (type === 'feature_development' || type === 'refine') && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.feature_id);
+  if (type === 'integration') return false;
+  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted;
 }
 
-function workflowCanDelete(unit: FlightDeckWorkUnit): boolean {
-  const type = workflowType(unit);
-  if (type === 'manual_shard') return !manualShardIsIntegrationInput(unit) && !unit.workflow_deleted && Boolean(unit.feature_id);
-  if (type === 'refine') return !unit.workflow_deleted && Boolean(unit.feature_id);
-  if (type === 'feature_development') return !unit.workflow_deleted && Boolean(unit.feature_id);
-  return false;
+function workflowDeleteLabel(unit: SupervisorWorkUnitProjection): string {
+  return workflowType(unit) === 'feature' ? 'Unqueue' : 'Delete';
 }
 
-function workflowDeleteLabel(unit: FlightDeckWorkUnit): string {
-  return workflowType(unit) === 'feature_development' ? 'Unqueue' : 'Delete';
+function workflowCanStageToIntegration(unit: SupervisorWorkUnitProjection): boolean {
+  return ['feature', 'manual'].includes(workflowType(unit))
+    && !unit.workflow_deleted
+    && unit.integration_state === 'available'
+    && workUnitHasStagedChanges(unit);
 }
 
-function workflowCanStageManual(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard' && !unit.workflow_deleted && Boolean(unit.feature_id) && !manualShardIsIntegrationInput(unit) && manualShardHasStagedChanges(unit);
-}
-
-function workflowCanUnstageManual(unit: FlightDeckWorkUnit): boolean {
-  return workflowType(unit) === 'manual_shard' && !unit.workflow_deleted && Boolean(unit.feature_id) && manualShardIsIntegrationInput(unit);
+function workflowCanUnstageFromIntegration(unit: SupervisorWorkUnitProjection): boolean {
+  return ['feature', 'manual'].includes(workflowType(unit))
+    && !unit.workflow_deleted
+    && unit.integration_state !== 'available';
 }
 
 function WorkflowProjectionCard(props: {
-  unit: FlightDeckWorkUnit;
-  supervisor: FlightDeckSupervisor;
+  unit: SupervisorWorkUnitProjection;
+  supervisor: SupervisorProjection;
   compact?: boolean;
   navigate?: (path: string) => void;
   onActionComplete?: () => void;
 }) {
   const { unit, navigate } = props;
+  const telemetryHydrating = workflowTelemetryHydrating(unit);
   const stages = buildStageProjection(unit);
   const capabilities = buildCapabilityProjection(unit);
   const recentStageExecutions = telemetryArray(unit, 'recent_stage_executions');
   const [historyAnchor, setHistoryAnchor] = useState<EventHistoryAnchor | null>(null);
   const [historyHydration, setHistoryHydration] = useState<WorkflowCardHistoryHydration | null>(null);
   const [hydratedRunId, setHydratedRunId] = useState<string | null>(null);
+  const [archiveIntegratedWorkflows, setArchiveIntegratedWorkflows] = useState(false);
+  const pendingSupervisorActions = usePendingSupervisorActions(props.supervisor.id);
+  const pendingAction = pendingSupervisorActions.find((pending) => pendingActionTargetsWorkUnit(pending, unit)) ?? null;
   const openCapabilityHistory = (capability: CapabilityProjection) => {
     if (!unit.workflow_run_id) return;
     setHistoryAnchor({
@@ -983,6 +1090,11 @@ function WorkflowProjectionCard(props: {
       capabilityInvocationId: null,
     });
   };
+
+  useEffect(() => {
+    setHistoryHydration(null);
+    setHydratedRunId(null);
+  }, [unit.workflow_run_id]);
 
   useEffect(() => {
     const runId = unit.workflow_run_id;
@@ -1009,11 +1121,8 @@ function WorkflowProjectionCard(props: {
 
   const displayCapabilities = capabilities.length > 0 ? capabilities : historyHydration?.capabilities ?? [];
   const displayFallbackStages = recentStageExecutions.length > 0 ? [] : historyHydration?.stages ?? [];
-  const integrationState = normalize(unit.state);
   const canApplyFinalPatch = workflowType(unit) === 'integration'
-    && !unit.workflow_deleted
-    && Boolean(unit.workflow_run_id)
-    && ['patch_ready', 'integrated', 'ready_to_apply'].includes(integrationState);
+    && unit.integration_apply_available;
 
 
   const title = unit.workflow_run_id ? (
@@ -1036,6 +1145,7 @@ function WorkflowProjectionCard(props: {
   );
 
   async function runWorkflowAction(action: 'start_work_unit' | 'pause_work_unit' | 'regenerate_work_unit' | 'delete_work_unit' | 'stage_work_unit' | 'unstage_work_unit' | 'apply_integration' | 'cancel') {
+    if (pendingAction) return;
     if (action === 'regenerate_work_unit') {
       const confirmed = workflowType(unit) === 'refine'
         ? window.confirm(`Delete and recreate the refine workflow for ${unit.title}?`)
@@ -1049,7 +1159,7 @@ function WorkflowProjectionCard(props: {
       if (!confirmed) return;
     }
     if (action === 'stage_work_unit') {
-      const confirmed = window.confirm(`Stage ${unit.title} to the integration pool? Backend validation requires staged git changes for manual shards.`);
+      const confirmed = window.confirm(`Add the staged changes from ${unit.title} to the integration workflow?`);
       if (!confirmed) return;
     }
     if (action === 'unstage_work_unit') {
@@ -1057,7 +1167,10 @@ function WorkflowProjectionCard(props: {
       if (!confirmed) return;
     }
     if (action === 'apply_integration') {
-      const confirmed = window.confirm('Apply the final integration patch to the root repository?');
+      const archiveMessage = archiveIntegratedWorkflows
+        ? ' The integrated Feature/Manual workflows will be archived after the patch is applied successfully.'
+        : ' The integrated Feature/Manual workflows will remain in the integration pool for further iteration.';
+      const confirmed = window.confirm(`Apply the final integration patch to the root repository?${archiveMessage}`);
       if (!confirmed) return;
     }
     if (action === 'cancel') {
@@ -1067,7 +1180,13 @@ function WorkflowProjectionCard(props: {
 
     if (action === 'stage_work_unit' || action === 'unstage_work_unit') {
       await runSupervisorAction(props.supervisor.id, { action: 'stage_work_unit', work_unit_id: unit.id, staged: action === 'stage_work_unit' });
-    } else if (action === 'apply_integration' || action === 'cancel') {
+    } else if (action === 'apply_integration') {
+      await runSupervisorAction(props.supervisor.id, {
+        action,
+        work_unit_id: unit.id,
+        archive_integrated_workflows: archiveIntegratedWorkflows,
+      });
+    } else if (action === 'cancel') {
       await runSupervisorAction(props.supervisor.id, { action });
     } else {
       await runSupervisorAction(props.supervisor.id, { action, work_unit_id: unit.id });
@@ -1075,13 +1194,24 @@ function WorkflowProjectionCard(props: {
     props.onActionComplete?.();
   }
 
+  const materializationLabel = workflowMaterializationLabel(unit);
+  const materializationActive = workflowIsMaterializing(unit) || workflowIsRegenerating(unit);
+  const actionPending = pendingAction !== null;
+  const actionLabel = pendingAction ? pendingSupervisorActionLabel(pendingAction) : null;
+  const actionTone = pendingAction ? pendingSupervisorActionTone(pendingAction) : null;
   const workflowHeaderState = normalize(telemetryString(unit, 'status') || unit.state);
-  const workflowHeaderWaiting = ['waiting', 'waiting_user', 'paused'].includes(workflowHeaderState);
-  const workflowHeaderActive = ['queued', 'running', 'active'].includes(workflowHeaderState);
-  const workflowHeaderAnimated = workflowHeaderWaiting || workflowHeaderActive;
-  const workflowHeaderColor = workflowHeaderWaiting
-    ? '250, 176, 5'
-    : '34, 139, 230';
+  const workflowHeaderWaiting = ['waiting', 'paused'].includes(workflowHeaderState);
+  const workflowHeaderActive = actionPending || materializationActive || ['queued', 'running', 'active'].includes(workflowHeaderState);
+  const workflowHeaderAnimated = telemetryHydrating || workflowHeaderWaiting || workflowHeaderActive;
+  const workflowHeaderColor = telemetryHydrating
+    ? '34, 139, 230'
+    : actionTone === 'red'
+      ? '250, 82, 82'
+      : actionTone === 'yellow' || materializationActive || workflowIsMaterializationPending(unit)
+        ? '250, 176, 5'
+        : workflowHeaderWaiting
+          ? '250, 176, 5'
+          : '34, 139, 230';
 
   return (
     <Card
@@ -1090,15 +1220,30 @@ function WorkflowProjectionCard(props: {
       p="sm"
       style={{
         background: 'linear-gradient(135deg, rgba(39, 42, 48, 0.96), rgba(31, 34, 39, 0.94))',
-        borderColor: `var(--mantine-color-${tone(unit.state)}-7)`,
+        borderColor: telemetryHydrating
+          ? 'var(--mantine-color-blue-7)'
+          : `var(--mantine-color-${tone(unit.state)}-7)`,
         marginLeft: props.compact ? 16 : 0,
+        minHeight: 188,
+        transition: 'border-color 220ms ease, box-shadow 220ms ease, background-color 220ms ease',
       }}
     >
       <Stack gap="sm">
         <style>{`
-          @keyframes flight-deck-workflow-header-flow {
+          @keyframes supervisor-workflow-header-flow {
             0% { background-position: 0% 50%; }
             100% { background-position: 200% 50%; }
+          }
+
+          @keyframes supervisor-work-unit-content-in {
+            0% {
+              opacity: 0;
+              transform: translateY(4px);
+            }
+            100% {
+              opacity: 1;
+              transform: translateY(0);
+            }
           }
         `}</style>
         <div
@@ -1119,11 +1264,13 @@ function WorkflowProjectionCard(props: {
                   ? `1px solid rgba(${workflowHeaderColor}, 0.46)`
                   : '1px solid transparent',
                 borderRadius: 'var(--mantine-radius-sm)',
-                backgroundColor: workflowHeaderWaiting
-                  ? 'rgba(250, 176, 5, 0.10)'
-                  : workflowHeaderActive
-                    ? 'rgba(34, 139, 230, 0.10)'
-                    : 'transparent',
+                backgroundColor: actionTone === 'red'
+                  ? 'rgba(250, 82, 82, 0.10)'
+                  : actionTone === 'yellow' || materializationActive || workflowIsMaterializationPending(unit) || workflowHeaderWaiting
+                    ? 'rgba(250, 176, 5, 0.10)'
+                    : workflowHeaderActive
+                      ? 'rgba(34, 139, 230, 0.10)'
+                      : 'transparent',
                 backgroundImage: workflowHeaderAnimated
                   ? `linear-gradient(
                       105deg,
@@ -1139,74 +1286,145 @@ function WorkflowProjectionCard(props: {
                   ? `inset 2px 0 0 rgba(${workflowHeaderColor}, 0.78)`
                   : 'none',
                 animation: workflowHeaderAnimated
-                  ? 'flight-deck-workflow-header-flow 3.6s linear infinite'
+                  ? 'supervisor-workflow-header-flow 3.6s linear infinite'
                   : undefined,
               }}
             >
               <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
                 <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
                   <Badge
-                    color={tone(workflowHeaderState)}
+                    color={telemetryHydrating ? 'blue' : actionTone ?? (materializationActive || workflowIsMaterializationPending(unit) ? 'yellow' : tone(actionPending ? 'running' : workflowHeaderState))}
                     variant="filled"
                   >
-                    {titleCase(workflowHeaderState)}
+                    <Group gap={5} wrap="nowrap">
+                      {telemetryHydrating || actionPending || materializationActive ? <Loader size={10} color="white" /> : null}
+                      <span>{telemetryHydrating ? 'Rendering' : actionLabel ?? materializationLabel ?? titleCase(workflowHeaderState)}</span>
+                    </Group>
                   </Badge>
                   {title}
                   {unit.workflow_deleted ? <Badge color="red" variant="outline">Deleted</Badge> : null}
+                  {!unit.workflow_run_id && workflowIsMaterializationPending(unit) && !workflowIsRegenerating(unit) ? <Badge color="yellow" variant="light">Waiting to start</Badge> : null}
                   {unit.patch_id ? <Badge color="violet" variant="light">Patch {unit.patch_id.slice(0, 8)}</Badge> : null}
                 </Group>
                 <Group gap={6} wrap="nowrap">
-                  {workflowCanUnstageManual(unit) ? (
-                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('unstage_work_unit')}>Unstage from integration pool</Button>
+                  {workflowCanUnstageFromIntegration(unit) ? (
+                    <Button size="compact-xs" color="yellow" variant="outline" loading={pendingAction?.action === 'stage_work_unit' && pendingAction.request.action === 'stage_work_unit' && pendingAction.request.staged === false} disabled={actionPending} onClick={() => void runWorkflowAction('unstage_work_unit')}>Remove from integration</Button>
                   ) : null}
                   {workflowCanPause(unit) ? (
-                    <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
+                    <Button size="compact-xs" variant="default" loading={pendingAction?.action === 'pause_work_unit' || pendingAction?.action === 'cancel'} disabled={actionPending} onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
                   ) : workflowCanRun(unit) ? (
-                    <Button size="compact-xs" variant="default" onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
+                    <Button size="compact-xs" variant="default" loading={pendingAction?.action === 'start_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
                   ) : null}
                   {workflowCanRegenerate(unit) ? (
-                    <Button size="compact-xs" color="yellow" variant="outline" onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
+                    <Button size="compact-xs" color="yellow" variant="outline" loading={pendingAction?.action === 'regenerate_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
                   ) : null}
-                  {workflowCanStageManual(unit) ? (
-                    <Button size="compact-xs" color="green" variant="outline" onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to integration pool</Button>
+                  {workflowCanStageToIntegration(unit) ? (
+                    <Button size="compact-xs" color="green" variant="outline" loading={pendingAction?.action === 'stage_work_unit' && pendingAction.request.action === 'stage_work_unit' && pendingAction.request.staged !== false} disabled={actionPending} onClick={() => void runWorkflowAction('stage_work_unit')}>Add staged changes to integration</Button>
                   ) : null}
                   {workflowCanDelete(unit) ? (
-                    <Button size="compact-xs" color="red" variant="outline" onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
+                    <Button size="compact-xs" color="red" variant="outline" loading={pendingAction?.action === 'delete_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
                   ) : null}
                 </Group>
               </Group>
             </Box>
-            <Group gap="xs" wrap="nowrap">
-              <Text fw={800} size="sm">Workflow stages</Text>
-              <Badge variant="light" size="xs">Progression</Badge>
-            </Group>
-            <StageRail stages={stages} />
-            {canApplyFinalPatch ? (
-              <Group justify="center" mt="sm">
+            {telemetryHydrating ? (
+              <Stack gap="xs" mih={104}>
+                <Group gap="xs" wrap="nowrap">
+                  <Text fw={800} size="sm" c="dimmed">Workflow stages</Text>
+                  <Badge variant="light" size="xs" color="gray">Loading</Badge>
+                </Group>
+                <Group gap="sm" wrap="nowrap" align="flex-start">
+                  <Skeleton radius="md" h={74} w={144} />
+                  <Skeleton radius="md" h={74} w={144} />
+                  <Skeleton radius="md" h={74} w={144} />
+                </Group>
+              </Stack>
+            ) : (
+              <Box
+                style={{
+                  minHeight: 104,
+                  animation: 'supervisor-work-unit-content-in 220ms ease-out both',
+                }}
+              >
+                {stages.length > 0 ? (
+                  <Stack gap="xs">
+                    <Group gap="xs" wrap="nowrap">
+                      <Text fw={800} size="sm">Workflow stages</Text>
+                      <Badge variant="light" size="xs">Progression</Badge>
+                    </Group>
+                    <StageRail stages={stages} />
+                  </Stack>
+                ) : null}
+              </Box>
+            )}
+            {!telemetryHydrating && canApplyFinalPatch ? (
+              <Group gap="md" align="center" justify="center" wrap="wrap" mt="sm">
                 <Button
                   size="md"
                   color="green"
                   variant="filled"
+                  loading={pendingAction?.action === 'apply_integration'}
+                  disabled={actionPending}
                   onClick={() => void runWorkflowAction('apply_integration')}
                   style={{ minWidth: 260 }}
                 >
-                  Apply final patch to root
+                  Apply Integration to root
                 </Button>
+                <Tooltip label="Archive integrated Feature and Manual workflows after successful apply">
+                  <Checkbox
+                    checked={archiveIntegratedWorkflows}
+                    onChange={(event) => setArchiveIntegratedWorkflows(event.currentTarget.checked)}
+                    disabled={actionPending}
+                    label="Archive workflows"
+                  />
+                </Tooltip>
               </Group>
             ) : null}
           </Stack>
-          <Stack gap={6} style={{ minWidth: 0 }}>
-            <Text fw={800} size="sm">Capability execution</Text>
-            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
-              <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
-            </ScrollArea.Autosize>
-          </Stack>
-          <Stack gap={6} style={{ minWidth: 0 }}>
-            <Text fw={800} size="sm">Stage execution</Text>
-            <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
-              <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
-            </ScrollArea.Autosize>
-          </Stack>
+          {telemetryHydrating ? (
+            <Stack gap={8} style={{ minWidth: 0 }} mih={132}>
+              <Text fw={800} size="sm" c="dimmed">Capability execution</Text>
+              <Skeleton h={18} radius="sm" />
+              <Skeleton h={18} radius="sm" w="88%" />
+              <Skeleton h={18} radius="sm" w="72%" />
+            </Stack>
+          ) : (
+            <Stack
+              gap={6}
+              style={{
+                minWidth: 0,
+                minHeight: 132,
+                animation: 'supervisor-work-unit-content-in 240ms ease-out both',
+              }}
+            >
+              <Text fw={800} size="sm">Capability execution</Text>
+              <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+                <CapabilityStrip capabilities={displayCapabilities} onOpenHistory={openCapabilityHistory} />
+              </ScrollArea.Autosize>
+            </Stack>
+          )}
+          {telemetryHydrating ? (
+            <Stack gap={8} style={{ minWidth: 0 }} mih={132}>
+              <Text fw={800} size="sm" c="dimmed">Stage execution</Text>
+              <Skeleton h={18} radius="sm" />
+              <Skeleton h={18} radius="sm" w="84%" />
+              <Skeleton h={18} radius="sm" w="68%" />
+            </Stack>
+          ) : (
+            <Stack
+              gap={6}
+              style={{
+                minWidth: 0,
+                minHeight: 132,
+                animation: 'supervisor-work-unit-content-in 260ms ease-out both',
+              }}
+            >
+              <Text fw={800} size="sm">Stage execution</Text>
+              <ScrollArea.Autosize mah={240} offsetScrollbars scrollbarSize={6}>
+                <RecentStageStrip unit={unit} fallbackStages={displayFallbackStages} onOpenHistory={openStageHistory} />
+              </ScrollArea.Autosize>
+            </Stack>
+          )}
         </div>
 
         <EventHistoryModal anchor={historyAnchor} onClose={() => setHistoryAnchor(null)} />
@@ -1273,7 +1491,7 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
     );
   }
 
-  if (props.groupKey === 'feature_development') {
+  if (props.groupKey === 'feature') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         <PoolSelectControl label="Template" ariaLabel="Feature template" data={props.templateOptions} value={templateValue} onChange={(value) => props.onSettingsChange({ template_id: value })} width={160} searchable />
@@ -1283,7 +1501,7 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
     );
   }
 
-  if (props.groupKey === 'manual_shard') {
+  if (props.groupKey === 'manual') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         <PoolSelectControl label="Template" ariaLabel="Manual template" data={props.templateOptions} value={templateValue} onChange={(value) => props.onSettingsChange({ template_id: value })} width={160} searchable />
@@ -1303,31 +1521,35 @@ function PoolControls(props: { groupKey: string; templateOptions: TemplateOption
   return null;
 }
 
-function manualShardIsStaged(unit: FlightDeckWorkUnit): boolean {
-  return manualShardIsIntegrationInput(unit);
+function manualShardIsStaged(unit: SupervisorWorkUnitProjection): boolean {
+  return workUnitIsIntegrationInput(unit);
 }
 
-function featureIsIntegrationReady(unit: FlightDeckWorkUnit): boolean {
-  return ['patch_ready', 'ready_for_integration', 'development_succeeded'].includes(normalize(unit.state))
-    && Boolean(unit.shard_path?.trim());
+function integrationInputIsReady(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.has_staged_changes && Boolean(unit.workspace_path?.trim());
 }
 
-function integrationInputIsSkipped(unit: FlightDeckWorkUnit): boolean {
-  return unit.telemetry?.integration_skipped === true;
+function integrationInputIsSkipped(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.integration_state === 'skipped';
 }
 
-function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
-  const features = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'feature_development' && !unit.workflow_deleted);
-  const manual = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'manual_shard' && !unit.workflow_deleted);
-  const manualStaged = manual.filter(manualShardIsStaged);
-  const manualUnstaged = manual.filter((unit) => !manualShardIsStaged(unit));
-  const skippedFeatures = features.filter(integrationInputIsSkipped);
-  const includedFeatures = features.filter((unit) => !integrationInputIsSkipped(unit));
-  const skippedManualStaged = manualStaged.filter(integrationInputIsSkipped);
-  const includedManualStaged = manualStaged.filter((unit) => !integrationInputIsSkipped(unit));
-  const readyManualStaged = includedManualStaged.filter(manualShardHasStagedChanges);
-  const readyFeatures = includedFeatures.filter(featureIsIntegrationReady);
-  const pendingFeatures = includedFeatures.filter((unit) => !featureIsIntegrationReady(unit));
+function integrationReadinessModel(supervisor: SupervisorProjection) {
+  const features = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'feature' && !unit.workflow_deleted);
+  const manual = supervisor.work_units.filter((unit) => (unit.workflow_type ?? unit.kind) === 'manual' && !unit.workflow_deleted);
+
+  const stagedFeatures = features.filter(workUnitIsIntegrationInput);
+  const unstagedFeatures = features.filter((unit) => !workUnitIsIntegrationInput(unit));
+  const stagedManual = manual.filter(workUnitIsIntegrationInput);
+  const unstagedManual = manual.filter((unit) => !workUnitIsIntegrationInput(unit));
+
+  const skippedFeatures = stagedFeatures.filter(integrationInputIsSkipped);
+  const includedFeatures = stagedFeatures.filter((unit) => !integrationInputIsSkipped(unit));
+  const skippedManualStaged = stagedManual.filter(integrationInputIsSkipped);
+  const includedManualStaged = stagedManual.filter((unit) => !integrationInputIsSkipped(unit));
+
+  const readyManualStaged = includedManualStaged.filter(integrationInputIsReady);
+  const readyFeatures = includedFeatures.filter(integrationInputIsReady);
+  const pendingFeatures = includedFeatures.filter((unit) => !integrationInputIsReady(unit));
   const blockedFeatures = includedFeatures.filter((unit) => ['blocked', 'failed'].includes(normalize(unit.state)));
   const skippedTotal = skippedFeatures.length + skippedManualStaged.length;
   const relevantTotal = includedFeatures.length + includedManualStaged.length;
@@ -1337,8 +1559,10 @@ function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
   return {
     features,
     manual,
-    manualStaged,
-    manualUnstaged,
+    stagedFeatures,
+    unstagedFeatures,
+    manualStaged: stagedManual,
+    manualUnstaged: unstagedManual,
     skippedFeatures,
     includedFeatures,
     skippedManualStaged,
@@ -1353,63 +1577,43 @@ function integrationReadinessModel(supervisor: FlightDeckSupervisor) {
   };
 }
 
-function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onActionComplete?: () => void; expanded?: boolean }) {
+function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onActionComplete?: () => void; expanded?: boolean }) {
   const [opened, setOpened] = useState(false);
-  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const pendingActions = usePendingSupervisorActions(props.supervisor.id);
   const model = integrationReadinessModel(props.supervisor);
   const readyWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.readyTotal / model.relevantTotal) * 100))}%` : '0%';
   const pendingWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.pendingFeatures.length / model.relevantTotal) * 100))}%` : '0%';
   const blockedWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.blockedFeatures.length / model.relevantTotal) * 100))}%` : '0%';
 
-  async function skipFeature(unit: FlightDeckWorkUnit) {
+  async function skipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     const confirmed = window.confirm(`Skip ${unit.title} for this integration input set?`);
     if (!confirmed) return;
-    setBusyKey(unit.id);
-    try {
-      await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
-      props.onActionComplete?.();
-    } finally {
-      setBusyKey(null);
-    }
+    await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
+    props.onActionComplete?.();
   }
 
-  async function unskipFeature(unit: FlightDeckWorkUnit) {
+  async function unskipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
-    setBusyKey(unit.id);
-    try {
-      await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
-      props.onActionComplete?.();
-    } finally {
-      setBusyKey(null);
-    }
+    await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
+    props.onActionComplete?.();
   }
 
-  async function skipManualShard(unit: FlightDeckWorkUnit) {
+  async function skipManualShard(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     const confirmed = window.confirm(`Skip manual shard ${unit.title} for this integration input set?`);
     if (!confirmed) return;
-    setBusyKey(unit.id);
-    try {
-      await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
-      props.onActionComplete?.();
-    } finally {
-      setBusyKey(null);
-    }
+    await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
+    props.onActionComplete?.();
   }
 
-  async function unskipManualShard(unit: FlightDeckWorkUnit) {
+  async function unskipManualShard(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
-    setBusyKey(unit.id);
-    try {
-      await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
-      props.onActionComplete?.();
-    } finally {
-      setBusyKey(null);
-    }
+    await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
+    props.onActionComplete?.();
   }
 
-  function inputRow(unit: FlightDeckWorkUnit, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
+  function inputRow(unit: SupervisorWorkUnitProjection, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
     const skipped = bucket === 'skipped_feature' || bucket === 'skipped_manual';
     const ready = bucket === 'ready_feature' || bucket === 'staged_manual' || bucket === 'skipped_manual';
     const blocked = bucket === 'blocked_feature';
@@ -1417,6 +1621,8 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
     const relevant = bucket !== 'unstaged_manual';
     const canSkip = Boolean(unit.feature_id) && relevant && !skipped;
     const canUnskip = Boolean(unit.feature_id) && skipped;
+    const pendingAction = pendingActions.find((pending) => pending.work_unit_id === unit.id && ['skip_integration_input', 'unskip_integration_input'].includes(pending.action)) ?? null;
+    const busy = pendingAction !== null;
     return (
       <Paper key={`${bucket}-${unit.id}`} withBorder radius="md" p="sm" style={{ background: 'rgba(255,255,255,0.025)' }}>
         <Group justify="space-between" gap="sm" align="center" wrap="nowrap">
@@ -1435,19 +1641,19 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
             </Group>
           </Stack>
           {manual && canUnskip ? (
-            <Button size="compact-xs" color="green" variant="outline" disabled={busyKey === unit.id} loading={busyKey === unit.id} onClick={() => void unskipManualShard(unit)}>
+            <Button size="compact-xs" color="green" variant="outline" disabled={busy} loading={busy} onClick={() => void unskipManualShard(unit)}>
               Unskip shard
             </Button>
           ) : manual ? (
-            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busyKey === unit.id} loading={busyKey === unit.id} onClick={() => void skipManualShard(unit)}>
+            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy} loading={busy} onClick={() => void skipManualShard(unit)}>
               Skip shard
             </Button>
           ) : canUnskip ? (
-            <Button size="compact-xs" color="green" variant="outline" disabled={busyKey === unit.id} loading={busyKey === unit.id} onClick={() => void unskipFeature(unit)}>
+            <Button size="compact-xs" color="green" variant="outline" disabled={busy} loading={busy} onClick={() => void unskipFeature(unit)}>
               Unskip feature
             </Button>
           ) : (
-            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busyKey === unit.id} loading={busyKey === unit.id} onClick={() => void skipFeature(unit)}>
+            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy} loading={busy} onClick={() => void skipFeature(unit)}>
               Skip feature
             </Button>
           )}
@@ -1466,6 +1672,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
             <Badge size="xs" color="yellow" variant="light">Pending {model.pendingFeatures.length}</Badge>
             <Badge size="xs" color="red" variant="light">Blocked {model.blockedFeatures.length}</Badge>
             <Badge size="xs" color="gray" variant="outline">Skipped {model.skippedTotal}</Badge>
+            <Badge size="xs" color="gray" variant="outline">Unstaged feature {model.unstagedFeatures.length}</Badge>
             <Badge size="xs" color="gray" variant="outline">Unstaged manual {model.manualUnstaged.length}</Badge>
           </Group>
           <Text size="xs" c="gray.4">{model.readyPct}% ready</Text>
@@ -1503,7 +1710,7 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
                   {model.pendingFeatures.map((unit) => inputRow(unit, 'pending_feature'))}
                   {model.blockedFeatures.map((unit) => inputRow(unit, 'blocked_feature'))}
                   {model.skippedFeatures.map((unit) => inputRow(unit, 'skipped_feature'))}
-                  {model.features.length === 0 ? <Text size="sm" c="dimmed">No feature workflows are scheduled.</Text> : null}
+                  {model.stagedFeatures.length === 0 ? <Text size="sm" c="dimmed">No feature work is staged for integration.</Text> : null}
                 </Stack>
               </ScrollArea>
             </Stack>
@@ -1530,35 +1737,70 @@ function IntegrationReadinessBar(props: { supervisor: FlightDeckSupervisor; onAc
 }
 
 function ManualPoolWorkflowList(props: {
-  units: FlightDeckWorkUnit[];
-  supervisor: FlightDeckSupervisor;
+  units: SupervisorWorkUnitProjection[];
+  supervisor: SupervisorProjection;
   navigate?: (path: string) => void;
   onActionComplete?: () => void;
-  pendingManualShardName?: string | null;
 }) {
   const staged = props.units.filter(manualShardIsStaged);
   const unstaged = props.units.filter((unit) => !manualShardIsStaged(unit));
+  const pendingActions = usePendingSupervisorActions(props.supervisor.id);
+  const pendingManualCreates = pendingActions.filter(
+    (pending) => pending.request.action === 'create_work_unit' && pending.request.pool_kind === 'manual'
+  );
+  const pendingManualNames = pendingManualCreates
+    .map((pending) => pending.request.action === 'create_work_unit' ? pending.request.name.trim() : '')
+    .filter((name) => name && !unstaged.some((unit) => unit.title === name));
+  const visibleUnstagedCount = unstaged.length + pendingManualNames.length;
 
   return (
     <Stack gap="sm">
-      {props.pendingManualShardName ? (
-        <Paper withBorder radius="lg" p="sm" style={{ marginLeft: 16, borderColor: 'var(--mantine-color-yellow-5)', background: 'rgba(250,176,5,0.08)' }}>
-          <Group gap="xs" wrap="nowrap">
-            <Badge color="yellow">Creating</Badge>
-            <Text fw={900} size="sm" truncate>{props.pendingManualShardName}</Text>
-            <Text size="xs" c="dimmed">Creating manual shard workflow...</Text>
-          </Group>
-        </Paper>
-      ) : null}
-      {unstaged.length > 0 ? (
+      {visibleUnstagedCount > 0 ? (
         <Stack gap="xs">
           <Group gap="xs">
             <Text fw={900} size="xs" tt="uppercase" c="gray.3">Unstaged manual workflows</Text>
             <Badge size="xs" color="gray" variant="outline">Not in integration input</Badge>
-            <Badge size="xs" color="gray">{unstaged.length}</Badge>
+            <Badge size="xs" color="gray">{visibleUnstagedCount}</Badge>
           </Group>
           {unstaged.map((unit) => (
             <WorkflowProjectionCard key={unit.id} unit={unit} supervisor={props.supervisor} compact navigate={props.navigate} onActionComplete={props.onActionComplete} />
+          ))}
+          {pendingManualNames.map((name) => (
+            <Card
+              key={`pending-manual:${name}`}
+              withBorder
+              radius="lg"
+              p="sm"
+              style={{
+                marginLeft: 16,
+                background: 'linear-gradient(135deg, rgba(39, 42, 48, 0.96), rgba(31, 34, 39, 0.94))',
+                borderColor: 'var(--mantine-color-yellow-7)',
+              }}
+            >
+              <Stack gap="sm">
+                <Box
+                  px="xs"
+                  py={6}
+                  style={{
+                    border: '1px solid rgba(250, 176, 5, 0.46)',
+                    borderRadius: 'var(--mantine-radius-sm)',
+                    backgroundColor: 'rgba(250, 176, 5, 0.10)',
+                    boxShadow: 'inset 2px 0 0 rgba(250, 176, 5, 0.78)',
+                  }}
+                >
+                  <Group gap="xs" wrap="nowrap">
+                    <Badge color="yellow" variant="filled">
+                      <Group gap={5} wrap="nowrap">
+                        <Loader size={10} color="white" />
+                        <span>Creating</span>
+                      </Group>
+                    </Badge>
+                    <Text fw={900} size="md" c="gray.0" truncate>{name}</Text>
+                  </Group>
+                </Box>
+                <Text size="sm" c="dimmed" px="xs">Creating manual workflow...</Text>
+              </Stack>
+            </Card>
           ))}
         </Stack>
       ) : null}
@@ -1579,17 +1821,18 @@ function ManualPoolWorkflowList(props: {
   );
 }
 
-function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit[]; supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void; onManualShardCreating?: (name: string | null) => void }) {
-  const childRunning = props.units.some((unit) => unit.state === 'running' || unit.state === 'integrating');
-  const poolRunning = props.groupKey === 'feature_development' && props.supervisor.status === 'running_children';
-  const poolPaused = props.groupKey === 'feature_development' && props.supervisor.status === 'paused';
-  const running = props.groupKey === 'feature_development' ? poolRunning : childRunning;
+function WorkPoolActionRail(props: { groupKey: string; units: SupervisorWorkUnitProjection[]; supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
+  const childRunning = props.units.some((unit) => unit.state === 'running');
+  const poolRunning = props.groupKey === 'feature' && props.supervisor.status === 'running_children';
+  const poolPaused = props.groupKey === 'feature' && props.supervisor.status === 'paused';
+  const running = props.groupKey === 'feature' ? poolRunning : childRunning;
   const queued = props.units.some((unit) => unit.state === 'queued');
-  const waiting = props.units.some((unit) => unit.state === 'waiting_user');
+  const waiting = props.units.some((unit) => unit.state === 'waiting');
   const settings = poolSetting(props.supervisor, props.groupKey);
   const selectedTemplate = settings.template_id ?? null;
-  const [manualBusy, setManualBusy] = useState(false);
-  const [featurePoolBusy, setFeaturePoolBusy] = useState(false);
+  const pendingActions = usePendingSupervisorActions(props.supervisor.id);
+  const manualBusy = pendingActions.some((pending) => pending.action === 'create_work_unit' && pending.request.action === 'create_work_unit' && pending.request.pool_kind === 'manual');
+  const featurePoolBusy = pendingActions.some((pending) => pending.action === 'pause_feature_pool' || pending.action === 'resume_feature_pool');
   const [manualNameOpen, setManualNameOpen] = useState(false);
   const [manualName, setManualName] = useState('');
   async function updateSettings(patch: SupervisorPoolConfig) {
@@ -1601,51 +1844,39 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
 
   async function createManualShard() {
     const name = manualName.trim() || `Manual shard ${props.units.length + 1}`;
-    setManualBusy(true);
-    props.onManualShardCreating?.(name);
-    try {
-      await runSupervisorAction(props.supervisor.id, {
-        action: 'create_work_unit',
-        pool_kind: 'manual_shard',
-        name,
-        template_id: selectedTemplate
-      });
-      setManualName('');
-      setManualNameOpen(false);
-      props.onActionComplete?.();
-    } finally {
-      setManualBusy(false);
-      props.onManualShardCreating?.(null);
-    }
+    await runSupervisorAction(props.supervisor.id, {
+      action: 'create_work_unit',
+      pool_kind: 'manual',
+      name,
+      template_id: selectedTemplate
+    });
+    setManualName('');
+    setManualNameOpen(false);
+    props.onActionComplete?.();
   }
 
   async function runFeaturePoolAction() {
     if (featurePoolBusy) return;
-
-    setFeaturePoolBusy(true);
-    try {
-      await runSupervisorAction(props.supervisor.id, {
-        action: running ? 'pause_feature_pool' : 'resume_feature_pool',
-      });
-      props.onActionComplete?.();
-    } finally {
-      setFeaturePoolBusy(false);
-    }
+    await runSupervisorAction(props.supervisor.id, {
+      action: running ? 'pause_feature_pool' : 'resume_feature_pool',
+    });
+    props.onActionComplete?.();
   }
 
   if (props.groupKey === 'integration') {
     const readiness = integrationReadinessModel(props.supervisor);
     const canRunIntegration = readiness.relevantTotal > 0 && readiness.readyTotal === readiness.relevantTotal && !running;
     const integrationWorkUnitId = `${props.supervisor.id}:integration`;
+    const integrationBusy = pendingActions.some((pending) => pending.action === 'start_work_unit' && pending.work_unit_id === integrationWorkUnitId);
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
-        <Button size="xs" variant="default" disabled={!canRunIntegration} onClick={() => void runSupervisorAction(props.supervisor.id, { action: 'start_work_unit', work_unit_id: integrationWorkUnitId }).then(() => props.onActionComplete?.())}>Run integration</Button>
+        <Button size="xs" variant="default" loading={integrationBusy} disabled={!canRunIntegration || integrationBusy} onClick={() => void runSupervisorAction(props.supervisor.id, { action: 'start_work_unit', work_unit_id: integrationWorkUnitId }).then(() => props.onActionComplete?.())}>Run integration</Button>
       </Group>
     );
   }
 
-  if (props.groupKey === 'feature_development') {
+  if (props.groupKey === 'feature') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
@@ -1680,7 +1911,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
     );
   }
 
-  if (props.groupKey === 'manual_shard') {
+  if (props.groupKey === 'manual') {
     return (
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
@@ -1688,7 +1919,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
           <TextInput
             size="xs"
             autoFocus
-            placeholder="Shard name"
+            placeholder="Work unit name"
             value={manualName}
             onChange={(event) => setManualName(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -1704,7 +1935,7 @@ function WorkPoolActionRail(props: { groupKey: string; units: FlightDeckWorkUnit
         {manualNameOpen ? (
           <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
         ) : (
-          <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New shard</Button>
+          <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New work unit</Button>
         )}
       </Group>
     );
@@ -1723,15 +1954,13 @@ function WorkPoolProjectionSection(props: {
   title: string;
   description: string;
   empty: string;
-  units: FlightDeckWorkUnit[];
-  supervisor: FlightDeckSupervisor;
+  units: SupervisorWorkUnitProjection[];
+  supervisor: SupervisorProjection;
   navigate?: (path: string) => void;
-  onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void;
+  onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void;
   onActionComplete?: () => void;
   templateOptions: TemplateOption[];
 }) {
-  const [pendingManualShardName, setPendingManualShardName] = useState<string | null>(null);
-
   return (
     <Box py="sm" style={{ borderTop: '1px solid rgba(255,255,255,0.10)' }}>
       <Stack gap="sm">
@@ -1750,12 +1979,12 @@ function WorkPoolProjectionSection(props: {
                 <Group gap="xs">
                   <Text fw={950} size="md" tt="uppercase" c="gray.0">{props.title}</Text>
                   <Badge color={props.units.length > 0 ? 'cyan' : 'gray'} variant="filled">{props.units.length}</Badge>
-                  {props.groupKey === 'feature_development' ? <Badge color={tone(props.supervisor.status)} variant="light">{titleCase(props.supervisor.status)}</Badge> : null}
+                  {props.groupKey === 'feature' ? <Badge color={tone(props.supervisor.status)} variant="light">{titleCase(props.supervisor.status)}</Badge> : null}
                 </Group>
                 {props.groupKey === 'integration' ? null : <Text size="xs" c="gray.4">{props.units.length > 0 ? props.description : props.empty}</Text>}
               </Stack>
             </Group>
-            <WorkPoolActionRail groupKey={props.groupKey} units={props.units} supervisor={props.supervisor} templateOptions={props.templateOptions} navigate={props.navigate} onOpenPlanner={props.onOpenPlanner} onActionComplete={props.onActionComplete} onManualShardCreating={setPendingManualShardName} />
+            <WorkPoolActionRail groupKey={props.groupKey} units={props.units} supervisor={props.supervisor} templateOptions={props.templateOptions} navigate={props.navigate} onOpenPlanner={props.onOpenPlanner} onActionComplete={props.onActionComplete} />
           </Group>
 
           {props.groupKey === 'integration' ? (
@@ -1764,8 +1993,8 @@ function WorkPoolProjectionSection(props: {
         </Stack>
 
         {props.units.length > 0 ? (
-          props.groupKey === 'manual_shard' ? (
-            <ManualPoolWorkflowList units={props.units} supervisor={props.supervisor} navigate={props.navigate} onActionComplete={props.onActionComplete} pendingManualShardName={pendingManualShardName} />
+          props.groupKey === 'manual' ? (
+            <ManualPoolWorkflowList units={props.units} supervisor={props.supervisor} navigate={props.navigate} onActionComplete={props.onActionComplete} />
           ) : (
             <Stack gap="sm">
               {props.units.map((unit) => (
@@ -1779,7 +2008,7 @@ function WorkPoolProjectionSection(props: {
   );
 }
 
-function IntegrationProjectionSection(props: { supervisor: FlightDeckSupervisor; units: FlightDeckWorkUnit[]; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onActionComplete?: () => void }) {
+function IntegrationProjectionSection(props: { supervisor: SupervisorProjection; units: SupervisorWorkUnitProjection[]; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onActionComplete?: () => void }) {
   return (
     <WorkPoolProjectionSection
       groupKey="integration"
@@ -1795,7 +2024,7 @@ function IntegrationProjectionSection(props: { supervisor: FlightDeckSupervisor;
   );
 }
 
-function TopologyMap(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
+function TopologyMap(props: { supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
   const development = supervisor.work_units.filter((unit) => unit.kind !== 'integration');
   const integration = supervisor.work_units.filter((unit) => unit.kind === 'integration');
@@ -1827,7 +2056,7 @@ function TopologyMap(props: { supervisor: FlightDeckSupervisor; templateOptions:
 
 function SupervisorPlannerOptionsModal(props: {
   opened: boolean;
-  supervisor: FlightDeckSupervisor | null;
+  supervisor: SupervisorProjection | null;
   onClose: () => void;
   onApplied: () => Promise<void> | void;
   onError?: (message: string) => void;
@@ -1844,9 +2073,9 @@ function SupervisorPlannerOptionsModal(props: {
     if (!supervisor) return;
     setLoading(true);
     try {
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows);
-      setSelectedPlannerId((current) => current ?? supervisorSelectedPlannerId ?? rows.find((planner) => planner.is_default)?.id ?? rows[0]?.id ?? null);
+      setSelectedPlannerId(supervisorSelectedPlannerId);
       setNewPlannerTitle((current) => current.trim() || `${supervisor.title || 'Supervisor'} Planner`);
     } catch (err) {
       props.onError?.(err instanceof Error ? err.message : String(err));
@@ -1878,18 +2107,18 @@ function SupervisorPlannerOptionsModal(props: {
     }
   }
 
-  async function createPlanner() {
+  async function createSupervisorPlanner() {
     if (!supervisor) return;
     const title = newPlannerTitle.trim() || `${supervisor.title || 'Supervisor'} Planner`;
     setLoading(true);
     try {
-      const planner = await createPlannerForRepo({
-        root_repo_path: supervisor.root_repo_path,
+      const planner = await createPlanner({
+        repo_ref: supervisor.root_repo_path,
         title,
         make_default: false,
         features: [],
       });
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows.some((row) => row.id === planner.id) ? rows : [planner, ...rows]);
       setSelectedPlannerId(planner.id);
       setNewPlannerTitle('');
@@ -1900,7 +2129,7 @@ function SupervisorPlannerOptionsModal(props: {
     }
   }
 
-  async function deletePlanner() {
+  async function deleteSelectedPlanner() {
     if (!supervisor || !selectedPlannerId) return;
     const planner = planners.find((item) => item.id === selectedPlannerId);
     if (!planner) return;
@@ -1908,8 +2137,8 @@ function SupervisorPlannerOptionsModal(props: {
     if (!confirmed) return;
     setLoading(true);
     try {
-      await deletePlannerForRepo(planner.id);
-      const rows = await listPlannersForRepo(supervisor.root_repo_path);
+      await deletePlannerApi(planner.id);
+      const rows = await listPlanners(supervisor.root_repo_path);
       setPlanners(rows);
       setSelectedPlannerId(rows.find((row) => row.id === supervisorSelectedPlannerId)?.id ?? rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
       await props.onApplied();
@@ -1949,10 +2178,10 @@ function SupervisorPlannerOptionsModal(props: {
             onChange={(event) => setNewPlannerTitle(event.currentTarget.value)}
             style={{ flex: 1 }}
           />
-          <Button size="xs" variant="light" onClick={() => void createPlanner()} loading={loading} disabled={!supervisor}>Create planner</Button>
+          <Button size="xs" variant="light" onClick={() => void createSupervisorPlanner()} loading={loading} disabled={!supervisor}>Create planner</Button>
         </Group>
         <Group justify="space-between" gap="xs" wrap="nowrap">
-          <Button size="xs" color="red" variant="light" onClick={() => void deletePlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
+          <Button size="xs" color="red" variant="light" onClick={() => void deleteSelectedPlanner()} loading={loading} disabled={!selectedPlannerId || selectedPlannerId === supervisorSelectedPlannerId}>
             Delete selected planner
           </Button>
           <Group gap="xs" wrap="nowrap">
@@ -1967,122 +2196,203 @@ function SupervisorPlannerOptionsModal(props: {
   );
 }
 
-function SupervisorCockpit(props: { supervisor: FlightDeckSupervisor; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: FlightDeckSupervisor) => void; onActionComplete?: () => void }) {
+function SupervisorCockpit(props: { supervisor: SupervisorProjection; templateOptions: TemplateOption[]; navigate?: (path: string) => void; onOpenPlanner?: (supervisor: SupervisorProjection, options?: OpenPlannerOptions) => void; onOpenPlannerOptions?: (supervisor: SupervisorProjection) => void; onActionComplete?: () => void }) {
   const { supervisor, navigate } = props;
-  const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting_user').length;
-  const failed = supervisor.work_units.filter((unit) => unit.state === 'failed' || unit.state === 'blocked').length;
-  const ready = supervisor.work_units.filter((unit) => unit.state === 'patch_ready' || unit.state === 'ready_for_integration').length;
+  const waiting = supervisor.work_units.filter((unit) => unit.state === 'waiting').length;
+  const failed = supervisor.work_units.filter((unit) => unit.state === 'failed').length;
   const integrationState = String(supervisor.integration?.state ?? 'idle');
+  const pendingActions = usePendingSupervisorActions(supervisor.id);
 
   return (
-    <Card withBorder radius="xl" p="lg" style={{ background: 'linear-gradient(135deg, rgba(28,126,214,0.12), rgba(255,255,255,0.025))' }}>
+    <AppSurface p="md">
       <Stack gap="sm">
-        <Group justify="space-between" align="flex-start">
-          <Stack gap={4}>
-            <Group gap="xs" wrap="wrap">
-              <Title order={2}>{supervisor.title}</Title>
-              <Badge variant="outline">{supervisor.work_units.length} work units</Badge>
-              <Badge color={waiting > 0 ? 'yellow' : 'gray'} variant="outline">{waiting} waiting</Badge>
-              <Badge color={failed > 0 ? 'red' : 'gray'} variant="outline">{failed} blocked</Badge>
-              <Badge color={ready > 0 ? 'cyan' : 'gray'} variant="outline">{ready} ready</Badge>
-            </Group>
-            <Text size="sm" c="dimmed">{compactPath(supervisor.root_repo_path)}</Text>
-          </Stack>
-          <Button
-            variant="light"
-            onClick={() => props.onOpenPlannerOptions?.(supervisor)}
-          >
+        <Group justify="space-between" align="center" wrap="wrap" gap="sm">
+          <Group gap="xs" wrap="wrap" style={{ minWidth: 0, flex: 1 }}>
+            <Text fw={950} size="xl" c="gray.0" truncate>
+              {supervisor.title}
+            </Text>
+            <Badge variant="outline">{supervisor.work_units.length} work units</Badge>
+            <Badge color={waiting > 0 ? 'yellow' : 'gray'} variant="outline">{waiting} waiting</Badge>
+            <Badge color={failed > 0 ? 'red' : 'gray'} variant="outline">{failed} blocked</Badge>
+            <Text
+              size="xs"
+              c="dimmed"
+              truncate
+              style={{ minWidth: 120, maxWidth: 360 }}
+            >
+              {compactPath(supervisor.root_repo_path)}
+            </Text>
+            {pendingActions.map((pending) => (
+              <Badge key={pending.id} color={pendingSupervisorActionTone(pending)} variant="light" size="sm">
+                <Group gap={6} wrap="nowrap">
+                  <Loader size={10} />
+                  <span>{pendingSupervisorActionLabel(pending)}</span>
+                </Group>
+              </Badge>
+            ))}
+          </Group>
+
+          <AppHeaderAction onClick={() => props.onOpenPlannerOptions?.(supervisor)}>
             Planner options
-          </Button>
+          </AppHeaderAction>
         </Group>
+
+        <Divider color="rgba(139,148,158,0.20)" />
 
         <TopologyMap supervisor={supervisor} templateOptions={props.templateOptions} navigate={navigate} onOpenPlanner={props.onOpenPlanner} onActionComplete={props.onActionComplete} />
       </Stack>
-    </Card>
+    </AppSurface>
   );
 }
 
-function MissionBar(props: {
-  deck: FlightDeckResponse | null;
-  filtersOpen: boolean;
-  supervisorFilter: string | null;
+type SupervisorUrlState = {
+  supervisorIds: string[];
   stateFilter: string | null;
   kindFilter: string | null;
   includeDeleted: boolean;
-  setFiltersOpen: (value: boolean) => void;
-  setSupervisorFilter: (value: string | null) => void;
+};
+
+function readSupervisorUrlState(): SupervisorUrlState {
+  const params = new URLSearchParams(window.location.search);
+  const supervisorIds = (params.get('ids') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return {
+    supervisorIds: [...new Set(supervisorIds)],
+    stateFilter: params.get('state') || null,
+    kindFilter: params.get('kind') || null,
+    includeDeleted: params.get('deleted') === '1',
+  };
+}
+
+function writeSupervisorUrlState(state: SupervisorUrlState) {
+  const url = new URL(window.location.href);
+
+  if (state.supervisorIds.length > 0) url.searchParams.set('ids', state.supervisorIds.join(','));
+  else url.searchParams.delete('ids');
+
+  if (state.stateFilter) url.searchParams.set('state', state.stateFilter);
+  else url.searchParams.delete('state');
+
+  if (state.kindFilter) url.searchParams.set('kind', state.kindFilter);
+  else url.searchParams.delete('kind');
+
+  if (state.includeDeleted) url.searchParams.set('deleted', '1');
+  else url.searchParams.delete('deleted');
+
+  window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+}
+
+function MissionBar(props: {
+  supervisorOptions: SupervisorListItem[];
+  supervisorIds: string[];
+  stateFilter: string | null;
+  kindFilter: string | null;
+  includeDeleted: boolean;
+  controlsOpen: boolean;
+  setSupervisorIds: (value: string[]) => void;
   setStateFilter: (value: string | null) => void;
   setKindFilter: (value: string | null) => void;
   setIncludeDeleted: (value: boolean) => void;
+  setControlsOpen: (value: boolean) => void;
   onOpenSupervisorManagement: () => void;
+  navigate?: (path: string) => void;
 }) {
-  const supervisorOptions = (props.deck?.supervisors ?? []).map((supervisor) => ({ value: supervisor.id, label: supervisor.title || supervisor.id.slice(0, 8) }));
-  const stateOptions = ['queued', 'running', 'waiting_user', 'failed', 'patch_ready', 'ready_for_integration', 'integrating', 'integrated', 'deleted'].map((value) => ({ value, label: titleCase(value) }));
-  const kindOptions = ['refine', 'feature_development', 'manual_shard', 'integration'].map((value) => ({ value, label: value === 'feature_development' ? 'Feature pool' : value === 'manual_shard' ? 'Manual pool' : `${titleCase(value)} pool` }));
-  const alerts = props.deck?.alerts ?? [];
+  const supervisorOptions = props.supervisorOptions.map((supervisor) => ({
+    value: supervisor.id,
+    label: supervisor.title || supervisor.id.slice(0, 8),
+  }));
+  const stateOptions = [
+    { value: 'draft', label: 'Draft' },
+    { value: 'queued', label: 'Queued' },
+    { value: 'running', label: 'Running' },
+    { value: 'waiting', label: 'Waiting' },
+    { value: 'paused', label: 'Paused' },
+    { value: 'success', label: 'Complete' },
+    { value: 'error', label: 'Error' },
+    { value: 'cancelled', label: 'Cancelled' },
+  ];
+  const kindOptions = ['refine', 'feature', 'manual', 'integration'].map((value) => ({ value, label: `${titleCase(value)} pool` }));
+
+  function navigate(next: AppHeaderView) {
+    if (next === 'workflows') props.navigate?.('/workflows');
+    else if (next === 'templates') props.navigate?.('/templates');
+    else if (next === 'runtime') props.navigate?.('/runtime');
+    else props.navigate?.('/supervisors');
+  }
 
   return (
-    <Card withBorder radius="xl" p="md" style={{ background: 'rgba(20,20,24,0.72)', backdropFilter: 'blur(14px)' }}>
-      <Stack gap="md">
-        <Group justify="space-between" align="center">
-          <Group gap="xl">
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Supervisors</Text>
-              <Text fw={900}>{props.deck?.totals.supervisors ?? 0}</Text>
-            </Stack>
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Work units</Text>
-              <Text fw={900}>{props.deck?.totals.work_units ?? 0}</Text>
-            </Stack>
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Waiting</Text>
-              <Text fw={900}>{props.deck?.totals.waiting_user ?? 0}</Text>
-            </Stack>
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Failed</Text>
-              <Text fw={900}>{props.deck?.totals.failed ?? 0}</Text>
-            </Stack>
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Ready integration</Text>
-              <Text fw={900}>{props.deck?.totals.ready_for_integration ?? 0}</Text>
-            </Stack>
-            <Stack gap={0}>
-              <Text size="xs" c="dimmed">Alerts</Text>
-              <Text fw={900}>{alerts.length}</Text>
-            </Stack>
+    <AppHeader
+      active="supervisor"
+      onChange={navigate}
+      onActiveDoubleClick={() => props.setControlsOpen(!props.controlsOpen)}
+      actions={(
+        <>
+          <Badge size="sm" variant="light" color="gray">
+            {props.supervisorIds.length > 0
+              ? `${props.supervisorIds.length} selected`
+              : 'All supervisors'}
+          </Badge>
+          <AppHeaderAction onClick={() => props.setControlsOpen(!props.controlsOpen)}>
+            Supervisor config
+          </AppHeaderAction>
+        </>
+      )}
+    >
+      {props.controlsOpen ? (
+        <Group justify="space-between" align="flex-end" gap="sm" wrap="wrap">
+          <Group gap="xs" align="flex-end" wrap="wrap" style={{ flex: 1 }}>
+            <MultiSelect
+              label="Supervisors"
+              placeholder="All supervisors"
+              data={supervisorOptions}
+              value={props.supervisorIds}
+              onChange={props.setSupervisorIds}
+              searchable
+              clearable
+              hidePickedOptions
+              w={360}
+              maw="100%"
+            />
+            <Select
+              label="State"
+              placeholder="All states"
+              data={stateOptions}
+              value={props.stateFilter}
+              onChange={props.setStateFilter}
+              clearable
+              w={150}
+            />
+            <Select
+              label="Kind"
+              placeholder="All work kinds"
+              data={kindOptions}
+              value={props.kindFilter}
+              onChange={props.setKindFilter}
+              clearable
+              w={180}
+            />
+            <Checkbox
+              mb={8}
+              label="Deleted references"
+              checked={props.includeDeleted}
+              onChange={(event) => props.setIncludeDeleted(event.currentTarget.checked)}
+            />
           </Group>
-          <Group gap="xs" wrap="nowrap">
-            <Button variant="light" onClick={() => props.setFiltersOpen(!props.filtersOpen)}>{props.filtersOpen ? 'Hide filters' : 'Show filters'}</Button>
-            <Button onClick={props.onOpenSupervisorManagement}>Supervisor management</Button>
-          </Group>
+          <AppHeaderAction onClick={props.onOpenSupervisorManagement}>
+            Manage supervisors
+          </AppHeaderAction>
         </Group>
-
-        {props.filtersOpen ? (
-          <SimpleGrid cols={{ base: 1, md: 4 }} spacing="sm">
-            <Select label="Supervisor" placeholder="All supervisors" data={supervisorOptions} value={props.supervisorFilter} onChange={props.setSupervisorFilter} clearable searchable />
-            <Select label="State" placeholder="All states" data={stateOptions} value={props.stateFilter} onChange={props.setStateFilter} clearable />
-            <Select label="Kind" placeholder="All work kinds" data={kindOptions} value={props.kindFilter} onChange={props.setKindFilter} clearable />
-            <Box pt={28}>
-              <Checkbox label="Show deleted workflow references" checked={props.includeDeleted} onChange={(event) => props.setIncludeDeleted(event.currentTarget.checked)} />
-            </Box>
-          </SimpleGrid>
-        ) : null}
-
-        {alerts.length > 0 ? (
-          <Group gap="xs">
-            {alerts.slice(0, 6).map((alert) => (
-              <Badge key={alert.id} color={alert.level === 'error' ? 'red' : 'yellow'} variant="light">{alert.message}</Badge>
-            ))}
-          </Group>
-        ) : null}
-      </Stack>
-    </Card>
+      ) : null}
+    </AppHeader>
   );
 }
 
 const pageShellStyle: CSSProperties = {
   minHeight: '100vh',
-  background: 'radial-gradient(circle at top left, rgba(34,184,207,0.16), transparent 32%), radial-gradient(circle at top right, rgba(121,80,242,0.14), transparent 30%)',
+  background: 'transparent',
 };
 
 function DequeueFeatureModal(props: {
@@ -2135,7 +2445,7 @@ function DequeueFeatureModal(props: {
 
 function FeatureQueueModal(props: {
   opened: boolean;
-  supervisor: FlightDeckSupervisor | null;
+  supervisor: SupervisorProjection | null;
   onClose: () => void;
   onApplied: () => Promise<void>;
 }) {
@@ -2184,7 +2494,16 @@ function FeatureQueueModal(props: {
         setQueue(next);
         updateQueuedFeatures(next.queued_features ?? []);
         const nextPlanners = next.planners ?? [];
-        setPlannerOptions(nextPlanners as PlannerWorkspace[]);
+        setPlannerOptions(nextPlanners.map((planner): PlannerWorkspace => ({
+          id: planner.id,
+          repo_ref: planner.root_repo_path,
+          title: planner.title,
+          is_default: planner.is_default,
+          feature_count: planner.feature_count ?? 0,
+          features: [],
+          created_at: planner.created_at ?? '',
+          updated_at: planner.updated_at ?? '',
+        })));
       })
       .catch((err) => {
         if (!cancelled) setQueueError(err instanceof Error ? err.message : String(err));
@@ -2227,21 +2546,63 @@ function FeatureQueueModal(props: {
 
   async function persistQueueSelection(nextQueuedFeatures: SupervisorQueuedFeature[]) {
     if (!supervisor) return;
-    const activePlannerId = selectedPlannerId;
-    const uniqueQueuedFeatures = nextQueuedFeatures.filter((item, index, rows) => item.feature_id && rows.findIndex((candidate) => candidate.feature_id === item.feature_id) === index);
+
+    const previousQueuedFeatures = queuedFeaturesRef.current;
+    const uniqueQueuedFeatures = nextQueuedFeatures.filter(
+      (item, index, rows) =>
+        item.feature_id
+        && item.planner_id
+        && rows.findIndex(
+          (candidate) => candidate.feature_id === item.feature_id && candidate.planner_id === item.planner_id,
+        ) === index,
+    );
+
+    const keyOf = (item: SupervisorQueuedFeature) => `${item.planner_id}:${item.feature_id}`;
+    const previousKeys = new Set(previousQueuedFeatures.map(keyOf));
+    const nextKeys = new Set(uniqueQueuedFeatures.map(keyOf));
+    const removed = previousQueuedFeatures.filter((item) => !nextKeys.has(keyOf(item)));
+    const added = uniqueQueuedFeatures.filter((item) => !previousKeys.has(keyOf(item)));
+
     updateQueuedFeatures(uniqueQueuedFeatures);
     setQueueLoading(true);
     setQueueError(null);
 
     const write = async () => {
       try {
-        await setSupervisorQueue(supervisor.id, uniqueQueuedFeatures);
+        for (const item of removed) {
+          await runSupervisorAction(supervisor.id, {
+            action: 'dequeue_feature',
+            planner_id: item.planner_id,
+            feature_id: item.feature_id,
+          });
+        }
+
+        for (const item of added) {
+          await runSupervisorAction(supervisor.id, {
+            action: 'enqueue_feature',
+            planner_id: item.planner_id,
+            feature_id: item.feature_id,
+          });
+        }
+
+        await runSupervisorAction(supervisor.id, {
+          action: 'reorder_feature_pool',
+          feature_ids: uniqueQueuedFeatures.map((item) => item.feature_id),
+        });
+
         const next = await getSupervisorQueue(supervisor.id);
         setQueue(next);
         updateQueuedFeatures(next.queued_features ?? []);
         await props.onApplied();
       } catch (err) {
         setQueueError(err instanceof Error ? err.message : String(err));
+        try {
+          const canonical = await getSupervisorQueue(supervisor.id);
+          setQueue(canonical);
+          updateQueuedFeatures(canonical.queued_features ?? []);
+        } catch {
+          updateQueuedFeatures(previousQueuedFeatures);
+        }
       }
     };
 
@@ -2268,14 +2629,23 @@ function FeatureQueueModal(props: {
       return;
     }
 
-    const planner = uniquePlannerOptions.find((item) => item.id === selectedPlannerId);
-    if (!selectedPlannerId || !planner) return;
+    const item = latestQueueItem(featureId);
+    const plannerId = item?.planner_id ?? selectedPlannerId;
+    if (!plannerId) {
+      setQueueError('Supervisor has no selected planner');
+      return;
+    }
+
+    const plannerTitle = item?.planner_title
+      ?? uniquePlannerOptions.find((planner) => planner.id === plannerId)?.title
+      ?? plannerId;
+
     void persistQueueSelection([
-      ...queuedFeaturesRef.current.filter((item) => item.feature_id !== featureId),
+      ...queuedFeaturesRef.current.filter((queued) => queued.feature_id !== featureId),
       {
         feature_id: featureId,
-        planner_id: latestQueueItem(featureId)?.planner_id ?? selectedPlannerId,
-        planner_title: latestQueueItem(featureId)?.planner_title ?? planner.title
+        planner_id: plannerId,
+        planner_title: plannerTitle
       }
     ]);
   }
@@ -2320,7 +2690,7 @@ function FeatureQueueModal(props: {
           <Text size="sm" c="dimmed">
             {uniquePlannerOptions.find((planner) => planner.id === selectedPlannerId)?.title ?? selectedPlannerId ?? 'No supervisor planner selected'}
           </Text>
-          <Text size="xs" c="dimmed">Selected by supervisor state. The queue cannot override it.</Text>
+          <Text size="xs" c="dimmed">This planner controls which available features are being browsed. Already queued features from other planners remain in the feature pool.</Text>
         </Stack>
         <Group gap="xs">
           <Badge color="blue" variant="light">{selectedIds.length} queued</Badge>
@@ -2401,22 +2771,267 @@ function FeatureQueueModal(props: {
   );
 }
 
-export function FlightDeckPanel(props: FlightDeckPanelProps) {
-  const [deck, setDeck] = useState<FlightDeckResponse | null>(null);
+function supervisorProjectionTotals(supervisors: SupervisorProjection[]): SupervisorProjectionResponse['totals'] {
+  const units = supervisors.flatMap((supervisor) => supervisor.work_units);
+  return {
+    supervisors: supervisors.length,
+    work_units: units.length,
+    running: units.filter((unit) => unit.state === 'running').length,
+    waiting_user: units.filter((unit) => unit.state === 'waiting').length,
+    failed: units.filter((unit) => unit.state === 'failed' || unit.state === 'error').length,
+    ready_for_integration: units.filter((unit) => unit.state === 'ready_for_integration').length,
+    integrating: units.filter((unit) => unit.state === 'integrating').length,
+  };
+}
+
+function rebuildSupervisorProjection(supervisors: SupervisorProjection[]): SupervisorProjectionResponse {
+  return {
+    supervisors,
+    alerts: supervisors.flatMap((supervisor) => supervisor.alerts),
+    totals: supervisorProjectionTotals(supervisors),
+  };
+}
+
+function applyHydrationSupervisor(
+  current: SupervisorProjectionResponse | null,
+  supervisor: SupervisorProjection
+): SupervisorProjectionResponse {
+  const supervisors = current?.supervisors ?? [];
+  const exists = supervisors.some((item) => item.id === supervisor.id);
+  const next = exists
+    ? supervisors.map((item) => item.id === supervisor.id ? supervisor : item)
+    : [...supervisors, supervisor];
+  return rebuildSupervisorProjection(next);
+}
+
+function applyHydrationWorkUnit(
+  current: SupervisorProjectionResponse | null,
+  supervisorId: string,
+  index: number,
+  workUnit: SupervisorWorkUnitProjection
+): SupervisorProjectionResponse | null {
+  if (!current) return current;
+
+  const supervisors = current.supervisors.map((supervisor) => {
+    if (supervisor.id !== supervisorId) return supervisor;
+
+    const work_units = [...supervisor.work_units];
+    const existingIndex = work_units.findIndex((unit) => unit.id === workUnit.id);
+    if (existingIndex >= 0) {
+      work_units[existingIndex] = workUnit;
+    } else {
+      work_units.splice(Math.min(index, work_units.length), 0, workUnit);
+    }
+
+    return {
+      ...supervisor,
+      work_units,
+      alerts: work_units.flatMap((unit) => unit.alerts),
+    };
+  });
+
+  return rebuildSupervisorProjection(supervisors);
+}
+
+function reconcileTelemetryArray(
+  current: Record<string, unknown>,
+  next: Record<string, unknown>,
+  key: string
+): unknown {
+  const nextValue = next[key];
+  if (Array.isArray(nextValue) && nextValue.length > 0) return nextValue;
+
+  const currentValue = current[key];
+  if (Array.isArray(currentValue) && currentValue.length > 0) return currentValue;
+
+  return nextValue ?? currentValue;
+}
+
+function reconcileSupervisorWorkUnitProjection(
+  current: SupervisorWorkUnitProjection,
+  next: SupervisorWorkUnitProjection
+): SupervisorWorkUnitProjection {
+  if (current.workflow_run_id !== next.workflow_run_id) {
+    return next;
+  }
+
+  const currentTelemetry = current.telemetry ?? {};
+  const nextTelemetry = next.telemetry ?? {};
+
+  return {
+    ...current,
+    ...next,
+    telemetry: {
+      ...currentTelemetry,
+      ...nextTelemetry,
+      recent_capability_executions: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'recent_capability_executions'),
+      current_stage_recent_capabilities: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'current_stage_recent_capabilities'),
+      recent_stage_executions: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'recent_stage_executions'),
+    },
+  };
+}
+
+function reconcileSupervisorWorkUnitProjections(
+  current: SupervisorWorkUnitProjection[],
+  next: SupervisorWorkUnitProjection[]
+): SupervisorWorkUnitProjection[] {
+  const nextById = new Map(next.map((unit) => [unit.id, unit]));
+  const currentIds = new Set(current.map((unit) => unit.id));
+  const retained = current
+    .filter((unit) => nextById.has(unit.id))
+    .map((unit) => reconcileSupervisorWorkUnitProjection(unit, nextById.get(unit.id)!));
+  const added = next.filter((unit) => !currentIds.has(unit.id));
+  return [...retained, ...added];
+}
+
+function reconcileSupervisorProjection(
+  current: SupervisorProjection,
+  next: SupervisorProjection
+): SupervisorProjection {
+  return {
+    ...current,
+    ...next,
+    work_units: reconcileSupervisorWorkUnitProjections(current.work_units, next.work_units),
+  };
+}
+
+function applySupervisorEventToProjection(
+  current: SupervisorProjectionResponse | null,
+  envelope: SupervisorEventEnvelope
+): SupervisorProjectionResponse | null {
+  if (!current) return current;
+
+  if (envelope.event.payload?.deleted === true) {
+    const supervisors = current.supervisors.filter((item) => item.id !== envelope.event.supervisor_run_id);
+    return supervisors.length === current.supervisors.length ? current : rebuildSupervisorProjection(supervisors);
+  }
+
+  const projection = envelope.event.payload?.supervisor;
+  if (!projection || typeof projection !== 'object' || Array.isArray(projection)) return current;
+
+  const supervisor = projection as SupervisorProjection;
+  if (!supervisor.id) return current;
+
+  const exists = current.supervisors.some((item) => item.id === supervisor.id);
+  const supervisors = exists
+    ? current.supervisors.map((item) => item.id === supervisor.id
+      ? reconcileSupervisorProjection(item, supervisor)
+      : item)
+    : [supervisor, ...current.supervisors];
+
+  return rebuildSupervisorProjection(supervisors);
+}
+
+function workflowEventProjection(event: RuntimeEventEnvelope['event']) {
+  const status = runtimeEventExecutionStatus(event);
+  const normalizedStatus = status === 'completed'
+    ? 'success'
+    : status === 'user_input'
+      ? 'waiting'
+      : status;
+
+  return {
+    status: normalizedStatus,
+    level: event.level,
+    kind: event.kind,
+    message: event.message,
+    created_at: event.created_at,
+    step_id: event.step_id,
+    stage_execution_id: event.stage_execution_id,
+    capability_invocation_id: event.capability_invocation_id,
+    parent_invocation_id: event.parent_invocation_id,
+  };
+}
+
+function applyWorkflowEventToSupervisorProjection(
+  current: SupervisorProjectionResponse | null,
+  envelope: RuntimeEventEnvelope
+): SupervisorProjectionResponse | null {
+  if (!current) return current;
+
+  let changed = false;
+  const event = envelope.event;
+  const projection = workflowEventProjection(event);
+
+  const supervisors = current.supervisors.map((supervisor) => {
+    let supervisorChanged = false;
+    const work_units = supervisor.work_units.map((unit) => {
+      if (unit.workflow_run_id !== event.run_id) return unit;
+
+      supervisorChanged = true;
+      changed = true;
+
+      const telemetry = { ...unit.telemetry };
+      if (event.step_id) telemetry.current_step_id = event.step_id;
+
+      if (event.stage_execution_id) {
+        const recent = Array.isArray(telemetry.recent_stage_executions)
+          ? telemetry.recent_stage_executions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          : [];
+        const existingIndex = recent.findIndex((item) => item.stage_execution_id === event.stage_execution_id);
+        const nextStage = {
+          ...(existingIndex >= 0 ? recent[existingIndex] : {}),
+          ...projection,
+        };
+        telemetry.recent_stage_executions = existingIndex >= 0
+          ? [nextStage, ...recent.filter((_, index) => index !== existingIndex)]
+          : [nextStage, ...recent];
+      }
+
+      if (event.capability_invocation_id) {
+        const recent = Array.isArray(telemetry.recent_capability_executions)
+          ? telemetry.recent_capability_executions.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          : [];
+        const existingIndex = recent.findIndex((item) => item.capability_invocation_id === event.capability_invocation_id);
+        const capability = typeof event.payload?.capability === 'string' ? event.payload.capability : undefined;
+        const nextCapability = {
+          ...(existingIndex >= 0 ? recent[existingIndex] : {}),
+          ...projection,
+          capability,
+        };
+        telemetry.recent_capability_executions = existingIndex >= 0
+          ? [nextCapability, ...recent.filter((_, index) => index !== existingIndex)]
+          : [nextCapability, ...recent];
+      }
+
+      const workflowStatus = event.kind === 'run_status_changed' && typeof event.payload?.status === 'string'
+        ? event.payload.status
+        : null;
+
+      if (workflowStatus) telemetry.status = workflowStatus;
+
+      return {
+        ...unit,
+        state: workflowStatus ?? unit.state,
+        telemetry,
+        updated_at: event.created_at,
+      };
+    });
+
+    return supervisorChanged ? { ...supervisor, work_units } : supervisor;
+  });
+
+  return changed ? rebuildSupervisorProjection(supervisors) : current;
+}
+
+export function SupervisorPanel(props: SupervisorPanelProps) {
+  const initialUrlState = useMemo(() => readSupervisorUrlState(), []);
+  const [deck, setDeck] = useState<SupervisorProjectionResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [supervisorFilter, setSupervisorFilter] = useState<string | null>(null);
-  const [stateFilter, setStateFilter] = useState<string | null>(null);
-  const [kindFilter, setKindFilter] = useState<string | null>(null);
-  const [includeDeleted, setIncludeDeleted] = useState(false);
-  const [filtersOpen, setFiltersOpen] = useState(true);
+  const [supervisorIds, setSupervisorIds] = useState<string[]>(initialUrlState.supervisorIds);
+  const [stateFilter, setStateFilter] = useState<string | null>(initialUrlState.stateFilter);
+  const [kindFilter, setKindFilter] = useState<string | null>(initialUrlState.kindFilter);
+  const [includeDeleted, setIncludeDeleted] = useState(initialUrlState.includeDeleted);
+  const [supervisorOptions, setSupervisorOptions] = useState<SupervisorListItem[]>([]);
+  const [supervisorControlsOpen, setSupervisorControlsOpen] = useState(false);
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
-  const [plannerSupervisor, setPlannerSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [plannerSupervisor, setPlannerSupervisor] = useState<SupervisorProjection | null>(null);
   const [plannerCreateFeatureOnOpen, setPlannerCreateFeatureOnOpen] = useState(false);
   const [plannerSelectFeatureOnOpen, setPlannerSelectFeatureOnOpen] = useState(false);
-  const [queueSupervisor, setQueueSupervisor] = useState<FlightDeckSupervisor | null>(null);
-  const [plannerOptionsSupervisor, setPlannerOptionsSupervisor] = useState<FlightDeckSupervisor | null>(null);
-  const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<FlightDeckSupervisor | null>(null);
+  const [queueSupervisor, setQueueSupervisor] = useState<SupervisorProjection | null>(null);
+  const [plannerOptionsSupervisor, setPlannerOptionsSupervisor] = useState<SupervisorProjection | null>(null);
+  const [newFineChoiceSupervisor, setNewFineChoiceSupervisor] = useState<SupervisorProjection | null>(null);
   const [plannerRefinementTemplateId, setPlannerRefinementTemplateId] = useState<string | null>(null);
   const [creatingRefineFeatureId, setCreatingRefineFeatureId] = useState<string | null>(null);
   const [supervisorManagementOpen, setSupervisorManagementOpen] = useState(false);
@@ -2429,12 +3044,47 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   const [executionEventLimit, setExecutionEventLimit] = useState<number | string>(100);
   const [savingExecutionEventLimit, setSavingExecutionEventLimit] = useState(false);
   const templateOptions = useMemo(() => workflowTemplateOptions(templates), [templates]);
+  const refreshInFlightRef = useRef(false);
+  const refreshPendingRef = useRef(false);
+  const hydrationCloseRef = useRef<(() => void) | null>(null);
+  const hydratingRef = useRef(false);
+  const hydrationEventBufferRef = useRef<Array<
+    | { type: 'workflow'; event: RuntimeEventEnvelope }
+    | { type: 'supervisor'; event: SupervisorEventEnvelope }
+  >>([]);
+  const supervisorFiltersRef = useRef({ supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted });
+  supervisorFiltersRef.current = { supervisor_ids: supervisorIds.join(',') || null, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted };
 
   useEffect(() => {
     let cancelled = false;
-    void listTemplates()
+    let revision = 0;
+    const reload = () => {
+      const requestRevision = ++revision;
+      void listTemplates()
+        .then((rows) => {
+          if (!cancelled && requestRevision === revision) setTemplates(rows);
+        })
+        .catch((err) => {
+          if (!cancelled && requestRevision === revision) setError(err instanceof Error ? err.message : String(err));
+        });
+    };
+    reload();
+    const unsubscribe = subscribeRuntimeEventBus({
+      onOpen: reload,
+      onTemplateEvent: reload,
+      onTemplateResync: reload
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listSupervisorRuns()
       .then((rows) => {
-        if (!cancelled) setTemplates(rows);
+        if (!cancelled) setSupervisorOptions(rows);
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -2444,7 +3094,14 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     };
   }, []);
 
+  useEffect(() => {
+    writeSupervisorUrlState({ supervisorIds, stateFilter, kindFilter, includeDeleted });
+  }, [supervisorIds, stateFilter, kindFilter, includeDeleted]);
+
   const settingsSupervisor = (deck?.supervisors ?? []).find((supervisor) => supervisor.id === settingsSupervisorId) ?? null;
+  const activePlannerSupervisor = plannerSupervisor
+    ? (deck?.supervisors.find((supervisor) => supervisor.id === plannerSupervisor.id) ?? plannerSupervisor)
+    : null;
 
   async function saveExecutionEventLimit() {
     if (!settingsSupervisor) return;
@@ -2462,32 +3119,117 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         },
       });
       setExecutionEventLimit(limit);
-      await refresh();
     } finally {
       setSavingExecutionEventLimit(false);
     }
   }
 
   async function refresh() {
+    if (refreshInFlightRef.current) {
+      refreshPendingRef.current = true;
+      return;
+    }
+
+    refreshInFlightRef.current = true;
     try {
-      setError(null);
-      const next = await getFlightDeck({ supervisor_id: supervisorFilter, state: stateFilter, kind: kindFilter, include_deleted: includeDeleted });
-      setDeck(next);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      do {
+        refreshPendingRef.current = false;
+        try {
+          setError(null);
+          const next = await getSupervisorProjection(supervisorFiltersRef.current);
+          setDeck(next);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } while (refreshPendingRef.current);
     } finally {
+      refreshInFlightRef.current = false;
       setLoading(false);
     }
   }
 
   useEffect(() => {
+    hydrationCloseRef.current?.();
+    hydratingRef.current = true;
+    hydrationEventBufferRef.current = [];
     setLoading(true);
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 2000);
-    return () => window.clearInterval(timer);
-  }, [supervisorFilter, stateFilter, kindFilter, includeDeleted]);
+    setError(null);
+    setDeck(rebuildSupervisorProjection([]));
 
-  function openPlanner(supervisor: FlightDeckSupervisor, options?: OpenPlannerOptions) {
+    const close = openSupervisorHydrationStream(supervisorFiltersRef.current, {
+      onSupervisor: (supervisor) => {
+        setDeck((current) => applyHydrationSupervisor(current, supervisor));
+      },
+      onWorkUnit: ({ supervisor_id, index, work_unit }) => {
+        setDeck((current) => applyHydrationWorkUnit(current, supervisor_id, index, work_unit));
+      },
+      onSupervisorComplete: (supervisor) => {
+        setDeck((current) => applyHydrationSupervisor(current, supervisor));
+      },
+      onComplete: () => {
+        hydratingRef.current = false;
+        const buffered = hydrationEventBufferRef.current;
+        hydrationEventBufferRef.current = [];
+        setDeck((current) => {
+          let next = current;
+          for (const bufferedEvent of buffered) {
+            next = bufferedEvent.type === 'workflow'
+              ? applyWorkflowEventToSupervisorProjection(next, bufferedEvent.event)
+              : applySupervisorEventToProjection(next, bufferedEvent.event);
+          }
+          return next;
+        });
+        setLoading(false);
+      },
+      onError: () => {
+        hydratingRef.current = false;
+        hydrationEventBufferRef.current = [];
+        void refresh();
+      },
+    });
+
+    hydrationCloseRef.current = close;
+
+    return () => {
+      close();
+      if (hydrationCloseRef.current === close) hydrationCloseRef.current = null;
+      hydratingRef.current = false;
+      hydrationEventBufferRef.current = [];
+    };
+  }, [supervisorIds, stateFilter, kindFilter, includeDeleted]);
+
+  useEffect(() => {
+    return subscribeRuntimeEventBus({
+      onEvent: (event) => {
+        if (hydratingRef.current) {
+          hydrationEventBufferRef.current.push({ type: 'workflow', event });
+          return;
+        }
+        setDeck((current) => applyWorkflowEventToSupervisorProjection(current, event));
+      },
+      onSupervisorEvent: (event) => {
+        const selectedSupervisorIds = (supervisorFiltersRef.current.supervisor_ids ?? '')
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean);
+        if (selectedSupervisorIds.length > 0 && !selectedSupervisorIds.includes(event.event.supervisor_run_id)) return;
+        if (hydratingRef.current) {
+          hydrationEventBufferRef.current.push({ type: 'supervisor', event });
+          return;
+        }
+        setDeck((current) => applySupervisorEventToProjection(current, event));
+      },
+      onSupervisorResync: () => {
+        hydrationCloseRef.current?.();
+        hydrationCloseRef.current = null;
+        hydratingRef.current = false;
+        hydrationEventBufferRef.current = [];
+        void refresh();
+      }
+    });
+  }, []);
+
+  function openPlanner(supervisor: SupervisorProjection, options?: OpenPlannerOptions) {
     if (options?.selectFeature) {
       setQueueSupervisor(supervisor);
       return;
@@ -2504,25 +3246,23 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }
 
   async function createRefineWorkflowForFeature(featureId: string) {
-    const supervisor = plannerSupervisor;
+    const supervisor = activePlannerSupervisor;
     const templateId = plannerRefinementTemplateId;
-    const plannerId = supervisor?.selected_planner_id ?? null;
-    if (!supervisor || !templateId || !plannerId) {
-      setError('Supervisor planner and refine template are required before creating a fine workflow.');
+    if (!supervisor || !templateId) {
+      setError('Supervisor and refine template are required before creating a refine workflow.');
       return;
     }
-
     setCreatingRefineFeatureId(featureId);
     try {
       setPlannerSupervisor(null);
       setPlannerCreateFeatureOnOpen(false);
       setPlannerSelectFeatureOnOpen(false);
-      await refinePlannerFeature(plannerId, featureId, {
-        supervisor_id: supervisor.id,
+      await runSupervisorAction(supervisor.id, {
+        action: 'refine_feature',
+        feature_id: featureId,
         workflow_template_id: templateId,
       });
       setPlannerRefinementTemplateId(null);
-      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2530,7 +3270,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     }
   }
 
-  async function createFlightDeckSupervisor() {
+  async function createSupervisorProjection() {
     const title = newSupervisorTitle.trim() || 'Supervisor';
     const rootRepoPath = newSupervisorRootRepoPath.trim();
     if (!rootRepoPath) {
@@ -2549,9 +3289,9 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         execution_plan_items: [],
         context: {}
       });
+      setSupervisorOptions(await listSupervisorRuns());
       setNewSupervisorTitle('Supervisor');
       setNewSupervisorRootRepoPath('');
-      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2559,16 +3299,17 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
     }
   }
 
-  async function removeFlightDeckSupervisor(supervisor: FlightDeckSupervisor) {
-    const confirmed = window.confirm(`Delete supervisor "${supervisor.title}"? This removes the supervisor record and cannot be undone from Flight Deck.`);
+  async function removeSupervisorProjection(supervisor: SupervisorProjection) {
+    const confirmed = window.confirm(`Delete supervisor "${supervisor.title}"? This removes the supervisor record and cannot be undone from Supervisor.`);
     if (!confirmed) return;
 
     setDeletingSupervisorId(supervisor.id);
     setError(null);
     try {
       await deleteSupervisorRun(supervisor.id);
+      setSupervisorIds((current) => current.filter((id) => id !== supervisor.id));
+      setSupervisorOptions((current) => current.filter((item) => item.id !== supervisor.id));
       setDeleteSupervisorId((current) => current === supervisor.id ? null : current);
-      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2577,21 +3318,22 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
   }
 
   return (
-    <Box p="md" style={pageShellStyle}>
+    <Box px="md" pb="md" pt={0} style={pageShellStyle}>
       <Stack gap="md">
         <MissionBar
-          deck={deck}
-          filtersOpen={filtersOpen}
-          supervisorFilter={supervisorFilter}
+          supervisorOptions={supervisorOptions}
+          supervisorIds={supervisorIds}
           stateFilter={stateFilter}
           kindFilter={kindFilter}
           includeDeleted={includeDeleted}
-          setFiltersOpen={setFiltersOpen}
-          setSupervisorFilter={setSupervisorFilter}
+          controlsOpen={supervisorControlsOpen}
+          setSupervisorIds={setSupervisorIds}
           setStateFilter={setStateFilter}
           setKindFilter={setKindFilter}
           setIncludeDeleted={setIncludeDeleted}
+          setControlsOpen={setSupervisorControlsOpen}
           onOpenSupervisorManagement={() => setSupervisorManagementOpen(true)}
+          navigate={props.navigate}
         />
 
 
@@ -2601,7 +3343,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
 
         <Stack gap="lg" pr="sm">
           {deck?.supervisors.length ? deck.supervisors.map((supervisor) => (
-            <SupervisorCockpit key={supervisor.id} supervisor={supervisor} templateOptions={templateOptions} navigate={props.navigate} onOpenPlanner={openPlanner} onOpenPlannerOptions={setPlannerOptionsSupervisor} onActionComplete={() => void refresh()} />
+            <SupervisorCockpit key={supervisor.id} supervisor={supervisor} templateOptions={templateOptions} navigate={props.navigate} onOpenPlanner={openPlanner} onOpenPlannerOptions={setPlannerOptionsSupervisor} onActionComplete={() => undefined} />
           )) : !loading ? (
             <Card withBorder radius="xl" p="lg">
               <Text c="dimmed">No supervisors matched the current filters.</Text>
@@ -2651,7 +3393,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
             <TextInput label="Title" value={newSupervisorTitle} onChange={(event) => setNewSupervisorTitle(event.currentTarget.value)} />
             <TextInput label="Root repo path" value={newSupervisorRootRepoPath} onChange={(event) => setNewSupervisorRootRepoPath(event.currentTarget.value)} />
             <Group justify="flex-end">
-              <Button onClick={() => void createFlightDeckSupervisor()} loading={creatingSupervisor}>Create supervisor</Button>
+              <Button onClick={() => void createSupervisorProjection()} loading={creatingSupervisor}>Create supervisor</Button>
             </Group>
           </Stack>
 
@@ -2674,7 +3416,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
             />
             <NumberInput
               label="Retained execution events per workflow"
-              description="Controls how many recent stage and capability execution events Flight Deck retains in each workflow projection."
+              description="Controls how many recent stage and capability execution events Supervisor retains in each workflow projection."
               value={executionEventLimit}
               onChange={setExecutionEventLimit}
               min={10}
@@ -2718,7 +3460,7 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
                 loading={deleteSupervisorId ? deletingSupervisorId === deleteSupervisorId : false}
                 onClick={() => {
                   const supervisor = (deck?.supervisors ?? []).find((item) => item.id === deleteSupervisorId);
-                  if (supervisor) void removeFlightDeckSupervisor(supervisor);
+                  if (supervisor) void removeSupervisorProjection(supervisor);
                 }}
               >
                 Delete selected supervisor
@@ -2741,11 +3483,11 @@ export function FlightDeckPanel(props: FlightDeckPanelProps) {
         onError={setError}
       />
       <PlannerModal
-        opened={plannerSupervisor !== null}
-        rootRepoPath={plannerSupervisor?.root_repo_path ?? ''}
+        opened={activePlannerSupervisor !== null}
+        repoRef={activePlannerSupervisor?.root_repo_path ?? ''}
         run={null}
         templates={templates}
-        selectedPlannerId={plannerSupervisor?.selected_planner_id ?? null}
+        selectedPlannerId={activePlannerSupervisor?.selected_planner_id ?? null}
         selectedFeatureId={null}
         createFeatureOnOpen={plannerCreateFeatureOnOpen}
         selectionMode={plannerSelectFeatureOnOpen}

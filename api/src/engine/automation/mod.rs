@@ -6,12 +6,8 @@ pub mod scopes;
 
 pub use config::{
     apply_trigger,
-    arm_capabilities,
-    can_arm,
     control_descriptors,
     profile,
-    profile_from_global_state,
-    AutomationProfile,
     AutomationTrigger,
 };
 pub use decisions::{AutomationDecision, CapabilityInjection};

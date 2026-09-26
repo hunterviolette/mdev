@@ -162,20 +162,6 @@ pub struct WorkflowTemplateDefinition {
 }
 
 
-pub use crate::engine::capabilities::planner::{
-    ExecutionPlanItem,
-    FeaturePlanItem,
-    FeaturePlanItemStatus,
-};
-
-pub use crate::supervisor::models::{
-    CreateSupervisorRunRequest,
-    SupervisorActionRequest,
-    SupervisorExecutionStrategy,
-    SupervisorRun,
-    SupervisorStatus,
-};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowBuilderCatalog {
     pub version: u32,
@@ -237,12 +223,6 @@ pub struct WorkflowGovernancePolicyDescriptor {
     pub fields: Vec<WorkflowStageField>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkflowStageGovernancePolicy {
-    pub key: String,
-    #[serde(default)]
-    pub config: Value,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStageField {
@@ -380,18 +360,6 @@ pub struct WorkflowRun {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowEvent {
-    pub id: Uuid,
-    pub run_id: Uuid,
-    pub step_id: Option<String>,
-    pub level: String,
-    pub kind: String,
-    pub message: String,
-    #[serde(default)]
-    pub payload: Value,
-    pub created_at: DateTime<Utc>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowEventStreamItem {
@@ -411,18 +379,23 @@ pub struct WorkflowEventStreamItem {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SprintEventStreamItem {
+#[derive(Debug, Clone, Serialize)]
+pub struct SupervisorEventPayload {
+    pub supervisor_run_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<crate::routes::supervisor_projection::SupervisorProjection>,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SupervisorEventStreamItem {
     pub id: String,
-    pub sprint_id: String,
+    pub supervisor_run_id: String,
     pub sequence_no: i64,
     pub event_type: String,
     pub event_time: String,
-    pub feature_id: Option<String>,
-    pub actor: String,
     pub message: String,
-    #[serde(default)]
-    pub payload: Value,
+    pub payload: SupervisorEventPayload,
     pub created_at: String,
 }
 

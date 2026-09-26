@@ -614,6 +614,27 @@ export type RuntimeEventEnvelope = {
   event: StageExecutionEvent;
 };
 
+export type SupervisorEvent = {
+  id: string;
+  supervisor_run_id: string;
+  sequence_no: number;
+  event_type: string;
+  event_time: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type SupervisorEventEnvelope = {
+  scope: string;
+  node_key: string;
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  event: SupervisorEvent;
+};
+
 export type RuntimeProjectionResponse = {
   runs: EventChainSummaryResponse[];
 };
