@@ -1065,6 +1065,7 @@ async fn stream_runtime_events(
     let state_for_task = state.clone();
     let mut workflow_live_rx = state.subscribe_workflow_events();
     let mut supervisor_live_rx = state.subscribe_supervisor_events();
+    let mut template_live_rx = state.subscribe_template_events();
     let mut last_workflow_sequence_by_run_id = HashMap::<String, i64>::new();
     let mut last_supervisor_sequence_by_id = HashMap::<String, i64>::new();
 
@@ -1131,6 +1132,22 @@ async fn stream_runtime_events(
                         let _ = tx.send(Ok(stream_error_sse("workflow event broadcast channel closed")));
                         return;
                     },
+                },
+                template_message = template_live_rx.recv() => match template_message {
+                    Ok(item) => {
+                        if tx.send(Ok(Event::default().event("template_event").data(item.to_string()))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if tx.send(Ok(Event::default().event("template_resync").data("{}"))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        let _ = tx.send(Ok(stream_error_sse("template event broadcast channel closed")));
+                        return;
+                    }
                 },
                 supervisor_message = supervisor_live_rx.recv() => match supervisor_message {
                     Ok(item) => {
@@ -1410,29 +1427,16 @@ async fn supervisor_child_workflow_run_ids(
     supervisor_run_id: Uuid,
 ) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
     let mut run_ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT sf.current_workflow_run_id
-         FROM sprint_features sf
-         JOIN sprints s ON s.id = sf.sprint_id
-         WHERE s.supervisor_run_id = ?
-           AND TRIM(COALESCE(sf.current_workflow_run_id, '')) != ''",
+        "SELECT DISTINCT workflow_run_id
+         FROM supervisor_work_units
+         WHERE supervisor_run_id = ?
+           AND archived_at IS NULL
+           AND TRIM(COALESCE(workflow_run_id, '')) != ''",
     )
     .bind(supervisor_run_id.to_string())
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-
-    if let Some(integration_run_id) = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT integration_run_id FROM supervisor_runs WHERE id = ?",
-    )
-    .bind(supervisor_run_id.to_string())
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal)?
-    .flatten()
-    .filter(|value| !value.trim().is_empty())
-    {
-        run_ids.push(integration_run_id);
-    }
 
     run_ids.sort();
     run_ids.dedup();

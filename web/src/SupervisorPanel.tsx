@@ -374,14 +374,7 @@ function buildStageProjection(unit: SupervisorWorkUnitProjection): StageProjecti
   const observedFromHistory = recentStages.map((stage) => stageKeyFromText(textField(stage, 'step_id'))).filter(Boolean);
   if (templateKeys.length === 0) {
     if (!unit.workflow_run_id && ['pending', 'materializing'].includes(workflowMaterializationState(unit))) {
-      return [{
-        key: 'workflow_pending',
-        label: workflowIsRegenerating(unit) ? 'Regenerating workflow' : workflowIsMaterializing(unit) ? 'Starting workflow' : 'Workflow queued',
-        state: workflowIsMaterializing(unit) || workflowIsRegenerating(unit) ? 'active' : 'up_next',
-        message: workflowIsMaterializing(unit) || workflowIsRegenerating(unit)
-          ? 'The supervisor is creating the workflow runtime.'
-          : 'The workflow is queued and has not been created yet.',
-      }];
+      return [];
     }
 
     const error = textField(unit.telemetry, 'stage_template_error') || 'Workflow template stages are unavailable; Supervisor cannot render stage rails.';
@@ -1099,6 +1092,11 @@ function WorkflowProjectionCard(props: {
   };
 
   useEffect(() => {
+    setHistoryHydration(null);
+    setHydratedRunId(null);
+  }, [unit.workflow_run_id]);
+
+  useEffect(() => {
     const runId = unit.workflow_run_id;
     if (!runId) return;
     if (capabilities.length > 0 || recentStageExecutions.length > 0) return;
@@ -1123,12 +1121,8 @@ function WorkflowProjectionCard(props: {
 
   const displayCapabilities = capabilities.length > 0 ? capabilities : historyHydration?.capabilities ?? [];
   const displayFallbackStages = recentStageExecutions.length > 0 ? [] : historyHydration?.stages ?? [];
-  const integrationState = normalize(unit.state);
   const canApplyFinalPatch = workflowType(unit) === 'integration'
-    && !unit.workflow_deleted
-    && Boolean(unit.workflow_run_id)
-    && integrationState === 'completed'
-    && !unit.applied_at;
+    && unit.integration_apply_available;
 
 
   const title = unit.workflow_run_id ? (
@@ -1352,25 +1346,19 @@ function WorkflowProjectionCard(props: {
                   animation: 'supervisor-work-unit-content-in 220ms ease-out both',
                 }}
               >
-                <Stack gap="xs">
-                  <Group gap="xs" wrap="nowrap">
-                    <Text fw={800} size="sm">Workflow stages</Text>
-                    <Badge variant="light" size="xs">Progression</Badge>
-                  </Group>
-                  <StageRail stages={stages} />
-                </Stack>
+                {stages.length > 0 ? (
+                  <Stack gap="xs">
+                    <Group gap="xs" wrap="nowrap">
+                      <Text fw={800} size="sm">Workflow stages</Text>
+                      <Badge variant="light" size="xs">Progression</Badge>
+                    </Group>
+                    <StageRail stages={stages} />
+                  </Stack>
+                ) : null}
               </Box>
             )}
             {!telemetryHydrating && canApplyFinalPatch ? (
-              <Stack gap="xs" align="center" mt="sm">
-                <Checkbox
-                  checked={archiveIntegratedWorkflows}
-                  onChange={(event) => setArchiveIntegratedWorkflows(event.currentTarget.checked)}
-                  label="Archive integrated workflows after successful apply"
-                />
-                <Text size="xs" c="dimmed" ta="center">
-                  Leave unchecked to keep Feature and Manual workflows in the integration pool for iterative development.
-                </Text>
+              <Group gap="md" align="center" justify="center" wrap="wrap" mt="sm">
                 <Button
                   size="md"
                   color="green"
@@ -1382,7 +1370,15 @@ function WorkflowProjectionCard(props: {
                 >
                   Apply Integration to root
                 </Button>
-              </Stack>
+                <Tooltip label="Archive integrated Feature and Manual workflows after successful apply">
+                  <Checkbox
+                    checked={archiveIntegratedWorkflows}
+                    onChange={(event) => setArchiveIntegratedWorkflows(event.currentTarget.checked)}
+                    disabled={actionPending}
+                    label="Archive workflows"
+                  />
+                </Tooltip>
+              </Group>
             ) : null}
           </Stack>
           {telemetryHydrating ? (
@@ -2837,6 +2833,44 @@ function applyHydrationWorkUnit(
   return rebuildSupervisorProjection(supervisors);
 }
 
+function reconcileTelemetryArray(
+  current: Record<string, unknown>,
+  next: Record<string, unknown>,
+  key: string
+): unknown {
+  const nextValue = next[key];
+  if (Array.isArray(nextValue) && nextValue.length > 0) return nextValue;
+
+  const currentValue = current[key];
+  if (Array.isArray(currentValue) && currentValue.length > 0) return currentValue;
+
+  return nextValue ?? currentValue;
+}
+
+function reconcileSupervisorWorkUnitProjection(
+  current: SupervisorWorkUnitProjection,
+  next: SupervisorWorkUnitProjection
+): SupervisorWorkUnitProjection {
+  if (current.workflow_run_id !== next.workflow_run_id) {
+    return next;
+  }
+
+  const currentTelemetry = current.telemetry ?? {};
+  const nextTelemetry = next.telemetry ?? {};
+
+  return {
+    ...current,
+    ...next,
+    telemetry: {
+      ...currentTelemetry,
+      ...nextTelemetry,
+      recent_capability_executions: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'recent_capability_executions'),
+      current_stage_recent_capabilities: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'current_stage_recent_capabilities'),
+      recent_stage_executions: reconcileTelemetryArray(currentTelemetry, nextTelemetry, 'recent_stage_executions'),
+    },
+  };
+}
+
 function reconcileSupervisorWorkUnitProjections(
   current: SupervisorWorkUnitProjection[],
   next: SupervisorWorkUnitProjection[]
@@ -2845,7 +2879,7 @@ function reconcileSupervisorWorkUnitProjections(
   const currentIds = new Set(current.map((unit) => unit.id));
   const retained = current
     .filter((unit) => nextById.has(unit.id))
-    .map((unit) => nextById.get(unit.id)!);
+    .map((unit) => reconcileSupervisorWorkUnitProjection(unit, nextById.get(unit.id)!));
   const added = next.filter((unit) => !currentIds.has(unit.id));
   return [...retained, ...added];
 }
@@ -3023,15 +3057,26 @@ export function SupervisorPanel(props: SupervisorPanelProps) {
 
   useEffect(() => {
     let cancelled = false;
-    void listTemplates()
-      .then((rows) => {
-        if (!cancelled) setTemplates(rows);
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      });
+    let revision = 0;
+    const reload = () => {
+      const requestRevision = ++revision;
+      void listTemplates()
+        .then((rows) => {
+          if (!cancelled && requestRevision === revision) setTemplates(rows);
+        })
+        .catch((err) => {
+          if (!cancelled && requestRevision === revision) setError(err instanceof Error ? err.message : String(err));
+        });
+    };
+    reload();
+    const unsubscribe = subscribeRuntimeEventBus({
+      onOpen: reload,
+      onTemplateEvent: reload,
+      onTemplateResync: reload
+    });
     return () => {
       cancelled = true;
+      unsubscribe();
     };
   }, []);
 

@@ -98,6 +98,7 @@ struct SupervisorWorkUnitProjection {
     has_staged_changes: bool,
     has_workspace_changes: bool,
     integration_state: IntegrationInputState,
+    integration_apply_available: bool,
     applied_at: Option<String>,
     telemetry: Value,
     alerts: Vec<SupervisorAlert>,
@@ -380,6 +381,18 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Sup
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let integration_apply_available = seed
+        .context
+        .get("integration_apply_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let integration_apply_available = seed
+        .context
+        .get("integration_apply_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
 
     SupervisorWorkUnitProjection {
         id: seed.id.clone(),
@@ -398,6 +411,7 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Sup
         has_staged_changes: false,
         has_workspace_changes: false,
         integration_state: seed.integration_state.clone(),
+        integration_apply_available,
         applied_at,
         telemetry: json!({ "hydrating": true }),
         alerts: work_unit_alerts(supervisor, seed),
@@ -590,21 +604,6 @@ async fn load_supervisors(state: &AppState, query: &SupervisorProjectionQuery) -
 }
 
 async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow) -> anyhow::Result<()> {
-    let current_sprint_id = sqlx::query(
-        r#"
-        SELECT id
-        FROM sprints
-        WHERE supervisor_run_id = ?
-          AND status != 'archived'
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(supervisor.id.as_str())
-    .fetch_optional(&state.db)
-    .await?
-    .map(|row| row.get::<String, _>("id"));
-
     sqlx::query(
         r#"
         DELETE FROM supervisor_work_units
@@ -668,14 +667,7 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
                 ELSE 'queued'
             END,
             sr.root_repo_path,
-            (
-                SELECT sf.shard_path
-                FROM sprint_features sf
-                WHERE sf.supervisor_run_id = sr.id
-                  AND sf.feature_id = pf.id
-                ORDER BY sf.updated_at DESC
-                LIMIT 1
-            ),
+            NULL,
             sr.integration_path,
             0,
             queued_ids.queue_position,
@@ -716,104 +708,6 @@ async fn sync_supervisor_work_units(state: &AppState, supervisor: &SupervisorRow
     .bind(supervisor.id.as_str())
     .bind(supervisor.id.as_str())
     .bind(supervisor.id.as_str())
-    .execute(&state.db)
-    .await?;
-
-    let Some(current_sprint_id) = current_sprint_id else {
-        return Ok(());
-    };
-
-    sqlx::query(
-        r#"
-        INSERT INTO supervisor_work_units (
-            id,
-            supervisor_run_id,
-            repo_id,
-            feature_id,
-            workflow_run_id,
-            patch_id,
-            kind,
-            title,
-            state,
-            root_repo_path,
-            shard_path,
-            integration_path,
-            priority,
-            queue_position,
-            blocked_reason,
-            waiting_user_input_json,
-            context_json,
-            created_at,
-            updated_at
-        )
-        SELECT
-            sr.id || ':' || sf.feature_id,
-            sr.id,
-            pf.repo_id,
-            sf.feature_id,
-            sf.current_workflow_run_id,
-            sf.current_patch_id,
-            'feature_development',
-            COALESCE(pf.title, sf.feature_id),
-            CASE
-                WHEN TRIM(COALESCE(sf.last_error, '')) != '' THEN 'failed'
-                WHEN sf.development_state IN ('development_running', 'running', 'active') THEN 'running'
-                WHEN sf.development_state IN ('waiting', 'waiting_user', 'paused') THEN 'waiting_user'
-                WHEN sf.development_state IN ('development_failed', 'failed', 'blocked') THEN 'failed'
-                WHEN sf.development_state IN ('development_succeeded', 'completed') THEN 'ready_for_integration'
-                WHEN sf.development_state IN ('integrating', 'integration_running') THEN 'integrating'
-                WHEN sf.development_state IN ('integrated', 'applied') THEN 'integrated'
-                WHEN sf.development_state = 'patch_ready' THEN 'patch_ready'
-                WHEN sf.status IN ('active', 'running') THEN 'running'
-                WHEN sf.status IN ('waiting', 'paused') THEN 'waiting_user'
-                WHEN sf.status IN ('failed', 'blocked') THEN 'failed'
-                WHEN sf.status = 'completed' THEN 'ready_for_integration'
-                ELSE 'queued'
-            END,
-            sr.root_repo_path,
-            sf.shard_path,
-            sr.integration_path,
-            0,
-            sf.sort_order,
-            sf.last_error,
-            '{}',
-            json_object(
-                'source', 'supervisor_projection_sync',
-                'sprint_id', sf.sprint_id,
-                'workflow_type', 'feature_development',
-                'pool_key', 'feature_development',
-                'planned_workflow', CASE WHEN sf.current_workflow_run_id IS NULL THEN 1 ELSE 0 END,
-                'planned_workflow_template_id', json_extract(sr.context_json, '$.pools.feature_development.template_id'),
-                'feature_status', sf.status,
-                'development_state', sf.development_state,
-                'integration_skipped', COALESCE(sf.integration_skipped, 0)
-            ),
-            sf.created_at,
-            sf.updated_at
-        FROM sprint_features sf
-        JOIN supervisor_runs sr ON sr.id = sf.supervisor_run_id
-        LEFT JOIN planner_features pf ON pf.id = sf.feature_id
-        WHERE sf.supervisor_run_id = ?
-          AND sf.sprint_id = ?
-          AND sf.status NOT IN ('unscheduled', 'archived', 'applied', 'deleted', 'removed', 'skipped')
-          AND sf.development_state NOT IN ('archived', 'applied', 'deleted', 'removed', 'skipped')
-        ON CONFLICT(id) DO UPDATE SET
-            repo_id = excluded.repo_id,
-            workflow_run_id = excluded.workflow_run_id,
-            patch_id = excluded.patch_id,
-            title = excluded.title,
-            state = excluded.state,
-            root_repo_path = excluded.root_repo_path,
-            shard_path = excluded.shard_path,
-            integration_path = excluded.integration_path,
-            queue_position = excluded.queue_position,
-            blocked_reason = excluded.blocked_reason,
-            context_json = excluded.context_json,
-            updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(supervisor.id.as_str())
-    .bind(current_sprint_id.as_str())
     .execute(&state.db)
     .await?;
 

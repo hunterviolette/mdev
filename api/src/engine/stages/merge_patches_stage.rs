@@ -144,17 +144,7 @@ pub async fn execute_stage(
         return Err(anyhow!("merge_patches requires integration pool_type"));
     }
 
-    let supervisor_runtime_context = match supervisor_run_id.as_deref() {
-        Some(supervisor_run_id) => load_supervisor_runtime_context(state, supervisor_run_id).await?,
-        None => json!({}),
-    };
-    let sprint_id = supervisor_context
-        .get("sprint_id")
-        .or_else(|| supervisor_runtime_context.get("sprint_id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let integration_batch_id = supervisor_run_id.clone().or_else(|| sprint_id.clone()).unwrap_or_else(|| run_id.to_string());
+    let integration_batch_id = supervisor_run_id.clone().unwrap_or_else(|| run_id.to_string());
 
     let configured_inputs = supervisor_context
         .get("integration_inputs")
@@ -184,8 +174,6 @@ pub async fn execute_stage(
         configured_inputs
     } else if let Some(supervisor_run_id) = supervisor_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
         load_supervisor_integration_inputs(state, Uuid::parse_str(supervisor_run_id)?).await?
-    } else if let Some(sprint_id) = sprint_id.as_deref() {
-        load_sprint_feature_inputs(state, sprint_id).await?
     } else {
         return Err(anyhow!("merge_patches requires integration inputs"));
     };
@@ -197,7 +185,6 @@ pub async fn execute_stage(
     if patch_items.is_empty() {
         failed.push(json!({
             "error": "merge_patches found no staged integration inputs with workspace_path",
-            "sprint_id": sprint_id,
             "integration_batch_id": integration_batch_id
         }));
     }
@@ -440,7 +427,6 @@ pub async fn execute_stage(
     local_state["merge_patches"] = json!({
         "status": status,
         "source": "supervisor_integration_pool",
-        "sprint_id": sprint_id,
         "integration_batch_id": integration_batch_id,
         "supervisor_run_id": supervisor_run_id,
         "applied": applied,
@@ -658,57 +644,3 @@ async fn persist_successful_integration_merge(
     Ok(report)
 }
 
-async fn load_supervisor_runtime_context(state: &AppState, supervisor_run_id: &str) -> Result<Value> {
-    let row = sqlx::query(
-        "SELECT root_repo_path, context_json FROM supervisor_runs WHERE id = ?",
-    )
-    .bind(supervisor_run_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let Some(row) = row else {
-        return Err(anyhow!("supervisor {} not found", supervisor_run_id));
-    };
-
-    let root_repo_path = row.get::<String, _>("root_repo_path");
-    let context_json = row.get::<String, _>("context_json");
-    let context = serde_json::from_str::<Value>(&context_json).unwrap_or_else(|_| json!({}));
-    let workspace = crate::supervisor::repo_snapshot::workspace_for(
-        &root_repo_path,
-        Uuid::parse_str(supervisor_run_id)?,
-    ).ok();
-
-    Ok(json!({
-        "root_repo_path": root_repo_path,
-        "snapshot_path": workspace.as_ref().map(|item| item.snapshot.to_string_lossy().replace('\\', "/")),
-        "integration_path": workspace.as_ref().map(|item| item.integration.to_string_lossy().replace('\\', "/")),
-        "sprint_id": context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
-        "context": context
-    }))
-}
-
-async fn load_sprint_feature_inputs(state: &AppState, sprint_id: &str) -> Result<Vec<SupervisorIntegrationInput>> {
-    let rows = sqlx::query("SELECT sf.feature_id, sf.shard_path, sf.current_workflow_run_id FROM sprint_features sf WHERE sf.sprint_id = ? AND sf.development_state IN ('development_succeeded', 'integrated', 'applied') AND COALESCE(sf.integration_skipped, 0) = 0 AND TRIM(COALESCE(sf.shard_path, '')) != '' ORDER BY sf.sort_order ASC, sf.created_at ASC")
-        .bind(sprint_id)
-        .fetch_all(&state.db)
-        .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let feature_id = row.get::<String, _>("feature_id");
-            let workflow_run_id = row
-                .try_get::<Option<String>, _>("current_workflow_run_id")
-                .ok()
-                .flatten()
-                .and_then(|value| Uuid::parse_str(&value).ok());
-            SupervisorIntegrationInput {
-                work_unit_id: feature_id.clone(),
-                feature_id: Some(feature_id),
-                workspace_path: row.get::<String, _>("shard_path").into(),
-                workflow_run_id,
-                kind: SupervisorWorkPoolKind::Feature,
-            }
-        })
-        .collect())
-}

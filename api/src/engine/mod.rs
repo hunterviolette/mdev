@@ -1102,6 +1102,27 @@ pub(crate) async fn set_run_status(
     Ok(())
 }
 
+pub(crate) async fn set_terminal_run_status(
+    state: &AppState,
+    run_id: Uuid,
+    status: RunStatus,
+    current_step_id: Option<&str>,
+) -> Result<()> {
+    set_run_status(state, run_id, status.clone(), current_step_id).await?;
+
+    if matches!(status, RunStatus::Success | RunStatus::Error | RunStatus::Cancelled) {
+        crate::supervisor::handle_workflow_terminal_event(
+            state,
+            run_id,
+            status,
+            current_step_id,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn persist_context(state: &AppState, run_id: Uuid, context: &Value) -> Result<()> {
     update_run_context(&state.db, run_id, context).await?;
     Ok(())

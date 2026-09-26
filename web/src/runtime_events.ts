@@ -249,7 +249,7 @@ const RUNTIME_EVENT_BUS_LEADER_STALE_MS = 7000;
 
 type RuntimeEventBusBroadcastMessage = {
   sourceId: string;
-  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event' | 'supervisor_event' | 'supervisor_resync';
+  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event' | 'supervisor_event' | 'supervisor_resync' | 'template_event' | 'template_resync';
   payload?: unknown;
 };
 
@@ -305,6 +305,8 @@ type RuntimeEventBusHandlers = {
   onEvent?: (event: RuntimeEventEnvelope) => void;
   onSupervisorEvent?: (event: SupervisorEventEnvelope) => void;
   onSupervisorResync?: () => void;
+  onTemplateEvent?: (event: { event_type: string; template_id: string }) => void;
+  onTemplateResync?: () => void;
   onError?: () => void;
 };
 
@@ -341,6 +343,12 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
         return;
       case 'supervisor_resync':
         handlers.onSupervisorResync?.();
+        return;
+      case 'template_event':
+        handlers.onTemplateEvent?.(message.payload as { event_type: string; template_id: string });
+        return;
+      case 'template_resync':
+        handlers.onTemplateResync?.();
         return;
     }
   }
@@ -425,6 +433,20 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
         broadcast('supervisor_event', event);
       } catch {
       }
+    });
+
+    nextSource.addEventListener('template_event', (raw) => {
+      if (disposed || !isLeader) return;
+      try {
+        const event = JSON.parse((raw as MessageEvent<string>).data) as { event_type: string; template_id: string };
+        broadcast('template_event', event);
+      } catch {
+      }
+    });
+
+    nextSource.addEventListener('template_resync', () => {
+      if (disposed || !isLeader) return;
+      broadcast('template_resync');
     });
 
     nextSource.addEventListener('supervisor_resync', () => {

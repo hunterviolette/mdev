@@ -203,6 +203,10 @@ impl TryFrom<&str> for SupervisorWorkUnitState {
     }
 }
 
+pub fn integration_work_unit_id(supervisor_run_id: Uuid) -> String {
+    format!("{}:integration", supervisor_run_id)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SupervisorWorkUnitStoredContext {
     #[serde(default)]

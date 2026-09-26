@@ -9,8 +9,6 @@ export type FeaturePlanItem = {
   summary: string;
   rough_summary?: string | null;
   refinement_workflow_run_id?: string | null;
-  applied_sprint_id?: string | null;
-  applied_sprint_title?: string | null;
   applied_at?: string | null;
   requirements: string[];
   acceptance_criteria: string[];
@@ -167,8 +165,6 @@ function normalizeImportedFeature(value: unknown, index: number): FeaturePlanIte
     summary,
     rough_summary: roughSummary || null,
     refinement_workflow_run_id: importString(item.refinement_workflow_run_id) || null,
-    applied_sprint_id: importString(item.applied_sprint_id) || null,
-    applied_sprint_title: importString(item.applied_sprint_title) || null,
     applied_at: importString(item.applied_at) || null,
     requirements: importStringArray(item.requirements),
     acceptance_criteria: importStringArray(item.acceptance_criteria),
@@ -538,6 +534,7 @@ export type SupervisorWorkUnitProjection = {
   has_staged_changes: boolean;
   has_workspace_changes: boolean;
   integration_state: IntegrationInputState;
+  integration_apply_available: boolean;
   applied_at?: string | null;
   queue_position?: number | null;
   blocked_reason?: string | null;

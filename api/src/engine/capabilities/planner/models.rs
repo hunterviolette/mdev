@@ -33,10 +33,6 @@ pub struct FeaturePlanItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refinement_workflow_run_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_sprint_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_sprint_title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<String>,
     #[serde(default)]
     pub requirements: Vec<String>,

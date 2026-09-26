@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub db: SqlitePool,
     workflow_events_tx: broadcast::Sender<WorkflowEventStreamItem>,
     supervisor_events_tx: broadcast::Sender<SupervisorEventStreamItem>,
+    template_events_tx: broadcast::Sender<Value>,
     process_session_id: String,
     pub workflow_coordinator: WorkflowCoordinator,
     pub supervisor_coordinator: SupervisorCoordinator,
@@ -56,10 +58,12 @@ impl AppState {
     pub fn new(db: SqlitePool) -> Self {
         let (workflow_events_tx, _) = broadcast::channel(4096);
         let (supervisor_events_tx, _) = broadcast::channel(4096);
+        let (template_events_tx, _) = broadcast::channel(1024);
         Self {
             db,
             workflow_events_tx,
             supervisor_events_tx,
+            template_events_tx,
             process_session_id: Uuid::new_v4().to_string(),
             workflow_coordinator: WorkflowCoordinator::default(),
             supervisor_coordinator: SupervisorCoordinator::default(),
@@ -85,6 +89,14 @@ impl AppState {
 
     pub fn publish_supervisor_event(&self, event: SupervisorEventStreamItem) {
         let _ = self.supervisor_events_tx.send(event);
+    }
+
+    pub fn subscribe_template_events(&self) -> broadcast::Receiver<Value> {
+        self.template_events_tx.subscribe()
+    }
+
+    pub fn publish_template_event(&self, event: Value) {
+        let _ = self.template_events_tx.send(event);
     }
 
     pub fn planner(&self) -> PlannerService<'_> {

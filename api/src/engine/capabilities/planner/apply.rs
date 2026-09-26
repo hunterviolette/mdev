@@ -82,8 +82,6 @@ async fn execute_inner(
     )?;
 
     refined.refinement_workflow_run_id = Some(ctx.run_id);
-    refined.applied_sprint_id = existing.applied_sprint_id;
-    refined.applied_sprint_title = existing.applied_sprint_title;
     refined.applied_at = existing.applied_at;
 
     let now = Utc::now().to_rfc3339();

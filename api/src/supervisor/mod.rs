@@ -23,7 +23,7 @@ use crate::{
     },
     models::{RunStatus, SupervisorEventPayload, SupervisorEventStreamItem},
 };
-use models::{CreateSupervisorRunRequest, CreateSupervisorWorkUnitRequest, IntegrationInputState, SupervisorExecutionStrategy, SupervisorFeatureWorkflow, SupervisorIntegrationCandidate, SupervisorIntegrationInput, SupervisorRun, SupervisorStatus, SupervisorWorkPoolKind, SupervisorWorkUnitRecord, SupervisorWorkUnitState, SupervisorWorkUnitStoredContext};
+use models::{integration_work_unit_id, CreateSupervisorRunRequest, CreateSupervisorWorkUnitRequest, IntegrationInputState, SupervisorExecutionStrategy, SupervisorFeatureWorkflow, SupervisorIntegrationCandidate, SupervisorIntegrationInput, SupervisorRun, SupervisorStatus, SupervisorWorkPoolKind, SupervisorWorkUnitRecord, SupervisorWorkUnitState, SupervisorWorkUnitStoredContext};
 use lifecycle::{SupervisorPoolKind, SupervisorWorkUnitPromiseRequest, SupervisorWorkflowSpawnRequest};
 
 
@@ -48,7 +48,7 @@ async fn ensure_supervisor_integration_work_unit(
     run: &SupervisorRun,
 ) -> Result<()> {
     let template_id = supervisor_pool_template_uuid(&run.context, SupervisorWorkPoolKind::Integration.as_str());
-    let work_unit_id = format!("{}:integration", run.id);
+    let work_unit_id = integration_work_unit_id(run.id);
 
     lifecycle::promise_supervisor_work_unit(
         state,
@@ -122,22 +122,6 @@ fn normalize_repo_root(value: &str) -> String {
 
 
 
-
-fn sprint_key_for(root: &str, sprint_id: &str) -> String {
-    let normalized = root.trim().replace('\\', "/");
-    let repo = normalized
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("repo");
-    let prefix = repo
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
-        .collect::<String>();
-    let suffix = sprint_id.chars().filter(|ch| *ch != '-').take(12).collect::<String>().to_ascii_uppercase();
-    format!("{}-SPRINT-{}", prefix, suffix)
-}
 
 async fn hydrate_supervisor_planner(state: &AppState, run: &mut SupervisorRun) -> Result<()> {
     let Some(planner_id) = run.selected_planner_id.clone() else {
@@ -436,7 +420,6 @@ pub async fn supervisor_queue_projection(state: &AppState, id: Uuid) -> Result<V
             "locked_by_other": locked_by_other,
             "lock_owner_supervisor_run_id": locked_owner,
             "disabled_reason": if locked_by_other { Some("Feature is checked out by another supervisor".to_string()) } else { None },
-            "current_sprint_id": Value::Null,
             "work_unit_id": work_unit_id,
             "current_workflow_run_id": workflow_run_id,
             "current_patch_id": patch_id,
@@ -635,6 +618,7 @@ pub async fn update_supervisor_config(state: &AppState, id: Uuid, mut config: Va
     kick_feature_pool_if_running(state, &mut run).await?;
 
     let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_config_updated", "supervisor configuration updated").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -654,6 +638,7 @@ pub async fn select_supervisor_planner(state: &AppState, id: Uuid, planner_id: S
     update_supervisor_run(state, &run).await?;
 
     let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_planner_selected", "supervisor planner selected").await?;
     Ok(json!({ "ok": true, "supervisor_run": run }))
 }
 
@@ -1722,6 +1707,8 @@ pub async fn delete_supervisor_run(state: &AppState, id: Uuid) -> Result<()> {
 
 pub async fn cancel_supervisor_run(state: &AppState, id: Uuid) -> Result<Value> {
     update_status(state, id, SupervisorStatus::Cancelled).await?;
+    let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_cancelled", "supervisor cancelled").await?;
     Ok(json!({ "ok": true, "status": "cancelled" }))
 }
 
@@ -1742,6 +1729,60 @@ fn workflow_terminal_event_message(status: &RunStatus) -> &'static str {
     }
 }
 
+async fn transition_integration_work_unit_terminal(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+    workflow_run_id: Uuid,
+    status: &RunStatus,
+) -> Result<bool> {
+    let work_unit_id = integration_work_unit_id(supervisor_run_id);
+    let now = Utc::now().to_rfc3339();
+    let (state_value, available) = match status {
+        RunStatus::Success => (SupervisorWorkUnitState::Completed.as_str(), true),
+        RunStatus::Error => (SupervisorWorkUnitState::Failed.as_str(), false),
+        RunStatus::Cancelled => (SupervisorWorkUnitState::Cancelled.as_str(), false),
+        _ => return Ok(false),
+    };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET state = ?,
+            context_json = json_set(
+                CASE
+                    WHEN ? THEN json_remove(
+                        CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+                        '$.applied_at'
+                    )
+                    WHEN json_valid(context_json) THEN context_json
+                    ELSE '{}'
+                END,
+                '$.integration_apply_available', json(?)
+            ),
+            updated_at = ?
+        WHERE id = ?
+          AND supervisor_run_id = ?
+          AND workflow_run_id = ?
+          AND archived_at IS NULL
+        "#,
+    )
+    .bind(state_value)
+    .bind(available)
+    .bind(if available { "true" } else { "false" })
+    .bind(&now)
+    .bind(&work_unit_id)
+    .bind(supervisor_run_id.to_string())
+    .bind(workflow_run_id.to_string())
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("integration workflow terminal transition did not resolve its integration work unit"));
+    }
+
+    Ok(available)
+}
+
 pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: Uuid, status: RunStatus, current_step_id: Option<&str>) -> Result<()> {
     let workflow_run = engine::load_run(state, workflow_run_id).await?;
     let supervisor_context = workflow_run.context.get("supervisor").cloned().unwrap_or_else(|| json!({}));
@@ -1760,7 +1801,6 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
         workflow_terminal_event_message(&status),
         json!({
             "supervisor_run_id": supervisor_id,
-            "sprint_id": supervisor_context.get("sprint_id").cloned().unwrap_or(Value::Null),
             "feature_id": supervisor_context.get("feature_id").cloned().unwrap_or(Value::Null),
             "input_source": supervisor_context.get("input_source").cloned().unwrap_or(Value::Null),
             "workflow_status": status_str(&status)
@@ -1768,7 +1808,6 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
     ).await?;
 
     let mut run = load_supervisor_run(state, supervisor_id).await?;
-    let now = Utc::now().to_rfc3339();
     let pool_type = supervisor_context
         .get("pool_type")
         .or_else(|| supervisor_context.get("pool_key"))
@@ -1794,28 +1833,31 @@ pub async fn handle_workflow_terminal_event(state: &AppState, workflow_run_id: U
     }
 
 
-    if is_integration_workflow {
-        match status {
-            RunStatus::Success => {
-                run.status = SupervisorStatus::ReadyToApply;
-                if let Some(sprint_id) = run.context.get("current_sprint_id").and_then(Value::as_str) {
-                    sqlx::query("UPDATE sprints SET status = ?, integration_completed_at = COALESCE(integration_completed_at, ?), updated_at = ? WHERE id = ?")
-                        .bind("ready_to_apply")
-                        .bind(&now)
-                        .bind(&now)
-                        .bind(sprint_id)
-                        .execute(&state.db)
-                        .await?;
-                }
-            }
-            RunStatus::Error | RunStatus::Cancelled => {
-                run.status = SupervisorStatus::Failed;
-            }
-            _ => {}
-        }
+    if matches!(status, RunStatus::Success | RunStatus::Error | RunStatus::Cancelled) {
+        let available = transition_integration_work_unit_terminal(
+            state,
+            supervisor_id,
+            workflow_run_id,
+            &status,
+        )
+        .await?;
+
+        run.status = if available {
+            SupervisorStatus::ReadyToApply
+        } else {
+            SupervisorStatus::Failed
+        };
         run.updated_at = Utc::now();
+
         update_supervisor_run(state, &run).await?;
-        publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "integration workflow terminal event processed").await?;
+
+        publish_supervisor_snapshot(
+            state,
+            &run,
+            if available { "integration_available" } else { "supervisor_snapshot" },
+            "integration workflow terminal event processed",
+        )
+        .await?;
     }
 
     Ok(())
@@ -1988,8 +2030,6 @@ async fn supervisor_work_unit_materialization_item(
         summary: work_unit.title.clone(),
         rough_summary: None,
         refinement_workflow_run_id: None,
-        applied_sprint_id: None,
-        applied_sprint_title: None,
         applied_at: None,
         requirements: Vec::new(),
         acceptance_criteria: Vec::new(),
@@ -2572,7 +2612,8 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
                     '$.final_patch_text',
                     '$.final_patch_hash',
                     '$.final_patch_bytes',
-                    '$.merge_report'
+                    '$.merge_report',
+                    '$.integration_apply_available'
                 ),
                 updated_at = ?
             WHERE id = ?
@@ -2916,12 +2957,12 @@ pub async fn apply_supervisor_work_unit(
     {
         return Err(anyhow!("integration work unit has already been applied to the root repository"));
     }
-    let integration_work_unit_state: String = integration_row.get("state");
-    let integration_run = engine::load_run(state, integration_run_id).await?;
-    if !matches!(integration_run.status, RunStatus::Success)
-        || integration_work_unit_state != SupervisorWorkUnitState::Completed.as_str()
-    {
-        return Err(anyhow!("current integration workflow must complete successfully before applying integration batch"));
+    let integration_apply_available = integration_context
+        .get("integration_apply_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !integration_apply_available {
+        return Err(anyhow!("current integration result is not available to apply"));
     }
     if !matches!(run.status, SupervisorStatus::ReadyToApply) {
         run.status = SupervisorStatus::ReadyToApply;
@@ -2985,7 +3026,8 @@ pub async fn apply_supervisor_work_unit(
                 '$.final_patch_hash', ?,
                 '$.final_patch_bytes', ?,
                 '$.merge_report', json(?),
-                '$.applied_at', ?
+                '$.applied_at', ?,
+                '$.integration_apply_available', json('false')
             ),
             updated_at = ?
         WHERE supervisor_run_id = ?
@@ -3084,7 +3126,7 @@ pub async fn apply_supervisor_work_unit(
     publish_supervisor_snapshot(
         state,
         &run,
-        "supervisor_snapshot",
+        "integration_consumed",
         "integration work unit applied to root repository",
     )
     .await?;
@@ -3239,14 +3281,12 @@ async fn default_refinement_workflow_template_id(state: &AppState) -> Result<Opt
 fn supervisor_context(run: &SupervisorRun, workspace: &repo_snapshot::SupervisorWorkspace) -> Value {
     json!({
         "supervisor_run_id": run.id,
-        "sprint_id": run.context.get("current_sprint_id").cloned().unwrap_or(Value::Null),
-        "sprint_key": run.context.get("current_sprint_key").cloned().unwrap_or(Value::Null),
         "strategy": run.strategy,
         "root_repo_path": run.root_repo_path,
         "snapshot_path": workspace.snapshot,
         "integration_path": workspace.integration,
         "patches_path": workspace.patches,
-        "input_source": "supervisor_sprint_feature"
+        "input_source": "supervisor_work_unit"
     })
 }
 
