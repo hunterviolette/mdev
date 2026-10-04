@@ -273,6 +273,10 @@ pub struct SupervisorIntegrationInput {
     pub workflow_run_id: Option<Uuid>,
     #[serde(alias = "workflow_type")]
     pub kind: SupervisorWorkPoolKind,
+    #[serde(default = "default_stage_work_unit")]
+    pub include_staged: bool,
+    #[serde(default)]
+    pub include_unstaged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,7 +297,13 @@ pub enum SupervisorActionRequest {
     RegenerateWorkUnit { work_unit_id: String },
     StartWorkUnit { work_unit_id: String },
     PauseWorkUnit { work_unit_id: String },
-    StageWorkUnit { work_unit_id: String, #[serde(default = "default_stage_work_unit")] staged: bool },
+    StageWorkUnit {
+        work_unit_id: String,
+        #[serde(default = "default_stage_work_unit")]
+        staged: bool,
+        #[serde(default)]
+        include_unstaged: bool,
+    },
     UpdateSupervisorConfig { config: Value },
     SelectPlanner { planner_id: String },
     EnqueueFeature { planner_id: String, feature_id: String },
@@ -321,6 +331,15 @@ fn default_stage_work_unit() -> bool {
 }
 
 impl SupervisorActionRequest {
+    pub fn requires_supervisor_lock(&self) -> bool {
+        !matches!(
+            self,
+            Self::StageWorkUnit { .. }
+                | Self::SkipIntegrationInput { .. }
+                | Self::UnskipIntegrationInput { .. }
+        )
+    }
+
     pub fn action_name(&self) -> &'static str {
         match self {
             Self::CreateWorkUnit(_) => "create_work_unit",

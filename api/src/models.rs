@@ -384,6 +384,8 @@ pub struct SupervisorEventPayload {
     pub supervisor_run_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<crate::routes::supervisor_projection::SupervisorProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_unit_patch: Option<Value>,
     pub deleted: bool,
 }
 

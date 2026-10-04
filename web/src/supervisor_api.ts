@@ -532,7 +532,10 @@ export type SupervisorWorkUnitProjection = {
   workspace_path?: string | null;
   integration_path?: string | null;
   has_staged_changes: boolean;
+  has_unstaged_changes: boolean;
   has_workspace_changes: boolean;
+  integration_include_staged: boolean;
+  integration_include_unstaged: boolean;
   integration_state: IntegrationInputState;
   integration_apply_available: boolean;
   applied_at?: string | null;
@@ -790,7 +793,7 @@ export type SupervisorActionRequest =
   | { action: 'regenerate_work_unit'; work_unit_id: string }
   | { action: 'start_work_unit'; work_unit_id: string }
   | { action: 'pause_work_unit'; work_unit_id: string }
-  | { action: 'stage_work_unit'; work_unit_id: string; staged?: boolean }
+  | { action: 'stage_work_unit'; work_unit_id: string; staged?: boolean; include_unstaged?: boolean }
   | { action: 'update_supervisor_config'; config: Record<string, unknown> }
   | { action: 'select_planner'; planner_id: string }
   | { action: 'enqueue_feature'; planner_id: string; feature_id: string }
@@ -865,7 +868,6 @@ export function getPendingSupervisorActions(supervisorId?: string): PendingSuper
 
 export async function runSupervisorAction(id: string, request: SupervisorActionRequest): Promise<Record<string, unknown>> {
   const pending = beginSupervisorAction(id, request);
-  let succeeded = false;
   try {
     const response = await fetch(`/api/supervisor-runs/${id}/actions`, {
       method: 'POST',
@@ -874,7 +876,6 @@ export async function runSupervisorAction(id: string, request: SupervisorActionR
     });
     if (!response.ok) throw new Error(await response.text());
     const result = await response.json();
-    succeeded = true;
     if (result && typeof result === 'object' && result.supervisor_run) {
       return {
         ...result,
@@ -883,10 +884,6 @@ export async function runSupervisorAction(id: string, request: SupervisorActionR
     }
     return result;
   } finally {
-    if (succeeded) {
-      window.setTimeout(() => finishSupervisorAction(pending.id), 300);
-    } else {
-      finishSupervisorAction(pending.id);
-    }
+    finishSupervisorAction(pending.id);
   }
 }

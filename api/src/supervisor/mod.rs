@@ -16,10 +16,13 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine,
-    engine::capabilities::planner::{
-        ExecutionPlanItem,
-        FeaturePlanItem,
-        FeaturePlanItemStatus,
+    engine::capabilities::{
+        git_patch_payload,
+        planner::{
+            ExecutionPlanItem,
+            FeaturePlanItem,
+            FeaturePlanItemStatus,
+        },
     },
     models::{RunStatus, SupervisorEventPayload, SupervisorEventStreamItem},
 };
@@ -177,6 +180,31 @@ async fn append_supervisor_event(
     };
     state.publish_supervisor_event(event.clone());
     Ok(event)
+}
+
+async fn publish_supervisor_work_unit_patch(
+    state: &AppState,
+    supervisor_run_id: Uuid,
+    work_unit_id: &str,
+    patch: Value,
+) -> Result<()> {
+    append_supervisor_event(
+        state,
+        supervisor_run_id,
+        "supervisor_work_unit_updated",
+        "supervisor work unit updated",
+        SupervisorEventPayload {
+            supervisor_run_id,
+            supervisor: None,
+            work_unit_patch: Some(json!({
+                "id": work_unit_id,
+                "changes": patch
+            })),
+            deleted: false,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 
@@ -1697,6 +1725,7 @@ pub async fn delete_supervisor_run(state: &AppState, id: Uuid) -> Result<()> {
         SupervisorEventPayload {
             supervisor_run_id: id,
             supervisor: None,
+            work_unit_patch: None,
             deleted: true,
         },
     )
@@ -2807,48 +2836,67 @@ pub async fn pause_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
     Ok(json!({ "ok": true, "action": "pause_work_unit", "work_unit_id": work_unit_id, "pause_result": pause_result, "supervisor_run": run }))
 }
 
-pub async fn stage_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String, staged: bool) -> Result<Value> {
+pub async fn stage_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String, staged: bool, include_unstaged: bool) -> Result<Value> {
     let work_unit = load_supervisor_integration_candidate(state, id, &work_unit_id).await?;
     if !work_unit.supports_integration_input() {
         return Err(anyhow!("work unit kind cannot be used as an integration input"));
     }
+    if work_unit.integration_state == IntegrationInputState::Skipped {
+        return Err(anyhow!("skipped integration input must be restored before changing its change scope"));
+    }
 
-    let integration_state = if staged {
-        let workspace_path = work_unit
-            .workspace_path
-            .as_deref()
-            .filter(|path| !path.as_os_str().is_empty())
-            .ok_or_else(|| anyhow!("work unit has no workspace"))?;
-        let change_status = patches::change_status(workspace_path)?;
-        if !work_unit.can_stage_to_integration(&change_status) {
-            return Err(anyhow!("work unit has no staged changes to add to integration or is already an integration input"));
-        }
+    let integration_state = if staged || include_unstaged {
         IntegrationInputState::Included
     } else {
-        if !work_unit.can_unstage_from_integration() {
-            return Err(anyhow!("work unit is not staged to integration"));
-        }
         IntegrationInputState::Available
     };
-
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE supervisor_work_units SET integration_state = ?, updated_at = ? WHERE id = ? AND supervisor_run_id = ?")
-        .bind(integration_state.as_str())
-        .bind(&now)
-        .bind(&work_unit_id)
-        .bind(id.to_string())
-        .execute(&state.db)
-        .await?;
 
-    let run = load_supervisor_run(state, id).await?;
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", if staged { "work unit staged for integration" } else { "work unit unstaged from integration" }).await?;
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET integration_state = ?,
+            context_json = json_set(
+                CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+                '$.integration_include_staged',
+                json(CASE WHEN ? != 0 THEN 'true' ELSE 'false' END),
+                '$.integration_include_unstaged',
+                json(CASE WHEN ? != 0 THEN 'true' ELSE 'false' END)
+            ),
+            updated_at = ?
+        WHERE id = ? AND supervisor_run_id = ?
+        "#,
+    )
+    .bind(integration_state.as_str())
+    .bind(staged)
+    .bind(include_unstaged)
+    .bind(&now)
+    .bind(&work_unit_id)
+    .bind(id.to_string())
+    .execute(&state.db)
+    .await?;
+
+    publish_supervisor_work_unit_patch(
+        state,
+        id,
+        &work_unit_id,
+        json!({
+            "integration_state": integration_state,
+            "integration_include_staged": staged,
+            "integration_include_unstaged": include_unstaged,
+            "updated_at": now
+        }),
+    )
+    .await?;
 
     Ok(json!({
         "ok": true,
         "action": "stage_work_unit",
         "work_unit_id": work_unit_id,
         "integration_state": integration_state,
-        "supervisor_run": run
+        "integration_include_staged": staged,
+        "integration_include_unstaged": include_unstaged,
+        "updated_at": now
     }))
 }
 
@@ -2879,15 +2927,23 @@ pub async fn set_supervisor_work_unit_integration_skipped(state: &AppState, id: 
         .execute(&state.db)
         .await?;
 
-    let run = load_supervisor_run(state, id).await?;
-    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", if skipped { "integration input skipped" } else { "integration input unskipped" }).await?;
+    publish_supervisor_work_unit_patch(
+        state,
+        id,
+        &work_unit_id,
+        json!({
+            "integration_state": integration_state,
+            "updated_at": now
+        }),
+    )
+    .await?;
 
     Ok(json!({
         "ok": true,
         "work_unit_id": work_unit_id,
         "kind": work_unit.kind,
         "integration_state": integration_state,
-        "supervisor_run": run
+        "updated_at": now
     }))
 }
 
@@ -2923,7 +2979,7 @@ pub async fn apply_supervisor_work_unit(
 
     let integration_row = sqlx::query(
         r#"
-        SELECT workflow_run_id, integration_path, state, context_json
+        SELECT workflow_run_id, workspace_path, state, context_json
         FROM supervisor_work_units
         WHERE supervisor_run_id = ?
           AND id = ?
@@ -2944,10 +3000,10 @@ pub async fn apply_supervisor_work_unit(
 
     let integration_run_id_text: String = integration_row.get("workflow_run_id");
     let integration_run_id = Uuid::parse_str(&integration_run_id_text)?;
-    let integration_path = integration_row
-        .get::<Option<String>, _>("integration_path")
+    let integration_workspace_path = integration_row
+        .get::<Option<String>, _>("workspace_path")
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("integration path is missing; re-run integration before applying final patch"))?;
+        .ok_or_else(|| anyhow!("integration workspace path is missing; regenerate the integration work unit before applying final patch"))?;
     let integration_context_json: String = integration_row.get("context_json");
     let integration_context = serde_json::from_str::<Value>(&integration_context_json).unwrap_or_else(|_| json!({}));
     if integration_context
@@ -2991,18 +3047,22 @@ pub async fn apply_supervisor_work_unit(
         return Err(anyhow!("integration workflow has no successfully merged input patches"));
     }
 
-    let patch_text = integration_context
+    let patch_text = match integration_context
         .get("final_patch_text")
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| patches::generate_patch_text(Path::new(&integration_path)).unwrap_or_default());
+    {
+        Some(value) => value,
+        None => git_patch_payload::generate_payload(&integration_workspace_path, "both", &[], None)?.patch_text,
+    };
     if patch_text.trim().is_empty() {
         return Err(anyhow!("integration produced an empty final patch; re-run integration before applying"));
     }
-    let patch_hash = patches::patch_content_hash(&patch_text);
+    let final_payload = git_patch_payload::payload_from_patch(&integration_workspace_path, "both", &patch_text)?;
+    let patch_hash = final_payload.patch_hash.clone();
     let final_patch_ref = format!("supervisor_work_units:{}:context_json.final_patch_text", integration_batch_id);
-    patches::apply_patch_text(Path::new(&run.root_repo_path), &patch_text)?;
+    git_patch_payload::apply_payload(&run.root_repo_path, &final_payload.payload_text, false)?;
     let now_text = Utc::now().to_rfc3339();
     let merge_report = json!({
         "ok": true,
@@ -3011,7 +3071,7 @@ pub async fn apply_supervisor_work_unit(
         "final_patch_ref": final_patch_ref,
         "final_patch_hash": patch_hash,
         "final_patch_bytes": patch_text.len(),
-        "integration_path": integration_path,
+        "workspace_path": integration_workspace_path,
         "applied_at": now_text,
         "archive_integrated_workflows": archive_integrated_workflows
     });
@@ -3152,7 +3212,7 @@ pub async fn apply_supervisor_work_unit(
 pub async fn load_supervisor_integration_inputs(state: &AppState, supervisor_id: Uuid) -> Result<Vec<SupervisorIntegrationInput>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, kind, feature_id, workflow_run_id, workspace_path
+        SELECT id, kind, feature_id, workflow_run_id, workspace_path, context_json
         FROM supervisor_work_units
         WHERE supervisor_run_id = ?
           AND kind IN ('feature', 'manual')
@@ -3170,6 +3230,8 @@ pub async fn load_supervisor_integration_inputs(state: &AppState, supervisor_id:
     rows.into_iter()
         .map(|row| {
             let kind_text: String = row.try_get("kind")?;
+            let context_json: String = row.try_get("context_json")?;
+            let context: Value = serde_json::from_str(&context_json).unwrap_or_else(|_| json!({}));
             let workflow_run_id = row
                 .try_get::<Option<String>, _>("workflow_run_id")?
                 .filter(|value| !value.trim().is_empty())
@@ -3182,6 +3244,14 @@ pub async fn load_supervisor_integration_inputs(state: &AppState, supervisor_id:
                 workspace_path: PathBuf::from(row.try_get::<String, _>("workspace_path")?),
                 workflow_run_id,
                 kind: SupervisorWorkPoolKind::try_from(kind_text.as_str()).map_err(anyhow::Error::msg)?,
+                include_staged: context
+                    .get("integration_include_staged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                include_unstaged: context
+                    .get("integration_include_unstaged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -3336,6 +3406,7 @@ async fn publish_supervisor_snapshot(state: &AppState, run: &SupervisorRun, even
         SupervisorEventPayload {
             supervisor_run_id: run.id,
             supervisor: projection,
+            work_unit_patch: None,
             deleted: false,
         },
     )

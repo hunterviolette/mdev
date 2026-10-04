@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -9,11 +7,11 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine,
+    engine::capabilities::git_patch_payload,
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
     supervisor::{
         load_supervisor_integration_inputs,
         models::{SupervisorIntegrationInput, SupervisorWorkPoolKind},
-        patches,
     },
 };
 
@@ -184,7 +182,7 @@ pub async fn execute_stage(
 
     if patch_items.is_empty() {
         failed.push(json!({
-            "error": "merge_patches found no staged integration inputs with workspace_path",
+            "error": "merge_patches found no selected integration inputs with workspace_path",
             "integration_batch_id": integration_batch_id
         }));
     }
@@ -198,7 +196,9 @@ pub async fn execute_stage(
         let capability_config = json!({
             "work_unit_id": work_unit_id,
             "workspace_path": workspace_path,
-            "target_repo_ref": repo_ref
+            "target_repo_ref": repo_ref,
+            "include_staged": patch.include_staged,
+            "include_unstaged": patch.include_unstaged
         });
 
         if workspace_path.is_empty() || work_unit_id.is_empty() {
@@ -225,17 +225,38 @@ pub async fn execute_stage(
         )
         .await?;
 
-        let patch_text = match patches::generate_staged_patch_text(Path::new(&workspace_path)) {
+        let scope = match (patch.include_staged, patch.include_unstaged) {
+            (true, true) => "both",
+            (true, false) => "staged",
+            (false, true) => "unstaged",
+            (false, false) => {
+                failed.push(json!({
+                    "patch": patch,
+                    "error": "integration input has no selected change scope"
+                }));
+                break;
+            }
+        };
+
+        let generated_payload = match git_patch_payload::generate_payload(
+            &workspace_path,
+            scope,
+            &[],
+            None,
+        ) {
             Ok(value) => value,
             Err(err) => {
                 let details = format!("{:#}", err);
-                let summary = "Could not read the staged changes from this work unit";
+                let summary = "Could not read the selected changes from this work unit";
                 let result = json!({
                     "ok": false,
-                    "error_type": "staged_patch_generation_failed",
+                    "error_type": "integration_patch_generation_failed",
                     "summary": summary,
                     "work_unit_id": work_unit_id,
                     "workspace_path": workspace_path,
+                    "include_staged": patch.include_staged,
+                    "include_unstaged": patch.include_unstaged,
+                    "scope": scope,
                     "details": details
                 });
                 append_git_patch_payload_event(
@@ -260,16 +281,17 @@ pub async fn execute_stage(
                 }));
                 failed.push(json!({
                     "patch": patch,
-                    "error": format!("failed to generate staged patch text: {:#}", err)
+                    "error": format!("failed to generate git patch payload: {:#}", err)
                 }));
                 break;
             }
         };
+        let patch_text = generated_payload.patch_text.clone();
 
         if patch_text.trim().is_empty() {
             let result = json!({
                 "ok": true,
-                "summary": "No staged changes were present in this integration input",
+                "summary": "No selected changes were present in this integration input",
                 "work_unit_id": work_unit_id,
                 "workspace_path": workspace_path,
                 "patch_bytes": 0,
@@ -306,10 +328,10 @@ pub async fn execute_stage(
             continue;
         }
 
-        match patches::apply_patch_text(Path::new(repo_ref), &patch_text) {
+        match git_patch_payload::apply_payload(repo_ref, &generated_payload.payload_text, false) {
             Ok(()) => {
-                let patch_hash = patches::patch_content_hash(&patch_text);
-                let base_commit = patches::current_head(Path::new(&workspace_path))?;
+                let patch_hash = generated_payload.patch_hash.clone();
+                let base_commit = Some(generated_payload.base_head.clone());
 
                 pending_patches.push(PendingIntegrationPatch {
                     id: Uuid::new_v4().to_string(),
@@ -326,7 +348,7 @@ pub async fn execute_stage(
 
                 let result = json!({
                     "ok": true,
-                    "summary": "Staged changes merged into the integration workspace",
+                    "summary": "Selected changes merged into the integration workspace",
                     "work_unit_id": work_unit_id,
                     "workspace_path": workspace_path,
                     "patch_bytes": patch_text.len()
@@ -507,8 +529,9 @@ async fn persist_successful_integration_merge(
 ) -> Result<Value> {
     let supervisor_run_id = supervisor_run_id
         .ok_or_else(|| anyhow!("merge_patches requires supervisor_run_id to persist integration results"))?;
-    let final_patch_text = patches::generate_patch_text(Path::new(integration_repo_path))?;
-    let final_patch_hash = patches::patch_content_hash(&final_patch_text);
+    let final_payload = git_patch_payload::generate_payload(integration_repo_path, "both", &[], None)?;
+    let final_patch_text = final_payload.patch_text;
+    let final_patch_hash = final_payload.patch_hash;
     let now = Utc::now().to_rfc3339();
     let final_patch_ref = format!(
         "supervisor_work_units:{}:context_json.final_patch_text",

@@ -75,8 +75,13 @@ async fn supervisor_action(
     let action = req.action_name();
     tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action requested");
 
-    let _supervisor_guard = state.supervisor_coordinator.lock(supervisor_id).await;
-    tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action acquired mutation lock");
+    let _supervisor_guard = if req.requires_supervisor_lock() {
+        let guard = state.supervisor_coordinator.lock(supervisor_id).await;
+        tracing::info!(supervisor_id = %supervisor_id, action = %action, "supervisor action acquired mutation lock");
+        Some(guard)
+    } else {
+        None
+    };
 
     let response = match req {
         SupervisorActionRequest::CreateWorkUnit(request) => supervisor::create_supervisor_work_unit(&state, supervisor_id, request).await,
@@ -84,7 +89,7 @@ async fn supervisor_action(
         SupervisorActionRequest::RegenerateWorkUnit { work_unit_id } => supervisor::regenerate_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::StartWorkUnit { work_unit_id } => supervisor::start_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
         SupervisorActionRequest::PauseWorkUnit { work_unit_id } => supervisor::pause_supervisor_work_unit(&state, supervisor_id, work_unit_id).await,
-        SupervisorActionRequest::StageWorkUnit { work_unit_id, staged } => supervisor::stage_supervisor_work_unit(&state, supervisor_id, work_unit_id, staged).await,
+        SupervisorActionRequest::StageWorkUnit { work_unit_id, staged, include_unstaged } => supervisor::stage_supervisor_work_unit(&state, supervisor_id, work_unit_id, staged, include_unstaged).await,
         SupervisorActionRequest::UpdateSupervisorConfig { config } => supervisor::update_supervisor_config(&state, supervisor_id, config).await,
         SupervisorActionRequest::SelectPlanner { planner_id } => supervisor::select_supervisor_planner(&state, supervisor_id, planner_id).await,
         SupervisorActionRequest::EnqueueFeature { planner_id, feature_id } => supervisor::enqueue_supervisor_feature(&state, supervisor_id, planner_id, feature_id).await,

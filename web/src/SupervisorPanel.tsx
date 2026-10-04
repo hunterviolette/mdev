@@ -1526,7 +1526,9 @@ function manualShardIsStaged(unit: SupervisorWorkUnitProjection): boolean {
 }
 
 function integrationInputIsReady(unit: SupervisorWorkUnitProjection): boolean {
-  return unit.has_staged_changes && Boolean(unit.workspace_path?.trim());
+  const selectedChangesAvailable = (unit.integration_include_staged && unit.has_staged_changes)
+    || (unit.integration_include_unstaged && unit.has_unstaged_changes);
+  return selectedChangesAvailable && Boolean(unit.workspace_path?.trim());
 }
 
 function integrationInputIsSkipped(unit: SupervisorWorkUnitProjection): boolean {
@@ -1590,27 +1592,30 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
     const confirmed = window.confirm(`Skip ${unit.title} for this integration input set?`);
     if (!confirmed) return;
     await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
-    props.onActionComplete?.();
   }
 
   async function unskipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
     await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
-    props.onActionComplete?.();
   }
 
   async function skipManualShard(unit: SupervisorWorkUnitProjection) {
-    if (!unit.feature_id) return;
     const confirmed = window.confirm(`Skip manual shard ${unit.title} for this integration input set?`);
     if (!confirmed) return;
     await runSupervisorAction(props.supervisor.id, { action: 'skip_integration_input', work_unit_id: unit.id });
-    props.onActionComplete?.();
   }
 
   async function unskipManualShard(unit: SupervisorWorkUnitProjection) {
-    if (!unit.feature_id) return;
     await runSupervisorAction(props.supervisor.id, { action: 'unskip_integration_input', work_unit_id: unit.id });
-    props.onActionComplete?.();
+  }
+
+  async function updateIntegrationChangeScope(unit: SupervisorWorkUnitProjection, includeStaged: boolean, includeUnstaged: boolean) {
+    await runSupervisorAction(props.supervisor.id, {
+      action: 'stage_work_unit',
+      work_unit_id: unit.id,
+      staged: includeStaged,
+      include_unstaged: includeUnstaged,
+    });
   }
 
   function inputRow(unit: SupervisorWorkUnitProjection, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
@@ -1619,9 +1624,9 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
     const blocked = bucket === 'blocked_feature';
     const manual = bucket === 'staged_manual' || bucket === 'skipped_manual' || bucket === 'unstaged_manual';
     const relevant = bucket !== 'unstaged_manual';
-    const canSkip = Boolean(unit.feature_id) && relevant && !skipped;
-    const canUnskip = Boolean(unit.feature_id) && skipped;
-    const pendingAction = pendingActions.find((pending) => pending.work_unit_id === unit.id && ['skip_integration_input', 'unskip_integration_input'].includes(pending.action)) ?? null;
+    const canSkip = relevant && !skipped;
+    const canUnskip = skipped;
+    const pendingAction = pendingActions.find((pending) => pending.work_unit_id === unit.id && ['skip_integration_input', 'unskip_integration_input', 'stage_work_unit'].includes(pending.action)) ?? null;
     const busy = pendingAction !== null;
     return (
       <Paper key={`${bucket}-${unit.id}`} withBorder radius="md" p="sm" style={{ background: 'rgba(255,255,255,0.025)' }}>
@@ -1638,6 +1643,30 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
               {unit.patch_id ? <Text size="xs" c="dimmed">Patch: {unit.patch_id.slice(0, 8)}</Text> : null}
               {unit.workflow_run_id ? <Text size="xs" c="dimmed">Workflow: {unit.workflow_run_id.slice(0, 8)}</Text> : null}
               {unit.blocked_reason ? <Text size="xs" c="red.3">{unit.blocked_reason}</Text> : null}
+            </Group>
+            <Group gap="md" wrap="wrap">
+              <Checkbox
+                size="xs"
+                checked={unit.integration_include_staged}
+                disabled={skipped || busy || !unit.has_staged_changes}
+                label={unit.has_staged_changes ? 'Staged changes' : 'No staged changes'}
+                onChange={(event) => void updateIntegrationChangeScope(
+                  unit,
+                  event.currentTarget.checked,
+                  unit.integration_include_unstaged,
+                )}
+              />
+              <Checkbox
+                size="xs"
+                checked={unit.integration_include_unstaged}
+                disabled={skipped || busy || !unit.has_unstaged_changes}
+                label={unit.has_unstaged_changes ? 'Unstaged changes' : 'No unstaged changes'}
+                onChange={(event) => void updateIntegrationChangeScope(
+                  unit,
+                  unit.integration_include_staged,
+                  event.currentTarget.checked,
+                )}
+              />
             </Group>
           </Stack>
           {manual && canUnskip ? (
@@ -2904,6 +2933,26 @@ function applySupervisorEventToProjection(
   if (envelope.event.payload?.deleted === true) {
     const supervisors = current.supervisors.filter((item) => item.id !== envelope.event.supervisor_run_id);
     return supervisors.length === current.supervisors.length ? current : rebuildSupervisorProjection(supervisors);
+  }
+
+  const workUnitPatch = envelope.event.payload?.work_unit_patch;
+  if (workUnitPatch && typeof workUnitPatch === 'object' && !Array.isArray(workUnitPatch)) {
+    const patchEnvelope = workUnitPatch as Record<string, unknown>;
+    const workUnitId = typeof patchEnvelope.id === 'string' ? patchEnvelope.id : '';
+    const changes = patchEnvelope.changes;
+    if (workUnitId && changes && typeof changes === 'object' && !Array.isArray(changes)) {
+      let changed = false;
+      const supervisors = current.supervisors.map((supervisor) => {
+        if (supervisor.id !== envelope.event.supervisor_run_id) return supervisor;
+        const work_units = supervisor.work_units.map((unit) => {
+          if (unit.id !== workUnitId) return unit;
+          changed = true;
+          return { ...unit, ...(changes as Partial<SupervisorWorkUnitProjection>) };
+        });
+        return changed ? { ...supervisor, work_units } : supervisor;
+      });
+      if (changed) return rebuildSupervisorProjection(supervisors);
+    }
   }
 
   const projection = envelope.event.payload?.supervisor;

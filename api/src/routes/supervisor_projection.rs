@@ -96,7 +96,10 @@ struct SupervisorWorkUnitProjection {
     workspace_path: Option<String>,
     integration_path: Option<String>,
     has_staged_changes: bool,
+    has_unstaged_changes: bool,
     has_workspace_changes: bool,
+    integration_include_staged: bool,
+    integration_include_unstaged: bool,
     integration_state: IntegrationInputState,
     integration_apply_available: bool,
     applied_at: Option<String>,
@@ -387,12 +390,18 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Sup
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let integration_apply_available = seed
+
+    let integration_include_staged = seed
         .context
-        .get("integration_apply_available")
+        .get("integration_include_staged")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| seed.integration_state.is_integration_input());
+
+    let integration_include_unstaged = seed
+        .context
+        .get("integration_include_unstaged")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-
 
     SupervisorWorkUnitProjection {
         id: seed.id.clone(),
@@ -409,7 +418,10 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Sup
         workspace_path: seed.workspace_path.clone(),
         integration_path: seed.integration_path.clone(),
         has_staged_changes: false,
+        has_unstaged_changes: false,
         has_workspace_changes: false,
+        integration_include_staged,
+        integration_include_unstaged,
         integration_state: seed.integration_state.clone(),
         integration_apply_available,
         applied_at,
@@ -451,6 +463,9 @@ async fn build_work_unit_projection(
     unit.has_staged_changes = change_status
         .as_ref()
         .is_some_and(|status| status.has_staged_changes());
+    unit.has_unstaged_changes = change_status
+        .as_ref()
+        .is_some_and(|status| status.has_unstaged_changes());
     unit.has_workspace_changes = change_status
         .as_ref()
         .is_some_and(|status| status.has_changes());
