@@ -1,9 +1,10 @@
 mod capabilities;
 mod changesets;
 mod event_chains;
-mod flight_deck;
+pub(crate) mod supervisor_projection;
 mod filesystem;
 mod health;
+mod inference_sessions;
 mod repo_tree;
 mod repo_sync;
 mod runs;
@@ -36,6 +37,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
     Router::new()
         .merge(health::router())
         .merge(settings::router())
+        .merge(inference_sessions::router())
         .merge(planner::router())
         .merge(processes::router())
         .merge(supervisor::router())
@@ -48,7 +50,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(sap::router())
         .merge(filesystem::router())
         .merge(event_chains::router())
-        .merge(flight_deck::router())
+        .merge(supervisor_projection::router())
         .merge(capabilities::router())
         .merge(changesets::router())
 }

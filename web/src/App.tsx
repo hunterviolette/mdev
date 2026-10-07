@@ -6,7 +6,7 @@ type AppRoute = {
   workflowRunId: string | null;
   workflowView: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
   supervisorRunId: string | null;
-  supervisorView: 'planner' | 'sprint' | null;
+  supervisorView: 'planner' | null;
 };
 
 function shortRouteId(value: string | null): string {
@@ -15,7 +15,8 @@ function shortRouteId(value: string | null): string {
 
 function routeTitle(route: AppRoute): string {
   if (route.workflowRunId) return 'Workflow';
-  if (route.path === '/flight-deck' || route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Flight Deck';
+  if (route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Supervisor';
+  if (route.path === '/templates') return 'Templates';
   if (route.path === '/runtime') return 'Runtime';
   if (route.path === '/workflows' || route.path === '/') return 'Workflow list';
   return 'Workflow Web';
@@ -25,7 +26,7 @@ function routeTitle(route: AppRoute): string {
 function parseRoute(): AppRoute {
   const path = window.location.pathname;
   const workflowMatch = path.match(/^\/workflows\/([^/]+)(?:\/(changes|commits|repository|capabilities))?$/);
-  const supervisorModalMatch = path.match(/^\/supervisors\/([^/]+)\/(planner|sprint)$/);
+  const supervisorModalMatch = path.match(/^\/supervisors\/([^/]+)\/planner$/);
   const supervisorMatch = path.match(/^\/supervisors\/([^/]+)/);
   return {
     path,
@@ -34,9 +35,7 @@ function parseRoute(): AppRoute {
       ? ((workflowMatch[2] ?? 'workflow') as 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities')
       : null,
     supervisorRunId: supervisorMatch?.[1] ? decodeURIComponent(supervisorMatch[1]) : null,
-    supervisorView: supervisorModalMatch?.[2] === 'planner' || supervisorModalMatch?.[2] === 'sprint'
-      ? supervisorModalMatch[2]
-      : null
+    supervisorView: supervisorModalMatch ? 'planner' : null
   };
 }
 

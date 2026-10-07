@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use crate::{
     engine::{
         capabilities::{capability_enabled, changeset::schema as changeset_schema, context_export, planner},
+        prompt_inputs::{PromptBlock, PromptBlockRole},
         stages::{compose_prompt_from_state, stage_supports_capability},
     },
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowStepDefinition},
@@ -231,12 +232,13 @@ pub fn prepare_inference_stage_state_with_hooks(
 
     let prompt = compose_prompt_from_state(&effective_enabled, &fragments);
     let model_input_blocks = build_model_input_blocks(&effective_enabled, &fragments);
+    let model_input_blocks_value = serde_json::to_value(&model_input_blocks)?;
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
-    obj.insert("model_input_blocks".to_string(), Value::Array(model_input_blocks.clone()));
-    obj.insert("prompt_blocks".to_string(), Value::Array(model_input_blocks));
+    obj.insert("model_input_blocks".to_string(), model_input_blocks_value.clone());
+    obj.insert("prompt_blocks".to_string(), model_input_blocks_value);
     if let Some(repo_context) = repo_context {
         obj.insert("repo_context".to_string(), repo_context);
     } else {
@@ -304,7 +306,7 @@ fn resolve_empty_user_input_default(
         })
 }
 
-fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<Value> {
+fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<PromptBlock> {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
     let fragments_obj = fragments.as_object().cloned().unwrap_or_default();
     let order = ["user_input", "review_failure", "planning_fragment", "repo_context", "changeset_schema", "planner_schema"];
@@ -319,32 +321,50 @@ fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<Value> {
         if content.is_empty() {
             continue;
         }
-        blocks.push(prompt_block(blocks.len(), key, prompt_fragment_label(key), prompt_fragment_role(key), prompt_fragment_source(key), content));
+        blocks.push(prompt_block(
+            blocks.len(),
+            key,
+            prompt_fragment_label(key),
+            prompt_fragment_role(key),
+            prompt_fragment_source(key),
+            content,
+        ));
     }
 
     blocks
 }
 
-fn prompt_block(index: usize, key: &str, label: String, role: &str, source: &str, content: &str) -> Value {
-    json!({
-        "index": index,
-        "id": key,
-        "key": key,
-        "capability_key": key,
-        "label": label,
-        "title": label,
-        "role": role,
-        "source": source,
-        "enabled": true,
-        "default_collapsed": role != "user",
-        "content_format": "markdown",
-        "char_count": content.chars().count(),
-        "content": content
-    })
+fn prompt_block(
+    index: usize,
+    key: &str,
+    label: String,
+    role: PromptBlockRole,
+    source: &str,
+    content: &str,
+) -> PromptBlock {
+    PromptBlock {
+        index,
+        id: key.to_string(),
+        key: key.to_string(),
+        capability_key: key.to_string(),
+        title: label.clone(),
+        label,
+        default_collapsed: role != PromptBlockRole::User,
+        role,
+        source: source.to_string(),
+        enabled: true,
+        content_format: "markdown".to_string(),
+        char_count: content.chars().count(),
+        content: content.to_string(),
+    }
 }
 
-fn prompt_fragment_role(key: &str) -> &'static str {
-    if key == "user_input" { "user" } else { "capability" }
+fn prompt_fragment_role(key: &str) -> PromptBlockRole {
+    if key == "user_input" {
+        PromptBlockRole::User
+    } else {
+        PromptBlockRole::Capability
+    }
 }
 
 fn prompt_fragment_source(key: &str) -> &'static str {

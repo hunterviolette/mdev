@@ -6,12 +6,8 @@ pub mod scopes;
 
 pub use config::{
     apply_trigger,
-    arm_capabilities,
-    can_arm,
     control_descriptors,
     profile,
-    profile_from_global_state,
-    AutomationProfile,
     AutomationTrigger,
 };
 pub use decisions::{AutomationDecision, CapabilityInjection};
@@ -41,6 +37,23 @@ pub fn ensure_automation_slots(run: &mut WorkflowRun) {
     if let Some(obj) = global_state.as_object_mut() {
         obj.entry("automation".to_string()).or_insert_with(|| json!({}));
     }
+}
+
+pub fn apply_inference_session_trigger(run: &mut WorkflowRun) {
+    crate::engine::normalize_inference_arm_state(run);
+    apply_trigger(run, AutomationTrigger::NewInferenceSession);
+}
+
+pub async fn apply_inference_session_transition(
+    state: &crate::app_state::AppState,
+    run_id: uuid::Uuid,
+    step: &crate::models::WorkflowStepDefinition,
+) -> anyhow::Result<()> {
+    let mut run = crate::engine::load_run(state, run_id).await?;
+    apply_inference_session_trigger(&mut run);
+    crate::engine::persist_context(state, run_id, &run.context).await?;
+    let _ = step;
+    Ok(())
 }
 
 pub fn apply_context_mutations(

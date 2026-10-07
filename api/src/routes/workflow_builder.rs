@@ -1,6 +1,5 @@
 use axum::{extract::State, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
-use crate::engine::capabilities::inference::panel::{build_inference_config_panel, inference_config_from_panel, InferenceConfigPanel};
 
 use crate::{
     app_state::AppState,
@@ -42,7 +41,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-builder-catalog", get(get_workflow_builder_catalog))
         .route("/api/workflow-builder/compile", post(compile_workflow_builder))
-        .route("/api/workflow-builder/inference-panel", post(build_workflow_builder_inference_panel))
 }
 
 async fn get_workflow_builder_catalog(
@@ -58,41 +56,6 @@ async fn compile_workflow_builder(
     let catalog = default_builder_catalog();
     let compiled = compile_document(&state, &catalog, req.document).await?;
     Ok(Json(compiled))
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct InferencePanelRequest {
-    definition: WorkflowTemplateDefinition,
-    #[serde(default)]
-    globals: WorkflowGlobalConfig,
-    #[serde(default)]
-    panel: Option<InferenceConfigPanel>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct InferencePanelResponse {
-    ok: bool,
-    panel: InferenceConfigPanel,
-    inference: Value,
-}
-
-async fn build_workflow_builder_inference_panel(
-    Json(req): Json<InferencePanelRequest>,
-) -> Result<Json<InferencePanelResponse>, (axum::http::StatusCode, String)> {
-    let inference = req
-        .panel
-        .clone()
-        .map(|panel| inference_config_from_panel(&req.globals, panel))
-        .unwrap_or_else(|| req.globals.capabilities.get("inference").cloned().unwrap_or_else(|| json!({})));
-    let panel = req
-        .panel
-        .unwrap_or_else(|| build_inference_config_panel(&req.definition, &req.globals));
-
-    Ok(Json(InferencePanelResponse {
-        ok: true,
-        panel,
-        inference,
-    }))
 }
 
 async fn compile_document(
@@ -247,7 +210,9 @@ async fn normalize_global_planner_fragment(
         .to_string();
 
     let mut global_state = serde_json::to_value(&*globals).map_err(|err| err.to_string())?;
-    planner::apply_repo_planner_capability(&state.db, &mut global_state, &repo_ref)
+    state
+        .planner()
+        .apply_repo_capability(&mut global_state, &repo_ref)
         .await
         .map_err(|err| err.to_string())?;
 
@@ -314,8 +279,13 @@ fn compile_workflow_capability_summary(
         stage_keys.sort();
         stage_keys.dedup();
 
-        if builder_stage_uses_inference(step) && !stage_keys.iter().any(|key| key == "context_export") {
-            stage_keys.push("context_export".to_string());
+        if builder_stage_uses_inference(step) {
+            if !stage_keys.iter().any(|key| key == "inference") {
+                stage_keys.push("inference".to_string());
+            }
+            if !stage_keys.iter().any(|key| key == "context_export") {
+                stage_keys.push("context_export".to_string());
+            }
             stage_keys.sort();
             stage_keys.dedup();
         }
@@ -340,14 +310,7 @@ fn compile_workflow_capability_summary(
 }
 
 fn builder_stage_uses_inference(step: &WorkflowStepDefinition) -> bool {
-    step.step_type == "design"
-        || step.step_type == "code"
-        || step.execution_plan.iter().any(|node| node.key == "inference")
-        || step
-            .execution_logic
-            .get("connections")
-            .and_then(|v| v.get("inference"))
-            .is_some()
+    stages::stage_supports_capability(step, "inference")
 }
 
 fn materialize_builder_stage_state(step: &WorkflowStepDefinition) -> Value {
@@ -571,9 +534,23 @@ pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) 
 }
 
 fn default_builder_catalog() -> WorkflowBuilderCatalog {
+    let stage_descriptors = stages::registered_stage_descriptors();
+    let stage_capabilities = stage_descriptors
+        .iter()
+        .map(|descriptor| {
+            let capabilities = stages::capability_contract_for_stage(&descriptor.definition_template)
+                .keys()
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>();
+            (descriptor.step_type.clone(), capabilities)
+        })
+        .collect();
+
     WorkflowBuilderCatalog {
         version: 2,
-        stage_descriptors: stages::registered_stage_descriptors(),
+        stage_descriptors,
+        stage_capabilities,
         automation_controls: automation::control_descriptors(),
     }
 }
@@ -631,26 +608,8 @@ fn default_globals() -> WorkflowGlobalConfig {
         }),
         capabilities: json!({
             "inference": {
-                "default_session": "coding",
-                "stage_sessions": {
-                    "design": "coding",
-                    "code": "coding",
-                    "review": "review"
-                },
-                "sessions": {
-                    "coding": {
-                        "provider": "openai",
-                        "transport": "api",
-                        "model": "gpt-4.1",
-                        "runtime": {}
-                    },
-                    "review": {
-                        "provider": "openai",
-                        "transport": "api",
-                        "model": "gpt-4.1",
-                        "runtime": {}
-                    }
-                }
+                "stage_sessions": {},
+                "sessions": {}
             },
             "context_export": {
                 "enabled": false,

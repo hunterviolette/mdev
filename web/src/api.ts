@@ -108,13 +108,18 @@ export type WorkflowTemplateDefinition = {
 };
 
 export type InferenceConfigPanelSession = {
+  editor_id?: string;
   name: string;
   transport: 'api' | 'browser' | string;
+  lifecycle: 'persistent' | 'non_persistent' | string;
   provider?: string | null;
   model?: string | null;
   endpoint?: string | null;
+  provider_options?: Record<string, unknown> | null;
   browser_url?: string | null;
   is_default: boolean;
+  source_mode: 'new' | 'existing' | string;
+  repository_session_id?: string | null;
 };
 
 export type InferenceConfigPanelStageMapping = {
@@ -127,10 +132,29 @@ export type InferenceConfigPanel = {
   stage_mappings: InferenceConfigPanelStageMapping[];
 };
 
-export type InferenceConfigPanelResponse = {
+export type OpenAiModelsResponse = {
   ok: boolean;
-  panel: InferenceConfigPanel;
-  inference: Record<string, unknown>;
+  models: string[];
+};
+
+export type RepositoryInferenceSession = {
+  id: string;
+  repo_ref: string;
+  title: string;
+  transport: 'api' | 'browser' | string;
+  lifecycle: 'persistent' | 'non_persistent' | string;
+  config: Record<string, unknown>;
+  transport_state: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  last_used_at?: string | null;
+};
+
+export type RepositoryInferenceSessionsResponse = {
+  ok: boolean;
+  sessions: RepositoryInferenceSession[];
+  bindings: Record<string, string>;
 };
 
 export type TerminalShell = 'system' | 'direct' | 'cmd' | 'power_shell' | 'sh' | 'bash';
@@ -402,6 +426,7 @@ export type WorkflowAutomationControlDescriptor = {
 export type WorkflowBuilderCatalog = {
   version: number;
   stage_descriptors: WorkflowStageDescriptor[];
+  stage_capabilities?: Record<string, string[]>;
   automation_controls?: WorkflowAutomationControlDescriptor[];
 };
 
@@ -614,6 +639,27 @@ export type RuntimeEventEnvelope = {
   event: StageExecutionEvent;
 };
 
+export type SupervisorEvent = {
+  id: string;
+  supervisor_run_id: string;
+  sequence_no: number;
+  event_type: string;
+  event_time: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type SupervisorEventEnvelope = {
+  scope: string;
+  node_key: string;
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  event: SupervisorEvent;
+};
+
 export type RuntimeProjectionResponse = {
   runs: EventChainSummaryResponse[];
 };
@@ -774,14 +820,34 @@ export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument
   });
 }
 
-export function buildWorkflowBuilderInferencePanel(body: {
-  definition: WorkflowTemplateDefinition;
-  globals: WorkflowGlobalConfig;
-  panel?: InferenceConfigPanel;
-}) {
-  return fetchJson<InferenceConfigPanelResponse>('/api/workflow-builder/inference-panel', {
+export function listOpenAiModels() {
+  return fetchJson<OpenAiModelsResponse>('/api/inference-providers/openai/models');
+}
+
+export function listInferenceSessions(repoRef: string, runId?: string | null) {
+  const params = new URLSearchParams({ repo_ref: repoRef });
+  if (runId?.trim()) params.set('run_id', runId.trim());
+  return fetchJson<RepositoryInferenceSessionsResponse>(`/api/inference-sessions?${params.toString()}`);
+}
+
+export function selectInferenceSession(runId: string, stageType: string, sessionId: string | null) {
+  return fetchJson<RepositoryInferenceSessionsResponse>('/api/inference-sessions/select', {
     method: 'POST',
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      run_id: runId,
+      stage_type: stageType,
+      session_id: sessionId,
+    }),
+  });
+}
+
+export function archiveInferenceSession(runId: string, sessionId: string) {
+  return fetchJson<RepositoryInferenceSessionsResponse>('/api/inference-sessions/archive', {
+    method: 'POST',
+    body: JSON.stringify({
+      run_id: runId,
+      session_id: sessionId,
+    }),
   });
 }
 

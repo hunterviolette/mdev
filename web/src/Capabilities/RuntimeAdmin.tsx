@@ -4,7 +4,6 @@ import {
   Badge,
   Button,
   Code,
-  Card,
   Group,
   ScrollArea,
   SegmentedControl,
@@ -13,6 +12,7 @@ import {
   Text,
 } from '@mantine/core';
 import { IconRefresh, IconTrash, IconX } from '@tabler/icons-react';
+import { AppHeaderAction, AppSurface } from '../AppHeader';
 
 import {
   clearCompletedRuntimeProcesses,
@@ -78,27 +78,16 @@ export function RuntimeAdmin() {
   }
 
   return (
-    <Card withBorder padding="md">
+    <AppSurface p="md">
       <Stack gap="sm">
-        <Group justify="space-between" align="center">
-          <Group gap="xs">
+        <Group justify="space-between" align="center" wrap="wrap" gap="sm">
+          <Group gap="xs" wrap="wrap">
             <Text fw={700}>Runtime processes</Text>
             <Badge color={activeCount > 0 ? 'green' : 'gray'}>
               {activeCount} active
             </Badge>
-          </Group>
-          <Button
-            variant="default"
-            leftSection={<IconRefresh size={16} />}
-            onClick={() => void refresh()}
-          >
-            Refresh
-          </Button>
-        </Group>
-          {error ? <Alert color="red">{error}</Alert> : null}
-
-          <Group justify="space-between">
             <SegmentedControl
+              size="xs"
               value={filter}
               onChange={(value) => setFilter(value as typeof filter)}
               data={[
@@ -107,17 +96,29 @@ export function RuntimeAdmin() {
                 { value: 'all', label: 'All' },
               ]}
             />
-            <Button
-              variant="default"
-              leftSection={<IconTrash size={16} />}
+          </Group>
+
+          <Group gap="xs" wrap="nowrap">
+            <AppHeaderAction
+              leftSection={<IconRefresh size={14} />}
+              onClick={() => void refresh()}
+            >
+              Refresh
+            </AppHeaderAction>
+            <AppHeaderAction
+              color="red"
+              leftSection={<IconTrash size={14} />}
               onClick={async () => {
                 await clearCompletedRuntimeProcesses();
                 await refresh();
               }}
             >
               Clear completed
-            </Button>
+            </AppHeaderAction>
           </Group>
+        </Group>
+
+        {error ? <Alert color="red">{error}</Alert> : null}
 
           <ScrollArea h="70vh">
             <Table striped highlightOnHover withTableBorder>
@@ -208,6 +209,6 @@ export function RuntimeAdmin() {
             ) : null}
           </ScrollArea>
       </Stack>
-    </Card>
+    </AppSurface>
   );
 }

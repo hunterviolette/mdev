@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -367,6 +367,19 @@ pub struct ReviewStatusFileEntry {
     pub index_status: String,
     pub worktree_status: String,
     pub untracked: bool,
+}
+
+impl From<crate::supervisor::patches::ChangeFile> for ReviewStatusFileEntry {
+    fn from(file: crate::supervisor::patches::ChangeFile) -> Self {
+        Self {
+            path: file.path,
+            additions: file.additions,
+            deletions: file.deletions,
+            index_status: file.index_status,
+            worktree_status: file.worktree_status,
+            untracked: file.untracked,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1473,55 +1486,7 @@ async fn review_commit_diff(
 async fn review_status(
     Json(req): Json<ReviewRepoRequest>,
 ) -> Result<Json<ReviewStatusResponse>, (axum::http::StatusCode, String)> {
-    let repo = PathBuf::from(&req.repo_ref);
-    let status = git_status(&repo).map_err(internal)?;
-
-    let staged_stats = git_diff_stats(&repo, true).unwrap_or_else(|_| HashMap::new());
-    let unstaged_stats = git_diff_stats(&repo, false).unwrap_or_else(|_| HashMap::new());
-    let untracked_paths: Vec<String> = status
-        .files
-        .iter()
-        .filter(|item| item.untracked)
-        .map(|item| item.path.clone())
-        .collect();
-    let untracked_stats = git_untracked_line_stats(&repo, &untracked_paths);
-
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
-
-    for file in status.files {
-        let staged_counts = staged_stats.get(&file.path).copied().unwrap_or((0, 0));
-        let unstaged_counts = if file.untracked {
-            untracked_stats.get(&file.path).copied().unwrap_or((0, 0))
-        } else {
-            unstaged_stats.get(&file.path).copied().unwrap_or((0, 0))
-        };
-
-        if file.staged {
-            staged.push(ReviewStatusFileEntry {
-                path: file.path.clone(),
-                additions: staged_counts.0,
-                deletions: staged_counts.1,
-                index_status: file.index_status.clone(),
-                worktree_status: file.worktree_status.clone(),
-                untracked: file.untracked,
-            });
-        }
-
-        if file.untracked || file.worktree_status != "." {
-            unstaged.push(ReviewStatusFileEntry {
-                path: file.path.clone(),
-                additions: unstaged_counts.0,
-                deletions: unstaged_counts.1,
-                index_status: file.index_status.clone(),
-                worktree_status: file.worktree_status.clone(),
-                untracked: file.untracked,
-            });
-        }
-    }
-
-    staged.sort_by(|a, b| a.path.cmp(&b.path));
-    unstaged.sort_by(|a, b| a.path.cmp(&b.path));
+    let status = crate::supervisor::patches::change_status(&PathBuf::from(&req.repo_ref)).map_err(internal)?;
 
     Ok(Json(ReviewStatusResponse {
         ok: true,
@@ -1529,8 +1494,8 @@ async fn review_status(
         upstream: status.upstream,
         ahead: status.ahead,
         behind: status.behind,
-        staged,
-        unstaged,
+        staged: status.staged.into_iter().map(Into::into).collect(),
+        unstaged: status.unstaged.into_iter().map(Into::into).collect(),
     }))
 }
 

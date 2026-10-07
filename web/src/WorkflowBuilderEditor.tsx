@@ -34,6 +34,7 @@ import {
   type WorkflowTemplateDefinition,
 } from './api';
 import { buildBuilderDocument, builderStepFromDescriptor, builderStepsFromDefinition, capabilityDisplayLabel, defaultGlobals, descriptorMap, type BuilderStep } from './workflow_builder';
+import { AppSurface } from './AppHeader';
 
 import {
   DeployQA,
@@ -42,6 +43,7 @@ import {
   type DeployQAValues,
 } from './Capabilities/DeployQA';
 import { SharedDependencies } from './Capabilities/SharedDependencies';
+import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import {
   Automation,
   type AutomationProfile,
@@ -55,7 +57,7 @@ type WorkflowBuilderEditorProps = {
   onError?: (message: string | null) => void;
   onOpenCapabilityConfig?: (
     capabilityKey: string,
-    onChange: (value: Record<string, unknown>) => void
+    onChange: (value: Record<string, unknown>) => Promise<void>
   ) => void;
 };
 
@@ -170,6 +172,7 @@ function workflowBuilderFieldVisible(field: WorkflowStageField, fields: Record<s
 
 export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadRevision = 0, onCompiledDefinitionChange, onError, onOpenCapabilityConfig }: WorkflowBuilderEditorProps) {
   const [catalog, setCatalog] = useState<Record<string, WorkflowStageDescriptor>>({});
+  const [stageCapabilities, setStageCapabilities] = useState<Record<string, string[]>>({});
   const [stageDescriptors, setStageDescriptors] = useState<WorkflowStageDescriptor[]>([]);
   const [automationControls, setAutomationControls] = useState<WorkflowAutomationControlDescriptor[]>([]);
   const [steps, setSteps] = useState<BuilderStep[]>([]);
@@ -182,6 +185,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
   const [compiledCapabilitySummary, setCompiledCapabilitySummary] = useState<WorkflowCapabilitySummaryItem[]>([]);
   const [deployQAOpen, setDeployQAOpen] = useState(false);
   const [sharedDependenciesOpen, setSharedDependenciesOpen] = useState(false);
+  const [inferenceOpen, setInferenceOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
   const [automationSaving, setAutomationSaving] = useState(false);
   const [automationStatus, setAutomationStatus] = useState<string | null>(null);
@@ -229,6 +233,29 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
     () => compiledCapabilitySummary.map((item) => item.key),
     [compiledCapabilitySummary]
   );
+
+  const inferenceConfig = useMemo<Record<string, unknown>>(() => {
+    const value = editableGlobals.capabilities?.inference;
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }, [editableGlobals.capabilities]);
+
+  const inferenceStageTypes = useMemo(
+    () => Array.from(new Set(
+      steps
+        .filter((step) => (stageCapabilities[step.stepType] ?? []).includes('inference'))
+        .map((step) => step.stepType)
+    )).sort(),
+    [steps, stageCapabilities]
+  );
+
+  const inferenceRepoRef = useMemo(() => {
+    const repo = editableGlobals.resources?.repo;
+    if (!repo || typeof repo !== 'object' || Array.isArray(repo)) return '';
+    const repoRef = (repo as Record<string, unknown>).repo_ref;
+    return typeof repoRef === 'string' ? repoRef : '';
+  }, [editableGlobals.resources]);
 
   const sharedDependencies = useMemo<SharedDependenciesConfig>(() => {
     const capabilities = editableGlobals.capabilities ?? {};
@@ -304,6 +331,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
         const byType = descriptorMap(loadedCatalog);
         setCatalog(byType);
         setStageDescriptors(descriptors);
+        setStageCapabilities(loadedCatalog.stage_capabilities ?? {});
         setAutomationControls(loadedCatalog.automation_controls ?? []);
 
         const hydratedSteps = builderStepsFromDefinition(initialDefinition, loadedCatalog);
@@ -404,11 +432,11 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
     }
   }
 
-  function updateCapabilityConfig(
+  async function updateCapabilityConfig(
     capabilityKey: string,
     value: Record<string, unknown>,
     message = `${capabilityDisplayLabel(capabilityKey)} capability configuration changed`
-  ) {
+  ): Promise<void> {
     const configKey = canonicalCapabilityConfigKey(capabilityKey);
     const nextGlobals: WorkflowGlobalConfig = {
       ...structuredClone(editableGlobals),
@@ -418,7 +446,10 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
       },
     };
 
-    void updateBuilderGlobals(nextGlobals, message);
+    const saved = await updateBuilderGlobals(nextGlobals, message);
+    if (!saved) {
+      throw new Error(`${capabilityDisplayLabel(capabilityKey)} capability configuration could not be compiled.`);
+    }
   }
 
   function addStep(stepType: string) {
@@ -673,7 +704,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
           minHeight: 0,
         }}
       >
-        <Card withBorder h="100%" p="sm">
+        <AppSurface h="100%" p="sm">
           <Stack h="100%" gap="sm">
             <Group justify="space-between" align="center">
               <Group gap="xs">
@@ -752,10 +783,17 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
 
                             const configKey = canonicalCapabilityConfigKey(item.key);
 
-                            if (configKey === 'context_export' || configKey === 'inference') {
+                            if (configKey === 'inference') {
+                              setInferenceOpen(true);
+                              return;
+                            }
+
+                            if (configKey === 'context_export') {
                               onOpenCapabilityConfig?.(
                                 configKey,
-                                (value) => updateCapabilityConfig(configKey, value)
+                                async (value) => {
+                                  await updateCapabilityConfig(configKey, value);
+                                }
                               );
                               return;
                             }
@@ -767,7 +805,9 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
                             setCapabilityConfigError(null);
                             onOpenCapabilityConfig?.(
                               configKey,
-                              (value) => updateCapabilityConfig(configKey, value)
+                              async (value) => {
+                                await updateCapabilityConfig(configKey, value);
+                              }
                             );
                           }}
                         >
@@ -844,9 +884,9 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
               </Stack>
             </ScrollArea>
           </Stack>
-        </Card>
+        </AppSurface>
 
-        <Card withBorder h="100%" p="sm">
+        <AppSurface h="100%" p="sm">
           <Stack h="100%" gap="sm">
             {!selectedStep || !selectedDescriptor ? (
               <Text c="dimmed" size="sm">Select a stage.</Text>
@@ -897,7 +937,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
               </ScrollArea>
             )}
           </Stack>
-        </Card>
+        </AppSurface>
       </Box>
       <Modal
         opened={capabilityConfigKey !== null}
@@ -1035,6 +1075,34 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
             } finally {
               setAutomationSaving(false);
             }
+          }}
+        />
+      </Modal>
+
+      <Modal
+        opened={inferenceOpen}
+        onClose={() => setInferenceOpen(false)}
+        title="Inference connector"
+        size="min(1440px, 96vw)"
+        centered
+        styles={{
+          content: { maxHeight: '92dvh' },
+          body: { overflowY: 'auto' },
+        }}
+      >
+        <InferenceSessionsPanel
+          opened={inferenceOpen}
+          value={inferenceConfig}
+          stageTypes={inferenceStageTypes}
+          repoRef={inferenceRepoRef}
+          onCancel={() => setInferenceOpen(false)}
+          onSave={async (value) => {
+            await updateCapabilityConfig(
+              'inference',
+              value,
+              'Inference capability configuration changed'
+            );
+            setInferenceOpen(false);
           }}
         />
       </Modal>

@@ -5,10 +5,13 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    engine::capabilities::{
-        changeset::schema::CHANGESET_SCHEMA_EXAMPLE,
-        context_export,
-        registry::{stage_capability_policy, CapabilityContext, CapabilityInvocation, execute_capability_invocations},
+    engine::{
+        capabilities::{
+            changeset::schema::CHANGESET_SCHEMA_EXAMPLE,
+            context_export,
+            registry::{stage_capability_policy, CapabilityContext, CapabilityInvocation, execute_capability_invocations},
+        },
+        prompt_inputs::prompt_blocks_from_state,
     },
 };
 
@@ -161,6 +164,7 @@ async fn execute_workflow_capability(
         repo_ref: scope.repo_ref.as_str(),
         step: &scope.step,
         local_state: &scope.local_state,
+        prompt_blocks: prompt_blocks_from_state(&scope.local_state).map_err(internal)?,
         cancellation,
         capability_invocation_id: None,
     };

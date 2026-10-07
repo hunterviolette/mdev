@@ -1,6 +1,6 @@
-use axum::{extract::State, routing::{get, patch}, Json, Router};
+use axum::{extract::State, routing::get, Json, Router};
 use chrono::{DateTime, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::runtime_env::{default_browser_bridge_url, default_browser_cdp_url};

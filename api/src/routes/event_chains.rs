@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine::{load_run, load_template_definition},
-    models::{SprintEventStreamItem, WorkflowEventStreamItem},
+    models::{SupervisorEventStreamItem, WorkflowEventStreamItem},
 };
 
 type StageChainEvent = WorkflowEventStreamItem;
@@ -189,14 +189,14 @@ struct RuntimeEventEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SprintEventEnvelope {
+struct SupervisorEventEnvelope {
     scope: String,
     node_key: String,
     run_id: Option<String>,
     supervisor_run_id: Option<String>,
     workflow_key: Option<String>,
     repo_ref: Option<String>,
-    event: SprintEventStreamItem,
+    event: SupervisorEventStreamItem,
 }
 
 pub fn router() -> Router<AppState> {
@@ -1011,148 +1011,50 @@ async fn stream_events(
     Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-fn row_to_sprint_event(row: sqlx::sqlite::SqliteRow) -> Result<SprintEventStreamItem, (axum::http::StatusCode, String)> {
-    let payload_json: String = row.get("payload_json");
-    Ok(SprintEventStreamItem {
-        id: row.get("id"),
-        sprint_id: row.get("sprint_id"),
-        sequence_no: row.get("sequence_no"),
-        event_type: row.get("event_type"),
-        event_time: row.get("event_time"),
-        feature_id: row.get("feature_id"),
-        actor: row.get("actor"),
-        message: row.get("message"),
-        payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
-        created_at: row.get("created_at"),
-    })
-}
-
-async fn runtime_sprint_event_rows(
-    state: &AppState,
+fn supervisor_event_envelope(
     query: &RuntimeEventQuery,
-    after_sequence: i64,
-) -> Result<Vec<sqlx::sqlite::SqliteRow>, (axum::http::StatusCode, String)> {
+    event: SupervisorEventStreamItem,
+) -> Option<SupervisorEventEnvelope> {
     if matches!(query.scope.as_deref(), Some("workflow") | Some("workflow_run")) || query.run_id.is_some() {
-        return Ok(Vec::new());
+        return None;
     }
-
-    if let Some(supervisor_run_id) = query.supervisor_run_id {
-        let rows = sqlx::query(
-            "SELECT se.id, se.sprint_id, se.sequence_no, se.event_type, se.event_time, se.feature_id, se.actor, se.message, se.payload_json, se.created_at
-             FROM sprint_events se
-             JOIN sprints s ON s.id = se.sprint_id
-             WHERE s.supervisor_run_id = ? AND se.sequence_no > ?
-             ORDER BY se.sequence_no ASC",
-        )
-        .bind(supervisor_run_id.to_string())
-        .bind(after_sequence)
-        .fetch_all(&state.db)
-        .await
-        .map_err(internal)?;
-        return Ok(rows);
-    }
-
-    let rows = sqlx::query(
-        "SELECT id, sprint_id, sequence_no, event_type, event_time, feature_id, actor, message, payload_json, created_at
-         FROM sprint_events
-         WHERE sequence_no > ?
-         ORDER BY created_at ASC, sequence_no ASC
-         LIMIT 500",
-    )
-    .bind(after_sequence)
-    .fetch_all(&state.db)
-    .await
-    .map_err(internal)?;
-    Ok(rows)
-}
-
-async fn sprint_event_envelope(
-    state: &AppState,
-    query: &RuntimeEventQuery,
-    event: SprintEventStreamItem,
-) -> Result<Option<SprintEventEnvelope>, (axum::http::StatusCode, String)> {
-    let row = sqlx::query("SELECT supervisor_run_id FROM sprints WHERE id = ?")
-        .bind(&event.sprint_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(internal)?;
-    let supervisor_run_id: Option<String> = row.and_then(|row| row.get("supervisor_run_id"));
 
     if let Some(expected) = query.supervisor_run_id {
-        if supervisor_run_id.as_deref() != Some(expected.to_string().as_str()) {
-            return Ok(None);
+        if event.supervisor_run_id != expected.to_string() {
+            return None;
         }
     }
 
-    Ok(Some(SprintEventEnvelope {
-        scope: "sprint".to_string(),
-        node_key: supervisor_run_id.as_deref().map(supervisor_node_key).unwrap_or_else(|| format!("sprint:{}", event.sprint_id)),
+    Some(SupervisorEventEnvelope {
+        scope: "supervisor".to_string(),
+        node_key: supervisor_node_key(&event.supervisor_run_id),
         run_id: None,
-        supervisor_run_id,
+        supervisor_run_id: Some(event.supervisor_run_id.clone()),
         workflow_key: None,
         repo_ref: query.repo_ref.clone(),
         event,
-    }))
+    })
 }
 
-fn sprint_event_sse(envelope: &SprintEventEnvelope) -> Option<Event> {
-    let name = if envelope.event.event_type == "supervisor_snapshot" {
-        "supervisor_snapshot"
-    } else {
-        "sprint_event"
-    };
+fn supervisor_event_sse(envelope: &SupervisorEventEnvelope) -> Option<Event> {
     serde_json::to_string(envelope).ok().map(|payload| {
         Event::default()
-            .event(name)
+            .event("supervisor_event")
             .retry(std::time::Duration::from_secs(5))
-            .id(format!("sprint:{}:{}", envelope.event.sprint_id, envelope.event.sequence_no))
+            .id(format!(
+                "supervisor:{}:{}",
+                envelope.event.supervisor_run_id,
+                envelope.event.sequence_no
+            ))
             .data(payload)
     })
 }
 
-async fn send_supervisor_snapshot_sse(
-    state: &AppState,
-    query: &RuntimeEventQuery,
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
-) -> bool {
-    let Some(supervisor_id) = query.supervisor_run_id else {
-        return true;
-    };
-    let Ok(run) = crate::supervisor::load_supervisor_run(state, supervisor_id).await else {
-        return true;
-    };
-    let snapshot = json!({
-        "scope": "sprint",
-        "node_key": supervisor_node_key(&supervisor_id.to_string()),
-        "run_id": null,
-        "supervisor_run_id": supervisor_id.to_string(),
-        "workflow_key": null,
-        "repo_ref": run.root_repo_path,
-        "event": {
-            "id": format!("snapshot-{}", Utc::now().timestamp_millis()),
-            "sprint_id": run.context.get("current_sprint_id").and_then(Value::as_str).unwrap_or(""),
-            "sequence_no": 0,
-            "event_type": "supervisor_snapshot",
-            "event_time": Utc::now().to_rfc3339(),
-            "feature_id": null,
-            "actor": "system",
-            "message": "current supervisor snapshot",
-            "payload": {
-                "supervisor_run_id": supervisor_id,
-                "supervisor_run": run,
-                "snapshot": true,
-                "synthetic": true
-            },
-            "created_at": Utc::now().to_rfc3339()
-        }
-    });
-    match Event::default()
-        .event("supervisor_snapshot")
+fn supervisor_resync_sse() -> Event {
+    Event::default()
+        .event("supervisor_resync")
         .retry(std::time::Duration::from_secs(5))
-        .data(snapshot.to_string())
-    {
-        event => tx.send(Ok(event)).is_ok(),
-    }
+        .data("{}")
 }
 
 async fn stream_runtime_events(
@@ -1162,9 +1064,10 @@ async fn stream_runtime_events(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let state_for_task = state.clone();
     let mut workflow_live_rx = state.subscribe_workflow_events();
-    let mut sprint_live_rx = state.subscribe_sprint_events();
+    let mut supervisor_live_rx = state.subscribe_supervisor_events();
+    let mut template_live_rx = state.subscribe_template_events();
     let mut last_workflow_sequence_by_run_id = HashMap::<String, i64>::new();
-    let mut last_sprint_sequence = 0;
+    let mut last_supervisor_sequence_by_id = HashMap::<String, i64>::new();
 
     tokio::spawn(async move {
         if let Ok(snapshot) = build_runtime_snapshot(&state_for_task, &query).await {
@@ -1175,10 +1078,6 @@ async fn stream_runtime_events(
             }
         }
 
-
-        if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
-            return;
-        }
 
         loop {
             tokio::select! {
@@ -1234,45 +1133,48 @@ async fn stream_runtime_events(
                         return;
                     },
                 },
-                sprint_message = sprint_live_rx.recv() => match sprint_message {
+                template_message = template_live_rx.recv() => match template_message {
                     Ok(item) => {
-                        if item.sequence_no <= last_sprint_sequence {
-                            continue;
-                        }
-                        last_sprint_sequence = item.sequence_no;
-                        if let Ok(Some(envelope)) = sprint_event_envelope(&state_for_task, &query, item).await {
-                            if let Some(event) = sprint_event_sse(&envelope) {
-                                if tx.send(Ok(event)).is_err() {
-                                    return;
-                                }
-                            }
-                            if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
-                                return;
-                            }
+                        if tx.send(Ok(Event::default().event("template_event").data(item.to_string()))).is_err() {
+                            return;
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
-                        let rows = runtime_sprint_event_rows(&state_for_task, &query, last_sprint_sequence)
-                            .await
-                            .unwrap_or_default();
-                        for row in rows {
-                            if let Ok(item) = row_to_sprint_event(row) {
-                                last_sprint_sequence = last_sprint_sequence.max(item.sequence_no);
-                                if let Ok(Some(envelope)) = sprint_event_envelope(&state_for_task, &query, item).await {
-                                    if let Some(event) = sprint_event_sse(&envelope) {
-                                        if tx.send(Ok(event)).is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !send_supervisor_snapshot_sse(&state_for_task, &query, &tx).await {
+                        if tx.send(Ok(Event::default().event("template_resync").data("{}"))).is_err() {
                             return;
                         }
                     }
                     Err(RecvError::Closed) => {
-                        let _ = tx.send(Ok(stream_error_sse("sprint event broadcast channel closed")));
+                        let _ = tx.send(Ok(stream_error_sse("template event broadcast channel closed")));
+                        return;
+                    }
+                },
+                supervisor_message = supervisor_live_rx.recv() => match supervisor_message {
+                    Ok(item) => {
+                        let last_sequence = last_supervisor_sequence_by_id
+                            .get(&item.supervisor_run_id)
+                            .copied()
+                            .unwrap_or(0);
+                        if item.sequence_no <= last_sequence {
+                            continue;
+                        }
+                        last_supervisor_sequence_by_id
+                            .insert(item.supervisor_run_id.clone(), item.sequence_no);
+                        if let Some(envelope) = supervisor_event_envelope(&query, item) {
+                            if let Some(event) = supervisor_event_sse(&envelope) {
+                                if tx.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if tx.send(Ok(supervisor_resync_sse())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        let _ = tx.send(Ok(stream_error_sse("supervisor event broadcast channel closed")));
                         return;
                     },
                 },
@@ -1525,29 +1427,16 @@ async fn supervisor_child_workflow_run_ids(
     supervisor_run_id: Uuid,
 ) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
     let mut run_ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT sf.current_workflow_run_id
-         FROM sprint_features sf
-         JOIN sprints s ON s.id = sf.sprint_id
-         WHERE s.supervisor_run_id = ?
-           AND TRIM(COALESCE(sf.current_workflow_run_id, '')) != ''",
+        "SELECT DISTINCT workflow_run_id
+         FROM supervisor_work_units
+         WHERE supervisor_run_id = ?
+           AND archived_at IS NULL
+           AND TRIM(COALESCE(workflow_run_id, '')) != ''",
     )
     .bind(supervisor_run_id.to_string())
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-
-    if let Some(integration_run_id) = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT integration_run_id FROM supervisor_runs WHERE id = ?",
-    )
-    .bind(supervisor_run_id.to_string())
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal)?
-    .flatten()
-    .filter(|value| !value.trim().is_empty())
-    {
-        run_ids.push(integration_run_id);
-    }
 
     run_ids.sort();
     run_ids.dedup();

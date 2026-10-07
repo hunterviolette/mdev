@@ -24,12 +24,12 @@ use crate::{
 
 use super::capabilities::{
     execute_capability_invocations,
-    planner,
     registry::CapabilityResult,
     CapabilityContext,
     CapabilityInvocation,
 };
 use super::automation::{self, AutomationDecision};
+use super::prompt_inputs::prompt_blocks_from_state;
 use super::{append_engine_event, ensure_engine_root, event_meta, merge_json_values, persist_context};
 
 pub struct StageRegistration {
@@ -101,16 +101,6 @@ pub trait Stage: Send + Sync {
         &[]
     }
 
-    fn automation_after_capability(
-        &self,
-        _run: &WorkflowRun,
-        _step: &WorkflowStepDefinition,
-        _result: &CapabilityResult,
-        _prior_results: &[CapabilityResult],
-    ) -> Result<Vec<AutomationDecision>> {
-        Ok(Vec::new())
-    }
-
     fn prepare_state(
         &self,
         context: StagePrepareContext<'_>,
@@ -144,13 +134,14 @@ pub(crate) fn automation_policy_keys_for_stage_type(stage_type: &str) -> &'stati
         .unwrap_or(&[])
 }
 
-pub(crate) fn automation_after_capability(
-    run: &WorkflowRun,
-    step: &WorkflowStepDefinition,
-    result: &CapabilityResult,
-    prior_results: &[CapabilityResult],
-) -> Result<Vec<AutomationDecision>> {
-    stage_for_step(step).automation_after_capability(run, step, result, prior_results)
+pub(crate) fn stage_type_supports_capability(
+    stage_type: &str,
+    capability: &str,
+) -> bool {
+    stage_registry()
+        .get(stage_type)
+        .map(|stage| stage.capabilities().contains(capability))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -291,11 +282,7 @@ pub fn rearm_session_scoped_inference_inputs(
     run: &mut WorkflowRun,
     _step: &WorkflowStepDefinition,
 ) {
-    normalize_inference_arm_state(run);
-    crate::engine::automation::apply_trigger(
-        run,
-        crate::engine::automation::AutomationTrigger::NewInferenceSession,
-    );
+    crate::engine::automation::apply_inference_session_trigger(run);
 }
 
 fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) -> bool {
@@ -362,7 +349,7 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
-    state.orchestration_inputs.clear_run(run_id);
+    state.prompt_inputs.clear_run(run_id);
     Ok(())
 }
 
@@ -536,15 +523,17 @@ pub async fn execute_stage(
         .unwrap_or(run.repo_ref.as_str())
         .to_string();
 
-    planner::apply_repo_planner_capability(&state.db, &mut global_state, repo_ref.as_str()).await?;
+    state
+        .planner()
+        .apply_repo_capability(&mut global_state, repo_ref.as_str())
+        .await?;
     root.insert("global_state".to_string(), global_state.clone());
 
     let mut execution_global_state = global_state.clone();
-    planner::hydrate_repo_planner_prompt_fragment(
-        &state.db,
-        &mut execution_global_state,
-    )
-    .await?;
+    state
+        .planner()
+        .hydrate_prompt_fragment(&mut execution_global_state)
+        .await?;
 
     let mut local_state = match existing_local_state {
         Value::Object(map) => Value::Object(map),
@@ -1015,6 +1004,7 @@ async fn run_capability_plan(
         repo_ref,
         step,
         local_state,
+        prompt_blocks: prompt_blocks_from_state(local_state)?,
         cancellation,
         capability_invocation_id: None,
     };

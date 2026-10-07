@@ -14,11 +14,12 @@ use crate::{
         event_meta,
         automation,
         load_run,
-        orchestration_inputs::{
+        prompt_inputs::{
             AttachmentRole,
-            OrchestrationInputLifecycle,
-            OrchestrationInputPayload,
-            OrchestrationInputScope,
+            PromptBlock,
+            PromptInputLifecycle,
+            PromptInputPayload,
+            PromptInputScope,
         },
         persist_context,
         set_run_status,
@@ -41,6 +42,7 @@ pub struct CapabilityContext<'a> {
     pub repo_ref: &'a str,
     pub step: &'a WorkflowStepDefinition,
     pub local_state: &'a Value,
+    pub prompt_blocks: Vec<PromptBlock>,
     pub cancellation: CancellationToken,
     pub capability_invocation_id: Option<String>,
 }
@@ -190,12 +192,12 @@ impl CapabilityContext<'_> {
             return;
         }
 
-        self.state.orchestration_inputs.publish(
+        self.state.prompt_inputs.publish(
             self.run_id,
-            OrchestrationInputScope::Run,
-            OrchestrationInputLifecycle::SingleUse,
+            PromptInputScope::Run,
+            PromptInputLifecycle::SingleUse,
             500,
-            OrchestrationInputPayload::PromptContribution {
+            PromptInputPayload::PromptContribution {
                 text,
                 source: Some(source.into()),
                 label: Some(label.into()),
@@ -215,12 +217,12 @@ impl CapabilityContext<'_> {
             return;
         }
 
-        self.state.orchestration_inputs.publish(
+        self.state.prompt_inputs.publish(
             self.run_id,
-            OrchestrationInputScope::Run,
-            OrchestrationInputLifecycle::SingleUse,
+            PromptInputScope::Run,
+            PromptInputLifecycle::SingleUse,
             500,
-            OrchestrationInputPayload::Attachment {
+            PromptInputPayload::Attachment {
                 path,
                 filename: filename.into(),
                 media_type,

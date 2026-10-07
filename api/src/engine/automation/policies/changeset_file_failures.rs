@@ -2,9 +2,17 @@ use std::collections::BTreeSet;
 
 use anyhow::Result;
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
 use crate::{
-    engine::{automation, capabilities::registry::CapabilityResult},
+    app_state::AppState,
+    engine::{
+        automation,
+        capabilities::{
+            inference::session,
+            registry::CapabilityResult,
+        },
+    },
     models::{WorkflowRun, WorkflowStepDefinition},
 };
 
@@ -13,14 +21,27 @@ use super::super::{
     scopes::AutomationScope,
 };
 
-pub fn after_capability(
+pub async fn after_capability(
+    state: &AppState,
+    run_id: Uuid,
     run: &WorkflowRun,
-    _step: &WorkflowStepDefinition,
+    step: &WorkflowStepDefinition,
     result: &CapabilityResult,
     _prior_results: &[CapabilityResult],
 ) -> Result<Vec<AutomationDecision>> {
     if result.capability != "changeset" {
         return Ok(Vec::new());
+    }
+
+    let route = session::resolve_inference_route_from_run(run, step)?;
+    let mut session_automation_state = session::bound_automation_state(
+        &state.db,
+        run_id,
+        &route.name,
+    )
+    .await?;
+    if !session_automation_state.is_object() {
+        session_automation_state = json!({});
     }
 
     let profile = automation::profile(run);
@@ -37,7 +58,7 @@ pub fn after_capability(
         .get("error_kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind == "payload");
-    let previous_payload_errors = automation_value(run, "changeset_payload_errors")
+    let previous_payload_errors = automation_value(&session_automation_state, "changeset_payload_errors")
         .and_then(|value| value.get("consecutive"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -48,7 +69,7 @@ pub fn after_capability(
     };
 
     let failing_files = failing_files_from_result(&result.payload);
-    let mut next_files = existing_file_counts(run);
+    let mut next_files = existing_file_counts(&session_automation_state);
 
     if result.ok {
         for path in touched_files_from_result(&result.payload) {
@@ -87,20 +108,29 @@ pub fn after_capability(
         }
     }
 
+    let next_session_state = json!({
+        "changeset_file_failures": {
+            "state": {
+                "files": Value::Object(next_files.clone())
+            }
+        },
+        "changeset_payload_errors": {
+            "consecutive": consecutive_payload_errors
+        }
+    });
+    merge_json_values(&mut session_automation_state, &next_session_state);
+    session::update_bound_automation_state(
+        &state.db,
+        run_id,
+        &route.name,
+        &session_automation_state,
+    )
+    .await?;
+
     let mut patch = json!({
         "automation": {
             "changeset_file_failures": {
-                "inject_context_after_consecutive_failures": inject_after,
-                "inject_broad_context_after_consecutive_failures": inject_broad_after,
-                "pause_after_consecutive_failures": pause_after,
-                "pause_reason": pause_reason,
-                "state": {
-                    "files": Value::Object(next_files.clone())
-                }
-            },
-            "changeset_payload_errors": {
-                "inject_changeset_schema_after_consecutive_errors": inject_schema_after,
-                "consecutive": consecutive_payload_errors
+                "pause_reason": pause_reason
             }
         }
     });
@@ -152,8 +182,8 @@ pub fn after_capability(
     }])
 }
 
-fn existing_file_counts(run: &WorkflowRun) -> Map<String, Value> {
-    automation_value(run, "changeset_file_failures")
+fn existing_file_counts(automation_state: &Value) -> Map<String, Value> {
+    automation_value(automation_state, "changeset_file_failures")
         .and_then(|v| v.get("state"))
         .and_then(|v| v.get("files"))
         .and_then(Value::as_object)
@@ -161,13 +191,10 @@ fn existing_file_counts(run: &WorkflowRun) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn automation_value<'a>(run: &'a WorkflowRun, policy_key: &str) -> Option<&'a Value> {
-    run.context
-        .get("workflow_engine")?
-        .get("global_state")?
-        .get("automation")?
-        .get(policy_key)
+fn automation_value<'a>(automation_state: &'a Value, policy_key: &str) -> Option<&'a Value> {
+    automation_state.get(policy_key)
 }
+
 
 fn failing_files_from_result(result: &Value) -> Vec<String> {
     result
