@@ -1,9 +1,9 @@
 pub mod api;
 pub mod browser;
-pub mod panel;
 pub mod prompting;
 pub mod session;
 pub mod stage_support;
+pub mod transport;
 pub mod model_output;
 
 use anyhow::Result;
@@ -37,29 +37,42 @@ pub enum InferenceTransport {
     Browser,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceSessionLifecycle {
+    Persistent,
+    NonPersistent,
+}
+
+impl Default for InferenceSessionLifecycle {
+    fn default() -> Self {
+        Self::Persistent
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
-    #[serde(default = "default_profile")]
+    #[serde(default = "default_profile", skip_serializing)]
     pub profile: String,
-    #[serde(default = "default_cdp_url")]
+    #[serde(default = "default_cdp_url", skip_serializing)]
     pub cdp_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub page_url_contains: String,
     #[serde(default)]
     pub target_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub edge_executable: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub user_data_dir: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub session_id: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing)]
     pub auto_launch_edge: bool,
-    #[serde(default = "default_response_timeout_ms")]
+    #[serde(default = "default_response_timeout_ms", skip_serializing)]
     pub response_timeout_ms: u64,
-    #[serde(default = "default_response_poll_ms")]
+    #[serde(default = "default_response_poll_ms", skip_serializing)]
     pub response_poll_ms: u64,
-    #[serde(default = "default_dom_poll_ms")]
+    #[serde(default = "default_dom_poll_ms", skip_serializing)]
     pub dom_poll_ms: u64,
 }
 
@@ -82,34 +95,146 @@ impl Default for BrowserConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceConfig {
-    pub transport: InferenceTransport,
-    #[serde(default)]
+pub struct ApiConfig {
+    #[serde(default = "default_api_provider")]
     pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default)]
     pub endpoint: String,
     #[serde(default)]
-    pub conversation_id: Option<String>,
+    pub provider_options: Value,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_api_provider(),
+            model: default_model(),
+            endpoint: String::new(),
+            provider_options: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InferenceConfig {
+    pub transport: InferenceTransport,
     #[serde(default)]
-    pub runtime: Value,
+    pub lifecycle: InferenceSessionLifecycle,
+    #[serde(default)]
+    pub api: ApiConfig,
     #[serde(default)]
     pub browser: BrowserConfig,
+}
+
+impl Serialize for InferenceConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("InferenceConfig", 3)?;
+        state.serialize_field("transport", &self.transport)?;
+        state.serialize_field("lifecycle", &self.lifecycle)?;
+        match self.transport {
+            InferenceTransport::Api => state.serialize_field("api", &self.api)?,
+            InferenceTransport::Browser => state.serialize_field("browser", &self.browser)?,
+        }
+        state.end()
+    }
 }
 
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             transport: InferenceTransport::Api,
-            provider: "openai".to_string(),
-            model: default_model(),
-            endpoint: String::new(),
-            conversation_id: None,
-            runtime: json!({}),
+            lifecycle: InferenceSessionLifecycle::Persistent,
+            api: ApiConfig::default(),
             browser: BrowserConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceSessionBindingMode {
+    #[default]
+    New,
+    Existing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceStageSessionBinding {
+    #[serde(default)]
+    pub mode: InferenceSessionBindingMode,
+    pub session: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum InferenceStageSessionBindingSpec {
+    Binding(InferenceStageSessionBinding),
+    Legacy(String),
+}
+
+impl InferenceStageSessionBindingSpec {
+    pub fn session_name(&self) -> &str {
+        match self {
+            Self::Binding(binding) => binding.session.as_str(),
+            Self::Legacy(session) => session.as_str(),
+        }
+    }
+
+    pub fn existing_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Binding(binding) if binding.mode == InferenceSessionBindingMode::Existing => {
+                binding
+                    .session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InferenceCapabilityConfig {
+    #[serde(default)]
+    pub stage_sessions: std::collections::BTreeMap<String, InferenceStageSessionBindingSpec>,
+    #[serde(default)]
+    pub sessions: std::collections::BTreeMap<String, InferenceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct InferenceCapabilitiesState {
+    #[serde(default)]
+    pub inference: Option<InferenceCapabilityConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct InferenceGlobalState {
+    #[serde(default)]
+    pub capabilities: InferenceCapabilitiesState,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct InferenceWorkflowEngineState {
+    #[serde(default)]
+    pub global_state: InferenceGlobalState,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct InferenceRunContext {
+    #[serde(default)]
+    pub workflow_engine: Option<InferenceWorkflowEngineState>,
+    #[serde(default)]
+    pub global_state: Option<InferenceGlobalState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +261,6 @@ pub struct BrowserProbeResult {
     pub ready: bool,
 }
 
-pub use session::persist_inference_config;
 
 pub async fn execute(
     ctx: &CapabilityContext<'_>,
@@ -158,10 +282,15 @@ pub async fn execute(
         });
     }
 
-    let resolved_session = session::resolve_inference_session(ctx).await?;
-    let selected_transport = resolved_session.config.transport.clone();
-    let selected_provider = resolved_session.config.provider.clone();
-    let selected_model = resolved_session.config.model.clone();
+    let resolved_route = session::resolve_inference_route(ctx).await?;
+    let selected_transport = resolved_route.config.transport.clone();
+    let (selected_provider, selected_model) = match selected_transport {
+        InferenceTransport::Api => (
+            resolved_route.config.api.provider.clone(),
+            resolved_route.config.api.model.clone(),
+        ),
+        InferenceTransport::Browser => ("browser".to_string(), String::new()),
+    };
 
     let model_input = prompting::build_model_input(ctx, prior_results)?;
     let sent_prompt = model_input.text.clone();
@@ -182,13 +311,11 @@ pub async fn execute(
         });
     }
 
-    let response = match selected_transport {
-        InferenceTransport::Browser => browser::execute(ctx, &model_input).await?,
-        InferenceTransport::Api => api::execute(ctx, &model_input).await?,
-    };
+    let inference = transport::Inference::new();
+    let response = inference.execute(ctx, &resolved_route, &model_input).await?;
 
     ctx.state
-        .orchestration_inputs
+        .prompt_inputs
         .acknowledge(ctx.run_id, &model_input.consumed_input_ids);
 
     let response_ok = response
@@ -332,6 +459,10 @@ fn default_profile() -> String {
 fn default_cdp_url() -> String {
     runtime_default_browser_cdp_url()
         .expect("WORKFLOW_BROWSER_CDP_HOST and WORKFLOW_BROWSER_CDP_PORT must be set")
+}
+
+fn default_api_provider() -> String {
+    "openai".to_string()
 }
 
 fn default_model() -> String {

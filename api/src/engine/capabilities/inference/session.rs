@@ -1,156 +1,515 @@
-use anyhow::{anyhow, Result};
+use std::collections::BTreeMap;
+
+use anyhow::{anyhow, bail, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use uuid::Uuid;
 
-use super::{ensure_object_slot, InferenceConfig, InferenceTransport};
+use super::{InferenceCapabilityConfig, InferenceConfig, InferenceRunContext, InferenceTransport};
 use super::super::registry::CapabilityContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolvedInferenceSession {
+pub struct ResolvedInferenceRoute {
     pub name: String,
+    pub stage_type: String,
+    pub existing_session_id: Option<String>,
     pub config: InferenceConfig,
 }
 
-pub fn resolve_inference_session_from_run(
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceSession {
+    pub id: String,
+    pub repo_ref: String,
+    pub title: String,
+    pub transport: InferenceTransport,
+    pub lifecycle: String,
+    pub config: InferenceConfig,
+    pub transport_state: Value,
+    pub automation_state: Value,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
+}
+
+pub fn resolve_inference_route_from_run(
     run: &crate::models::WorkflowRun,
     step: &crate::models::WorkflowStepDefinition,
-) -> Result<ResolvedInferenceSession> {
-    let global_state = run
-        .context
-        .get("workflow_engine")
-        .and_then(|v| v.get("global_state"))
-        .or_else(|| run.context.get("engine").and_then(|v| v.get("global_state")))
-        .or_else(|| run.context.get("global_state"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let inference = global_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let sessions = inference
-        .get("sessions")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("inference capability must define a sessions map"))?;
-
-    let session_name = step
-        .execution_logic
-        .get("connections")
-        .and_then(|value| value.get("inference"))
-        .and_then(|value| value.get("session"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| mapped_stage_session(&inference, step.step_type.as_str()))
-        .or_else(|| inference.get("default_session").and_then(Value::as_str).map(str::to_string))
-        .ok_or_else(|| anyhow!("inference capability must define default_session or a stage session mapping"))?;
-
-    let session_value = sessions
-        .get(session_name.as_str())
-        .cloned()
-        .ok_or_else(|| anyhow!("inference session '{}' is not configured", session_name))?;
-
-    let mut config = serde_json::from_value::<InferenceConfig>(session_value)
-        .map_err(|err| anyhow!("failed to decode inference session '{}': {}", session_name, err))?;
-
-    if config.provider.trim().is_empty() {
-        config.provider = default_provider_for_transport(&config.transport).to_string();
+) -> Result<ResolvedInferenceRoute> {
+    let inference = inference_config_from_run(run)?;
+    let stage_binding = inference
+        .stage_sessions
+        .get(step.step_type.as_str())
+        .ok_or_else(|| anyhow!("inference stage '{}' does not have a session binding", step.step_type))?;
+    let session_name = stage_binding
+        .session_name()
+        .trim();
+    if session_name.is_empty() {
+        bail!("inference stage '{}' has an empty session binding", step.step_type);
     }
 
-    Ok(ResolvedInferenceSession {
-        name: session_name,
+    let mut resolved = resolve_named_inference_session_from_config(&inference, session_name)?;
+    resolved.stage_type = step.step_type.clone();
+    resolved.existing_session_id = stage_binding
+        .existing_session_id()
+        .map(str::to_string);
+    Ok(resolved)
+}
+
+pub fn resolve_named_inference_session_from_run(
+    run: &crate::models::WorkflowRun,
+    session_name: &str,
+) -> Result<ResolvedInferenceRoute> {
+    let inference = inference_config_from_run(run)?;
+    resolve_named_inference_session_from_config(&inference, session_name)
+}
+
+fn inference_config_from_run(run: &crate::models::WorkflowRun) -> Result<InferenceCapabilityConfig> {
+    let context = serde_json::from_value::<InferenceRunContext>(run.context.clone())
+        .map_err(|err| anyhow!("failed to decode workflow inference context: {}", err))?;
+
+    Ok(context
+        .workflow_engine
+        .map(|engine| engine.global_state)
+        .or(context.global_state)
+        .and_then(|global_state| global_state.capabilities.inference)
+        .unwrap_or_default())
+}
+
+fn resolve_named_inference_session_from_config(
+    inference: &InferenceCapabilityConfig,
+    session_name: &str,
+) -> Result<ResolvedInferenceRoute> {
+    let config = inference
+        .sessions
+        .get(session_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("inference session configuration '{}' is not configured", session_name))?;
+
+    Ok(ResolvedInferenceRoute {
+        name: session_name.to_string(),
+        stage_type: String::new(),
+        existing_session_id: None,
         config,
     })
 }
 
-pub async fn resolve_inference_session(ctx: &CapabilityContext<'_>) -> Result<ResolvedInferenceSession> {
-    let run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    resolve_inference_session_from_run(&run, ctx.step)
-}
-
-pub async fn persist_inference_config(
+pub async fn resolve_inference_route(
     ctx: &CapabilityContext<'_>,
-    session_name: &str,
-    cfg: &InferenceConfig,
+) -> Result<ResolvedInferenceRoute> {
+    let run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
+    resolve_inference_route_from_run(&run, ctx.step)
+}
+
+pub async fn bound_session(
+    ctx: &CapabilityContext<'_>,
+    stage_type: &str,
+) -> Result<Option<InferenceSession>> {
+    load_bound_session(&ctx.state.db, ctx.run_id, stage_type).await
+}
+
+pub async fn load_bound_session(
+    db: &SqlitePool,
+    run_id: Uuid,
+    stage_type: &str,
+) -> Result<Option<InferenceSession>> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.id, s.repo_ref, s.title, s.transport, s.lifecycle,
+               s.config_json, s.transport_state_json, s.automation_state_json,
+               s.status, s.created_at, s.updated_at, s.last_used_at
+        FROM workflow_inference_stage_bindings b
+        JOIN inference_sessions s ON s.id = b.inference_session_id
+        WHERE b.workflow_run_id = ? AND b.stage_type = ?
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(stage_type)
+    .fetch_optional(db)
+    .await?;
+
+    row.map(row_to_inference_session).transpose()
+}
+
+pub async fn create_session(
+    db: &SqlitePool,
+    repo_ref: &str,
+    run_id: Uuid,
+    route: &ResolvedInferenceRoute,
+) -> Result<InferenceSession> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let title = format!("{} · {}", route.name, &id[..8]);
+    let transport = transport_name(&route.config.transport);
+    let mut tx = db.begin().await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO inference_sessions (
+            id, repo_ref, title, transport, lifecycle,
+            config_json, transport_state_json, automation_state_json,
+            status, created_at, updated_at, last_used_at
+        ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}', 'pending', ?, ?, NULL)
+        "#,
+    )
+    .bind(&id)
+    .bind(repo_ref)
+    .bind(&title)
+    .bind(transport)
+    .bind(lifecycle_name(&route.config.lifecycle))
+    .bind(serde_json::to_string(&route.config)?)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_inference_stage_bindings (
+            workflow_run_id, stage_type, inference_session_id, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(workflow_run_id, stage_type)
+        DO UPDATE SET inference_session_id = excluded.inference_session_id, updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(&route.stage_type)
+    .bind(&id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    get_session(db, &id)
+        .await?
+        .ok_or_else(|| anyhow!("created inference session could not be loaded"))
+}
+
+pub async fn activate_session(
+    db: &SqlitePool,
+    session_id: &str,
+    transport_state: Value,
+) -> Result<InferenceSession> {
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "UPDATE inference_sessions SET transport_state_json = ?, status = 'active', updated_at = ?, last_used_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&transport_state)?)
+    .bind(&now)
+    .bind(&now)
+    .bind(session_id)
+    .execute(db)
+    .await?;
+
+    get_session(db, session_id)
+        .await?
+        .ok_or_else(|| anyhow!("inference session '{}' was not found", session_id))
+}
+
+pub async fn mark_session_failed(
+    db: &SqlitePool,
+    session_id: &str,
+    error: &anyhow::Error,
 ) -> Result<()> {
-    let mut run = crate::engine::load_run(ctx.state, ctx.run_id).await?;
-    let root = crate::engine::ensure_engine_root(&mut run.context);
-    let global_state = ensure_object_slot(root, "global_state");
-    let capabilities = ensure_object_slot(global_state, "capabilities");
-    let inference = ensure_object_slot(capabilities, "inference");
-    let sessions = ensure_object_slot(inference, "sessions");
+    let now = Utc::now().to_rfc3339();
 
-    sessions.insert(session_name.to_string(), serde_json::to_value(cfg)?);
-    crate::engine::persist_context(ctx.state, ctx.run_id, &run.context).await
+    sqlx::query(
+        "UPDATE inference_sessions SET transport_state_json = ?, status = 'error', updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&json!({
+        "error": format!("{:#}", error)
+    }))?)
+    .bind(now)
+    .bind(session_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
 }
 
-pub fn runtime_string(cfg: &InferenceConfig, key: &str) -> Option<String> {
-    cfg.runtime
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
+pub async fn archive_session(
+    db: &SqlitePool,
+    session_id: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = db.begin().await?;
+
+    sqlx::query(
+        "UPDATE inference_sessions SET status = 'archived', updated_at = ? WHERE id = ? AND status != 'archived'",
+    )
+    .bind(&now)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM workflow_inference_stage_bindings WHERE inference_session_id = ?",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
 }
 
-pub fn set_runtime_string(cfg: &mut InferenceConfig, key: &str, value: Option<String>) {
-    if !cfg.runtime.is_object() {
-        cfg.runtime = json!({});
+pub async fn archive_non_persistent_sessions_on_startup(
+    db: &SqlitePool,
+) -> Result<u64> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = db.begin().await?;
+
+    let result = sqlx::query(
+        "UPDATE inference_sessions SET status = 'archived', updated_at = ? WHERE lifecycle = 'non_persistent' AND status != 'archived'",
+    )
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM workflow_inference_stage_bindings WHERE inference_session_id IN (SELECT id FROM inference_sessions WHERE lifecycle = 'non_persistent' AND status = 'archived')",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn touch_session(
+    db: &SqlitePool,
+    session_id: &str,
+    transport_state: Value,
+) -> Result<InferenceSession> {
+    activate_session(db, session_id, transport_state).await
+}
+
+pub async fn get_session(
+    db: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<InferenceSession>> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, repo_ref, title, transport, lifecycle,
+               config_json, transport_state_json, automation_state_json,
+               status, created_at, updated_at, last_used_at
+        FROM inference_sessions
+        WHERE id = ?
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+
+    row.map(row_to_inference_session).transpose()
+}
+
+pub async fn list_repo_sessions(
+    db: &SqlitePool,
+    repo_ref: &str,
+) -> Result<Vec<InferenceSession>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, repo_ref, title, transport, lifecycle,
+               config_json, transport_state_json, automation_state_json,
+               status, created_at, updated_at, last_used_at
+        FROM inference_sessions
+        WHERE repo_ref = ? AND status != 'archived'
+        ORDER BY COALESCE(last_used_at, updated_at) DESC, created_at DESC
+        "#,
+    )
+    .bind(repo_ref)
+    .fetch_all(db)
+    .await?;
+
+    rows.into_iter().map(row_to_inference_session).collect()
+}
+
+pub async fn bindings_for_run(
+    db: &SqlitePool,
+    run_id: Uuid,
+) -> Result<BTreeMap<String, String>> {
+    let rows = sqlx::query(
+        "SELECT stage_type, inference_session_id FROM workflow_inference_stage_bindings WHERE workflow_run_id = ? ORDER BY stage_type",
+    )
+    .bind(run_id.to_string())
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("stage_type"),
+                row.get::<String, _>("inference_session_id"),
+            )
+        })
+        .collect())
+}
+
+pub async fn binding_id(
+    db: &SqlitePool,
+    run_id: Uuid,
+    stage_type: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT inference_session_id FROM workflow_inference_stage_bindings WHERE workflow_run_id = ? AND stage_type = ?",
+    )
+    .bind(run_id.to_string())
+    .bind(stage_type)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(|row| row.get::<String, _>("inference_session_id")))
+}
+
+pub async fn bind_session(
+    db: &SqlitePool,
+    run_id: Uuid,
+    stage_type: &str,
+    session_id: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_inference_stage_bindings (
+            workflow_run_id, stage_type, inference_session_id, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(workflow_run_id, stage_type)
+        DO UPDATE SET inference_session_id = excluded.inference_session_id, updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(run_id.to_string())
+    .bind(stage_type)
+    .bind(session_id)
+    .bind(now)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn bound_automation_state(
+    db: &SqlitePool,
+    run_id: Uuid,
+    route_name: &str,
+) -> Result<Value> {
+    Ok(load_bound_session(db, run_id, route_name)
+        .await?
+        .map(|session| session.automation_state)
+        .unwrap_or_else(|| json!({})))
+}
+
+pub async fn update_bound_automation_state(
+    db: &SqlitePool,
+    run_id: Uuid,
+    route_name: &str,
+    automation_state: &Value,
+) -> Result<()> {
+    let Some(session_id) = binding_id(db, run_id, route_name).await? else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        "UPDATE inference_sessions SET automation_state_json = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(automation_state)?)
+    .bind(Utc::now().to_rfc3339())
+    .bind(session_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+pub fn validate_session_for_route(
+    session: &InferenceSession,
+    route: &ResolvedInferenceRoute,
+) -> Result<()> {
+    if session.transport != route.config.transport {
+        bail!(
+            "inference session '{}' uses transport '{}' but route '{}' uses '{}'",
+            session.id,
+            transport_name(&session.transport),
+            route.name,
+            transport_name(&route.config.transport)
+        );
     }
 
-    let obj = cfg.runtime.as_object_mut().expect("runtime must be object");
-    match value {
-        Some(value) if !value.trim().is_empty() => {
-            obj.insert(key.to_string(), Value::String(value));
-        }
-        _ => {
-            obj.remove(key);
-        }
-    }
+    Ok(())
 }
 
-pub fn selected_session_from_local_state(local_state: &Value) -> Option<String> {
-    local_state
-        .get("capabilities")
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("selected_session"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-pub fn resolve_stage_session_name(inference: &Value, step_type: &str) -> Option<String> {
-    mapped_stage_session(inference, step_type)
-        .or_else(|| inference.get("default_session").and_then(Value::as_str).map(str::to_string))
-}
-
-fn explicit_stage_session(ctx: &CapabilityContext<'_>) -> Option<String> {
-    ctx.step
-        .execution_logic
-        .get("connections")
-        .and_then(|v| v.get("inference"))
-        .and_then(|v| v.get("session"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| selected_session_from_local_state(ctx.local_state))
-}
-
-fn mapped_stage_session(inference: &Value, step_type: &str) -> Option<String> {
+pub fn resolve_stage_session_name(
+    inference: &InferenceCapabilityConfig,
+    step_type: &str,
+) -> Option<String> {
     inference
-        .get("stage_sessions")
-        .and_then(|v| v.get(step_type))
-        .and_then(Value::as_str)
+        .stage_sessions
+        .get(step_type)
+        .map(|binding| binding.session_name())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
-fn default_provider_for_transport(transport: &InferenceTransport) -> &'static str {
+fn row_to_inference_session(row: SqliteRow) -> Result<InferenceSession> {
+    let transport = match row.get::<String, _>("transport").as_str() {
+        "browser" => InferenceTransport::Browser,
+        "api" => InferenceTransport::Api,
+        other => return Err(anyhow!("unknown inference transport '{}'", other)),
+    };
+
+    let config_text = row
+        .try_get::<String, _>("config_json")
+        .unwrap_or_else(|_| "{}".to_string());
+    let mut config = serde_json::from_str::<InferenceConfig>(&config_text)
+        .unwrap_or_default();
+    config.transport = transport.clone();
+
+    let transport_state_text = row.get::<String, _>("transport_state_json");
+    let transport_state = serde_json::from_str::<Value>(&transport_state_text)
+        .unwrap_or_else(|_| json!({}));
+    let automation_state_text = row
+        .try_get::<String, _>("automation_state_json")
+        .unwrap_or_else(|_| "{}".to_string());
+    let automation_state = serde_json::from_str::<Value>(&automation_state_text)
+        .unwrap_or_else(|_| json!({}));
+
+    Ok(InferenceSession {
+        id: row.get("id"),
+        repo_ref: row.get("repo_ref"),
+        title: row.get("title"),
+        transport,
+        lifecycle: row
+            .try_get::<String, _>("lifecycle")
+            .unwrap_or_else(|_| "persistent".to_string()),
+        config,
+        transport_state,
+        automation_state,
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        last_used_at: row
+            .try_get::<Option<String>, _>("last_used_at")
+            .unwrap_or(None),
+    })
+}
+
+fn lifecycle_name(lifecycle: &super::InferenceSessionLifecycle) -> &'static str {
+    match lifecycle {
+        super::InferenceSessionLifecycle::Persistent => "persistent",
+        super::InferenceSessionLifecycle::NonPersistent => "non_persistent",
+    }
+}
+
+fn transport_name(transport: &InferenceTransport) -> &'static str {
     match transport {
-        InferenceTransport::Api => "openai",
+        InferenceTransport::Api => "api",
         InferenceTransport::Browser => "browser",
     }
 }

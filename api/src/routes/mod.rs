@@ -4,6 +4,7 @@ mod event_chains;
 pub(crate) mod supervisor_projection;
 mod filesystem;
 mod health;
+mod inference_sessions;
 mod repo_tree;
 mod repo_sync;
 mod runs;
@@ -36,6 +37,7 @@ pub fn router() -> Router<crate::app_state::AppState> {
     Router::new()
         .merge(health::router())
         .merge(settings::router())
+        .merge(inference_sessions::router())
         .merge(planner::router())
         .merge(processes::router())
         .merge(supervisor::router())

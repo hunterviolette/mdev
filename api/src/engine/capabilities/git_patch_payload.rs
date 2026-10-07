@@ -121,6 +121,19 @@ pub fn payload_from_patch(repo_ref: &str, scope: &str, patch_text: &str) -> Resu
 }
 
 pub fn apply_payload(repo_ref: &str, payload_text: &str, reverse: bool) -> Result<()> {
+    apply_payload_inner(repo_ref, payload_text, reverse, false)
+}
+
+pub fn apply_payload_for_integration(repo_ref: &str, payload_text: &str) -> Result<()> {
+    apply_payload_inner(repo_ref, payload_text, false, true)
+}
+
+fn apply_payload_inner(
+    repo_ref: &str,
+    payload_text: &str,
+    reverse: bool,
+    prefer_incoming_conflicts: bool,
+) -> Result<()> {
     let envelope: GitPatchPayloadEnvelope = serde_json::from_str(payload_text)
         .context("failed to parse git patch payload envelope")?;
     if !matches!(envelope.version, 1 | 2) || envelope.kind != "git_apply_patch" {
@@ -137,7 +150,13 @@ pub fn apply_payload(repo_ref: &str, payload_text: &str, reverse: bool) -> Resul
             if envelope.merge_files.is_empty() {
                 return Err(apply_error);
             }
-            apply_three_way_merge(&repo, &envelope.patch, &envelope.merge_files).map_err(|merge_error| {
+            apply_three_way_merge(
+                &repo,
+                &envelope.patch,
+                &envelope.merge_files,
+                prefer_incoming_conflicts,
+            )
+            .map_err(|merge_error| {
                 anyhow::anyhow!(
                     "git apply failed and per-file merge fallback failed.\ngit_apply_error={:#}\nmerge_error={:#}",
                     apply_error,
@@ -210,7 +229,12 @@ fn read_version(repo: &Path, source: &str, path: &str) -> Result<(bool, Option<S
     Ok((true, String::from_utf8(stdout).ok()))
 }
 
-fn apply_three_way_merge(repo: &Path, patch: &str, merge_files: &[GitPatchMergeFile]) -> Result<()> {
+fn apply_three_way_merge(
+    repo: &Path,
+    patch: &str,
+    merge_files: &[GitPatchMergeFile],
+    prefer_incoming_conflicts: bool,
+) -> Result<()> {
     for merge_file in merge_files {
         if apply_patch_file_exact(repo, patch, &merge_file.path).is_ok() {
             continue;
@@ -234,6 +258,7 @@ fn apply_three_way_merge(repo: &Path, patch: &str, merge_files: &[GitPatchMergeF
             merge_file.base.as_deref(),
             ours.as_deref(),
             merge_file.result.as_deref(),
+            prefer_incoming_conflicts,
         )?;
 
         match merged {
@@ -276,25 +301,47 @@ fn safe_target_path(repo: &Path, path: &str) -> Result<PathBuf> {
     Ok(repo.join(relative))
 }
 
-fn merge_text_versions(path: &str, base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> Result<Option<String>> {
+fn merge_text_versions(
+    path: &str,
+    base: Option<&str>,
+    ours: Option<&str>,
+    theirs: Option<&str>,
+    prefer_incoming_conflicts: bool,
+) -> Result<Option<String>> {
     match (base, ours, theirs) {
         (None, None, Some(theirs)) => Ok(Some(theirs.to_string())),
         (None, Some(ours), Some(theirs)) if ours == theirs => Ok(Some(ours.to_string())),
+        (None, Some(_), Some(theirs)) if prefer_incoming_conflicts => Ok(Some(theirs.to_string())),
         (None, Some(_), Some(_)) => bail!("three-way add/add conflict in {path}"),
         (Some(base), Some(ours), None) if ours == base => Ok(None),
+        (Some(_), Some(_), None) if prefer_incoming_conflicts => Ok(None),
         (Some(_), Some(_), None) => bail!("three-way modify/delete conflict in {path}"),
         (Some(_), None, None) => Ok(None),
         (Some(base), None, Some(theirs)) if theirs == base => Ok(None),
+        (Some(_), None, Some(theirs)) if prefer_incoming_conflicts => Ok(Some(theirs.to_string())),
         (Some(_), None, Some(_)) => bail!("three-way delete/modify conflict in {path}"),
         (Some(base), Some(ours), Some(theirs)) if ours == theirs => Ok(Some(ours.to_string())),
         (Some(base), Some(ours), Some(theirs)) if ours == base => Ok(Some(theirs.to_string())),
         (Some(base), Some(ours), Some(theirs)) if theirs == base => Ok(Some(ours.to_string())),
-        (Some(base), Some(ours), Some(theirs)) => merge_file_contents(path, base, ours, theirs).map(Some),
+        (Some(base), Some(ours), Some(theirs)) => merge_file_contents(
+            path,
+            base,
+            ours,
+            theirs,
+            prefer_incoming_conflicts,
+        )
+        .map(Some),
         (None, _, None) => Ok(ours.map(str::to_string)),
     }
 }
 
-fn merge_file_contents(path: &str, base: &str, ours: &str, theirs: &str) -> Result<String> {
+fn merge_file_contents(
+    path: &str,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    prefer_incoming_conflicts: bool,
+) -> Result<String> {
     let temp_dir = std::env::temp_dir().join(format!("mdev-three-way-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir)?;
     let ours_path = temp_dir.join("ours");
@@ -316,6 +363,25 @@ fn merge_file_contents(path: &str, base: &str, ours: &str, theirs: &str) -> Resu
     let result = match output {
         Ok(output) if output.status.success() => String::from_utf8(output.stdout)
             .with_context(|| format!("three-way merge output was not UTF-8 for {path}")),
+        Ok(output) if prefer_incoming_conflicts => {
+            let resolved = Command::new("git")
+                .arg("merge-file")
+                .arg("-p")
+                .arg("--theirs")
+                .arg(&ours_path)
+                .arg(&base_path)
+                .arg(&theirs_path)
+                .output()
+                .with_context(|| format!("failed to resolve integration merge for {path}"))?;
+            if !resolved.status.success() {
+                bail!(
+                    "three-way content conflict in {path}: {}",
+                    String::from_utf8_lossy(&resolved.stderr).trim()
+                );
+            }
+            String::from_utf8(resolved.stdout)
+                .with_context(|| format!("resolved three-way merge output was not UTF-8 for {path}"))
+        }
         Ok(output) => bail!(
             "three-way content conflict in {path}: {}",
             String::from_utf8_lossy(&output.stderr).trim()

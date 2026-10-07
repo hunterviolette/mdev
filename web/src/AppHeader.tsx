@@ -50,26 +50,55 @@ export function AppHeader(props: {
     <AppSurface px="md" style={{ overflow: 'hidden' }}>
       <Stack gap={0}>
         <Group justify="space-between" align="center" wrap="wrap" gap="sm" mih={44}>
-          <Tabs
-            value={props.active}
-            onChange={(value) => {
-              if (value === 'workflows' || value === 'supervisor' || value === 'templates' || value === 'runtime') {
-                props.onChange(value);
-              }
-            }}
-          >
+          <Tabs value={props.active}>
             <Tabs.List style={{ borderBottom: 0 }}>
-              <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
+              <Tabs.Tab
+                value="workflows"
+                renderRoot={(rootProps) => <a {...rootProps} href="/workflows" />}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                  event.preventDefault();
+                  props.onChange('workflows');
+                }}
+              >
+                Workflows
+              </Tabs.Tab>
               <Tabs.Tab
                 value="supervisor"
+                renderRoot={(rootProps) => <a {...rootProps} href="/supervisors" />}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                  event.preventDefault();
+                  props.onChange('supervisor');
+                }}
                 onDoubleClick={() => {
                   if (props.active === 'supervisor') props.onActiveDoubleClick?.();
                 }}
               >
                 Supervisors
               </Tabs.Tab>
-              <Tabs.Tab value="templates">Templates</Tabs.Tab>
-              <Tabs.Tab value="runtime">Runtime</Tabs.Tab>
+              <Tabs.Tab
+                value="templates"
+                renderRoot={(rootProps) => <a {...rootProps} href="/templates" />}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                  event.preventDefault();
+                  props.onChange('templates');
+                }}
+              >
+                Templates
+              </Tabs.Tab>
+              <Tabs.Tab
+                value="runtime"
+                renderRoot={(rootProps) => <a {...rootProps} href="/runtime" />}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                  event.preventDefault();
+                  props.onChange('runtime');
+                }}
+              >
+                Runtime
+              </Tabs.Tab>
             </Tabs.List>
           </Tabs>
 

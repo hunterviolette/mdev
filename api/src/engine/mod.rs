@@ -1,6 +1,6 @@
 pub(crate) mod capabilities;
 pub(crate) mod automation;
-pub(crate) mod orchestration_inputs;
+pub(crate) mod prompt_inputs;
 mod runtime;
 pub(crate) mod runtime_tools;
 pub(crate) mod runtime_endpoints;
@@ -614,34 +614,6 @@ pub fn clear_prepared_inference_step(run: &mut WorkflowRun) {
     run_state.remove("prepared_inference_step_id");
 }
 
-pub async fn reconcile_inference_session(
-    state: &AppState,
-    run: &mut WorkflowRun,
-) -> Result<bool> {
-    let step = run
-        .current_step_id
-        .as_deref()
-        .and_then(|step_id| run.definition.steps.iter().find(|step| step.id == step_id))
-        .cloned();
-
-    let Some(step) = step else {
-        return Ok(false);
-    };
-
-    let changed = capabilities::inference::browser::reconcile_browser_session_rearm(
-        state,
-        run,
-        &step,
-    )
-    .await?;
-
-    if changed {
-        persist_context(state, run.id, &run.context).await?;
-    }
-
-    Ok(changed)
-}
-
 pub async fn preprocess_run_for_current_stage(
     state: &AppState,
     run: &mut WorkflowRun,
@@ -663,10 +635,9 @@ pub async fn preprocess_run_for_current_stage(
 
     if stage_changed || !stage_prepared {
         rearm_inference_inputs_for_stage(run, &step);
-        let changed = reconcile_inference_session(state, run).await?;
         set_prepared_inference_step_id(run, step.id.as_str());
         persist_context(state, run.id, &run.context).await?;
-        return Ok(changed);
+        return Ok(false);
     }
 
     refresh_inference_arm_state(run, Some(&step));
@@ -717,6 +688,39 @@ pub async fn select_step(state: &AppState, run_id: Uuid, step_id: &str) -> Resul
     }))
 }
 
+fn validate_inference_stage_session_slots(run: &WorkflowRun) -> Result<()> {
+    let expected = run
+        .definition
+        .steps
+        .iter()
+        .filter(|step| stages::stage_supports_capability(step, "inference"))
+        .map(|step| step.step_type.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let configured = run
+        .context
+        .get("workflow_engine")
+        .and_then(|value| value.get("global_state"))
+        .and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("inference"))
+        .and_then(|value| value.get("stage_sessions"))
+        .and_then(Value::as_object)
+        .map(|bindings| bindings.keys().cloned().collect::<std::collections::BTreeSet<_>>())
+        .unwrap_or_default();
+
+    if configured != expected {
+        let missing = expected.difference(&configured).cloned().collect::<Vec<_>>();
+        let unexpected = configured.difference(&expected).cloned().collect::<Vec<_>>();
+        return Err(anyhow!(
+            "inference stage mapping slots must match workflow structure; missing={:?} unexpected={:?}",
+            missing,
+            unexpected
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) -> Result<Value> {
     let mut run = load_run(state, run_id).await?;
 
@@ -724,6 +728,14 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
         Value::Object(map) => Value::Object(map),
         _ => return Err(anyhow!("global payload must be object")),
     };
+
+    let patches_inference_stage_sessions = global_payload
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .and_then(|capabilities| capabilities.get("inference"))
+        .and_then(Value::as_object)
+        .map(|inference| inference.contains_key("stage_sessions"))
+        .unwrap_or(false);
 
     let selected_step = run
         .current_step_id
@@ -736,6 +748,10 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
         merge_json_values(global_state, &global_payload);
         normalize_runtime_planner(global_state);
+    }
+
+    if patches_inference_stage_sessions {
+        validate_inference_stage_session_slots(&run)?;
     }
 
     refresh_inference_arm_state(&mut run, selected_step.as_ref());
@@ -844,7 +860,7 @@ pub async fn patch_stage_state(state: &AppState, run_id: Uuid, step_id: &str, pa
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
-    state.orchestration_inputs.clear_run(run_id);
+    state.prompt_inputs.clear_run(run_id);
     Ok(())
 }
 

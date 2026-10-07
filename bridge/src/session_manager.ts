@@ -674,7 +674,6 @@ export class SessionManager {
     const uploadName = this.basename(cmd.file_path);
     const uploadTimeout = Math.min(timeout, 15000);
     let via = 'input';
-    let input: Locator | null = null;
 
     const inputSelectors = cmd.input_selector
       ? [cmd.input_selector]
@@ -685,28 +684,29 @@ export class SessionManager {
           'input[type="file"]'
         ].filter((selector): selector is string => Boolean(selector))));
 
-    for (const selector of inputSelectors) {
-      const candidate = state.page.locator(selector).first();
-      const count = await candidate.count().catch(() => 0);
+    const findInput = async (): Promise<Locator | null> => {
+      for (const selector of inputSelectors) {
+        const candidates = state.page.locator(selector);
+        const count = await candidates.count().catch(() => 0);
 
-      if (count === 0) {
-        continue;
+        for (let index = 0; index < count; index += 1) {
+          const candidate = candidates.nth(index);
+          const accept = await candidate.getAttribute('accept').catch(() => null);
+
+          if (selector === 'input[type="file"]' && accept) {
+            continue;
+          }
+
+          return candidate;
+        }
       }
 
-      const aria = await candidate.getAttribute('aria-label').catch(() => null);
-      const accept = await candidate.getAttribute('accept').catch(() => null);
+      return null;
+    };
 
-      if (selector === 'input[type="file"]' && accept) {
-        continue;
-      }
+    let input = await findInput();
 
-      input = candidate;
-      break;
-    }
-
-    if (input) {
-      await input.setInputFiles(cmd.file_path, { timeout: uploadTimeout });
-    } else {
+    if (!input) {
       const triggerSelectors = cmd.button_selector
         ? [cmd.button_selector]
         : Array.from(new Set([
@@ -733,11 +733,33 @@ export class SessionManager {
         throw new Error(`No file input or upload trigger found for session ${state.sessionId}`);
       }
 
-      const chooserPromise = state.page.waitForEvent('filechooser', { timeout: uploadTimeout });
+      const chooserPromise = state.page
+        .waitForEvent('filechooser', { timeout: uploadTimeout })
+        .catch(() => null);
+
       await trigger.click({ timeout: uploadTimeout });
-      const chooser = await chooserPromise;
-      await chooser.setFiles(cmd.file_path);
-      via = 'filechooser';
+
+      const inputDeadline = Date.now() + Math.min(uploadTimeout, 5000);
+      while (!input && Date.now() < inputDeadline) {
+        input = await findInput();
+        if (!input) {
+          await state.page.waitForTimeout(100);
+        }
+      }
+
+      if (!input) {
+        const chooser = await chooserPromise;
+        if (!chooser) {
+          throw new Error(`No file input appeared and no file chooser opened for session ${state.sessionId}`);
+        }
+        await chooser.setFiles(cmd.file_path);
+        via = 'filechooser';
+      }
+    }
+
+    if (input) {
+      await input.setInputFiles(cmd.file_path, { timeout: uploadTimeout });
+      via = 'input';
     }
 
     state.pendingUploads = Array.from(new Set([...state.pendingUploads, uploadName]));
@@ -798,8 +820,13 @@ export class SessionManager {
         return rect.width > 0 && rect.height > 0;
       };
 
-      const clean = (value: string) => value.trim().replace(/\s+/g, ' ');
+      const normalizeForMatching = (value: string) => value.trim().replace(/\s+/g, ' ');
       const isUsefulText = (text: string) => text.length > 0 && !/^[\s\d:AMPamp]+$/.test(text);
+      const extractText = (element: Element) => {
+        const clone = element.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll('[data-testid^="action-bar-"], .turn-action-controls').forEach((node) => node.remove());
+        return (clone.textContent ?? '').trim();
+      };
 
       const actionButtons = Array.from(document.querySelectorAll(
         '[data-testid="action-bar-copy"], .turn-action-controls button[aria-label="Copy"]'
@@ -817,14 +844,14 @@ export class SessionManager {
           const candidates = Array.from(content.children).filter((child) => {
             const hasUserContent = child.matches('[data-user-message-bubble="true"]')
               || Boolean(child.querySelector('[data-user-message-bubble="true"]'));
-            const text = clean((child as HTMLElement).innerText || child.textContent || '');
-            return !hasUserContent && isUsefulText(text);
+            const text = extractText(child);
+            return !hasUserContent && isUsefulText(normalizeForMatching(text));
           });
 
           for (let index = candidates.length - 1; index >= 0; index -= 1) {
             const candidate = candidates[index] as HTMLElement;
-            const rawText = clean(candidate.innerText || candidate.textContent || '');
-            if (isUsefulText(rawText)) {
+            const rawText = extractText(candidate);
+            if (isUsefulText(normalizeForMatching(rawText))) {
               texts.push(rawText);
               break;
             }
@@ -841,20 +868,14 @@ export class SessionManager {
             continue;
           }
 
-          const rawText = clean(el.innerText || el.textContent || '');
-          if (!isUsefulText(rawText) || rawText.length < 40) {
+          const rawText = extractText(el);
+          const normalizedText = normalizeForMatching(rawText);
+          if (!isUsefulText(normalizedText) || normalizedText.length < 40) {
             continue;
           }
 
-          const actionText = clean(Array.from(el.querySelectorAll('[data-testid^="action-bar-"]'))
-            .map((node) => node.textContent ?? '')
-            .join(' '));
-          const withoutActions = clean(actionText ? rawText.replace(actionText, '') : rawText);
-
-          if (isUsefulText(withoutActions) && withoutActions.length >= 40) {
-            texts.push(withoutActions);
-            break;
-          }
+          texts.push(rawText);
+          break;
         }
       }
 

@@ -42,7 +42,7 @@ pub async fn patch_transient_stage_user_input(
         .to_string();
 
     state
-        .orchestration_inputs
+        .prompt_inputs
         .set_user_instruction(run_id, step_id, text.clone());
 
     append_engine_event(
@@ -77,7 +77,7 @@ pub fn get_transient_stage_user_input(
         "ok": true,
         "run_id": run_id,
         "step_id": step_id,
-        "text": state.orchestration_inputs.user_instruction(run_id, step_id)
+        "text": state.prompt_inputs.user_instruction(run_id, step_id)
     })
 }
 

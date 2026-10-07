@@ -155,6 +155,61 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS inference_sessions (
+            id TEXT PRIMARY KEY,
+            repo_ref TEXT NOT NULL,
+            title TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            lifecycle TEXT NOT NULL DEFAULT 'persistent',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            transport_state_json TEXT NOT NULL DEFAULT '{}',
+            automation_state_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workflow_inference_stage_bindings (
+            workflow_run_id TEXT NOT NULL,
+            stage_type TEXT NOT NULL,
+            inference_session_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(workflow_run_id, stage_type)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_sessions_repo_used ON inference_sessions (repo_ref, last_used_at, updated_at)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("DROP INDEX IF EXISTS idx_inference_sessions_repo_transport_provider")
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_sessions_repo_transport ON inference_sessions (repo_ref, transport)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_workflow_inference_stage_bindings_session ON workflow_inference_stage_bindings (inference_session_id)")
+        .execute(db)
+        .await?;
+
+    sqlx::query("DROP TABLE IF EXISTS workflow_inference_session_bindings")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS workflow_events (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -358,6 +413,9 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     ensure_column(db, "workflow_runs", "archived_at", "TEXT").await?;
     ensure_column(db, "workflow_runs", "archived_reason", "TEXT").await?;
+    ensure_column(db, "inference_sessions", "lifecycle", "TEXT NOT NULL DEFAULT 'persistent'").await?;
+    ensure_column(db, "inference_sessions", "automation_state_json", "TEXT NOT NULL DEFAULT '{}'").await?;
+    ensure_column(db, "inference_sessions", "config_json", "TEXT NOT NULL DEFAULT '{}'").await?;
     ensure_column(db, "workflow_events", "global_sequence_no", "INTEGER NOT NULL DEFAULT 0").await?;
 
     sqlx::query(

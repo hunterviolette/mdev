@@ -185,7 +185,7 @@ async fn insert_and_start_run(
         engine::automation::apply_context_mutations(&mut seeded_run, &decisions, Some(step.id.as_str()), None)?;
         engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
     }
-    context = seeded_run.context;
+    context = seeded_run.context.clone();
 
     sqlx::query("INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(id.to_string())
@@ -201,6 +201,9 @@ async fn insert_and_start_run(
         .bind(now.to_rfc3339())
         .execute(&state.db)
         .await?;
+
+    engine::capabilities::inference::transport::materialize_run_bindings(state, &seeded_run).await?;
+
     Ok(id)
 }
 

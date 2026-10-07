@@ -168,6 +168,8 @@ pub struct WorkflowBuilderCatalog {
     #[serde(default)]
     pub stage_descriptors: Vec<WorkflowStageDescriptor>,
     #[serde(default)]
+    pub stage_capabilities: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     pub automation_controls: Vec<WorkflowAutomationControlDescriptor>,
 }
 

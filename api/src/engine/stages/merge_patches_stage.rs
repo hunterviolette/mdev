@@ -328,7 +328,7 @@ pub async fn execute_stage(
             continue;
         }
 
-        match git_patch_payload::apply_payload(repo_ref, &generated_payload.payload_text, false) {
+        match git_patch_payload::apply_payload_for_integration(repo_ref, &generated_payload.payload_text) {
             Ok(()) => {
                 let patch_hash = generated_payload.patch_hash.clone();
                 let base_commit = Some(generated_payload.base_head.clone());

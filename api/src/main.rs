@@ -51,6 +51,32 @@ async fn main() -> anyhow::Result<()> {
         .runtime_endpoints
         .refresh_local_lan_ipv4_in_background();
 
+    match crate::engine::capabilities::inference::session::archive_non_persistent_sessions_on_startup(&state.db).await {
+        Ok(archived_sessions) if archived_sessions > 0 => {
+            tracing::info!(archived_sessions, "archived non-persistent inference sessions from the previous API process");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{:#}", error),
+                "failed to archive non-persistent inference sessions on startup"
+            );
+        }
+    }
+
+    match crate::engine::capabilities::inference::transport::backfill_run_bindings_on_startup(&state).await {
+        Ok(backfilled_bindings) if backfilled_bindings > 0 => {
+            tracing::info!(backfilled_bindings, "backfilled workflow inference bindings");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{:#}", error),
+                "failed to backfill workflow inference bindings on startup"
+            );
+        }
+    }
+
     match crate::engine::repair_process_interruption_errors_on_startup(&state).await {
         Ok(repaired_runs) if repaired_runs > 0 => {
             tracing::info!(

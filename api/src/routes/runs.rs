@@ -744,7 +744,7 @@ async fn create_run(
             .map_err(internal)?;
         engine::refresh_inference_arm_state(&mut seeded_run, Some(step));
     }
-    run_context = seeded_run.context;
+    run_context = seeded_run.context.clone();
 
     sqlx::query(
         "INSERT INTO workflow_runs (id, template_id, definition_json, status, current_step_id, title, repo_ref, workflow_key, context_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -763,6 +763,10 @@ async fn create_run(
     .execute(&state.db)
     .await
     .map_err(internal)?;
+
+    engine::capabilities::inference::transport::materialize_run_bindings(&state, &seeded_run)
+        .await
+        .map_err(internal)?;
 
     engine::append_engine_event(
         &state,

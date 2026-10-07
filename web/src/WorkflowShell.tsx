@@ -3618,10 +3618,10 @@ export function WorkflowShell(props: {
       return;
     }
 
-    const sessions = ((inference.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const defaultSessionName = typeof inference.default_session === 'string' ? inference.default_session : '';
-    const defaultSession = defaultSessionName ? ((sessions[defaultSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
-    setInferenceTransport(defaultSession.transport === 'browser' ? 'browser' : 'api');
+    const routes = ((inference.routes as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const defaultRouteName = typeof inference.default_route === 'string' ? inference.default_route : '';
+    const defaultRoute = defaultRouteName ? ((routes[defaultRouteName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(defaultRoute.transport === 'browser' ? 'browser' : 'api');
     setBrowserProbe(null);
   }, [sharedInferenceState, selectedRun?.id]);
 
@@ -3759,10 +3759,10 @@ export function WorkflowShell(props: {
         ? Boolean(selectedAutomation.auto_apply_changeset)
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
-    const inferenceSessions = ((inferenceConfig.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const inferenceSessionName = typeof inferenceConfig.default_session === 'string' ? inferenceConfig.default_session : '';
-    const inferenceSession = inferenceSessionName ? ((inferenceSessions[inferenceSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
-    setInferenceTransport(inferenceSession.transport === 'browser' ? 'browser' : 'api');
+    const inferenceRoutes = ((inferenceConfig.routes as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const inferenceRouteName = typeof inferenceConfig.default_route === 'string' ? inferenceConfig.default_route : '';
+    const inferenceRoute = inferenceRouteName ? ((inferenceRoutes[inferenceRouteName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(inferenceRoute.transport === 'browser' ? 'browser' : 'api');
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setSelectedRepoPaths(includeFiles);
     setSelectedRepoDirs(new Set(includeDirectories));
@@ -5013,18 +5013,6 @@ export function WorkflowShell(props: {
     setMonitorView('workflow_detail');
     setActiveWorkspaceTab('workflows');
     props.navigate?.(workflowTabRoute(runId, 'workflows'));
-  }
-
-  function backToWorkflowList() {
-    setMonitorView('workflow_list');
-    setMonitorHomeView('workflows');
-    props.navigate?.('/workflows');
-  }
-
-  function handleWorkflowListLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }) {
-    if (shouldUseBrowserNavigation(event)) return;
-    event.preventDefault();
-    backToWorkflowList();
   }
 
   async function openBuilder() {
@@ -7010,15 +6998,40 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           {error ? <Alert color="red">{error}</Alert> : null}
 
           {view !== 'builder' && monitorView === 'workflow_detail' ? (
-            <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
-              <Tabs.List>
-                <Tabs.Tab value="workflows">Workflow (Alt+1)</Tabs.Tab>
-                <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
-                <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
-                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
-                <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
-              </Tabs.List>
-            </Tabs>
+            <>
+              <AppHeader
+                active="workflows"
+                onChange={(next) => {
+                  setView('monitor');
+                  setMonitorView('workflow_list');
+                  setMonitorHomeView(next);
+                  setActiveWorkspaceTab('workflows');
+
+                  if (next === 'supervisor') {
+                    props.navigate?.('/supervisors');
+                  } else if (next === 'templates') {
+                    props.navigate?.('/templates');
+                  } else if (next === 'runtime') {
+                    props.navigate?.('/runtime');
+                  } else {
+                    props.navigate?.('/workflows');
+                  }
+                }}
+              >
+                <Tabs
+                    value={activeWorkspaceTab}
+                    onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}
+                  >
+                    <Tabs.List style={{ borderBottom: 0 }}>
+                  <Tabs.Tab value="workflows">Home (Alt+1)</Tabs.Tab>
+                  <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
+                  <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
+                  <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
+                  <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
+                    </Tabs.List>
+                  </Tabs>
+              </AppHeader>
+            </>
           ) : null}
 
           {view === 'builder' ? (
@@ -7037,7 +7050,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               }}
             >
               <Stack h="100%" gap="sm">
-                <Card withBorder p="sm">
+                <AppSurface p="sm">
                   <Stack gap="sm">
                     <Group justify="space-between" align="flex-start" wrap="wrap">
                       <Stack gap={2}>
@@ -7068,9 +7081,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       </Grid.Col>
                     </Grid>
                   </Stack>
-                </Card>
+                </AppSurface>
 
-                <Card withBorder p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
+                <AppSurface p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
                   <WorkflowBuilderEditor
                     key={`builder-load-${builderLoadRevision}`}
                     initialDefinition={loadedTemplateDefinition}
@@ -7117,7 +7130,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       });
                     }}
                   />
-                </Card>
+                </AppSurface>
               </Stack>
             </Modal>
           ) : activeWorkspaceTab === 'diff' ? (
@@ -7368,14 +7381,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     width: '100%'
                   }}
                 >
-                  <Card withBorder>
+                  <AppSurface p="md">
                     {selectedRun ? (
                       <Stack>
                         <Group justify="space-between">
                           <Group>
-                            <Button variant="light" component="a"
-              href="/workflows"
-              onClick={handleWorkflowListLinkClick}>Back to workflows</Button>
                             <div>
                               <Title order={4}>{selectedRun.title}</Title>
                               <Text c="dimmed">{selectedRun.repo_ref}</Text>
@@ -7467,9 +7477,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     ) : (
                       <Text c="dimmed">No workflow selected.</Text>
                     )}
-                  </Card>
+                  </AppSurface>
 
-                  <Card withBorder>
+                  <AppSurface p="md">
                     <Stack>
                       <Grid align="stretch">
                         <Grid.Col span={{ base: 12, xl: 4 }}>
@@ -7601,7 +7611,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
                       {manualCapabilityStatus ? <Alert color={manualCapabilityStatus.toLowerCase().includes('error') ? 'red' : 'blue'}>{manualCapabilityStatus}</Alert> : null}
                     </Stack>
-                  </Card>
+                  </AppSurface>
                   </Stack>
                 </Grid.Col>
 
@@ -7614,8 +7624,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     overflow: 'hidden'
                   }}
                 >
-                  <Card
-                    withBorder
+                  <AppSurface
                     style={{
                       height: '100%',
                       width: '100%',
@@ -7788,7 +7797,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         ) : null}
                       </ScrollArea>
                     </Stack>
-                  </Card>
+                  </AppSurface>
                 </Grid.Col>
               </Grid>
             )}
@@ -7930,7 +7939,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           <InferenceSessionsPanel
             opened={globalInferenceConfigOpen}
             globals={currentInferencePanelGlobals()}
-            definition={currentInferencePanelDefinition()}
+            value={(((currentInferencePanelGlobals()?.capabilities as Record<string, unknown> | undefined)?.inference as Record<string, unknown> | undefined) ?? {})}
+ stageTypes={Array.from(new Set((currentInferencePanelDefinition()?.steps ?? []).filter((step) => step.capabilities.some((capability) => capability.capability === 'inference' && capability.enabled !== false)).map((step) => step.step_type))).sort()}
+            repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+            runId={selectedRun?.id ?? null}
             busy={inferenceBusy}
             status={inferenceStatus}
             onCancel={() => setGlobalInferenceConfigOpen(false)}

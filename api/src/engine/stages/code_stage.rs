@@ -13,7 +13,6 @@ use crate::{
             },
             registry::CapabilityResult,
         },
-        automation::{policies::changeset_file_failures, AutomationDecision},
         stages::{
             Stage,
             StageCapabilities,
@@ -52,16 +51,6 @@ impl Stage for CodeStage {
 
     fn automation_policy_keys(&self) -> &'static [&'static str] {
         &["changeset_file_failures"]
-    }
-
-    fn automation_after_capability(
-        &self,
-        run: &WorkflowRun,
-        step: &WorkflowStepDefinition,
-        result: &CapabilityResult,
-        prior_results: &[CapabilityResult],
-    ) -> Result<Vec<AutomationDecision>> {
-        changeset_file_failures::after_capability(run, step, result, prior_results)
     }
 
     fn prepare_state(

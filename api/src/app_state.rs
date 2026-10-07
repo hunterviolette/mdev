@@ -16,7 +16,7 @@ use crate::engine::runtime_endpoints::RuntimeEndpointManager;
 use crate::{
     engine::{
         capabilities::terminal_runtime::ProcessRegistry,
-        orchestration_inputs::OrchestrationInputStore,
+        prompt_inputs::PromptInputStore,
         workflow_lifecycle::WorkflowCoordinator,
     },
     models::{SupervisorEventStreamItem, WorkflowEventStreamItem},
@@ -48,7 +48,7 @@ pub struct AppState {
     pub workflow_coordinator: WorkflowCoordinator,
     pub supervisor_coordinator: SupervisorCoordinator,
     pub process_registry: ProcessRegistry,
-    pub orchestration_inputs: OrchestrationInputStore,
+    pub prompt_inputs: PromptInputStore,
     pub operator_inputs: OperatorInputRegistry,
     pub repo_sync: RepoSyncRuntime,
     pub runtime_endpoints: RuntimeEndpointManager,
@@ -68,7 +68,7 @@ impl AppState {
             workflow_coordinator: WorkflowCoordinator::default(),
             supervisor_coordinator: SupervisorCoordinator::default(),
             process_registry: ProcessRegistry::default(),
-            orchestration_inputs: OrchestrationInputStore::default(),
+            prompt_inputs: PromptInputStore::default(),
             operator_inputs: OperatorInputRegistry::default(),
             repo_sync: RepoSyncRuntime::default(),
             runtime_endpoints: RuntimeEndpointManager::default(),

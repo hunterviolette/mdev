@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+mime_guess = "2"
 axum = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 chrono = { version = "0.4", features = ["serde"] }
