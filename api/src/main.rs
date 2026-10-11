@@ -64,19 +64,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    match crate::engine::capabilities::inference::transport::backfill_run_bindings_on_startup(&state).await {
-        Ok(backfilled_bindings) if backfilled_bindings > 0 => {
-            tracing::info!(backfilled_bindings, "backfilled workflow inference bindings");
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!(
-                error = %format!("{:#}", error),
-                "failed to backfill workflow inference bindings on startup"
-            );
-        }
-    }
-
     match crate::engine::repair_process_interruption_errors_on_startup(&state).await {
         Ok(repaired_runs) if repaired_runs > 0 => {
             tracing::info!(

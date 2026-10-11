@@ -37,7 +37,7 @@ pub async fn after_capability(
     let mut session_automation_state = session::bound_automation_state(
         &state.db,
         run_id,
-        &route.name,
+        &route.stage_type,
     )
     .await?;
     if !session_automation_state.is_object() {
@@ -122,7 +122,7 @@ pub async fn after_capability(
     session::update_bound_automation_state(
         &state.db,
         run_id,
-        &route.name,
+        &route.stage_type,
         &session_automation_state,
     )
     .await?;

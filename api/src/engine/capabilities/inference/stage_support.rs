@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::prompting::{resolve_default_user_input, ExecutionLogicPromptConfig};
+
 use crate::{
     engine::{
         capabilities::{capability_enabled, changeset::schema as changeset_schema, context_export, planner},
@@ -99,13 +101,17 @@ pub fn prepare_inference_stage_state_with_hooks(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let default_user_input = resolve_empty_user_input_default(
-        step,
-        &state,
+    let execution_logic = state
+        .get("execution_logic")
+        .cloned()
+        .unwrap_or_else(|| step.execution_logic.clone());
+    let configuration = serde_json::from_value::<ExecutionLogicPromptConfig>(execution_logic)?;
+    let resolved_default = resolve_default_user_input(
+        &configuration,
         hooks.empty_user_input_default.as_deref(),
     );
 
-    let user_input = explicit_user_input.or(default_user_input);
+    let user_input = explicit_user_input.or_else(|| resolved_default.value.clone());
 
     if let Some(user_input_fragment) = user_input.clone() {
         fragments
@@ -236,6 +242,10 @@ pub fn prepare_inference_stage_state_with_hooks(
 
     let obj = state.as_object_mut().expect("stage state must be object");
     obj.insert("composed_prompt".to_string(), Value::String(prompt));
+    obj.insert(
+        "inference_prompting".to_string(),
+        serde_json::to_value(&resolved_default)?,
+    );
     obj.insert("prompt_fragment_enabled".to_string(), effective_enabled);
     obj.insert("model_input_blocks".to_string(), model_input_blocks_value.clone());
     obj.insert("prompt_blocks".to_string(), model_input_blocks_value);
@@ -276,35 +286,7 @@ pub fn auto_apply_enabled(step: &WorkflowStepDefinition, state: &Value) -> bool 
         .unwrap_or(false)
 }
 
-fn resolve_empty_user_input_default(
-    step: &WorkflowStepDefinition,
-    state: &Value,
-    hook_default: Option<&str>,
-) -> Option<String> {
-    state
-        .get("execution_logic")
-        .and_then(|v| v.get("automation"))
-        .and_then(|v| v.get("empty_user_input_default"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            step.execution_logic
-                .get("automation")
-                .and_then(|v| v.get("empty_user_input_default"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            hook_default
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-}
+
 
 fn build_model_input_blocks(enabled: &Value, fragments: &Value) -> Vec<PromptBlock> {
     let enabled_obj = enabled.as_object().cloned().unwrap_or_default();
@@ -423,10 +405,10 @@ fn inference_input_enabled(
     global_state: &Value,
     step: &WorkflowStepDefinition,
     key: &str,
-    default_enabled: bool,
+    _default_enabled: bool,
 ) -> bool {
     stage_supports_capability(step, key)
-        && capability_enabled(global_state, key, default_enabled)
+        && capability_enabled(global_state, key, false)
 }
 
 pub fn build_inference_execution_plan(

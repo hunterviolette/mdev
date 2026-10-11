@@ -1,5 +1,6 @@
 pub mod api;
 pub mod browser;
+pub mod persistence;
 pub mod prompting;
 pub mod session;
 pub mod stage_support;

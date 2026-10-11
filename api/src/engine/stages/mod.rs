@@ -69,7 +69,28 @@ pub(crate) fn registered_stage_descriptors() -> Vec<WorkflowStageDescriptor> {
     let _ = stage_registry();
     let mut descriptors = inventory::iter::<StageRegistration>
         .into_iter()
-        .map(|registration| registration.implementation.descriptor())
+        .map(|registration| {
+            let stage = registration.implementation;
+            let mut descriptor = stage.descriptor();
+            if stage.capabilities().contains("inference") {
+                if let Some(default) = stage.inference_default_user_input() {
+                    if let Some(config) = descriptor.definition_template.config.as_object_mut() {
+                        config.insert("inference_default_user_input".to_string(), json!(default));
+                    }
+                    for group in &mut descriptor.editable_fields {
+                        for field in &mut group.fields {
+                            if field.bind_to == "execution_logic.automation.empty_user_input_default" {
+                                field.default = json!(default);
+                                field.label = "Default user input".to_string();
+                                field.description = "Initial user input for workflows created from this template.".to_string();
+                                field.ui.placeholder = String::new();
+                            }
+                        }
+                    }
+                }
+            }
+            descriptor
+        })
         .collect::<Vec<_>>();
     descriptors.sort_by(|left, right| left.step_type.cmp(&right.step_type));
     descriptors
@@ -96,6 +117,10 @@ pub trait Stage: Send + Sync {
     fn descriptor(&self) -> WorkflowStageDescriptor;
 
     fn capabilities(&self) -> StageCapabilities;
+
+    fn inference_default_user_input(&self) -> Option<&'static str> {
+        None
+    }
 
     fn automation_policy_keys(&self) -> &'static [&'static str] {
         &[]
@@ -278,14 +303,7 @@ fn ensure_value_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value must be object")
 }
 
-pub fn rearm_session_scoped_inference_inputs(
-    run: &mut WorkflowRun,
-    _step: &WorkflowStepDefinition,
-) {
-    crate::engine::automation::apply_inference_session_trigger(run);
-}
-
-fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun) -> bool {
+fn reset_session_scoped_inference_state(run: &mut WorkflowRun) {
     let root = ensure_engine_root(&mut run.context);
     let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
     let global_state_obj = ensure_value_object(global_state);
@@ -300,6 +318,7 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
 
     inference_obj.remove("next_prompt_fragments");
     inference_obj.remove("active_prompt_fragments");
+    inference_obj.remove("connection_runtime");
 
     if let Some(enabled) = inference_obj
         .get_mut("prompt_fragment_enabled")
@@ -322,30 +341,6 @@ fn reset_session_scoped_inference_state(state: &AppState, run: &mut WorkflowRun)
             inference_obj.remove("prompt_fragments");
         }
     }
-
-    let connection_runtime = inference_obj
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}));
-    let connection_runtime_obj = ensure_value_object(connection_runtime);
-
-    let current_process_session_id = state.process_session_id().to_string();
-    let persisted_process_session_id = connection_runtime_obj
-        .get("process_session_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    if persisted_process_session_id == current_process_session_id {
-        return false;
-    }
-
-    connection_runtime_obj.clear();
-    connection_runtime_obj.insert(
-        "process_session_id".to_string(),
-        Value::String(current_process_session_id),
-    );
-
-    true
 }
 
 pub(crate) async fn clear_auto_prompt_fragments(state: &AppState, run_id: Uuid) -> Result<()> {
@@ -471,8 +466,20 @@ pub async fn execute_stage(
     );
     let stage_started_at = Instant::now();
 
-    reset_session_scoped_inference_state(state, run);
+    reset_session_scoped_inference_state(run);
     crate::engine::clear_prepared_inference_step(run);
+
+    let inference_session_ids: Vec<String> = {
+        let bindings = crate::engine::capabilities::inference::session::bindings_for_run(
+            &state.db,
+            run_id,
+        )
+        .await?;
+        let mut ids: Vec<String> = bindings.into_values().collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
 
     append_engine_event(
         state,
@@ -484,6 +491,7 @@ pub async fn execute_stage(
         json!({
             "step_id": step.id,
             "step_type": step.step_type,
+            "inference_session_ids": inference_session_ids,
             "event_meta": event_meta(Some(stage_execution_id.as_str()), None, None, true)
         }),
     )

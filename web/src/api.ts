@@ -137,6 +137,17 @@ export type OpenAiModelsResponse = {
   models: string[];
 };
 
+export type RepositoryInferenceSessionUsage = {
+  invocation_count: number;
+  completed_count: number;
+  failed_count: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  cost_amount: number | null;
+  cost_currency: string | null;
+};
+
 export type RepositoryInferenceSession = {
   id: string;
   repo_ref: string;
@@ -149,6 +160,7 @@ export type RepositoryInferenceSession = {
   created_at: string;
   updated_at: string;
   last_used_at?: string | null;
+  usage: RepositoryInferenceSessionUsage;
 };
 
 export type RepositoryInferenceSessionsResponse = {
@@ -494,7 +506,7 @@ export type WorkflowTemplate = {
 
 export type WorkflowRunStatus = 'draft' | 'queued' | 'running' | 'waiting' | 'paused' | 'success' | 'complete' | 'error' | 'cancelled';
 
-export type InferenceTransport = 'api' | 'browser';
+export type InferenceTransport = string;
 
 export type BrowserProbeResult = {
   session_id: string;
@@ -822,6 +834,49 @@ export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument
 
 export function listOpenAiModels() {
   return fetchJson<OpenAiModelsResponse>('/api/inference-providers/openai/models');
+}
+
+export type InferenceInputRecord = {
+  id: string;
+  invocation_id: string;
+  workflow_run_id: string;
+  step_id: string;
+  stage_type: string;
+  session_id: string;
+  provider: string;
+  model: string;
+  sequence_no: number;
+  input_type: string;
+  input_origin: string;
+  input_source: string;
+  label: string;
+  content: string;
+  created_at: string;
+};
+
+export type InferenceInputsResponse = {
+  inputs: InferenceInputRecord[];
+  total: number;
+  has_more: boolean;
+  next_offset: number | null;
+};
+
+export type InferenceInputsFilters = {
+  search?: string;
+  stage_type?: string;
+  hide_defaults?: boolean;
+  offset?: number;
+  limit?: number;
+};
+
+export function getInferenceInputs(runId: string, filters: InferenceInputsFilters = {}) {
+  const params = new URLSearchParams();
+  if (filters.search?.trim()) params.set('search', filters.search.trim());
+  if (filters.stage_type) params.set('stage_type', filters.stage_type);
+  if (filters.hide_defaults !== undefined) params.set('hide_defaults', String(filters.hide_defaults));
+  params.set('offset', String(filters.offset ?? 0));
+  params.set('limit', String(filters.limit ?? 100));
+  return fetchJson<InferenceInputsResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/inference/inputs?${params.toString()}`);
 }
 
 export function listInferenceSessions(repoRef: string, runId?: string | null) {
@@ -1963,5 +2018,114 @@ export function sapScanExportCandidates(repoRef: string) {
     body: JSON.stringify({ repo_ref: repoRef })
   });
 }
+
+export type WorkflowImpact = {
+  run_id: string;
+  user_inputs: number;
+  inference_outputs: number;
+  input_tokens: number;
+  output_tokens: number;
+  stage_executions: number;
+  completed_stages: number;
+  failed_stages: number;
+  capability_activations: number;
+  changeset_attempts: number;
+  changeset_applied: number;
+  files_changed: number;
+  files_created: number;
+  files_modified: number;
+  files_deleted: number;
+  files_moved: number;
+  file_paths: string[];
+  lines_added: number | null;
+  lines_removed: number | null;
+};
+
+export function getWorkflowImpact(runId: string) {
+  return fetchJson<WorkflowImpact>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact`);
+}
+export type ImpactEffect = { attempt_id: string; step_id: string | null; attempt_status: string; created_at: string; action: string; status: string; path_before: string | null; path_after: string | null; operation: { op?: string; action?: string; match?: { text?: string }; replacement?: string; text?: string; changes?: Array<{ action?: string; match?: { text?: string }; replacement?: string; text?: string }>; contents?: string; from?: string; to?: string }; error: string | null };
+export type ImpactInvocation = { id: string; session_id: string; step_id: string; stage_type: string; provider: string; model: string; transport: string; status: string; error: string | null; created_at: string; completed_at: string | null; input_tokens: number | null; output_tokens: number | null; cached_tokens: number | null; cost: number | null; currency: string | null; metadata: unknown };
+export type ImpactAttempt = { id: string; status: string; total_ops: number; applied_ops: number; failed_ops: number; skipped_ops: number; total_actions: number; applied_actions: number; failed_actions: number; created_at: string };
+export type ImpactDetail = { effects: ImpactEffect[]; inference: ImpactInvocation[]; attempts: ImpactAttempt[] };
+export async function getImpactDetail(runId: string): Promise<ImpactDetail> {
+  const path = `/api/workflow-runs/${encodeURIComponent(runId)}/impact/detail`;
+  const response = await fetch(path, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store'
+  });
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Impact detail request failed (${response.status}) at ${response.url || path}: ${body.startsWith('<') ? 'Server returned HTML instead of API data.' : body.slice(0, 300)}`);
+  }
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new Error(`Impact detail endpoint returned ${contentType || 'an unknown content type'} instead of JSON. Request: ${response.url || path}. Verify the running Rust API includes /impact/detail and that the frontend API proxy targets it.`);
+  }
+  const result: unknown = await response.json();
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new Error('Impact detail API returned an invalid response object.');
+  }
+  const value = result as Record<string, unknown>;
+  if (!Array.isArray(value.effects) || !Array.isArray(value.inference)) {
+    throw new Error('Impact detail API response is missing effects or inference arrays.');
+  }
+  return result as ImpactDetail;
+}
+
+export type ImpactEvent = {
+  id: string;
+  sequence_no: number;
+  step_id: string | null;
+  stage_execution_id: string | null;
+  capability_invocation_id: string | null;
+  parent_invocation_id: string | null;
+  is_header_event: boolean;
+  level: string;
+  kind: string;
+  message: string;
+  payload: unknown;
+  created_at: string;
+};
+
+export type ImpactInferenceRecord = {
+  id: string;
+  step_id: string;
+  stage_type: string;
+  capability_invocation_id: string | null;
+  provider: string;
+  model: string;
+  transport: string;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+  inputs: Array<{ sequence_no: number; input_type: string; input_origin: string; input_source: string; label: string; content: string }>;
+  response_text: string | null;
+  response_payload: unknown;
+  provider_metadata: unknown;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  cost_amount: number | null;
+  cost_currency: string | null;
+};
+
+export type ImpactEventsResponse = { events: ImpactEvent[]; has_more: boolean; next_cursor: number | null };
+export type ImpactInferenceResponse = { invocations: ImpactInferenceRecord[]; has_more: boolean };
+
+export function getImpactEvents(runId: string, filters: { after?: number; before?: number; from?: string; to?: string; step_id?: string; stage_execution_id?: string; capability_invocation_id?: string; kind?: string; level?: string; search?: string; limit?: number } = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') query.set(key, String(value));
+  return fetchJson<ImpactEventsResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/events?${query}`);
+}
+
+export function getImpactInference(runId: string, filters: { invocation_id?: string; step_id?: string; capability_invocation_id?: string; from?: string; to?: string; before?: string; limit?: number } = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') query.set(key, String(value));
+  return fetchJson<ImpactInferenceResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/inference?${query}`);
+}
+
+
 
 

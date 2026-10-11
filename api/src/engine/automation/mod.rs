@@ -47,12 +47,10 @@ pub fn apply_inference_session_trigger(run: &mut WorkflowRun) {
 pub async fn apply_inference_session_transition(
     state: &crate::app_state::AppState,
     run_id: uuid::Uuid,
-    step: &crate::models::WorkflowStepDefinition,
 ) -> anyhow::Result<()> {
     let mut run = crate::engine::load_run(state, run_id).await?;
     apply_inference_session_trigger(&mut run);
     crate::engine::persist_context(state, run_id, &run.context).await?;
-    let _ = step;
     Ok(())
 }
 

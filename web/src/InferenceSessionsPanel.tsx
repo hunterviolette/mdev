@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Alert, Badge, Button, Card, Group, Select, SimpleGrid, Stack, Text, TextInput, Title } from '@mantine/core';
+import { Alert, Badge, Button, Card, Group, ScrollArea, Select, SimpleGrid, Stack, Text, TextInput, Title } from '@mantine/core';
 import {
   archiveInferenceSession,
-  getRun,
-  getWorkflowBuilderCatalog,
   listInferenceSessions,
   listOpenAiModels,
   type InferenceConfigPanel,
@@ -156,6 +154,51 @@ function inferenceConfigFromPanel(panel: InferenceConfigPanel): Record<string, u
   };
 }
 
+function formatSessionTokens(value: number | null | undefined): string {
+  if (value == null) return 'Unavailable';
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatSessionCost(amount: number | null | undefined, currency: string | null | undefined): string {
+  if (amount == null || !currency) return 'Unavailable';
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    }).format(amount);
+  } catch {
+    return `${amount.toFixed(4)} ${currency}`;
+  }
+}
+
+function RepositorySessionUsage({ session }: { session: RepositoryInferenceSession }) {
+  const usage = session.usage;
+  if (!usage) return null;
+
+  const metrics = [
+    { label: 'Inferences', value: usage.invocation_count.toLocaleString() },
+    { label: 'Completed', value: usage.completed_count.toLocaleString() },
+    { label: 'Failed', value: usage.failed_count.toLocaleString() },
+    { label: 'Input tokens', value: formatSessionTokens(usage.input_tokens) },
+    { label: 'Output tokens', value: formatSessionTokens(usage.output_tokens) },
+    { label: 'Cached tokens', value: formatSessionTokens(usage.cached_input_tokens) },
+    { label: 'Recorded cost', value: formatSessionCost(usage.cost_amount, usage.cost_currency) },
+  ];
+
+  return (
+    <SimpleGrid cols={{ base: 2, sm: 4, lg: 7 }} spacing="xs" mt="xs">
+      {metrics.map((metric) => (
+        <Stack key={metric.label} gap={2}>
+          <Text size="xs" c="dimmed">{metric.label}</Text>
+          <Text size="sm" fw={600}>{metric.value}</Text>
+        </Stack>
+      ))}
+    </SimpleGrid>
+  );
+}
+
 function repositorySessionProvider(session: RepositoryInferenceSession) {
   const api = session.config.api;
   if (!api || typeof api !== 'object' || Array.isArray(api)) return null;
@@ -184,10 +227,55 @@ function repositorySessionBrowserUrl(session: RepositoryInferenceSession) {
   return typeof targetUrl === 'string' ? targetUrl : null;
 }
 
+function reconcileRepositorySessions(
+  panel: InferenceConfigPanel,
+  repositorySessions: RepositoryInferenceSession[],
+): InferenceConfigPanel {
+  return {
+    ...panel,
+    sessions: panel.sessions.map((session) => {
+      const matches = repositorySessions.filter((candidate) => {
+        if (session.repository_session_id) {
+          return candidate.id === session.repository_session_id;
+        }
+
+        const nameMatches = candidate.title === session.name
+          || candidate.title.startsWith(`${session.name} · `);
+        if (!nameMatches || candidate.transport !== session.transport || candidate.lifecycle !== session.lifecycle) {
+          return false;
+        }
+
+        if (candidate.transport === 'browser') {
+          return repositorySessionBrowserUrl(candidate) === session.browser_url;
+        }
+
+        return repositorySessionProvider(candidate) === session.provider
+          && repositorySessionModel(candidate) === session.model
+          && (repositorySessionEndpoint(candidate) ?? '') === (session.endpoint ?? '');
+      });
+
+      if (matches.length !== 1) return session;
+
+      const repositorySession = matches[0];
+      return {
+        ...session,
+        transport: repositorySession.transport,
+        lifecycle: repositorySession.lifecycle,
+        provider: repositorySessionProvider(repositorySession),
+        model: repositorySessionModel(repositorySession),
+        endpoint: repositorySessionEndpoint(repositorySession),
+        browser_url: repositorySessionBrowserUrl(repositorySession),
+        source_mode: 'existing',
+        repository_session_id: repositorySession.id,
+      };
+    }),
+  };
+}
+
 export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
   const { opened, value, stageTypes, repoRef = null, runId = null, busy = false, status = null, onCancel, onSave } = props;
   const [panel, setPanel] = useState<InferenceConfigPanel>(() => emptyPanel());
-  const [structuralStagesLoading, setStructuralStagesLoading] = useState(false);
+  const structuralStagesLoading = stageTypes.length === 0 && Object.keys(recordValue(value.stage_sessions)).length > 0;
   const [loadError, setLoadError] = useState<string | null>(null);
   const [repositorySessions, setRepositorySessions] = useState<RepositoryInferenceSession[]>([]);
   const [repositoryActionBusy, setRepositoryActionBusy] = useState<string | null>(null);
@@ -195,62 +283,18 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
   const [openAiModelsLoading, setOpenAiModelsLoading] = useState(false);
 
   const openAiModelOptions = openAiModels.map((model) => ({ value: model, label: model }));
-  const usesOpenAi = panel.sessions.some((session) => session.transport === 'api' && session.provider === 'openai');
-  const hasIncompleteExistingBinding = panel.sessions.some((session) => session.source_mode === 'existing' && !session.repository_session_id?.trim());
+  const usesOpenAi = panel.sessions.some((session) => session.source_mode === 'new' && session.transport === 'api' && session.provider === 'openai');
+  const newSessions = panel.sessions.filter((session) => session.source_mode === 'new' && !session.repository_session_id);
+  const existingSessions = panel.sessions.filter((session) => session.source_mode === 'existing' || Boolean(session.repository_session_id));
+  const hasIncompleteExistingBinding = existingSessions.some((session) => !session.repository_session_id?.trim());
+  const hasDuplicateSessionNames = new Set(panel.sessions.map((session) => session.name.trim()).filter(Boolean)).size !== panel.sessions.filter((session) => session.name.trim()).length;
+  const hasInvalidStageMapping = panel.stage_mappings.some((mapping) => !panel.sessions.some((session) => session.name.trim() && session.name === mapping.session));
 
   useEffect(() => {
-    if (!opened) return;
-
-    let cancelled = false;
+    if (!opened || structuralStagesLoading) return;
     setLoadError(null);
-
-    const runtimeRunId = runId?.trim();
-    if (!runtimeRunId) {
-      setStructuralStagesLoading(false);
-      setPanel(withSessionEditorIds(inferencePanelFromConfig(value, stageTypes)));
-      return;
-    }
-
-    setStructuralStagesLoading(true);
-    setPanel(emptyPanel());
-
-    void Promise.all([
-      getRun(runtimeRunId),
-      getWorkflowBuilderCatalog(),
-    ])
-      .then(([run, catalog]) => {
-        if (cancelled) return;
-
-        const stageCapabilities = catalog.stage_capabilities ?? {};
-        const structuralStageTypes = Array.from(new Set(
-          (run.definition?.steps ?? [])
-            .filter((step) => (stageCapabilities[step.step_type] ?? []).includes('inference'))
-            .map((step) => step.step_type)
-        )).sort();
-
-        const workflowEngine = recordValue(run.context?.workflow_engine);
-        const globalState = recordValue(workflowEngine.global_state);
-        const capabilities = recordValue(globalState.capabilities);
-        const runtimeInference = recordValue(capabilities.inference);
-        const inference = Object.keys(runtimeInference).length > 0
-          ? runtimeInference
-          : value;
-
-        setPanel(withSessionEditorIds(inferencePanelFromConfig(inference, structuralStageTypes)));
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setPanel(emptyPanel());
-        setLoadError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setStructuralStagesLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [opened, value, stageTypes, runId]);
+    setPanel(withSessionEditorIds(inferencePanelFromConfig(value, stageTypes)));
+  }, [opened, structuralStagesLoading]);
 
   useEffect(() => {
     if (!opened || !usesOpenAi) {
@@ -290,6 +334,7 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
       .then((response) => {
         if (cancelled) return;
         setRepositorySessions(response.sessions);
+        setPanel((prev) => reconcileRepositorySessions(prev, response.sessions));
       })
       .catch((err) => {
         if (cancelled) return;
@@ -304,7 +349,9 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
   function updateSession(name: string, patch: Partial<InferenceConfigPanelSession>) {
     setPanel((prev) => ({
       ...prev,
-      sessions: prev.sessions.map((session) => session.name === name ? { ...session, ...patch } : session),
+      sessions: prev.sessions.map((session) => session.name === name && session.source_mode === 'new'
+        ? { ...session, ...patch }
+        : session),
     }));
   }
 
@@ -332,17 +379,21 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
   }
 
   function removeSession(name: string) {
-    setPanel((prev) => ({
-      ...prev,
-      sessions: prev.sessions.filter((session) => session.name !== name),
-      stage_mappings: prev.stage_mappings.map((mapping) => mapping.session === name
-        ? { ...mapping, session: '' }
-        : mapping),
-    }));
+    setPanel((prev) => {
+      const target = prev.sessions.find((session) => session.name === name);
+      if (!target || target.source_mode !== 'new' || target.repository_session_id) return prev;
+      return {
+        ...prev,
+        sessions: prev.sessions.filter((session) => session.name !== name),
+        stage_mappings: prev.stage_mappings.map((mapping) => mapping.session === name
+          ? { ...mapping, session: '' }
+          : mapping),
+      };
+    });
   }
 
   function changeTransport(sessionName: string, value: string | null) {
-    const session = panel.sessions.find((item) => item.name === sessionName);
+    const session = panel.sessions.find((item) => item.name === sessionName && item.source_mode === 'new');
     if (!session) return;
 
     if (value === 'browser') {
@@ -369,6 +420,11 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
     setPanel((prev) => {
       if (prev.sessions.some((session) => session.repository_session_id === repositorySession.id)) {
         return prev;
+      }
+
+      const reconciled = reconcileRepositorySessions(prev, [repositorySession]);
+      if (reconciled.sessions.some((session) => session.repository_session_id === repositorySession.id)) {
+        return reconciled;
       }
 
       const session: InferenceConfigPanelSession = {
@@ -426,7 +482,16 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
   }
 
   async function save() {
-    await onSave(inferenceConfigFromPanel(panel));
+    const reconciled = reconcileRepositorySessions(panel, repositorySessions);
+    if (new Set(reconciled.sessions.map((session) => session.name.trim())).size !== reconciled.sessions.length) {
+      setLoadError('Session names must be unique.');
+      return;
+    }
+    if (reconciled.stage_mappings.some((mapping) => !reconciled.sessions.some((session) => session.name === mapping.session))) {
+      setLoadError('Every stage must reference an available session.');
+      return;
+    }
+    await onSave(inferenceConfigFromPanel(reconciled));
   }
 
   return (
@@ -438,7 +503,8 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
         </Stack>
         <Group gap="xs">
           <Badge variant="light">{panel.stage_mappings.length} stages</Badge>
-          <Badge color="blue" variant="light">{panel.sessions.length} sessions</Badge>
+          <Badge color="blue" variant="light">{repositorySessions.length} existing</Badge>
+        <Badge variant="light">{newSessions.length} new</Badge>
           <Button size="xs" variant="light" onClick={addSession}>Add session</Button>
         </Group>
       </Group>
@@ -450,7 +516,7 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
           <Group justify="space-between" align="flex-start" wrap="wrap">
             <Stack gap={2}>
               <Title order={5}>Repository sessions</Title>
-              <Text size="xs" c="dimmed">Existing inference sessions owned by this repository. Choose which ones are available to this workflow or archive sessions that are no longer needed.</Text>
+              <Text size="xs" c="dimmed">Repository sessions are immutable. New configurations become repository sessions when their mapped stages execute.</Text>
             </Stack>
             <Badge variant="light">{repositorySessions.length} available</Badge>
           </Group>
@@ -458,12 +524,13 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
           {!repoRef?.trim() ? (
             <Alert color="gray">Select a repository to view its inference sessions.</Alert>
           ) : repositorySessions.length === 0 ? (
-            <Alert color="gray">No active inference sessions exist in this repository.</Alert>
+            <Alert color="gray">No repository sessions have been created. Add a new definition and map a stage to create one on execution.</Alert>
           ) : (
-            <Stack gap="xs">
-              {repositorySessions.map((repositorySession) => {
+            <ScrollArea.Autosize mah={360} type="auto" offsetScrollbars>
+              <Stack gap="xs">
+                {repositorySessions.map((repositorySession) => {
                 const workflowSessions = panel.sessions.filter((session) => session.repository_session_id === repositorySession.id);
-                const isUsed = workflowSessions.length > 0;
+                const isUsed = panel.stage_mappings.some((mapping) => workflowSessions.some((session) => session.name === mapping.session));
                 const lastUsed = repositorySession.last_used_at || repositorySession.updated_at;
 
                 return (
@@ -476,10 +543,16 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
                           <Badge color={repositorySession.lifecycle === 'non_persistent' ? 'orange' : 'gray'} variant="light">
                             {repositorySession.lifecycle === 'non_persistent' ? 'Non-persistent' : 'Persistent'}
                           </Badge>
-                          {isUsed ? <Badge color="green" variant="light">Used by workflow</Badge> : null}
+                          {isUsed ? <Badge color="green" variant="light">Mapped to workflow</Badge> : null}
                         </Group>
                         <Text size="xs" c="dimmed">{repositorySession.id}</Text>
                         <Text size="xs" c="dimmed">Last used {lastUsed}</Text>
+                        {repositorySession.transport === 'api' ? (
+                          <Text size="xs" c="dimmed">
+                            {[repositorySessionProvider(repositorySession), repositorySessionModel(repositorySession)].filter(Boolean).join(' · ')}
+                          </Text>
+                        ) : null}
+                        <RepositorySessionUsage session={repositorySession} />
                         {isUsed ? (
                           <Text size="xs" c="dimmed">Workflow session: {workflowSessions.map((session) => session.name).join(', ')}</Text>
                         ) : null}
@@ -517,8 +590,9 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
                     </Group>
                   </Card>
                 );
-              })}
-            </Stack>
+                })}
+              </Stack>
+            </ScrollArea.Autosize>
           )}
         </Stack>
       </Card>
@@ -527,9 +601,9 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
         <Alert color="gray">Add an inference session to configure this workflow.</Alert>
       ) : (
         <Stack gap="md">
-          {panel.sessions.map((session, sessionIndex) => {
-            const existingSessionId = session.source_mode === 'existing' ? session.repository_session_id ?? null : null;
-            const isExisting = Boolean(existingSessionId);
+          {newSessions.map((session, sessionIndex) => {
+            const existingSessionId = session.repository_session_id ?? null;
+            const isExisting = session.source_mode === 'existing' || Boolean(existingSessionId);
             const repositorySession = isExisting
               ? repositorySessions.find((candidate) => candidate.id === existingSessionId) ?? null
               : null;
@@ -546,10 +620,10 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
                         </Badge>
                       </Group>
                       <Text size="xs" c="dimmed">
-                        {isExisting ? 'Existing repository session' : 'New workflow session'}
+                        {isExisting ? 'Existing repository session' : 'New session definition · created when the mapped stage executes'}
                       </Text>
                     </Stack>
-                    {panel.sessions.length > 1 ? (
+                    {session.source_mode === 'new' && !session.repository_session_id ? (
                       <Button size="xs" color="red" variant="subtle" onClick={() => removeSession(session.name)}>Remove</Button>
                     ) : null}
                   </Group>
@@ -559,12 +633,12 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
                     <Stack gap="xs">
                       <Group gap="xs">
                         <Badge color="violet" variant="light">Existing repository session</Badge>
-                        <Badge variant="light">{repositorySession?.transport === 'browser' ? 'Browser' : 'API'}</Badge>
-                        <Badge variant="light">{repositorySession?.lifecycle === 'non_persistent' ? 'Non-persistent' : 'Persistent'}</Badge>
+                        <Badge variant="light">{repositorySession?.transport === 'browser' ? 'Browser' : repositorySession?.transport === 'api' ? 'API' : session.transport === 'browser' ? 'Browser' : 'API'}</Badge>
+                        <Badge variant="light">{(repositorySession?.lifecycle ?? session.lifecycle) === 'non_persistent' ? 'Non-persistent' : 'Persistent'}</Badge>
                       </Group>
                       <Text size="sm" fw={600}>{repositorySession?.title ?? session.name}</Text>
                       <Text size="xs" c="dimmed">{existingSessionId}</Text>
-                      <Alert color="gray">Existing session configuration is immutable. Create a new session and remap stages to change inference configuration.</Alert>
+                      <Alert color="gray">Existing session configuration is read-only. Create a new session and change stage mappings to use different inference settings.</Alert>
                     </Stack>
                   ) : (
                     <Stack gap="md">
@@ -722,6 +796,14 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
         </Stack>
       </Card>
 
+      {hasDuplicateSessionNames ? (
+        <Alert color="red">Session names must be unique.</Alert>
+      ) : null}
+
+      {hasInvalidStageMapping ? (
+        <Alert color="red">Every stage must reference an available session or new session definition.</Alert>
+      ) : null}
+
       {hasIncompleteExistingBinding ? (
         <Alert color="yellow">Every existing session binding must reference a repository session.</Alert>
       ) : null}
@@ -737,7 +819,9 @@ export function InferenceSessionsPanel(props: InferenceSessionsPanelProps) {
           disabled={
             structuralStagesLoading
             || hasIncompleteExistingBinding
-            || panel.sessions.some((session) => session.source_mode === 'new' && !session.name.trim())
+            || hasDuplicateSessionNames
+            || hasInvalidStageMapping
+            || newSessions.some((session) => !session.name.trim())
             || panel.stage_mappings.some((mapping) => !mapping.session.trim())
           }
         >

@@ -54,6 +54,7 @@ import {
   listTemplates,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
+  sendRunAction,
   patchWorkflowStageUserInput,
   pauseWorkflowRun,
   prepareWorkflowStage,
@@ -92,6 +93,7 @@ import {
   type WorkflowTemplateDefinition,
   type WorkflowTransition
 } from './api';
+import { StageInputAttachments, getStageInputAttachments, clearStageInputAttachments, serializeStageInputAttachments } from './StageInputAttachments';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
@@ -128,6 +130,8 @@ const CommitSummaryPanel = lazy(async () => {
   const mod = await import('./CommitSummaryPanel');
   return { default: mod.CommitSummaryPanel };
 });
+
+const ImpactPanel = lazy(async () => ({ default: (await import('./ImpactPanel')).ImpactPanel }));
 
 const RepoMonacoFileEditorPanel = lazy(async () => {
   const mod = await import('./RepoMonacoFileEditorPanel');
@@ -178,7 +182,7 @@ type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
 type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
-type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities' | 'impact';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -189,6 +193,7 @@ type StageModifierAction = {
   key: string;
   label: string;
   status?: string;
+  lifecycle?: string;
   color?: string;
   buttonLabel: string;
   onOpen?: () => void;
@@ -1381,6 +1386,9 @@ const StageModifierActions = memo(function StageModifierActions(props: {
               {action.status ? (
                 <Badge variant="light" color={action.color ?? 'blue'}>{action.status}</Badge>
               ) : null}
+              {action.lifecycle ? (
+                <Badge variant="light" color={action.lifecycle === 'Non-persistent' ? 'orange' : 'gray'}>{action.lifecycle}</Badge>
+              ) : null}
             </Group>
             {action.helperText ? <Text size="xs" c="dimmed">{action.helperText}</Text> : null}
           </Stack>
@@ -1467,6 +1475,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
   const userInputIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
   const [userInputDraft, setUserInputDraftState] = useState(stageUserInput);
+  const [defaultInputExpanded, setDefaultInputExpanded] = useState(false);
+  const [defaultInputDraft, setDefaultInputDraft] = useState('');
 
   const setUserInputDraft = useCallback((value: string) => {
     setUserInputDraftState(value);
@@ -1477,6 +1487,76 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     setUserInputDraftState(stageUserInput);
   }, [userInputIdentity, stageUserInput]);
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
+  const configuredDefaultInput = (selectedWorkflowStep?.execution_logic?.automation as { empty_user_input_default?: string } | undefined)?.empty_user_input_default;
+  const descriptorInferenceDefault = (descriptor?.definition_template?.config as Record<string, unknown> | undefined)?.inference_default_user_input;
+  const inheritedDefaultInput = typeof descriptorInferenceDefault === 'string'
+    ? descriptorInferenceDefault
+    : selectedWorkflowStep?.step_type === 'code'
+      ? 'please provide changeset in a codeblock with no comments to align coding'
+      : selectedWorkflowStep?.step_type === 'design' && Boolean(sharedPlannerFragmentState?.fragment_armed)
+        ? 'are you aligned with the feature implementation?'
+        : '';
+  const hasDefaultInputOverride = typeof configuredDefaultInput === 'string' && configuredDefaultInput.trim().length > 0;
+  const resolvedDefaultInput = hasDefaultInputOverride ? configuredDefaultInput : inheritedDefaultInput;
+
+  useEffect(() => {
+    setDefaultInputExpanded(false);
+  }, [userInputIdentity]);
+
+  useEffect(() => {
+    setDefaultInputDraft(resolvedDefaultInput);
+  }, [userInputIdentity, resolvedDefaultInput]);
+
+  function persistDefaultInput() {
+    if (!usesInference || defaultInputDraft === resolvedDefaultInput) return;
+    onPatchSelectedStepConfig('execution_logic.automation.empty_user_input_default', defaultInputDraft.trim() === inheritedDefaultInput.trim() ? '' : defaultInputDraft);
+  }
+
+  const defaultInputControl = usesInference ? (
+    <Button
+      size="xs"
+      variant={defaultInputExpanded ? 'light' : 'subtle'}
+      color="gray"
+      disabled={disabled}
+      onClick={() => {
+        if (defaultInputExpanded) persistDefaultInput();
+        setDefaultInputExpanded((current) => !current);
+      }}
+    >
+      Default input
+    </Button>
+  ) : null;
+
+  const defaultInputEditor = usesInference && defaultInputExpanded ? (
+    <Stack gap="xs">
+      <Textarea
+        aria-label="Default user input"
+        value={defaultInputDraft}
+        onChange={(event) => setDefaultInputDraft(event.currentTarget.value)}
+        onBlur={persistDefaultInput}
+        disabled={disabled}
+        minRows={2}
+        maxRows={10}
+        autosize
+      />
+      {hasDefaultInputOverride ? (
+        <Group justify="flex-end">
+          <Button
+            size="xs"
+            variant="subtle"
+            color="gray"
+            disabled={disabled}
+            onClick={() => {
+              setDefaultInputDraft(inheritedDefaultInput);
+              onPatchSelectedStepConfig('execution_logic.automation.empty_user_input_default', '');
+            }}
+          >
+            Restore stage default
+          </Button>
+        </Group>
+      ) : null}
+    </Stack>
+  ) : null;
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
     || selectedWorkflowStep.step_type === 'design'
@@ -1610,11 +1690,20 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     }
 
     if (usesInference) {
+      const sessions = (sharedInferenceState?.sessions ?? {}) as Record<string, Record<string, unknown>>;
+      const stageSessions = (sharedInferenceState?.stage_sessions ?? {}) as Record<string, { session?: string }>;
+      const stageType = selectedWorkflowStep?.step_type ?? '';
+      const sessionName = stageSessions[stageType]?.session;
+      const session = sessionName ? sessions[sessionName] : null;
+      const transport = session?.transport;
+      const lifecycle = session?.lifecycle;
+
       actions.push({
         key: 'inference',
         label: 'Inference',
-        status: inferenceTransport === 'browser' ? 'Browser' : 'API',
-        color: inferenceConnectionStatus.color,
+        status: transport === 'browser' ? 'Browser' : transport === 'api' ? 'API' : 'Unmapped',
+        lifecycle: lifecycle === 'non_persistent' ? 'Non-persistent' : lifecycle === 'persistent' ? 'Persistent' : undefined,
+        color: transport === 'browser' ? 'violet' : transport === 'api' ? 'blue' : 'gray',
         buttonLabel: 'Configure',
         onOpen: onOpenInferenceConfig
       });
@@ -1675,8 +1764,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     designMode,
     fineFeatureFormatArmed,
     autoNormalizeAndApplyToPlanner,
-    inferenceConnectionStatus,
-    inferenceTransport,
+    selectedWorkflowStep,
     onOpenInferenceConfig,
     onOpenDeployQA,
     stageApplyError,
@@ -1787,6 +1875,24 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       );
     }
 
+    if (field.bind_to === 'prompt.user_input') {
+      return (
+        <StageInputAttachments
+          key={`${userInputIdentity}:${field.key}`}
+          runId={selectedRunId}
+          stepId={selectedWorkflowStep?.id ?? null}
+          label={field.label}
+          description={field.description}
+          value={userInputDraft}
+          onChange={setUserInputDraft}
+          disabled={disabled}
+          minRows={4}
+          defaultInputControl={defaultInputControl}
+          defaultInputEditor={defaultInputEditor}
+        />
+      );
+    }
+
     if (field.type === 'multiline_text') {
       return (
         <Textarea
@@ -1822,12 +1928,16 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           : `${descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs`}
       </Title>
       {!descriptor ? (
-        <Textarea
-          label="User input"
+        <StageInputAttachments
+          key={userInputIdentity}
+          runId={selectedRunId}
+          stepId={selectedWorkflowStep?.id ?? null}
           value={userInputDraft}
-          onChange={(event) => setUserInputDraft(event.currentTarget.value)}
+          onChange={setUserInputDraft}
           disabled={disabled}
           minRows={2}
+          defaultInputControl={defaultInputControl}
+          defaultInputEditor={defaultInputEditor}
         />
       ) : null}
       {selectedWorkflowStep?.step_type !== 'qa'
@@ -1837,7 +1947,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
                 <Text fw={600} size="sm">{group.label}</Text>
               ) : null}
               {group.fields
-                .filter((field) => fieldVisible(field))
+                .filter((field) => fieldVisible(field) && field.bind_to !== 'execution_logic.automation.empty_user_input_default')
                 .map((field) => renderField(field))}
             </Stack>
           ))
@@ -2244,7 +2354,7 @@ export function WorkflowShell(props: {
   route?: {
     path: string;
     workflowRunId: string | null;
-    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
+    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact' | null;
     supervisorRunId: string | null;
     supervisorView?: 'planner' | null;
   };
@@ -4894,13 +5004,19 @@ export function WorkflowShell(props: {
       const snapshotStepId = typeof payload.current_step_id === 'string'
         ? payload.current_step_id
         : incoming.step_id;
-      setRuns((prev) => prev.map((run) => run.id === runId ? {
-        ...run,
-        ...(snapshotStatus ? { status: snapshotStatus } : {}),
-        current_step_id: snapshotStepId ?? run.current_step_id,
-        context: snapshotContext as Record<string, unknown>,
-        updated_at: incoming.created_at
-      } : run));
+      setRuns((prev) => prev.map((run) => {
+        if (run.id !== runId) return run;
+        const currentUpdatedAt = Date.parse(run.updated_at);
+        const incomingUpdatedAt = Date.parse(incoming.created_at);
+        if (Number.isFinite(currentUpdatedAt) && Number.isFinite(incomingUpdatedAt) && incomingUpdatedAt < currentUpdatedAt) return run;
+        return {
+          ...run,
+          ...(snapshotStatus ? { status: snapshotStatus } : {}),
+          current_step_id: snapshotStepId ?? run.current_step_id,
+          context: snapshotContext as Record<string, unknown>,
+          updated_at: incoming.created_at
+        };
+      }));
     }
   }
 
@@ -4962,12 +5078,14 @@ export function WorkflowShell(props: {
         return `${base}/repository`;
       case 'capabilities':
         return `${base}/capabilities`;
+      case 'impact':
+        return `${base}/impact`;
       default:
         return base;
     }
   }
 
-  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null | undefined): WorkspaceTabKey {
+  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact' | null | undefined): WorkspaceTabKey {
     switch (view) {
       case 'changes':
         return 'diff';
@@ -4977,6 +5095,8 @@ export function WorkflowShell(props: {
         return 'files';
       case 'capabilities':
         return 'capabilities';
+      case 'impact':
+        return 'impact';
       default:
         return 'workflows';
     }
@@ -4992,6 +5112,8 @@ export function WorkflowShell(props: {
         return 'repository';
       case 'capabilities':
         return 'capabilities';
+      case 'impact':
+        return 'impact';
       default:
         return 'workflow';
     }
@@ -5235,6 +5357,17 @@ export function WorkflowShell(props: {
 
     if (stepId) {
       await patchWorkflowStageUserInput(runId, stepId, userInput);
+
+      const attachmentFiles = getStageInputAttachments(runId, stepId);
+      if (attachmentFiles.length > 0) {
+        const attachments = await serializeStageInputAttachments(attachmentFiles);
+        await sendRunAction(runId, {
+          action: 'publish_stage_attachments',
+          step_id: stepId,
+          payload: { attachments }
+        });
+        clearStageInputAttachments(runId, stepId);
+      }
 
       const stagePayload = structuredClone(buildInteractiveStagePayload());
       const prompt = asRecord(stagePayload.prompt);
@@ -6862,17 +6995,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         return;
       }
       if (!selectedRun) return;
-      const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
-      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      await patchWorkflowGlobalState(selectedRun.id, {
+      const response = await patchWorkflowGlobalState(selectedRun.id, {
         capabilities: {
-          ...currentCapabilities,
           inference: inferencePatch,
         },
-      });
+      }) as { ok: boolean; global_state: Record<string, unknown> };
+      if (!response.ok) throw new Error('Failed to save inference configuration');
+      const runId = selectedRun.id;
+      setRuns((prev) => prev.map((run) => {
+        if (run.id !== runId) return run;
+        const workflowEngine = (run.context?.workflow_engine as Record<string, unknown> | undefined) ?? {};
+        return {
+          ...run,
+          context: {
+            ...run.context,
+            workflow_engine: {
+              ...workflowEngine,
+              global_state: response.global_state,
+            },
+          },
+        };
+      }));
       setInferenceStatus('Inference sessions saved.');
       setGlobalInferenceConfigOpen(false);
-      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -6983,6 +7128,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
       if (key === '5') {
         setActiveWorkspaceTab('capabilities');
+        return;
+      }
+      if (key === '6') {
+        setActiveWorkspaceTab('impact');
       }
     };
 
@@ -7028,6 +7177,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
                   <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
                   <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
+                  <Tabs.Tab value="impact">Impact (Alt+6)</Tabs.Tab>
                     </Tabs.List>
                   </Tabs>
               </AppHeader>
@@ -7150,6 +7300,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : activeWorkspaceTab === 'files' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
               <RepoMonacoFileEditorPanel runId={selectedRun?.id ?? ''} />
+            </Suspense>
+          ) : activeWorkspaceTab === 'impact' ? (
+            <Suspense fallback={<Card withBorder p="lg"><Loader size="sm" /></Card>}>
+              <ImpactPanel runId={selectedRunId} />
             </Suspense>
           ) : activeWorkspaceTab === 'capabilities' ? (
             <Card withBorder>
@@ -7936,18 +8090,26 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
           }}
         >
-          <InferenceSessionsPanel
-            opened={globalInferenceConfigOpen}
-            globals={currentInferencePanelGlobals()}
-            value={(((currentInferencePanelGlobals()?.capabilities as Record<string, unknown> | undefined)?.inference as Record<string, unknown> | undefined) ?? {})}
- stageTypes={Array.from(new Set((currentInferencePanelDefinition()?.steps ?? []).filter((step) => step.capabilities.some((capability) => capability.capability === 'inference' && capability.enabled !== false)).map((step) => step.step_type))).sort()}
-            repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
-            runId={selectedRun?.id ?? null}
-            busy={inferenceBusy}
-            status={inferenceStatus}
-            onCancel={() => setGlobalInferenceConfigOpen(false)}
-            onSave={handleSaveInferenceSessionsPanel}
-          />
+          {workflowBuilderCatalog ? (
+            <InferenceSessionsPanel
+              opened={globalInferenceConfigOpen}
+              globals={currentInferencePanelGlobals()}
+              value={(((currentInferencePanelGlobals()?.capabilities as Record<string, unknown> | undefined)?.inference as Record<string, unknown> | undefined) ?? {})}
+              stageTypes={Array.from(new Set(
+                (currentInferencePanelDefinition()?.steps ?? [])
+                  .filter((step) => (workflowBuilderCatalog.stage_capabilities?.[step.step_type] ?? []).includes('inference'))
+                  .map((step) => step.step_type)
+              )).sort()}
+              repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+              runId={selectedRun?.id ?? null}
+              busy={inferenceBusy}
+              status={inferenceStatus}
+              onCancel={() => setGlobalInferenceConfigOpen(false)}
+              onSave={handleSaveInferenceSessionsPanel}
+            />
+          ) : (
+            <Text size="sm" c="dimmed">Inference stage capabilities are unavailable. The connector cannot be edited until the workflow catalog loads.</Text>
+          )}
         </Modal>
 
         <Modal

@@ -226,6 +226,8 @@ async fn execute_turn(
         metadata: json!({
             "conversation_id": conversation_id,
             "response_id": response.get("id").cloned().unwrap_or(Value::Null),
+            "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+            "status": response.get("status").cloned().unwrap_or(Value::Null),
             "attachment_count": input.attachments.len()
         }),
     })

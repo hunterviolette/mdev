@@ -32,6 +32,45 @@ pub struct InferenceSession {
     pub created_at: String,
     pub updated_at: String,
     pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub usage: InferenceSessionUsage,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InferenceSessionUsage {
+    pub invocation_count: i64,
+    pub completed_count: i64,
+    pub failed_count: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cost_amount: Option<f64>,
+    pub cost_currency: Option<String>,
+}
+
+pub fn normalize_repository_scope(repo_ref: &str) -> String {
+    let normalized = repo_ref.trim().replace('\\', "/").trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+pub fn repository_scope_from_context(context: &Value, fallback_repo_ref: &str) -> String {
+    let root_repo_path = context
+        .get("supervisor")
+        .and_then(|value| value.get("root_repo_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_repo_ref);
+
+    normalize_repository_scope(root_repo_path)
+}
+
+pub fn repository_scope_for_run(run: &crate::models::WorkflowRun) -> String {
+    repository_scope_from_context(&run.context, &run.repo_ref)
 }
 
 pub fn resolve_inference_route_from_run(
@@ -236,24 +275,15 @@ pub async fn archive_session(
     session_id: &str,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = db.begin().await?;
 
     sqlx::query(
         "UPDATE inference_sessions SET status = 'archived', updated_at = ? WHERE id = ? AND status != 'archived'",
     )
     .bind(&now)
     .bind(session_id)
-    .execute(&mut *tx)
+    .execute(db)
     .await?;
 
-    sqlx::query(
-        "DELETE FROM workflow_inference_stage_bindings WHERE inference_session_id = ?",
-    )
-    .bind(session_id)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
     Ok(())
 }
 
@@ -261,22 +291,14 @@ pub async fn archive_non_persistent_sessions_on_startup(
     db: &SqlitePool,
 ) -> Result<u64> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = db.begin().await?;
 
     let result = sqlx::query(
         "UPDATE inference_sessions SET status = 'archived', updated_at = ? WHERE lifecycle = 'non_persistent' AND status != 'archived'",
     )
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(db)
     .await?;
 
-    sqlx::query(
-        "DELETE FROM workflow_inference_stage_bindings WHERE inference_session_id IN (SELECT id FROM inference_sessions WHERE lifecycle = 'non_persistent' AND status = 'archived')",
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
     Ok(result.rows_affected())
 }
 
@@ -314,12 +336,34 @@ pub async fn list_repo_sessions(
 ) -> Result<Vec<InferenceSession>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, repo_ref, title, transport, lifecycle,
-               config_json, transport_state_json, automation_state_json,
-               status, created_at, updated_at, last_used_at
-        FROM inference_sessions
-        WHERE repo_ref = ? AND status != 'archived'
-        ORDER BY COALESCE(last_used_at, updated_at) DESC, created_at DESC
+        SELECT s.id, s.repo_ref, s.title, s.transport, s.lifecycle,
+               s.config_json, s.transport_state_json, s.automation_state_json,
+               s.status, s.created_at, s.updated_at, s.last_used_at,
+               COALESCE(u.invocation_count, 0) AS invocation_count,
+               COALESCE(u.completed_count, 0) AS completed_count,
+               COALESCE(u.failed_count, 0) AS failed_count,
+               u.input_tokens, u.output_tokens, u.cached_input_tokens,
+               CASE WHEN u.priced_count = u.invocation_count AND u.currency_count = 1 THEN u.cost_amount ELSE NULL END AS cost_amount,
+               CASE WHEN u.priced_count = u.invocation_count AND u.currency_count = 1 THEN u.cost_currency ELSE NULL END AS cost_currency
+        FROM inference_sessions s
+        LEFT JOIN (
+            SELECT i.inference_session_id,
+                   COUNT(*) AS invocation_count,
+                   SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
+                   SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(o.input_tokens) AS input_tokens,
+                   SUM(o.output_tokens) AS output_tokens,
+                   SUM(o.cached_input_tokens) AS cached_input_tokens,
+                   SUM(o.cost_amount) AS cost_amount,
+                   MIN(NULLIF(TRIM(o.cost_currency), '')) AS cost_currency,
+                   COUNT(DISTINCT NULLIF(TRIM(o.cost_currency), '')) AS currency_count,
+                   SUM(CASE WHEN o.cost_amount IS NOT NULL AND NULLIF(TRIM(o.cost_currency), '') IS NOT NULL THEN 1 ELSE 0 END) AS priced_count
+            FROM inference_invocations i
+            LEFT JOIN inference_invocation_outputs o ON o.invocation_id = i.id
+            GROUP BY i.inference_session_id
+        ) u ON u.inference_session_id = s.id
+        WHERE s.repo_ref = ? AND s.status != 'archived'
+        ORDER BY COALESCE(s.last_used_at, s.updated_at) DESC, s.created_at DESC
         "#,
     )
     .bind(repo_ref)
@@ -394,12 +438,33 @@ pub async fn bind_session(
     Ok(())
 }
 
+pub async fn rebind_run_session(
+    db: &SqlitePool,
+    run_id: Uuid,
+    previous_session_id: &str,
+    next_session_id: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "UPDATE workflow_inference_stage_bindings SET inference_session_id = ?, updated_at = ? WHERE workflow_run_id = ? AND inference_session_id = ?",
+    )
+    .bind(next_session_id)
+    .bind(now)
+    .bind(run_id.to_string())
+    .bind(previous_session_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn bound_automation_state(
     db: &SqlitePool,
     run_id: Uuid,
-    route_name: &str,
+    stage_type: &str,
 ) -> Result<Value> {
-    Ok(load_bound_session(db, run_id, route_name)
+    Ok(load_bound_session(db, run_id, stage_type)
         .await?
         .map(|session| session.automation_state)
         .unwrap_or_else(|| json!({})))
@@ -408,10 +473,10 @@ pub async fn bound_automation_state(
 pub async fn update_bound_automation_state(
     db: &SqlitePool,
     run_id: Uuid,
-    route_name: &str,
+    stage_type: &str,
     automation_state: &Value,
 ) -> Result<()> {
-    let Some(session_id) = binding_id(db, run_id, route_name).await? else {
+    let Some(session_id) = binding_id(db, run_id, stage_type).await? else {
         return Ok(());
     };
 
@@ -497,6 +562,16 @@ fn row_to_inference_session(row: SqliteRow) -> Result<InferenceSession> {
         last_used_at: row
             .try_get::<Option<String>, _>("last_used_at")
             .unwrap_or(None),
+        usage: InferenceSessionUsage {
+            invocation_count: row.try_get("invocation_count").unwrap_or(0),
+            completed_count: row.try_get("completed_count").unwrap_or(0),
+            failed_count: row.try_get("failed_count").unwrap_or(0),
+            input_tokens: row.try_get("input_tokens").unwrap_or(None),
+            output_tokens: row.try_get("output_tokens").unwrap_or(None),
+            cached_input_tokens: row.try_get("cached_input_tokens").unwrap_or(None),
+            cost_amount: row.try_get("cost_amount").unwrap_or(None),
+            cost_currency: row.try_get("cost_currency").unwrap_or(None),
+        },
     })
 }
 

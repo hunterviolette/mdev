@@ -23,6 +23,8 @@ use crate::{
     models::{StageExecutionNode, WorkflowRun, WorkflowStepDefinition},
 };
 
+const DEFAULT_USER_INPUT: &str = "please provide changeset in a codeblock with no comments to align coding";
+
 pub struct CodeStage;
 
 pub static STAGE: CodeStage = CodeStage;
@@ -47,6 +49,10 @@ impl Stage for CodeStage {
             "changeset_schema",
             "changeset",
         ])
+    }
+
+    fn inference_default_user_input(&self) -> Option<&'static str> {
+        Some(DEFAULT_USER_INPUT)
     }
 
     fn automation_policy_keys(&self) -> &'static [&'static str] {
@@ -112,9 +118,7 @@ fn prepare_code_state(
             include_changeset_schema: step.prompt.include_changeset_schema,
         },
         InferenceStageHooks {
-            empty_user_input_default: Some(
-                "please provide changeset in a codeblock with no comments to align coding".to_string(),
-            ),
+            empty_user_input_default: STAGE.inference_default_user_input().map(str::to_string),
         },
     )?;
 

@@ -71,7 +71,20 @@ async fn list_inference_sessions(
     State(state): State<AppState>,
     Query(query): Query<ListInferenceSessionsQuery>,
 ) -> Result<Json<InferenceSessionsResponse>, (axum::http::StatusCode, String)> {
-    let sessions = session::list_repo_sessions(&state.db, query.repo_ref.trim())
+    let repo_ref = match query
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(run_id) => {
+            let run_id = Uuid::parse_str(run_id).map_err(bad_request)?;
+            let run = engine::load_run(&state, run_id).await.map_err(internal)?;
+            session::repository_scope_for_run(&run)
+        }
+        None => session::normalize_repository_scope(query.repo_ref.trim()),
+    };
+    let sessions = session::list_repo_sessions(&state.db, &repo_ref)
         .await
         .map_err(internal)?;
 
@@ -129,6 +142,7 @@ async fn select_inference_session(
     }
     let session_spec = session::resolve_inference_route_from_run(&run, step)
         .map_err(bad_request)?;
+    let session_repo_ref = session::repository_scope_for_run(&run);
     let requested_session_id = request
         .session_id
         .as_deref()
@@ -147,7 +161,7 @@ async fn select_inference_session(
                     )
                 })?;
 
-            if selected.repo_ref != run.repo_ref {
+            if selected.repo_ref != session_repo_ref {
                 return Err((
                     axum::http::StatusCode::BAD_REQUEST,
                     "inference session belongs to a different repository".to_string(),
@@ -162,7 +176,7 @@ async fn select_inference_session(
         None => {
             session::create_session(
                 &state.db,
-                &run.repo_ref,
+                &session_repo_ref,
                 run_id,
                 &session_spec,
             )
@@ -173,25 +187,15 @@ async fn select_inference_session(
     };
 
     if created {
-        if let Some(step_id) = run.current_step_id.as_deref() {
-            if let Some(step) = run
-                .definition
-                .steps
-                .iter()
-                .find(|step| step.id == step_id)
-            {
-                crate::engine::automation::apply_inference_session_transition(
-                    &state,
-                    run_id,
-                    step,
-                )
-                .await
-                .map_err(internal)?;
-            }
-        }
+        crate::engine::automation::apply_inference_session_transition(
+            &state,
+            run_id,
+        )
+        .await
+        .map_err(internal)?;
     }
 
-    let sessions = session::list_repo_sessions(&state.db, &run.repo_ref)
+    let sessions = session::list_repo_sessions(&state.db, &session_repo_ref)
         .await
         .map_err(internal)?;
     let bindings = session::bindings_for_run(&state.db, run_id)
@@ -229,7 +233,8 @@ async fn archive_inference_session(
             )
         })?;
 
-    if selected.repo_ref != run.repo_ref {
+    let session_repo_ref = session::repository_scope_for_run(&run);
+    if selected.repo_ref != session_repo_ref {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "inference session belongs to a different repository".to_string(),
@@ -240,7 +245,7 @@ async fn archive_inference_session(
         .await
         .map_err(internal)?;
 
-    let sessions = session::list_repo_sessions(&state.db, &run.repo_ref)
+    let sessions = session::list_repo_sessions(&state.db, &session_repo_ref)
         .await
         .map_err(internal)?;
     let bindings = session::bindings_for_run(&state.db, run_id)

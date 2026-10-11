@@ -11,7 +11,7 @@ use crate::{
     models::{StageExecutionNode, StageExecutionNodeKind, WorkflowRun, WorkflowStepDefinition},
     supervisor::{
         load_supervisor_integration_inputs,
-        models::{SupervisorIntegrationInput, SupervisorWorkPoolKind},
+        models::SupervisorWorkPoolKind,
     },
 };
 
@@ -144,37 +144,14 @@ pub async fn execute_stage(
 
     let integration_batch_id = supervisor_run_id.clone().unwrap_or_else(|| run_id.to_string());
 
-    let configured_inputs = supervisor_context
-        .get("integration_inputs")
-        .and_then(Value::as_array)
-        .cloned()
-        .or_else(|| {
-            step.config
-                .get("patches")
-                .and_then(Value::as_array)
-                .cloned()
-        })
-        .or_else(|| {
-            run.context
-                .get("workflow_engine")
-                .and_then(|value| value.get("global_state"))
-                .and_then(|value| value.get("supervisor"))
-                .and_then(|value| value.get("patches"))
-                .and_then(Value::as_array)
-                .cloned()
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<std::result::Result<Vec<SupervisorIntegrationInput>, _>>()?;
-
-    let patch_items = if !configured_inputs.is_empty() {
-        configured_inputs
-    } else if let Some(supervisor_run_id) = supervisor_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        load_supervisor_integration_inputs(state, Uuid::parse_str(supervisor_run_id)?).await?
-    } else {
-        return Err(anyhow!("merge_patches requires integration inputs"));
-    };
+    let integration_supervisor_run_id = supervisor_run_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("merge_patches requires an integration pool association"))?;
+    let patch_items = load_supervisor_integration_inputs(
+        state,
+        Uuid::parse_str(integration_supervisor_run_id)?,
+    )
+    .await?;
     let mut applied = Vec::new();
     let mut pending_patches = Vec::new();
     let mut failed = Vec::new();

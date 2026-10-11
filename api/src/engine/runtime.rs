@@ -745,7 +745,19 @@ async fn prepare_stage_for_execution(
     let mut run = load_run(state, run_id).await?;
     let definition = load_template_definition(state, &run).await?
         .ok_or_else(|| anyhow!("run has no template definition"))?;
-    let target_step_id = current_step(&definition, &run, requested_step_id)?.id.clone();
+    let target_step = current_step(&definition, &run, requested_step_id)?.clone();
+
+    if crate::engine::capabilities::inference::transport::reconcile_stage_session(
+        state,
+        &run,
+        &target_step,
+    )
+    .await?
+    {
+        run = load_run(state, run_id).await?;
+    }
+
+    let target_step_id = target_step.id.clone();
     let previous_step_id = run.current_step_id.clone();
     let step = transition_to_step(
         state,

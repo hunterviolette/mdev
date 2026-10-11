@@ -1,6 +1,7 @@
 mod capabilities;
 mod changesets;
 mod event_chains;
+mod impact;
 pub(crate) mod supervisor_projection;
 mod filesystem;
 mod health;
@@ -53,4 +54,5 @@ pub fn router() -> Router<crate::app_state::AppState> {
         .merge(supervisor_projection::router())
         .merge(capabilities::router())
         .merge(changesets::router())
+        .merge(impact::router())
 }

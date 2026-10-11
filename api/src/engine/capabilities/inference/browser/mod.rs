@@ -35,69 +35,21 @@ impl InferenceTransportAdapter for BrowserInferenceTransport {
             return Ok(true);
         }
 
-        let session_id = session
+        let Some(session_id) = session
             .transport_state
             .get("bridge_session_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string);
-
-        let Some(session_id) = session_id else {
+        else {
             return Ok(false);
         };
 
-        if !adapter::list_session_ids()?
+        Ok(adapter::list_session_ids()?
             .iter()
-            .any(|live_session_id| live_session_id == &session_id)
-        {
-            return Ok(false);
-        }
-
-        let mut browser = route.config.browser.clone();
-        browser.session_id = Some(session_id);
-
-        if let Some(cdp_url) = session
-            .transport_state
-            .get("cdp_url")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            browser.cdp_url = cdp_url.to_string();
-        }
-
-        if let Some(profile) = session
-            .transport_state
-            .get("profile")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            browser.profile = profile.to_string();
-        }
-
-        if let Some(conversation_url) = session
-            .transport_state
-            .get("conversation_url")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            browser.target_url = conversation_url.to_string();
-        }
-
-        match tokio::task::spawn_blocking(move || adapter::probe(&mut browser)).await {
-            Ok(Ok(probe)) => Ok(probe.browser_connected && probe.page_open),
-            Ok(Err(error)) if is_stale_session_error(&error) => Ok(false),
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(anyhow!("Browser session probe task failed: {}", error)),
-        }
+            .any(|live_session_id| live_session_id == session_id))
     }
 
-    fn is_session_unavailable_error(&self, error: &anyhow::Error) -> bool {
-        is_stale_session_error(error)
-    }
 
     async fn create_session(
         &self,
@@ -115,7 +67,17 @@ impl InferenceTransportAdapter for BrowserInferenceTransport {
         session: &InferenceSession,
         input: &ModelInput,
     ) -> Result<InferenceTransportExecution> {
-        execute(ctx, route, Some(session), input).await
+        match execute(ctx, route, Some(session), input).await {
+            Ok(execution) => Ok(execution),
+            Err(error) if is_stale_session_error(&error) => {
+                let mut recovered_session = session.clone();
+                if let Some(transport_state) = recovered_session.transport_state.as_object_mut() {
+                    transport_state.remove("bridge_session_id");
+                }
+                execute(ctx, route, Some(&recovered_session), input).await
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

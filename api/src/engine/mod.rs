@@ -746,6 +746,23 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
     {
         let root = ensure_engine_root(&mut run.context);
         let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
+        if let Some(inference_patch) = global_payload
+            .get("capabilities")
+            .and_then(|value| value.get("inference"))
+            .and_then(Value::as_object)
+        {
+            if let Some(inference_state) = global_state
+                .get_mut("capabilities")
+                .and_then(|value| value.get_mut("inference"))
+                .and_then(Value::as_object_mut)
+            {
+                for key in ["sessions", "stage_sessions"] {
+                    if inference_patch.contains_key(key) {
+                        inference_state.remove(key);
+                    }
+                }
+            }
+        }
         merge_json_values(global_state, &global_payload);
         normalize_runtime_planner(global_state);
     }
@@ -764,6 +781,18 @@ pub async fn patch_global_state(state: &AppState, run_id: Uuid, payload: Value) 
         .unwrap_or_else(|| json!({}));
 
     update_run_context(&state.db, run_id, &run.context).await?;
+    append_engine_event(
+        state,
+        run_id,
+        run.current_step_id.as_deref(),
+        "info",
+        "workflow_global_state_changed",
+        "Workflow global capability state updated",
+        json!({
+            "global_state": global_state_snapshot.clone(),
+            "run_context": run.context.clone(),
+        }),
+    ).await?;
     Ok(json!({ "ok": true, "global_state": global_state_snapshot }))
 }
 
@@ -1142,55 +1171,6 @@ pub(crate) async fn set_terminal_run_status(
 pub(crate) async fn persist_context(state: &AppState, run_id: Uuid, context: &Value) -> Result<()> {
     update_run_context(&state.db, run_id, context).await?;
     Ok(())
-}
-
-pub(crate) async fn on_browser_session_changed(
-    state: &AppState,
-    run_id: Uuid,
-    previous_session_id: &str,
-    next_session_id: &str,
-) -> Result<()> {
-    let mut run = load_run(state, run_id).await?;
-    let root = ensure_engine_root(&mut run.context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    let global_state_obj = ensure_value_object(global_state);
-    let capabilities = global_state_obj
-        .entry("capabilities".to_string())
-        .or_insert_with(|| json!({}));
-    let capabilities_obj = ensure_value_object(capabilities);
-    let inference = capabilities_obj
-        .entry("inference".to_string())
-        .or_insert_with(|| json!({}));
-    let inference_obj = ensure_value_object(inference);
-    let connection_runtime = inference_obj
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}));
-    let connection_runtime_obj = ensure_value_object(connection_runtime);
-
-    connection_runtime_obj.insert(
-        "session_rearm".to_string(),
-        json!({
-            "needed": true,
-            "reason": "browser_session_changed",
-            "previous_session_id": previous_session_id,
-            "next_session_id": next_session_id
-        }),
-    );
-
-    inference_obj.remove("shared_inference_state");
-    inference_obj.remove("next_prompt_fragments");
-    inference_obj.remove("active_prompt_fragments");
-
-    clear_prepared_inference_step(&mut run);
-
-    tracing::warn!(
-        run_id = %run_id,
-        previous_session_id = %previous_session_id,
-        next_session_id = %next_session_id,
-        "browser inference session changed; deferred inference fragment rearming to stage preprocessing"
-    );
-
-    persist_context(state, run_id, &run.context).await
 }
 
 pub(crate) fn ensure_engine_root(context: &mut Value) -> &mut Map<String, Value> {

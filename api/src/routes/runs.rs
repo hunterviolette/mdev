@@ -1,4 +1,7 @@
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
+use axum::extract::DefaultBodyLimit;
+use base64::Engine;
+use crate::engine::prompt_inputs::{AttachmentRole, PromptInputLifecycle, PromptInputPayload, PromptInputScope};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -18,7 +21,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/workflow-runs/:run_id", get(get_run).delete(delete_run))
         .route("/api/workflow-runs/:run_id/open", post(open_run))
         .route("/api/workflow-runs/:run_id/events", get(list_run_events))
-        .route("/api/workflow-runs/:run_id/actions", post(run_action))
+        .route("/api/workflow-runs/:run_id/actions", post(run_action).layer(DefaultBodyLimit::max(12 * 1024 * 1024)))
 }
 
 async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<WorkflowRun>>, (axum::http::StatusCode, String)> {
@@ -303,6 +306,100 @@ async fn delete_run(
     })))
 }
 
+async fn publish_stage_attachments(
+    state: &AppState,
+    run_id: Uuid,
+    step_id: &str,
+    payload: &Value,
+) -> Result<Value, (axum::http::StatusCode, String)> {
+    let attachments = payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "attachments array required".to_string()))?;
+
+    if attachments.is_empty() || attachments.len() > 16 {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "expected 1 to 16 attachments".to_string()));
+    }
+
+    let mut decoded = Vec::with_capacity(attachments.len());
+    let mut total_bytes = 0usize;
+
+    for attachment in attachments {
+        let filename = attachment.get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment")
+            .trim();
+        let filename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+            .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "invalid filename".to_string()))?
+            .to_string();
+        let declared_media_type = attachment.get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let encoded = attachment.get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "attachment data required".to_string()))?;
+        if encoded.len() > 11 * 1024 * 1024 {
+            return Err((axum::http::StatusCode::PAYLOAD_TOO_LARGE, "attachment exceeds 8 MB".to_string()));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "invalid base64 attachment".to_string()))?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err((axum::http::StatusCode::PAYLOAD_TOO_LARGE, "attachment exceeds 8 MB".to_string()));
+        }
+        total_bytes += bytes.len();
+        if total_bytes > 8 * 1024 * 1024 {
+            return Err((axum::http::StatusCode::PAYLOAD_TOO_LARGE, "combined attachments exceed 8 MB".to_string()));
+        }
+        let media_type = mime_guess::from_path(&filename).first_raw().unwrap_or("application/octet-stream");
+        let media_type = if media_type == "application/octet-stream" && declared_media_type.starts_with("text/") {
+            "text/plain"
+        } else {
+            media_type
+        };
+        let role = if media_type.starts_with("image/") {
+            AttachmentRole::Image
+        } else {
+            AttachmentRole::Document
+        };
+        decoded.push((filename, media_type.to_string(), role, bytes));
+    }
+
+    let directory = std::env::temp_dir()
+        .join("mdev-prompt-attachments")
+        .join(run_id.to_string())
+        .join(Uuid::new_v4().to_string());
+    tokio::fs::create_dir_all(&directory).await.map_err(internal)?;
+    let mut stored = Vec::with_capacity(decoded.len());
+    for (filename, media_type, role, bytes) in decoded {
+        let path = directory.join(format!("{}-{}", Uuid::new_v4(), filename));
+        if let Err(error) = tokio::fs::write(&path, &bytes).await {
+            let _ = tokio::fs::remove_dir_all(&directory).await;
+            return Err(internal(error));
+        }
+        stored.push((path, filename, media_type, role));
+    }
+
+    for (path, filename, media_type, role) in &stored {
+        state.prompt_inputs.publish(
+            run_id,
+            PromptInputScope::Stage { step_id: step_id.to_string() },
+            PromptInputLifecycle::SingleUse,
+            1_000,
+            PromptInputPayload::Attachment {
+                path: path.to_string_lossy().into_owned(),
+                filename: filename.clone(),
+                media_type: Some(media_type.clone()),
+                role: role.clone(),
+            },
+        );
+    }
+
+    Ok(json!({ "ok": true, "run_id": run_id, "step_id": step_id, "count": stored.len() }))
+}
+
 async fn run_action(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
@@ -315,7 +412,6 @@ async fn run_action(
         run_id = %run_id,
         action = %action,
         step_id = ?requested_step_id,
-        payload = %req.payload,
         "workflow run action requested"
     );
 
@@ -374,6 +470,12 @@ async fn run_action(
             engine::select_step(&state, run_id, step_id)
                 .await
                 .map_err(internal)?
+        }
+        "publish_stage_attachments" => {
+            let step_id = req.step_id.as_deref().ok_or_else(|| {
+                (axum::http::StatusCode::BAD_REQUEST, "step_id required".to_string())
+            })?;
+            publish_stage_attachments(&state, run_id, step_id, &req.payload).await?
         }
         "get_transient_stage_user_input" => {
             let step_id = req.step_id.as_deref().ok_or_else(|| {
@@ -566,79 +668,6 @@ async fn run_action(
     Ok(Json(response))
 }
 
-fn seed_missing_browser_session_rearm(context: &mut Value) {
-    let root = engine::ensure_engine_root(context);
-    let global_state = root.entry("global_state".to_string()).or_insert_with(|| json!({}));
-    if !global_state.is_object() {
-        *global_state = json!({});
-    }
-    let Some(global_state_obj) = global_state.as_object_mut() else {
-        return;
-    };
-
-    let capabilities = global_state_obj.entry("capabilities".to_string()).or_insert_with(|| json!({}));
-    if !capabilities.is_object() {
-        *capabilities = json!({});
-    }
-    let Some(capabilities_obj) = capabilities.as_object_mut() else {
-        return;
-    };
-
-    let inference = capabilities_obj.entry("inference".to_string()).or_insert_with(|| json!({}));
-    if !inference.is_object() {
-        *inference = json!({});
-    }
-    let Some(inference_obj) = inference.as_object_mut() else {
-        return;
-    };
-
-    let transport = inference_obj
-        .get("transport")
-        .and_then(Value::as_str)
-        .unwrap_or("browser");
-    if !transport.eq_ignore_ascii_case("browser") {
-        return;
-    }
-
-    let session_id = inference_obj
-        .get("browser")
-        .and_then(|v| v.get("session_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    if !session_id.is_empty() {
-        return;
-    }
-
-    let connection_runtime = inference_obj
-        .entry("connection_runtime".to_string())
-        .or_insert_with(|| json!({}));
-    if !connection_runtime.is_object() {
-        *connection_runtime = json!({});
-    }
-    let Some(connection_runtime_obj) = connection_runtime.as_object_mut() else {
-        return;
-    };
-
-    connection_runtime_obj.insert(
-        "session_rearm".to_string(),
-        json!({
-            "needed": true,
-            "reason": "browser_session_changed",
-            "previous_session_id": "missing",
-            "next_session_id": ""
-        }),
-    );
-
-    inference_obj.insert("repo_context_armed".to_string(), Value::Bool(true));
-    inference_obj.insert("changeset_schema_armed".to_string(), Value::Bool(true));
-    inference_obj.remove("shared_inference_state");
-    inference_obj.remove("next_prompt_fragments");
-    inference_obj.remove("active_prompt_fragments");
-}
-
 async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
@@ -734,7 +763,6 @@ async fn create_run(
         created_at: now,
         updated_at: now,
     };
-    seed_missing_browser_session_rearm(&mut seeded_run.context);
     seed_compile_command_context_from_definition(&mut seeded_run.context, &definition);
     if let Some(step) = initial_step {
         let decisions = engine::automation::before_stage(&state, id, &mut seeded_run, step)

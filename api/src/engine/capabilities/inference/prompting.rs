@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
 use uuid::Uuid;
 
 use crate::engine::{
@@ -80,11 +80,23 @@ fn model_attachment_kind(media_type: &str) -> ModelAttachmentKind {
     ModelAttachmentKind::Binary
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInputOrigin {
+    UserCustom,
+    StageDefault,
+    ConfiguredDefault,
+    StageConfigured,
+    Inherited,
+    AutomationGenerated,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInputBlock {
     pub source: String,
     pub label: String,
     pub content: String,
+    pub origin: ModelInputOrigin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,16 +110,64 @@ pub struct ModelInput {
     pub primary_input_text: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-struct AutomationPromptConfig {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AutomationPromptConfig {
     #[serde(default)]
-    empty_user_input_default: String,
+    pub empty_user_input_default: String,
 }
 
-#[derive(Default, Deserialize)]
-struct ExecutionLogicPromptConfig {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ExecutionLogicPromptConfig {
     #[serde(default)]
-    automation: AutomationPromptConfig,
+    pub automation: AutomationPromptConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultUserInputSource {
+    WorkflowOverride,
+    StageDefault,
+    None,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedDefaultUserInput {
+    pub value: Option<String>,
+    pub inherited_value: Option<String>,
+    pub source: DefaultUserInputSource,
+}
+
+pub fn resolve_default_user_input(
+    configuration: &ExecutionLogicPromptConfig,
+    stage_default: Option<&str>,
+) -> ResolvedDefaultUserInput {
+    let inherited_value = stage_default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let workflow_default = configuration.automation.empty_user_input_default.trim();
+    if !workflow_default.is_empty() {
+        return ResolvedDefaultUserInput {
+            value: Some(workflow_default.to_string()),
+            inherited_value,
+            source: DefaultUserInputSource::WorkflowOverride,
+        };
+    }
+
+    if let Some(value) = inherited_value.clone() {
+        return ResolvedDefaultUserInput {
+            value: Some(value),
+            inherited_value,
+            source: DefaultUserInputSource::StageDefault,
+        };
+    }
+
+    ResolvedDefaultUserInput {
+        value: None,
+        inherited_value: None,
+        source: DefaultUserInputSource::None,
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -116,26 +176,38 @@ struct ContextExportResult {
     output_path: String,
 }
 
-fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<String> {
-    let execution_logic = ctx
+
+
+fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<(String, String, ModelInputOrigin)> {
+    let configuration = ctx
         .local_state
         .get("execution_logic")
-        .cloned()
-        .unwrap_or_else(|| ctx.step.execution_logic.clone());
-    let config = serde_json::from_value::<ExecutionLogicPromptConfig>(execution_logic)
+        .and_then(|value| serde_json::from_value::<ExecutionLogicPromptConfig>(value.clone()).ok())
+        .or_else(|| serde_json::from_value::<ExecutionLogicPromptConfig>(ctx.step.execution_logic.clone()).ok())
         .unwrap_or_default();
 
-    let value = config.automation.empty_user_input_default.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    let prepared = ctx
+        .local_state
+        .get("inference_prompting")
+        .and_then(|value| serde_json::from_value::<ResolvedDefaultUserInput>(value.clone()).ok());
+
+    let inherited = prepared
+        .as_ref()
+        .and_then(|value| value.inherited_value.as_deref());
+
+    let resolved = resolve_default_user_input(&configuration, inherited);
+    let value = resolved.value?;
+    let (source, origin) = match resolved.source {
+        DefaultUserInputSource::WorkflowOverride => ("empty_user_input_default", ModelInputOrigin::ConfiguredDefault),
+        DefaultUserInputSource::StageDefault => ("empty_user_input_default", ModelInputOrigin::StageDefault),
+        DefaultUserInputSource::None => return None,
+    };
+    Some((source.to_string(), value, origin))
 }
 
 fn configured_stage_input(
     ctx: &CapabilityContext<'_>,
-) -> (Option<(String, String)>, Vec<ModelInputBlock>) {
+) -> (Option<(String, String, ModelInputOrigin)>, Vec<ModelInputBlock>) {
     let mut primary = None;
     let mut input_blocks = Vec::new();
 
@@ -150,7 +222,7 @@ fn configured_stage_input(
         }
 
         if primary.is_none() && block.role == PromptBlockRole::User {
-            primary = Some(("user_input".to_string(), content.to_string()));
+            primary = Some(("user_input".to_string(), content.to_string(), ModelInputOrigin::StageConfigured));
             continue;
         }
 
@@ -171,6 +243,7 @@ fn configured_stage_input(
             source: source.to_string(),
             label: label.to_string(),
             content: content.to_string(),
+            origin: ModelInputOrigin::StageConfigured,
         });
     }
 
@@ -179,7 +252,7 @@ fn configured_stage_input(
 
 fn prompt_input_blocks(
     inputs: &[PromptInput],
-) -> (Option<(String, String)>, Vec<ModelInputBlock>, Vec<ModelAttachment>) {
+) -> (Option<(String, String, ModelInputOrigin)>, Vec<ModelInputBlock>, Vec<ModelAttachment>) {
     let mut primary = None;
     let mut blocks = Vec::new();
     let mut attachments = Vec::new();
@@ -189,7 +262,7 @@ fn prompt_input_blocks(
             PromptInputPayload::UserInstruction { text }
                 if primary.is_none() && !text.trim().is_empty() =>
             {
-                primary = Some(("user_instruction".to_string(), text.trim().to_string()));
+                primary = Some(("user_instruction".to_string(), text.trim().to_string(), ModelInputOrigin::UserCustom));
             }
             PromptInputPayload::PromptContribution {
                 text,
@@ -213,6 +286,7 @@ fn prompt_input_blocks(
                     source,
                     label,
                     content: text.trim().to_string(),
+                    origin: ModelInputOrigin::Inherited,
                 });
             }
             PromptInputPayload::Attachment {
@@ -295,24 +369,22 @@ pub fn build_model_input(
 
     let primary = prompt_primary
         .or(stage_primary)
-        .or_else(|| {
-            configured_default_user_input(ctx)
-                .map(|value| ("empty_user_input_default".to_string(), value))
-        });
+        .or_else(|| configured_default_user_input(ctx));
 
     let mut sections = Vec::new();
 
-    if let Some((source, text)) = primary.as_ref() {
+    if let Some((source, text, origin)) = primary.as_ref() {
         append_unique_section(&mut sections, text.clone());
         input_blocks.insert(
             0,
             ModelInputBlock {
                 source: source.clone(),
-                label: match source.as_str() {
-                    "user_instruction" | "user_input" => "User instruction".to_string(),
+                label: match origin {
+                    ModelInputOrigin::UserCustom | ModelInputOrigin::StageConfigured => "User instruction".to_string(),
                     _ => "Default user instruction".to_string(),
                 },
                 content: text.clone(),
+                origin: origin.clone(),
             },
         );
     }

@@ -176,6 +176,82 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS inference_invocations (
+            id TEXT PRIMARY KEY,
+            inference_session_id TEXT NOT NULL,
+            workflow_run_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            stage_type TEXT NOT NULL,
+            capability_invocation_id TEXT,
+            transport TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(inference_session_id) REFERENCES inference_sessions(id)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS inference_invocation_inputs (
+            id TEXT PRIMARY KEY,
+            invocation_id TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            input_type TEXT NOT NULL,
+            input_origin TEXT NOT NULL,
+            input_source TEXT NOT NULL,
+            label TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(invocation_id) REFERENCES inference_invocations(id)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS inference_invocation_outputs (
+            id TEXT PRIMARY KEY,
+            invocation_id TEXT NOT NULL UNIQUE,
+            response_text TEXT NOT NULL,
+            response_payload_json TEXT NOT NULL,
+            provider_metadata_json TEXT NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            cost_amount REAL,
+            cost_currency TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(invocation_id) REFERENCES inference_invocations(id)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocations_session ON inference_invocations(inference_session_id, created_at)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocations_workflow ON inference_invocations(workflow_run_id, created_at)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocations_capability ON inference_invocations(capability_invocation_id)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocation_inputs_invocation ON inference_invocation_inputs(invocation_id, sequence_no)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS workflow_inference_stage_bindings (
             workflow_run_id TEXT NOT NULL,
             stage_type TEXT NOT NULL,

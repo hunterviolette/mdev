@@ -919,6 +919,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
                         {group.label}
                       </Text>
                       {group.fields
+                        .filter((field) => field.bind_to !== 'prompt.user_input' && field.bind_to !== 'execution_logic.automation.empty_user_input_default')
                         .filter((field) => workflowBuilderFieldVisible(field, selectedStep.fields))
                         .map((field) => renderField(field, selectedStep.fields[field.key]))}
                     </Stack>

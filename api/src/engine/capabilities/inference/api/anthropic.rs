@@ -163,6 +163,8 @@ async fn execute_turn(
         metadata: json!({
             "message_id": response.get("id").cloned().unwrap_or(Value::Null),
             "stop_reason": response.get("stop_reason").cloned().unwrap_or(Value::Null),
+            "usage": response.get("usage").cloned().unwrap_or(Value::Null),
+            "model": response.get("model").cloned().unwrap_or(Value::Null),
             "attachment_count": input.attachments.len()
         }),
     })

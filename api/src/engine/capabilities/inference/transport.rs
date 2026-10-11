@@ -45,12 +45,21 @@ pub trait InferenceTransportAdapter: Send + Sync {
     ) -> Result<InferenceTransportExecution>;
 }
 
+fn inference_configs_equal(
+    left: &super::InferenceConfig,
+    right: &super::InferenceConfig,
+) -> Result<bool> {
+    Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
+}
+
 pub async fn materialize_run_bindings(
     state: &AppState,
     run: &WorkflowRun,
 ) -> Result<()> {
     let existing_bindings = session::bindings_for_run(&state.db, run.id).await?;
+    let session_repo_ref = session::repository_scope_for_run(run);
     let mut new_sessions = std::collections::BTreeMap::<String, String>::new();
+    let mut created_session = false;
 
     for step in &run.definition.steps {
         if !crate::engine::stages::stage_supports_capability(step, "inference") {
@@ -61,11 +70,16 @@ pub async fn materialize_run_bindings(
 
         if let Some(session_id) = existing_bindings.get(&step.step_type) {
             if route.existing_session_id.is_none() {
-                new_sessions
-                    .entry(route.name.clone())
-                    .or_insert_with(|| session_id.clone());
+                if let Some(bound) = session::get_session(&state.db, session_id).await? {
+                    if bound.repo_ref == session_repo_ref
+                        && bound.status != "archived"
+                        && inference_configs_equal(&bound.config, &route.config)?
+                    {
+                        new_sessions.entry(route.name.clone()).or_insert_with(|| session_id.clone());
+                        continue;
+                    }
+                }
             }
-            continue;
         }
 
         if let Some(session_id) = route.existing_session_id.as_deref() {
@@ -73,7 +87,7 @@ pub async fn materialize_run_bindings(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("configured inference session '{}' was not found", session_id))?;
 
-            if selected.repo_ref != run.repo_ref {
+            if selected.repo_ref != session_repo_ref {
                 anyhow::bail!("configured inference session '{}' belongs to a different repository", session_id);
             }
 
@@ -81,7 +95,9 @@ pub async fn materialize_run_bindings(
                 anyhow::bail!("configured inference session '{}' is archived", session_id);
             }
 
-            session::bind_session(&state.db, run.id, &step.step_type, session_id).await?;
+            if existing_bindings.get(&step.step_type).map(String::as_str) != Some(session_id) {
+                session::bind_session(&state.db, run.id, &step.step_type, session_id).await?;
+            }
             continue;
         }
 
@@ -90,50 +106,138 @@ pub async fn materialize_run_bindings(
             continue;
         }
 
+        if let Some(session_id) = existing_bindings.get(&step.step_type) {
+            let selected = session::get_session(&state.db, session_id).await?;
+            if let Some(selected) = selected {
+                if selected.repo_ref == session_repo_ref
+                    && selected.status != "archived"
+                    && inference_configs_equal(&selected.config, &route.config)?
+                {
+                    new_sessions.insert(route.name.clone(), selected.id);
+                    continue;
+                }
+            }
+        }
+
         let created = session::create_session(
             &state.db,
-            &run.repo_ref,
+            &session_repo_ref,
             run.id,
             &route,
         )
         .await?;
 
         new_sessions.insert(route.name.clone(), created.id);
+        created_session = true;
+    }
+
+    if created_session {
+        crate::engine::automation::apply_inference_session_transition(state, run.id).await?;
     }
 
     Ok(())
 }
 
-pub async fn backfill_run_bindings_on_startup(state: &AppState) -> Result<usize> {
-    let run_ids = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM workflow_runs WHERE status NOT IN ('success', 'cancelled') ORDER BY created_at ASC",
-    )
-    .fetch_all(&state.db)
-    .await?;
+pub async fn reconcile_stage_session(
+    state: &AppState,
+    run: &WorkflowRun,
+    step: &WorkflowStepDefinition,
+) -> Result<bool> {
+    if !crate::engine::stages::stage_supports_capability(step, "inference") {
+        return Ok(false);
+    }
 
-    let mut backfilled = 0usize;
+    let route = session::resolve_inference_route_from_run(run, step)?;
+    let session_repo_ref = session::repository_scope_for_run(run);
+    let current = session::load_bound_session(&state.db, run.id, &step.step_type).await?;
 
-    for run_id in run_ids {
-        let run_id = uuid::Uuid::parse_str(&run_id)?;
-        let run = crate::engine::load_run(state, run_id).await?;
-        let before = session::bindings_for_run(&state.db, run_id).await?.len();
+    if let Some(session_id) = route.existing_session_id.as_deref() {
+        let selected = session::get_session(&state.db, session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("configured inference session '{}' was not found", session_id))?;
 
-        match materialize_run_bindings(state, &run).await {
-            Ok(()) => {
-                let after = session::bindings_for_run(&state.db, run_id).await?.len();
-                backfilled += after.saturating_sub(before);
+        if selected.repo_ref != session_repo_ref {
+            anyhow::bail!("configured inference session '{}' belongs to a different repository", session_id);
+        }
+
+        if selected.status == "archived" {
+            anyhow::bail!("configured inference session '{}' is archived", session_id);
+        }
+
+        if current.as_ref().map(|bound| bound.id.as_str()) != Some(session_id) {
+            session::bind_session(&state.db, run.id, &step.step_type, session_id).await?;
+            return Ok(true);
+        }
+
+        if selected.status == "pending" {
+            return Ok(false);
+        }
+
+        let mut effective_route = route.clone();
+        effective_route.config = selected.config.clone();
+        let adapter = adapter_for_transport(&effective_route.config.transport);
+        let available = selected.status == "active"
+            && adapter.session_available(state, &effective_route, &selected).await?;
+
+        if available {
+            return Ok(false);
+        }
+
+        let created = session::create_session(&state.db, &session_repo_ref, run.id, &effective_route).await?;
+        session::rebind_run_session(&state.db, run.id, &selected.id, &created.id).await?;
+        crate::engine::automation::apply_inference_session_transition(state, run.id).await?;
+        return Ok(true);
+    }
+
+    if let Some(bound) = current.as_ref() {
+        if bound.repo_ref == session_repo_ref && bound.status != "archived" && inference_configs_equal(&bound.config, &route.config)? {
+            if bound.status == "pending" {
+                return Ok(false);
             }
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    error = %format!("{:#}", error),
-                    "failed to backfill workflow inference bindings"
-                );
+
+            let adapter = adapter_for_transport(&route.config.transport);
+            if bound.status == "active" && adapter.session_available(state, &route, bound).await? {
+                return Ok(false);
             }
         }
     }
 
-    Ok(backfilled)
+    let bindings = session::bindings_for_run(&state.db, run.id).await?;
+    for candidate in &run.definition.steps {
+        if candidate.step_type == step.step_type
+            || !crate::engine::stages::stage_supports_capability(candidate, "inference")
+        {
+            continue;
+        }
+
+        let candidate_route = session::resolve_inference_route_from_run(run, candidate)?;
+        if candidate_route.existing_session_id.is_some()
+            || candidate_route.name != route.name
+            || !inference_configs_equal(&candidate_route.config, &route.config)?
+        {
+            continue;
+        }
+
+        let Some(candidate_id) = bindings.get(&candidate.step_type) else {
+            continue;
+        };
+        let Some(candidate_session) = session::get_session(&state.db, candidate_id).await? else {
+            continue;
+        };
+
+        if candidate_session.repo_ref == session_repo_ref
+            && candidate_session.status != "archived"
+            && inference_configs_equal(&candidate_session.config, &route.config)?
+        {
+            session::bind_session(&state.db, run.id, &step.step_type, &candidate_session.id).await?;
+            return Ok(true);
+        }
+    }
+
+    let created = session::create_session(&state.db, &session_repo_ref, run.id, &route).await?;
+    crate::engine::automation::apply_inference_session_transition(state, run.id).await?;
+    let _ = created;
+    Ok(true)
 }
 
 pub struct Inference;
@@ -155,6 +259,7 @@ impl Inference {
                 "inference stage '{}' does not have a materialized session binding",
                 ctx.step.step_type
             ))?;
+        let session_repo_ref = existing.repo_ref.clone();
 
         let mut effective_route = route.clone();
         effective_route.config = existing.config.clone();
@@ -175,16 +280,23 @@ impl Inference {
 
             let created = session::create_session(
                 &ctx.state.db,
-                ctx.repo_ref,
+                &session_repo_ref,
                 ctx.run_id,
                 route,
+            )
+            .await?;
+
+            session::rebind_run_session(
+                &ctx.state.db,
+                ctx.run_id,
+                &existing.id,
+                &created.id,
             )
             .await?;
 
             crate::engine::automation::apply_inference_session_transition(
                 ctx.state,
                 ctx.run_id,
-                ctx.step,
             )
             .await?;
 
@@ -204,19 +316,28 @@ impl Inference {
             Err(error) if !creating && adapter.is_session_unavailable_error(&error) => {
                 session::archive_session(&ctx.state.db, &logical_session.id).await?;
 
+                let previous_session_id = logical_session.id.clone();
                 logical_session = session::create_session(
                     &ctx.state.db,
-                    ctx.repo_ref,
+                    &session_repo_ref,
                     ctx.run_id,
                     route,
                 )
                 .await?;
+
+                session::rebind_run_session(
+                    &ctx.state.db,
+                    ctx.run_id,
+                    &previous_session_id,
+                    &logical_session.id,
+                )
+                .await?;
+
                 creating = true;
 
                 crate::engine::automation::apply_inference_session_transition(
                     ctx.state,
                     ctx.run_id,
-                    ctx.step,
                 )
                 .await?;
 
@@ -281,6 +402,26 @@ impl Inference {
                     "last_used_at": logical_session.last_used_at
                 }),
             );
+        }
+
+        let provider = payload.get("provider").and_then(Value::as_str).unwrap_or("browser").to_string();
+        let model = payload.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let transport = match route.config.transport {
+            super::InferenceTransport::Api => "api",
+            super::InferenceTransport::Browser => "browser",
+        };
+        let invocation_id = super::persistence::record_invocation(
+            &ctx.state.db,
+            ctx,
+            &logical_session.id,
+            transport,
+            &provider,
+            &model,
+            input,
+            &payload,
+        ).await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("inference_invocation_id".to_string(), Value::String(invocation_id));
         }
 
         Ok(payload)

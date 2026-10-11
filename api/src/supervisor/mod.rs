@@ -2151,18 +2151,9 @@ async fn supervisor_work_unit_workflow_context(
             obj.insert("planner_id".to_string(), Value::String(planner_id));
         }
         SupervisorWorkPoolKind::Integration => {
-            let inputs = load_supervisor_integration_inputs(state, run.id).await?;
-            if inputs.is_empty() {
-                return Err(anyhow!("integration has no included work-unit inputs"));
-            }
-
             obj.insert(
                 "pool_type".to_string(),
                 Value::String(SupervisorWorkPoolKind::Integration.as_str().to_string()),
-            );
-            obj.insert(
-                "integration_inputs".to_string(),
-                serde_json::to_value(inputs)?,
             );
         }
         SupervisorWorkPoolKind::Manual => {}
