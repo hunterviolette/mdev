@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -7,6 +8,14 @@ import urllib.request
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
+workspace_targets = {
+    (root / workspace).resolve()
+    for workspace in json.loads((root / 'package.json').read_text(encoding='utf-8'))['workspaces']
+}
+
+def ignore_workspace_links(directory, names):
+    return [name for name in names if (Path(directory) / name).resolve() in workspace_targets]
+
 version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
 node_version = os.environ['NODE_VERSION']
 output = root / 'release-output'
@@ -30,7 +39,7 @@ with tempfile.TemporaryDirectory() as temporary:
     shutil.copytree(root / 'bridge' / 'dist', application / 'bridge' / 'dist')
     shutil.copytree(root / 'adt-bridge' / 'dist', application / 'adt-bridge' / 'dist')
     shutil.copytree(root / 'web' / 'dist', application / 'web' / 'dist')
-    shutil.copytree(root / 'node_modules', application / 'node_modules', symlinks=True)
+    shutil.copytree(root / 'node_modules', application / 'node_modules', symlinks=True, ignore=ignore_workspace_links)
 
     archive = temporary / 'node.tar.gz'
     url = f'https://nodejs.org/dist/v{node_version}/node-v{node_version}-linux-x64.tar.gz'

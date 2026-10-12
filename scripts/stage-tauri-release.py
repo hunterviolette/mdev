@@ -8,6 +8,14 @@ import zipfile
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
+workspace_targets = {
+    (root / workspace).resolve()
+    for workspace in json.loads((root / 'package.json').read_text(encoding='utf-8'))['workspaces']
+}
+
+def ignore_workspace_links(directory, names):
+    return [name for name in names if (Path(directory) / name).resolve() in workspace_targets]
+
 stage = root / 'launcher' / 'src-tauri'
 version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
 repository = os.environ['GITHUB_REPOSITORY']
@@ -37,7 +45,7 @@ shutil.copy2(root / 'api' / 'target' / 'release' / api_name, stage / 'runtime' /
 shutil.copytree(root / 'bridge' / 'dist', stage / 'bridge' / 'dist')
 shutil.copytree(root / 'adt-bridge' / 'dist', stage / 'adt-bridge' / 'dist')
 shutil.copytree(root / 'web' / 'dist', stage / 'web' / 'dist')
-shutil.copytree(root / 'node_modules', stage / 'node_modules', symlinks=False)
+shutil.copytree(root / 'node_modules', stage / 'node_modules', symlinks=False, ignore=ignore_workspace_links)
 
 urllib.request.urlretrieve(url, archive)
 if system == 'windows':
