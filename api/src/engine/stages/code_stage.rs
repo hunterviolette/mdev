@@ -13,7 +13,6 @@ use crate::{
             },
             registry::CapabilityResult,
         },
-        automation::{policies::changeset_file_failures, AutomationDecision},
         stages::{
             Stage,
             StageCapabilities,
@@ -23,6 +22,8 @@ use crate::{
     },
     models::{StageExecutionNode, WorkflowRun, WorkflowStepDefinition},
 };
+
+const DEFAULT_USER_INPUT: &str = "please provide changeset in a codeblock with no comments to align coding";
 
 pub struct CodeStage;
 
@@ -50,18 +51,12 @@ impl Stage for CodeStage {
         ])
     }
 
-    fn automation_policy_keys(&self) -> &'static [&'static str] {
-        &["changeset_file_failures"]
+    fn inference_default_user_input(&self) -> Option<&'static str> {
+        Some(DEFAULT_USER_INPUT)
     }
 
-    fn automation_after_capability(
-        &self,
-        run: &WorkflowRun,
-        step: &WorkflowStepDefinition,
-        result: &CapabilityResult,
-        prior_results: &[CapabilityResult],
-    ) -> Result<Vec<AutomationDecision>> {
-        changeset_file_failures::after_capability(run, step, result, prior_results)
+    fn automation_policy_keys(&self) -> &'static [&'static str] {
+        &["changeset_file_failures"]
     }
 
     fn prepare_state(
@@ -123,9 +118,7 @@ fn prepare_code_state(
             include_changeset_schema: step.prompt.include_changeset_schema,
         },
         InferenceStageHooks {
-            empty_user_input_default: Some(
-                "please provide changeset in a codeblock with no comments to align coding".to_string(),
-            ),
+            empty_user_input_default: STAGE.inference_default_user_input().map(str::to_string),
         },
     )?;
 

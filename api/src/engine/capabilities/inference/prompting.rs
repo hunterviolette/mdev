@@ -1,25 +1,96 @@
 use std::path::PathBuf;
 
+use super::accounting::{count_tokens, InputTokenComponent};
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
 use uuid::Uuid;
 
 use crate::engine::{
     capabilities::registry::{find_result, CapabilityContext, CapabilityResult},
-    orchestration_inputs::{
-        AttachmentRole,
-        OrchestrationInputEnvelope,
-        OrchestrationInputPayload,
-    },
+    prompt_inputs::{AttachmentRole, PromptBlockRole, PromptInput, PromptInputPayload},
 };
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAttachmentKind {
+    Text,
+    Image,
+    Document,
+    Binary,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelAttachment {
     pub path: PathBuf,
     pub filename: String,
-    pub media_type: Option<String>,
+    pub media_type: String,
+    pub kind: ModelAttachmentKind,
     pub role: AttachmentRole,
+}
+
+fn model_attachment(
+    path: PathBuf,
+    filename: String,
+    media_type: Option<String>,
+    role: AttachmentRole,
+) -> ModelAttachment {
+    let media_type = media_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            mime_guess::from_path(&path)
+                .first_raw()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let kind = model_attachment_kind(&media_type);
+
+    ModelAttachment {
+        path,
+        filename,
+        media_type,
+        kind,
+        role,
+    }
+}
+
+fn model_attachment_kind(media_type: &str) -> ModelAttachmentKind {
+    let media_type = media_type.trim().to_ascii_lowercase();
+
+    if media_type.starts_with("image/") {
+        return ModelAttachmentKind::Image;
+    }
+
+    if media_type == "application/pdf" {
+        return ModelAttachmentKind::Document;
+    }
+
+    if media_type.starts_with("text/")
+        || media_type == "application/json"
+        || media_type == "application/xml"
+        || media_type == "application/yaml"
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+    {
+        return ModelAttachmentKind::Text;
+    }
+
+    ModelAttachmentKind::Binary
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInputOrigin {
+    UserCustom,
+    StageDefault,
+    ConfiguredDefault,
+    StageConfigured,
+    Inherited,
+    AutomationGenerated,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,6 +98,7 @@ pub struct ModelInputBlock {
     pub source: String,
     pub label: String,
     pub content: String,
+    pub origin: ModelInputOrigin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,18 +109,125 @@ pub struct ModelInput {
     pub input_blocks: Vec<ModelInputBlock>,
     pub consumed_input_ids: Vec<Uuid>,
     pub primary_input_source: Option<String>,
+    pub primary_input_text: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-struct AutomationPromptConfig {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AutomationPromptConfig {
     #[serde(default)]
-    empty_user_input_default: String,
+    pub empty_user_input_default: String,
 }
 
-#[derive(Default, Deserialize)]
-struct ExecutionLogicPromptConfig {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ExecutionLogicPromptConfig {
     #[serde(default)]
-    automation: AutomationPromptConfig,
+    pub automation: AutomationPromptConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultUserInputSource {
+    WorkflowOverride,
+    StageDefault,
+    None,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedDefaultUserInput {
+    pub value: Option<String>,
+    pub inherited_value: Option<String>,
+    pub source: DefaultUserInputSource,
+}
+
+pub fn resolve_default_user_input(
+    configuration: &ExecutionLogicPromptConfig,
+    stage_default: Option<&str>,
+) -> ResolvedDefaultUserInput {
+    let inherited_value = stage_default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let workflow_default = configuration.automation.empty_user_input_default.trim();
+    if !workflow_default.is_empty() {
+        return ResolvedDefaultUserInput {
+            value: Some(workflow_default.to_string()),
+            inherited_value,
+            source: DefaultUserInputSource::WorkflowOverride,
+        };
+    }
+
+    if let Some(value) = inherited_value.clone() {
+        return ResolvedDefaultUserInput {
+            value: Some(value),
+            inherited_value,
+            source: DefaultUserInputSource::StageDefault,
+        };
+    }
+
+    ResolvedDefaultUserInput {
+        value: None,
+        inherited_value: None,
+        source: DefaultUserInputSource::None,
+    }
+}
+
+pub fn estimate_input_components(
+    input: &ModelInput,
+    pasted_context: Option<&str>,
+) -> Result<Vec<InputTokenComponent>> {
+    let mut components = Vec::new();
+    let mut seen_text = std::collections::HashSet::new();
+    for block in &input.input_blocks {
+        let content = block.content.trim();
+        if content.is_empty() || !seen_text.insert(content.to_string()) {
+            continue;
+        }
+        components.push(InputTokenComponent {
+            input_type: if block.source == "compile_commands" { "context" } else { "instruction" }.to_string(),
+            input_source: block.source.clone(),
+            label: block.label.clone(),
+            tokens: count_tokens(content)?,
+        });
+    }
+    if input.input_blocks.is_empty() && !input.text.trim().is_empty() {
+        components.push(InputTokenComponent {
+            input_type: "instruction".to_string(),
+            input_source: "composite_text".to_string(),
+            label: "Composite prompt".to_string(),
+            tokens: count_tokens(&input.text)?,
+        });
+    }
+    let compiled_context = pasted_context.or(input.pasted_context_text.as_deref());
+    if let Some(content) = compiled_context.filter(|content| !content.trim().is_empty()) {
+        let mut remaining = content.to_string();
+        for block in &input.input_blocks {
+            if block.source == "compile_commands" && !block.content.trim().is_empty() {
+                remaining = remaining.replacen(block.content.trim(), "", 1);
+            }
+        }
+        if !remaining.trim().is_empty() {
+            components.push(InputTokenComponent {
+                input_type: "context".to_string(),
+                input_source: "pasted_context".to_string(),
+                label: "Pasted context".to_string(),
+                tokens: count_tokens(remaining.trim())?,
+            });
+        }
+    }
+    for attachment in &input.attachments {
+        if attachment.kind != ModelAttachmentKind::Text {
+            continue;
+        }
+        let content = std::fs::read_to_string(&attachment.path)?;
+        components.push(InputTokenComponent {
+            input_type: "attachment".to_string(),
+            input_source: format!("{:?}", attachment.role).to_ascii_lowercase(),
+            label: attachment.filename.clone(),
+            tokens: count_tokens(&content)?,
+        });
+    }
+    Ok(components)
 }
 
 #[derive(Default, Deserialize)]
@@ -57,106 +236,95 @@ struct ContextExportResult {
     output_path: String,
 }
 
-fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<String> {
-    let execution_logic = ctx
+
+
+fn configured_default_user_input(ctx: &CapabilityContext<'_>) -> Option<(String, String, ModelInputOrigin)> {
+    let configuration = ctx
         .local_state
         .get("execution_logic")
-        .cloned()
-        .unwrap_or_else(|| ctx.step.execution_logic.clone());
-    let config = serde_json::from_value::<ExecutionLogicPromptConfig>(execution_logic)
+        .and_then(|value| serde_json::from_value::<ExecutionLogicPromptConfig>(value.clone()).ok())
+        .or_else(|| serde_json::from_value::<ExecutionLogicPromptConfig>(ctx.step.execution_logic.clone()).ok())
         .unwrap_or_default();
 
-    let value = config.automation.empty_user_input_default.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    let prepared = ctx
+        .local_state
+        .get("inference_prompting")
+        .and_then(|value| serde_json::from_value::<ResolvedDefaultUserInput>(value.clone()).ok());
+
+    let inherited = prepared
+        .as_ref()
+        .and_then(|value| value.inherited_value.as_deref());
+
+    let resolved = resolve_default_user_input(&configuration, inherited);
+    let value = resolved.value?;
+    let (source, origin) = match resolved.source {
+        DefaultUserInputSource::WorkflowOverride => ("empty_user_input_default", ModelInputOrigin::ConfiguredDefault),
+        DefaultUserInputSource::StageDefault => ("empty_user_input_default", ModelInputOrigin::StageDefault),
+        DefaultUserInputSource::None => return None,
+    };
+    Some((source.to_string(), value, origin))
 }
 
 fn configured_stage_input(
     ctx: &CapabilityContext<'_>,
-) -> (Option<(String, String)>, Vec<ModelInputBlock>) {
-    let Some(blocks) = ctx
-        .local_state
-        .get("model_input_blocks")
-        .and_then(Value::as_array)
-    else {
-        return (None, Vec::new());
-    };
-
+) -> (Option<(String, String, ModelInputOrigin)>, Vec<ModelInputBlock>) {
     let mut primary = None;
     let mut input_blocks = Vec::new();
 
-    for block in blocks {
-        let Some(content) = block
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-
-        let key = block
-            .get("key")
-            .or_else(|| block.get("id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("inference");
-        let role = block
-            .get("role")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-
-        if primary.is_none() && (role == "user" || key == "user_input") {
-            primary = Some(("user_input".to_string(), content.to_string()));
+    for block in &ctx.prompt_blocks {
+        if !block.enabled {
             continue;
         }
 
-        let source = block
-            .get("source")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(key)
-            .to_string();
-        let label = block
-            .get("label")
-            .or_else(|| block.get("title"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(key)
-            .to_string();
+        let content = block.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        if primary.is_none() && block.role == PromptBlockRole::User {
+            primary = Some(("user_input".to_string(), content.to_string(), ModelInputOrigin::StageConfigured));
+            continue;
+        }
+
+        let source = block.source.trim();
+        let source = if source.is_empty() {
+            block.key.as_str()
+        } else {
+            source
+        };
+        let label = block.label.trim();
+        let label = if label.is_empty() {
+            block.key.as_str()
+        } else {
+            label
+        };
 
         input_blocks.push(ModelInputBlock {
-            source,
-            label,
+            source: source.to_string(),
+            label: label.to_string(),
             content: content.to_string(),
+            origin: ModelInputOrigin::StageConfigured,
         });
     }
 
     (primary, input_blocks)
 }
 
-fn orchestration_blocks(
-    inputs: &[OrchestrationInputEnvelope],
-) -> (Option<(String, String)>, Vec<ModelInputBlock>, Vec<ModelAttachment>) {
+fn prompt_input_blocks(
+    inputs: &[PromptInput],
+) -> (Option<(String, String, ModelInputOrigin)>, Vec<ModelInputBlock>, Vec<ModelAttachment>) {
     let mut primary = None;
     let mut blocks = Vec::new();
     let mut attachments = Vec::new();
 
     for item in inputs {
         match &item.payload {
-            OrchestrationInputPayload::UserInstruction { text }
+            PromptInputPayload::UserInstruction { text }
                 if primary.is_none() && !text.trim().is_empty() =>
             {
-                primary = Some(("user_instruction".to_string(), text.trim().to_string()));
+                primary = Some(("user_instruction".to_string(), text.trim().to_string(), ModelInputOrigin::UserCustom));
             }
-            OrchestrationInputPayload::PromptContribution {
+            PromptInputPayload::PromptContribution {
                 text,
                 source,
                 label,
@@ -178,20 +346,21 @@ fn orchestration_blocks(
                     source,
                     label,
                     content: text.trim().to_string(),
+                    origin: ModelInputOrigin::Inherited,
                 });
             }
-            OrchestrationInputPayload::Attachment {
+            PromptInputPayload::Attachment {
                 path,
                 filename,
                 media_type,
                 role,
             } => {
-                attachments.push(ModelAttachment {
-                    path: PathBuf::from(path),
-                    filename: filename.clone(),
-                    media_type: media_type.clone(),
-                    role: role.clone(),
-                });
+                attachments.push(model_attachment(
+                    PathBuf::from(path),
+                    filename.clone(),
+                    media_type.clone(),
+                    role.clone(),
+                ));
             }
             _ => {}
         }
@@ -221,12 +390,12 @@ fn context_export_attachment(
         .unwrap_or("repo_context.txt")
         .to_string();
 
-    Some(ModelAttachment {
+    Some(model_attachment(
         path,
         filename,
-        media_type: Some("text/plain".to_string()),
-        role: AttachmentRole::RepositoryContext,
-    })
+        Some("text/plain".to_string()),
+        AttachmentRole::RepositoryContext,
+    ))
 }
 
 fn append_unique_section(target: &mut Vec<String>, value: impl Into<String>) {
@@ -249,35 +418,33 @@ pub fn build_model_input(
 ) -> Result<ModelInput> {
     let resolved = ctx
         .state
-        .orchestration_inputs
+        .prompt_inputs
         .resolve_for_step(ctx.run_id, ctx.step.id.as_str());
 
     let consumed_input_ids = resolved.iter().map(|item| item.id).collect::<Vec<_>>();
     let (stage_primary, mut input_blocks) = configured_stage_input(ctx);
-    let (orchestration_primary, orchestration_input_blocks, mut attachments) =
-        orchestration_blocks(&resolved);
-    input_blocks.extend(orchestration_input_blocks);
+    let (prompt_primary, contributed_prompt_blocks, mut attachments) =
+        prompt_input_blocks(&resolved);
+    input_blocks.extend(contributed_prompt_blocks);
 
-    let primary = orchestration_primary
+    let primary = prompt_primary
         .or(stage_primary)
-        .or_else(|| {
-            configured_default_user_input(ctx)
-                .map(|value| ("empty_user_input_default".to_string(), value))
-        });
+        .or_else(|| configured_default_user_input(ctx));
 
     let mut sections = Vec::new();
 
-    if let Some((source, text)) = primary.as_ref() {
+    if let Some((source, text, origin)) = primary.as_ref() {
         append_unique_section(&mut sections, text.clone());
         input_blocks.insert(
             0,
             ModelInputBlock {
                 source: source.clone(),
-                label: match source.as_str() {
-                    "user_instruction" | "user_input" => "User instruction".to_string(),
+                label: match origin {
+                    ModelInputOrigin::UserCustom | ModelInputOrigin::StageConfigured => "User instruction".to_string(),
                     _ => "Default user instruction".to_string(),
                 },
                 content: text.clone(),
+                origin: origin.clone(),
             },
         );
     }
@@ -327,7 +494,7 @@ pub fn build_model_input(
             .map(Iterator::count)
             .unwrap_or(0),
         attachment_count = attachments.len(),
-        orchestration_input_count = resolved.len(),
+        prompt_input_count = resolved.len(),
         "central model input built"
     );
 
@@ -337,6 +504,7 @@ pub fn build_model_input(
         attachments,
         input_blocks,
         consumed_input_ids,
-        primary_input_source: primary.map(|item| item.0),
+        primary_input_source: primary.as_ref().map(|item| item.0.clone()),
+        primary_input_text: primary.map(|item| item.1),
     })
 }

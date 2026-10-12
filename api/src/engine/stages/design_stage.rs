@@ -18,7 +18,6 @@ use crate::{
             Stage,
             StageCapabilities,
             StageExecutionNode,
-            StageExecutionNodeKind,
             StagePlanContext,
             StagePrepareContext,
         },

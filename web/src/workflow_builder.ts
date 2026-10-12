@@ -113,26 +113,8 @@ export function defaultGlobals(): WorkflowGlobalConfig {
     },
     capabilities: {
       inference: {
-        default_session: 'coding',
-        stage_sessions: {
-          design: 'coding',
-          code: 'coding',
-          review: 'review',
-        },
-        sessions: {
-          coding: {
-            provider: 'openai',
-            transport: 'api',
-            model: 'gpt-4.1',
-            runtime: {},
-          },
-          review: {
-            provider: 'openai',
-            transport: 'api',
-            model: 'gpt-4.1',
-            runtime: {},
-          },
-        },
+        stage_sessions: {},
+        sessions: {},
       },
       shared_dependencies: defaultSharedDependencies(),
     },
@@ -141,26 +123,7 @@ export function defaultGlobals(): WorkflowGlobalConfig {
   };
 }
 
-export function inferenceEnabledStageTypes(catalog: WorkflowBuilderCatalog, steps: BuilderStep[]): string[] {
-  const descriptors = descriptorMap(catalog);
-  const seen = new Set<string>();
-
-  for (const step of steps) {
-    const descriptor = descriptors[step.stepType];
-    const capabilities = descriptor?.definition_template?.capabilities ?? [];
-    const executionPlan = descriptor?.definition_template?.execution_plan ?? [];
-    const hasInference = capabilities.some((item) => item.capability === 'inference' && item.enabled !== false)
-      || executionPlan.some((item) => item.kind === 'capability' && item.key === 'inference' && item.enabled !== false);
-
-    if (hasInference) {
-      seen.add(step.stepType);
-    }
-  }
-
-  return Array.from(seen);
-}
-
-export function inferenceSessionNames(globals: WorkflowGlobalConfig): string[] {
+export function inferenceRouteNames(globals: WorkflowGlobalConfig): string[] {
   const inference = (globals.capabilities?.inference ?? {}) as Record<string, unknown>;
   const sessions = (inference.sessions ?? {}) as Record<string, unknown>;
   return Object.keys(sessions);

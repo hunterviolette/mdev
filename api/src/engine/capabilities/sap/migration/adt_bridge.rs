@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::engine::capabilities::inference::BrowserConfig as BrowserTurnConfig;
 use crate::engine::capabilities::inference::browser::adapter as browser_bridge;
-use crate::runtime_env::default_browser_cdp_url;
+use crate::environment_file::default_browser_cdp_url;
 use super::sap_adt_manifest::{
     SapAdtManifestDocument,
     SapAdtManifestResource,
@@ -1058,27 +1058,7 @@ fn mdev_data_dir() -> PathBuf {
     std::env::temp_dir().join("mdev")
 }
 
-fn bundled_chromium_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(root) = app_root() {
-        let browsers = root.join("browsers");
-        #[cfg(target_os = "windows")]
-        let relative = PathBuf::from("chrome-win").join("chrome.exe");
-        #[cfg(target_os = "macos")]
-        let relative = PathBuf::from("chrome-mac").join("Chromium.app").join("Contents").join("MacOS").join("Chromium");
-        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-        let relative = PathBuf::from("chrome-linux").join("chrome");
 
-        if let Ok(entries) = std::fs::read_dir(&browsers) {
-            for entry in entries.flatten() {
-                out.push(entry.path().join(&relative));
-            }
-        }
-
-        out.push(browsers.join(&relative));
-    }
-    out
-}
 
 struct AdtBridgeClient {
     child: Option<Child>,
@@ -1118,7 +1098,18 @@ impl AdtBridgeClient {
             .args(&args)
             .current_dir(bridge_dir)
             .env("ADT_HOST_URL", base_url)
-            .env("MDEV_BROWSER_USER_DATA_DIR", mdev_data_dir().join("browser-profile").to_string_lossy().to_string())
+            .env(
+                "MDEV_BROWSER_USER_DATA_DIR",
+                std::env::var("MDEV_BROWSER_USER_DATA_DIR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        mdev_data_dir()
+                            .join("browser-profile")
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1232,20 +1223,7 @@ fn browser_profile_for_adt(sap: &SapAdtState) -> String {
 }
 
 fn browser_executable_for_adt() -> String {
-    if let Ok(value) = std::env::var("MDEV_BROWSER_EXECUTABLE") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    for candidate in bundled_chromium_candidates() {
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    String::new()
+    crate::browser_registry::resolve_adt_browser_executable().unwrap_or_default()
 }
 
 fn browser_page_match_url(url: &str) -> String {

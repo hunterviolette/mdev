@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,9 +16,41 @@ pub enum AttachmentRole {
     GeneratedArtifact,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptBlockRole {
+    User,
+    Capability,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptBlock {
+    pub index: usize,
+    pub id: String,
+    pub key: String,
+    pub capability_key: String,
+    pub label: String,
+    pub title: String,
+    pub role: PromptBlockRole,
+    pub source: String,
+    pub enabled: bool,
+    pub default_collapsed: bool,
+    pub content_format: String,
+    pub char_count: usize,
+    pub content: String,
+}
+
+pub fn prompt_blocks_from_state(state: &Value) -> Result<Vec<PromptBlock>> {
+    let Some(value) = state.get("model_input_blocks") else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_value(value.clone()).context("invalid typed prompt block runtime state")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OrchestrationInputPayload {
+pub enum PromptInputPayload {
     UserInstruction {
         text: String,
     },
@@ -35,7 +69,7 @@ pub enum OrchestrationInputPayload {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OrchestrationInputScope {
+pub enum PromptInputScope {
     Run,
     Stage {
         step_id: String,
@@ -50,7 +84,7 @@ pub enum OrchestrationInputScope {
     },
 }
 
-impl OrchestrationInputScope {
+impl PromptInputScope {
     fn applies_to_step(&self, step_id: &str) -> bool {
         match self {
             Self::Run => true,
@@ -69,7 +103,7 @@ impl OrchestrationInputScope {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum OrchestrationInputLifecycle {
+pub enum PromptInputLifecycle {
     SingleUse,
     UntilStageCompletes,
     UntilRunCompletes,
@@ -77,31 +111,31 @@ pub enum OrchestrationInputLifecycle {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OrchestrationInputEnvelope {
+pub struct PromptInput {
     pub id: Uuid,
     pub run_id: Uuid,
-    pub scope: OrchestrationInputScope,
-    pub lifecycle: OrchestrationInputLifecycle,
+    pub scope: PromptInputScope,
+    pub lifecycle: PromptInputLifecycle,
     pub priority: i32,
     pub created_at: DateTime<Utc>,
-    pub payload: OrchestrationInputPayload,
+    pub payload: PromptInputPayload,
 }
 
 #[derive(Clone, Default)]
-pub struct OrchestrationInputStore {
-    inputs: Arc<DashMap<Uuid, Vec<OrchestrationInputEnvelope>>>,
+pub struct PromptInputStore {
+    inputs: Arc<DashMap<Uuid, Vec<PromptInput>>>,
 }
 
-impl OrchestrationInputStore {
+impl PromptInputStore {
     pub fn publish(
         &self,
         run_id: Uuid,
-        scope: OrchestrationInputScope,
-        lifecycle: OrchestrationInputLifecycle,
+        scope: PromptInputScope,
+        lifecycle: PromptInputLifecycle,
         priority: i32,
-        payload: OrchestrationInputPayload,
-    ) -> OrchestrationInputEnvelope {
-        let envelope = OrchestrationInputEnvelope {
+        payload: PromptInputPayload,
+    ) -> PromptInput {
+        let envelope = PromptInput {
             id: Uuid::new_v4(),
             run_id,
             scope,
@@ -127,8 +161,8 @@ impl OrchestrationInputStore {
             !matches!(
                 (&item.scope, &item.payload),
                 (
-                    OrchestrationInputScope::Stage { step_id: existing_step },
-                    OrchestrationInputPayload::UserInstruction { .. }
+                    PromptInputScope::Stage { step_id: existing_step },
+                    PromptInputPayload::UserInstruction { .. }
                 ) if existing_step == step_id
             )
         });
@@ -137,16 +171,16 @@ impl OrchestrationInputStore {
             return;
         }
 
-        inputs.push(OrchestrationInputEnvelope {
+        inputs.push(PromptInput {
             id: Uuid::new_v4(),
             run_id,
-            scope: OrchestrationInputScope::Stage {
+            scope: PromptInputScope::Stage {
                 step_id: step_id.to_string(),
             },
-            lifecycle: OrchestrationInputLifecycle::SingleUse,
+            lifecycle: PromptInputLifecycle::SingleUse,
             priority: 1_000,
             created_at: Utc::now(),
-            payload: OrchestrationInputPayload::UserInstruction {
+            payload: PromptInputPayload::UserInstruction {
                 text: normalized,
             },
         });
@@ -156,7 +190,7 @@ impl OrchestrationInputStore {
         self.resolve_for_step(run_id, step_id)
             .into_iter()
             .find_map(|item| match item.payload {
-                OrchestrationInputPayload::UserInstruction { text } => Some(text),
+                PromptInputPayload::UserInstruction { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()
@@ -166,7 +200,7 @@ impl OrchestrationInputStore {
         &self,
         run_id: Uuid,
         step_id: &str,
-    ) -> Vec<OrchestrationInputEnvelope> {
+    ) -> Vec<PromptInput> {
         let mut resolved = self
             .inputs
             .get(&run_id)
@@ -200,7 +234,7 @@ impl OrchestrationInputStore {
 
         inputs.retain(|item| {
             !input_ids.contains(&item.id)
-                || !matches!(item.lifecycle, OrchestrationInputLifecycle::SingleUse)
+                || !matches!(item.lifecycle, PromptInputLifecycle::SingleUse)
         });
     }
 

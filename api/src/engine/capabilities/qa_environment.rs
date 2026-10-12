@@ -26,7 +26,6 @@ use crate::engine::{
         QaReadinessSpec,
         QaStageSpec,
         TerminalCommandMode,
-        TerminalCommandSpec,
     },
 };
 

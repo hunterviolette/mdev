@@ -18,7 +18,7 @@ export type FeaturePlanItem = {
 
 export type PlannerWorkspace = {
   id: string;
-  root_repo_path: string;
+  repo_ref: string;
   title: string;
   is_default: boolean;
   feature_count: number;
@@ -52,19 +52,19 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function listPlannersForRepo(rootRepoPath: string): Promise<PlannerWorkspace[]> {
-  const params = new URLSearchParams({ root_repo_path: rootRepoPath });
+export function listPlanners(repoRef: string): Promise<PlannerWorkspace[]> {
+  const params = new URLSearchParams({ repo_ref: repoRef });
   return fetchJson<PlannerWorkspace[]>(`/api/planners?${params.toString()}`);
 }
 
-export function createPlannerForRepo(body: { root_repo_path: string; title?: string | null; make_default?: boolean; features?: FeaturePlanItem[] }): Promise<PlannerWorkspace> {
+export function createPlanner(body: { repo_ref: string; title?: string | null; make_default?: boolean; features?: FeaturePlanItem[] }): Promise<PlannerWorkspace> {
   return fetchJson<PlannerWorkspace>('/api/planners/create', {
     method: 'POST',
     body: JSON.stringify(body),
   });
 }
 
-export function ensurePlannerForRepo(body: { root_repo_path: string; title?: string | null }): Promise<EnsurePlannerResponse> {
+export function ensurePlanner(body: { repo_ref: string; title?: string | null }): Promise<EnsurePlannerResponse> {
   return fetchJson<EnsurePlannerResponse>('/api/planners/ensure', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -86,7 +86,7 @@ export function updatePlannerFeatures(id: string, features: FeaturePlanItem[]): 
   });
 }
 
-export function deletePlannerForRepo(id: string): Promise<{ ok: boolean }> {
+export function deletePlanner(id: string): Promise<{ ok: boolean }> {
   return fetchJson<{ ok: boolean }>(`/api/planners/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });

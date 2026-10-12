@@ -45,14 +45,17 @@ fn resolve_bridge_dir(_raw: &str) -> PathBuf {
 }
 
 fn resolve_user_data_dir(raw: &str) -> PathBuf {
-    let input = raw.trim();
-    if !input.is_empty() {
-        let candidate = PathBuf::from(input);
-        let _ = std::fs::create_dir_all(&candidate);
-        return candidate;
-    }
+    let candidate = if !raw.trim().is_empty() {
+        PathBuf::from(raw.trim())
+    } else if let Some(configured) = std::env::var("MDEV_BROWSER_USER_DATA_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        PathBuf::from(configured)
+    } else {
+        mdev_data_dir().join("browser-profile")
+    };
 
-    let candidate = mdev_data_dir().join("browser-profile");
     let _ = std::fs::create_dir_all(&candidate);
     candidate
 }
@@ -132,27 +135,7 @@ fn bundled_node() -> String {
     "node".to_string()
 }
 
-fn bundled_chromium_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(root) = app_root() {
-        let browsers = root.join("browsers");
-        #[cfg(target_os = "windows")]
-        let relative = PathBuf::from("chrome-win").join("chrome.exe");
-        #[cfg(target_os = "macos")]
-        let relative = PathBuf::from("chrome-mac").join("Chromium.app").join("Contents").join("MacOS").join("Chromium");
-        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-        let relative = PathBuf::from("chrome-linux").join("chrome");
 
-        if let Ok(entries) = std::fs::read_dir(&browsers) {
-            for entry in entries.flatten() {
-                out.push(entry.path().join(&relative));
-            }
-        }
-
-        out.push(browsers.join(&relative));
-    }
-    out
-}
 
 fn bridge_entrypoint(bridge_root: &std::path::Path) -> Result<(String, Vec<String>)> {
     let dist_entry = bridge_root.join("dist").join("index.js");
@@ -494,10 +477,10 @@ pub fn shutdown_browser_bridge() {
 }
 
 fn launch_edge(cfg: &BrowserConfig) -> Result<Child> {
-    let executable = resolve_browser_executable(cfg);
+    let executable = resolve_browser_executable(cfg)?;
 
     let cdp_url = if cfg.cdp_url.trim().is_empty() {
-        crate::runtime_env::default_browser_cdp_url()?
+        crate::environment_file::default_browser_cdp_url()?
     } else {
         cfg.cdp_url.clone()
     };
@@ -558,56 +541,9 @@ fn cdp_reachable(cdp_url: &str) -> bool {
     }
 }
 
-fn resolve_browser_executable(cfg: &BrowserConfig) -> String {
-    let configured = cfg.edge_executable.trim();
-    if !configured.is_empty() {
-        return configured.to_string();
-    }
-
-    for candidate in bundled_chromium_candidates() {
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        for candidate in [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ] {
-            if std::path::Path::new(candidate).exists() {
-                return candidate.to_string();
-            }
-        }
-        "msedge.exe".to_string()
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        for candidate in [
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ] {
-            if std::path::Path::new(candidate).exists() {
-                return candidate.to_string();
-            }
-        }
-        "Microsoft Edge".to_string()
-    }
-
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        for candidate in ["microsoft-edge", "google-chrome", "chromium", "chromium-browser"] {
-            if Command::new(candidate).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
-                return candidate.to_string();
-            }
-        }
-        "chromium".to_string()
-    }
+fn resolve_browser_executable(cfg: &BrowserConfig) -> Result<String> {
+    crate::browser_registry::resolve_browser_executable(&cfg.edge_executable)
+        .ok_or_else(|| anyhow!("no browser executable configured or discovered"))
 }
 
 fn normalize_browser_url_for_launch(url: &str) -> String {

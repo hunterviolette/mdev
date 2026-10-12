@@ -108,13 +108,18 @@ export type WorkflowTemplateDefinition = {
 };
 
 export type InferenceConfigPanelSession = {
+  editor_id?: string;
   name: string;
   transport: 'api' | 'browser' | string;
+  lifecycle: 'persistent' | 'non_persistent' | string;
   provider?: string | null;
   model?: string | null;
   endpoint?: string | null;
+  provider_options?: Record<string, unknown> | null;
   browser_url?: string | null;
   is_default: boolean;
+  source_mode: 'new' | 'existing' | string;
+  repository_session_id?: string | null;
 };
 
 export type InferenceConfigPanelStageMapping = {
@@ -127,10 +132,41 @@ export type InferenceConfigPanel = {
   stage_mappings: InferenceConfigPanelStageMapping[];
 };
 
-export type InferenceConfigPanelResponse = {
+export type OpenAiModelsResponse = {
   ok: boolean;
-  panel: InferenceConfigPanel;
-  inference: Record<string, unknown>;
+  models: string[];
+};
+
+export type RepositoryInferenceSessionUsage = {
+  invocation_count: number;
+  completed_count: number;
+  failed_count: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  cost_amount: number | null;
+  cost_currency: string | null;
+};
+
+export type RepositoryInferenceSession = {
+  id: string;
+  repo_ref: string;
+  title: string;
+  transport: 'api' | 'browser' | string;
+  lifecycle: 'persistent' | 'non_persistent' | string;
+  config: Record<string, unknown>;
+  transport_state: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  last_used_at?: string | null;
+  usage: RepositoryInferenceSessionUsage;
+};
+
+export type RepositoryInferenceSessionsResponse = {
+  ok: boolean;
+  sessions: RepositoryInferenceSession[];
+  bindings: Record<string, string>;
 };
 
 export type TerminalShell = 'system' | 'direct' | 'cmd' | 'power_shell' | 'sh' | 'bash';
@@ -402,6 +438,7 @@ export type WorkflowAutomationControlDescriptor = {
 export type WorkflowBuilderCatalog = {
   version: number;
   stage_descriptors: WorkflowStageDescriptor[];
+  stage_capabilities?: Record<string, string[]>;
   automation_controls?: WorkflowAutomationControlDescriptor[];
 };
 
@@ -469,7 +506,7 @@ export type WorkflowTemplate = {
 
 export type WorkflowRunStatus = 'draft' | 'queued' | 'running' | 'waiting' | 'paused' | 'success' | 'complete' | 'error' | 'cancelled';
 
-export type InferenceTransport = 'api' | 'browser';
+export type InferenceTransport = string;
 
 export type BrowserProbeResult = {
   session_id: string;
@@ -612,6 +649,27 @@ export type RuntimeEventEnvelope = {
   workflow_key?: string | null;
   repo_ref?: string | null;
   event: StageExecutionEvent;
+};
+
+export type SupervisorEvent = {
+  id: string;
+  supervisor_run_id: string;
+  sequence_no: number;
+  event_type: string;
+  event_time: string;
+  message: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type SupervisorEventEnvelope = {
+  scope: string;
+  node_key: string;
+  run_id?: string | null;
+  supervisor_run_id?: string | null;
+  workflow_key?: string | null;
+  repo_ref?: string | null;
+  event: SupervisorEvent;
 };
 
 export type RuntimeProjectionResponse = {
@@ -774,14 +832,80 @@ export function compileWorkflowBuilderDocument(document: WorkflowBuilderDocument
   });
 }
 
-export function buildWorkflowBuilderInferencePanel(body: {
-  definition: WorkflowTemplateDefinition;
-  globals: WorkflowGlobalConfig;
-  panel?: InferenceConfigPanel;
-}) {
-  return fetchJson<InferenceConfigPanelResponse>('/api/workflow-builder/inference-panel', {
+export function listOpenAiModels() {
+  return fetchJson<OpenAiModelsResponse>('/api/inference-providers/openai/models');
+}
+
+export type InferenceInputRecord = {
+  id: string;
+  invocation_id: string;
+  workflow_run_id: string;
+  step_id: string;
+  stage_type: string;
+  session_id: string;
+  provider: string;
+  model: string;
+  sequence_no: number;
+  input_type: string;
+  input_origin: string;
+  input_source: string;
+  label: string;
+  content: string;
+  created_at: string;
+};
+
+export type InferenceInputsResponse = {
+  inputs: InferenceInputRecord[];
+  total: number;
+  has_more: boolean;
+  next_offset: number | null;
+  non_default_by_session: Record<string, number>;
+};
+
+export type InferenceInputsFilters = {
+  search?: string;
+  stage_type?: string;
+  session_id?: string;
+  hide_defaults?: boolean;
+  offset?: number;
+  limit?: number;
+};
+
+export function getInferenceInputs(runId: string, filters: InferenceInputsFilters = {}) {
+  const params = new URLSearchParams();
+  if (filters.search?.trim()) params.set('search', filters.search.trim());
+  if (filters.stage_type) params.set('stage_type', filters.stage_type);
+  if (filters.session_id) params.set('session_id', filters.session_id);
+  if (filters.hide_defaults !== undefined) params.set('hide_defaults', String(filters.hide_defaults));
+  params.set('offset', String(filters.offset ?? 0));
+  params.set('limit', String(filters.limit ?? 100));
+  return fetchJson<InferenceInputsResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/inference/inputs?${params.toString()}`);
+}
+
+export function listInferenceSessions(repoRef: string, runId?: string | null) {
+  const params = new URLSearchParams({ repo_ref: repoRef });
+  if (runId?.trim()) params.set('run_id', runId.trim());
+  return fetchJson<RepositoryInferenceSessionsResponse>(`/api/inference-sessions?${params.toString()}`);
+}
+
+export function selectInferenceSession(runId: string, stageType: string, sessionId: string | null) {
+  return fetchJson<RepositoryInferenceSessionsResponse>('/api/inference-sessions/select', {
     method: 'POST',
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      run_id: runId,
+      stage_type: stageType,
+      session_id: sessionId,
+    }),
+  });
+}
+
+export function archiveInferenceSession(runId: string, sessionId: string) {
+  return fetchJson<RepositoryInferenceSessionsResponse>('/api/inference-sessions/archive', {
+    method: 'POST',
+    body: JSON.stringify({
+      run_id: runId,
+      session_id: sessionId,
+    }),
   });
 }
 
@@ -1172,11 +1296,36 @@ export function getPayloadGatewaySchema() {
   }>(`/api/capabilities/payload-gateway/schema`);
 }
 
-export function getChangesetSchema() {
-  return fetchJson<{
-    ok: boolean;
-    schema: string;
-  }>(`/api/capabilities/changeset-schema`);
+export async function getChangesetSchema(runId?: string): Promise<{ ok: boolean; schema: string; run_id?: string }> {
+  if (!runId) return { ok: true, schema: '' };
+
+  const capabilities = await listWorkflowCapabilities(runId);
+  const available = Array.isArray(capabilities.capabilities)
+    ? capabilities.capabilities.some((item) => {
+        const capability = item as Record<string, unknown>;
+        return capability.capability === 'changeset_schema';
+      })
+    : false;
+
+  if (!available) return { ok: true, schema: '' };
+
+  const response = await executeWorkflowCapability(runId, 'changeset_schema', {});
+  const results = Array.isArray(response.results) ? response.results : [];
+  const result = results.find((item) => {
+    const entry = item as Record<string, unknown>;
+    return entry.capability === 'changeset_schema';
+  }) as Record<string, unknown> | undefined;
+  const payload = result?.payload as Record<string, unknown> | undefined;
+
+  if (response.ok !== true || result?.ok !== true || typeof payload?.schema !== 'string') {
+    throw new Error('Changeset schema capability execution failed');
+  }
+
+  return {
+    ok: true,
+    run_id: runId,
+    schema: payload.schema,
+  };
 }
 
 export function listWorkflowCapabilities(runId: string) {
@@ -1774,6 +1923,19 @@ export function discardWorkflowReviewDiff(runId: string, body: {
   });
 }
 
+export type ReviewCumulativeDiffResponse = {
+  ok: boolean;
+  files: number;
+  additions: number;
+  deletions: number;
+  from_ref: string;
+  to_ref: string;
+};
+
+export function getWorkflowCumulativeDiff(runId: string) {
+  return fetchJson<ReviewCumulativeDiffResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/review/cumulative-diff`);
+}
+
 export function getWorkflowReviewStatus(runId: string) {
   return fetchJson<ReviewStatusResponse>(`/api/workflow-runs/${runId}/review/status`);
 }
@@ -1897,5 +2059,147 @@ export function sapScanExportCandidates(repoRef: string) {
     body: JSON.stringify({ repo_ref: repoRef })
   });
 }
+
+export type WorkflowImpact = {
+  run_id: string;
+  user_inputs: number;
+  inference_outputs: number;
+  input_tokens: number;
+  output_tokens: number;
+  stage_executions: number;
+  completed_stages: number;
+  failed_stages: number;
+  capability_activations: number;
+  changeset_attempts: number;
+  changeset_applied: number;
+  files_changed: number;
+  files_created: number;
+  files_modified: number;
+  files_deleted: number;
+  files_moved: number;
+  file_paths: string[];
+  lines_added: number | null;
+  lines_removed: number | null;
+};
+
+export function getWorkflowImpact(runId: string) {
+  return fetchJson<WorkflowImpact>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact`);
+}
+export type ImpactEffect = { attempt_id: string; step_id: string | null; attempt_status: string; created_at: string; action: string; status: string; path_before: string | null; path_after: string | null; operation: { op?: string; action?: string; match?: { text?: string }; replacement?: string; text?: string; changes?: Array<{ action?: string; match?: { text?: string }; replacement?: string; text?: string }>; contents?: string; from?: string; to?: string }; error: string | null };
+export type ImpactInferenceAccounting = {
+  reported_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cached_input_tokens: number | null;
+    reasoning_output_tokens: number | null;
+  } | null;
+  theoretical_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    tokenizer: 'o200k_base';
+    input_scope: 'submitted_content' | 'full_known_context';
+  } | null;
+  costs: Array<{
+    source: {
+      kind: 'provider_reported' | 'calculated';
+      provider?: string;
+      pricing?: {
+        provider: string;
+        model: string;
+        version: string;
+        effective_from?: string | null;
+      };
+      usage_source?: 'reported' | 'theoretical';
+    };
+    amount: {
+      amount: string;
+      currency: string;
+    };
+  }>;
+};
+
+export type ImpactInvocation = { id: string; session_id: string; step_id: string; stage_type: string; provider: string; model: string; transport: string; status: string; error: string | null; created_at: string; completed_at: string | null; input_tokens: number | null; output_tokens: number | null; cached_tokens: number | null; cost: number | null; currency: string | null; metadata: unknown; accounting: ImpactInferenceAccounting | null };
+export type ImpactAttempt = { id: string; step_id: string | null; status: string; total_ops: number; applied_ops: number; failed_ops: number; skipped_ops: number; total_actions: number; applied_actions: number; failed_actions: number; created_at: string };
+export type ImpactDetail = { effects: ImpactEffect[]; inference: ImpactInvocation[]; attempts: ImpactAttempt[] };
+export async function getImpactDetail(runId: string): Promise<ImpactDetail> {
+  const path = `/api/workflow-runs/${encodeURIComponent(runId)}/impact/detail`;
+  const response = await fetch(path, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store'
+  });
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Impact detail request failed (${response.status}) at ${response.url || path}: ${body.startsWith('<') ? 'Server returned HTML instead of API data.' : body.slice(0, 300)}`);
+  }
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new Error(`Impact detail endpoint returned ${contentType || 'an unknown content type'} instead of JSON. Request: ${response.url || path}. Verify the running Rust API includes /impact/detail and that the frontend API proxy targets it.`);
+  }
+  const result: unknown = await response.json();
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new Error('Impact detail API returned an invalid response object.');
+  }
+  const value = result as Record<string, unknown>;
+  if (!Array.isArray(value.effects) || !Array.isArray(value.inference)) {
+    throw new Error('Impact detail API response is missing effects or inference arrays.');
+  }
+  return result as ImpactDetail;
+}
+
+export type ImpactEvent = {
+  id: string;
+  sequence_no: number;
+  step_id: string | null;
+  stage_execution_id: string | null;
+  capability_invocation_id: string | null;
+  parent_invocation_id: string | null;
+  is_header_event: boolean;
+  level: string;
+  kind: string;
+  message: string;
+  payload: unknown;
+  created_at: string;
+};
+
+export type ImpactInferenceRecord = {
+  id: string;
+  step_id: string;
+  stage_type: string;
+  capability_invocation_id: string | null;
+  provider: string;
+  model: string;
+  transport: string;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+  inputs: Array<{ sequence_no: number; input_type: string; input_origin: string; input_source: string; label: string; content: string }>;
+  response_text: string | null;
+  response_payload: unknown;
+  provider_metadata: unknown;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  cost_amount: number | null;
+  cost_currency: string | null;
+  accounting: ImpactInferenceAccounting | null;
+};
+
+export type ImpactEventsResponse = { events: ImpactEvent[]; has_more: boolean; next_cursor: number | null };
+export type ImpactInferenceResponse = { invocations: ImpactInferenceRecord[]; has_more: boolean };
+
+export function getImpactEvents(runId: string, filters: { after?: number; before?: number; from?: string; to?: string; step_id?: string; stage_execution_id?: string; capability_invocation_id?: string; kind?: string; level?: string; search?: string; limit?: number } = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') query.set(key, String(value));
+  return fetchJson<ImpactEventsResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/events?${query}`);
+}
+
+export function getImpactInference(runId: string, filters: { invocation_id?: string; step_id?: string; capability_invocation_id?: string; from?: string; to?: string; before?: string; limit?: number } = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') query.set(key, String(value));
+  return fetchJson<ImpactInferenceResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/inference?${query}`);
+}
+
+
 
 

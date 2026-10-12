@@ -1,4 +1,4 @@
-use std::{fs, path::{Path, PathBuf}, time::Instant};
+use std::{fs, path::{Path, PathBuf}, process::Command, time::Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -361,6 +361,40 @@ pub async fn execute(
     })
 }
 
+fn applied_line_diff(before: Option<&[u8]>, after: Option<&[u8]>) -> Option<(i64, i64)> {
+    if before == after {
+        return Some((0, 0));
+    }
+    let directory = std::env::temp_dir().join(format!("mdev-impact-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&directory).ok()?;
+    let old_path = directory.join("before");
+    let new_path = directory.join("after");
+    let result = (|| {
+        fs::write(&old_path, before.unwrap_or_default()).ok()?;
+        fs::write(&new_path, after.unwrap_or_default()).ok()?;
+        let output = Command::new("git")
+            .args(["diff", "--no-index", "--numstat", "--no-ext-diff", "--"])
+            .arg(&old_path)
+            .arg(&new_path)
+            .output()
+            .ok()?;
+        if !matches!(output.status.code(), Some(0) | Some(1)) {
+            return None;
+        }
+        if output.status.code() == Some(0) {
+            return Some((0, 0));
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let fields = text.lines().next()?.split('\t').collect::<Vec<_>>();
+        if fields.len() < 3 {
+            return None;
+        }
+        Some((fields[0].parse().ok()?, fields[1].parse().ok()?))
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
 pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -> Result<Value> {
     let normalized = normalize_changeset_payload_text(payload_text)?;
     let payload: ChangeSetPayload = serde_json::from_str(&normalized)
@@ -381,11 +415,20 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
     let mut successful_actions = 0usize;
     let mut applied_operations = Vec::<Operation>::new();
     let mut first_error = None::<String>;
+    let mut lines_added = 0i64;
+    let mut lines_removed = 0i64;
+    let mut line_stats_complete = true;
 
     for (idx, op) in payload.operations.iter().enumerate() {
         let index = idx + 1;
         let label = operation_label_with_index(index, op);
         lines.push(label.clone());
+        let diff_path = match op {
+            Operation::Write { path, .. } | Operation::Delete { path } | Operation::Edit { path, .. } => Some(path.as_str()),
+            Operation::Move { .. } => None,
+        };
+        let before_content = diff_path.and_then(|path| fs::read(repo.join(path)).ok());
+        let previous_applied = applied_operations.len();
 
         match op {
             Operation::Edit { path, changes } => {
@@ -451,6 +494,19 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
                     lines.push(format!("[{}] FAILED: {}", index, err_text));
                 }
             },
+        }
+
+        if applied_operations.len() > previous_applied {
+            if let Some(path) = diff_path {
+                let after_content = fs::read(repo.join(path)).ok();
+                match applied_line_diff(before_content.as_deref(), after_content.as_deref()) {
+                    Some((added, removed)) => {
+                        lines_added += added;
+                        lines_removed += removed;
+                    }
+                    None => line_stats_complete = false,
+                }
+            }
         }
     }
 
@@ -572,7 +628,9 @@ pub fn execute_changeset_apply(repo: &Path, payload_text: &str, git_ref: &str) -
             "successful_actions": successful_actions,
             "failed_actions": failed_actions,
             "total_actions": total_actions,
-            "failed_files": failing_files.len()
+            "failed_files": failing_files.len(),
+            "lines_added": if line_stats_complete { Some(lines_added) } else { None },
+            "lines_removed": if line_stats_complete { Some(lines_removed) } else { None }
         },
         "lines": lines,
         "touched_files": touched_files,

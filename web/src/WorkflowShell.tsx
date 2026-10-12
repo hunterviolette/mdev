@@ -54,6 +54,7 @@ import {
   listTemplates,
   patchWorkflowGlobalState,
   patchWorkflowStageState,
+  sendRunAction,
   patchWorkflowStageUserInput,
   pauseWorkflowRun,
   prepareWorkflowStage,
@@ -92,6 +93,7 @@ import {
   type WorkflowTemplateDefinition,
   type WorkflowTransition
 } from './api';
+import { StageInputAttachments, getStageInputAttachments, clearStageInputAttachments, serializeStageInputAttachments } from './StageInputAttachments';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
@@ -105,7 +107,8 @@ import { DeployQARuntime } from './Capabilities/DeployQARuntime';
 import { RuntimeAdmin } from './Capabilities/RuntimeAdmin';
 import { SharedDependencies } from './Capabilities/SharedDependencies';
 import { Automation, type AutomationProfile } from './Capabilities/Automation';
-import { FlightDeckPanel } from './FlightDeckPanel';
+import { SupervisorPanel } from './SupervisorPanel';
+import { AppHeader, AppHeaderAction, AppSurface } from './AppHeader';
 import { defaultGlobals, descriptorMap, flattenStageFields } from './workflow_builder';
 import {
   emptyRuntimeEventStore,
@@ -127,6 +130,8 @@ const CommitSummaryPanel = lazy(async () => {
   const mod = await import('./CommitSummaryPanel');
   return { default: mod.CommitSummaryPanel };
 });
+
+const ImpactPanel = lazy(async () => ({ default: (await import('./ImpactPanel')).ImpactPanel }));
 
 const RepoMonacoFileEditorPanel = lazy(async () => {
   const mod = await import('./RepoMonacoFileEditorPanel');
@@ -176,8 +181,8 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'flight_deck' | 'runtime';
-type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities';
+type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime' | 'settings';
+type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities' | 'impact';
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -188,6 +193,7 @@ type StageModifierAction = {
   key: string;
   label: string;
   status?: string;
+  lifecycle?: string;
   color?: string;
   buttonLabel: string;
   onOpen?: () => void;
@@ -1380,6 +1386,9 @@ const StageModifierActions = memo(function StageModifierActions(props: {
               {action.status ? (
                 <Badge variant="light" color={action.color ?? 'blue'}>{action.status}</Badge>
               ) : null}
+              {action.lifecycle ? (
+                <Badge variant="light" color={action.lifecycle === 'Non-persistent' ? 'orange' : 'gray'}>{action.lifecycle}</Badge>
+              ) : null}
             </Group>
             {action.helperText ? <Text size="xs" c="dimmed">{action.helperText}</Text> : null}
           </Stack>
@@ -1466,6 +1475,8 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, unknown>>({});
   const userInputIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
   const [userInputDraft, setUserInputDraftState] = useState(stageUserInput);
+  const [defaultInputExpanded, setDefaultInputExpanded] = useState(false);
+  const [defaultInputDraft, setDefaultInputDraft] = useState('');
 
   const setUserInputDraft = useCallback((value: string) => {
     setUserInputDraftState(value);
@@ -1476,6 +1487,76 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     setUserInputDraftState(stageUserInput);
   }, [userInputIdentity, stageUserInput]);
   const usesInference = stepUsesCapability(selectedWorkflowStep, 'inference');
+  const configuredDefaultInput = (selectedWorkflowStep?.execution_logic?.automation as { empty_user_input_default?: string } | undefined)?.empty_user_input_default;
+  const descriptorInferenceDefault = (descriptor?.definition_template?.config as Record<string, unknown> | undefined)?.inference_default_user_input;
+  const inheritedDefaultInput = typeof descriptorInferenceDefault === 'string'
+    ? descriptorInferenceDefault
+    : selectedWorkflowStep?.step_type === 'code'
+      ? 'please provide changeset in a codeblock with no comments to align coding'
+      : selectedWorkflowStep?.step_type === 'design' && Boolean(sharedPlannerFragmentState?.fragment_armed)
+        ? 'are you aligned with the feature implementation?'
+        : '';
+  const hasDefaultInputOverride = typeof configuredDefaultInput === 'string' && configuredDefaultInput.trim().length > 0;
+  const resolvedDefaultInput = hasDefaultInputOverride ? configuredDefaultInput : inheritedDefaultInput;
+
+  useEffect(() => {
+    setDefaultInputExpanded(false);
+  }, [userInputIdentity]);
+
+  useEffect(() => {
+    setDefaultInputDraft(resolvedDefaultInput);
+  }, [userInputIdentity, resolvedDefaultInput]);
+
+  function persistDefaultInput() {
+    if (!usesInference || defaultInputDraft === resolvedDefaultInput) return;
+    onPatchSelectedStepConfig('execution_logic.automation.empty_user_input_default', defaultInputDraft.trim() === inheritedDefaultInput.trim() ? '' : defaultInputDraft);
+  }
+
+  const defaultInputControl = usesInference ? (
+    <Button
+      size="xs"
+      variant={defaultInputExpanded ? 'light' : 'subtle'}
+      color="gray"
+      disabled={disabled}
+      onClick={() => {
+        if (defaultInputExpanded) persistDefaultInput();
+        setDefaultInputExpanded((current) => !current);
+      }}
+    >
+      Default input
+    </Button>
+  ) : null;
+
+  const defaultInputEditor = usesInference && defaultInputExpanded ? (
+    <Stack gap="xs">
+      <Textarea
+        aria-label="Default user input"
+        value={defaultInputDraft}
+        onChange={(event) => setDefaultInputDraft(event.currentTarget.value)}
+        onBlur={persistDefaultInput}
+        disabled={disabled}
+        minRows={2}
+        maxRows={10}
+        autosize
+      />
+      {hasDefaultInputOverride ? (
+        <Group justify="flex-end">
+          <Button
+            size="xs"
+            variant="subtle"
+            color="gray"
+            disabled={disabled}
+            onClick={() => {
+              setDefaultInputDraft(inheritedDefaultInput);
+              onPatchSelectedStepConfig('execution_logic.automation.empty_user_input_default', '');
+            }}
+          >
+            Restore stage default
+          </Button>
+        </Group>
+      ) : null}
+    </Stack>
+  ) : null;
   const usesRepoContext = !!selectedWorkflowStep && (
     usesInference
     || selectedWorkflowStep.step_type === 'design'
@@ -1609,11 +1690,20 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     }
 
     if (usesInference) {
+      const sessions = (sharedInferenceState?.sessions ?? {}) as Record<string, Record<string, unknown>>;
+      const stageSessions = (sharedInferenceState?.stage_sessions ?? {}) as Record<string, { session?: string }>;
+      const stageType = selectedWorkflowStep?.step_type ?? '';
+      const sessionName = stageSessions[stageType]?.session;
+      const session = sessionName ? sessions[sessionName] : null;
+      const transport = session?.transport;
+      const lifecycle = session?.lifecycle;
+
       actions.push({
         key: 'inference',
         label: 'Inference',
-        status: inferenceTransport === 'browser' ? 'Browser' : 'API',
-        color: inferenceConnectionStatus.color,
+        status: transport === 'browser' ? 'Browser' : transport === 'api' ? 'API' : 'Unmapped',
+        lifecycle: lifecycle === 'non_persistent' ? 'Non-persistent' : lifecycle === 'persistent' ? 'Persistent' : undefined,
+        color: transport === 'browser' ? 'violet' : transport === 'api' ? 'blue' : 'gray',
         buttonLabel: 'Configure',
         onOpen: onOpenInferenceConfig
       });
@@ -1674,8 +1764,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
     designMode,
     fineFeatureFormatArmed,
     autoNormalizeAndApplyToPlanner,
-    inferenceConnectionStatus,
-    inferenceTransport,
+    selectedWorkflowStep,
     onOpenInferenceConfig,
     onOpenDeployQA,
     stageApplyError,
@@ -1786,6 +1875,24 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
       );
     }
 
+    if (field.bind_to === 'prompt.user_input') {
+      return (
+        <StageInputAttachments
+          key={`${userInputIdentity}:${field.key}`}
+          runId={selectedRunId}
+          stepId={selectedWorkflowStep?.id ?? null}
+          label={field.label}
+          description={field.description}
+          value={userInputDraft}
+          onChange={setUserInputDraft}
+          disabled={disabled}
+          minRows={4}
+          defaultInputControl={defaultInputControl}
+          defaultInputEditor={defaultInputEditor}
+        />
+      );
+    }
+
     if (field.type === 'multiline_text') {
       return (
         <Textarea
@@ -1821,12 +1928,16 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
           : `${descriptor?.label ?? selectedWorkflowStep?.name ?? 'Stage'} inputs`}
       </Title>
       {!descriptor ? (
-        <Textarea
-          label="User input"
+        <StageInputAttachments
+          key={userInputIdentity}
+          runId={selectedRunId}
+          stepId={selectedWorkflowStep?.id ?? null}
           value={userInputDraft}
-          onChange={(event) => setUserInputDraft(event.currentTarget.value)}
+          onChange={setUserInputDraft}
           disabled={disabled}
           minRows={2}
+          defaultInputControl={defaultInputControl}
+          defaultInputEditor={defaultInputEditor}
         />
       ) : null}
       {selectedWorkflowStep?.step_type !== 'qa'
@@ -1836,7 +1947,7 @@ const BackendDrivenStageInputsPanel = memo(function BackendDrivenStageInputsPane
                 <Text fw={600} size="sm">{group.label}</Text>
               ) : null}
               {group.fields
-                .filter((field) => fieldVisible(field))
+                .filter((field) => fieldVisible(field) && field.bind_to !== 'execution_logic.automation.empty_user_input_default')
                 .map((field) => renderField(field))}
             </Stack>
           ))
@@ -2220,13 +2331,13 @@ const runtimeProjectionHydrationByRunId = new Map<string, Promise<void>>();
 
 let canonicalChangesetSchemaRequest: Promise<string> | null = null;
 
-async function getCachedCanonicalChangesetSchema(): Promise<string> {
+async function getCachedCanonicalChangesetSchema(runId?: string): Promise<string> {
   if (canonicalChangesetSchemaCache !== null) {
     return canonicalChangesetSchemaCache;
   }
 
   if (!canonicalChangesetSchemaRequest) {
-    canonicalChangesetSchemaRequest = getChangesetSchema()
+    canonicalChangesetSchemaRequest = getChangesetSchema(runId)
       .then((response) => {
         canonicalChangesetSchemaCache = response.schema;
         return response.schema;
@@ -2239,13 +2350,15 @@ async function getCachedCanonicalChangesetSchema(): Promise<string> {
   return canonicalChangesetSchemaRequest;
 }
 
+import { ApplicationSettings } from './ApplicationSettings';
+
 export function WorkflowShell(props: {
   route?: {
     path: string;
     workflowRunId: string | null;
-    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
+    workflowView?: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact' | null;
     supervisorRunId: string | null;
-    supervisorView?: 'planner' | 'sprint' | null;
+    supervisorView?: 'planner' | null;
   };
   navigate?: (path: string) => void;
 }) {
@@ -2318,7 +2431,7 @@ export function WorkflowShell(props: {
     if (!selectedRunId || !selectedWorkflowStep) return;
 
     if (bindTo === 'prompt.user_input') {
-      setStageUserInput(typeof value === 'string' ? value : String(value ?? ''));
+      setStageUserInputDraft(typeof value === 'string' ? value : String(value ?? ''));
       return;
     } else if (bindTo === 'execution.compile_checks.commands_text') {
       setStageCompileCommandsText(typeof value === 'string' ? value : String(value ?? ''));
@@ -2445,6 +2558,8 @@ export function WorkflowShell(props: {
 
   const [stageUserInput, setStageUserInputState] = useState('');
   const stageUserInputRef = useRef('');
+  const stageUserInputDraftsRef = useRef<Map<string, string>>(new Map());
+  const stageUserInputHydrationRef = useRef<string | null>(null);
 
   function setStageUserInput(value: string) {
     stageUserInputRef.current = value;
@@ -2452,6 +2567,10 @@ export function WorkflowShell(props: {
   }
 
   const setStageUserInputDraft = useCallback((value: string) => {
+    const draftKey = stageUserInputHydrationRef.current;
+    if (draftKey) {
+      stageUserInputDraftsRef.current.set(draftKey, value);
+    }
     stageUserInputRef.current = value;
   }, []);
   const [stageIncludeRepoContext, setStageIncludeRepoContext] = useState(false);
@@ -3363,14 +3482,27 @@ export function WorkflowShell(props: {
       return;
     }
 
-    if (routedPath === '/flight-deck' || routedSupervisorRunId || routedPath === '/supervisors') {
+    if (routedSupervisorRunId || routedPath === '/supervisors') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
-      setMonitorHomeView((value) => value === 'flight_deck' ? value : 'flight_deck');
+      setMonitorHomeView((value) => value === 'supervisor' ? value : 'supervisor');
       setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
-      if (routedPath !== '/flight-deck') {
-        props.navigate?.('/flight-deck');
-      }
+      return;
+    }
+
+    if (routedPath === '/templates') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'templates' ? value : 'templates');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+      return;
+    }
+
+    if (routedPath === '/settings') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'settings' ? value : 'settings');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
       return;
     }
 
@@ -3612,30 +3744,69 @@ export function WorkflowShell(props: {
       return;
     }
 
-    const sessions = ((inference.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const defaultSessionName = typeof inference.default_session === 'string' ? inference.default_session : '';
-    const defaultSession = defaultSessionName ? ((sessions[defaultSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
-    setInferenceTransport(defaultSession.transport === 'browser' ? 'browser' : 'api');
+    const routes = ((inference.routes as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const defaultRouteName = typeof inference.default_route === 'string' ? inference.default_route : '';
+    const defaultRoute = defaultRouteName ? ((routes[defaultRouteName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(defaultRoute.transport === 'browser' ? 'browser' : 'api');
     setBrowserProbe(null);
   }, [sharedInferenceState, selectedRun?.id]);
 
   useEffect(() => {
     if (!changesetSchemaConfigOpen) return;
-    if (stageChangesetSchemaText.trim()) return;
+
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    const builderGlobals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const builderCapabilities = (builderGlobals.capabilities as Record<string, unknown> | undefined) ?? {};
+    const builderSchema = (builderCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    const persistedSchema = view === 'builder' ? builderSchema.schema : currentSchema.schema;
+
+    if (typeof persistedSchema === 'string' && persistedSchema.trim()) {
+      setStageChangesetSchemaText(persistedSchema);
+      return;
+    }
 
     let cancelled = false;
-    void getCachedCanonicalChangesetSchema()
-      .then((schema) => {
+    const runId = view === 'builder' ? undefined : selectedRun?.id;
+
+    void getChangesetSchema(runId)
+      .then(async ({ schema }) => {
+        if (cancelled || !schema.trim()) return;
+
+        if (view === 'builder') {
+          saveBuilderCapability('changeset_schema', {
+            ...builderSchema,
+            schema
+          });
+        } else if (selectedRun?.id) {
+          await patchGlobalCapabilityState({
+            capabilities: {
+              ...currentCapabilities,
+              changeset_schema: {
+                ...currentSchema,
+                schema
+              }
+            }
+          });
+        } else {
+          return;
+        }
+
         if (!cancelled) {
           setStageChangesetSchemaText(schema);
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        if (!cancelled) {
+          setError(error instanceof Error ? error.message : String(error));
+        }
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [changesetSchemaConfigOpen, stageChangesetSchemaText]);
+  }, [changesetSchemaConfigOpen, view, selectedRun?.id]);
 
   useEffect(() => {
     if (!globalApplyChangesetOpen) return;
@@ -3703,7 +3874,7 @@ export function WorkflowShell(props: {
     } else if (canonicalChangesetSchemaCache !== null) {
       setStageChangesetSchemaText(canonicalChangesetSchemaCache);
     } else if (step.step_type === 'code') {
-      void getCachedCanonicalChangesetSchema()
+      void getCachedCanonicalChangesetSchema(selectedRunId ?? undefined)
         .then((schema) => {
           const stageIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
           const hydratedStageIdentityRef = { current: stageIdentity };
@@ -3753,10 +3924,10 @@ export function WorkflowShell(props: {
         ? Boolean(selectedAutomation.auto_apply_changeset)
         : Boolean((step.execution?.changeset_apply as Record<string, unknown> | undefined)?.enabled ?? step.step_type === 'code')
     );
-    const inferenceSessions = ((inferenceConfig.sessions as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-    const inferenceSessionName = typeof inferenceConfig.default_session === 'string' ? inferenceConfig.default_session : '';
-    const inferenceSession = inferenceSessionName ? ((inferenceSessions[inferenceSessionName] as Record<string, unknown> | undefined) ?? {}) : {};
-    setInferenceTransport(inferenceSession.transport === 'browser' ? 'browser' : 'api');
+    const inferenceRoutes = ((inferenceConfig.routes as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const inferenceRouteName = typeof inferenceConfig.default_route === 'string' ? inferenceConfig.default_route : '';
+    const inferenceRoute = inferenceRouteName ? ((inferenceRoutes[inferenceRouteName] as Record<string, unknown> | undefined) ?? {}) : {};
+    setInferenceTransport(inferenceRoute.transport === 'browser' ? 'browser' : 'api');
     setStageRepoContextGitRef(typeof repoContext.git_ref === 'string' && repoContext.git_ref.trim() ? repoContext.git_ref : 'WORKTREE');
     setSelectedRepoPaths(includeFiles);
     setSelectedRepoDirs(new Set(includeDirectories));
@@ -3774,7 +3945,17 @@ export function WorkflowShell(props: {
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
     setStageRepoContextInlinePrompt(Boolean(repoContext.inline_repo_context_in_prompt));
 
-    setStageUserInput(hydratedUserInput);
+    const drafts = stageUserInputDraftsRef.current;
+    const previousStageKey = stageUserInputHydrationRef.current;
+    const stageChanged = previousStageKey !== null && previousStageKey !== selectedStageHydrationKey;
+
+    if (stageChanged) {
+      drafts.clear();
+    }
+
+    const existingDraft = drafts.get(selectedStageHydrationKey);
+    setStageUserInput(stageChanged ? '' : existingDraft ?? hydratedUserInput);
+    stageUserInputHydrationRef.current = selectedStageHydrationKey;
   }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
 
 
@@ -4131,20 +4312,27 @@ export function WorkflowShell(props: {
 
   function capabilityIoPayload(capability: LiveCapabilityTrail): Record<string, unknown> {
     return {
-      capability_id: capability.capabilityId,
       name: capability.name,
       status: capability.status,
-      latest_kind: capability.latestKind,
-      latest_level: capability.latestLevel,
-      input: capability.inputPayload ?? null,
-      output: capability.outputPayload ?? capability.latestPayload ?? null
+      message: capability.message,
+      input: deriveCapabilityPayload('input', capability.inputPayload),
+      output: deriveCapabilityPayload('output', capability.outputPayload ?? capability.latestPayload)
     };
   }
 
   function deriveCapabilityPayload(role: 'input' | 'output', payload: unknown): unknown {
     const objectPayload = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
     if (!objectPayload) return payload ?? null;
+
     if (role === 'input') {
+      const config = asRecord(objectPayload.config);
+      if (objectPayload.capability === 'git_patch_payload' && config) {
+        return {
+          work_unit_id: config.work_unit_id ?? null,
+          workspace_path: config.workspace_path ?? null,
+          target_repo_ref: config.target_repo_ref ?? null
+        };
+      }
       return objectPayload.input ?? objectPayload.inputs ?? objectPayload.request ?? objectPayload.args ?? objectPayload.payload ?? objectPayload;
     }
 
@@ -4157,6 +4345,23 @@ export function WorkflowShell(props: {
           ? outputRecord.lines.filter((line): line is string => typeof line === 'string')
           : []
       };
+    }
+
+    if (objectPayload.capability === 'git_patch_payload') {
+      const result = asRecord(objectPayload.result) ?? outputRecord;
+      if (result) {
+        return {
+          ok: result.ok ?? null,
+          summary: result.summary ?? null,
+          error_type: result.error_type ?? null,
+          failed_files: Array.isArray(result.failed_files) ? result.failed_files : [],
+          work_unit_id: result.work_unit_id ?? null,
+          workspace_path: result.workspace_path ?? null,
+          patch_id: result.patch_id ?? null,
+          patch_bytes: result.patch_bytes ?? null,
+          details: result.details ?? null
+        };
+      }
     }
 
     return output;
@@ -4173,14 +4378,15 @@ export function WorkflowShell(props: {
     const nestedError = asRecord(record.error);
 
     const candidates = [
+      record.summary,
+      result?.summary,
+      nestedError?.summary,
       record.error_message,
       record.error,
       nestedError?.message,
-      nestedError?.summary,
       result?.error_message,
       result?.error,
       result?.message,
-      result?.summary,
       result?.status,
       nestedOutput?.error_message,
       nestedOutput?.error,
@@ -4863,13 +5069,19 @@ export function WorkflowShell(props: {
       const snapshotStepId = typeof payload.current_step_id === 'string'
         ? payload.current_step_id
         : incoming.step_id;
-      setRuns((prev) => prev.map((run) => run.id === runId ? {
-        ...run,
-        ...(snapshotStatus ? { status: snapshotStatus } : {}),
-        current_step_id: snapshotStepId ?? run.current_step_id,
-        context: snapshotContext as Record<string, unknown>,
-        updated_at: incoming.created_at
-      } : run));
+      setRuns((prev) => prev.map((run) => {
+        if (run.id !== runId) return run;
+        const currentUpdatedAt = Date.parse(run.updated_at);
+        const incomingUpdatedAt = Date.parse(incoming.created_at);
+        if (Number.isFinite(currentUpdatedAt) && Number.isFinite(incomingUpdatedAt) && incomingUpdatedAt < currentUpdatedAt) return run;
+        return {
+          ...run,
+          ...(snapshotStatus ? { status: snapshotStatus } : {}),
+          current_step_id: snapshotStepId ?? run.current_step_id,
+          context: snapshotContext as Record<string, unknown>,
+          updated_at: incoming.created_at
+        };
+      }));
     }
   }
 
@@ -4931,12 +5143,14 @@ export function WorkflowShell(props: {
         return `${base}/repository`;
       case 'capabilities':
         return `${base}/capabilities`;
+      case 'impact':
+        return `${base}/impact`;
       default:
         return base;
     }
   }
 
-  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null | undefined): WorkspaceTabKey {
+  function workspaceTabFromRouteView(view: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact' | null | undefined): WorkspaceTabKey {
     switch (view) {
       case 'changes':
         return 'diff';
@@ -4946,6 +5160,8 @@ export function WorkflowShell(props: {
         return 'files';
       case 'capabilities':
         return 'capabilities';
+      case 'impact':
+        return 'impact';
       default:
         return 'workflows';
     }
@@ -4961,6 +5177,8 @@ export function WorkflowShell(props: {
         return 'repository';
       case 'capabilities':
         return 'capabilities';
+      case 'impact':
+        return 'impact';
       default:
         return 'workflow';
     }
@@ -4984,24 +5202,68 @@ export function WorkflowShell(props: {
     props.navigate?.(workflowTabRoute(runId, 'workflows'));
   }
 
-  function backToWorkflowList() {
-    setMonitorView('workflow_list');
-    setMonitorHomeView('workflows');
-    props.navigate?.('/workflows');
-  }
-
-  function handleWorkflowListLinkClick(event: { defaultPrevented: boolean; button: number; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; preventDefault: () => void }) {
-    if (shouldUseBrowserNavigation(event)) return;
-    event.preventDefault();
-    backToWorkflowList();
-  }
-
   async function openBuilder() {
     try {
       setBusy(true);
       setError(null);
       await refreshRunsAndTemplates();
       setView('builder');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openNewTemplateBuilder() {
+    try {
+      setBusy(true);
+      setError(null);
+      await refreshRunsAndTemplates();
+      setSelectedTemplateId(null);
+      setWorkflowName('New workflow template');
+      setWorkflowDescription('');
+      setRepoRef('');
+      updateCompiledBuilderDefinition(null);
+      setLoadedTemplateDefinition(null);
+      setBuilderGlobals(defaultGlobals());
+      setJsonDraft('');
+      setBuilderLoadRevision((previous) => previous + 1);
+      setBuilderMode('builder');
+      setCreateRunAfterSave(false);
+      setView('builder');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function openTemplateBuilder(templateId: string) {
+    handleLoadTemplateMetadata(templateId);
+    setCreateRunAfterSave(false);
+    setView('builder');
+  }
+
+  async function createWorkflowDirectlyFromTemplate(template: WorkflowTemplate) {
+    try {
+      setBusy(true);
+      setError(null);
+      const run = await createRun({
+        template_id: template.id,
+        title: template.name,
+        repo_ref: template.repo_ref,
+        definition: template.definition,
+        context: {
+          workflow_engine: {}
+        }
+      });
+      await refreshRunsAndTemplates(run.id);
+      setSelectedRunId(run.id);
+      setView('monitor');
+      setMonitorView('workflow_detail');
+      setActiveWorkspaceTab('workflows');
+      props.navigate?.(workflowTabRoute(run.id, 'workflows'));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -5150,18 +5412,26 @@ export function WorkflowShell(props: {
     }
   }
 
+  function clearStageUserInputAfterExecution(runId: string, stepId: string | null) {
+    if (!stepId) return;
+    const draftKey = `${runId}:${stepId}`;
+    stageUserInputDraftsRef.current.set(draftKey, '');
+    if (stageUserInputHydrationRef.current === draftKey) {
+      setStageUserInput('');
+    }
+  }
+
   async function executeWorkflowStage(
     runId: string,
     stepId: string | null,
     userInput: string,
     mode: 'single' | 'autonomous'
   ) {
-    setStageUserInput(userInput);
+    const executionInput = userInput;
+    const stagePayload = stepId ? structuredClone(buildInteractiveStagePayload()) : null;
+    const attachmentFiles = stepId ? [...getStageInputAttachments(runId, stepId)] : [];
 
-    if (stepId) {
-      await patchWorkflowStageUserInput(runId, stepId, userInput);
-
-      const stagePayload = structuredClone(buildInteractiveStagePayload());
+    if (stagePayload) {
       const prompt = asRecord(stagePayload.prompt);
       if (prompt && Object.prototype.hasOwnProperty.call(prompt, 'user_input')) {
         delete prompt.user_input;
@@ -5169,8 +5439,22 @@ export function WorkflowShell(props: {
           delete stagePayload.prompt;
         }
       }
+    }
 
-      if (Object.keys(stagePayload).length > 0) {
+    if (stepId) {
+      await patchWorkflowStageUserInput(runId, stepId, executionInput);
+
+      if (attachmentFiles.length > 0) {
+        const attachments = await serializeStageInputAttachments(attachmentFiles);
+        await sendRunAction(runId, {
+          action: 'publish_stage_attachments',
+          step_id: stepId,
+          payload: { attachments }
+        });
+        clearStageInputAttachments(runId, stepId);
+      }
+
+      if (stagePayload && Object.keys(stagePayload).length > 0) {
         await patchWorkflowStageState(runId, stepId, stagePayload);
       }
     }
@@ -5200,12 +5484,15 @@ export function WorkflowShell(props: {
 
     const runId = selectedRunId;
     const stepId = selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? null;
-    const latestUserInput = stageUserInputRef.current;
+    const draftKey = stepId ? `${runId}:${stepId}` : null;
+    const latestUserInput = (draftKey ? stageUserInputDraftsRef.current.get(draftKey) : undefined)
+      ?? (stageUserInputHydrationRef.current === draftKey ? stageUserInputRef.current : '');
 
     try {
       setBusy(true);
       setError(null);
       await executeWorkflowStage(runId, stepId, latestUserInput, 'autonomous');
+      clearStageUserInputAfterExecution(runId, stepId);
       await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -5653,7 +5940,7 @@ export function WorkflowShell(props: {
   async function loadCanonicalChangesetSchema(forceOverride = true) {
     try {
       setChangesetSchemaBusy(true);
-      const json = await getChangesetSchema();
+      const json = await getChangesetSchema(selectedRunId ?? undefined);
       if (forceOverride || !stageChangesetSchemaText.trim()) {
         setStageChangesetSchemaText(typeof json.schema === 'string' ? json.schema : '');
       }
@@ -6558,10 +6845,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
     const runId = selectedRun.id;
     const stepId = selectedRunStepId;
-    const latestUserInput = stageUserInputRef.current;
+    const draftKey = `${runId}:${stepId}`;
+    const latestUserInput = stageUserInputDraftsRef.current.get(draftKey)
+      ?? (stageUserInputHydrationRef.current === draftKey ? stageUserInputRef.current : '');
 
     await runManualCapability(async () => {
       const json = await executeWorkflowStage(runId, stepId, latestUserInput, 'single');
+      clearStageUserInputAfterExecution(runId, stepId);
       return json as Record<string, unknown>;
     }, 'Executed current stage through backend workflow engine.');
   }
@@ -6787,17 +7077,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         return;
       }
       if (!selectedRun) return;
-      const currentGlobalState = ((selectedRun.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
-      const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
-      await patchWorkflowGlobalState(selectedRun.id, {
+      const response = await patchWorkflowGlobalState(selectedRun.id, {
         capabilities: {
-          ...currentCapabilities,
           inference: inferencePatch,
         },
-      });
+      }) as { ok: boolean; global_state: Record<string, unknown> };
+      if (!response.ok) throw new Error('Failed to save inference configuration');
+      const runId = selectedRun.id;
+      setRuns((prev) => prev.map((run) => {
+        if (run.id !== runId) return run;
+        const workflowEngine = (run.context?.workflow_engine as Record<string, unknown> | undefined) ?? {};
+        return {
+          ...run,
+          context: {
+            ...run.context,
+            workflow_engine: {
+              ...workflowEngine,
+              global_state: response.global_state,
+            },
+          },
+        };
+      }));
       setInferenceStatus('Inference sessions saved.');
       setGlobalInferenceConfigOpen(false);
-      await refreshSelectedRunArtifacts();
     } catch (err) {
       setInferenceStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -6908,6 +7210,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
       if (key === '5') {
         setActiveWorkspaceTab('capabilities');
+        return;
+      }
+      if (key === '6') {
+        setActiveWorkspaceTab('impact');
       }
     };
 
@@ -6923,15 +7229,43 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           {error ? <Alert color="red">{error}</Alert> : null}
 
           {view !== 'builder' && monitorView === 'workflow_detail' ? (
-            <Tabs value={activeWorkspaceTab} onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}>
-              <Tabs.List>
-                <Tabs.Tab value="workflows">Workflow (Alt+1)</Tabs.Tab>
-                <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
-                <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
-                <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
-                <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
-              </Tabs.List>
-            </Tabs>
+            <>
+              <AppHeader
+                active="workflows"
+                onChange={(next) => {
+                  setView('monitor');
+                  setMonitorView('workflow_list');
+                  setMonitorHomeView(next);
+                  setActiveWorkspaceTab('workflows');
+
+                  if (next === 'supervisor') {
+                    props.navigate?.('/supervisors');
+                  } else if (next === 'templates') {
+                    props.navigate?.('/templates');
+                  } else if (next === 'runtime') {
+                    props.navigate?.('/runtime');
+                  } else if (next === 'settings') {
+                    props.navigate?.('/settings');
+                  } else {
+                    props.navigate?.('/workflows');
+                  }
+                }}
+              >
+                <Tabs
+                    value={activeWorkspaceTab}
+                    onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}
+                  >
+                    <Tabs.List style={{ borderBottom: 0 }}>
+                  <Tabs.Tab value="workflows">Home (Alt+1)</Tabs.Tab>
+                  <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
+                  <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
+                  <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
+                  <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
+                  <Tabs.Tab value="impact">Impact (Alt+6)</Tabs.Tab>
+                    </Tabs.List>
+                  </Tabs>
+              </AppHeader>
+            </>
           ) : null}
 
           {view === 'builder' ? (
@@ -6950,7 +7284,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               }}
             >
               <Stack h="100%" gap="sm">
-                <Card withBorder p="sm">
+                <AppSurface p="sm">
                   <Stack gap="sm">
                     <Group justify="space-between" align="flex-start" wrap="wrap">
                       <Stack gap={2}>
@@ -6981,9 +7315,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       </Grid.Col>
                     </Grid>
                   </Stack>
-                </Card>
+                </AppSurface>
 
-                <Card withBorder p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
+                <AppSurface p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
                   <WorkflowBuilderEditor
                     key={`builder-load-${builderLoadRevision}`}
                     initialDefinition={loadedTemplateDefinition}
@@ -7030,7 +7364,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                       });
                     }}
                   />
-                </Card>
+                </AppSurface>
               </Stack>
             </Modal>
           ) : activeWorkspaceTab === 'diff' ? (
@@ -7050,6 +7384,10 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           ) : activeWorkspaceTab === 'files' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
               <RepoMonacoFileEditorPanel runId={selectedRun?.id ?? ''} />
+            </Suspense>
+          ) : activeWorkspaceTab === 'impact' ? (
+            <Suspense fallback={<Card withBorder p="lg"><Loader size="sm" /></Card>}>
+              <ImpactPanel runId={selectedRunId} />
             </Suspense>
           ) : activeWorkspaceTab === 'capabilities' ? (
             <Card withBorder>
@@ -7083,79 +7421,122 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             </Card>
           ) : monitorView === 'workflow_list' ? (
             <Stack>
-              <Card withBorder>
-                <Stack gap="sm">
-                  <Group justify="space-between" align="center" wrap="wrap">
-                    <Stack gap={2}>
-                      <Title order={4}>Workspace monitor</Title>
-                    </Stack>
-                    <Group>
-                      <Button
-                        size="xs"
-                        onClick={() => {
-                          if (monitorHomeView === 'workflows') {
-                            void openBuilder();
-                          } else {
-                            props.navigate?.('/flight-deck');
-                          }
-                        }}
-                        loading={monitorHomeView === 'workflows' ? busy : false}
-                      >
-                        {monitorHomeView === 'workflows' ? 'New workflow' : 'Flight Deck'}
-                      </Button>
-                      <Button
-                        size="xs"
-                        variant="default"
-                        leftSection={<IconRefresh size={16} />}
-                        onClick={() => {
-                          if (monitorHomeView === 'workflows') {
-                            void refreshRunsAndTemplates();
-                          } else if (monitorHomeView === 'flight_deck') {
-                            props.navigate?.('/flight-deck');
-                          } else {
-                            props.navigate?.('/runtime');
-                          }
-                        }}
-                      >
-                        Refresh
-                      </Button>
-                    </Group>
-                  </Group>
-                  <Tabs
-                    value={monitorHomeView}
-                    onChange={(value) => {
-                      const next = (value as MonitorHomeView | null) ?? 'workflows';
-                      setMonitorHomeView((current) => current === next ? current : next);
-                      if (next === 'runtime') {
-                        props.navigate?.('/runtime');
-                      } else if (next === 'flight_deck') {
-                        props.navigate?.('/flight-deck');
-                      } else {
-                        props.navigate?.('/workflows');
-                      }
-                    }}
-                  >
-                    <Tabs.List>
-                      <Tabs.Tab value="workflows">Workflows</Tabs.Tab>
-                      <Tabs.Tab value="flight_deck">Flight Deck</Tabs.Tab>
-                      <Tabs.Tab value="runtime">Runtime</Tabs.Tab>
-                    </Tabs.List>
-                  </Tabs>
-                </Stack>
-              </Card>
+              {monitorHomeView !== 'supervisor' ? (
+                <AppHeader
+                  active={monitorHomeView}
+                  onChange={(next) => {
+                    setMonitorHomeView((current) => current === next ? current : next);
+                    if (next === 'runtime') {
+                      props.navigate?.('/runtime');
+                    } else if (next === 'settings') {
+                      props.navigate?.('/settings');
+                    } else if (next === 'supervisor') {
+                      props.navigate?.('/supervisors');
+                    } else if (next === 'templates') {
+                      props.navigate?.('/templates');
+                    } else {
+                      props.navigate?.('/workflows');
+                    }
+                  }}
+                  actions={monitorHomeView === 'workflows' ? (
+                    <AppHeaderAction onClick={() => void openBuilder()} loading={busy}>
+                      New workflow
+                    </AppHeaderAction>
+                  ) : monitorHomeView === 'templates' ? (
+                    <AppHeaderAction onClick={() => void openNewTemplateBuilder()} loading={busy}>
+                      New template
+                    </AppHeaderAction>
+                  ) : undefined}
+                />
+              ) : null}
 
-              {monitorHomeView === 'runtime' ? (
+              {monitorHomeView === 'settings' ? (
+                <ApplicationSettings />
+              ) : monitorHomeView === 'runtime' ? (
                 <RuntimeAdmin />
-              ) : monitorHomeView === 'flight_deck' ? (
-                <FlightDeckPanel
+              ) : monitorHomeView === 'supervisor' ? (
+                <SupervisorPanel
                   navigate={props.navigate}
                 />
+              ) : monitorHomeView === 'templates' ? (
+                <AppSurface p="md">
+                  <Stack gap="sm">
+                    <Group justify="space-between" align="center" wrap="wrap">
+                      <Group gap="xs">
+                        <Title order={4}>Templates</Title>
+                        <Badge variant="light" color="gray">{templates.length}</Badge>
+                      </Group>
+                    </Group>
+
+                    {templates.length === 0 ? (
+                      <Text size="sm" c="dimmed">No saved templates yet.</Text>
+                    ) : (
+                      <Table striped highlightOnHover>
+                        <Table.Thead>
+                          <Table.Tr>
+                            <Table.Th>Template</Table.Th>
+                            <Table.Th>Description</Table.Th>
+                            <Table.Th>Repo</Table.Th>
+                            <Table.Th>Actions</Table.Th>
+                          </Table.Tr>
+                        </Table.Thead>
+                        <Table.Tbody>
+                          {templates.map((template) => (
+                            <Table.Tr key={template.id}>
+                              <Table.Td>
+                                <Text fw={700}>{template.name}</Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Text size="sm" c="dimmed" lineClamp={2}>
+                                  {template.description || 'No description provided.'}
+                                </Text>
+                              </Table.Td>
+                              <Table.Td>
+                                <Code>{template.repo_ref || '—'}</Code>
+                              </Table.Td>
+                              <Table.Td>
+                                <Group gap="xs" wrap="nowrap">
+                                  <Button
+                                    size="compact-xs"
+                                    variant="light"
+                                    onClick={() => openTemplateBuilder(template.id)}
+                                  >
+                                    Edit
+                                  </Button>
+                                  <Button
+                                    size="compact-xs"
+                                    variant="light"
+                                    onClick={() => void createWorkflowDirectlyFromTemplate(template)}
+                                    loading={busy}
+                                  >
+                                    New workflow
+                                  </Button>
+                                  <ActionIcon
+                                    color="red"
+                                    variant="subtle"
+                                    aria-label={`Delete ${template.name}`}
+                                    onClick={() => void handleDeleteTemplate(template.id)}
+                                  >
+                                    <IconTrash size={16} />
+                                  </ActionIcon>
+                                </Group>
+                              </Table.Td>
+                            </Table.Tr>
+                          ))}
+                        </Table.Tbody>
+                      </Table>
+                    )}
+                  </Stack>
+                </AppSurface>
               ) : (
                 <>
-                  <Card withBorder>
-                    <Stack>
+                  <AppSurface p="md">
+                    <Stack gap="sm">
                       <Group justify="space-between" align="center" wrap="wrap">
-                        <Title order={4}>Workflow list</Title>
+                        <Group gap="xs">
+                          <Title order={4}>Workflow list</Title>
+                          <Badge variant="light" color="gray">{runs.length}</Badge>
+                        </Group>
                       </Group>
                       <Table striped highlightOnHover>
                         <Table.Thead>
@@ -7193,7 +7574,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         </Table.Tbody>
                       </Table>
                     </Stack>
-                  </Card>
+                  </AppSurface>
 
                   <Card withBorder>
                     <Stack>
@@ -7242,14 +7623,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     width: '100%'
                   }}
                 >
-                  <Card withBorder>
+                  <AppSurface p="md">
                     {selectedRun ? (
                       <Stack>
                         <Group justify="space-between">
                           <Group>
-                            <Button variant="light" component="a"
-              href="/workflows"
-              onClick={handleWorkflowListLinkClick}>Back to workflows</Button>
                             <div>
                               <Title order={4}>{selectedRun.title}</Title>
                               <Text c="dimmed">{selectedRun.repo_ref}</Text>
@@ -7341,9 +7719,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     ) : (
                       <Text c="dimmed">No workflow selected.</Text>
                     )}
-                  </Card>
+                  </AppSurface>
 
-                  <Card withBorder>
+                  <AppSurface p="md">
                     <Stack>
                       <Grid align="stretch">
                         <Grid.Col span={{ base: 12, xl: 4 }}>
@@ -7475,7 +7853,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
                       {manualCapabilityStatus ? <Alert color={manualCapabilityStatus.toLowerCase().includes('error') ? 'red' : 'blue'}>{manualCapabilityStatus}</Alert> : null}
                     </Stack>
-                  </Card>
+                  </AppSurface>
                   </Stack>
                 </Grid.Col>
 
@@ -7488,8 +7866,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     overflow: 'hidden'
                   }}
                 >
-                  <Card
-                    withBorder
+                  <AppSurface
                     style={{
                       height: '100%',
                       width: '100%',
@@ -7662,7 +8039,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         ) : null}
                       </ScrollArea>
                     </Stack>
-                  </Card>
+                  </AppSurface>
                 </Grid.Col>
               </Grid>
             )}
@@ -7768,7 +8145,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={Boolean(overlayPlanner)}
-          rootRepoPath={overlayPlanner?.rootRepoPath ?? ''}
+          repoRef={overlayPlanner?.rootRepoPath ?? ''}
           onClose={() => setOverlayPlanner(null)}
           onSaved={() => props.navigate?.('/flight-deck')}
           onError={setError}
@@ -7777,7 +8154,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
         <PlannerModal
           opened={plannerFragmentConfigOpen}
-          rootRepoPath={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+          repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
           selectedPlannerId={selectedPlannerWorkspaceId}
           selectedFeatureId={selectedPlannerFeatureId}
           selectionMode
@@ -7801,15 +8178,26 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
           }}
         >
-          <InferenceSessionsPanel
-            opened={globalInferenceConfigOpen}
-            globals={currentInferencePanelGlobals()}
-            definition={currentInferencePanelDefinition()}
-            busy={inferenceBusy}
-            status={inferenceStatus}
-            onCancel={() => setGlobalInferenceConfigOpen(false)}
-            onSave={handleSaveInferenceSessionsPanel}
-          />
+          {workflowBuilderCatalog ? (
+            <InferenceSessionsPanel
+              opened={globalInferenceConfigOpen}
+              globals={currentInferencePanelGlobals()}
+              value={(((currentInferencePanelGlobals()?.capabilities as Record<string, unknown> | undefined)?.inference as Record<string, unknown> | undefined) ?? {})}
+              stageTypes={Array.from(new Set(
+                (currentInferencePanelDefinition()?.steps ?? [])
+                  .filter((step) => (workflowBuilderCatalog.stage_capabilities?.[step.step_type] ?? []).includes('inference'))
+                  .map((step) => step.step_type)
+              )).sort()}
+              repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()}
+              runId={selectedRun?.id ?? null}
+              busy={inferenceBusy}
+              status={inferenceStatus}
+              onCancel={() => setGlobalInferenceConfigOpen(false)}
+              onSave={handleSaveInferenceSessionsPanel}
+            />
+          ) : (
+            <Text size="sm" c="dimmed">Inference stage capabilities are unavailable. The connector cannot be edited until the workflow catalog loads.</Text>
+          )}
         </Modal>
 
         <Modal

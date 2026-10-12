@@ -671,29 +671,101 @@ export class SessionManager {
   async uploadFile(cmd: UploadFileCommand) {
     const state = this.getSession(cmd.session_id);
     const timeout = cmd.timeout_ms ?? 60000;
-    const inputSelector = cmd.input_selector ?? state.uploadInputSelector ?? 'input[type="file"]';
     const uploadName = this.basename(cmd.file_path);
+    const uploadTimeout = Math.min(timeout, 15000);
     let via = 'input';
 
-    const input = state.page.locator(inputSelector).first();
-    if (await input.count()) {
-      await input.setInputFiles(cmd.file_path, { timeout });
-    } else {
-      const triggerSelector = cmd.button_selector ?? state.uploadButtonSelector;
-      if (!triggerSelector) {
-        throw new Error(`No file input found for session ${state.sessionId}`);
+    const inputSelectors = cmd.input_selector
+      ? [cmd.input_selector]
+      : Array.from(new Set([
+          'input[type="file"][aria-label="Attach files"]',
+          'input[type="file"]:not([accept])',
+          state.uploadInputSelector,
+          'input[type="file"]'
+        ].filter((selector): selector is string => Boolean(selector))));
+
+    const findInput = async (): Promise<Locator | null> => {
+      for (const selector of inputSelectors) {
+        const candidates = state.page.locator(selector);
+        const count = await candidates.count().catch(() => 0);
+
+        for (let index = 0; index < count; index += 1) {
+          const candidate = candidates.nth(index);
+          const accept = await candidate.getAttribute('accept').catch(() => null);
+
+          if (selector === 'input[type="file"]' && accept) {
+            continue;
+          }
+
+          return candidate;
+        }
       }
 
-      const trigger = state.page.locator(triggerSelector).first();
-      const chooserPromise = state.page.waitForEvent('filechooser', { timeout });
-      await trigger.click({ timeout });
-      const chooser = await chooserPromise;
-      await chooser.setFiles(cmd.file_path);
-      via = 'filechooser';
+      return null;
+    };
+
+    let input = await findInput();
+
+    if (!input) {
+      const triggerSelectors = cmd.button_selector
+        ? [cmd.button_selector]
+        : Array.from(new Set([
+            'button[aria-label="Add files and more"]',
+            state.uploadButtonSelector,
+            'button[aria-label*="upload" i]',
+            'button[title*="upload" i]'
+          ].filter((selector): selector is string => Boolean(selector))));
+
+      let trigger: Locator | null = null;
+
+      for (const selector of triggerSelectors) {
+        const candidate = state.page.locator(selector).first();
+        const count = await candidate.count().catch(() => 0);
+        const visible = count > 0 && await candidate.isVisible().catch(() => false);
+
+        if (visible) {
+          trigger = candidate;
+          break;
+        }
+      }
+
+      if (!trigger) {
+        throw new Error(`No file input or upload trigger found for session ${state.sessionId}`);
+      }
+
+      const chooserPromise = state.page
+        .waitForEvent('filechooser', { timeout: uploadTimeout })
+        .catch(() => null);
+
+      await trigger.click({ timeout: uploadTimeout });
+
+      const inputDeadline = Date.now() + Math.min(uploadTimeout, 5000);
+      while (!input && Date.now() < inputDeadline) {
+        input = await findInput();
+        if (!input) {
+          await state.page.waitForTimeout(100);
+        }
+      }
+
+      if (!input) {
+        const chooser = await chooserPromise;
+        if (!chooser) {
+          throw new Error(`No file input appeared and no file chooser opened for session ${state.sessionId}`);
+        }
+        await chooser.setFiles(cmd.file_path);
+        via = 'filechooser';
+      }
+    }
+
+    if (input) {
+      await input.setInputFiles(cmd.file_path, { timeout: uploadTimeout });
+      via = 'input';
     }
 
     state.pendingUploads = Array.from(new Set([...state.pendingUploads, uploadName]));
+
     const ready = await this.waitForPendingUploads(state, Math.min(timeout, 20000));
+
     if (!ready) {
       throw new Error(`Upload did not become ready for session ${state.sessionId}: ${uploadName}`);
     }
@@ -748,33 +820,62 @@ export class SessionManager {
         return rect.width > 0 && rect.height > 0;
       };
 
-      const clean = (value: string) => value.trim().replace(/\s+/g, ' ');
+      const normalizeForMatching = (value: string) => value.trim().replace(/\s+/g, ' ');
       const isUsefulText = (text: string) => text.length > 0 && !/^[\s\d:AMPamp]+$/.test(text);
+      const extractText = (element: Element) => {
+        const clone = element.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll('[data-testid^="action-bar-"], .turn-action-controls').forEach((node) => node.remove());
+        return (clone.textContent ?? '').trim();
+      };
 
-      const actionButtons = Array.from(document.querySelectorAll('[data-testid="action-bar-copy"]')).filter(isVisible);
+      const actionButtons = Array.from(document.querySelectorAll(
+        '[data-testid="action-bar-copy"], .turn-action-controls button[aria-label="Copy"]'
+      )).filter(isVisible);
       const texts: string[] = [];
 
       for (const button of actionButtons) {
+        const actionBar = button.closest('.turn-action-controls');
+        const turn = actionBar?.parentElement;
+        const content = turn
+          ? Array.from(turn.children).find((child) => child !== actionBar)
+          : null;
+
+        if (content) {
+          const candidates = Array.from(content.children).filter((child) => {
+            const hasUserContent = child.matches('[data-user-message-bubble="true"]')
+              || Boolean(child.querySelector('[data-user-message-bubble="true"]'));
+            const text = extractText(child);
+            return !hasUserContent && isUsefulText(normalizeForMatching(text));
+          });
+
+          for (let index = candidates.length - 1; index >= 0; index -= 1) {
+            const candidate = candidates[index] as HTMLElement;
+            const rawText = extractText(candidate);
+            if (isUsefulText(normalizeForMatching(rawText))) {
+              texts.push(rawText);
+              break;
+            }
+          }
+
+          if (texts.length > 0) {
+            continue;
+          }
+        }
+
         let el = button.parentElement;
         for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
           if (el.querySelector('[data-testid="user-message"]')) {
             continue;
           }
 
-          const rawText = clean(el.innerText || el.textContent || '');
-          if (!isUsefulText(rawText) || rawText.length < 40) {
+          const rawText = extractText(el);
+          const normalizedText = normalizeForMatching(rawText);
+          if (!isUsefulText(normalizedText) || normalizedText.length < 40) {
             continue;
           }
 
-          const actionText = clean(Array.from(el.querySelectorAll('[data-testid^="action-bar-"]'))
-            .map((node) => node.textContent ?? '')
-            .join(' '));
-          const withoutActions = clean(actionText ? rawText.replace(actionText, '') : rawText);
-
-          if (isUsefulText(withoutActions) && withoutActions.length >= 40) {
-            texts.push(withoutActions);
-            break;
-          }
+          texts.push(rawText);
+          break;
         }
       }
 
@@ -832,6 +933,8 @@ export class SessionManager {
     const start = Date.now();
     const effectiveTimeoutMs = Math.max(timeoutMs, 1000);
     const baseline = state.lastResponseBaseline;
+    let stableText = '';
+    let stablePolls = 0;
 
     while (true) {
       if (Date.now() - start >= effectiveTimeoutMs) {
@@ -844,8 +947,15 @@ export class SessionManager {
       const hasNewResponse = !baseline
         || snap.count > baseline.count
         || snap.lastText !== baseline.lastText;
-      const done = hasResponse && hasNewResponse && ready.ready;
 
+      if (hasResponse && hasNewResponse && snap.lastText === stableText) {
+        stablePolls += 1;
+      } else {
+        stableText = snap.lastText;
+        stablePolls = 0;
+      }
+
+      const done = hasResponse && hasNewResponse && ready.ready && stablePolls >= 2;
 
       if (done) {
         state.responseTimeoutMs = undefined;
@@ -1056,6 +1166,25 @@ export class SessionManager {
     return await locator.isVisible().catch(() => false);
   }
 
+  private async hasReadyAttachment(page: Page, filename: string): Promise<boolean> {
+    const trimmed = filename.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const attachment = page.getByRole('button', { name: trimmed, exact: true }).first();
+    if (await attachment.isVisible().catch(() => false)) {
+      return true;
+    }
+
+    const removeAttachment = page.getByRole('button', { name: `Remove ${trimmed}`, exact: true }).first();
+    if (await removeAttachment.isVisible().catch(() => false)) {
+      return true;
+    }
+
+    return await this.hasVisibleText(page, trimmed);
+  }
+
   private async waitForPendingUploads(state: SessionState, timeoutMs: number): Promise<boolean> {
     if (state.pendingUploads.length === 0) {
       return true;
@@ -1063,11 +1192,11 @@ export class SessionManager {
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const visibility = await Promise.all(state.pendingUploads.map(async (name) => ({
+      const readiness = await Promise.all(state.pendingUploads.map(async (name) => ({
         name,
-        visible: await this.hasVisibleText(state.page, name)
+        ready: await this.hasReadyAttachment(state.page, name)
       })));
-      if (visibility.every((item) => item.visible)) {
+      if (readiness.every((item) => item.ready)) {
         return true;
       }
       await state.page.waitForTimeout(250);

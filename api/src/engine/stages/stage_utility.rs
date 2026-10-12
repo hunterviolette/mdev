@@ -5,33 +5,11 @@ use crate::{
     models::WorkflowStepDefinition,
 };
 
-pub fn supervisor_enabled(step: &WorkflowStepDefinition, local_state: &Value) -> bool {
-    local_state
-        .get("execution_logic")
-        .and_then(|v| v.get("supervisor"))
-        .and_then(|v| v.get("enabled"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            step.execution_logic
-                .get("supervisor")
-                .and_then(|v| v.get("enabled"))
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(false)
-}
 
 pub fn planner_feature_selected(global_state: &Value) -> bool {
     !planner::build_planning_fragment(global_state).trim().is_empty()
 }
 
-pub fn planner_fragment_armed(global_state: &Value) -> bool {
-    global_state
-        .get("capabilities")
-        .and_then(|v| v.get("planner"))
-        .and_then(|v| v.get("fragment_armed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
 
 pub fn review_ai_enabled(step: &WorkflowStepDefinition, local_state: &Value) -> bool {
     local_state

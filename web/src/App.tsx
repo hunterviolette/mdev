@@ -4,9 +4,9 @@ import { WorkflowShell } from './WorkflowShell';
 type AppRoute = {
   path: string;
   workflowRunId: string | null;
-  workflowView: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | null;
+  workflowView: 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact' | null;
   supervisorRunId: string | null;
-  supervisorView: 'planner' | 'sprint' | null;
+  supervisorView: 'planner' | null;
 };
 
 function shortRouteId(value: string | null): string {
@@ -15,8 +15,10 @@ function shortRouteId(value: string | null): string {
 
 function routeTitle(route: AppRoute): string {
   if (route.workflowRunId) return 'Workflow';
-  if (route.path === '/flight-deck' || route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Flight Deck';
+  if (route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Supervisor';
+  if (route.path === '/templates') return 'Templates';
   if (route.path === '/runtime') return 'Runtime';
+  if (route.path === '/settings') return 'Application Settings';
   if (route.path === '/workflows' || route.path === '/') return 'Workflow list';
   return 'Workflow Web';
 }
@@ -24,19 +26,17 @@ function routeTitle(route: AppRoute): string {
 
 function parseRoute(): AppRoute {
   const path = window.location.pathname;
-  const workflowMatch = path.match(/^\/workflows\/([^/]+)(?:\/(changes|commits|repository|capabilities))?$/);
-  const supervisorModalMatch = path.match(/^\/supervisors\/([^/]+)\/(planner|sprint)$/);
+  const workflowMatch = path.match(/^\/workflows\/([^/]+)(?:\/(changes|commits|repository|capabilities|impact))?$/);
+  const supervisorModalMatch = path.match(/^\/supervisors\/([^/]+)\/planner$/);
   const supervisorMatch = path.match(/^\/supervisors\/([^/]+)/);
   return {
     path,
     workflowRunId: workflowMatch?.[1] ? decodeURIComponent(workflowMatch[1]) : null,
     workflowView: workflowMatch?.[1]
-      ? ((workflowMatch[2] ?? 'workflow') as 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities')
+      ? ((workflowMatch[2] ?? 'workflow') as 'workflow' | 'changes' | 'commits' | 'repository' | 'capabilities' | 'impact')
       : null,
     supervisorRunId: supervisorMatch?.[1] ? decodeURIComponent(supervisorMatch[1]) : null,
-    supervisorView: supervisorModalMatch?.[2] === 'planner' || supervisorModalMatch?.[2] === 'sprint'
-      ? supervisorModalMatch[2]
-      : null
+    supervisorView: supervisorModalMatch ? 'planner' : null
   };
 }
 

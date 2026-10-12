@@ -61,8 +61,8 @@ pub async fn before_capability(
 }
 
 pub async fn after_capability(
-    _state: &AppState,
-    _run_id: Uuid,
+    state: &AppState,
+    run_id: Uuid,
     run: &WorkflowRun,
     step: &WorkflowStepDefinition,
     _stage_execution_id: Option<&str>,
@@ -70,7 +70,16 @@ pub async fn after_capability(
     prior_results: &[CapabilityResult],
 ) -> Result<Vec<AutomationDecision>> {
     let mut decisions = Vec::new();
-    decisions.extend(crate::engine::stages::automation_after_capability(
+    decisions.extend(changeset_file_failures::after_capability(
+        state,
+        run_id,
+        run,
+        step,
+        result,
+        prior_results,
+    )
+    .await?);
+    decisions.extend(compile_failures::after_capability(
         run,
         step,
         result,

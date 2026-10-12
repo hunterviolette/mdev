@@ -1,10 +1,12 @@
 mod app_state;
+mod browser_registry;
 mod auth;
 mod db;
+mod environment_file;
 mod engine;
 mod models;
 mod supervisor;
-mod runtime_env;
+
 mod routes;
 
 use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
@@ -26,6 +28,44 @@ async fn main() -> anyhow::Result<()> {
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let app_root = resolve_app_root(&cwd)?;
     load_runtime_env(&app_root)?;
+
+    if env::var("MDEV_BROWSER_USER_DATA_DIR")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        env::set_var(
+            "MDEV_BROWSER_USER_DATA_DIR",
+            app_root.join(".mdev").join("browser-profile"),
+        );
+    }
+
+    let browser_profile_dir = PathBuf::from(env::var("MDEV_BROWSER_USER_DATA_DIR")?);
+    fs::create_dir_all(&browser_profile_dir).with_context(|| {
+        format!(
+            "failed to create browser profile directory {}",
+            browser_profile_dir.display()
+        )
+    })?;
+
+    if env::var("MDEV_BROWSER_USER_DATA_DIR")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        env::set_var(
+            "MDEV_BROWSER_USER_DATA_DIR",
+            app_root.join(".mdev").join("browser-profile"),
+        );
+    }
+
+    let browser_profile_dir = PathBuf::from(env::var("MDEV_BROWSER_USER_DATA_DIR")?);
+    fs::create_dir_all(&browser_profile_dir).with_context(|| {
+        format!(
+            "failed to create browser profile directory {}",
+            browser_profile_dir.display()
+        )
+    })?;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -51,23 +91,36 @@ async fn main() -> anyhow::Result<()> {
         .runtime_endpoints
         .refresh_local_lan_ipv4_in_background();
 
-    match crate::engine::fail_stale_running_runs_on_startup(&state).await {
-        Ok(failed_runs) if failed_runs > 0 => {
-            tracing::warn!(
-                failed_runs,
-                "marked workflows interrupted by the previous API process as failed"
+    match crate::engine::capabilities::inference::session::archive_non_persistent_sessions_on_startup(&state.db).await {
+        Ok(archived_sessions) if archived_sessions > 0 => {
+            tracing::info!(archived_sessions, "archived non-persistent inference sessions from the previous API process");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{:#}", error),
+                "failed to archive non-persistent inference sessions on startup"
+            );
+        }
+    }
+
+    match crate::engine::repair_process_interruption_errors_on_startup(&state).await {
+        Ok(repaired_runs) if repaired_runs > 0 => {
+            tracing::info!(
+                repaired_runs,
+                "repaired legacy workflow errors caused by API process interruption"
             );
         }
         Ok(_) => {}
         Err(error) => {
             tracing::error!(
                 error = %format!("{:#}", error),
-                "failed to reconcile workflows interrupted by the previous API process"
+                "failed to repair legacy workflow process-interruption errors"
             );
         }
     }
 
-    let addr = crate::runtime_env::workflow_api_bind_addr()?;
+    let addr = crate::environment_file::workflow_api_bind_addr()?;
 
     let shutdown_state = state.clone();
     let app = build_router(state, auth, &layout.web_dist);
@@ -88,13 +141,25 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
 
-            let active_run_ids = shutdown_state
+            match shutdown_state
                 .workflow_coordinator
-                .stop_active_executions(
-                    &shutdown_state,
-                    "The API shut down while workflow execution was active.",
-                )
-                .await;
+                .stop_active_executions(&shutdown_state)
+                .await
+            {
+                Ok(short_circuited_run_ids) if !short_circuited_run_ids.is_empty() => {
+                    tracing::warn!(
+                        short_circuited_workflows = short_circuited_run_ids.len(),
+                        "short-circuited active workflow executions during API shutdown"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %format!("{:#}", error),
+                        "failed to short-circuit active workflow executions during API shutdown"
+                    );
+                }
+            }
 
             let terminated = shutdown_state
                 .process_registry
@@ -106,28 +171,6 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(
                         error = %format!("{:#}", error),
                         "failed to terminate a managed process during API shutdown"
-                    );
-                }
-            }
-
-            match crate::engine::fail_active_runs_for_process_stop(
-                &shutdown_state,
-                &active_run_ids,
-                "The server was shut down before the stage execution completed.",
-            )
-            .await
-            {
-                Ok(failed_runs) if failed_runs > 0 => {
-                    tracing::warn!(
-                        failed_runs,
-                        "marked active workflows as failed during API shutdown"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(
-                        error = %format!("{:#}", error),
-                        "failed to mark active workflows as failed during API shutdown"
                     );
                 }
             }
@@ -168,7 +211,7 @@ struct RuntimeLayout {
     web_dist: PathBuf,
 }
 
-fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
     if let Some(repo_root) = detect_repo_root(cwd) {
         return Ok(repo_root);
     }
@@ -181,12 +224,7 @@ fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn load_runtime_env(app_root: &Path) -> anyhow::Result<()> {
-    let env_path = app_root.join(".env");
-    if env_path.exists() {
-        dotenvy::from_path(&env_path)
-            .with_context(|| format!("failed to load {}", env_path.display()))?;
-    }
-    Ok(())
+    environment_file::load(app_root)
 }
 
 fn resolve_runtime_path(app_root: &Path, value: &str) -> PathBuf {
@@ -221,7 +259,7 @@ fn runtime_layout(app_root: PathBuf) -> anyhow::Result<RuntimeLayout> {
     })
 }
 
-fn mdev_data_dir(app_root: &Path) -> PathBuf {
+pub(crate) fn mdev_data_dir(app_root: &Path) -> PathBuf {
     if let Ok(value) = env::var("MDEV_DATA_DIR") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
