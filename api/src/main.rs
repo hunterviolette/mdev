@@ -12,6 +12,7 @@ mod routes;
 use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 use axum::Router;
 use tower_http::{
     cors::CorsLayer,
@@ -36,26 +37,7 @@ async fn main() -> anyhow::Result<()> {
     {
         env::set_var(
             "MDEV_BROWSER_USER_DATA_DIR",
-            app_root.join(".mdev").join("browser-profile"),
-        );
-    }
-
-    let browser_profile_dir = PathBuf::from(env::var("MDEV_BROWSER_USER_DATA_DIR")?);
-    fs::create_dir_all(&browser_profile_dir).with_context(|| {
-        format!(
-            "failed to create browser profile directory {}",
-            browser_profile_dir.display()
-        )
-    })?;
-
-    if env::var("MDEV_BROWSER_USER_DATA_DIR")
-        .ok()
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-    {
-        env::set_var(
-            "MDEV_BROWSER_USER_DATA_DIR",
-            app_root.join(".mdev").join("browser-profile"),
+            default_browser_profile_dir(&app_root),
         );
     }
 
@@ -217,10 +199,15 @@ pub(crate) fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let exe = env::current_exe().context("failed to determine executable path")?;
-    Ok(exe
-        .parent()
-        .context("executable has no parent directory")?
-        .to_path_buf())
+    let executable_dir = exe.parent().context("executable has no parent directory")?;
+    if executable_dir.file_name().and_then(|name| name.to_str()) == Some("runtime") {
+        if let Some(root) = executable_dir.parent() {
+            if root.join("web").join("dist").join("index.html").is_file() {
+                return Ok(root.to_path_buf());
+            }
+        }
+    }
+    Ok(executable_dir.to_path_buf())
 }
 
 fn load_runtime_env(app_root: &Path) -> anyhow::Result<()> {
@@ -257,6 +244,31 @@ fn runtime_layout(app_root: PathBuf) -> anyhow::Result<RuntimeLayout> {
         data_dir: mdev_data_dir(&app_root),
         app_root,
     })
+}
+
+fn default_browser_profile_dir(app_root: &Path) -> PathBuf {
+    if detect_repo_root(app_root).is_some() {
+        return app_root.join(".mdev").join("browser-profile");
+    }
+
+    let installation_path = fs::canonicalize(app_root)
+        .unwrap_or_else(|_| app_root.to_path_buf());
+
+    let installation_identity = installation_path
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    #[cfg(target_os = "windows")]
+    let installation_identity = installation_identity.to_lowercase();
+
+    let installation_hash = hex::encode(
+        Sha256::digest(installation_identity.as_bytes())
+    );
+
+    mdev_data_dir(app_root)
+        .join("installations")
+        .join(installation_hash)
+        .join("browser-profile")
 }
 
 pub(crate) fn mdev_data_dir(app_root: &Path) -> PathBuf {

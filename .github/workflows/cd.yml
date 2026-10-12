@@ -3,7 +3,7 @@ name: cd
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   actions: read
@@ -12,53 +12,57 @@ permissions:
   attestations: write
 
 env:
-  APP_NAME: mdev
-  CARGO_BIN_NAME: workflow-api
   NODE_VERSION: 24.14.0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  WORKFLOW_API_HOST: 127.0.0.1
-  WORKFLOW_API_PORT: 8788
-  WORKFLOW_WEB_HOST: 127.0.0.1
-  WORKFLOW_WEB_PORT: 5173
-  WORKFLOW_BROWSER_CDP_HOST: 127.0.0.1
-  WORKFLOW_BROWSER_CDP_PORT: 9222
+  TURBO_TELEMETRY_DISABLED: 1
 
 jobs:
   verify-ci:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-
     steps:
       - name: Verify CI passed for this commit
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          SHA="${GITHUB_SHA}"
-          REPO="${GITHUB_REPOSITORY}"
-
-          SUCCESS_COUNT="$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&status=completed&per_page=20" \
-            --jq '[.workflow_runs[] | select(.conclusion == "success") ] | length')"
-
-          if [ "${SUCCESS_COUNT}" -lt 1 ]; then
-            echo "No successful ci.yml push run found for commit ${SHA}. Refusing to build or publish a release."
+          SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.sha')"
+          TYPE="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type')"
+          if [ "$TYPE" = "tag" ]; then
+            SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${SHA}" --jq '.object.sha')"
+          fi
+          COUNT="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&status=completed&per_page=20" --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No successful CI push run found for $SHA"
             exit 1
           fi
 
-          echo "Found successful CI run for ${SHA}."
-
-  build-macos-intel:
-    runs-on: macos-15-intel
+  build:
     needs: verify-ci
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            os: windows-latest
+            bundles: nsis
+          - id: linux-x64
+            os: ubuntu-22.04
+            bundles: deb,appimage
+          - id: macos-x64
+            os: macos-15-intel
+            bundles: dmg
+          - id: macos-arm64
+            os: macos-latest
+            bundles: dmg
+    runs-on: ${{ matrix.os }}
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -66,105 +70,52 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node dependencies
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libayatana-appindicator3-dev
+
+      - name: Install dependencies
         run: npm ci --include=optional
 
-      - name: Build Node workspaces
+      - name: Build JavaScript workspaces
         run: npx turbo build
 
-      - name: Build Rust app
+      - name: Build Rust API
         working-directory: api
         run: cargo build --release
 
-      - name: Download Node runtime
+      - name: Stage complete release
+        run: python scripts/stage-tauri-release.py
+
+      - name: Build signed Tauri packages
+        working-directory: launcher
+        run: npx tauri build --config src-tauri/tauri.release.conf.json --bundles ${{ matrix.bundles }}
+
+      - name: Collect release packages
+        shell: bash
         run: |
-          set -euo pipefail
-          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz" -o node.tar.gz
-          mkdir -p node-dist
-          tar -xzf node.tar.gz -C node-dist
+          mkdir -p release-output
+          find launcher/src-tauri/target/release/bundle -type f \( -name '*.sig' -o -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.tar.gz' -o -name '*.nsis.zip' \) -exec cp {} release-output/ \;
+          if ! find release-output -name '*.sig' -print -quit | grep -q .; then
+            echo 'No signed updater artifacts were produced'
+            exit 1
+          fi
 
-      - name: Assemble .app bundle
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          APP_ROOT="dist/${APP_NAME}.app/Contents"
-          MACOS_DIR="$APP_ROOT/MacOS"
-
-          mkdir -p \
-            "$MACOS_DIR/runtime" \
-            "$MACOS_DIR/bridge/dist" \
-            "$MACOS_DIR/adt-bridge/dist" \
-            "$MACOS_DIR/web/dist"
-
-          cp "api/target/release/${CARGO_BIN_NAME}" "$MACOS_DIR/${APP_NAME}"
-          cp "node-dist/node-v${NODE_VERSION}-darwin-x64/bin/node" "$MACOS_DIR/runtime/node"
-
-          cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
-          cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
-          cp -R web/dist/. "$MACOS_DIR/web/dist/"
-
-          cp -R node_modules "$MACOS_DIR/node_modules"
-
-          chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
-
-          export APP_ROOT VERSION
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          info = f"""<?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-            <dict>
-              <key>CFBundleDisplayName</key>
-              <string>mdev</string>
-              <key>CFBundleExecutable</key>
-              <string>mdev</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.example.mdev</string>
-              <key>CFBundleName</key>
-              <string>mdev</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>{os.environ["VERSION"]}</string>
-              <key>CFBundleVersion</key>
-              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>12.0</string>
-            </dict>
-          </plist>
-          """
-          Path(os.environ["APP_ROOT"], "Info.plist").write_text(info, encoding="utf-8")
-          PY
-
-      - name: Create DMG
-        run: |
-          set -euo pipefail
-          mkdir -p dmg-src
-          cp -R "dist/${APP_NAME}.app" dmg-src/
-          ln -s /Applications dmg-src/Applications
-          hdiutil create -volname "mdev" -srcfolder dmg-src -ov -format UDZO "dist/${APP_NAME}-macos-x64.dmg"
-
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
-          name: mdev-macos-x64
-          path: dist/mdev-macos-x64.dmg
+          name: ${{ matrix.id }}
+          path: release-output/*
+          if-no-files-found: error
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: dist/mdev-macos-x64.dmg
-
-  build-macos-arm64:
-    runs-on: macos-latest
+  build-headless:
+    runs-on: ubuntu-22.04
     needs: verify-ci
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -172,308 +123,50 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node dependencies
+      - name: Install dependencies
         run: npm ci --include=optional
 
-      - name: Build Node workspaces
+      - name: Build JavaScript workspaces
         run: npx turbo build
 
-      - name: Build Rust app
+      - name: Build Rust API
         working-directory: api
         run: cargo build --release
 
-      - name: Download Node runtime
-        run: |
-          set -euo pipefail
-          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-arm64.tar.gz" -o node.tar.gz
-          mkdir -p node-dist
-          tar -xzf node.tar.gz -C node-dist
+      - name: Build headless Debian package
+        run: python scripts/build-headless-deb.py
 
-      - name: Assemble .app bundle
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          APP_ROOT="dist/${APP_NAME}.app/Contents"
-          MACOS_DIR="$APP_ROOT/MacOS"
-
-          mkdir -p \
-            "$MACOS_DIR/runtime" \
-            "$MACOS_DIR/bridge/dist" \
-            "$MACOS_DIR/adt-bridge/dist" \
-            "$MACOS_DIR/web/dist"
-
-          cp "api/target/release/${CARGO_BIN_NAME}" "$MACOS_DIR/${APP_NAME}"
-          cp "node-dist/node-v${NODE_VERSION}-darwin-arm64/bin/node" "$MACOS_DIR/runtime/node"
-
-          cp -R bridge/dist/. "$MACOS_DIR/bridge/dist/"
-          cp -R adt-bridge/dist/. "$MACOS_DIR/adt-bridge/dist/"
-          cp -R web/dist/. "$MACOS_DIR/web/dist/"
-
-          cp -R node_modules "$MACOS_DIR/node_modules"
-
-          chmod +x "$MACOS_DIR/${APP_NAME}" "$MACOS_DIR/runtime/node"
-
-          export APP_ROOT VERSION
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          info = f"""<?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-            <dict>
-              <key>CFBundleDisplayName</key>
-              <string>mdev</string>
-              <key>CFBundleExecutable</key>
-              <string>mdev</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.example.mdev</string>
-              <key>CFBundleName</key>
-              <string>mdev</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>{os.environ["VERSION"]}</string>
-              <key>CFBundleVersion</key>
-              <string>{os.environ["GITHUB_RUN_NUMBER"]}</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>12.0</string>
-            </dict>
-          </plist>
-          """
-          Path(os.environ["APP_ROOT"], "Info.plist").write_text(info, encoding="utf-8")
-          PY
-
-      - name: Create DMG
-        run: |
-          set -euo pipefail
-          mkdir -p dmg-src
-          cp -R "dist/${APP_NAME}.app" dmg-src/
-          ln -s /Applications dmg-src/Applications
-          hdiutil create -volname "mdev" -srcfolder dmg-src -ov -format UDZO "dist/${APP_NAME}-macos-arm64.dmg"
-
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
-          name: mdev-macos-arm64
-          path: dist/mdev-macos-arm64.dmg
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: dist/mdev-macos-arm64.dmg
-
-  build-linux:
-    runs-on: ubuntu-latest
-    needs: verify-ci
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Node dependencies
-        run: npm ci --include=optional
-
-      - name: Build Node workspaces
-        run: npx turbo build
-
-      - name: Build Rust app
-        working-directory: api
-        run: cargo build --release
-
-      - name: Download Node runtime
-        run: |
-          set -euo pipefail
-          curl -L "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o node.tar.gz
-          mkdir -p node-dist
-          tar -xzf node.tar.gz -C node-dist
-
-      - name: Assemble Debian package layout
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          ROOT="dist/debroot"
-          APPDIR="$ROOT/opt/${APP_NAME}"
-
-          mkdir -p \
-            "$ROOT/DEBIAN" \
-            "$ROOT/usr/bin" \
-            "$APPDIR/runtime" \
-            "$APPDIR/bridge/dist" \
-            "$APPDIR/adt-bridge/dist" \
-            "$APPDIR/web/dist"
-
-          cp "api/target/release/${CARGO_BIN_NAME}" "$APPDIR/${APP_NAME}"
-          cp "node-dist/node-v${NODE_VERSION}-linux-x64/bin/node" "$APPDIR/runtime/node"
-
-          cp -R bridge/dist/. "$APPDIR/bridge/dist/"
-          cp -R adt-bridge/dist/. "$APPDIR/adt-bridge/dist/"
-          cp -R web/dist/. "$APPDIR/web/dist/"
-
-          cp -R node_modules "$APPDIR/node_modules"
-
-          chmod +x "$APPDIR/${APP_NAME}" "$APPDIR/runtime/node"
-          ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${APP_NAME}"
-
-          export ROOT VERSION APP_NAME
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          control = f"""Package: {os.environ["APP_NAME"]}
-          Version: {os.environ["VERSION"]}
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: mdev release automation
-          Description: mdev desktop application bundle
-          """
-          Path(os.environ["ROOT"], "DEBIAN", "control").write_text(control, encoding="utf-8")
-          PY
-
-      - name: Build DEB
-        run: |
-          set -euo pipefail
-          dpkg-deb --build dist/debroot "dist/${APP_NAME}-linux-amd64.deb"
-
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: mdev-linux-amd64
-          path: dist/mdev-linux-amd64.deb
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: dist/mdev-linux-amd64.deb
-
-  build-windows:
-    runs-on: windows-latest
-    needs: verify-ci
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Node dependencies
-        run: npm ci --include=optional
-
-      - name: Build Node workspaces
-        run: npx turbo build
-
-      - name: Build Rust app
-        working-directory: api
-        run: cargo build --release
-
-      - name: Download Node runtime
-        shell: pwsh
-        run: |
-          $zipName = "node-v$env:NODE_VERSION-win-x64.zip"
-          Invoke-WebRequest "https://nodejs.org/dist/v$env:NODE_VERSION/$zipName" -OutFile node.zip
-          Expand-Archive node.zip -DestinationPath node-dist
-
-      - name: Assemble app folder
-        shell: pwsh
-        run: |
-          $root = "dist/app"
-
-          New-Item -ItemType Directory -Force -Path "$root/runtime" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$root/bridge/dist" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$root/adt-bridge/dist" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$root/web/dist" | Out-Null
-
-          Copy-Item "api/target/release/$env:CARGO_BIN_NAME.exe" "$root/$env:APP_NAME.exe"
-          Copy-Item "node-dist/node-v$env:NODE_VERSION-win-x64/node.exe" "$root/runtime/node.exe"
-
-          Copy-Item "bridge/dist/*" "$root/bridge/dist/" -Recurse
-          Copy-Item "adt-bridge/dist/*" "$root/adt-bridge/dist/" -Recurse
-          Copy-Item "web/dist/*" "$root/web/dist/" -Recurse
-          Copy-Item "node_modules" "$root/node_modules" -Recurse
-
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup -y
-
-      - name: Write Inno Setup script
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME.Substring(1)
-          @"
-          [Setup]
-          AppId={{A3C1A4E3-8E0C-4B3A-9B8D-4B3A8E0C4B3A}}
-          AppName=mdev
-          AppVersion=$version
-          DefaultDirName={autopf}\mdev
-          DefaultGroupName=mdev
-          OutputDir=.
-          OutputBaseFilename=mdev-windows-x64-setup
-          Compression=lzma
-          SolidCompression=yes
-          WizardStyle=modern
-
-          [Files]
-          Source: "app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-          [Icons]
-          Name: "{group}\mdev"; Filename: "{app}\mdev.exe"
-          Name: "{autodesktop}\mdev"; Filename: "{app}\mdev.exe"; Tasks: desktopicon
-
-          [Tasks]
-          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
-
-          [Run]
-          Filename: "{app}\mdev.exe"; Description: "Launch mdev"; Flags: nowait postinstall skipifsilent
-          "@ | Set-Content -Path dist\mdev.iss
-
-      - name: Build installer
-        shell: pwsh
-        run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" dist\mdev.iss
-
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: mdev-windows-x64
-          path: dist/mdev-windows-x64-setup.exe
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: dist/mdev-windows-x64-setup.exe
+          name: headless-linux-x64
+          path: release-output/mdev-server-linux-amd64.deb
+          if-no-files-found: error
 
   publish-release:
     runs-on: ubuntu-latest
     needs:
-      - build-macos-intel
-      - build-macos-arm64
-      - build-linux
-      - build-windows
-
+      - build
+      - build-headless
     steps:
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+      - name: Generate signed updater manifest
+        run: python scripts/publish-tauri-manifest.py
+
+      - name: Include headless package
+        run: cp release-artifacts/headless-linux-x64/mdev-server-linux-amd64.deb release-publish/
+
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-publish/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+      - name: Attest release files
+        uses: actions/attest-build-provenance@v3
         with:
-          files: |
-            release-artifacts/mdev-macos-x64/mdev-macos-x64.dmg
-            release-artifacts/mdev-macos-arm64/mdev-macos-arm64.dmg
-            release-artifacts/mdev-linux-amd64/mdev-linux-amd64.deb
-            release-artifacts/mdev-windows-x64/mdev-windows-x64-setup.exe
+          subject-path: release-publish/*

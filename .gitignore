@@ -5,6 +5,7 @@ tmp/
 .turbo/
 .data/
 .mdev/
+launcher/src-tauri/gen/
 
 .env
 .env.local
