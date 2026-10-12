@@ -1,11 +1,23 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
+use serde::{Serialize, Deserialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::prompting::{ModelInput, ModelInputOrigin};
+use super::accounting::{count_tokens, CompositeInputSummary, InferenceAccounting, InputScope, ReportedUsage, TheoreticalUsage, TokenizerKind, InputTokenComponent};
 use super::super::registry::CapabilityContext;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvocationInput {
+    pub sequence_no: i64,
+    pub input_type: String,
+    pub input_origin: String,
+    pub input_source: String,
+    pub label: String,
+    pub content: String,
+}
 
 pub async fn record_invocation(
     db: &SqlitePool,
@@ -16,6 +28,8 @@ pub async fn record_invocation(
     model: &str,
     input: &ModelInput,
     response: &Value,
+    reported_usage: Option<&ReportedUsage>,
+    output_text: &str,
 ) -> Result<String> {
     let invocation_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -25,31 +39,27 @@ pub async fn record_invocation(
         "failed"
     };
 
-    let mut tx = db.begin().await?;
+    let input_components: Vec<InputTokenComponent> = match response.get("theoretical_input_components") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => super::prompting::estimate_input_components(input, None)?,
+    };
+    let composite_input = CompositeInputSummary::from_components(&input_components);
+    let theoretical_usage = TheoreticalUsage {
+        input_tokens: composite_input.theoretical_tokens,
+        output_tokens: count_tokens(output_text)?,
+        tokenizer: TokenizerKind::O200kBase,
+        input_scope: InputScope::SubmittedContent,
+    };
+    let mut accounting = InferenceAccounting::new(
+        reported_usage.cloned(),
+        Some(theoretical_usage),
+    );
+    accounting.input_components = input_components;
+    accounting.composite_input = composite_input;
+    let accounting_json = serde_json::to_string(&accounting)?;
 
-    sqlx::query(
-        "INSERT INTO inference_invocations (id, inference_session_id, workflow_run_id, step_id, stage_type, capability_invocation_id, transport, provider, model, status, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(&invocation_id)
-    .bind(session_id)
-    .bind(ctx.run_id.to_string())
-    .bind(&ctx.step.id)
-    .bind(&ctx.step.step_type)
-    .bind(ctx.capability_invocation_id.as_deref())
-    .bind(transport)
-    .bind(provider)
-    .bind(model)
-    .bind(status)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-
-    for (index, block) in input.input_blocks.iter().enumerate() {
-        if !is_instruction_source(&block.source) || block.content.trim().is_empty() {
-            continue;
-        }
-
+    let inputs = input.input_blocks.iter().enumerate().filter_map(|(index, block)| {
+        if !is_instruction_source(&block.source) || block.content.trim().is_empty() { return None; }
         let origin = match block.origin {
             ModelInputOrigin::UserCustom => "user_custom",
             ModelInputOrigin::StageDefault => "stage_default",
@@ -58,50 +68,38 @@ pub async fn record_invocation(
             ModelInputOrigin::Inherited => "inherited",
             ModelInputOrigin::AutomationGenerated => "automation_generated",
         };
-
-        sqlx::query(
-            "INSERT INTO inference_invocation_inputs (id, invocation_id, sequence_no, input_type, input_origin, input_source, label, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(Uuid::new_v4().to_string())
+        Some(InvocationInput {
+            sequence_no: index as i64,
+            input_type: "instruction".to_string(),
+            input_origin: origin.to_string(),
+            input_source: block.source.clone(),
+            label: block.label.clone(),
+            content: block.content.clone(),
+        })
+    }).collect::<Vec<_>>();
+    let output = serde_json::json!({
+        "text": output_text,
+        "payload": response,
+        "provider_metadata": response.get("provider_metadata")
+    });
+    sqlx::query("INSERT INTO inference_invocations (id, inference_session_id, workflow_run_id, step_id, stage_type, capability_invocation_id, transport, provider, model, status, input_json, output_json, accounting_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&invocation_id)
-        .bind(index as i64)
-        .bind("instruction")
-        .bind(origin)
-        .bind(&block.source)
-        .bind(&block.label)
-        .bind(&block.content)
+        .bind(session_id)
+        .bind(ctx.run_id.to_string())
+        .bind(&ctx.step.id)
+        .bind(&ctx.step.step_type)
+        .bind(ctx.capability_invocation_id.as_deref())
+        .bind(transport)
+        .bind(provider)
+        .bind(model)
+        .bind(status)
+        .bind(serde_json::to_string(&inputs)?)
+        .bind(serde_json::to_string(&output)?)
+        .bind(&accounting_json)
         .bind(&now)
-        .execute(&mut *tx)
+        .bind(&now)
+        .execute(db)
         .await?;
-    }
-
-    let metadata = response.get("provider_metadata").cloned().unwrap_or(Value::Null);
-    let usage = metadata.get("usage").unwrap_or(&Value::Null);
-    let input_tokens = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64);
-    let output_tokens = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64);
-    let cached_input_tokens = usage.get("input_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .or_else(|| usage.get("cache_read_input_tokens"))
-        .and_then(Value::as_i64);
-
-    sqlx::query(
-        "INSERT INTO inference_invocation_outputs (id, invocation_id, response_text, response_payload_json, provider_metadata_json, input_tokens, output_tokens, cached_input_tokens, cost_amount, cost_currency, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(&invocation_id)
-    .bind(response.get("text").and_then(Value::as_str).unwrap_or(""))
-    .bind(serde_json::to_string(response)?)
-    .bind(serde_json::to_string(&metadata)?)
-    .bind(input_tokens)
-    .bind(output_tokens)
-    .bind(cached_input_tokens)
-    .bind(metadata.get("cost").and_then(Value::as_f64))
-    .bind(metadata.get("currency").and_then(Value::as_str))
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
     Ok(invocation_id)
 }
 

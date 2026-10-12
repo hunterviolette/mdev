@@ -12,6 +12,16 @@ use super::{
 };
 use super::super::{prompting::{ModelAttachmentKind, ModelInput}, ApiConfig};
 
+#[derive(serde::Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
 pub struct AnthropicProvider;
 
 pub static ANTHROPIC_PROVIDER: AnthropicProvider = AnthropicProvider;
@@ -155,6 +165,20 @@ async fn execute_turn(
         }]
     }));
 
+    let reported_usage = response
+        .get("usage")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<AnthropicUsage>(value.clone()))
+        .transpose()?
+        .map(|usage| super::super::accounting::ReportedUsage {
+            input_tokens: usage.input_tokens
+                .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
+                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cache_read_input_tokens,
+            reasoning_output_tokens: None,
+        });
+
     Ok(ApiProviderExecution {
         text,
         state: json!({
@@ -167,6 +191,7 @@ async fn execute_turn(
             "model": response.get("model").cloned().unwrap_or(Value::Null),
             "attachment_count": input.attachments.len()
         }),
+        reported_usage,
     })
 }
 

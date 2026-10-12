@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::session::{InferenceSession, ResolvedInferenceRoute};
+use super::accounting::ReportedUsage;
 use super::super::registry::CapabilityContext;
 use super::{api, browser, prompting::ModelInput, session, InferenceTransport};
 use crate::{
@@ -14,6 +15,7 @@ pub struct InferenceTransportExecution {
     pub text: String,
     pub metadata: Value,
     pub transport_state: Value,
+    pub reported_usage: Option<ReportedUsage>,
 }
 
 #[async_trait]
@@ -419,6 +421,8 @@ impl Inference {
             &model,
             input,
             &payload,
+            execution.reported_usage.as_ref(),
+            &execution.text,
         ).await?;
         if let Some(object) = payload.as_object_mut() {
             object.insert("inference_invocation_id".to_string(), Value::String(invocation_id));

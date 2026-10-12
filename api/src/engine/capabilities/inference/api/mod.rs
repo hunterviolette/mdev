@@ -13,11 +13,13 @@ use super::session::{InferenceSession, ResolvedInferenceRoute};
 use super::transport::{InferenceTransportAdapter, InferenceTransportExecution};
 use super::super::registry::CapabilityContext;
 use super::ApiConfig;
+use super::accounting::ReportedUsage;
 
 pub struct ApiProviderExecution {
     pub text: String,
     pub state: Value,
     pub metadata: Value,
+    pub reported_usage: Option<ReportedUsage>,
 }
 
 #[async_trait]
@@ -191,6 +193,7 @@ async fn execute(
             "provider_metadata": execution.metadata
         }),
         transport_state: provider_state(adapter.name(), execution.state),
+        reported_usage: execution.reported_usage,
     })
 }
 

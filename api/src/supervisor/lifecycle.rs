@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use crate::engine::capabilities::git_patch_payload;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
@@ -289,6 +290,70 @@ pub async fn archive_supervisor_workflow_by_work_unit(
     let workflow_run_id: Option<String> = row.get("workflow_run_id");
     let workspace_path: Option<String> = row.get("workspace_path");
     let now = Utc::now().to_rfc3339();
+
+    if let (Some(workflow_run_id), Some(workspace_path)) = (
+        workflow_run_id.as_deref().filter(|value| !value.trim().is_empty()),
+        workspace_path.as_deref().filter(|value| !value.trim().is_empty()),
+    ) {
+        let workflow_key: String = sqlx::query_scalar("SELECT workflow_key FROM workflow_runs WHERE id = ?")
+            .bind(workflow_run_id)
+            .fetch_one(&state.db)
+            .await?;
+        let source = sqlx::query("SELECT kind, feature_id FROM supervisor_work_units WHERE id = ? AND supervisor_run_id = ?")
+            .bind(work_unit_id)
+            .bind(supervisor_run_id.to_string())
+            .fetch_one(&state.db)
+            .await?;
+        let patch = git_patch_payload::generate_payload(workspace_path, "both", &[], None)?;
+        if !patch.patch_text.trim().is_empty() {
+            let applied_hash: Option<String> = sqlx::query_scalar("SELECT patch_hash FROM supervisor_workflow_patches WHERE root_repo_path = ? AND workflow_key = ? AND archive_status = 'applied'")
+                .bind(root_repo_path)
+                .bind(&workflow_key)
+                .fetch_optional(&state.db)
+                .await?;
+            if applied_hash.as_deref() != Some(patch.patch_hash.as_str()) {
+                sqlx::query(r#"
+                    INSERT INTO supervisor_workflow_patches (
+                        root_repo_path, workflow_key, source_work_unit_id,
+                        source_workflow_run_id, source_kind, feature_id,
+                        supervisor_run_id, integration_workflow_run_id,
+                        archive_status, base_commit, patch_text, patch_hash,
+                        patch_bytes, applied_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'unapplied', NULL, ?, ?, ?, NULL, ?, ?)
+                    ON CONFLICT(root_repo_path, workflow_key, archive_status) DO UPDATE SET
+                        source_work_unit_id = excluded.source_work_unit_id,
+                        source_workflow_run_id = excluded.source_workflow_run_id,
+                        source_kind = excluded.source_kind,
+                        feature_id = excluded.feature_id,
+                        supervisor_run_id = excluded.supervisor_run_id,
+                        patch_text = excluded.patch_text,
+                        patch_hash = excluded.patch_hash,
+                        patch_bytes = excluded.patch_bytes,
+                        updated_at = excluded.updated_at
+                "#)
+                .bind(root_repo_path)
+                .bind(&workflow_key)
+                .bind(work_unit_id)
+                .bind(workflow_run_id)
+                .bind(source.get::<String, _>("kind"))
+                .bind(source.get::<Option<String>, _>("feature_id"))
+                .bind(supervisor_run_id.to_string())
+                .bind(&patch.patch_text)
+                .bind(&patch.patch_hash)
+                .bind(patch.patch_text.len() as i64)
+                .bind(&now)
+                .bind(&now)
+                .execute(&state.db)
+                .await?;
+            } else {
+                sqlx::query("DELETE FROM supervisor_workflow_patches WHERE root_repo_path = ? AND workflow_key = ? AND archive_status = 'unapplied'")
+                    .bind(root_repo_path)
+                    .bind(&workflow_key)
+                    .execute(&state.db)
+                    .await?;
+            }
+        }
+    }
 
     if let Some(workflow_run_id) = workflow_run_id.as_deref().filter(|value| !value.trim().is_empty()) {
         sqlx::query("UPDATE workflow_runs SET status = 'archived', archived_at = ?, archived_reason = ?, updated_at = ? WHERE id = ?")

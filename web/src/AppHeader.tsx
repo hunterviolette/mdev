@@ -1,7 +1,7 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { Box, Button, Group, Paper, Stack, Tabs, type ButtonProps, type PaperProps } from '@mantine/core';
 
-export type AppHeaderView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
+export type AppHeaderView = 'workflows' | 'supervisor' | 'templates' | 'runtime' | 'settings';
 
 export const appSurfaceStyle: CSSProperties = {
   background: 'linear-gradient(135deg, rgba(28,126,214,0.08), rgba(255,255,255,0.025))',
@@ -98,6 +98,17 @@ export function AppHeader(props: {
                 }}
               >
                 Runtime
+              </Tabs.Tab>
+              <Tabs.Tab
+                value="settings"
+                renderRoot={(rootProps) => <a {...rootProps} href="/settings" />}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+                  event.preventDefault();
+                  props.onChange('settings');
+                }}
+              >
+                Application Settings
               </Tabs.Tab>
             </Tabs.List>
           </Tabs>

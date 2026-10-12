@@ -31,6 +31,109 @@ use lifecycle::{SupervisorPoolKind, SupervisorWorkUnitPromiseRequest, Supervisor
 
 
 
+pub struct WorkUnitActionState<'a> {
+    pub kind: &'a str,
+    pub state: &'a str,
+    pub integration_state: &'a str,
+    pub workflow_exists: bool,
+    pub workflow_deleted: bool,
+    pub has_workspace_changes: bool,
+    pub materialization_state: &'a str,
+    pub regenerating: bool,
+}
+
+pub fn available_actions(state: &WorkUnitActionState<'_>) -> Vec<&'static str> {
+    if state.workflow_deleted || state.state == "archived" {
+        return Vec::new();
+    }
+
+    let processing = state.state == "running"
+        || (!state.workflow_exists && state.materialization_state == "materializing")
+        || state.regenerating;
+    let integration = state.kind == "integration";
+    let integrated = state.integration_state != "available";
+    let input = matches!(state.kind, "feature" | "manual");
+    let mut actions = Vec::new();
+
+    if processing && state.workflow_exists {
+        actions.push("pause_work_unit");
+    } else if !processing && (integration || (!integrated && state.workflow_exists)) {
+        actions.push("start_work_unit");
+    }
+
+    if !processing && state.workflow_exists && !integrated {
+        actions.push("regenerate_work_unit");
+    }
+
+    if !integration && !integrated {
+        actions.push("delete_work_unit");
+    }
+
+    if input && !integrated && state.has_workspace_changes {
+        actions.push("stage_to_integration");
+    }
+
+    if input && integrated {
+        actions.push("remove_from_integration");
+    }
+
+    if input && !processing && integrated {
+        actions.push("archive_work_unit");
+    }
+
+    actions
+}
+
+pub async fn ensure_action_allowed(
+    state: &AppState,
+    supervisor_id: Uuid,
+    work_unit_id: &str,
+    action: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT wu.kind, wu.state, wu.integration_state, wu.workspace_path, wu.workflow_run_id, wu.context_json, wr.archived_at AS workflow_archived_at FROM supervisor_work_units wu LEFT JOIN workflow_runs wr ON wr.id = wu.workflow_run_id WHERE wu.supervisor_run_id = ? AND wu.id = ? AND wu.archived_at IS NULL LIMIT 1"
+    )
+    .bind(supervisor_id.to_string())
+    .bind(work_unit_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow!("work unit not found"))?;
+
+    let kind: String = row.try_get("kind")?;
+    let work_state: String = row.try_get("state")?;
+    let integration_state: String = row.try_get("integration_state")?;
+    let workflow_run_id: Option<String> = row.try_get("workflow_run_id")?;
+    let archived_at: Option<String> = row.try_get("workflow_archived_at")?;
+    let workspace_path: Option<String> = row.try_get("workspace_path")?;
+    let context_json: String = row.try_get("context_json")?;
+    let context: Value = serde_json::from_str(&context_json).unwrap_or_else(|_| json!({}));
+    let materialization_state = context.get("materialization_state").and_then(Value::as_str).unwrap_or("");
+    let regenerating = workflow_run_id.is_none()
+        && context.get("regenerated_at").and_then(Value::as_str).is_some()
+        && matches!(materialization_state, "pending" | "materializing");
+    let has_workspace_changes = workspace_path.as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|path| patches::change_status(Path::new(path)).ok())
+        .is_some_and(|status| status.has_changes());
+
+    let current = WorkUnitActionState {
+        kind: &kind,
+        state: &work_state,
+        integration_state: &integration_state,
+        workflow_exists: workflow_run_id.as_deref().is_some_and(|id| !id.trim().is_empty()),
+        workflow_deleted: archived_at.is_some(),
+        has_workspace_changes,
+        materialization_state,
+        regenerating,
+    };
+
+    if !available_actions(&current).contains(&action) {
+        return Err(anyhow!("action '{}' is not available for work unit '{}'", action, work_unit_id));
+    }
+
+    Ok(())
+}
+
 pub async fn load_supervisor_run(state: &AppState, id: Uuid) -> Result<SupervisorRun> {
     let row = sqlx::query("SELECT * FROM supervisor_runs WHERE id = ? AND archived_at IS NULL")
         .bind(id.to_string())
@@ -2513,7 +2616,29 @@ pub async fn create_supervisor_work_unit(state: &AppState, id: Uuid, request: Cr
     }))
 }
 
+pub async fn archive_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String) -> Result<Value> {
+    ensure_action_allowed(state, id, &work_unit_id, "archive_work_unit").await?;
+    let run = load_supervisor_run(state, id).await?;
+    let result = lifecycle::archive_supervisor_workflow_by_work_unit(
+        state,
+        id,
+        &run.root_repo_path,
+        &work_unit_id,
+        "archived individually",
+    ).await?;
+    let run = load_supervisor_run(state, id).await?;
+    publish_supervisor_snapshot(state, &run, "supervisor_snapshot", "work unit archived").await?;
+    Ok(json!({
+        "ok": true,
+        "action": "archive_work_unit",
+        "work_unit_id": work_unit_id,
+        "result": result,
+        "supervisor_run": run
+    }))
+}
+
 pub async fn delete_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String) -> Result<Value> {
+    ensure_action_allowed(state, id, &work_unit_id, "delete_work_unit").await?;
     let mut run = load_supervisor_run(state, id).await?;
     let row = load_supervisor_work_unit_row(state, id, &work_unit_id).await?;
     let kind = row.kind;
@@ -2587,6 +2712,7 @@ pub async fn delete_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_i
 }
 
 pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String) -> Result<Value> {
+    ensure_action_allowed(state, id, &work_unit_id, "regenerate_work_unit").await?;
     let mut run = load_supervisor_run(state, id).await?;
     let work_unit = load_supervisor_work_unit_row(state, id, &work_unit_id).await?;
 
@@ -2828,6 +2954,20 @@ pub async fn pause_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
 }
 
 pub async fn stage_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String, staged: bool, include_unstaged: bool) -> Result<Value> {
+    if staged || include_unstaged {
+        let row = sqlx::query("SELECT integration_state FROM supervisor_work_units WHERE supervisor_run_id = ? AND id = ? AND archived_at IS NULL")
+            .bind(id.to_string())
+            .bind(&work_unit_id)
+            .fetch_one(&state.db)
+            .await?;
+        let integration_state: String = row.get("integration_state");
+        if integration_state == "available" {
+            ensure_action_allowed(state, id, &work_unit_id, "stage_to_integration").await?;
+        }
+    } else {
+        ensure_action_allowed(state, id, &work_unit_id, "remove_from_integration").await?;
+    }
+
     let work_unit = load_supervisor_integration_candidate(state, id, &work_unit_id).await?;
     if !work_unit.supports_integration_input() {
         return Err(anyhow!("work unit kind cannot be used as an integration input"));
@@ -2835,6 +2975,15 @@ pub async fn stage_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id
     if work_unit.integration_state == IntegrationInputState::Skipped {
         return Err(anyhow!("skipped integration input must be restored before changing its change scope"));
     }
+    if staged || include_unstaged {
+        let workspace_path = work_unit.workspace_path.as_deref()
+            .ok_or_else(|| anyhow!("integration input has no workspace"))?;
+        let changes = patches::change_status(workspace_path)?;
+        if !(staged && changes.has_staged_changes() || include_unstaged && changes.has_unstaged_changes()) {
+            return Err(anyhow!("selected integration change scope contains no changes"));
+        }
+    }
+
 
     let integration_state = if staged || include_unstaged {
         IntegrationInputState::Included
@@ -3018,21 +3167,17 @@ pub async fn apply_supervisor_work_unit(
     }
 
     let integration_batch_id = run.id.to_string();
-    let integrated_inputs = sqlx::query(
-        r#"
-        SELECT source_work_unit_id, feature_id
-        FROM supervisor_integration_patches
-        WHERE supervisor_run_id = ?
-          AND integration_work_unit_id = ?
-          AND integration_workflow_run_id = ?
-        ORDER BY created_at ASC
-        "#,
-    )
-    .bind(run.id.to_string())
-    .bind(&work_unit_id)
-    .bind(integration_run_id.to_string())
-    .fetch_all(&state.db)
-    .await?;
+    let integrated_inputs = integration_context
+        .get("integration_inputs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("integration input snapshot is missing; rerun integration"))?;
+    if integration_context
+        .get("integration_workflow_run_id")
+        .and_then(Value::as_str)
+        != Some(integration_run_id_text.as_str())
+    {
+        return Err(anyhow!("integration input snapshot does not match the current integration workflow"));
+    }
 
     if integrated_inputs.is_empty() {
         return Err(anyhow!("integration workflow has no successfully merged input patches"));
@@ -3053,6 +3198,27 @@ pub async fn apply_supervisor_work_unit(
     let final_payload = git_patch_payload::payload_from_patch(&integration_workspace_path, "both", &patch_text)?;
     let patch_hash = final_payload.patch_hash.clone();
     let final_patch_ref = format!("supervisor_work_units:{}:context_json.final_patch_text", integration_batch_id);
+    let mut workflow_patches = Vec::with_capacity(integrated_inputs.len());
+    for input in integrated_inputs {
+        let source_work_unit_id = input
+            .get("work_unit_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("integration input is missing work_unit_id"))?;
+        let source_workflow_run_id = input.get("workflow_run_id").and_then(Value::as_str);
+        let workflow_key: Option<String> = if let Some(workflow_run_id) = source_workflow_run_id {
+            sqlx::query_scalar("SELECT NULLIF(TRIM(workflow_key), '') FROM workflow_runs WHERE id = ?")
+                .bind(workflow_run_id)
+                .fetch_optional(&state.db)
+                .await?
+                .flatten()
+        } else {
+            None
+        };
+        let mut patch = input.clone();
+        patch["workflow_key"] = json!(workflow_key.unwrap_or_else(|| source_work_unit_id.to_string()));
+        workflow_patches.push(patch);
+    }
+
     git_patch_payload::apply_payload(&run.root_repo_path, &final_payload.payload_text, false)?;
     let now_text = Utc::now().to_rfc3339();
     let merge_report = json!({
@@ -3103,17 +3269,92 @@ pub async fn apply_supervisor_work_unit(
     let applied_at_text = applied_at.to_rfc3339();
     let source_work_unit_ids = integrated_inputs
         .iter()
-        .map(|row| row.get::<String, _>("source_work_unit_id"))
+        .filter_map(|row| row.get("work_unit_id").and_then(Value::as_str).map(str::to_string))
         .collect::<Vec<_>>();
     let feature_ids = integrated_inputs
         .iter()
-        .filter_map(|row| row.get::<Option<String>, _>("feature_id"))
+        .filter_map(|row| row.get("feature_id").and_then(Value::as_str).map(str::to_string))
         .filter(|feature_id| !feature_id.trim().is_empty())
         .collect::<Vec<_>>();
 
     let source_work_unit_ids_json = serde_json::to_string(&source_work_unit_ids)?;
     let feature_ids_json = serde_json::to_string(&feature_ids)?;
     let mut tx = state.db.begin().await?;
+    let mut archived_workflow_keys = HashSet::new();
+    for patch in &workflow_patches {
+        let workflow_key = patch.get("workflow_key").and_then(Value::as_str).ok_or_else(|| anyhow!("missing workflow_key"))?.to_string();
+        if !archived_workflow_keys.insert(workflow_key.clone()) {
+            continue;
+        }
+
+        let source_work_unit_id = patch.get("work_unit_id").and_then(Value::as_str).ok_or_else(|| anyhow!("missing work_unit_id"))?;
+        let source_workflow_run_id = patch.get("workflow_run_id").and_then(Value::as_str);
+        let source_kind = patch.get("kind").and_then(Value::as_str).ok_or_else(|| anyhow!("missing kind"))?;
+        let feature_id = patch.get("feature_id").and_then(Value::as_str);
+        let base_commit = patch.get("base_commit").and_then(Value::as_str);
+        let source_patch_text = patch.get("patch_text").and_then(Value::as_str).ok_or_else(|| anyhow!("missing patch_text"))?;
+        let source_patch_hash = patch.get("patch_hash").and_then(Value::as_str).ok_or_else(|| anyhow!("missing patch_hash"))?;
+        let source_patch_bytes = patch.get("patch_bytes").and_then(Value::as_i64).ok_or_else(|| anyhow!("missing patch_bytes"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO supervisor_workflow_patches (
+                root_repo_path,
+                workflow_key,
+                source_work_unit_id,
+                source_workflow_run_id,
+                source_kind,
+                feature_id,
+                supervisor_run_id,
+                integration_workflow_run_id,
+                archive_status,
+                base_commit,
+                patch_text,
+                patch_hash,
+                patch_bytes,
+                applied_at,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(root_repo_path, workflow_key, archive_status) DO UPDATE SET
+                source_work_unit_id = excluded.source_work_unit_id,
+                source_workflow_run_id = excluded.source_workflow_run_id,
+                source_kind = excluded.source_kind,
+                feature_id = excluded.feature_id,
+                supervisor_run_id = excluded.supervisor_run_id,
+                integration_workflow_run_id = excluded.integration_workflow_run_id,
+                base_commit = excluded.base_commit,
+                patch_text = excluded.patch_text,
+                patch_hash = excluded.patch_hash,
+                patch_bytes = excluded.patch_bytes,
+                applied_at = excluded.applied_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&run.root_repo_path)
+        .bind(&workflow_key)
+        .bind(&source_work_unit_id)
+        .bind(&source_workflow_run_id)
+        .bind(&source_kind)
+        .bind(&feature_id)
+        .bind(run.id.to_string())
+        .bind(integration_run_id.to_string())
+        .bind(&base_commit)
+        .bind(&source_patch_text)
+        .bind(&source_patch_hash)
+        .bind(source_patch_bytes)
+        .bind(&applied_at_text)
+        .bind(&applied_at_text)
+        .bind(&applied_at_text)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM supervisor_workflow_patches WHERE root_repo_path = ? AND workflow_key = ? AND archive_status = 'unapplied'")
+            .bind(&run.root_repo_path)
+            .bind(&workflow_key)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     if archive_integrated_workflows {
         sqlx::query(
@@ -3168,6 +3409,19 @@ pub async fn apply_supervisor_work_unit(
     .await?;
 
     tx.commit().await?;
+
+    if archive_integrated_workflows {
+        for source_work_unit_id in &source_work_unit_ids {
+            lifecycle::archive_supervisor_workflow_by_work_unit(
+                state,
+                run.id,
+                &run.root_repo_path,
+                source_work_unit_id,
+                "integration applied and archived by user",
+            )
+            .await?;
+        }
+    }
 
     run.final_patch_path = None;
     run.merge_report = merge_report;

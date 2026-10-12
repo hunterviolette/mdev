@@ -1,10 +1,12 @@
 mod app_state;
+mod browser_registry;
 mod auth;
 mod db;
+mod environment_file;
 mod engine;
 mod models;
 mod supervisor;
-mod runtime_env;
+
 mod routes;
 
 use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
@@ -26,6 +28,44 @@ async fn main() -> anyhow::Result<()> {
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let app_root = resolve_app_root(&cwd)?;
     load_runtime_env(&app_root)?;
+
+    if env::var("MDEV_BROWSER_USER_DATA_DIR")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        env::set_var(
+            "MDEV_BROWSER_USER_DATA_DIR",
+            app_root.join(".mdev").join("browser-profile"),
+        );
+    }
+
+    let browser_profile_dir = PathBuf::from(env::var("MDEV_BROWSER_USER_DATA_DIR")?);
+    fs::create_dir_all(&browser_profile_dir).with_context(|| {
+        format!(
+            "failed to create browser profile directory {}",
+            browser_profile_dir.display()
+        )
+    })?;
+
+    if env::var("MDEV_BROWSER_USER_DATA_DIR")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        env::set_var(
+            "MDEV_BROWSER_USER_DATA_DIR",
+            app_root.join(".mdev").join("browser-profile"),
+        );
+    }
+
+    let browser_profile_dir = PathBuf::from(env::var("MDEV_BROWSER_USER_DATA_DIR")?);
+    fs::create_dir_all(&browser_profile_dir).with_context(|| {
+        format!(
+            "failed to create browser profile directory {}",
+            browser_profile_dir.display()
+        )
+    })?;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -80,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let addr = crate::runtime_env::workflow_api_bind_addr()?;
+    let addr = crate::environment_file::workflow_api_bind_addr()?;
 
     let shutdown_state = state.clone();
     let app = build_router(state, auth, &layout.web_dist);
@@ -171,7 +211,7 @@ struct RuntimeLayout {
     web_dist: PathBuf,
 }
 
-fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
     if let Some(repo_root) = detect_repo_root(cwd) {
         return Ok(repo_root);
     }
@@ -184,12 +224,7 @@ fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn load_runtime_env(app_root: &Path) -> anyhow::Result<()> {
-    let env_path = app_root.join(".env");
-    if env_path.exists() {
-        dotenvy::from_path(&env_path)
-            .with_context(|| format!("failed to load {}", env_path.display()))?;
-    }
-    Ok(())
+    environment_file::load(app_root)
 }
 
 fn resolve_runtime_path(app_root: &Path, value: &str) -> PathBuf {
@@ -224,7 +259,7 @@ fn runtime_layout(app_root: PathBuf) -> anyhow::Result<RuntimeLayout> {
     })
 }
 
-fn mdev_data_dir(app_root: &Path) -> PathBuf {
+pub(crate) fn mdev_data_dir(app_root: &Path) -> PathBuf {
     if let Ok(value) = env::var("MDEV_DATA_DIR") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {

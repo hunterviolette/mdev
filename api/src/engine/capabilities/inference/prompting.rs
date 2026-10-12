@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use super::accounting::{count_tokens, InputTokenComponent};
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -168,6 +170,64 @@ pub fn resolve_default_user_input(
         inherited_value: None,
         source: DefaultUserInputSource::None,
     }
+}
+
+pub fn estimate_input_components(
+    input: &ModelInput,
+    pasted_context: Option<&str>,
+) -> Result<Vec<InputTokenComponent>> {
+    let mut components = Vec::new();
+    let mut seen_text = std::collections::HashSet::new();
+    for block in &input.input_blocks {
+        let content = block.content.trim();
+        if content.is_empty() || !seen_text.insert(content.to_string()) {
+            continue;
+        }
+        components.push(InputTokenComponent {
+            input_type: if block.source == "compile_commands" { "context" } else { "instruction" }.to_string(),
+            input_source: block.source.clone(),
+            label: block.label.clone(),
+            tokens: count_tokens(content)?,
+        });
+    }
+    if input.input_blocks.is_empty() && !input.text.trim().is_empty() {
+        components.push(InputTokenComponent {
+            input_type: "instruction".to_string(),
+            input_source: "composite_text".to_string(),
+            label: "Composite prompt".to_string(),
+            tokens: count_tokens(&input.text)?,
+        });
+    }
+    let compiled_context = pasted_context.or(input.pasted_context_text.as_deref());
+    if let Some(content) = compiled_context.filter(|content| !content.trim().is_empty()) {
+        let mut remaining = content.to_string();
+        for block in &input.input_blocks {
+            if block.source == "compile_commands" && !block.content.trim().is_empty() {
+                remaining = remaining.replacen(block.content.trim(), "", 1);
+            }
+        }
+        if !remaining.trim().is_empty() {
+            components.push(InputTokenComponent {
+                input_type: "context".to_string(),
+                input_source: "pasted_context".to_string(),
+                label: "Pasted context".to_string(),
+                tokens: count_tokens(remaining.trim())?,
+            });
+        }
+    }
+    for attachment in &input.attachments {
+        if attachment.kind != ModelAttachmentKind::Text {
+            continue;
+        }
+        let content = std::fs::read_to_string(&attachment.path)?;
+        components.push(InputTokenComponent {
+            input_type: "attachment".to_string(),
+            input_source: format!("{:?}", attachment.role).to_ascii_lowercase(),
+            label: attachment.filename.clone(),
+            tokens: count_tokens(&content)?,
+        });
+    }
+    Ok(components)
 }
 
 #[derive(Default, Deserialize)]

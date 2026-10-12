@@ -859,11 +859,13 @@ export type InferenceInputsResponse = {
   total: number;
   has_more: boolean;
   next_offset: number | null;
+  non_default_by_session: Record<string, number>;
 };
 
 export type InferenceInputsFilters = {
   search?: string;
   stage_type?: string;
+  session_id?: string;
   hide_defaults?: boolean;
   offset?: number;
   limit?: number;
@@ -873,6 +875,7 @@ export function getInferenceInputs(runId: string, filters: InferenceInputsFilter
   const params = new URLSearchParams();
   if (filters.search?.trim()) params.set('search', filters.search.trim());
   if (filters.stage_type) params.set('stage_type', filters.stage_type);
+  if (filters.session_id) params.set('session_id', filters.session_id);
   if (filters.hide_defaults !== undefined) params.set('hide_defaults', String(filters.hide_defaults));
   params.set('offset', String(filters.offset ?? 0));
   params.set('limit', String(filters.limit ?? 100));
@@ -1293,11 +1296,36 @@ export function getPayloadGatewaySchema() {
   }>(`/api/capabilities/payload-gateway/schema`);
 }
 
-export function getChangesetSchema() {
-  return fetchJson<{
-    ok: boolean;
-    schema: string;
-  }>(`/api/capabilities/changeset-schema`);
+export async function getChangesetSchema(runId?: string): Promise<{ ok: boolean; schema: string; run_id?: string }> {
+  if (!runId) return { ok: true, schema: '' };
+
+  const capabilities = await listWorkflowCapabilities(runId);
+  const available = Array.isArray(capabilities.capabilities)
+    ? capabilities.capabilities.some((item) => {
+        const capability = item as Record<string, unknown>;
+        return capability.capability === 'changeset_schema';
+      })
+    : false;
+
+  if (!available) return { ok: true, schema: '' };
+
+  const response = await executeWorkflowCapability(runId, 'changeset_schema', {});
+  const results = Array.isArray(response.results) ? response.results : [];
+  const result = results.find((item) => {
+    const entry = item as Record<string, unknown>;
+    return entry.capability === 'changeset_schema';
+  }) as Record<string, unknown> | undefined;
+  const payload = result?.payload as Record<string, unknown> | undefined;
+
+  if (response.ok !== true || result?.ok !== true || typeof payload?.schema !== 'string') {
+    throw new Error('Changeset schema capability execution failed');
+  }
+
+  return {
+    ok: true,
+    run_id: runId,
+    schema: payload.schema,
+  };
 }
 
 export function listWorkflowCapabilities(runId: string) {
@@ -1895,6 +1923,19 @@ export function discardWorkflowReviewDiff(runId: string, body: {
   });
 }
 
+export type ReviewCumulativeDiffResponse = {
+  ok: boolean;
+  files: number;
+  additions: number;
+  deletions: number;
+  from_ref: string;
+  to_ref: string;
+};
+
+export function getWorkflowCumulativeDiff(runId: string) {
+  return fetchJson<ReviewCumulativeDiffResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/review/cumulative-diff`);
+}
+
 export function getWorkflowReviewStatus(runId: string) {
   return fetchJson<ReviewStatusResponse>(`/api/workflow-runs/${runId}/review/status`);
 }
@@ -2045,8 +2086,40 @@ export function getWorkflowImpact(runId: string) {
   return fetchJson<WorkflowImpact>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact`);
 }
 export type ImpactEffect = { attempt_id: string; step_id: string | null; attempt_status: string; created_at: string; action: string; status: string; path_before: string | null; path_after: string | null; operation: { op?: string; action?: string; match?: { text?: string }; replacement?: string; text?: string; changes?: Array<{ action?: string; match?: { text?: string }; replacement?: string; text?: string }>; contents?: string; from?: string; to?: string }; error: string | null };
-export type ImpactInvocation = { id: string; session_id: string; step_id: string; stage_type: string; provider: string; model: string; transport: string; status: string; error: string | null; created_at: string; completed_at: string | null; input_tokens: number | null; output_tokens: number | null; cached_tokens: number | null; cost: number | null; currency: string | null; metadata: unknown };
-export type ImpactAttempt = { id: string; status: string; total_ops: number; applied_ops: number; failed_ops: number; skipped_ops: number; total_actions: number; applied_actions: number; failed_actions: number; created_at: string };
+export type ImpactInferenceAccounting = {
+  reported_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cached_input_tokens: number | null;
+    reasoning_output_tokens: number | null;
+  } | null;
+  theoretical_usage: {
+    input_tokens: number;
+    output_tokens: number;
+    tokenizer: 'o200k_base';
+    input_scope: 'submitted_content' | 'full_known_context';
+  } | null;
+  costs: Array<{
+    source: {
+      kind: 'provider_reported' | 'calculated';
+      provider?: string;
+      pricing?: {
+        provider: string;
+        model: string;
+        version: string;
+        effective_from?: string | null;
+      };
+      usage_source?: 'reported' | 'theoretical';
+    };
+    amount: {
+      amount: string;
+      currency: string;
+    };
+  }>;
+};
+
+export type ImpactInvocation = { id: string; session_id: string; step_id: string; stage_type: string; provider: string; model: string; transport: string; status: string; error: string | null; created_at: string; completed_at: string | null; input_tokens: number | null; output_tokens: number | null; cached_tokens: number | null; cost: number | null; currency: string | null; metadata: unknown; accounting: ImpactInferenceAccounting | null };
+export type ImpactAttempt = { id: string; step_id: string | null; status: string; total_ops: number; applied_ops: number; failed_ops: number; skipped_ops: number; total_actions: number; applied_actions: number; failed_actions: number; created_at: string };
 export type ImpactDetail = { effects: ImpactEffect[]; inference: ImpactInvocation[]; attempts: ImpactAttempt[] };
 export async function getImpactDetail(runId: string): Promise<ImpactDetail> {
   const path = `/api/workflow-runs/${encodeURIComponent(runId)}/impact/detail`;
@@ -2109,6 +2182,7 @@ export type ImpactInferenceRecord = {
   cached_input_tokens: number | null;
   cost_amount: number | null;
   cost_currency: string | null;
+  accounting: ImpactInferenceAccounting | null;
 };
 
 export type ImpactEventsResponse = { events: ImpactEvent[]; has_more: boolean; next_cursor: number | null };

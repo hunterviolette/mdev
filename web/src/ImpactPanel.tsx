@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Badge, Box, Button, Checkbox, Code, Collapse, Divider, Grid, Group, HoverCard, Loader, Modal, Paper, Progress, ScrollArea, SegmentedControl, Select, SimpleGrid, Stack, Table, Tabs, Text, TextInput, Title } from '@mantine/core';
 import { getImpactDetail, getImpactEvents, getImpactInference, getInferenceInputs, getWorkflowImpact, type ImpactDetail, type ImpactEffect, type ImpactEvent, type ImpactInferenceRecord, type ImpactInvocation, type InferenceInputRecord, type WorkflowImpact } from './api';
 import { DiffTree, type DiffTreeFile } from './DiffTree';
+import { getWorkflowReviewStatus, type ReviewStatusResponse, type ReviewStatusFileEntry } from './api';
 
 const { ImpactFileExplorer } = (() => {
 type Line = { sign: '+' | '-' | ' '; value: string };
@@ -100,6 +101,70 @@ function ImpactFileExplorer({ files, effects }: { files: string[]; effects: Impa
 return { ImpactFileExplorer };
 })();
 
+function InferenceTokenUsage({ accounting, inputTokens, outputTokens }: {
+  accounting?: {
+    reported_usage?: { input_tokens: number; output_tokens: number } | null;
+    theoretical_usage?: { input_tokens: number; output_tokens: number; tokenizer: string; input_scope: string } | null;
+  } | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+}) {
+  const reportedInput = accounting?.reported_usage?.input_tokens ?? inputTokens;
+  const reportedOutput = accounting?.reported_usage?.output_tokens ?? outputTokens;
+  const theoretical = accounting?.theoretical_usage;
+  const hasReported = reportedInput != null || reportedOutput != null;
+  const input = reportedInput ?? theoretical?.input_tokens;
+  const output = reportedOutput ?? theoretical?.output_tokens;
+  const estimatedInput = reportedInput == null && theoretical?.input_tokens != null;
+  const estimatedOutput = reportedOutput == null && theoretical?.output_tokens != null;
+  const format = (value: number | null | undefined, estimated: boolean) => value == null ? '—' : `${value.toLocaleString()}${estimated ? '*' : ''}`;
+  return <Text size="xs" c="dimmed" title={estimatedInput || estimatedOutput ? inferenceTokenExplanation : undefined}>
+    {hasReported ? 'Reported: ' : theoretical ? 'Theoretical: ' : ''}{format(input, estimatedInput)} in / {format(output, estimatedOutput)} out tokens
+  </Text>;
+}
+
+const inferenceTokenExplanation = 'Theoretical token usage is estimated from known input and output content using o200k_base. Provider-reported usage takes precedence where available. Actual provider context and tokenization may differ.';
+
+function inferenceTokenTotals(records: ImpactInvocation[]) {
+  let input = 0;
+  let output = 0;
+  let inputKnown = 0;
+  let outputKnown = 0;
+  let inputEstimated = false;
+  let outputEstimated = false;
+  for (const record of records) {
+    const reportedInput = record.accounting?.reported_usage?.input_tokens ?? record.input_tokens;
+    const reportedOutput = record.accounting?.reported_usage?.output_tokens ?? record.output_tokens;
+    const theoreticalInput = record.accounting?.theoretical_usage?.input_tokens;
+    const theoreticalOutput = record.accounting?.theoretical_usage?.output_tokens;
+    const inputValue = reportedInput ?? theoreticalInput;
+    const outputValue = reportedOutput ?? theoreticalOutput;
+    if (inputValue != null) {
+      input += inputValue;
+      inputKnown++;
+      if (reportedInput == null) inputEstimated = true;
+    }
+    if (outputValue != null) {
+      output += outputValue;
+      outputKnown++;
+      if (reportedOutput == null) outputEstimated = true;
+    }
+  }
+  return {
+    input: inputKnown ? input : null,
+    output: outputKnown ? output : null,
+    inputEstimated,
+    outputEstimated,
+    inputIncomplete: inputKnown < records.length,
+    outputIncomplete: outputKnown < records.length,
+  };
+}
+
+function InferenceTokenValue({ value, estimated, incomplete }: { value: number | null; estimated: boolean; incomplete?: boolean }) {
+  const explanation = [estimated ? inferenceTokenExplanation : '', incomplete ? 'Usage was unavailable for some invocations; the displayed total includes only recorded values.' : ''].filter(Boolean).join(' ');
+  return <Text span title={explanation || undefined} style={{ whiteSpace: 'nowrap' }}>{value == null ? '—' : value.toLocaleString()}{estimated && <Text span c="dimmed">*</Text>}{incomplete && <Text span c="dimmed">†</Text>}</Text>;
+}
+
 const { ImpactInferenceSummary } = (() => {
 type Props = { runId: string; records: ImpactInvocation[]; responses: number; onHistory: () => void };
 const failed = (r: ImpactInvocation) => /fail|error|cancel/i.test(r.status) || !!r.error;
@@ -115,6 +180,26 @@ const cost = (rows: ImpactInvocation[]) => {
   const currencies = [...new Set(priced.map(r => r.currency || 'unknown'))];
   return currencies.length !== 1 ? 'Mixed currencies' : `${currencies[0]} ${priced.reduce((n, r) => n + (r.cost || 0), 0).toFixed(4)}`;
 };
+function InferenceTokenUsage({ accounting, inputTokens, outputTokens }: {
+  accounting: ImpactInvocation['accounting'];
+  inputTokens: number | null;
+  outputTokens: number | null;
+}) {
+  const reported = accounting?.reported_usage;
+  const theoretical = accounting?.theoretical_usage;
+  const reportedInput = reported?.input_tokens ?? inputTokens;
+  const reportedOutput = reported?.output_tokens ?? outputTokens;
+  const hasReported = reportedInput != null || reportedOutput != null;
+  const primaryInput = reportedInput ?? theoretical?.input_tokens;
+  const primaryOutput = reportedOutput ?? theoretical?.output_tokens;
+  const format = (value: number | null | undefined, estimated: boolean) => value == null ? '—' : `${value.toLocaleString()}${estimated ? '*' : ''}`;
+  const estimatedInput = reportedInput == null && theoretical?.input_tokens != null;
+  const estimatedOutput = reportedOutput == null && theoretical?.output_tokens != null;
+  return <Text size="xs" c="dimmed" title={estimatedInput || estimatedOutput ? inferenceTokenExplanation : undefined}>
+    {hasReported ? 'Reported: ' : theoretical ? 'Theoretical: ' : ''}{format(primaryInput, estimatedInput)} in / {format(primaryOutput, estimatedOutput)} out tokens
+  </Text>;
+}
+
 function InvocationRow({ runId, item }: { runId: string; item: ImpactInvocation }) {
   const [opened, setOpened] = useState(false);
   const [detail, setDetail] = useState<ImpactInferenceRecord | null>(null);
@@ -124,9 +209,9 @@ function InvocationRow({ runId, item }: { runId: string; item: ImpactInvocation 
   return <Paper withBorder radius="sm" p="xs"><Stack gap="xs">
     <Box component="button" type="button" onClick={() => setOpened(v => !v)} style={{ cursor: 'pointer', width: '100%', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left' }}>
       <Group justify="space-between" wrap="wrap" gap="xs"><Group gap="xs"><Text size="xs">{opened ? '▾' : '▸'} {item.stage_type} · {item.model || 'Unknown model'}</Text><Badge size="xs" color={failed(item) ? 'red' : 'teal'}>{item.status}</Badge></Group><Text size="xs" c="dimmed">{elapsed(item.created_at, item.completed_at)}</Text></Group>
-      <Text size="xs" c="dimmed">{new Date(item.created_at).toLocaleString()} · {item.input_tokens == null ? '—' : item.input_tokens} in / {item.output_tokens == null ? '—' : item.output_tokens} out · {item.cost == null ? 'Cost unavailable' : `${item.currency || ''} ${item.cost}`}</Text>
+      <Text size="xs" c="dimmed">{new Date(item.created_at).toLocaleString()} · {item.cost == null ? 'Cost unavailable' : `${item.currency || ''} ${item.cost}`}</Text><InferenceTokenUsage accounting={item.accounting} inputTokens={item.input_tokens} outputTokens={item.output_tokens} />
     </Box>
-    <Collapse in={opened}>{loading && <Loader size="xs" />}{error && <Text size="xs" c="red">{error}</Text>}{detail && <Stack gap="sm"><Text size="xs" fw={700}>Inputs ({detail.inputs.length})</Text>{detail.inputs.map((input, index) => <Box key={index}><Text size="xs" c="dimmed">{input.label || input.input_type}</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 250, overflowY: 'auto', fontSize: 11, background: 'var(--mantine-color-default-hover)' }}>{input.content}</Box></Box>)}<Text size="xs" fw={700}>Output</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 350, overflowY: 'auto', fontSize: 11, background: 'var(--mantine-color-default-hover)' }}>{detail.response_text || 'No text output recorded'}</Box>{detail.provider_metadata != null && <><Text size="xs" fw={700}>Provider metadata</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 180, overflowY: 'auto', fontSize: 11 }}>{JSON.stringify(detail.provider_metadata, null, 2)}</Box></>}{detail.error_message && <Text size="xs" c="red">{detail.error_message}</Text>}</Stack>}</Collapse>
+    <Collapse in={opened}>{loading && <Loader size="xs" />}{error && <Text size="xs" c="red">{error}</Text>}{detail && <Stack gap="sm"><InferenceTokenUsage accounting={detail.accounting} inputTokens={detail.input_tokens} outputTokens={detail.output_tokens} /><Text size="xs" fw={700}>Inputs ({detail.inputs.length})</Text>{detail.inputs.map((input, index) => <Box key={index}><Text size="xs" c="dimmed">{input.label || input.input_type}</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 250, overflowY: 'auto', fontSize: 11, background: 'var(--mantine-color-default-hover)' }}>{input.content}</Box></Box>)}<Text size="xs" fw={700}>Output</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 350, overflowY: 'auto', fontSize: 11, background: 'var(--mantine-color-default-hover)' }}>{detail.response_text || 'No text output recorded'}</Box>{detail.provider_metadata != null && <><Text size="xs" fw={700}>Provider metadata</Text><Box component="pre" p="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 180, overflowY: 'auto', fontSize: 11 }}>{JSON.stringify(detail.provider_metadata, null, 2)}</Box></>}{detail.error_message && <Text size="xs" c="red">{detail.error_message}</Text>}</Stack>}</Collapse>
   </Stack></Paper>;
 }
 function InferenceInputsView({ runId }: { runId: string }) {
@@ -237,6 +322,23 @@ function InferenceInputsView({ runId }: { runId: string }) {
 function ImpactInferenceSummary({ runId, records, responses, onHistory }: Props) {
   const [view, setView] = useState<'sessions' | 'inputs'>('sessions');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [inputCounts, setInputCounts] = useState<Record<string, number>>({});
+  const [inputCountsLoaded, setInputCountsLoaded] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setInputCounts({});
+    setInputCountsLoaded(false);
+    getInferenceInputs(runId, { limit: 1, hide_defaults: true }).then(result => {
+      if (!active) return;
+      setInputCounts(result.non_default_by_session || {});
+      setInputCountsLoaded(true);
+    }).catch(() => {
+      if (active) setInputCountsLoaded(false);
+    });
+    return () => { active = false; };
+  }, [runId, records]);
+  const totals = useMemo(() => inferenceTokenTotals(records), [records]);
+  const nonDefaultInputs = inputCountsLoaded ? [...new Set(records.map(record => record.session_id))].reduce((sum, id) => sum + (inputCounts[id] || 0), 0) : null;
   const providers = useMemo(() => {
     const groups = new Map<string, Map<string, ImpactInvocation[]>>();
     for (const record of records) {
@@ -262,7 +364,15 @@ function ImpactInferenceSummary({ runId, records, responses, onHistory }: Props)
         <Button size="xs" variant="subtle" onClick={onHistory}>History →</Button>
       </Group>
     </Group>
-    <Group gap="xl"><Box><Text size="xs" c="dimmed">Responses</Text><Text fw={700}>{responses}</Text></Box><Box><Text size="xs" c="dimmed">Invocations</Text><Text fw={700}>{records.length}</Text></Box><Box><Text size="xs" c="dimmed">Provider errors</Text><Text fw={700} c={errorCount ? 'red' : undefined}>{errorCount}</Text></Box><Box><Text size="xs" c="dimmed">Recorded cost</Text><Text fw={700}>{cost(records)}</Text></Box></Group>
+    <Group gap="xl" wrap="wrap" align="flex-start">
+      <Box><Text size="xs" c="dimmed">Responses</Text><Text fw={700}>{responses}</Text></Box>
+      <Box><Text size="xs" c="dimmed">Invocations</Text><Text fw={700}>{records.length}</Text></Box>
+      <Box><Text size="xs" c="dimmed">Non-default inputs</Text><Text fw={700}>{nonDefaultInputs == null ? '—' : nonDefaultInputs.toLocaleString()}</Text></Box>
+      <Box><Text size="xs" c="dimmed">Input tokens</Text><Text fw={700}><InferenceTokenValue value={totals.input} estimated={totals.inputEstimated} incomplete={totals.inputIncomplete} /></Text></Box>
+      <Box><Text size="xs" c="dimmed">Output tokens</Text><Text fw={700}><InferenceTokenValue value={totals.output} estimated={totals.outputEstimated} incomplete={totals.outputIncomplete} /></Text></Box>
+      <Box><Text size="xs" c="dimmed">Provider errors</Text><Text fw={700} c={errorCount ? 'red' : undefined}>{errorCount}</Text></Box>
+      <Box><Text size="xs" c="dimmed">Recorded cost</Text><Text fw={700}>{cost(records)}</Text></Box>
+    </Group>
     {view === 'inputs' ? <InferenceInputsView runId={runId} /> : <>
     {!providers.length && <Text size="sm" c="dimmed">No recorded inference sessions.</Text>}
     {providers.map(provider => {
@@ -281,14 +391,26 @@ function ImpactInferenceSummary({ runId, records, responses, onHistory }: Props)
               const start = session.calls[0]?.created_at;
               const finish = session.calls.filter(record => record.completed_at).map(record => record.completed_at!).sort().slice(-1)[0] || null;
               const errors = session.calls.filter(failed).length;
+              const sessionTokens = inferenceTokenTotals(session.calls);
+              const sessionInputs = inputCountsLoaded ? inputCounts[session.id] || 0 : null;
               const models = [...new Set(session.calls.map(record => record.model?.trim()).filter((model): model is string => !!model && model.toLowerCase() !== 'unknown' && model.toLowerCase() !== 'unknown model'))];
               return <Box key={key} style={{ borderTop: index ? '1px solid var(--mantine-color-default-border)' : undefined }}>
                 <Box component="button" type="button" onClick={() => setExpanded(current => ({ ...current, [key]: !open }))} px="sm" py={9} style={{ cursor: 'pointer', width: '100%', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left' }}>
                   <Group gap="sm" wrap="nowrap">
                     <Text size="xs" c="dimmed" w={12}>{open ? '▾' : '▸'}</Text>
-                    <Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }} truncate>Session {session.id.slice(0, 12)}{models.length ? ` · ${models.join(', ')}` : ''}</Text>
+                    <Box style={{ flex: 1, minWidth: 0 }}>
+                      <Text size="sm" fw={600} truncate>Session {session.id.slice(0, 12)}{models.length ? ` · ${models.join(', ')}` : ''}</Text>
+                      <Group gap="xs" wrap="wrap" mt={2}>
+                        <Text size="xs" c="dimmed">{session.calls.length} {session.calls.length === 1 ? 'call' : 'calls'}</Text>
+                        <Text size="xs" c="dimmed">·</Text>
+                        <Text size="xs" c="dimmed">{sessionInputs == null ? '—' : sessionInputs.toLocaleString()} non-default inputs</Text>
+                        <Text size="xs" c="dimmed">·</Text>
+                        <Text size="xs" c="dimmed"><InferenceTokenValue value={sessionTokens.input} estimated={sessionTokens.inputEstimated} incomplete={sessionTokens.inputIncomplete} /> in</Text>
+                        <Text size="xs" c="dimmed">·</Text>
+                        <Text size="xs" c="dimmed"><InferenceTokenValue value={sessionTokens.output} estimated={sessionTokens.outputEstimated} incomplete={sessionTokens.outputIncomplete} /> out</Text>
+                      </Group>
+                    </Box>
                     {errors > 0 && <Badge size="xs" color="red" variant="light">{errors} errors</Badge>}
-                    <Text size="xs" c="dimmed" style={{ whiteSpace: 'nowrap' }}>{session.calls.length} {session.calls.length === 1 ? 'call' : 'calls'}</Text>
                     <Text size="xs" c="dimmed" ta="right" w={85} style={{ whiteSpace: 'nowrap' }}>{start ? elapsed(start, finish) : 'Unavailable'}</Text>
                   </Group>
                 </Box>
@@ -303,7 +425,7 @@ function ImpactInferenceSummary({ runId, records, responses, onHistory }: Props)
         </Paper>
       </Stack>;
     })}
-    <Text size="xs" c="dimmed">Call durations use recorded inference start/end timestamps. Session span runs from its first call to its last recorded completion; it is not stage execution duration. Missing times, tokens, and costs are not estimated.</Text>
+    <Text size="xs" c="dimmed">Session duration spans the first invocation to the last recorded completion. Hover over * for theoretical token methodology and † for incomplete totals.</Text>
     </>}
   </Stack></Paper>;
 }
@@ -392,7 +514,7 @@ return { ImpactEvidence };
 
 const { ImpactStageFlow } = (() => {
 type Props = { runId: string; data: WorkflowImpact; onInspect: (target: 'stage' | 'capability' | 'history', name?: string) => void };
-type Outcome = { id: string; name: string; step: string; failed: boolean; completed: boolean };
+type Outcome = { id: string; name: string; step: string; failed: boolean; completed: boolean; durationMs: number | null };
 type Capability = Outcome & { stageExecution: string | null };
 const detail = (e: ImpactEvent): Record<string, unknown> => e.payload && typeof e.payload === 'object' && !Array.isArray(e.payload) ? e.payload as Record<string, unknown> : {};
 const label = (value: string) => value.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -414,9 +536,126 @@ const capabilityName = (e: ImpactEvent) => {
 const isError = (e: ImpactEvent) => /fail|error|reject/i.test(e.kind) || /error|fatal/i.test(e.level);
 const isDone = (e: ImpactEvent) => /complet|success|succeed/i.test(e.kind);
 const percent = (success: number, total: number) => total ? `${(100 * success / total).toFixed(1)}%` : '—';
+const recordedDuration = (e: ImpactEvent): number | null => {
+  const value = detail(e).duration_ms;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+};
+const durationTotal = (items: Outcome[]) => {
+  const recorded = items.filter(item => item.durationMs !== null);
+  if (!recorded.length) return '—';
+  const ms = recorded.reduce((sum, item) => sum + (item.durationMs || 0), 0);
+  const value = ms < 1000 ? `${Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : ms < 3600000 ? `${Math.floor(ms / 60000)}m ${((ms % 60000) / 1000).toFixed(1)}s` : `${Math.floor(ms / 3600000)}h ${Math.floor(ms % 3600000 / 60000)}m`;
+  return recorded.length < items.length ? `${value} recorded` : value;
+};
+
+type DiffSummary = { files: number; additions: number; deletions: number };
+
+const summarizeDiff = (files: ReviewStatusFileEntry[]): DiffSummary => ({
+  files: new Set(files.map(file => file.path)).size,
+  additions: files.reduce((sum, file) => sum + file.additions, 0),
+  deletions: files.reduce((sum, file) => sum + file.deletions, 0)
+});
+
+function DiffMetric({ label, value, color }: { label: string; value: string; color?: string }) {
+  return <Paper withBorder radius="md" p="sm" style={{ minWidth: 0 }}>
+    <Text size="xs" c="dimmed">{label}</Text>
+    <Text fw={800} fz={24} c={color} style={{ overflowWrap: 'anywhere' }}>{value}</Text>
+  </Paper>;
+}
+
+function DiffBreakdown({ title, summary }: { title: string; summary: DiffSummary }) {
+  return <Paper withBorder radius="md" p="sm" style={{ minWidth: 0 }}>
+    <Stack gap="sm">
+      <Text fw={700} size="sm">{title}</Text>
+      <SimpleGrid cols={3} spacing="xs">
+        <Box><Text size="xs" c="dimmed">Files</Text><Text fw={700} fz="lg">{summary.files.toLocaleString()}</Text></Box>
+        <Box><Text size="xs" c="dimmed">Added</Text><Text fw={700} fz="lg" c="teal">+{summary.additions.toLocaleString()}</Text></Box>
+        <Box><Text size="xs" c="dimmed">Removed</Text><Text fw={700} fz="lg" c="red">−{summary.deletions.toLocaleString()}</Text></Box>
+      </SimpleGrid>
+    </Stack>
+  </Paper>;
+}
+
+function ImpactRepositoryDiff({ summaries, reviewError }: { summaries: { staged: DiffSummary; unstaged: DiffSummary; composite: DiffSummary } | null; reviewError: boolean }) {
+  return <Paper withBorder radius="md" p="lg" h="100%">
+    <Stack gap="md">
+      <Box>
+        <Text fw={700} size="sm">Repository diff</Text>
+        <Text size="xs" c="dimmed">Current repository changes</Text>
+      </Box>
+      {summaries ? <>
+        <SimpleGrid cols={3} spacing="xs">
+          <DiffMetric label="Files changed" value={summaries.composite.files.toLocaleString()} />
+          <DiffMetric label="Lines added" value={`+${summaries.composite.additions.toLocaleString()}`} color="teal" />
+          <DiffMetric label="Lines removed" value={`−${summaries.composite.deletions.toLocaleString()}`} color="red" />
+        </SimpleGrid>
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+          <DiffBreakdown title="Staged" summary={summaries.staged} />
+          <DiffBreakdown title="Unstaged" summary={summaries.unstaged} />
+        </SimpleGrid>
+      </> : <Text size="xs" c="dimmed">{reviewError ? 'Repository diff unavailable' : 'Loading repository diff…'}</Text>}
+    </Stack>
+  </Paper>;
+}
+
+function ImpactExecutionSummary({ data, runtime, cost, onHistory }: { data: WorkflowImpact; runtime: string; cost: string; onHistory: () => void }) {
+  return <Paper withBorder radius="md" p="lg" h="100%">
+    <Stack gap="md">
+      <Group justify="space-between" align="start" gap="xs">
+        <Box>
+          <Text fw={700} size="sm">Execution summary</Text>
+          <Text size="xs" c="dimmed">Totals across all stages</Text>
+        </Box>
+        <Button size="xs" variant="subtle" onClick={onHistory}>View history →</Button>
+      </Group>
+      <SimpleGrid cols={3} spacing="xs">
+        <DiffMetric label="Total executions" value={data.stage_executions.toLocaleString()} />
+        <DiffMetric label="Completed" value={data.completed_stages.toLocaleString()} color="teal" />
+        <DiffMetric label="Failed" value={data.failed_stages.toLocaleString()} color="red" />
+        <DiffMetric label="Total cost" value={cost} />
+        <DiffMetric label="Total runtime" value={runtime} />
+      </SimpleGrid>
+    </Stack>
+  </Paper>;
+}
 
 function ImpactStageFlow({ runId, data, onInspect }: Props) {
   const [events, setEvents] = useState<ImpactEvent[]>([]);
+  const [reviewStatus, setReviewStatus] = useState<ReviewStatusResponse | null>(null);
+  const [reviewError, setReviewError] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setReviewStatus(null);
+    setReviewError(false);
+    getWorkflowReviewStatus(runId).then(status => {
+      if (!cancelled) setReviewStatus(status);
+    }).catch(() => {
+      if (!cancelled) setReviewError(true);
+    });
+    return () => { cancelled = true; };
+  }, [runId, data.stage_executions, data.capability_activations]);
+  const diffSummaries = useMemo(() => {
+    if (!reviewStatus) return null;
+    const staged = summarizeDiff(reviewStatus.staged);
+    const unstaged = summarizeDiff(reviewStatus.unstaged);
+    const composite: DiffSummary = {
+      files: new Set([...reviewStatus.staged, ...reviewStatus.unstaged].map(file => file.path)).size,
+      additions: staged.additions + unstaged.additions,
+      deletions: staged.deletions + unstaged.deletions
+    };
+    return { staged, unstaged, composite };
+  }, [reviewStatus]);
+  const [inference, setInference] = useState<ImpactInvocation[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setInference(null);
+    getImpactDetail(runId).then(result => {
+      if (!cancelled) setInference(result.inference);
+    }).catch(() => {
+      if (!cancelled) setInference([]);
+    });
+    return () => { cancelled = true; };
+  }, [runId, data.inference_outputs]);
   const [pending, setPending] = useState(true);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -448,17 +687,19 @@ function ImpactStageFlow({ runId, data, onInspect }: Props) {
       const step = e.step_id || '';
       if (e.stage_execution_id) {
         const id = e.stage_execution_id;
-        const item = byExecution.get(id) || { id, name: stageName(e), step, failed: false, completed: false };
-        item.failed ||= isError(e);
+        const item = byExecution.get(id) || { id, name: stageName(e), step, failed: false, completed: false, durationMs: null };
+        item.failed ||= isError(e) || detail(e).ok === false;
         item.completed ||= isDone(e);
+        if ((e.kind === 'stage_execution_completed' || e.kind === 'stage_execution_failed') && recordedDuration(e) !== null) item.durationMs = recordedDuration(e);
         byExecution.set(id, item);
       }
       if (e.capability_invocation_id) {
         const id = e.capability_invocation_id;
-        const item = byInvocation.get(id) || { id, name: capabilityName(e), step, stageExecution: e.stage_execution_id, failed: false, completed: false };
+        const item = byInvocation.get(id) || { id, name: capabilityName(e), step, stageExecution: e.stage_execution_id, failed: false, completed: false, durationMs: null };
         if (!item.stageExecution && e.stage_execution_id) item.stageExecution = e.stage_execution_id;
-        item.failed ||= isError(e);
+        item.failed ||= isError(e) || detail(e).ok === false;
         item.completed ||= isDone(e);
+        if ((/_completed$|_failed$/.test(e.kind)) && recordedDuration(e) !== null) item.durationMs = recordedDuration(e);
         byInvocation.set(id, item);
       }
     }
@@ -475,15 +716,30 @@ function ImpactStageFlow({ runId, data, onInspect }: Props) {
     }
     return [...names.values()];
   }, [events]);
-  const totalOutcomes = data.completed_stages + data.failed_stages;
-  return <Paper withBorder radius="md" p="lg"><Stack gap="md">
-    <Group justify="space-between"><Box><Text fw={700} size="sm">Stage execution flow</Text><Text size="xs" c="dimmed">Execution outcomes and capabilities by stage</Text></Box><Button size="xs" variant="subtle" onClick={() => onInspect('history')}>View history →</Button></Group>
-    <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="sm">
-      <Paper withBorder radius="md" p="md"><Text size="xs" c="dimmed">Total executions</Text><Text fw={800} fz={28}>{data.stage_executions}</Text></Paper>
-      <Paper withBorder radius="md" p="md"><Text size="xs" c="dimmed">Completed outcomes</Text><Text fw={800} fz={28} c="teal">{data.completed_stages}</Text></Paper>
-      <Paper withBorder radius="md" p="md"><Text size="xs" c="dimmed">Failed outcomes</Text><Text fw={800} fz={28} c="red">{data.failed_stages}</Text></Paper>
-      <Paper withBorder radius="md" p="md"><Text size="xs" c="dimmed">Outcome success rate</Text><Text fw={800} fz={28} c="teal">{percent(data.completed_stages, totalOutcomes)}</Text></Paper>
+  const runtime = durationTotal(stages.flatMap(stage => stage.executions));
+  const cost = useMemo(() => {
+    if (inference === null) return 'Loading…';
+    if (!inference.length) return '—';
+    const priced = inference.filter(item => item.cost !== null && Number.isFinite(item.cost));
+    if (!priced.length) return 'Unavailable';
+    const currencies = [...new Set(priced.map(item => item.currency || 'unknown'))];
+    if (currencies.length !== 1) return 'Mixed currencies';
+    const total = priced.reduce((sum, item) => sum + (item.cost || 0), 0);
+    const amount = total.toFixed(4);
+    const currency = currencies[0];
+    const formatted = currency === 'USD' ? `$${amount}` : `${currency} ${amount}`;
+    return priced.length < inference.length ? `${formatted} recorded` : formatted;
+  }, [inference]);
+  return <Stack gap="md">
+    <SimpleGrid cols={{ base: 1, lg: 2 }} spacing="md" verticalSpacing="md">
+      <ImpactRepositoryDiff summaries={diffSummaries} reviewError={reviewError} />
+      <ImpactExecutionSummary data={data} runtime={runtime} cost={cost} onHistory={() => onInspect('history')} />
     </SimpleGrid>
+    <Paper withBorder radius="md" p="lg"><Stack gap="md">
+    <Box>
+      <Text fw={700} size="sm">Stage execution flow</Text>
+      <Text size="xs" c="dimmed">Execution outcomes and capabilities by stage</Text>
+    </Box>
     <Divider />
     <Text fw={700} size="sm">Stage breakdown</Text>
     {error && <Text c="red" size="xs">Unable to load stage details: {error}</Text>}
@@ -500,8 +756,9 @@ function ImpactStageFlow({ runId, data, onInspect }: Props) {
       return <Paper key={stage.name} withBorder radius="md" p="sm" style={{ flex: '1 0 210px', minWidth: 0 }}><Stack gap="xs">
         <Box>
           <Group justify="space-between" gap="xs"><Text size="xs" fw={700}>{label(stage.name)}</Text><Text size="xs" c="dimmed">{stage.executions.length} attempts</Text></Group>
+          <Group justify="space-between" gap="xs"><Text size="xs" c="dimmed">Total stage time</Text><Text size="xs" fw={600} title="Sum of recorded stage execution durations across attempts">{durationTotal(stage.executions)}</Text></Group>
           <Text fw={700} fz="xl" c="teal" mt="xs">{percent(completed, stage.executions.length)} <Text component="span" size="xs" c="dimmed">success</Text></Text>
-          <Progress.Root size={7} mt="xs">{completed > 0 && <Progress.Section value={rate} color="teal" />}{failed > 0 && <Progress.Section value={failed / stage.executions.length * 100} color="red" />}</Progress.Root>
+          <Progress.Root size={7} radius="sm" mt="xs">{completed > 0 && <Progress.Section value={rate} color="teal" />}{failed > 0 && <Progress.Section value={failed / stage.executions.length * 100} color="red" />}</Progress.Root>
           <Group justify="space-between" mt="xs"><Text size="xs" c="teal">{completed} successful</Text><Text size="xs" c={failed ? 'red' : 'dimmed'}>{failed} failed</Text></Group>
           <Text size="xs" c="dimmed" mt={5}>{stage.capabilities.length} capability invocations · {groups.size} types</Text>
         </Box>
@@ -511,8 +768,8 @@ function ImpactStageFlow({ runId, data, onInspect }: Props) {
             const errors = calls.filter(c => c.failed).length;
             return <Box key={name} component="button" type="button" onClick={() => onInspect('capability', name)} style={{ border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer', textAlign: 'left' }}>
               <Group justify="space-between" gap="xs"><Text size="xs" fw={600}>{label(name)}</Text><Text size="xs" c="dimmed">{calls.length} runs · {percent(success, calls.length)}</Text></Group>
-              <Progress.Root size={5} mt={4}>{success > 0 && <Progress.Section value={success / calls.length * 100} color="teal" />}{errors > 0 && <Progress.Section value={errors / calls.length * 100} color="red" />}</Progress.Root>
-              <Text size="xs" c="dimmed">{success} succeeded{errors ? ` · ${errors} failed` : ''}</Text>
+              <Group justify="space-between" gap="xs"><Text size="xs" c="dimmed">{success} succeeded{errors ? ` · ${errors} failed` : ''}</Text><Text size="xs" fw={600} title="Sum of recorded capability invocation durations across runs">{durationTotal(calls)}</Text></Group>
+              <Progress.Root size={3} radius="xl" mt={4} color="gray.7">{success > 0 && <Progress.Section value={success / calls.length * 100} color="teal.8" />}{errors > 0 && <Progress.Section value={errors / calls.length * 100} color="red.8" />}</Progress.Root>
             </Box>;
           })}
           {groups.size === 0 && <Text size="xs" c="dimmed">No linked capability invocations.</Text>}
@@ -520,7 +777,8 @@ function ImpactStageFlow({ runId, data, onInspect }: Props) {
       </Stack></Paper>;
     })}</Group></Box>
     {!pending && !error && !stages.length && <Text size="sm" c="dimmed">No recorded stage executions.</Text>}
-  </Stack></Paper>;
+    </Stack></Paper>
+  </Stack>;
 }
 return { ImpactStageFlow };
 })();
@@ -537,6 +795,8 @@ const grouped = (events: ImpactEvent[], type: 'stage' | 'capability'): Aggregate
 function Stat({ label, value, color }: { label: string; value: string | number; color?: string }) { return <Box><Text size="xs" c="dimmed">{label}</Text><Text fw={700} fz="lg" c={color}>{typeof value === 'number' ? value.toLocaleString() : value}</Text></Box>; }
 function Header({ title, subtitle, onClick }: { title: string; subtitle: string; onClick: () => void }) { return <Group justify="space-between" align="start"><Box><Text fw={700} size="sm">{title}</Text><Text size="xs" c="dimmed">{subtitle}</Text></Box><Button size="xs" variant="subtle" onClick={onClick}>Details →</Button></Group>; }
 function ImpactDashboard({ runId, data, events, hasMore, onInspect }: Props) {
+  const [selectedSession, setSelectedSession] = useState('all');
+  useEffect(() => { setSelectedSession('all'); }, [runId]);
   const stages = grouped(events, 'stage');
   const capabilities = grouped(events, 'capability').sort((a, b) => b.count - a.count);
   const measuredStages = stages.reduce((sum, item) => sum + item.count, 0);
@@ -685,7 +945,7 @@ function InferenceInspector({ runId, event }: { runId: string; event: ImpactEven
     {!loading && !selected && <Text size="sm" c="dimmed">No inference invocation linked to this selection.</Text>}
     {selected && <>
       {inference.length > 1 && <Select size="xs" data={inference.map(item => ({ value: item.id, label: `${formatTime(item.created_at)} · ${item.model} · ${item.status}` }))} value={selected.id} onChange={setChosenId} allowDeselect={false} />}
-      <Group gap="xs" align="center"><Badge size="sm" variant="light">{selected.provider}</Badge>{selected.model && <Text size="xs" c="dimmed">{selected.model}</Text>}<Text size="xs" c="dimmed">{formatTime(selected.created_at)}</Text><Text size="xs" c="dimmed">{selected.input_tokens ?? '—'} in / {selected.output_tokens ?? '—'} out tokens</Text></Group>
+      <Group gap="xs" align="center"><Badge size="sm" variant="light">{selected.provider}</Badge>{selected.model && <Text size="xs" c="dimmed">{selected.model}</Text>}<Text size="xs" c="dimmed">{formatTime(selected.created_at)}</Text><InferenceTokenUsage accounting={selected.accounting} inputTokens={selected.input_tokens} outputTokens={selected.output_tokens} /></Group>
       {selected.error_message && <Alert color="red">{selected.error_message}</Alert>}
       <SegmentedControl size="xs" fullWidth value={view} onChange={value => setView(value as 'readable' | 'raw')} data={[{ label: 'Readable', value: 'readable' }, { label: 'Raw payload', value: 'raw' }]} />
       <Select size="xs" value={origin} onChange={value => setOrigin(value || 'all')} allowDeselect={false} data={[{ value: 'all', label: 'All recorded inputs' }, { value: 'user', label: 'User instructions' }, { value: 'generated', label: 'Generated and inherited inputs' }, { value: 'recovery', label: 'Errors and recovery inputs' }]} />

@@ -174,11 +174,16 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
-    sqlx::query(
-        r#"
+    sqlx::query("DROP TABLE IF EXISTS inference_invocation_inputs").execute(db).await?;
+    sqlx::query("DROP TABLE IF EXISTS inference_invocation_outputs").execute(db).await?;
+    let columns = sqlx::query("PRAGMA table_info(inference_invocations)").fetch_all(db).await?;
+    if !columns.is_empty() && !columns.iter().any(|row| row.get::<String, _>("name") == "input_json") {
+        sqlx::query("DROP TABLE inference_invocations").execute(db).await?;
+    }
+    sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS inference_invocations (
             id TEXT PRIMARY KEY,
-            inference_session_id TEXT NOT NULL,
+            inference_session_id TEXT NOT NULL REFERENCES inference_sessions(id),
             workflow_run_id TEXT NOT NULL,
             step_id TEXT NOT NULL,
             stage_type TEXT NOT NULL,
@@ -188,54 +193,13 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
             model TEXT NOT NULL,
             status TEXT NOT NULL,
             error_message TEXT,
+            input_json TEXT NOT NULL DEFAULT '[]',
+            output_json TEXT NOT NULL DEFAULT '{}',
+            accounting_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
-            completed_at TEXT,
-            FOREIGN KEY(inference_session_id) REFERENCES inference_sessions(id)
+            completed_at TEXT
         )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS inference_invocation_inputs (
-            id TEXT PRIMARY KEY,
-            invocation_id TEXT NOT NULL,
-            sequence_no INTEGER NOT NULL,
-            input_type TEXT NOT NULL,
-            input_origin TEXT NOT NULL,
-            input_source TEXT NOT NULL,
-            label TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(invocation_id) REFERENCES inference_invocations(id)
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS inference_invocation_outputs (
-            id TEXT PRIMARY KEY,
-            invocation_id TEXT NOT NULL UNIQUE,
-            response_text TEXT NOT NULL,
-            response_payload_json TEXT NOT NULL,
-            provider_metadata_json TEXT NOT NULL,
-            input_tokens INTEGER,
-            output_tokens INTEGER,
-            cached_input_tokens INTEGER,
-            cost_amount REAL,
-            cost_currency TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(invocation_id) REFERENCES inference_invocations(id)
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
+    "#).execute(db).await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocations_session ON inference_invocations(inference_session_id, created_at)")
         .execute(db)
@@ -244,9 +208,6 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocations_capability ON inference_invocations(capability_invocation_id)")
-        .execute(db)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_inference_invocation_inputs_invocation ON inference_invocation_inputs(invocation_id, sequence_no)")
         .execute(db)
         .await?;
 
@@ -446,23 +407,28 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+
+
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS supervisor_integration_patches (
-            id TEXT PRIMARY KEY,
-            supervisor_run_id TEXT NOT NULL REFERENCES supervisor_runs(id) ON DELETE CASCADE,
-            integration_work_unit_id TEXT NOT NULL REFERENCES supervisor_work_units(id) ON DELETE CASCADE,
-            integration_workflow_run_id TEXT NOT NULL,
-            source_work_unit_id TEXT NOT NULL REFERENCES supervisor_work_units(id) ON DELETE CASCADE,
-            source_kind TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS supervisor_workflow_patches (
+            root_repo_path TEXT NOT NULL,
+            workflow_key TEXT NOT NULL,
+            source_work_unit_id TEXT NOT NULL,
             source_workflow_run_id TEXT,
+            source_kind TEXT NOT NULL,
             feature_id TEXT,
-            workspace_path TEXT NOT NULL,
+            supervisor_run_id TEXT NOT NULL,
+            integration_workflow_run_id TEXT,
+            archive_status TEXT NOT NULL CHECK (archive_status IN ('applied', 'unapplied')),
             base_commit TEXT,
             patch_text TEXT NOT NULL,
             patch_hash TEXT NOT NULL,
             patch_bytes INTEGER NOT NULL,
-            created_at TEXT NOT NULL
+            applied_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (root_repo_path, workflow_key, archive_status)
         )
         "#,
     )
@@ -470,22 +436,20 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_supervisor ON supervisor_integration_patches (supervisor_run_id, created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_supervisor_workflow_patches_source ON supervisor_workflow_patches (source_work_unit_id, updated_at)"
     )
     .execute(db)
     .await?;
 
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_integration_run ON supervisor_integration_patches (integration_workflow_run_id, created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_supervisor_workflow_patches_supervisor ON supervisor_workflow_patches (supervisor_run_id, updated_at)"
     )
     .execute(db)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_supervisor_integration_patches_source_work_unit ON supervisor_integration_patches (source_work_unit_id, created_at)"
-    )
-    .execute(db)
-    .await?;
+    sqlx::query("DROP TABLE IF EXISTS supervisor_integration_patches")
+        .execute(db)
+        .await?;
 
     ensure_column(db, "workflow_runs", "archived_at", "TEXT").await?;
     ensure_column(db, "workflow_runs", "archived_reason", "TEXT").await?;
@@ -586,9 +550,10 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
           AND kind IN ('feature', 'manual')
           AND EXISTS (
               SELECT 1
-              FROM supervisor_integration_patches sip
-              WHERE sip.supervisor_run_id = supervisor_work_units.supervisor_run_id
-                AND sip.source_work_unit_id = supervisor_work_units.id
+              FROM supervisor_workflow_patches swp
+              WHERE swp.supervisor_run_id = supervisor_work_units.supervisor_run_id
+                AND swp.source_work_unit_id = supervisor_work_units.id
+                AND swp.archive_status = 'applied'
           )
         "#,
     )

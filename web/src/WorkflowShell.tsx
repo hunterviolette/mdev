@@ -181,7 +181,7 @@ function openBuilderCapabilityConfig(
 type BuilderMode = 'builder' | 'json';
 type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
-type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime';
+type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime' | 'settings';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities' | 'impact';
 type EventTone = { color: string; label: string };
 
@@ -2331,13 +2331,13 @@ const runtimeProjectionHydrationByRunId = new Map<string, Promise<void>>();
 
 let canonicalChangesetSchemaRequest: Promise<string> | null = null;
 
-async function getCachedCanonicalChangesetSchema(): Promise<string> {
+async function getCachedCanonicalChangesetSchema(runId?: string): Promise<string> {
   if (canonicalChangesetSchemaCache !== null) {
     return canonicalChangesetSchemaCache;
   }
 
   if (!canonicalChangesetSchemaRequest) {
-    canonicalChangesetSchemaRequest = getChangesetSchema()
+    canonicalChangesetSchemaRequest = getChangesetSchema(runId)
       .then((response) => {
         canonicalChangesetSchemaCache = response.schema;
         return response.schema;
@@ -2349,6 +2349,8 @@ async function getCachedCanonicalChangesetSchema(): Promise<string> {
 
   return canonicalChangesetSchemaRequest;
 }
+
+import { ApplicationSettings } from './ApplicationSettings';
 
 export function WorkflowShell(props: {
   route?: {
@@ -2429,7 +2431,7 @@ export function WorkflowShell(props: {
     if (!selectedRunId || !selectedWorkflowStep) return;
 
     if (bindTo === 'prompt.user_input') {
-      setStageUserInput(typeof value === 'string' ? value : String(value ?? ''));
+      setStageUserInputDraft(typeof value === 'string' ? value : String(value ?? ''));
       return;
     } else if (bindTo === 'execution.compile_checks.commands_text') {
       setStageCompileCommandsText(typeof value === 'string' ? value : String(value ?? ''));
@@ -2556,6 +2558,8 @@ export function WorkflowShell(props: {
 
   const [stageUserInput, setStageUserInputState] = useState('');
   const stageUserInputRef = useRef('');
+  const stageUserInputDraftsRef = useRef<Map<string, string>>(new Map());
+  const stageUserInputHydrationRef = useRef<string | null>(null);
 
   function setStageUserInput(value: string) {
     stageUserInputRef.current = value;
@@ -2563,6 +2567,10 @@ export function WorkflowShell(props: {
   }
 
   const setStageUserInputDraft = useCallback((value: string) => {
+    const draftKey = stageUserInputHydrationRef.current;
+    if (draftKey) {
+      stageUserInputDraftsRef.current.set(draftKey, value);
+    }
     stageUserInputRef.current = value;
   }, []);
   const [stageIncludeRepoContext, setStageIncludeRepoContext] = useState(false);
@@ -3490,6 +3498,14 @@ export function WorkflowShell(props: {
       return;
     }
 
+    if (routedPath === '/settings') {
+      setView((value) => value === 'monitor' ? value : 'monitor');
+      setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
+      setMonitorHomeView((value) => value === 'settings' ? value : 'settings');
+      setActiveWorkspaceTab((value) => value === 'workflows' ? value : 'workflows');
+      return;
+    }
+
     if (routedPath === '/runtime') {
       setView((value) => value === 'monitor' ? value : 'monitor');
       setMonitorView((value) => value === 'workflow_list' ? value : 'workflow_list');
@@ -3737,21 +3753,60 @@ export function WorkflowShell(props: {
 
   useEffect(() => {
     if (!changesetSchemaConfigOpen) return;
-    if (stageChangesetSchemaText.trim()) return;
+
+    const currentGlobalState = ((selectedRun?.context?.workflow_engine as Record<string, unknown> | undefined)?.global_state as Record<string, unknown> | undefined) ?? {};
+    const currentCapabilities = (currentGlobalState.capabilities as Record<string, unknown> | undefined) ?? {};
+    const currentSchema = (currentCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    const builderGlobals = ((compiledBuilderDefinition?.globals as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+    const builderCapabilities = (builderGlobals.capabilities as Record<string, unknown> | undefined) ?? {};
+    const builderSchema = (builderCapabilities.changeset_schema as Record<string, unknown> | undefined) ?? {};
+    const persistedSchema = view === 'builder' ? builderSchema.schema : currentSchema.schema;
+
+    if (typeof persistedSchema === 'string' && persistedSchema.trim()) {
+      setStageChangesetSchemaText(persistedSchema);
+      return;
+    }
 
     let cancelled = false;
-    void getCachedCanonicalChangesetSchema()
-      .then((schema) => {
+    const runId = view === 'builder' ? undefined : selectedRun?.id;
+
+    void getChangesetSchema(runId)
+      .then(async ({ schema }) => {
+        if (cancelled || !schema.trim()) return;
+
+        if (view === 'builder') {
+          saveBuilderCapability('changeset_schema', {
+            ...builderSchema,
+            schema
+          });
+        } else if (selectedRun?.id) {
+          await patchGlobalCapabilityState({
+            capabilities: {
+              ...currentCapabilities,
+              changeset_schema: {
+                ...currentSchema,
+                schema
+              }
+            }
+          });
+        } else {
+          return;
+        }
+
         if (!cancelled) {
           setStageChangesetSchemaText(schema);
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        if (!cancelled) {
+          setError(error instanceof Error ? error.message : String(error));
+        }
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [changesetSchemaConfigOpen, stageChangesetSchemaText]);
+  }, [changesetSchemaConfigOpen, view, selectedRun?.id]);
 
   useEffect(() => {
     if (!globalApplyChangesetOpen) return;
@@ -3819,7 +3874,7 @@ export function WorkflowShell(props: {
     } else if (canonicalChangesetSchemaCache !== null) {
       setStageChangesetSchemaText(canonicalChangesetSchemaCache);
     } else if (step.step_type === 'code') {
-      void getCachedCanonicalChangesetSchema()
+      void getCachedCanonicalChangesetSchema(selectedRunId ?? undefined)
         .then((schema) => {
           const stageIdentity = `${selectedRunId ?? ''}:${selectedWorkflowStep?.id ?? ''}`;
           const hydratedStageIdentityRef = { current: stageIdentity };
@@ -3890,7 +3945,17 @@ export function WorkflowShell(props: {
     setStageRepoContextIncludeUnstagedDiff(Boolean(repoContext.include_unstaged_diff));
     setStageRepoContextInlinePrompt(Boolean(repoContext.inline_repo_context_in_prompt));
 
-    setStageUserInput(hydratedUserInput);
+    const drafts = stageUserInputDraftsRef.current;
+    const previousStageKey = stageUserInputHydrationRef.current;
+    const stageChanged = previousStageKey !== null && previousStageKey !== selectedStageHydrationKey;
+
+    if (stageChanged) {
+      drafts.clear();
+    }
+
+    const existingDraft = drafts.get(selectedStageHydrationKey);
+    setStageUserInput(stageChanged ? '' : existingDraft ?? hydratedUserInput);
+    stageUserInputHydrationRef.current = selectedStageHydrationKey;
   }, [selectedStageHydrationKey, selectedRun?.context, selectedStageState]);
 
 
@@ -5347,18 +5412,38 @@ export function WorkflowShell(props: {
     }
   }
 
+  function clearStageUserInputAfterExecution(runId: string, stepId: string | null) {
+    if (!stepId) return;
+    const draftKey = `${runId}:${stepId}`;
+    stageUserInputDraftsRef.current.set(draftKey, '');
+    if (stageUserInputHydrationRef.current === draftKey) {
+      setStageUserInput('');
+    }
+  }
+
   async function executeWorkflowStage(
     runId: string,
     stepId: string | null,
     userInput: string,
     mode: 'single' | 'autonomous'
   ) {
-    setStageUserInput(userInput);
+    const executionInput = userInput;
+    const stagePayload = stepId ? structuredClone(buildInteractiveStagePayload()) : null;
+    const attachmentFiles = stepId ? [...getStageInputAttachments(runId, stepId)] : [];
+
+    if (stagePayload) {
+      const prompt = asRecord(stagePayload.prompt);
+      if (prompt && Object.prototype.hasOwnProperty.call(prompt, 'user_input')) {
+        delete prompt.user_input;
+        if (Object.keys(prompt).length === 0) {
+          delete stagePayload.prompt;
+        }
+      }
+    }
 
     if (stepId) {
-      await patchWorkflowStageUserInput(runId, stepId, userInput);
+      await patchWorkflowStageUserInput(runId, stepId, executionInput);
 
-      const attachmentFiles = getStageInputAttachments(runId, stepId);
       if (attachmentFiles.length > 0) {
         const attachments = await serializeStageInputAttachments(attachmentFiles);
         await sendRunAction(runId, {
@@ -5369,16 +5454,7 @@ export function WorkflowShell(props: {
         clearStageInputAttachments(runId, stepId);
       }
 
-      const stagePayload = structuredClone(buildInteractiveStagePayload());
-      const prompt = asRecord(stagePayload.prompt);
-      if (prompt && Object.prototype.hasOwnProperty.call(prompt, 'user_input')) {
-        delete prompt.user_input;
-        if (Object.keys(prompt).length === 0) {
-          delete stagePayload.prompt;
-        }
-      }
-
-      if (Object.keys(stagePayload).length > 0) {
+      if (stagePayload && Object.keys(stagePayload).length > 0) {
         await patchWorkflowStageState(runId, stepId, stagePayload);
       }
     }
@@ -5408,12 +5484,15 @@ export function WorkflowShell(props: {
 
     const runId = selectedRunId;
     const stepId = selectedWorkflowStep?.id ?? selectedRun?.current_step_id ?? null;
-    const latestUserInput = stageUserInputRef.current;
+    const draftKey = stepId ? `${runId}:${stepId}` : null;
+    const latestUserInput = (draftKey ? stageUserInputDraftsRef.current.get(draftKey) : undefined)
+      ?? (stageUserInputHydrationRef.current === draftKey ? stageUserInputRef.current : '');
 
     try {
       setBusy(true);
       setError(null);
       await executeWorkflowStage(runId, stepId, latestUserInput, 'autonomous');
+      clearStageUserInputAfterExecution(runId, stepId);
       await refreshRunDetails(runId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -5861,7 +5940,7 @@ export function WorkflowShell(props: {
   async function loadCanonicalChangesetSchema(forceOverride = true) {
     try {
       setChangesetSchemaBusy(true);
-      const json = await getChangesetSchema();
+      const json = await getChangesetSchema(selectedRunId ?? undefined);
       if (forceOverride || !stageChangesetSchemaText.trim()) {
         setStageChangesetSchemaText(typeof json.schema === 'string' ? json.schema : '');
       }
@@ -6766,10 +6845,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
     const runId = selectedRun.id;
     const stepId = selectedRunStepId;
-    const latestUserInput = stageUserInputRef.current;
+    const draftKey = `${runId}:${stepId}`;
+    const latestUserInput = stageUserInputDraftsRef.current.get(draftKey)
+      ?? (stageUserInputHydrationRef.current === draftKey ? stageUserInputRef.current : '');
 
     await runManualCapability(async () => {
       const json = await executeWorkflowStage(runId, stepId, latestUserInput, 'single');
+      clearStageUserInputAfterExecution(runId, stepId);
       return json as Record<string, unknown>;
     }, 'Executed current stage through backend workflow engine.');
   }
@@ -7162,6 +7244,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     props.navigate?.('/templates');
                   } else if (next === 'runtime') {
                     props.navigate?.('/runtime');
+                  } else if (next === 'settings') {
+                    props.navigate?.('/settings');
                   } else {
                     props.navigate?.('/workflows');
                   }
@@ -7344,6 +7428,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     setMonitorHomeView((current) => current === next ? current : next);
                     if (next === 'runtime') {
                       props.navigate?.('/runtime');
+                    } else if (next === 'settings') {
+                      props.navigate?.('/settings');
                     } else if (next === 'supervisor') {
                       props.navigate?.('/supervisors');
                     } else if (next === 'templates') {
@@ -7364,7 +7450,9 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 />
               ) : null}
 
-              {monitorHomeView === 'runtime' ? (
+              {monitorHomeView === 'settings' ? (
+                <ApplicationSettings />
+              ) : monitorHomeView === 'runtime' ? (
                 <RuntimeAdmin />
               ) : monitorHomeView === 'supervisor' ? (
                 <SupervisorPanel

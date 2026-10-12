@@ -12,6 +12,28 @@ use super::{
 };
 use super::super::{prompting::{ModelAttachmentKind, ModelInput}, ApiConfig};
 
+#[derive(serde::Deserialize)]
+struct OpenAiUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiInputDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAiOutputDetails>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiInputDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiOutputDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
 pub struct OpenAiProvider;
 
 pub static OPENAI_PROVIDER: OpenAiProvider = OpenAiProvider;
@@ -218,6 +240,18 @@ async fn execute_turn(
         )
         .await?;
 
+    let reported_usage = response
+        .get("usage")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<OpenAiUsage>(value.clone()))
+        .transpose()?
+        .map(|usage| super::super::accounting::ReportedUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.input_tokens_details.and_then(|details| details.cached_tokens),
+            reasoning_output_tokens: usage.output_tokens_details.and_then(|details| details.reasoning_tokens),
+        });
+
     Ok(ApiProviderExecution {
         text: output,
         state: json!({
@@ -230,6 +264,7 @@ async fn execute_turn(
             "status": response.get("status").cloned().unwrap_or(Value::Null),
             "attachment_count": input.attachments.len()
         }),
+        reported_usage,
     })
 }
 

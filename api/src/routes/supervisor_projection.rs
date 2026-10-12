@@ -98,6 +98,7 @@ struct SupervisorWorkUnitProjection {
     has_staged_changes: bool,
     has_unstaged_changes: bool,
     has_workspace_changes: bool,
+    available_actions: Vec<&'static str>,
     integration_include_staged: bool,
     integration_include_unstaged: bool,
     integration_state: IntegrationInputState,
@@ -420,6 +421,7 @@ fn placeholder_work_unit(supervisor: &SupervisorRow, seed: &WorkUnitSeed) -> Sup
         has_staged_changes: false,
         has_unstaged_changes: false,
         has_workspace_changes: false,
+        available_actions: Vec::new(),
         integration_include_staged,
         integration_include_unstaged,
         integration_state: seed.integration_state.clone(),
@@ -470,6 +472,25 @@ async fn build_work_unit_projection(
         .as_ref()
         .is_some_and(|status| status.has_changes());
     unit.telemetry = telemetry;
+    let materialization_state = unit.telemetry
+        .get("materialization_state")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let regenerating = unit.workflow_run_id.is_none()
+        && unit.telemetry.get("regenerated_at").and_then(Value::as_str).is_some()
+        && matches!(materialization_state, "pending" | "materializing");
+    unit.available_actions = crate::supervisor::available_actions(
+        &crate::supervisor::WorkUnitActionState {
+            kind: &unit.workflow_type,
+            state: &unit.state,
+            integration_state: unit.integration_state.as_str(),
+            workflow_exists: unit.workflow_run_id.is_some(),
+            workflow_deleted: unit.workflow_deleted,
+            has_workspace_changes: unit.has_workspace_changes,
+            materialization_state,
+            regenerating,
+        },
+    );
     Ok(unit)
 }
 

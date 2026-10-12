@@ -18,6 +18,7 @@ function routeTitle(route: AppRoute): string {
   if (route.path === '/supervisors' || route.path.startsWith('/supervisors/')) return 'Supervisor';
   if (route.path === '/templates') return 'Templates';
   if (route.path === '/runtime') return 'Runtime';
+  if (route.path === '/settings') return 'Application Settings';
   if (route.path === '/workflows' || route.path === '/') return 'Workflow list';
   return 'Workflow Web';
 }

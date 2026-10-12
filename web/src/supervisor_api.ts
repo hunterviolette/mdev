@@ -517,6 +517,15 @@ export type SupervisorAlert = {
 
 export type IntegrationInputState = 'available' | 'included' | 'skipped';
 
+export type SupervisorAvailableAction =
+  | 'start_work_unit'
+  | 'pause_work_unit'
+  | 'regenerate_work_unit'
+  | 'delete_work_unit'
+  | 'stage_to_integration'
+  | 'remove_from_integration'
+  | 'archive_work_unit';
+
 export type SupervisorWorkUnitProjection = {
   id: string;
   supervisor_id: string;
@@ -534,6 +543,7 @@ export type SupervisorWorkUnitProjection = {
   has_staged_changes: boolean;
   has_unstaged_changes: boolean;
   has_workspace_changes: boolean;
+  available_actions: SupervisorAvailableAction[];
   integration_include_staged: boolean;
   integration_include_unstaged: boolean;
   integration_state: IntegrationInputState;
@@ -790,6 +800,7 @@ export type SupervisorWorkPoolKind = 'refine' | 'feature' | 'manual' | 'integrat
 export type SupervisorActionRequest =
   | { action: 'create_work_unit'; pool_kind: SupervisorWorkPoolKind; name: string; feature_id?: string | null; template_id?: string | null }
   | { action: 'delete_work_unit'; work_unit_id: string }
+  | { action: 'archive_work_unit'; work_unit_id: string }
   | { action: 'regenerate_work_unit'; work_unit_id: string }
   | { action: 'start_work_unit'; work_unit_id: string }
   | { action: 'pause_work_unit'; work_unit_id: string }

@@ -63,6 +63,8 @@ function pendingSupervisorActionLabel(pending: PendingSupervisorAction): string 
         : 'Creating workflow';
     case 'delete_work_unit':
       return 'Deleting workflow';
+    case 'archive_work_unit':
+      return 'Archiving workflow';
     case 'regenerate_work_unit':
       return 'Regenerating workflow';
     case 'start_work_unit':
@@ -1014,22 +1016,19 @@ function workflowIsProcessing(unit: SupervisorWorkUnitProjection): boolean {
 }
 
 function workflowCanRun(unit: SupervisorWorkUnitProjection): boolean {
-  if (workflowType(unit) === 'integration') return !unit.workflow_deleted && !workflowIsProcessing(unit);
-  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
+  return unit.available_actions?.includes('start_work_unit') ?? false;
 }
 
 function workflowCanPause(unit: SupervisorWorkUnitProjection): boolean {
-  return !unit.workflow_deleted && workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
+  return unit.available_actions?.includes('pause_work_unit') ?? false;
 }
 
 function workflowCanRegenerate(unit: SupervisorWorkUnitProjection): boolean {
-  return !unit.workflow_deleted && !workflowIsProcessing(unit) && Boolean(unit.workflow_run_id);
+  return unit.available_actions?.includes('regenerate_work_unit') ?? false;
 }
 
 function workflowCanDelete(unit: SupervisorWorkUnitProjection): boolean {
-  const type = workflowType(unit);
-  if (type === 'integration') return false;
-  return !workUnitIsIntegrationInput(unit) && !unit.workflow_deleted;
+  return unit.available_actions?.includes('delete_work_unit') ?? false;
 }
 
 function workflowDeleteLabel(unit: SupervisorWorkUnitProjection): string {
@@ -1037,16 +1036,15 @@ function workflowDeleteLabel(unit: SupervisorWorkUnitProjection): string {
 }
 
 function workflowCanStageToIntegration(unit: SupervisorWorkUnitProjection): boolean {
-  return ['feature', 'manual'].includes(workflowType(unit))
-    && !unit.workflow_deleted
-    && unit.integration_state === 'available'
-    && workUnitHasStagedChanges(unit);
+  return unit.available_actions?.includes('stage_to_integration') ?? false;
 }
 
 function workflowCanUnstageFromIntegration(unit: SupervisorWorkUnitProjection): boolean {
-  return ['feature', 'manual'].includes(workflowType(unit))
-    && !unit.workflow_deleted
-    && unit.integration_state !== 'available';
+  return unit.available_actions?.includes('remove_from_integration') ?? false;
+}
+
+function workflowCanArchive(unit: SupervisorWorkUnitProjection): boolean {
+  return unit.available_actions?.includes('archive_work_unit') ?? false;
 }
 
 function WorkflowProjectionCard(props: {
@@ -1144,7 +1142,7 @@ function WorkflowProjectionCard(props: {
     <Title order={5} lineClamp={1}>{unit.title}</Title>
   );
 
-  async function runWorkflowAction(action: 'start_work_unit' | 'pause_work_unit' | 'regenerate_work_unit' | 'delete_work_unit' | 'stage_work_unit' | 'unstage_work_unit' | 'apply_integration' | 'cancel') {
+  async function runWorkflowAction(action: 'start_work_unit' | 'pause_work_unit' | 'regenerate_work_unit' | 'delete_work_unit' | 'archive_work_unit' | 'stage_work_unit' | 'unstage_work_unit' | 'apply_integration' | 'cancel') {
     if (pendingAction) return;
     if (action === 'regenerate_work_unit') {
       const confirmed = workflowType(unit) === 'refine'
@@ -1158,8 +1156,12 @@ function WorkflowProjectionCard(props: {
         : window.confirm(`Delete ${unit.title}? This deletes the supervisor workflow/workspace state for this work unit.`);
       if (!confirmed) return;
     }
+    if (action === 'archive_work_unit') {
+      const confirmed = window.confirm(`Archive ${unit.title}? This archives the workflow and removes its workspace.`);
+      if (!confirmed) return;
+    }
     if (action === 'stage_work_unit') {
-      const confirmed = window.confirm(`Add the staged changes from ${unit.title} to the integration workflow?`);
+      const confirmed = window.confirm(`Stage available changes from ${unit.title} to Integration?`);
       if (!confirmed) return;
     }
     if (action === 'unstage_work_unit') {
@@ -1179,7 +1181,12 @@ function WorkflowProjectionCard(props: {
     }
 
     if (action === 'stage_work_unit' || action === 'unstage_work_unit') {
-      await runSupervisorAction(props.supervisor.id, { action: 'stage_work_unit', work_unit_id: unit.id, staged: action === 'stage_work_unit' });
+      await runSupervisorAction(props.supervisor.id, {
+        action: 'stage_work_unit',
+        work_unit_id: unit.id,
+        staged: action === 'stage_work_unit' && unit.has_staged_changes,
+        include_unstaged: action === 'stage_work_unit' && unit.has_unstaged_changes,
+      });
     } else if (action === 'apply_integration') {
       await runSupervisorAction(props.supervisor.id, {
         action,
@@ -1319,10 +1326,13 @@ function WorkflowProjectionCard(props: {
                     <Button size="compact-xs" color="yellow" variant="outline" loading={pendingAction?.action === 'regenerate_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
                   ) : null}
                   {workflowCanStageToIntegration(unit) ? (
-                    <Button size="compact-xs" color="green" variant="outline" loading={pendingAction?.action === 'stage_work_unit' && pendingAction.request.action === 'stage_work_unit' && pendingAction.request.staged !== false} disabled={actionPending} onClick={() => void runWorkflowAction('stage_work_unit')}>Add staged changes to integration</Button>
+                    <Button size="compact-xs" color="green" variant="outline" loading={pendingAction?.action === 'stage_work_unit' && pendingAction.request.action === 'stage_work_unit' && pendingAction.request.staged !== false} disabled={actionPending} onClick={() => void runWorkflowAction('stage_work_unit')}>Stage to Integration</Button>
                   ) : null}
                   {workflowCanDelete(unit) ? (
                     <Button size="compact-xs" color="red" variant="outline" loading={pendingAction?.action === 'delete_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('delete_work_unit')}>{workflowDeleteLabel(unit)}</Button>
+                  ) : null}
+                  {workflowCanArchive(unit) ? (
+                    <Button size="compact-xs" color="yellow" variant="outline" loading={pendingAction?.action === 'archive_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('archive_work_unit')}>Archive</Button>
                   ) : null}
                 </Group>
               </Group>

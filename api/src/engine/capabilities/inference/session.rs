@@ -351,15 +351,14 @@ pub async fn list_repo_sessions(
                    COUNT(*) AS invocation_count,
                    SUM(CASE WHEN i.status = 'completed' THEN 1 ELSE 0 END) AS completed_count,
                    SUM(CASE WHEN i.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-                   SUM(o.input_tokens) AS input_tokens,
-                   SUM(o.output_tokens) AS output_tokens,
-                   SUM(o.cached_input_tokens) AS cached_input_tokens,
-                   SUM(o.cost_amount) AS cost_amount,
-                   MIN(NULLIF(TRIM(o.cost_currency), '')) AS cost_currency,
-                   COUNT(DISTINCT NULLIF(TRIM(o.cost_currency), '')) AS currency_count,
-                   SUM(CASE WHEN o.cost_amount IS NOT NULL AND NULLIF(TRIM(o.cost_currency), '') IS NOT NULL THEN 1 ELSE 0 END) AS priced_count
+                   SUM(CAST(json_extract(i.accounting_json, '$.reported_usage.input_tokens') AS INTEGER)) AS input_tokens,
+                   SUM(CAST(json_extract(i.accounting_json, '$.reported_usage.output_tokens') AS INTEGER)) AS output_tokens,
+                   SUM(CAST(json_extract(i.accounting_json, '$.reported_usage.cached_input_tokens') AS INTEGER)) AS cached_input_tokens,
+                   NULL AS cost_amount,
+                   NULL AS cost_currency,
+                   0 AS currency_count,
+                   0 AS priced_count
             FROM inference_invocations i
-            LEFT JOIN inference_invocation_outputs o ON o.invocation_id = i.id
             GROUP BY i.inference_session_id
         ) u ON u.inference_session_id = s.id
         WHERE s.repo_ref = ? AND s.status != 'archived'

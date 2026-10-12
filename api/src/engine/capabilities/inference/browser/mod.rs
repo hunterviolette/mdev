@@ -361,6 +361,7 @@ pub async fn execute(
     } else {
         Some(pasted_context_sections.join("\n\n"))
     };
+    let accounting_pasted_context = pasted_context_text.clone();
     let attachment_paths = input
         .attachments
         .iter()
@@ -526,6 +527,10 @@ pub async fn execute(
     .map_err(|error| anyhow!("Browser bridge blocking task failed: {}", error))??;
 
     let (inference_cfg, readiness_failure, completed, uploaded_files) = blocking_result;
+    let theoretical_input_components = super::prompting::estimate_input_components(
+        input,
+        accounting_pasted_context.as_deref(),
+    )?;
     let final_session_id = inference_cfg.browser.session_id.clone().unwrap_or(session_id);
     let cdp_url = inference_cfg.browser.cdp_url.clone();
     let debug_port = cdp_url.rsplit(':').next().map(str::to_string);
@@ -557,6 +562,7 @@ pub async fn execute(
                 )
             }),
             transport_state,
+            reported_usage: None,
         });
     }
 
@@ -597,6 +603,7 @@ pub async fn execute(
             "browser_session_id": result.browser_session_id,
             "probe": probe,
             "uploaded_files": uploaded_files,
+            "theoretical_input_components": theoretical_input_components,
             "repo_context_inline_prompt": inline_repo_context,
             "send": bridge_result.get("send").cloned().unwrap_or(Value::Null),
             "read": bridge_result.get("read").cloned().unwrap_or(Value::Null)
@@ -608,5 +615,6 @@ pub async fn execute(
             "debug_port": debug_port,
             "profile": inference_cfg.browser.profile
         }),
+        reported_usage: None,
     })
 }

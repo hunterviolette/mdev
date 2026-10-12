@@ -527,42 +527,6 @@ async fn persist_successful_integration_merge(
 
     let mut persisted_inputs = Vec::with_capacity(patches_to_persist.len());
     for patch in patches_to_persist {
-        sqlx::query(
-            r#"
-            INSERT INTO supervisor_integration_patches (
-                id,
-                supervisor_run_id,
-                integration_work_unit_id,
-                integration_workflow_run_id,
-                source_work_unit_id,
-                source_kind,
-                source_workflow_run_id,
-                feature_id,
-                workspace_path,
-                base_commit,
-                patch_text,
-                patch_hash,
-                patch_bytes,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&patch.id)
-        .bind(supervisor_run_id)
-        .bind(&integration_work_unit_id)
-        .bind(integration_workflow_run_id.to_string())
-        .bind(&patch.source_work_unit_id)
-        .bind(patch.source_kind.as_str())
-        .bind(&patch.source_workflow_run_id)
-        .bind(&patch.feature_id)
-        .bind(&patch.workspace_path)
-        .bind(&patch.base_commit)
-        .bind(&patch.patch_text)
-        .bind(&patch.patch_hash)
-        .bind(patch.patch_bytes)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
 
         sqlx::query(
             "UPDATE supervisor_work_units SET patch_id = ?, updated_at = ? WHERE supervisor_run_id = ? AND id = ? AND archived_at IS NULL",
@@ -583,7 +547,8 @@ async fn persist_successful_integration_merge(
             "workspace_path": patch.workspace_path,
             "base_commit": patch.base_commit,
             "patch_hash": patch.patch_hash,
-            "patch_bytes": patch.patch_bytes
+            "patch_bytes": patch.patch_bytes,
+            "patch_text": patch.patch_text
         }));
     }
 
@@ -613,6 +578,8 @@ async fn persist_successful_integration_merge(
                 '$.final_patch_hash', ?,
                 '$.final_patch_bytes', ?,
                 '$.merge_report', json(?),
+                '$.integration_inputs', json(?),
+                '$.integration_workflow_run_id', ?,
                 '$.integration_path', ?
             ),
             updated_at = ?
@@ -627,6 +594,8 @@ async fn persist_successful_integration_merge(
     .bind(&final_patch_hash)
     .bind(final_patch_text.len() as i64)
     .bind(serde_json::to_string(&report)?)
+    .bind(serde_json::to_string(&persisted_inputs)?)
+    .bind(integration_workflow_run_id.to_string())
     .bind(integration_repo_path)
     .bind(&now)
     .bind(&integration_work_unit_id)

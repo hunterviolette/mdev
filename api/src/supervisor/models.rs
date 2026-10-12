@@ -255,7 +255,7 @@ impl SupervisorIntegrationCandidate {
     pub fn can_stage_to_integration(&self, changes: &super::patches::ChangeStatus) -> bool {
         self.supports_integration_input()
             && self.integration_state == IntegrationInputState::Available
-            && changes.has_staged_changes()
+            && changes.has_changes()
     }
 
     pub const fn can_unstage_from_integration(&self) -> bool {
@@ -294,6 +294,7 @@ pub struct CreateSupervisorWorkUnitRequest {
 pub enum SupervisorActionRequest {
     CreateWorkUnit(CreateSupervisorWorkUnitRequest),
     DeleteWorkUnit { work_unit_id: String },
+    ArchiveWorkUnit { work_unit_id: String },
     RegenerateWorkUnit { work_unit_id: String },
     StartWorkUnit { work_unit_id: String },
     PauseWorkUnit { work_unit_id: String },
@@ -344,6 +345,7 @@ impl SupervisorActionRequest {
         match self {
             Self::CreateWorkUnit(_) => "create_work_unit",
             Self::DeleteWorkUnit { .. } => "delete_work_unit",
+            Self::ArchiveWorkUnit { .. } => "archive_work_unit",
             Self::RegenerateWorkUnit { .. } => "regenerate_work_unit",
             Self::StartWorkUnit { .. } => "start_work_unit",
             Self::PauseWorkUnit { .. } => "pause_work_unit",

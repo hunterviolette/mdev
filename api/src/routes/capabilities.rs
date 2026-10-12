@@ -7,7 +7,6 @@ use crate::{
     app_state::AppState,
     engine::{
         capabilities::{
-            changeset::schema::CHANGESET_SCHEMA_EXAMPLE,
             context_export,
             registry::{stage_capability_policy, CapabilityContext, CapabilityInvocation, execute_capability_invocations},
         },
@@ -55,17 +54,9 @@ struct WorkflowContextExportSummaryResponse {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/capabilities/changeset-schema", get(get_changeset_schema))
         .route("/api/workflow-runs/:run_id/capabilities", get(list_workflow_capabilities))
         .route("/api/workflow-runs/:run_id/context-export/summary", post(get_workflow_context_export_summary))
         .route("/api/workflow-runs/:run_id/capabilities/:capability_id/execute", post(execute_workflow_capability))
-}
-
-async fn get_changeset_schema() -> Json<serde_json::Value> {
-    Json(json!({
-        "ok": true,
-        "schema": CHANGESET_SCHEMA_EXAMPLE,
-    }))
 }
 
 async fn list_workflow_capabilities(
