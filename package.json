@@ -4,7 +4,8 @@
   "workspaces": [
     "web",
     "bridge",
-    "adt-bridge"
+    "adt-bridge",
+    "launcher"
   ],
   "scripts": {
     "dev": "concurrently -n api,node \"npm run dev:api\" \"turbo dev --parallel\"",
