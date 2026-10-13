@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -23,7 +24,7 @@ def stage_runtime_dependencies(destination):
             shutil.copy2(source, target)
 
         subprocess.run([
-            'npm', 'ci',
+            'npm.cmd' if os.name == 'nt' else 'npm', 'ci',
             '--omit=dev',
             '--include=optional',
             '--ignore-scripts',
