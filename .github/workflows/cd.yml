@@ -91,7 +91,12 @@ jobs:
 
       - name: Build signed Tauri packages
         working-directory: launcher
-        run: npx --no-install tauri build --config src-tauri/tauri.release.conf.json --bundles ${{ matrix.bundles }}
+        env:
+          NO_STRIP: "true"
+          RUST_BACKTRACE: "1"
+          CI: "true"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "false"
+        run: npx --no-install tauri build --verbose --config src-tauri/tauri.release.conf.json --bundles ${{ matrix.bundles }}
 
       - name: Collect release packages
         shell: bash
