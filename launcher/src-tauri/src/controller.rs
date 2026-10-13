@@ -99,10 +99,15 @@ fn api_start(app: tauri::AppHandle, state: tauri::State<'_, ApiProcess>) -> Resu
         .stderr(Stdio::piped());
 
     #[cfg(windows)]
+    command
+        .env("MDEV_CONTROLLER_MANAGED", "1")
+        .stdin(Stdio::piped());
+
+    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
@@ -136,51 +141,13 @@ fn api_start(app: tauri::AppHandle, state: tauri::State<'_, ApiProcess>) -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
 fn send_shutdown_signal(pid: u32) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(())
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
-
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Console::{
-            AttachConsole, FreeConsole, GenerateConsoleCtrlEvent,
-            SetConsoleCtrlHandler, CTRL_BREAK_EVENT,
-        };
-
-        unsafe {
-            let _ = FreeConsole();
-
-            if AttachConsole(pid) == 0 {
-                return Err(format!(
-                    "Failed to attach to API console: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-
-            SetConsoleCtrlHandler(None, 1);
-            let result = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-            let error = if result == 0 {
-                Some(std::io::Error::last_os_error().to_string())
-            } else {
-                None
-            };
-
-            FreeConsole();
-            SetConsoleCtrlHandler(None, 0);
-
-            if let Some(error) = error {
-                return Err(format!("Failed to signal API shutdown: {error}"));
-            }
-        }
-
-        Ok(())
-    }
+    Ok(())
 }
 
 fn stop_process(process: &ApiProcess) -> Result<(), String> {
@@ -196,7 +163,17 @@ fn stop_process(process: &ApiProcess) -> Result<(), String> {
     }
 
     let pid = child.id();
+
+    #[cfg(unix)]
     send_shutdown_signal(pid)?;
+
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().ok_or("API shutdown channel is unavailable")?;
+        stdin.write_all(b"shutdown\n").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+    }
 
     let deadline = Instant::now() + Duration::from_secs(30);
 

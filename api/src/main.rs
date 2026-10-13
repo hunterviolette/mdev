@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
     open_mdev_web_ui(addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            await_shutdown_signal().await;
 
             match shutdown_state
                 .workflow_coordinator
@@ -163,6 +163,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn await_shutdown_signal() {
+    #[cfg(windows)]
+    if env::var("MDEV_CONTROLLER_MANAGED").as_deref() == Ok("1") {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut request = String::new();
+        if let Ok(length) = stdin.read_line(&mut request).await {
+            if length > 0 && request.trim() == "shutdown" {
+                return;
+            }
+        }
+    }
+
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn build_router(state: AppState, auth_state: auth::AuthState, web_dist: &Path) -> Router {
     let auth_enabled = auth_state.enabled();
     let auth_middleware_state = auth_state.clone();
@@ -178,11 +195,12 @@ fn build_router(state: AppState, auth_state: auth::AuthState, web_dist: &Path) -
         api = api.layer(CorsLayer::permissive());
     }
 
-    if web_dist.exists() {
-        let index_html = web_dist.join("index.html");
+    let index_html = web_dist.join("index.html");
+    if index_html.is_file() {
+        tracing::info!(path = %web_dist.display(), "serving web frontend");
         api.fallback_service(ServeDir::new(web_dist).fallback(ServeFile::new(index_html)))
     } else {
-        tracing::warn!(path = %web_dist.display(), "web/dist not found; serving backend routes only");
+        tracing::error!(path = %index_html.display(), "web frontend entrypoint not found; serving backend routes only");
         api
     }
 }
@@ -201,11 +219,9 @@ pub(crate) fn resolve_app_root(cwd: &Path) -> anyhow::Result<PathBuf> {
     let exe = env::current_exe().context("failed to determine executable path")?;
     let executable_dir = exe.parent().context("executable has no parent directory")?;
     if executable_dir.file_name().and_then(|name| name.to_str()) == Some("runtime") {
-        if let Some(root) = executable_dir.parent() {
-            if root.join("web").join("dist").join("index.html").is_file() {
-                return Ok(root.to_path_buf());
-            }
-        }
+        return executable_dir.parent()
+            .map(Path::to_path_buf)
+            .context("runtime directory has no parent");
     }
     Ok(executable_dir.to_path_buf())
 }
