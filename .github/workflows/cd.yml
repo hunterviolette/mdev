@@ -50,10 +50,10 @@ jobs:
             bundles: deb,appimage
           - id: macos-x64
             os: macos-15-intel
-            bundles: dmg
+            bundles: app,dmg
           - id: macos-arm64
             os: macos-latest
-            bundles: dmg
+            bundles: app,dmg
     runs-on: ${{ matrix.os }}
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

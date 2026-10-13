@@ -66,6 +66,15 @@ archive.unlink()
 
 config = {
     'version': version,
+    'bundle': {
+        'resources': {
+            'runtime/': 'runtime/',
+            'bridge/': 'bridge/',
+            'adt-bridge/': 'adt-bridge/',
+            'web/': 'web/',
+            'node_modules/': 'node_modules/'
+        }
+    },
     'plugins': {
         'updater': {
             'pubkey': public_key,
