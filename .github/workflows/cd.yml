@@ -48,9 +48,9 @@ jobs:
           - id: linux-x64
             os: ubuntu-22.04
             bundles: deb,appimage
-          - id: macos-x64
-            os: macos-15-intel
-            bundles: app,dmg
+          # - id: macos-x64
+          #   os: macos-15-intel
+          #   bundles: app,dmg
           - id: macos-arm64
             os: macos-latest
             bundles: app,dmg

@@ -16,7 +16,7 @@ platforms = {}
 suffixes = {
     'windows-x64': ('windows-x86_64', ('.nsis.zip', '.exe')),
     'linux-x64': ('linux-x86_64', ('.AppImage',)),
-    'macos-x64': ('darwin-x86_64', ('.app.tar.gz',)),
+    # 'macos-x64': ('darwin-x86_64', ('.app.tar.gz',)),
     'macos-arm64': ('darwin-aarch64', ('.app.tar.gz',))
 }
 
