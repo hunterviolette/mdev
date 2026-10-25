@@ -34,6 +34,9 @@ import {
   applyWorkflowChangeset,
   executeWorkflowCapability,
   createTemplate,
+  buildTemplateExport,
+  importTemplates,
+  parseTemplateBundle,
   deleteRun,
   deleteTemplate,
   getWorkflowChangeset,
@@ -42,7 +45,6 @@ import {
   getRun,
   getRuntimeProjection,
   getRuntimeSnapshot,
-  openRuntimeEventStream,
   openWorkflowRun,
   getStageExecutionChain,
   getWorkflowBuilderCatalog,
@@ -90,6 +92,8 @@ import {
   type WorkflowStageField,
   type WorkflowStepDefinition,
   type WorkflowTemplate,
+  type WorkflowTemplateBundle,
+  type TemplateConflictStrategy,
   type WorkflowTemplateDefinition,
   type WorkflowTransition
 } from './api';
@@ -183,6 +187,12 @@ type ShellView = 'builder' | 'monitor';
 type MonitorView = 'workflow_list' | 'workflow_detail';
 type MonitorHomeView = 'workflows' | 'supervisor' | 'templates' | 'runtime' | 'settings';
 type WorkspaceTabKey = 'workflows' | 'diff' | 'commits' | 'files' | 'capabilities' | 'impact';
+
+const workflowShortcutModifier = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent) ? '⌥' : 'Alt+';
+
+function workflowShortcutLabel(number: number): string {
+  return `${workflowShortcutModifier}${number}`;
+}
 type EventTone = { color: string; label: string };
 
 type InferenceConnectionStatus = { color: string; label: string };
@@ -2367,11 +2377,25 @@ export function WorkflowShell(props: {
   const [monitorView, setMonitorView] = useState<MonitorView>('workflow_list');
   const [monitorHomeView, setMonitorHomeView] = useState<MonitorHomeView>('workflows');
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTabKey>('workflows');
+  const [workspaceTabMounts, setWorkspaceTabMounts] = useState<{
+    runId: string | null;
+    tabs: WorkspaceTabKey[];
+  }>({ runId: null, tabs: ['workflows'] });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [overlayPlanner, setOverlayPlanner] = useState<{ supervisorId: string; title: string; rootRepoPath: string } | null>(null);
 
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
+  const [templateExportOpen, setTemplateExportOpen] = useState(false);
+  const [templateImportOpen, setTemplateImportOpen] = useState(false);
+  const [templateExportSelection, setTemplateExportSelection] = useState<string[]>([]);
+  const [templateImportBundle, setTemplateImportBundle] = useState<WorkflowTemplateBundle | null>(null);
+  const [templateImportSelection, setTemplateImportSelection] = useState<number[]>([]);
+  const [templateImportStrategy, setTemplateImportStrategy] = useState<TemplateConflictStrategy>('skip');
+  const [templateTransferBusy, setTemplateTransferBusy] = useState(false);
+  const [templateTransferMessage, setTemplateTransferMessage] = useState<string | null>(null);
+  const templateImportFileRef = useRef<HTMLInputElement | null>(null);
+
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [events, setEvents] = useState<WorkflowEvent[]>([]);
   const [allWorkflowEvents, setAllWorkflowEvents] = useState<Record<string, WorkflowEvent[]>>({});
@@ -3439,6 +3463,25 @@ export function WorkflowShell(props: {
   }, [selectedRunId]);
 
   useEffect(() => {
+    setWorkspaceTabMounts((current) => {
+      if (current.runId !== selectedRunId) {
+        return { runId: selectedRunId, tabs: [activeWorkspaceTab] };
+      }
+      if (current.tabs.includes(activeWorkspaceTab)) return current;
+      return {
+        runId: selectedRunId,
+        tabs: [...current.tabs, activeWorkspaceTab]
+      };
+    });
+  }, [selectedRunId, activeWorkspaceTab]);
+
+  const mountedWorkspaceTabs = workspaceTabMounts.runId === selectedRunId
+    ? workspaceTabMounts.tabs.includes(activeWorkspaceTab)
+      ? workspaceTabMounts.tabs
+      : [...workspaceTabMounts.tabs, activeWorkspaceTab]
+    : [activeWorkspaceTab];
+
+  useEffect(() => {
     const contentElement = workflowDetailContentRef.current;
     if (!contentElement) return;
 
@@ -3548,48 +3591,6 @@ export function WorkflowShell(props: {
 
   useEffect(() => {
     let cancelled = false;
-    const routedRunId = props.route?.workflowRunId?.trim() ?? '';
-
-    if (routedRunId) {
-      const source = openRuntimeEventStream({
-        scope: 'workflow',
-        run_id: routedRunId
-      });
-
-      source.onopen = () => {
-        if (cancelled) return;
-        setRuntimeEvents((prev) => ({ ...prev, connected: true }));
-      };
-
-      source.addEventListener('runtime_snapshot', (raw) => {
-        if (cancelled) return;
-        try {
-          const snapshot = JSON.parse((raw as MessageEvent<string>).data) as RuntimeSnapshotResponse;
-          setRuntimeEvents((prev) => reduceRuntimeSnapshot(prev, snapshot));
-          hydrateRunsFromRuntimeSnapshot(snapshot.nodes ?? []);
-        } catch {
-        }
-      });
-
-      source.addEventListener('runtime_event', (raw) => {
-        if (cancelled) return;
-        try {
-          const incoming = JSON.parse((raw as MessageEvent<string>).data) as RuntimeEventEnvelope;
-          applyLiveWorkflowEvent(incoming.event);
-        } catch {
-        }
-      });
-
-      source.onerror = () => {
-        if (cancelled) return;
-        setRuntimeEvents((prev) => ({ ...prev, connected: false }));
-      };
-
-      return () => {
-        cancelled = true;
-        source.close();
-      };
-    }
 
     async function loadInitialGraph() {
       try {
@@ -5397,6 +5398,75 @@ export function WorkflowShell(props: {
     setLoadTemplateOpen(false);
   }
 
+  function openTemplateExport() {
+    setTemplateExportSelection(templates.map((template) => template.id));
+    setTemplateTransferMessage(null);
+    setTemplateExportOpen(true);
+  }
+
+  function openTemplateImport() {
+    setTemplateImportBundle(null);
+    setTemplateImportSelection([]);
+    setTemplateImportStrategy('skip');
+    setTemplateTransferMessage(null);
+    if (templateImportFileRef.current) templateImportFileRef.current.value = '';
+    setTemplateImportOpen(true);
+  }
+
+  async function handleTemplateImportFile(file: File | null) {
+    if (!file) return;
+    try {
+      setTemplateTransferMessage(null);
+      setTemplateImportBundle(null);
+      setTemplateImportSelection([]);
+      if (file.size > 10 * 1024 * 1024) {
+        throw new Error('Template file exceeds the 10 MB limit');
+      }
+      const bundle = parseTemplateBundle(JSON.parse(await file.text()));
+      setTemplateImportBundle(bundle);
+      setTemplateImportSelection(bundle.templates.map((_, index) => index));
+    } catch (err) {
+      setTemplateTransferMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function handleTemplateExport() {
+    try {
+      const selected = templates.filter((template) => templateExportSelection.includes(template.id));
+      if (!selected.length) throw new Error('Select at least one template');
+      const bundle = buildTemplateExport(selected);
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `mdev-workflow-templates-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setTemplateExportOpen(false);
+    } catch (err) {
+      setTemplateTransferMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleTemplateImport() {
+    if (!templateImportBundle || !templateImportSelection.length) return;
+    try {
+      setTemplateTransferBusy(true);
+      setTemplateTransferMessage(null);
+      const result = await importTemplates(templateImportBundle, templateImportSelection, templateImportStrategy);
+      await refreshRunsAndTemplates();
+      setTemplateImportOpen(false);
+      setTemplateImportBundle(null);
+      setTemplateTransferMessage(`Imported ${result.imported}, updated ${result.updated}, renamed ${result.renamed}, skipped ${result.skipped} templates.`);
+    } catch (err) {
+      setTemplateTransferMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTemplateTransferBusy(false);
+    }
+  }
+
   async function handleDeleteTemplate(templateId: string) {
     try {
       setBusy(true);
@@ -7175,8 +7245,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
         return;
       }
 
-      const key = event.key;
-      if (!/^[1-9]$/.test(key)) {
+      const key = /^Digit[1-6]$/.test(event.code) ? event.code.slice(-1) : event.key;
+      if (!/^[1-6]$/.test(key)) {
         return;
       }
 
@@ -7256,12 +7326,12 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}
                   >
                     <Tabs.List style={{ borderBottom: 0 }}>
-                  <Tabs.Tab value="workflows">Home (Alt+1)</Tabs.Tab>
-                  <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes (Alt+2)</Tabs.Tab>
-                  <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits (Alt+3)</Tabs.Tab>
-                  <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository (Alt+4)</Tabs.Tab>
-                  <Tabs.Tab value="capabilities">Capabilities (Alt+5)</Tabs.Tab>
-                  <Tabs.Tab value="impact">Impact (Alt+6)</Tabs.Tab>
+                  <Tabs.Tab value="workflows">Home ({workflowShortcutLabel(1)})</Tabs.Tab>
+                  <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes ({workflowShortcutLabel(2)})</Tabs.Tab>
+                  <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits ({workflowShortcutLabel(3)})</Tabs.Tab>
+                  <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository ({workflowShortcutLabel(4)})</Tabs.Tab>
+                  <Tabs.Tab value="capabilities">Capabilities ({workflowShortcutLabel(5)})</Tabs.Tab>
+                  <Tabs.Tab value="impact">Impact ({workflowShortcutLabel(6)})</Tabs.Tab>
                     </Tabs.List>
                   </Tabs>
               </AppHeader>
@@ -7367,7 +7437,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 </AppSurface>
               </Stack>
             </Modal>
-          ) : activeWorkspaceTab === 'diff' ? (
+          ) : (
+            <>
+              {(monitorView === 'workflow_detail'
+                ? mountedWorkspaceTabs
+                : ['workflows' as WorkspaceTabKey]
+              ).map((renderedTab) => (
+                <div
+                  key={`${selectedRunId ?? 'none'}:${renderedTab}`}
+                  style={{
+                    display: monitorView !== 'workflow_detail' || renderedTab === activeWorkspaceTab
+                      ? undefined
+                      : 'none'
+                  }}
+                >
+                  {renderedTab === 'diff' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading changes view…</Text></Group></Card>}>
               <DiffPanel
                 runId={selectedRunId}
@@ -7377,19 +7461,19 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 forceViewerOpen
               />
             </Suspense>
-          ) : activeWorkspaceTab === 'commits' ? (
+          ) : renderedTab === 'commits' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading commit summary…</Text></Group></Card>}>
               <CommitSummaryPanel repoRef={(selectedRun?.repo_ref ?? repoRef ?? '').trim()} />
             </Suspense>
-          ) : activeWorkspaceTab === 'files' ? (
+          ) : renderedTab === 'files' ? (
             <Suspense fallback={<Card withBorder p="lg"><Group gap="xs"><Loader size="sm" /><Text size="sm" c="dimmed">Loading repository view…</Text></Group></Card>}>
               <RepoMonacoFileEditorPanel runId={selectedRun?.id ?? ''} />
             </Suspense>
-          ) : activeWorkspaceTab === 'impact' ? (
+          ) : renderedTab === 'impact' ? (
             <Suspense fallback={<Card withBorder p="lg"><Loader size="sm" /></Card>}>
               <ImpactPanel runId={selectedRunId} />
             </Suspense>
-          ) : activeWorkspaceTab === 'capabilities' ? (
+          ) : renderedTab === 'capabilities' ? (
             <Card withBorder>
               <GlobalCapabilitiesPanel
                 repoContextArmed={!!sharedInferenceState?.repo_context_armed}
@@ -7459,6 +7543,95 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   navigate={props.navigate}
                 />
               ) : monitorHomeView === 'templates' ? (
+                <>
+                <Modal opened={templateExportOpen} onClose={() => setTemplateExportOpen(false)} title="Export templates" size="lg" centered>
+                  <Stack gap="md">
+                    <Group justify="space-between">
+                      <Text size="sm">{templateExportSelection.length} of {templates.length} selected</Text>
+                      <Group gap="xs">
+                        <Button size="xs" variant="subtle" onClick={() => setTemplateExportSelection(templates.map((template) => template.id))}>Select all</Button>
+                        <Button size="xs" variant="subtle" onClick={() => setTemplateExportSelection([])}>Deselect all</Button>
+                      </Group>
+                    </Group>
+                    <ScrollArea.Autosize mah={400}>
+                      <Stack gap="xs">
+                        {templates.map((template) => (
+                          <Checkbox
+                            key={template.id}
+                            label={template.name}
+                            description={template.description || undefined}
+                            checked={templateExportSelection.includes(template.id)}
+                            onChange={(event) => setTemplateExportSelection((current) => event.currentTarget.checked ? [...current, template.id] : current.filter((id) => id !== template.id))}
+                          />
+                        ))}
+                      </Stack>
+                    </ScrollArea.Autosize>
+                    {templateTransferMessage && <Alert color="red">{templateTransferMessage}</Alert>}
+                    <Group justify="flex-end">
+                      <Button variant="default" onClick={() => setTemplateExportOpen(false)}>Cancel</Button>
+                      <Button disabled={!templateExportSelection.length} onClick={handleTemplateExport}>Download JSON</Button>
+                    </Group>
+                  </Stack>
+                </Modal>
+                <Modal opened={templateImportOpen} onClose={() => !templateTransferBusy && setTemplateImportOpen(false)} title="Import templates" size="lg" centered closeOnClickOutside={!templateTransferBusy} closeOnEscape={!templateTransferBusy}>
+                  <Stack gap="md">
+                    <input
+                      ref={templateImportFileRef}
+                      type="file"
+                      accept=".json,application/json"
+                      aria-label="Choose template JSON file"
+                      onChange={(event) => void handleTemplateImportFile(event.currentTarget.files?.[0] ?? null)}
+                    />
+                    {templateImportBundle && (
+                      <>
+                        <Group justify="space-between">
+                          <Text size="sm">{templateImportSelection.length} of {templateImportBundle.templates.length} selected</Text>
+                          <Group gap="xs">
+                            <Button size="xs" variant="subtle" onClick={() => setTemplateImportSelection(templateImportBundle.templates.map((_, index) => index))}>Select all</Button>
+                            <Button size="xs" variant="subtle" onClick={() => setTemplateImportSelection([])}>Deselect all</Button>
+                          </Group>
+                        </Group>
+                        <ScrollArea.Autosize mah={350}>
+                          <Stack gap="xs">
+                            {templateImportBundle.templates.map((template, index) => {
+                              const existing = templates.some((item) => item.name === template.name);
+                              const protectedTemplate = template.name === 'Default refinement workflow';
+                              return (
+                                <Checkbox
+                                  key={index}
+                                  checked={templateImportSelection.includes(index)}
+                                  disabled={protectedTemplate || templateTransferBusy}
+                                  onChange={(event) => setTemplateImportSelection((current) => event.currentTarget.checked ? [...current, index] : current.filter((value) => value !== index))}
+                                  label={template.name}
+                                  description={`${protectedTemplate ? 'Protected system template' : existing ? 'Name already exists' : 'New template'}${template.repo_ref ? ` · Repo: ${template.repo_ref}` : ''}`}
+                                />
+                              );
+                            })}
+                          </Stack>
+                        </ScrollArea.Autosize>
+                        <Select
+                          label="When a template name already exists"
+                          value={templateImportStrategy}
+                          onChange={(value) => setTemplateImportStrategy((value ?? 'skip') as TemplateConflictStrategy)}
+                          data={[
+                            { value: 'skip', label: 'Skip existing templates' },
+                            { value: 'overwrite', label: 'Overwrite existing templates' },
+                            { value: 'rename', label: 'Import with a new name' }
+                          ]}
+                          disabled={templateTransferBusy}
+                        />
+                        {templateImportBundle.templates.some((template) => template.repo_ref && (/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(template.repo_ref))) && (
+                          <Alert color="yellow">Some templates contain absolute repository paths. Verify these paths after import.</Alert>
+                        )}
+                      </>
+                    )}
+                    {templateTransferMessage && <Alert color="red">{templateTransferMessage}</Alert>}
+                    <Group justify="flex-end">
+                      <Button variant="default" disabled={templateTransferBusy} onClick={() => setTemplateImportOpen(false)}>Cancel</Button>
+                      <Button loading={templateTransferBusy} disabled={!templateImportBundle || !templateImportSelection.some((index) => templateImportBundle.templates[index]?.name !== 'Default refinement workflow')} onClick={() => void handleTemplateImport()}>Import selected</Button>
+                    </Group>
+                  </Stack>
+                </Modal>
                 <AppSurface p="md">
                   <Stack gap="sm">
                     <Group justify="space-between" align="center" wrap="wrap">
@@ -7466,7 +7639,14 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Title order={4}>Templates</Title>
                         <Badge variant="light" color="gray">{templates.length}</Badge>
                       </Group>
+                      <Group gap="xs">
+                        <Button variant="default" size="xs" onClick={openTemplateImport} disabled={templateTransferBusy}>Import</Button>
+                        <Button variant="default" size="xs" onClick={openTemplateExport} disabled={templates.length === 0 || templateTransferBusy}>Export</Button>
+                      </Group>
                     </Group>
+                    {templateTransferMessage && !templateImportOpen && !templateExportOpen ? (
+                      <Alert color="blue" withCloseButton onClose={() => setTemplateTransferMessage(null)}>{templateTransferMessage}</Alert>
+                    ) : null}
 
                     {templates.length === 0 ? (
                       <Text size="sm" c="dimmed">No saved templates yet.</Text>
@@ -7528,6 +7708,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     )}
                   </Stack>
                 </AppSurface>
+                </>
               ) : (
                 <>
                   <AppSurface p="md">
@@ -7727,7 +7908,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Grid.Col span={{ base: 12, xl: 4 }}>
                           <Stack>
                             {pendingDispositionReview && pendingDispositionReview.stageId === selectedWorkflowStep?.id ? (
-                              <Card withBorder>
+                              <>
+                                <Card withBorder>
                                 <Stack gap="sm">
                                   <Alert color="yellow" title="User input required">
                                     <Text size="sm">
@@ -7774,6 +7956,14 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                   </Group>
                                 </Stack>
                               </Card>
+                              {selectedWorkflowStep?.step_type === 'qa' ? (
+                                <DeployQARuntime
+                                  runId={selectedRunId}
+                                  step={selectedWorkflowStep}
+                                  disabled={isBackendRunLocked}
+                                />
+                              ) : null}
+                            </>
                             ) : !inferenceRequiredForSelectedStep || !inferenceRequiresConnection || inferenceReady ? (
                               <>
                                 {selectedWorkflowStep?.step_type === 'sap_import' ? (
@@ -8042,7 +8232,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   </AppSurface>
                 </Grid.Col>
               </Grid>
-            )}
+                  )}
+                </div>
+              ))}
+            </>
+          )}
           </Stack>
 
         <Modal

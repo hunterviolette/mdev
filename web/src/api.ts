@@ -220,6 +220,7 @@ export type RuntimeProcessesResponse = {
 };
 
 export type TerminalSequenceSpec = {
+  strategy?: 'series' | 'parallel';
   commands: TerminalCommandSpec[];
   stop_on_failure: boolean;
 };
@@ -813,6 +814,98 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type PortableWorkflowTemplate = Pick<WorkflowTemplate, 'name' | 'description' | 'repo_ref' | 'definition'>;
+
+export type WorkflowTemplateBundle = {
+  format: 'mdev-workflow-templates';
+  version: 1;
+  templates: PortableWorkflowTemplate[];
+};
+
+export type TemplateConflictStrategy = 'skip' | 'overwrite' | 'rename';
+
+export type ImportTemplatesResponse = {
+  imported: number;
+  updated: number;
+  skipped: number;
+  renamed: number;
+  templates: WorkflowTemplate[];
+};
+
+export function importTemplates(
+  bundle: WorkflowTemplateBundle,
+  selectedIndices: number[],
+  conflictStrategy: TemplateConflictStrategy
+) {
+  return fetchJson<ImportTemplatesResponse>('/api/workflow-templates/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      ...bundle,
+      selected_indices: selectedIndices,
+      conflict_strategy: conflictStrategy
+    })
+  });
+}
+
+export function buildTemplateExport(templates: WorkflowTemplate[]): WorkflowTemplateBundle {
+  return {
+    format: 'mdev-workflow-templates',
+    version: 1,
+    templates: templates.map(({ name, description, repo_ref, definition }) => ({
+      name,
+      description,
+      repo_ref,
+      definition
+    }))
+  };
+}
+
+export function parseTemplateBundle(value: unknown): WorkflowTemplateBundle {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid template bundle');
+  }
+  const bundle = value as Record<string, unknown>;
+  if (bundle.format !== 'mdev-workflow-templates' || bundle.version !== 1 || !Array.isArray(bundle.templates)) {
+    throw new Error('Unsupported template bundle format or version');
+  }
+  if (bundle.templates.length > 1000) {
+    throw new Error('Template bundle exceeds the 1000-template limit');
+  }
+  const templates = bundle.templates.map((value, index) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`Invalid template at index ${index}`);
+    }
+    const template = value as Record<string, unknown>;
+    if (typeof template.name !== 'string' || !template.name.trim() || template.name.length > 255) {
+      throw new Error(`Invalid template name at index ${index}`);
+    }
+    if (template.description !== undefined && typeof template.description !== 'string') {
+      throw new Error(`Invalid template description at index ${index}`);
+    }
+    if (template.repo_ref !== undefined && typeof template.repo_ref !== 'string') {
+      throw new Error(`Invalid repository reference at index ${index}`);
+    }
+    if (!template.definition || typeof template.definition !== 'object' || Array.isArray(template.definition)) {
+      throw new Error(`Invalid workflow definition at index ${index}`);
+    }
+    const definition = template.definition as Record<string, unknown>;
+    if (typeof definition.version !== 'number' || !Array.isArray(definition.steps) || !definition.steps.length || !definition.globals || typeof definition.globals !== 'object') {
+      throw new Error(`Incomplete workflow definition at index ${index}`);
+    }
+    return {
+      name: template.name as string,
+      description: (template.description ?? '') as string,
+      repo_ref: (template.repo_ref ?? '') as string,
+      definition: template.definition as WorkflowTemplateDefinition
+    };
+  });
+  return {
+    format: 'mdev-workflow-templates',
+    version: 1,
+    templates
+  };
+}
+
 export function listTemplates() {
   return fetchJson<WorkflowTemplate[]>('/api/workflow-templates');
 }
@@ -845,6 +938,8 @@ export type InferenceInputRecord = {
   session_id: string;
   provider: string;
   model: string;
+  invocation_status: string;
+  invocation_error: string | null;
   sequence_no: number;
   input_type: string;
   input_origin: string;

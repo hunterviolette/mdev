@@ -77,12 +77,15 @@ pub async fn record_invocation(
             content: block.content.clone(),
         })
     }).collect::<Vec<_>>();
+    let error_message = if status == "failed" {
+        response.get("error_message").and_then(Value::as_str)
+    } else { None };
     let output = serde_json::json!({
         "text": output_text,
         "payload": response,
         "provider_metadata": response.get("provider_metadata")
     });
-    sqlx::query("INSERT INTO inference_invocations (id, inference_session_id, workflow_run_id, step_id, stage_type, capability_invocation_id, transport, provider, model, status, input_json, output_json, accounting_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO inference_invocations (id, inference_session_id, workflow_run_id, step_id, stage_type, capability_invocation_id, transport, provider, model, status, error_message, input_json, output_json, accounting_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&invocation_id)
         .bind(session_id)
         .bind(ctx.run_id.to_string())
@@ -93,6 +96,7 @@ pub async fn record_invocation(
         .bind(provider)
         .bind(model)
         .bind(status)
+        .bind(error_message)
         .bind(serde_json::to_string(&inputs)?)
         .bind(serde_json::to_string(&output)?)
         .bind(&accounting_json)

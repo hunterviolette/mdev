@@ -15,6 +15,27 @@ use crate::engine::{
     runtime_tools::{DependencyEcosystem, DependencyProviderSpec, SharedDependenciesConfig, TrustedDependencyArtifactSpec},
 };
 
+pub fn build_cache_environment(workspace: &Path) -> Result<BTreeMap<String, String>> {
+    let repository = super::qa_environment::trusted_repository_root(workspace)?;
+    let cache = repository.join(".mdev").join("cache");
+    fs::create_dir_all(cache.join("sccache"))?;
+    fs::create_dir_all(cache.join("npm"))?;
+    let available = Command::new("sccache")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !available {
+        bail!("sccache is required for shared Cargo compilation but was not found");
+    }
+    let mut environment = BTreeMap::new();
+    environment.insert("RUSTC_WRAPPER".to_string(), "sccache".to_string());
+    environment.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
+    environment.insert("SCCACHE_DIR".to_string(), cache.join("sccache").to_string_lossy().into_owned());
+    environment.insert("npm_config_cache".to_string(), cache.join("npm").to_string_lossy().into_owned());
+    Ok(environment)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyFingerprint {
     pub provider_id: String,
@@ -106,10 +127,10 @@ pub async fn execute(
     let requested_provider_ids = requested_provider_ids
         .into_iter()
         .filter(|requested_id| {
-            shared_dependencies.providers.iter().any(|provider| {
-                matches!(provider.ecosystem, DependencyEcosystem::Node)
-                    && provider.id == *requested_id
-            })
+            shared_dependencies
+                .providers
+                .iter()
+                .any(|provider| provider.id == *requested_id)
         })
         .collect::<Vec<_>>();
 
@@ -185,7 +206,11 @@ pub async fn execute(
                     if issues.len() == 1 { "" } else { "es" }
                 )
             } else {
-                "Shared dependency validation succeeded. The shard uses the trusted Node dependency layer.".to_string()
+                format!(
+                    "Shared dependency validation succeeded for {} provider{}. All selected manifests match their trusted roots.",
+                    resolved.len(),
+                    if resolved.len() == 1 { "" } else { "s" }
+                )
             },
             "issues": issues,
             "providers": resolved
@@ -525,7 +550,7 @@ fn effective_trusted_artifact(
             DependencyEcosystem::Cargo => TrustedDependencyArtifactSpec::Cargo {
                 cargo_home: Some(".cargo".to_string()),
                 target_directory: Some("target".to_string()),
-                share_target: true,
+                share_target: false,
             },
         }
     })

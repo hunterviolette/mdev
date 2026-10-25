@@ -242,6 +242,26 @@ pub async fn reconcile_stage_session(
     Ok(true)
 }
 
+async fn record_transport_failure(
+    ctx: &CapabilityContext<'_>,
+    session_id: &str,
+    route: &ResolvedInferenceRoute,
+    input: &ModelInput,
+    error: &anyhow::Error,
+) {
+    let transport = match route.config.transport {
+        InferenceTransport::Api => "api",
+        InferenceTransport::Browser => "browser",
+    };
+    let response = json!({"ok": false, "error_message": format!("{error:#}")});
+    if let Err(record_error) = super::persistence::record_invocation(
+        &ctx.state.db, ctx, session_id, transport, transport, "", input,
+        &response, None, "",
+    ).await {
+        tracing::warn!(error = %record_error, "failed to persist unsuccessful inference input");
+    }
+}
+
 pub struct Inference;
 
 impl Inference {
@@ -316,6 +336,7 @@ impl Inference {
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) if !creating && adapter.is_session_unavailable_error(&error) => {
+                record_transport_failure(ctx, &logical_session.id, route, input, &error).await;
                 session::archive_session(&ctx.state.db, &logical_session.id).await?;
 
                 let previous_session_id = logical_session.id.clone();
@@ -346,6 +367,7 @@ impl Inference {
                 match adapter.create_session(ctx, route, input).await {
                     Ok(execution) => execution,
                     Err(error) => {
+                        record_transport_failure(ctx, &logical_session.id, route, input, &error).await;
                         let _ = session::mark_session_failed(
                             &ctx.state.db,
                             &logical_session.id,
@@ -357,6 +379,7 @@ impl Inference {
                 }
             }
             Err(error) => {
+                record_transport_failure(ctx, &logical_session.id, route, input, &error).await;
                 if creating {
                     let _ = session::mark_session_failed(
                         &ctx.state.db,

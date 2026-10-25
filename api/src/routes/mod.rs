@@ -2,6 +2,7 @@ mod capabilities;
 mod changesets;
 mod event_chains;
 mod impact;
+mod supervisor_impact;
 pub(crate) mod supervisor_projection;
 mod filesystem;
 mod health;

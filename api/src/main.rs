@@ -9,7 +9,7 @@ mod supervisor;
 
 mod routes;
 
-use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}, process::Command};
+use std::{env, fs, io::ErrorKind, path::{Path, PathBuf}};
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::connect(&db_url).await?;
     db::migrate(&db).await?;
+    db::migrate_supervisor_directories(&db).await?;
 
     let auth = auth::initialize(&db).await?;
     let state = AppState::new(db);
@@ -110,15 +111,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
-            tracing::info!(%addr, "mdev api already running; opening existing web ui");
-            open_mdev_web_ui(addr);
+            tracing::info!(%addr, "mdev api already running");
             return Ok(());
         }
         Err(err) => return Err(err).with_context(|| format!("failed to bind workflow api to {addr}")),
     };
 
     tracing::info!(%addr, web_dist = %layout.web_dist.display(), data_dir = %layout.data_dir.display(), "workflow api listening");
-    open_mdev_web_ui(addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             await_shutdown_signal().await;
@@ -187,7 +186,7 @@ fn build_router(state: AppState, auth_state: auth::AuthState, web_dist: &Path) -
         .merge(routes::router())
         .merge(auth::router())
         .route_layer(axum::middleware::from_fn_with_state(auth_middleware_state, auth::authorize))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(axum::Extension(auth_state))
         .layer(TraceLayer::new_for_http());
 
@@ -195,13 +194,15 @@ fn build_router(state: AppState, auth_state: auth::AuthState, web_dist: &Path) -
         api = api.layer(CorsLayer::permissive());
     }
 
+    let proxy_state = state.clone();
     let index_html = web_dist.join("index.html");
     if index_html.is_file() {
         tracing::info!(path = %web_dist.display(), "serving web frontend");
         api.fallback_service(ServeDir::new(web_dist).fallback(ServeFile::new(index_html)))
+            .layer(axum::middleware::from_fn_with_state(proxy_state, engine::capabilities::qa_environment::proxy_middleware))
     } else {
         tracing::error!(path = %index_html.display(), "web frontend entrypoint not found; serving backend routes only");
-        api
+        api.layer(axum::middleware::from_fn_with_state(proxy_state, engine::capabilities::qa_environment::proxy_middleware))
     }
 }
 
@@ -332,38 +333,6 @@ pub(crate) fn mdev_data_dir(app_root: &Path) -> PathBuf {
     }
 
     app_root.join(".data")
-}
-
-fn open_mdev_web_ui(addr: std::net::SocketAddr) {
-    if env::var("MDEV_NO_BROWSER_OPEN").ok().as_deref() == Some("1") {
-        return;
-    }
-
-    let url = format!("http://{}", addr);
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", &url]);
-        command
-    };
-
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut command = Command::new("open");
-        command.arg(&url);
-        command
-    };
-
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let mut cmd = {
-        let mut command = Command::new("xdg-open");
-        command.arg(&url);
-        command
-    };
-
-    if let Err(err) = cmd.spawn() {
-        tracing::warn!(url = %url, error = %format!("{:#}", err), "failed to open mdev web ui");
-    }
 }
 
 fn detect_repo_root(start: &Path) -> Option<PathBuf> {

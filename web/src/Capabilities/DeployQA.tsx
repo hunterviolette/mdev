@@ -17,7 +17,17 @@ import type {
   TerminalCommandSpec,
 } from '../api';
 
+export type QaDirectoryMapping = {
+  source: string;
+  destination: string;
+  mode: 'copy' | 'symlink';
+  replace_existing: boolean;
+  existing_destination?: 'error' | 'replace' | 'use_existing';
+  exclude_directories?: string[];
+};
+
 export type DeployQAValues = {
+  directory_mappings: QaDirectoryMapping[];
   services: QaServiceSpec[];
   port_start: number;
   port_end: number;
@@ -139,6 +149,9 @@ export function deployQAValuesFromCapability(value: unknown): DeployQAValues | n
   }
 
   return {
+    directory_mappings: Array.isArray(environmentRecord.directory_mappings)
+      ? structuredClone(environmentRecord.directory_mappings) as QaDirectoryMapping[]
+      : [],
     services: structuredClone(services) as QaServiceSpec[],
     port_start: portStart,
     port_end: portEnd,
@@ -163,6 +176,7 @@ export function deployQACapabilityFromValues(
     ...capability,
     environment: {
       ...environment,
+      directory_mappings: structuredClone(values.directory_mappings),
       port_range: {
         start: values.port_start,
         end: values.port_end,
@@ -209,6 +223,28 @@ export function DeployQA({
       centered
     >
       <Stack gap="md">
+        <Group justify="space-between">
+          <div>
+            <Text fw={700}>Directory mappings</Text>
+            <Text size="sm" c="dimmed">Copy or symlink directories from the trusted repository into the QA workspace.</Text>
+          </div>
+          <Button variant="default" leftSection={<IconPlus size={16} />} disabled={disabled} onClick={() => onChange('directory_mappings', [...values.directory_mappings, { source: '', destination: '', mode: 'copy', replace_existing: false, existing_destination: 'error', exclude_directories: [] }])}>Add directory</Button>
+        </Group>
+        {values.directory_mappings.map((mapping, index) => (
+          <Card key={index} withBorder padding="sm">
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={600}>Directory {index + 1}</Text>
+                <Button size="compact-xs" variant="subtle" color="red" disabled={disabled} leftSection={<IconTrash size={14} />} onClick={() => onChange('directory_mappings', values.directory_mappings.filter((_, i) => i !== index))}>Remove</Button>
+              </Group>
+              <TextInput label="Source directory" value={mapping.source} disabled={disabled} onChange={event => onChange('directory_mappings', values.directory_mappings.map((item, i) => i === index ? { ...item, source: event.currentTarget.value } : item))} />
+              <TextInput label="QA destination" value={mapping.destination} disabled={disabled} onChange={event => onChange('directory_mappings', values.directory_mappings.map((item, i) => i === index ? { ...item, destination: event.currentTarget.value } : item))} />
+              <Select label="Method" data={[{ value: 'copy', label: 'Copy directory' }, { value: 'symlink', label: 'Symlink directory' }]} value={mapping.mode} disabled={disabled} onChange={value => onChange('directory_mappings', values.directory_mappings.map((item, i) => i === index ? { ...item, mode: (value || 'copy') as QaDirectoryMapping['mode'] } : item))} />
+              {mapping.mode === 'copy' && <Select label="Existing destination" data={[{ value: 'error', label: 'Fail if existing' }, { value: 'replace', label: 'Replace existing' }, { value: 'use_existing', label: 'Use existing' }]} value={mapping.existing_destination ?? (mapping.replace_existing ? 'replace' : 'error')} disabled={disabled} onChange={value => onChange('directory_mappings', values.directory_mappings.map((item, i) => i === index ? { ...item, existing_destination: (value ?? 'error') as QaDirectoryMapping['existing_destination'], replace_existing: value === 'replace' } : item))} />}
+              {mapping.mode === 'copy' && <Textarea label="Exclude directories" description="One directory name or relative path per line. Use **/target to match directories at any depth." autosize minRows={2} value={(mapping.exclude_directories ?? []).join('\n')} disabled={disabled} onChange={event => onChange('directory_mappings', values.directory_mappings.map((item, i) => i === index ? { ...item, exclude_directories: event.currentTarget.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean) } : item))} />}
+            </Stack>
+          </Card>
+        ))}
         <Group justify="space-between">
           <div>
             <Text fw={700}>Services</Text>

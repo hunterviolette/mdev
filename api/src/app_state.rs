@@ -12,6 +12,7 @@ use crate::engine::capabilities::{
     repo_sync::RepoSyncRuntime,
 };
 use crate::engine::runtime_endpoints::RuntimeEndpointManager;
+use crate::engine::capabilities::qa_environment::QaReverseProxy;
 
 use crate::{
     engine::{
@@ -52,6 +53,7 @@ pub struct AppState {
     pub operator_inputs: OperatorInputRegistry,
     pub repo_sync: RepoSyncRuntime,
     pub runtime_endpoints: RuntimeEndpointManager,
+    pub qa_reverse_proxy: QaReverseProxy,
 }
 
 impl AppState {
@@ -72,6 +74,7 @@ impl AppState {
             operator_inputs: OperatorInputRegistry::default(),
             repo_sync: RepoSyncRuntime::default(),
             runtime_endpoints: RuntimeEndpointManager::default(),
+            qa_reverse_proxy: QaReverseProxy::default(),
         }
     }
 

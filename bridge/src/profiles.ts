@@ -10,7 +10,7 @@ export type InteractionProfile = {
 
 const profiles: Record<string, InteractionProfile> = {
   auto: {
-    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container',
+    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container, [data-testid="assistant-message"] .standard-markdown',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',
@@ -20,18 +20,18 @@ const profiles: Record<string, InteractionProfile> = {
 
 const candidateProfiles: InteractionProfile[] = [
   {
-    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container',
+    responseSelector: '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid="message-content"], message-content, .assistant-message, .model-response-text, .response-container, [data-testid="assistant-message"] .standard-markdown',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: '#prompt-textarea, textarea, div[contenteditable="true"], [role="textbox"]',
     chatSubmitSelector: 'button[data-testid="send-button"], button[type="submit"], [aria-label*="send" i], button[aria-label*="Send message" i]'
   },
   {
-    responseSelector: '[class*="font-claude-message"]',
+    responseSelector: '[data-testid="assistant-message"] .standard-markdown',
     uploadInputSelector: 'input[type="file"]',
     uploadButtonSelector: 'button[aria-label*="upload" i], button[title*="upload" i], button[type="button"]',
     chatInputSelector: 'div[contenteditable="true"], textarea, [role="textbox"]',
-    chatSubmitSelector: 'button[type="submit"], [aria-label*="send" i], button[aria-label*="Use voice mode" i]'
+    chatSubmitSelector: 'button[data-testid="chat-input-send"], button[type="submit"], [aria-label*="send" i]'
   }
 ];
 

@@ -860,7 +860,8 @@ fn seed_compile_command_context_from_definition(context: &mut Value, definition:
         };
 
         execution_obj.insert("compile_checks".to_string(), json!({
-            "commands": commands
+            "commands": commands,
+            "strategy": step.execution.compile_checks.get("strategy").and_then(Value::as_str).unwrap_or("series")
         }));
     }
 }

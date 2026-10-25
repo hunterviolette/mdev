@@ -12,6 +12,7 @@ use crate::{
     app_state::AppState,
     engine::capabilities::git::git::{
         generate_git_apply_patch,
+        git_cumulative_diff_stats,
         git_diff_stats,
         git_status,
         git_untracked_line_stats,
@@ -603,6 +604,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/review/stage", post(review_stage))
         .route("/api/review/unstage", post(review_unstage))
         .route("/api/workflow-runs/:run_id/review/status", get(workflow_review_status))
+        .route("/api/workflow-runs/:run_id/review/cumulative-diff", get(workflow_review_cumulative_diff))
         .route("/api/workflow-runs/:run_id/review/diff", get(workflow_review_diff))
         .route("/api/workflow-runs/:run_id/review/diff/manifest", get(workflow_review_diff_manifest))
         .route("/api/workflow-runs/:run_id/review/stage", post(workflow_review_stage))
@@ -618,6 +620,43 @@ async fn workflow_review_status(
 ) -> Result<Json<ReviewStatusResponse>, (axum::http::StatusCode, String)> {
     let scope = resolve_workflow_scope(&state, run_id).await?;
     review_status(Json(ReviewRepoRequest { repo_ref: scope.repo_ref })).await
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewCumulativeDiffResponse {
+    pub ok: bool,
+    pub files: usize,
+    pub additions: u64,
+    pub deletions: u64,
+    pub from_ref: String,
+    pub to_ref: String,
+}
+
+async fn workflow_review_cumulative_diff(
+    State(state): State<AppState>,
+    Path(run_id): Path<uuid::Uuid>,
+) -> Result<Json<ReviewCumulativeDiffResponse>, (axum::http::StatusCode, String)> {
+    let scope = resolve_workflow_scope(&state, run_id).await?;
+    let repo = PathBuf::from(&scope.repo_ref);
+    let mut stats = git_cumulative_diff_stats(&repo).map_err(internal)?;
+    let status = git_status(&repo).map_err(internal)?;
+    let untracked_paths: Vec<String> = status
+        .files
+        .iter()
+        .filter(|file| file.untracked)
+        .map(|file| file.path.clone())
+        .collect();
+    for (path, counts) in git_untracked_line_stats(&repo, &untracked_paths) {
+        stats.insert(path, counts);
+    }
+    Ok(Json(ReviewCumulativeDiffResponse {
+        ok: true,
+        files: stats.len(),
+        additions: stats.values().map(|(added, _)| *added).sum(),
+        deletions: stats.values().map(|(_, removed)| *removed).sum(),
+        from_ref: "HEAD".to_string(),
+        to_ref: "WORKTREE".to_string(),
+    }))
 }
 
 async fn workflow_review_diff(

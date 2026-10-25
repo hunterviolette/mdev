@@ -91,8 +91,9 @@ export function StageInputAttachments(props: {
           }
         }}
         disabled={disabled}
-        minRows={minRows}
-        autosize
+        autosize={false}
+        rows={Math.max(minRows, 5)}
+        styles={{ input: { overflowY: 'auto', resize: 'none' } }}
       />
       <input
         ref={inputRef}

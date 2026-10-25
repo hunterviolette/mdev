@@ -298,7 +298,7 @@ function InferenceInputsView({ runId }: { runId: string }) {
     {error && <Text size="xs" c="red">{error}</Text>}
     <ScrollArea.Autosize mah={480} type="auto" offsetScrollbars>
       <Table striped highlightOnHover verticalSpacing="sm" miw={1000}>
-        <Table.Thead><Table.Tr><Table.Th>Time</Table.Th><Table.Th>Session</Table.Th><Table.Th>Stage</Table.Th><Table.Th>Origin</Table.Th><Table.Th>Source</Table.Th><Table.Th>Input text</Table.Th></Table.Tr></Table.Thead>
+        <Table.Thead><Table.Tr><Table.Th>Time</Table.Th><Table.Th>Session</Table.Th><Table.Th>Stage</Table.Th><Table.Th>Status</Table.Th><Table.Th>Origin</Table.Th><Table.Th>Source</Table.Th><Table.Th>Input text</Table.Th></Table.Tr></Table.Thead>
         <Table.Tbody>{rows.map(item => {
           const expanded = expandedInputs.includes(item.id);
           const content = expanded || item.content.length <= 450 ? item.content : `${item.content.slice(0, 450)}…`;
@@ -306,6 +306,7 @@ function InferenceInputsView({ runId }: { runId: string }) {
             <Table.Td style={{ verticalAlign: 'top', whiteSpace: 'nowrap' }}><Text size="xs">{new Date(item.created_at).toLocaleString()}</Text></Table.Td>
             <Table.Td style={{ verticalAlign: 'top' }}><Text size="xs" fw={600}>Session {item.session_id.slice(0, 12)}</Text><Text size="xs" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{item.session_id}</Text></Table.Td>
             <Table.Td style={{ verticalAlign: 'top' }}><Text size="xs">{item.stage_type}</Text><Text size="xs" c="dimmed">{item.step_id}</Text></Table.Td>
+            <Table.Td style={{ verticalAlign: 'top' }}><Badge size="xs" color={item.invocation_status === 'failed' ? 'red' : 'teal'} title={item.invocation_error || undefined}>{item.invocation_status === 'failed' ? 'Error' : item.invocation_status}</Badge>{item.invocation_error && <Text size="xs" c="red" style={{ overflowWrap: 'anywhere' }}>{item.invocation_error}</Text>}</Table.Td>
             <Table.Td style={{ verticalAlign: 'top' }}><Badge size="xs" variant="light" color={item.input_origin === 'user_custom' ? 'blue' : 'gray'}>{item.input_origin.replace(/_/g, ' ')}</Badge></Table.Td>
             <Table.Td style={{ verticalAlign: 'top' }}><Text size="xs">{item.label}</Text><Text size="xs" c="dimmed">{item.input_source}</Text></Table.Td>
             <Table.Td style={{ minWidth: 300, maxWidth: 650, verticalAlign: 'top' }}><Text size="xs" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{content}</Text>{item.content.length > 450 && <Button size="compact-xs" variant="subtle" onClick={() => setExpandedInputs(current => expanded ? current.filter(id => id !== item.id) : [...current, item.id])}>{expanded ? 'Show less' : 'Show full input'}</Button>}</Table.Td>

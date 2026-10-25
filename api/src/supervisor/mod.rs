@@ -61,7 +61,7 @@ pub fn available_actions(state: &WorkUnitActionState<'_>) -> Vec<&'static str> {
         actions.push("start_work_unit");
     }
 
-    if !processing && state.workflow_exists && !integrated {
+    if !processing && state.workflow_exists && !integrated && !integration {
         actions.push("regenerate_work_unit");
     }
 
@@ -2203,8 +2203,7 @@ async fn supervisor_work_unit_workflow_context(
     work_unit: &SupervisorWorkUnitRecord,
     template_id: Uuid,
 ) -> Result<Value> {
-    let workspace = repo_snapshot::workspace_for(&run.root_repo_path, run.id)?;
-    let mut context = supervisor_context(run, &workspace);
+    let mut context = supervisor_context(run);
     let obj = context
         .as_object_mut()
         .ok_or_else(|| anyhow!("supervisor workflow context must be an object"))?;
@@ -2316,6 +2315,8 @@ async fn after_supervisor_work_unit_materialized(
             run.integration_run_id = Some(workflow_run_id);
             run.integration_path = Some(workspace_path.to_string());
             run.final_patch_path = None;
+
+
         }
         SupervisorWorkPoolKind::Manual => {}
     }
@@ -2712,9 +2713,11 @@ pub async fn delete_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_i
 }
 
 pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String) -> Result<Value> {
-    ensure_action_allowed(state, id, &work_unit_id, "regenerate_work_unit").await?;
     let mut run = load_supervisor_run(state, id).await?;
     let work_unit = load_supervisor_work_unit_row(state, id, &work_unit_id).await?;
+    if work_unit.kind != SupervisorWorkPoolKind::Integration {
+        ensure_action_allowed(state, id, &work_unit_id, "regenerate_work_unit").await?;
+    }
 
     if matches!(work_unit.kind, SupervisorWorkPoolKind::Refine | SupervisorWorkPoolKind::Feature)
         && run.selected_planner_id.is_none()
@@ -2829,17 +2832,131 @@ pub async fn regenerate_supervisor_work_unit(state: &AppState, id: Uuid, work_un
     }))
 }
 
+async fn prepare_integration_work_unit(state: &AppState, run: &mut SupervisorRun, work_unit: &SupervisorWorkUnitRecord) -> Result<()> {
+    let existing_workflow = if let Some(workflow_run_id) = work_unit.workflow_run_id {
+        match engine::load_run(state, workflow_run_id).await {
+            Ok(existing) => {
+                if matches!(existing.status, RunStatus::Running | RunStatus::Queued) {
+                    return Err(anyhow!("integration workflow is already running"));
+                }
+                Some(existing)
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if work_unit.state == SupervisorWorkUnitState::Running && existing_workflow.is_some() {
+        return Err(anyhow!("integration work unit is already running"));
+    }
+
+    let current_tree = repo_snapshot::source_tree_oid(&run.root_repo_path)?;
+    let baseline_matches_source = match work_unit.workspace_path.as_deref() {
+        Some(path) => repo_snapshot::integration_baseline_matches(
+            &run.root_repo_path,
+            path.to_string_lossy().as_ref(),
+            &current_tree,
+        )?,
+        None => false,
+    };
+    let requires_regeneration = (work_unit.workflow_run_id.is_some()
+        || work_unit.workspace_path.is_some())
+        && (existing_workflow.is_none() || !baseline_matches_source);
+
+    if requires_regeneration {
+        tracing::info!(
+            supervisor_id = %run.id,
+            work_unit_id = %work_unit.id,
+            source_tree = %current_tree,
+            baseline_matches_source,
+            workflow_available = existing_workflow.is_some(),
+            "regenerating integration workflow"
+        );
+        regenerate_supervisor_work_unit(state, run.id, work_unit.id.clone()).await?;
+        *run = load_supervisor_run(state, run.id).await?;
+    } else if work_unit.workflow_run_id.is_some() {
+        if let Some(workspace_path) = work_unit.workspace_path.as_deref() {
+            repo_snapshot::reset_integration_workspace(
+                &run.root_repo_path,
+                run.id,
+                workspace_path.to_string_lossy().as_ref(),
+            )?;
+        }
+        tracing::info!(
+            supervisor_id = %run.id,
+            work_unit_id = %work_unit.id,
+            source_tree = %current_tree,
+            "reusing integration workflow with matching source tree"
+        );
+    }
+
+    run.final_patch_path = None;
+    run.merge_report = json!({});
+    run.validation_report = json!({});
+
+    sqlx::query(
+        r#"
+        UPDATE supervisor_work_units
+        SET context_json = json_remove(
+                CASE WHEN json_valid(context_json) THEN context_json ELSE '{}' END,
+                '$.applied_at',
+                '$.final_patch_ref',
+                '$.final_patch_text',
+                '$.final_patch_hash',
+                '$.final_patch_bytes',
+                '$.merge_report',
+                '$.validation_report',
+                '$.integration_apply_available'
+            ),
+            patch_id = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND supervisor_run_id = ?
+          AND kind = 'integration'
+          AND archived_at IS NULL
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&work_unit.id)
+    .bind(run.id.to_string())
+    .execute(&state.db)
+    .await?;
+
+    run.updated_at = Utc::now();
+    update_supervisor_run(state, run).await?;
+    Ok(())
+}
+
 pub async fn start_supervisor_work_unit(state: &AppState, id: Uuid, work_unit_id: String) -> Result<Value> {
     if work_unit_id.trim().is_empty() {
         return Err(anyhow!("work_unit_id is required"));
     }
 
     let mut run = load_supervisor_run(state, id).await?;
+    let canonical_integration_id = integration_work_unit_id(id);
+    let work_unit_id = if work_unit_id == canonical_integration_id || work_unit_id == "integration" {
+        ensure_supervisor_integration_work_unit(state, &run).await?;
+        canonical_integration_id
+    } else {
+        work_unit_id
+    };
     let work_unit = load_supervisor_work_unit_row(state, id, &work_unit_id).await?;
+
+    if work_unit.kind == SupervisorWorkPoolKind::Integration {
+        prepare_integration_work_unit(state, &mut run, &work_unit).await?;
+    }
+
+    let refreshed_work_unit = if work_unit.kind == SupervisorWorkPoolKind::Integration {
+        load_supervisor_work_unit_row(state, id, &work_unit_id).await?
+    } else {
+        work_unit.clone()
+    };
+
     let workflow_run_id = materialize_supervisor_work_unit(
         state,
         &mut run,
-        &work_unit,
+        &refreshed_work_unit,
     )
     .await?;
 
@@ -3593,14 +3710,11 @@ async fn default_refinement_workflow_template_id(state: &AppState) -> Result<Opt
 }
 
 
-fn supervisor_context(run: &SupervisorRun, workspace: &repo_snapshot::SupervisorWorkspace) -> Value {
+fn supervisor_context(run: &SupervisorRun) -> Value {
     json!({
         "supervisor_run_id": run.id,
         "strategy": run.strategy,
         "root_repo_path": run.root_repo_path,
-        "snapshot_path": workspace.snapshot,
-        "integration_path": workspace.integration,
-        "patches_path": workspace.patches,
         "input_source": "supervisor_work_unit"
     })
 }

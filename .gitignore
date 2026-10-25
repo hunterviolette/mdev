@@ -7,6 +7,7 @@ tmp/
 .mdev/
 launcher/src-tauri/gen/
 
+**.tsbuildinfo
 .env
 .env.local
 .env.*.local
