@@ -7,6 +7,7 @@ use crate::engine::runtime_tools::{
     TerminalCommandMode,
     TerminalCommandSpec,
     TerminalSequenceSpec,
+    TerminalSequenceStrategy,
     TerminalShell,
 };
 
@@ -50,7 +51,17 @@ pub async fn execute(
     }
 
     let mut sequence = resolve_compile_sequence(ctx, config)?;
-    let shared_environment = shared_dependency_environment(prior_results);
+    let repo_ref = ctx.local_state
+        .get("resources")
+        .and_then(|value| value.get("repo"))
+        .and_then(|value| value.get("repo_ref"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(ctx.repo_ref);
+    let mut shared_environment = shared_dependency_environment(prior_results);
+    if PathBuf::from(repo_ref).components().any(|component| component.as_os_str() == ".mdev") {
+        shared_environment.extend(super::shared_dependencies::build_cache_environment(&PathBuf::from(repo_ref))?);
+    }
 
     for command in &mut sequence.commands {
         for (key, value) in &shared_environment {
@@ -204,6 +215,15 @@ fn resolve_compile_sequence(
         }
     }
 
+    let strategy = config
+        .get("strategy")
+        .or_else(|| ctx.local_state.get("execution").and_then(|value| value.get("compile_checks")).and_then(|value| value.get("strategy")))
+        .or_else(|| ctx.step.execution.compile_checks.get("strategy"))
+        .or_else(|| ctx.local_state.get("capabilities").and_then(|value| value.get("compile_commands")).and_then(|value| value.get("strategy")))
+        .cloned()
+        .unwrap_or_else(|| json!("series"));
+    let strategy: TerminalSequenceStrategy = serde_json::from_value(strategy)
+        .context("invalid compile command execution strategy")?;
     let commands = resolve_legacy_compile_commands(
         config,
         ctx.local_state,
@@ -211,7 +231,9 @@ fn resolve_compile_sequence(
         ctx.step.execution_logic.clone(),
     );
 
-    terminal_sequence_from_value(commands)
+    let mut sequence = terminal_sequence_from_value(commands)?;
+    sequence.strategy = strategy;
+    Ok(sequence)
 }
 
 fn resolve_legacy_compile_commands(
@@ -310,6 +332,7 @@ fn terminal_sequence_from_value(commands: Value) -> Result<TerminalSequenceSpec>
         .collect::<Result<Vec<_>>>()?;
 
     Ok(TerminalSequenceSpec {
+        strategy: TerminalSequenceStrategy::Series,
         commands,
         stop_on_failure: true,
     })

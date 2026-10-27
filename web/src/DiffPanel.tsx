@@ -19,6 +19,7 @@ import {
   Tooltip,
 } from '@mantine/core';
 import { DiffCode, inspectUnifiedPatch } from './DiffCode';
+import { subscribeRuntimeEventBus } from './runtime_events';
 import { IconMinus, IconPlus, IconTrash } from '@tabler/icons-react';
 import {
   closeReviewDiffSession,
@@ -774,7 +775,8 @@ export function DiffPanel(props: DiffPanelProps) {
   async function refreshScopeFilePatches(
     nextState: DiffPanelState,
     _files: ReviewDiffManifestFileEntry[],
-    requestId: number
+    requestId: number,
+    invalidate = false
   ) {
     if (mode === 'commit') {
       await closeActiveDiffSession();
@@ -792,6 +794,11 @@ export function DiffPanel(props: DiffPanelProps) {
       setFilePatchBusyByPath({});
       setCollapsedByPath({});
       return;
+    }
+
+    if (invalidate) {
+      await closeActiveDiffSession();
+      setFilePatchByPath({});
     }
 
     const sessionKey = reviewDiffSessionKey(repoRef, nextState);
@@ -839,7 +846,7 @@ export function DiffPanel(props: DiffPanelProps) {
     const busy: Record<string, boolean> = {};
     for (const file of files) {
       collapsed[file.path] = false;
-      if (!filePatchByPath[file.path]) {
+      if (invalidate || !filePatchByPath[file.path]) {
         busy[file.path] = true;
       }
     }
@@ -854,7 +861,7 @@ export function DiffPanel(props: DiffPanelProps) {
     const lineCount = nextState.selected_path ? SELECTED_FILE_DIFF_WINDOW_LINE_COUNT : SCOPE_DIFF_WINDOW_LINE_COUNT;
     const patchEntries = await Promise.all(
       files.map(async (file) => {
-        if (filePatchByPath[file.path]) {
+        if (!invalidate && filePatchByPath[file.path]) {
           return [file.path, filePatchByPath[file.path]] as const;
         }
         try {
@@ -998,7 +1005,7 @@ export function DiffPanel(props: DiffPanelProps) {
     setFilePatchBusyByPath({});
   }
 
-  async function refreshDiff(nextState: DiffPanelState) {
+  async function refreshDiff(nextState: DiffPanelState, invalidate = false) {
     if (!repoRef.trim() || !viewerOpen) return;
 
     const requestId = ++refreshDiffRequestIdRef.current;
@@ -1039,7 +1046,7 @@ export function DiffPanel(props: DiffPanelProps) {
       if (refreshDiffRequestIdRef.current === requestId) {
         setDiffBusy(false);
       }
-      await refreshScopeFilePatches(nextState, [], requestId);
+      await refreshScopeFilePatches(nextState, [], requestId, invalidate);
       return;
     } catch (err) {
       if (refreshDiffRequestIdRef.current !== requestId) {
@@ -1052,6 +1059,24 @@ export function DiffPanel(props: DiffPanelProps) {
       }
     }
   }
+
+  async function refreshWorktree() {
+    if (commitMode) return;
+    await refreshStatus();
+    await refreshDiff(state, true);
+  }
+
+  useEffect(() => {
+    if (commitMode) return;
+    return subscribeRuntimeEventBus({
+      onChangesetApplied: (event) => {
+        const normalized = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+        if (normalized(event.repo_ref) === normalized(repoRef)) {
+          void refreshWorktree();
+        }
+      },
+    });
+  }, [repoRef, commitMode, viewerOpen, state]);
 
   async function patchState(patch: Partial<DiffPanelState>) {
     const next = {
@@ -1241,7 +1266,7 @@ export function DiffPanel(props: DiffPanelProps) {
         <Card withBorder p={6} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <Group justify="space-between" align="center" mb={4} wrap="nowrap">
             <Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-              <Button size="xs" variant="default" onClick={() => commitMode ? void refreshDiff(state) : void refreshStatus()} loading={commitMode ? diffBusy : statusBusy}>Refresh</Button>
+              <Button size="xs" variant="default" onClick={() => commitMode ? void refreshDiff(state) : void refreshWorktree()} loading={commitMode ? diffBusy : statusBusy}>Refresh</Button>
               <Button size="xs" variant="default" onClick={() => setSidebarHidden((value) => !value)}>
                 {showSidebar ? 'Hide diff browser' : 'Show diff browser'}
               </Button>

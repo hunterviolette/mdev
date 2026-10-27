@@ -126,6 +126,10 @@ pub trait Stage: Send + Sync {
         &[]
     }
 
+    fn pause_on_capability_failure(&self, _capability: &str, _ok: bool) -> bool {
+        false
+    }
+
     fn prepare_state(
         &self,
         context: StagePrepareContext<'_>,
@@ -136,6 +140,14 @@ pub trait Stage: Send + Sync {
         &self,
         context: StagePlanContext<'_>,
     ) -> Result<Vec<StageExecutionNode>>;
+
+    fn resolve_transition(
+        &self,
+        _automatic_execution: bool,
+        transition: StageTransition,
+    ) -> StageTransition {
+        transition
+    }
 
     fn lifecycle_hook(&self) -> Box<dyn StageLifecycleHook> {
         Box::new(NoopStageLifecycleHook)
@@ -150,6 +162,14 @@ fn stage_for_step(step: &WorkflowStepDefinition) -> &'static dyn Stage {
         .copied()
         .or_else(|| registry.get("design").copied())
         .expect("design stage must be registered")
+}
+
+pub(crate) fn stage_requires_pause_after_capability(
+    step: &WorkflowStepDefinition,
+    capability: &str,
+    ok: bool,
+) -> bool {
+    stage_for_step(step).pause_on_capability_failure(capability, ok)
 }
 
 pub(crate) fn automation_policy_keys_for_stage_type(stage_type: &str) -> &'static [&'static str] {
@@ -720,6 +740,23 @@ pub async fn execute_stage(
             _ => {}
         }
     }
+
+    if let Some(failed) = capability_results.iter().find(|item| {
+        let capability = item.get("key").and_then(Value::as_str).unwrap_or("");
+        let ok = item.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        stage_requires_pause_after_capability(step, capability, ok)
+    }) {
+        let capability = failed.get("key").and_then(Value::as_str).unwrap_or("unknown");
+        branch = StageBranch {
+            status: StageStatus::Paused,
+            transition: StageTransition::Stay,
+            message: format!("Capability '{}' failed. Stage paused for operator intervention.", capability),
+            patch: None,
+        };
+    }
+
+    branch.transition = stage_for_step(step)
+        .resolve_transition(automatic_execution, branch.transition);
 
     if automation::pause_message(&after_decisions).is_some() {
         super::runtime::request_run_pause_after_stage(run)?;

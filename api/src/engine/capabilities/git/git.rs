@@ -254,6 +254,20 @@ pub fn git_diff_stats(repo: &Path, staged: bool) -> Result<HashMap<String, (u64,
     Ok(stats)
 }
 
+pub fn git_cumulative_diff_stats(repo: &Path) -> Result<HashMap<String, (u64, u64)>> {
+    ensure_git_repo(repo)?;
+    let out = run_git(repo, &["diff", "HEAD", "--numstat", "--no-ext-diff"])?;
+    let mut stats = HashMap::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        if let Some((path, additions, deletions)) = parse_numstat_line(line) {
+            let entry = stats.entry(path).or_insert((0u64, 0u64));
+            entry.0 = entry.0.saturating_add(additions);
+            entry.1 = entry.1.saturating_add(deletions);
+        }
+    }
+    Ok(stats)
+}
+
 pub fn git_untracked_line_stats(repo: &Path, paths: &[String]) -> HashMap<String, (u64, u64)> {
     let mut stats = HashMap::new();
 

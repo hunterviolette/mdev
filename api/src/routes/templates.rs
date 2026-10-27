@@ -1,7 +1,9 @@
 use axum::{extract::{Path, State}, routing::get, Json, Router};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::{
@@ -14,6 +16,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/workflow-templates", get(list_templates).post(create_template))
+        .route("/api/workflow-templates/import", axum::routing::post(import_templates))
         .route("/api/workflow-templates/:template_id", axum::routing::delete(delete_template))
         .route("/api/workflow-builder-contract", get(get_workflow_builder_contract))
 }
@@ -268,6 +271,183 @@ async fn create_template(
         "template": &template,
     }));
     Ok(Json(template))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PortableTemplate {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    repo_ref: String,
+    definition: WorkflowTemplateDefinition,
+}
+
+#[derive(Debug, Deserialize)]
+struct TemplateImportRequest {
+    format: String,
+    version: u32,
+    templates: Vec<PortableTemplate>,
+    #[serde(default)]
+    selected_indices: Vec<usize>,
+    conflict_strategy: TemplateConflictStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TemplateConflictStrategy {
+    Skip,
+    Overwrite,
+    Rename,
+}
+
+#[derive(Debug, Serialize)]
+struct TemplateImportResponse {
+    imported: usize,
+    updated: usize,
+    skipped: usize,
+    renamed: usize,
+    templates: Vec<WorkflowTemplate>,
+}
+
+async fn import_templates(
+    State(state): State<AppState>,
+    Json(req): Json<TemplateImportRequest>,
+) -> Result<Json<TemplateImportResponse>, (axum::http::StatusCode, String)> {
+    let bad_request = |message: String| (axum::http::StatusCode::BAD_REQUEST, message);
+    if req.format != "mdev-workflow-templates" || req.version != 1 {
+        return Err(bad_request("Unsupported template bundle format or version".to_string()));
+    }
+    if req.templates.len() > 1000 {
+        return Err(bad_request("Template bundle exceeds the 1000-template limit".to_string()));
+    }
+    let mut selected = HashSet::new();
+    for index in &req.selected_indices {
+        if *index >= req.templates.len() || !selected.insert(*index) {
+            return Err(bad_request("Invalid or duplicate selected template index".to_string()));
+        }
+    }
+    let mut prepared = Vec::new();
+    for (index, template) in req.templates.into_iter().enumerate() {
+        if !selected.contains(&index) {
+            continue;
+        }
+        let name = template.name.trim().to_string();
+        if name.is_empty() || name.len() > 255 {
+            return Err(bad_request(format!("Invalid template name at index {index}")));
+        }
+        if template.definition.steps.is_empty() {
+            return Err(bad_request(format!("Template '{name}' has no workflow steps")));
+        }
+        let mut definition = template.definition;
+        normalize_shared_dependencies(&mut definition.globals);
+        normalize_qa_environment(
+            &mut definition.globals,
+            definition.steps.iter().any(|step| step.step_type.trim().eq_ignore_ascii_case("qa")),
+        );
+        let definition_json = serde_json::to_string_pretty(&definition).map_err(internal)?;
+        prepared.push((name, template.description, normalize_repo_ref(&template.repo_ref), definition, definition_json));
+    }
+    ensure_default_refinement_template(&state).await?;
+    let mut tx = state.db.begin().await.map_err(internal)?;
+    let mut response = TemplateImportResponse {
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        renamed: 0,
+        templates: Vec::new(),
+    };
+    let mut events = Vec::new();
+    for (original_name, description, repo_ref, definition, definition_json) in prepared {
+        if original_name == DEFAULT_REFINEMENT_TEMPLATE_NAME {
+            response.skipped += 1;
+            continue;
+        }
+        let existing = sqlx::query("SELECT id, created_at FROM workflow_templates WHERE name = ?")
+            .bind(&original_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?;
+        let mut name = original_name;
+        let mut existing_to_update = None;
+        if let Some(row) = existing {
+            match req.conflict_strategy {
+                TemplateConflictStrategy::Skip => {
+                    response.skipped += 1;
+                    continue;
+                }
+                TemplateConflictStrategy::Overwrite => {
+                    existing_to_update = Some((row.get::<String, _>("id"), row.get::<String, _>("created_at")));
+                }
+                TemplateConflictStrategy::Rename => {
+                    let base = name.clone();
+                    let mut suffix = 1usize;
+                    loop {
+                        name = format!("{base} (imported {suffix})");
+                        let taken: Option<String> = sqlx::query_scalar("SELECT id FROM workflow_templates WHERE name = ?")
+                            .bind(&name)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(internal)?;
+                        if taken.is_none() {
+                            break;
+                        }
+                        suffix += 1;
+                    }
+                    response.renamed += 1;
+                }
+            }
+        }
+        let now = Utc::now();
+        let (id, created_at, event_type) = if let Some((id, created_at)) = existing_to_update {
+            sqlx::query("UPDATE workflow_templates SET description = ?, repo_ref = ?, definition_json = ?, updated_at = ? WHERE id = ?")
+                .bind(&description)
+                .bind(&repo_ref)
+                .bind(&definition_json)
+                .bind(now.to_rfc3339())
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+            response.updated += 1;
+            (parse_uuid(id)?, parse_ts(created_at)?, "template_updated")
+        } else {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO workflow_templates (id, name, description, repo_ref, definition_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(id.to_string())
+                .bind(&name)
+                .bind(&description)
+                .bind(&repo_ref)
+                .bind(&definition_json)
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+            response.imported += 1;
+            (id, now, "template_created")
+        };
+        let template = WorkflowTemplate {
+            id,
+            name,
+            description,
+            repo_ref,
+            definition,
+            created_at,
+            updated_at: now,
+        };
+        events.push(json!({
+            "event_type": event_type,
+            "template_id": id,
+            "template": &template,
+        }));
+        response.templates.push(template);
+    }
+    tx.commit().await.map_err(internal)?;
+    for event in events {
+        state.publish_template_event(event);
+    }
+    Ok(Json(response))
 }
 
 async fn delete_template(

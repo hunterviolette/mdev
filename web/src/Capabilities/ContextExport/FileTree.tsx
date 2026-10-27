@@ -167,9 +167,19 @@ export function FileTree(props: FileTreeProps) {
             position="right"
           >
             <Group
+              className="mdev-context-export-tree-row"
               gap={5}
               wrap="nowrap"
               px={6}
+              role={onClick ? 'button' : undefined}
+              tabIndex={onClick ? 0 : undefined}
+              aria-label={`${entry.path}, ${state}`}
+              onKeyDown={(event) => {
+                if (onClick && (event.key === 'Enter' || event.key === ' ')) {
+                  event.preventDefault();
+                  onClick(entry.path);
+                }
+              }}
               style={{
                 minHeight: 28,
                 marginLeft: depth * 16,
@@ -201,8 +211,10 @@ export function FileTree(props: FileTreeProps) {
               />
               {isDirectory ? (
                 <ActionIcon
+                  className="mdev-context-export-expand"
                   variant="transparent"
                   size="sm"
+                  aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${entry.path}`}
                   onClick={(event) => {
                     event.stopPropagation();
                     toggleExpanded(entry.path);
@@ -251,9 +263,9 @@ export function FileTree(props: FileTreeProps) {
   };
 
   return (
-    <Stack gap="xs" h="100%" style={{ minHeight: 0, flex: 1 }}>
+    <Stack className="mdev-context-export-file-tree" gap="xs" h="100%" style={{ minHeight: 0, flex: 1, minWidth: 0 }}>
       {props.searchable !== false || props.showExpandCollapse !== false ? (
-        <Group gap="xs" wrap="nowrap">
+        <Group className="mdev-context-export-tree-toolbar" gap="xs" wrap="wrap">
           {props.searchable !== false ? (
             <TextInput
               value={filter}
@@ -261,7 +273,7 @@ export function FileTree(props: FileTreeProps) {
               placeholder="Filter paths"
               leftSection={<IconSearch size={14} />}
               size="xs"
-              style={{ flex: 1 }}
+              style={{ flex: '1 1 160px', minWidth: 0 }}
             />
           ) : null}
           {props.showExpandCollapse !== false ? (
@@ -289,9 +301,11 @@ export function FileTree(props: FileTreeProps) {
         </Group>
       ) : null}
       <ScrollArea
+        className="mdev-context-export-tree-scroll"
         style={{
           flex: 1,
           minHeight: 0,
+          minWidth: 0,
           border: '1px solid var(--mantine-color-default-border)',
           borderRadius: 6,
           background: 'var(--mantine-color-body)'

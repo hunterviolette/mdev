@@ -1,179 +1,175 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{fs, path::{Path, PathBuf}, process::Command};
 
 use anyhow::{anyhow, Context, Result};
-use crate::engine::capabilities::context_export::is_gitignored;
 use uuid::Uuid;
-
 
 #[derive(Debug, Clone)]
 pub struct SupervisorWorkspace {
     pub root: PathBuf,
-    pub snapshot: PathBuf,
-    pub integration: PathBuf,
-
-    pub patches: PathBuf,
-
 }
 
-pub fn workspace_for(root_repo_path: &str, supervisor_id: Uuid) -> Result<SupervisorWorkspace> {
-    let root_repo = PathBuf::from(root_repo_path);
-    let root = root_repo.join(".mdev").join(supervisor_id.to_string());
+pub fn workspace_for(root_repo_path: &str) -> Result<SupervisorWorkspace> {
     Ok(SupervisorWorkspace {
-        snapshot: root.join("snapshot"),
-        integration: root.join("integration"),
-
-        patches: root.join("patches"),
-
-        root,
+        root: PathBuf::from(root_repo_path).join(".mdev").join("supervisors").join("shards"),
     })
 }
 
+fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.output().with_context(|| format!("failed to execute git in {}", root.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
+fn source_tree(root: &Path) -> Result<String> {
+    let index = std::env::temp_dir().join(format!("mdev-snapshot-{}.index", Uuid::new_v4()));
+    let result = (|| -> Result<String> {
+        git(root, &["read-tree", "HEAD"], Some(&index))?;
+        git(root, &["add", "-A"], Some(&index))?;
+        git(root, &["write-tree"], Some(&index))
+    })();
+    let _ = fs::remove_file(&index);
+    result
+}
 
+pub fn source_tree_oid(root_repo_path: &str) -> Result<String> {
+    source_tree(Path::new(root_repo_path))
+}
 
+fn snapshot_commit(root: &Path) -> Result<String> {
+    let tree = source_tree(root)?;
+    git(root, &[
+        "-c", "user.name=mdev supervisor",
+        "-c", "user.email=mdev-supervisor@example.invalid",
+        "commit-tree", &tree, "-m", "supervisor source snapshot",
+    ], None)
+}
 
 pub fn materialize_work_unit_workspace(
     root_repo_path: &str,
     supervisor_id: Uuid,
     workspace_id: Uuid,
 ) -> Result<PathBuf> {
-    let workspace = workspace_for(root_repo_path, supervisor_id)?;
+    let workspace = workspace_for(root_repo_path)?;
     fs::create_dir_all(&workspace.root)?;
     let workspace_path = workspace.root.join(workspace_id.to_string());
-    copy_repo_tree(
-        Path::new(root_repo_path),
-        &workspace_path,
-        Some(&workspace.root),
-    )?;
-    tracing::info!(
-        supervisor_id = %supervisor_id,
-        root_repo_path = %root_repo_path,
-        workspace_id = %workspace_id,
-        workspace_path = %workspace_path.display(),
-        "materialized supervisor work unit workspace from current worktree"
-    );
+    if workspace_path.exists() {
+        return Err(anyhow!("supervisor workspace already exists: {}", workspace_path.display()));
+    }
+    let root = Path::new(root_repo_path);
+    let commit = snapshot_commit(root)?;
+    git(root, &["worktree", "add", "--detach", "--", workspace_path.to_string_lossy().as_ref(), &commit], None)?;
+    tracing::info!(supervisor_id = %supervisor_id, workspace_id = %workspace_id, snapshot_commit = %commit, workspace_path = %workspace_path.display(), "materialized supervisor Git worktree");
     Ok(workspace_path)
-}
-
-pub fn delete_supervisor_workspace_path(root_repo_path: &str, supervisor_id: Uuid, workspace_path: &str) -> Result<bool> {
-    let workspace_path = workspace_path.trim();
-    if workspace_path.is_empty() {
-        return Ok(false);
-    }
-
-    let workspace = workspace_for(root_repo_path, supervisor_id)?;
-    let candidate = PathBuf::from(workspace_path);
-    let root_repo = fs::canonicalize(root_repo_path)
-        .with_context(|| format!("failed to canonicalize root repo {}", root_repo_path))?;
-    let supervisor_root = canonicalize_existing_or_parent(&workspace.root)?;
-    let candidate_canonical = canonicalize_existing_or_parent(&candidate)?;
-
-    if candidate_canonical == root_repo {
-        return Err(anyhow!("refusing to delete root repo as supervisor workspace"));
-    }
-    if candidate_canonical == supervisor_root {
-        return Err(anyhow!("refusing to delete supervisor workspace root"));
-    }
-    if !candidate_canonical.starts_with(&supervisor_root) {
-        return Err(anyhow!("refusing to delete path outside supervisor-owned workspaces: {}", candidate.display()));
-    }
-
-    if candidate.exists() {
-        fs::remove_dir_all(&candidate).or_else(|_| fs::remove_file(&candidate))
-            .with_context(|| format!("failed to delete supervisor workspace {}", candidate.display()))?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return fs::canonicalize(path).with_context(|| format!("failed to canonicalize {}", path.display()));
     }
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let parent = path.parent().ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     let parent = canonicalize_existing_or_parent(parent)?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("path has no final component: {}", path.display()))?;
-
-    Ok(parent.join(file_name))
+    let name = path.file_name().ok_or_else(|| anyhow!("path has no final component: {}", path.display()))?;
+    Ok(parent.join(name))
 }
 
-
-
-
-
-fn copy_repo_tree(from: &Path, to: &Path, skip_root: Option<&Path>) -> Result<()> {
-    copy_tree_inner(from, to, Some(from), skip_root)
-}
-
-fn copy_tree_inner(from: &Path, to: &Path, gitignore_root: Option<&Path>, skip_root: Option<&Path>) -> Result<()> {
-    if !from.is_dir() {
-        return Err(anyhow!("{} is not a directory", from.display()));
+fn validate_workspace(root_repo_path: &str, workspace_path: &str) -> Result<PathBuf> {
+    let workspace = workspace_for(root_repo_path)?;
+    let root = fs::canonicalize(root_repo_path)?;
+    let shards_root = canonicalize_existing_or_parent(&workspace.root)?;
+    let candidate = canonicalize_existing_or_parent(Path::new(workspace_path))?;
+    if candidate == root || candidate == shards_root || candidate.parent() != Some(shards_root.as_path()) {
+        return Err(anyhow!("invalid supervisor workspace path: {}", workspace_path));
     }
-    if to.exists() {
-        fs::remove_dir_all(to).with_context(|| format!("failed to remove {}", to.display()))?;
-    }
-    fs::create_dir_all(to).with_context(|| format!("failed to create {}", to.display()))?;
-    tracing::info!(from = %from.display(), to = %to.display(), gitignore_filter = gitignore_root.is_some(), "copying supervisor tree");
-    copy_dir_contents(from, to, gitignore_root, skip_root)?;
-    tracing::info!(from = %from.display(), to = %to.display(), "copied supervisor tree");
-    Ok(())
+    let name = candidate.file_name().and_then(|value| value.to_str()).ok_or_else(|| anyhow!("missing workspace identifier"))?;
+    Uuid::parse_str(name)?;
+    Ok(candidate)
 }
 
-fn copy_dir_contents(from: &Path, to: &Path, gitignore_root: Option<&Path>, skip_root: Option<&Path>) -> Result<()> {
-    for entry in fs::read_dir(from).with_context(|| format!("failed to read {}", from.display()))? {
+fn detach_workspace_links(directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        let src = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str == ".git" {
-            tracing::debug!(path = %src.display(), "skipping git metadata during supervisor tree copy");
-            continue;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let mut is_link = metadata.file_type().is_symlink();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            is_link |= metadata.file_attributes() & 0x400 != 0;
         }
-
-        if name_str == ".mdev" {
-            tracing::debug!(path = %src.display(), "skipping mdev metadata during supervisor tree copy");
-            continue;
-        }
-
-        if skip_root.is_some_and(|skip| path_is_or_under(&src, skip)) {
-            tracing::info!(path = %src.display(), "skipping active supervisor workspace during snapshot copy");
-            continue;
-        }
-
-        if let Some(repo) = gitignore_root {
-            let rel = src
-                .strip_prefix(repo)
-                .unwrap_or(&src)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_gitignored(repo, &rel)? {
-                tracing::debug!(path = %rel, "skipping gitignored path during supervisor snapshot copy");
-                continue;
+        if is_link {
+            if fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(metadata.is_dir()) {
+                fs::remove_dir(&path)?;
+            } else {
+                fs::remove_file(&path)?;
             }
-        }
-
-        let dst = to.join(&name);
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            fs::create_dir_all(&dst)?;
-            copy_dir_contents(&src, &dst, gitignore_root, skip_root)?;
-        } else if meta.is_file() {
-            fs::copy(&src, &dst).with_context(|| format!("failed to copy {} to {}", src.display(), dst.display()))?;
+        } else if metadata.is_dir() {
+            detach_workspace_links(&path)?;
         }
     }
     Ok(())
 }
 
-fn path_is_or_under(path: &Path, root: &Path) -> bool {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    path == root || path.starts_with(root)
+pub fn delete_supervisor_workspace_path(root_repo_path: &str, _supervisor_id: Uuid, workspace_path: &str) -> Result<bool> {
+    if workspace_path.trim().is_empty() {
+        return Ok(false);
+    }
+    let candidate = validate_workspace(root_repo_path, workspace_path)?;
+    if !candidate.exists() {
+        return Ok(false);
+    }
+    if candidate.join(".git").is_file() {
+        let root = Path::new(root_repo_path);
+        let common = git(&candidate, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None)?;
+        let expected = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None)?;
+        if fs::canonicalize(common)? != fs::canonicalize(expected)? {
+            return Err(anyhow!("workspace is attached to another Git repository"));
+        }
+        detach_workspace_links(&candidate)?;
+        fs::remove_dir_all(&candidate)?;
+        git(root, &["worktree", "prune", "--expire", "now"], None)?;
+    } else if candidate.join(".git").is_dir() {
+        let repository_root = git(&candidate, &["rev-parse", "--show-toplevel"], None)?;
+        if fs::canonicalize(repository_root)? != candidate {
+            return Err(anyhow!("legacy supervisor workspace is not its own Git root"));
+        }
+        detach_workspace_links(&candidate)?;
+        fs::remove_dir_all(&candidate)?;
+    } else {
+        detach_workspace_links(&candidate)?;
+        fs::remove_dir_all(&candidate)?;
+        git(Path::new(root_repo_path), &["worktree", "prune", "--expire", "now"], None)?;
+    }
+    Ok(true)
 }
 
+pub fn integration_baseline_matches(root_repo_path: &str, workspace_path: &str, source_oid: &str) -> Result<bool> {
+    let candidate = validate_workspace(root_repo_path, workspace_path)?;
+    if !candidate.join(".git").is_file() {
+        return Ok(false);
+    }
+    let root = Path::new(root_repo_path);
+    let common = git(&candidate, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None)?;
+    let expected = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"], None)?;
+    if fs::canonicalize(common)? != fs::canonicalize(expected)? {
+        return Ok(false);
+    }
+    Ok(git(&candidate, &["rev-parse", "HEAD^{tree}"], None)? == source_oid)
+}
+
+pub fn reset_integration_workspace(root_repo_path: &str, supervisor_id: Uuid, workspace_path: &str) -> Result<()> {
+    let candidate = validate_workspace(root_repo_path, workspace_path)?;
+    if !candidate.join(".git").is_file() {
+        return Err(anyhow!("integration workspace is not a linked Git worktree"));
+    }
+    git(&candidate, &["reset", "--hard", "HEAD"], None)?;
+    git(&candidate, &["clean", "-fd", "--", "."], None)?;
+    tracing::info!(supervisor_id = %supervisor_id, workspace_path = %candidate.display(), "restored integration baseline");
+    Ok(())
+}

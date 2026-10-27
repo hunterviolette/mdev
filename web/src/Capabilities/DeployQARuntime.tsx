@@ -53,8 +53,14 @@ function serviceUrl(
 ): string | null {
   if (!process || !ACTIVE_STATUSES.has(process.status)) return null;
 
-  const port =
-    process.environment?.SERVICE_PORT
+  const publicUrl = process.environment?.MDEV_QA_PUBLIC_URL
+    ?? process.environment?.SERVICE_PUBLIC_URL;
+
+  if (typeof publicUrl === 'string' && /^https?:\/\//.test(publicUrl.trim())) {
+    return publicUrl.trim();
+  }
+
+  const port = process.environment?.SERVICE_PORT
     ?? process.environment?.MDEV_QA_PORT
     ?? process.environment?.PORT;
 

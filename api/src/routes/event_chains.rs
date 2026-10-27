@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    engine::{load_run, load_template_definition},
+    engine::{load_run, load_template_definition, capabilities::changeset},
     models::{SupervisorEventStreamItem, WorkflowEventStreamItem},
 };
 
@@ -1066,6 +1066,7 @@ async fn stream_runtime_events(
     let mut workflow_live_rx = state.subscribe_workflow_events();
     let mut supervisor_live_rx = state.subscribe_supervisor_events();
     let mut template_live_rx = state.subscribe_template_events();
+    let mut changeset_live_rx = changeset::subscribe_changeset_events();
     let mut last_workflow_sequence_by_run_id = HashMap::<String, i64>::new();
     let mut last_supervisor_sequence_by_id = HashMap::<String, i64>::new();
 
@@ -1081,6 +1082,19 @@ async fn stream_runtime_events(
 
         loop {
             tokio::select! {
+                changeset_message = changeset_live_rx.recv() => match changeset_message {
+                    Ok(item) => {
+                        let allowed = match item.get("run_id").and_then(Value::as_str) {
+                            Some(run_id) => runtime_event_allowed(&state_for_task, &query, run_id).await.unwrap_or(false),
+                            None => false,
+                        };
+                        if allowed && tx.send(Ok(Event::default().event("changeset_applied").data(item.to_string()))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                },
                 workflow_message = workflow_live_rx.recv() => match workflow_message {
                     Ok(item) => {
                         let last_sequence = last_workflow_sequence_by_run_id

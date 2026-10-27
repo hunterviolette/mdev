@@ -10,6 +10,7 @@ import {
   Divider,
   Group,
   JsonInput,
+  HoverCard,
   Loader,
   Modal,
   MultiSelect,
@@ -31,6 +32,7 @@ import { createPlanner, deletePlanner as deletePlannerApi, listPlanners, type Pl
 import { createSupervisorRun, deleteSupervisorRun, getSupervisorProjection, getPendingSupervisorActions, getSupervisorActionStateVersion, getSupervisorQueue, getWorkflowEventHistory, listSupervisorRuns, openSupervisorHydrationStream, runSupervisorAction, subscribeSupervisorActionState, type SupervisorProjectionResponse, type SupervisorProjection, type SupervisorWorkUnitProjection, type PendingSupervisorAction, type SupervisorListItem, type SupervisorQueuedFeature, type SupervisorQueueProjection, type WorkflowEventHistoryItem, type WorkflowEventHistoryQuery } from './supervisor_api';
 import { executionTone as tone, runtimeEventExecutionStatus, subscribeRuntimeEventBus } from './runtime_events';
 import { AppHeader, AppHeaderAction, AppSurface, type AppHeaderView } from './AppHeader';
+import { SupervisorImpactPanel } from './SupervisorImpactPanel';
 
 type SupervisorPanelProps = {
   navigate?: (path: string) => void;
@@ -1319,10 +1321,10 @@ function WorkflowProjectionCard(props: {
                   ) : null}
                   {workflowCanPause(unit) ? (
                     <Button size="compact-xs" variant="default" loading={pendingAction?.action === 'pause_work_unit' || pendingAction?.action === 'cancel'} disabled={actionPending} onClick={() => void runWorkflowAction(workflowType(unit) === 'integration' ? 'cancel' : 'pause_work_unit')}>Pause</Button>
-                  ) : workflowCanRun(unit) ? (
+                  ) : workflowType(unit) !== 'integration' && workflowCanRun(unit) ? (
                     <Button size="compact-xs" variant="default" loading={pendingAction?.action === 'start_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('start_work_unit')}>Run</Button>
                   ) : null}
-                  {workflowCanRegenerate(unit) ? (
+                  {workflowType(unit) !== 'integration' && workflowCanRegenerate(unit) ? (
                     <Button size="compact-xs" color="yellow" variant="outline" loading={pendingAction?.action === 'regenerate_work_unit'} disabled={actionPending} onClick={() => void runWorkflowAction('regenerate_work_unit')}>Regenerate</Button>
                   ) : null}
                   {workflowCanStageToIntegration(unit) ? (
@@ -1589,13 +1591,105 @@ function integrationReadinessModel(supervisor: SupervisorProjection) {
   };
 }
 
+function IntegrationReadinessSummary({ model }: { model: ReturnType<typeof integrationReadinessModel> }) {
+  return (
+    <Group gap="xs" wrap="wrap" aria-label="Integration input summary">
+      <Badge color={model.relevantTotal > 0 && model.readyTotal === model.relevantTotal ? 'green' : 'yellow'}>
+        {model.readyTotal}/{model.relevantTotal} ready
+      </Badge>
+      <Badge color="gray" variant="outline">Skipped {model.skippedTotal}</Badge>
+      <Badge color="cyan" variant="light">Features {model.features.length}</Badge>
+      <Badge color="violet" variant="light">Staged manual {model.manualStaged.length}</Badge>
+      <Badge color="gray" variant="outline">Unstaged manual {model.manualUnstaged.length}</Badge>
+    </Group>
+  );
+}
+
+function IntegrationReadinessProgress({ model }: { model: ReturnType<typeof integrationReadinessModel> }) {
+  const units = [...model.stagedFeatures, ...model.manualStaged];
+  const total = units.length;
+  const ready = units.filter((unit) => !integrationInputIsSkipped(unit) && integrationInputIsReady(unit)).length;
+  const blocked = units.filter((unit) => !integrationInputIsSkipped(unit) && !integrationInputIsReady(unit) && ['blocked', 'failed'].includes(normalize(unit.state))).length;
+  const pending = units.filter((unit) => !integrationInputIsSkipped(unit) && !integrationInputIsReady(unit) && !['blocked', 'failed'].includes(normalize(unit.state))).length;
+  const skipped = units.filter(integrationInputIsSkipped).length;
+  const segments = [
+    { count: ready, color: 'var(--mantine-color-green-6)' },
+    { count: pending, color: 'var(--mantine-color-yellow-6)' },
+    { count: blocked, color: 'var(--mantine-color-red-6)' },
+    { count: skipped, color: 'var(--mantine-color-gray-6)' },
+  ];
+
+  return (
+    <HoverCard width={380} position="bottom" withArrow shadow="lg" openDelay={150} closeDelay={150} withinPortal>
+      <HoverCard.Target>
+        <Box
+          role="img"
+          aria-label={`${ready} ready, ${pending} pending, ${blocked} blocked, ${skipped} skipped out of ${total} integration inputs`}
+          w="100%"
+          h={10}
+          style={{ display: 'flex', borderRadius: 999, overflow: 'hidden', background: 'var(--mantine-color-dark-5)', cursor: 'help' }}
+        >
+          {segments.filter((segment) => segment.count > 0).map((segment, index) => (
+            <Box key={index} h="100%" style={{ flex: `${segment.count} 1 0`, background: segment.color, minWidth: 0 }} />
+          ))}
+        </Box>
+      </HoverCard.Target>
+      <HoverCard.Dropdown style={{ maxWidth: 'calc(100vw - 24px)', maxHeight: 'min(65dvh, 560px)', overflowY: 'auto' }}>
+        <Stack gap="xs">
+          <Group justify="space-between" gap="xs" wrap="wrap">
+            <Text size="sm" fw={800}>Integration input snapshot</Text>
+            <Text size="xs" c="dimmed">{total} total</Text>
+          </Group>
+          <Group gap={5} wrap="wrap">
+            <Badge size="xs" color="green">{ready} ready</Badge>
+            {pending > 0 && <Badge size="xs" color="yellow">{pending} pending</Badge>}
+            {blocked > 0 && <Badge size="xs" color="red">{blocked} blocked</Badge>}
+            <Badge size="xs" color="gray">{skipped} skipped</Badge>
+          </Group>
+          <Divider />
+          {units.map((unit) => {
+            const isSkipped = integrationInputIsSkipped(unit);
+            const isReady = !isSkipped && integrationInputIsReady(unit);
+            const isBlocked = !isSkipped && !isReady && ['blocked', 'failed'].includes(normalize(unit.state));
+            const status = isSkipped ? 'Skipped' : isReady ? 'Ready' : isBlocked ? 'Blocked' : 'Pending';
+            const statusColor = isSkipped ? 'gray' : isReady ? 'green' : isBlocked ? 'red' : 'yellow';
+            return (
+              <Box key={unit.id} py={5} style={{ borderBottom: '1px solid var(--mantine-color-dark-4)' }}>
+                <Group justify="space-between" align="flex-start" gap="xs" wrap="nowrap">
+                  <Text size="xs" fw={700} style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>{unit.title}</Text>
+                  <Badge size="xs" color={statusColor} variant={isSkipped ? 'outline' : 'light'}>{status}</Badge>
+                </Group>
+                <Group gap="xs" mt={5} wrap="wrap">
+                  <Badge size="xs" color={unit.integration_include_staged ? 'blue' : 'gray'} variant="light">
+                    Staged: {unit.has_staged_changes ? unit.integration_include_staged && !isSkipped ? 'Included' : 'Excluded' : 'None'}
+                  </Badge>
+                  <Badge size="xs" color={unit.integration_include_unstaged ? 'violet' : 'gray'} variant="light">
+                    Unstaged: {unit.has_unstaged_changes ? unit.integration_include_unstaged && !isSkipped ? 'Included' : 'Excluded' : 'None'}
+                  </Badge>
+                </Group>
+              </Box>
+            );
+          })}
+          {total === 0 && <Text size="xs" c="dimmed">No integration inputs are selected.</Text>}
+          <Text size="xs" c="dimmed">Ready percentage excludes skipped inputs. The bar includes all selected and skipped inputs.</Text>
+        </Stack>
+      </HoverCard.Dropdown>
+    </HoverCard>
+  );
+}
+
 function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onActionComplete?: () => void; expanded?: boolean }) {
   const [opened, setOpened] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
   const pendingActions = usePendingSupervisorActions(props.supervisor.id);
   const model = integrationReadinessModel(props.supervisor);
-  const readyWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.readyTotal / model.relevantTotal) * 100))}%` : '0%';
-  const pendingWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.pendingFeatures.length / model.relevantTotal) * 100))}%` : '0%';
-  const blockedWidth = model.relevantTotal > 0 ? `${Math.max(0, Math.min(100, (model.blockedFeatures.length / model.relevantTotal) * 100))}%` : '0%';
+  const inputs = [...model.features, ...model.manual];
+  const includedInputs = inputs.filter((unit) => workUnitIsIntegrationInput(unit) && !integrationInputIsSkipped(unit));
+  const skippedInputs = inputs.filter(integrationInputIsSkipped);
+  const actionsBusy = bulkBusy || pendingActions.some((pending) =>
+    ['skip_integration_input', 'unskip_integration_input', 'stage_work_unit'].includes(pending.action));
+
 
   async function skipFeature(unit: SupervisorWorkUnitProjection) {
     if (!unit.feature_id) return;
@@ -1628,10 +1722,48 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
     });
   }
 
+  async function bulkUpdate(kind: 'skip' | 'unskip' | 'staged_on' | 'staged_off' | 'unstaged_on' | 'unstaged_off') {
+    if (actionsBusy) return;
+    const targets = kind === 'skip' ? includedInputs
+      : kind === 'unskip' ? skippedInputs
+      : inputs.filter((unit) => !integrationInputIsSkipped(unit)
+        && (kind.startsWith('staged') ? unit.has_staged_changes : unit.has_unstaged_changes)
+        && (kind === 'staged_on' ? !unit.integration_include_staged
+          : kind === 'staged_off' ? unit.integration_include_staged
+          : kind === 'unstaged_on' ? !unit.integration_include_unstaged : unit.integration_include_unstaged));
+    if (!targets.length) return;
+    if (kind === 'skip' && !window.confirm(`Skip all ${targets.length} included integration inputs?`)) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      for (const unit of targets) {
+        if (kind === 'skip' || kind === 'unskip') {
+          await runSupervisorAction(props.supervisor.id, {
+            action: kind === 'skip' ? 'skip_integration_input' : 'unskip_integration_input',
+            work_unit_id: unit.id,
+          });
+        } else {
+          const isStaged = kind.startsWith('staged');
+          await updateIntegrationChangeScope(
+            unit,
+            isStaged ? kind === 'staged_on' : unit.integration_include_staged,
+            !isStaged ? kind === 'unstaged_on' : unit.integration_include_unstaged,
+          );
+        }
+      }
+      props.onActionComplete?.();
+    } catch (error) {
+      setBulkError(error instanceof Error ? error.message : 'Bulk update failed. Some inputs may have been updated.');
+      props.onActionComplete?.();
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   function inputRow(unit: SupervisorWorkUnitProjection, bucket: 'ready_feature' | 'pending_feature' | 'blocked_feature' | 'skipped_feature' | 'staged_manual' | 'skipped_manual' | 'unstaged_manual') {
     const skipped = bucket === 'skipped_feature' || bucket === 'skipped_manual';
-    const ready = bucket === 'ready_feature' || bucket === 'staged_manual' || bucket === 'skipped_manual';
-    const blocked = bucket === 'blocked_feature';
+    const ready = !skipped && integrationInputIsReady(unit);
+    const blocked = !skipped && ['blocked', 'failed'].includes(normalize(unit.state));
     const manual = bucket === 'staged_manual' || bucket === 'skipped_manual' || bucket === 'unstaged_manual';
     const relevant = bucket !== 'unstaged_manual';
     const canSkip = relevant && !skipped;
@@ -1639,13 +1771,23 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
     const pendingAction = pendingActions.find((pending) => pending.work_unit_id === unit.id && ['skip_integration_input', 'unskip_integration_input', 'stage_work_unit'].includes(pending.action)) ?? null;
     const busy = pendingAction !== null;
     return (
-      <Paper key={`${bucket}-${unit.id}`} withBorder radius="md" p="sm" style={{ background: 'rgba(255,255,255,0.025)' }}>
+      <Paper
+        key={`${bucket}-${unit.id}`}
+        withBorder
+        radius="md"
+        p="sm"
+        style={{
+          background: 'rgba(255,255,255,0.025)',
+          borderLeft: `3px solid var(--mantine-color-${skipped ? 'gray' : blocked ? 'red' : manual ? 'violet' : ready ? 'cyan' : 'yellow'}-6)`,
+          opacity: skipped ? 0.78 : 1,
+        }}
+      >
         <Group justify="space-between" gap="sm" align="center" wrap="nowrap">
           <Stack gap={3} style={{ minWidth: 0, flex: '1 1 auto' }}>
             <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
               <Badge size="xs" color={skipped ? 'gray' : ready ? 'green' : blocked ? 'red' : 'yellow'}>{skipped ? 'Skipped' : ready ? 'Ready' : blocked ? 'Blocked' : 'Pending'}</Badge>
               <Badge size="xs" color={manual ? 'violet' : 'cyan'} variant="light">{manual ? 'Manual shard' : 'Feature'}</Badge>
-              <Badge size="xs" color={skipped ? 'gray' : relevant ? 'blue' : 'gray'} variant={skipped || !relevant ? 'outline' : 'light'}>{skipped ? 'Skipped' : relevant ? 'Integration input' : 'Not included'}</Badge>
+              {!skipped ? <Badge size="xs" color={relevant ? 'blue' : 'gray'} variant={relevant ? 'light' : 'outline'}>{relevant ? 'Integration input' : 'Not included'}</Badge> : null}
               <Text fw={850} size="sm" truncate>{unit.title}</Text>
             </Group>
             <Group gap="xs" wrap="wrap">
@@ -1658,7 +1800,7 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
               <Checkbox
                 size="xs"
                 checked={unit.integration_include_staged}
-                disabled={skipped || busy || !unit.has_staged_changes}
+                disabled={skipped || busy || bulkBusy || !unit.has_staged_changes}
                 label={unit.has_staged_changes ? 'Staged changes' : 'No staged changes'}
                 onChange={(event) => void updateIntegrationChangeScope(
                   unit,
@@ -1669,7 +1811,7 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
               <Checkbox
                 size="xs"
                 checked={unit.integration_include_unstaged}
-                disabled={skipped || busy || !unit.has_unstaged_changes}
+                disabled={skipped || busy || bulkBusy || !unit.has_unstaged_changes}
                 label={unit.has_unstaged_changes ? 'Unstaged changes' : 'No unstaged changes'}
                 onChange={(event) => void updateIntegrationChangeScope(
                   unit,
@@ -1680,19 +1822,19 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
             </Group>
           </Stack>
           {manual && canUnskip ? (
-            <Button size="compact-xs" color="green" variant="outline" disabled={busy} loading={busy} onClick={() => void unskipManualShard(unit)}>
+            <Button size="compact-xs" color="green" variant="outline" disabled={busy || bulkBusy} loading={busy} onClick={() => void unskipManualShard(unit)}>
               Unskip shard
             </Button>
           ) : manual ? (
-            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy} loading={busy} onClick={() => void skipManualShard(unit)}>
+            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy || bulkBusy} loading={busy} onClick={() => void skipManualShard(unit)}>
               Skip shard
             </Button>
           ) : canUnskip ? (
-            <Button size="compact-xs" color="green" variant="outline" disabled={busy} loading={busy} onClick={() => void unskipFeature(unit)}>
+            <Button size="compact-xs" color="green" variant="outline" disabled={busy || bulkBusy} loading={busy} onClick={() => void unskipFeature(unit)}>
               Unskip feature
             </Button>
           ) : (
-            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy} loading={busy} onClick={() => void skipFeature(unit)}>
+            <Button size="compact-xs" color="yellow" variant="outline" disabled={!canSkip || busy || bulkBusy} loading={busy} onClick={() => void skipFeature(unit)}>
               Skip feature
             </Button>
           )}
@@ -1703,72 +1845,99 @@ function IntegrationReadinessBar(props: { supervisor: SupervisorProjection; onAc
 
   return (
     <>
-      <Stack gap={props.expanded ? 8 : 3} style={{ width: props.expanded ? '100%' : undefined, minWidth: props.expanded ? 0 : 280, maxWidth: props.expanded ? 'none' : 420, flex: props.expanded ? '1 1 auto' : '1 1 320px', cursor: 'pointer' }} onClick={() => setOpened(true)}>
-        <Group justify="space-between" gap="xs" wrap="wrap">
-          <Group gap="xs" wrap="wrap">
-            <Text size="xs" fw={900} tt="uppercase" c="gray.2">Status</Text>
-            <Badge size="xs" color="green" variant="light">Ready {model.readyTotal}</Badge>
-            <Badge size="xs" color="yellow" variant="light">Pending {model.pendingFeatures.length}</Badge>
-            <Badge size="xs" color="red" variant="light">Blocked {model.blockedFeatures.length}</Badge>
-            <Badge size="xs" color="gray" variant="outline">Skipped {model.skippedTotal}</Badge>
-            <Badge size="xs" color="gray" variant="outline">Unstaged feature {model.unstagedFeatures.length}</Badge>
-            <Badge size="xs" color="gray" variant="outline">Unstaged manual {model.manualUnstaged.length}</Badge>
+      <Paper
+        withBorder
+        radius="md"
+        px="md"
+        py="sm"
+        role="button"
+        tabIndex={0}
+        aria-label="View integration input readiness details"
+        onClick={() => setOpened(true)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setOpened(true);
+          }
+        }}
+        style={{
+          width: '100%',
+          cursor: 'pointer',
+          background: 'linear-gradient(110deg, rgba(36, 47, 47, 0.42), rgba(255,255,255,0.018))',
+          borderColor: 'rgba(255,255,255,0.12)',
+        }}
+      >
+        <Stack gap="xs">
+          <Group justify="space-between" align="center" gap="md" wrap="wrap">
+            <Group gap="md" align="center" wrap="wrap" style={{ flex: '1 1 auto', minWidth: 0 }}>
+              <Text size="xs" fw={800} c="gray.3" tt="uppercase">Integration inputs</Text>
+              <IntegrationReadinessSummary model={model} />
+            </Group>
+            <Group gap="md" align="center" wrap="nowrap">
+              <Text fw={900} size="sm" style={{ whiteSpace: 'nowrap' }}>{model.readyPct}% ready</Text>
+              <Text size="xs" c="gray.4" style={{ whiteSpace: 'nowrap' }}>Manage inputs →</Text>
+            </Group>
           </Group>
-          <Text size="xs" c="gray.4">{model.readyPct}% ready</Text>
-        </Group>
-        <Paper withBorder radius="xl" p={2} style={{ height: props.expanded ? 20 : 12, width: '100%', overflow: 'hidden', background: 'rgba(255,255,255,0.05)' }}>
-          <Group gap={0} wrap="nowrap" h="100%">
-            <Box h="100%" style={{ width: readyWidth, background: 'var(--mantine-color-green-6)' }} />
-            <Box h="100%" style={{ width: pendingWidth, background: 'var(--mantine-color-yellow-6)' }} />
-            <Box h="100%" style={{ width: blockedWidth, background: 'var(--mantine-color-red-6)' }} />
-          </Group>
-        </Paper>
-      </Stack>
+          <IntegrationReadinessProgress model={model} />
+        </Stack>
+      </Paper>
 
-      <Modal opened={opened} onClose={() => setOpened(false)} title="Integration input readiness" size="80vw" centered>
-        <Stack gap="md">
-          <Group gap="xs" wrap="wrap">
-            <Badge color={model.readyTotal === model.relevantTotal && model.relevantTotal > 0 ? 'green' : 'yellow'}>{model.readyTotal}/{model.relevantTotal} ready</Badge>
-            <Badge color="cyan" variant="light">Features {model.features.length}</Badge>
-            <Badge color="violet" variant="light">Staged manual {model.manualStaged.length}</Badge>
-            <Badge color="gray" variant="outline">Unstaged manual {model.manualUnstaged.length}</Badge>
+      <Modal
+        opened={opened}
+        onClose={() => setOpened(false)}
+        title="Integration input readiness"
+        size="calc(100vw - 48px)"
+        centered
+        padding="md"
+        scrollAreaComponent={ScrollArea.Autosize}
+        styles={{
+          content: { width: '100%', maxHeight: 'calc(100dvh - 48px)', display: 'flex', flexDirection: 'column' },
+          body: { minHeight: 0, overflowY: 'auto', flex: '1 1 auto' },
+          header: { flexShrink: 0 },
+        }}
+      >
+        <Stack gap="md" style={{ minWidth: 0, width: '100%' }}>
+          <IntegrationReadinessSummary model={model} />
+          <IntegrationReadinessProgress model={model} />
+          <Group gap="xs" wrap="wrap" aria-label="Bulk integration input actions">
+            <Button size="compact-xs" variant="light" color="yellow" disabled={actionsBusy || includedInputs.length === 0} onClick={() => void bulkUpdate('skip')}>Skip all</Button>
+            <Button size="compact-xs" variant="light" color="green" disabled={actionsBusy || skippedInputs.length === 0} onClick={() => void bulkUpdate('unskip')}>Unskip all</Button>
+            <Button size="compact-xs" variant="default" disabled={actionsBusy || !inputs.some((u) => !integrationInputIsSkipped(u) && u.has_staged_changes && !u.integration_include_staged)} onClick={() => void bulkUpdate('staged_on')}>Include all staged</Button>
+            <Button size="compact-xs" variant="default" disabled={actionsBusy || !inputs.some((u) => !integrationInputIsSkipped(u) && u.has_staged_changes && u.integration_include_staged)} onClick={() => void bulkUpdate('staged_off')}>Exclude all staged</Button>
+            <Button size="compact-xs" variant="default" disabled={actionsBusy || !inputs.some((u) => !integrationInputIsSkipped(u) && u.has_unstaged_changes && !u.integration_include_unstaged)} onClick={() => void bulkUpdate('unstaged_on')}>Include all unstaged</Button>
+            <Button size="compact-xs" variant="default" disabled={actionsBusy || !inputs.some((u) => !integrationInputIsSkipped(u) && u.has_unstaged_changes && u.integration_include_unstaged)} onClick={() => void bulkUpdate('unstaged_off')}>Exclude all unstaged</Button>
           </Group>
+          {bulkError ? <Alert color="red" title="Bulk update incomplete">{bulkError}</Alert> : null}
 
-          <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="md">
-            <Stack gap="xs">
-              <Group gap="xs">
-                <Text fw={900}>Feature pool</Text>
-                <Badge color="green" variant="light">Ready {model.readyFeatures.length}</Badge>
-                <Badge color="yellow" variant="light">Pending {model.pendingFeatures.length}</Badge>
-                <Badge color="red" variant="light">Blocked {model.blockedFeatures.length}</Badge>
-                <Badge color="gray" variant="outline">Skipped {model.skippedFeatures.length}</Badge>
+          <Stack gap="sm" style={{ minWidth: 0, width: '100%' }}>
+            <Group justify="space-between" align="center" gap="sm" wrap="wrap">
+              <Group gap="xs" wrap="wrap">
+                <Text fw={800} size="sm">Integration inputs ({model.relevantTotal + model.skippedTotal})</Text>
               </Group>
-              <ScrollArea h={420}>
-                <Stack gap="xs" pr="xs">
-                  {model.readyFeatures.map((unit) => inputRow(unit, 'ready_feature'))}
-                  {model.pendingFeatures.map((unit) => inputRow(unit, 'pending_feature'))}
-                  {model.blockedFeatures.map((unit) => inputRow(unit, 'blocked_feature'))}
-                  {model.skippedFeatures.map((unit) => inputRow(unit, 'skipped_feature'))}
-                  {model.stagedFeatures.length === 0 ? <Text size="sm" c="dimmed">No feature work is staged for integration.</Text> : null}
-                </Stack>
-              </ScrollArea>
-            </Stack>
-
-            <Stack gap="xs">
-              <Group gap="xs">
-                <Text fw={900}>Manual pool</Text>
-                <Badge color="violet" variant="light">Staged {model.includedManualStaged.length}</Badge>
-                <Badge color="gray" variant="outline">Skipped {model.skippedManualStaged.length}</Badge>
-              </Group>
-              <ScrollArea h={420}>
-                <Stack gap="xs" pr="xs">
-                  {model.includedManualStaged.map((unit) => inputRow(unit, 'staged_manual'))}
-                  {model.skippedManualStaged.map((unit) => inputRow(unit, 'skipped_manual'))}
-                  {model.manualStaged.length === 0 ? <Text size="sm" c="dimmed">No manual shards are staged for integration.</Text> : null}
-                </Stack>
-              </ScrollArea>
-            </Stack>
-          </SimpleGrid>
+              <Text size="xs" c="dimmed">Manage integration inputs</Text>
+            </Group>
+            <ScrollArea.Autosize mah="calc(100dvh - 300px)" type="auto" offsetScrollbars style={{ width: '100%', minWidth: 0 }}>
+              <Box
+                pr="xs"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: 'var(--mantine-spacing-sm)',
+                  alignItems: 'stretch',
+                  width: '100%',
+                  minWidth: 0,
+                }}
+              >
+                {model.includedFeatures.map((unit) => inputRow(unit, ['blocked', 'failed'].includes(normalize(unit.state)) ? 'blocked_feature' : integrationInputIsReady(unit) ? 'ready_feature' : 'pending_feature'))}
+                {model.includedManualStaged.map((unit) => inputRow(unit, 'staged_manual'))}
+                {model.skippedFeatures.map((unit) => inputRow(unit, 'skipped_feature'))}
+                {model.skippedManualStaged.map((unit) => inputRow(unit, 'skipped_manual'))}
+                {model.stagedFeatures.length === 0 && model.manualStaged.length === 0 ? (
+                  <Text size="sm" c="dimmed" ta="center" py="md" style={{ gridColumn: '1 / -1' }}>No inputs are currently staged for integration.</Text>
+                ) : null}
+              </Box>
+            </ScrollArea.Autosize>
+          </Stack>
         </Stack>
       </Modal>
     </>
@@ -1955,24 +2124,25 @@ function WorkPoolActionRail(props: { groupKey: string; units: SupervisorWorkUnit
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
         {manualNameOpen ? (
-          <TextInput
-            size="xs"
-            autoFocus
-            placeholder="Work unit name"
-            value={manualName}
-            onChange={(event) => setManualName(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') void createManualShard();
-              if (event.key === 'Escape') {
-                setManualName('');
-                setManualNameOpen(false);
-              }
-            }}
-            w={190}
-          />
-        ) : null}
-        {manualNameOpen ? (
-          <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
+          <Stack gap="xs" miw={280}>
+            <TextInput
+              size="xs"
+              placeholder="Work unit name"
+              value={manualName}
+              onChange={(event) => setManualName(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void createManualShard();
+                if (event.key === 'Escape') {
+                  setManualName('');
+                  setManualNameOpen(false);
+                }
+              }}
+            />
+            <Group gap="xs">
+              <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
+              <Button size="xs" variant="subtle" onClick={() => { setManualName(''); setManualNameOpen(false); }}>Cancel</Button>
+            </Group>
+          </Stack>
         ) : (
           <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New work unit</Button>
         )}
@@ -2004,7 +2174,7 @@ function WorkPoolProjectionSection(props: {
     <Box py="sm" style={{ borderTop: '1px solid rgba(255,255,255,0.10)' }}>
       <Stack gap="sm">
         <Stack
-          gap={props.groupKey === 'integration' ? 'sm' : 0}
+          gap={props.groupKey === 'integration' ? 'xs' : 0}
           px="xs"
           py={6}
           style={{
@@ -2241,6 +2411,7 @@ function SupervisorCockpit(props: { supervisor: SupervisorProjection; templateOp
   const failed = supervisor.work_units.filter((unit) => unit.state === 'failed').length;
   const integrationState = String(supervisor.integration?.state ?? 'idle');
   const pendingActions = usePendingSupervisorActions(supervisor.id);
+  const [impactOpen, setImpactOpen] = useState(false);
 
   return (
     <AppSurface p="md">
@@ -2271,14 +2442,23 @@ function SupervisorCockpit(props: { supervisor: SupervisorProjection; templateOp
             ))}
           </Group>
 
-          <AppHeaderAction onClick={() => props.onOpenPlannerOptions?.(supervisor)}>
-            Planner options
-          </AppHeaderAction>
+          <Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+            <AppHeaderAction onClick={() => props.onOpenPlannerOptions?.(supervisor)}>
+              Planner options
+            </AppHeaderAction>
+            <AppHeaderAction onClick={() => setImpactOpen(value => !value)}>
+              {impactOpen ? 'Hide impact' : 'Supervisor impact'}
+            </AppHeaderAction>
+          </Group>
         </Group>
 
         <Divider color="rgba(139,148,158,0.20)" />
 
-        <TopologyMap supervisor={supervisor} templateOptions={props.templateOptions} navigate={navigate} onOpenPlanner={props.onOpenPlanner} onActionComplete={props.onActionComplete} />
+        {impactOpen ? (
+          <SupervisorImpactPanel supervisorId={supervisor.id} navigate={navigate} />
+        ) : (
+          <TopologyMap supervisor={supervisor} templateOptions={props.templateOptions} navigate={navigate} onOpenPlanner={props.onOpenPlanner} onActionComplete={props.onActionComplete} />
+        )}
       </Stack>
     </AppSurface>
   );
@@ -2366,7 +2546,7 @@ function MissionBar(props: {
     <AppHeader
       active="supervisor"
       onChange={navigate}
-      onActiveDoubleClick={() => props.setControlsOpen(!props.controlsOpen)}
+      onActiveTabClick={() => props.setControlsOpen(!props.controlsOpen)}
       actions={(
         <>
           <Badge size="sm" variant="light" color="gray">

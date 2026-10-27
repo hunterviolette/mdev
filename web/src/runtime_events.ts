@@ -249,7 +249,7 @@ const RUNTIME_EVENT_BUS_LEADER_STALE_MS = 7000;
 
 type RuntimeEventBusBroadcastMessage = {
   sourceId: string;
-  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event' | 'supervisor_event' | 'supervisor_resync' | 'template_event' | 'template_resync';
+  type: 'connected' | 'disconnected' | 'runtime_snapshot' | 'runtime_projection' | 'runtime_event' | 'supervisor_event' | 'supervisor_resync' | 'template_event' | 'template_resync' | 'changeset_applied';
   payload?: unknown;
 };
 
@@ -307,6 +307,7 @@ type RuntimeEventBusHandlers = {
   onSupervisorResync?: () => void;
   onTemplateEvent?: (event: { event_type: string; template_id: string }) => void;
   onTemplateResync?: () => void;
+  onChangesetApplied?: (event: { repo_ref: string; run_id?: string | null; changeset_attempt_id?: string | null }) => void;
   onError?: () => void;
 };
 
@@ -346,6 +347,9 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
         return;
       case 'template_event':
         handlers.onTemplateEvent?.(message.payload as { event_type: string; template_id: string });
+        return;
+      case 'changeset_applied':
+        handlers.onChangesetApplied?.(message.payload as { repo_ref: string; run_id?: string | null; changeset_attempt_id?: string | null });
         return;
       case 'template_resync':
         handlers.onTemplateResync?.();
@@ -431,6 +435,14 @@ function startRuntimeEventBus(handlers: RuntimeEventBusHandlers) {
       try {
         const event = JSON.parse((raw as MessageEvent<string>).data) as SupervisorEventEnvelope;
         broadcast('supervisor_event', event);
+      } catch {
+      }
+    });
+
+    nextSource.addEventListener('changeset_applied', (raw) => {
+      if (disposed || !isLeader) return;
+      try {
+        broadcast('changeset_applied', JSON.parse((raw as MessageEvent<string>).data));
       } catch {
       }
     });
@@ -547,6 +559,7 @@ function ensureSharedRuntimeEventBus() {
     onEvent: (event) => dispatchRuntimeEventBus('onEvent', event),
     onSupervisorEvent: (event) => dispatchRuntimeEventBus('onSupervisorEvent', event),
     onSupervisorResync: () => dispatchRuntimeEventBus('onSupervisorResync'),
+    onChangesetApplied: (event) => dispatchRuntimeEventBus('onChangesetApplied', event),
     onError: () => dispatchRuntimeEventBus('onError')
   });
 }

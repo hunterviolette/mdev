@@ -619,11 +619,17 @@ pub(crate) async fn execute_capability_chain(
                 Some("pause_error" | "select_stage")
             );
 
-        queue.extend(follow_ups);
+        let stage_pause_requested = crate::engine::stages::stage_requires_pause_after_capability(
+            ctx.step,
+            result.capability.as_str(),
+            result.ok,
+        );
+
         results.push(result);
-        if automation_pause_requested || checkpoint_stops_chain {
+        if stage_pause_requested || automation_pause_requested || checkpoint_stops_chain {
             break;
         }
+        queue.extend(follow_ups);
     }
 
     Ok(results)

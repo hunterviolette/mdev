@@ -27,7 +27,7 @@ fn default_readiness_timeout_seconds() -> u64 {
 }
 
 fn default_hostname_template() -> String {
-    "{run}.qa.localhost".to_string()
+    "{workflow}.qa.localhost".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,8 +98,18 @@ impl Default for TerminalCommandSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSequenceStrategy {
+    #[default]
+    Series,
+    Parallel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSequenceSpec {
+    #[serde(default)]
+    pub strategy: TerminalSequenceStrategy,
     #[serde(default)]
     pub commands: Vec<TerminalCommandSpec>,
     #[serde(default = "default_true")]
@@ -109,6 +119,7 @@ pub struct TerminalSequenceSpec {
 impl Default for TerminalSequenceSpec {
     fn default() -> Self {
         Self {
+            strategy: TerminalSequenceStrategy::Series,
             commands: Vec::new(),
             stop_on_failure: true,
         }
@@ -293,8 +304,41 @@ pub struct QaServiceSpec {
     pub public: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QaDirectoryMode {
+    Copy,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QaSymlinkBehavior {
+    Reject,
+    Preserve,
+    #[default]
+    Skip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QaDirectoryMapping {
+    pub source: String,
+    pub destination: String,
+    pub mode: QaDirectoryMode,
+    #[serde(default)]
+    pub replace_existing: bool,
+    #[serde(default)]
+    pub existing_destination: Option<String>,
+    #[serde(default)]
+    pub exclude_directories: Vec<String>,
+    #[serde(default)]
+    pub symlink_behavior: QaSymlinkBehavior,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QaEnvironmentSpec {
+    #[serde(default)]
+    pub directory_mappings: Vec<QaDirectoryMapping>,
     #[serde(default)]
     pub port_range: PortRangeSpec,
     #[serde(default = "default_hostname_template")]
@@ -308,12 +352,6 @@ pub struct QaEnvironmentSpec {
 }
 
 fn default_qa_services() -> Vec<QaServiceSpec> {
-    let mut web_environment = BTreeMap::new();
-    web_environment.insert(
-        "VITE_API_BASE_URL".to_string(),
-        "{service.api.internal_url}/api".to_string(),
-    );
-
     let mut api_environment = BTreeMap::new();
     api_environment.insert(
         "WORKFLOW_API_HOST".to_string(),
@@ -321,32 +359,6 @@ fn default_qa_services() -> Vec<QaServiceSpec> {
     );
 
     vec![
-        QaServiceSpec {
-            id: "web".to_string(),
-            label: "Web".to_string(),
-            command: TerminalCommandSpec {
-                id: "deploy-qa-web".to_string(),
-                label: "npm run dev".to_string(),
-                command: "npm run dev -- --host 127.0.0.1 --port {port} --strictPort".to_string(),
-                arguments: Vec::new(),
-                working_directory: "web".to_string(),
-                environment: web_environment,
-                shell: TerminalShell::System,
-                mode: TerminalCommandMode::Service,
-                timeout_seconds: None,
-                continue_on_error: false,
-            },
-            port: QaServicePortSpec {
-                environment_variable: "WORKFLOW_WEB_PORT".to_string(),
-                preferred: None,
-            },
-            readiness: QaReadinessSpec::Http {
-                path: "/".to_string(),
-                expected_status: Some(200),
-                timeout_seconds: 60,
-            },
-            public: false,
-        },
         QaServiceSpec {
             id: "api".to_string(),
             label: "API".to_string(),
@@ -379,6 +391,7 @@ fn default_qa_services() -> Vec<QaServiceSpec> {
 impl Default for QaEnvironmentSpec {
     fn default() -> Self {
         Self {
+            directory_mappings: Vec::new(),
             port_range: PortRangeSpec::default(),
             hostname_template: default_hostname_template(),
             prepare: TerminalSequenceSpec::default(),

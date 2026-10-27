@@ -39,6 +39,10 @@ impl Stage for CompileStage {
         &["compile_failures"]
     }
 
+    fn pause_on_capability_failure(&self, capability: &str, ok: bool) -> bool {
+        capability == "shared_dependencies" && !ok
+    }
+
     fn prepare_state(
         &self,
         context: StagePrepareContext<'_>,

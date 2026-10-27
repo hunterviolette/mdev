@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     engine::capabilities::planner::FeaturePlanItem,
-    supervisor::{patches, repo_snapshot, workflow_spawn},
+    supervisor::{repo_snapshot, workflow_spawn},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +195,11 @@ pub async fn promise_supervisor_work_unit(
             archived_reason = NULL,
             updated_at = excluded.updated_at
         WHERE supervisor_work_units.archived_at IS NOT NULL
-           OR supervisor_work_units.state IN ('deleted', 'archived', 'cancelled', 'failed')
+           OR supervisor_work_units.state IN ('deleted', 'archived')
+           OR (
+               supervisor_work_units.state IN ('cancelled', 'failed')
+               AND supervisor_work_units.kind <> 'integration'
+           )
         "#,
     )
     .bind(&request.work_unit_id)
@@ -397,7 +401,7 @@ fn spawn_workspace(request: &SupervisorWorkflowSpawnRequest, workspace_id: Uuid)
         request.supervisor_run_id,
         workspace_id,
     )?;
-    patches::create_baseline(&workspace_path)?;
+
     Ok(workspace_path.to_string_lossy().to_string())
 }
 

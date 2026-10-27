@@ -21,6 +21,7 @@ use crate::engine::runtime_tools::{
     TerminalCommandMode,
     TerminalCommandSpec,
     TerminalSequenceSpec,
+    TerminalSequenceStrategy,
     TerminalShell,
 };
 
@@ -299,14 +300,28 @@ pub async fn run_sequence(
     sequence: &TerminalSequenceSpec,
     owner: &TerminalExecutionOwner,
 ) -> Result<TerminalSequenceResult> {
-    let mut commands = Vec::new();
-    let mut ok = true;
-
     for command in &sequence.commands {
         if command.mode != TerminalCommandMode::Run {
             bail!("terminal sequence command '{}' must use run mode", command.id);
         }
+    }
 
+    if sequence.strategy == TerminalSequenceStrategy::Parallel {
+        let results = futures_util::future::join_all(
+            sequence.commands.iter().map(|command| {
+                run_command(registry, workspace_root, command, owner.clone())
+            }),
+        )
+        .await;
+        let commands = results.into_iter().collect::<Result<Vec<_>>>()?;
+        let ok = commands.iter().all(|result| result.status == "succeeded");
+        return Ok(TerminalSequenceResult { ok, commands });
+    }
+
+    let mut commands = Vec::new();
+    let mut ok = true;
+
+    for command in &sequence.commands {
         let result = run_command(registry, workspace_root, command, owner.clone()).await?;
         let succeeded = result.status == "succeeded";
         ok &= succeeded;

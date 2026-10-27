@@ -694,20 +694,12 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
   }
 
   return (
-    <Box h="100%" p="md">
-      <Box
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(0, 1fr) 360px',
-          gap: 16,
-          height: '100%',
-          minHeight: 0,
-        }}
-      >
-        <AppSurface h="100%" p="sm">
+    <Box className="mdev-builder-page" h="100%" p="md">
+      <Box className="mdev-builder-layout">
+        <AppSurface className="mdev-builder-pipeline" h="100%" p="sm">
           <Stack h="100%" gap="sm">
-            <Group justify="space-between" align="center">
-              <Group gap="xs">
+            <Group justify="space-between" align="center" wrap="wrap" gap="sm">
+              <Group gap="xs" wrap="wrap">
                 <Title order={4}>Workflow pipeline</Title>
                 <Badge color={compileBadgeColor(compileState)} variant="light">
                   {compileState.toUpperCase()}
@@ -886,7 +878,7 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
           </Stack>
         </AppSurface>
 
-        <AppSurface h="100%" p="sm">
+        <AppSurface className="mdev-builder-inspector" h="100%" p="sm">
           <Stack h="100%" gap="sm">
             {!selectedStep || !selectedDescriptor ? (
               <Text c="dimmed" size="sm">Select a stage.</Text>
@@ -1023,18 +1015,19 @@ export function WorkflowBuilderEditor({ initialDefinition, builderGlobals, loadR
           }
         }}
         title={
-          <Group gap="sm" wrap="nowrap">
+          <Stack gap={2} style={{ minWidth: 0 }}>
             <Text fw={600}>Automation</Text>
-            <Text size="sm" c="dimmed" fw={400}>
+            <Text size="sm" c="dimmed" fw={400} style={{ overflowWrap: 'anywhere' }}>
               Choose which behaviors run automatically and when they should activate.
             </Text>
-          </Group>
+          </Stack>
         }
-        size="min(1120px, 94vw)"
+        size="min(1120px, calc(100vw - 16px))"
         centered
         styles={{
-          content: { maxHeight: '92dvh' },
-          body: { overflow: 'hidden' },
+          content: { maxHeight: '92dvh', minWidth: 0 },
+          header: { minWidth: 0 },
+          body: { minWidth: 0, overflow: 'hidden' },
         }}
       >
         <Automation

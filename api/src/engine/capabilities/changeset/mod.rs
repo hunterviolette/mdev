@@ -2,12 +2,28 @@ use std::{path::PathBuf, time::Instant};
 
 use anyhow::{bail, Result};
 use serde::Serialize;
+use std::sync::LazyLock;
+use tokio::sync::broadcast;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
 pub mod apply;
 pub mod persistence;
 pub mod schema;
+
+static CHANGESET_EVENTS: LazyLock<broadcast::Sender<Value>> = LazyLock::new(|| {
+    let (tx, _) = broadcast::channel(1024);
+    tx
+});
+
+pub fn subscribe_changeset_events() -> broadcast::Receiver<Value> {
+    CHANGESET_EVENTS.subscribe()
+}
+
+pub fn publish_changeset_event(event: Value) {
+    let _ = CHANGESET_EVENTS.send(event);
+}
+
 
 pub use persistence::ChangesetAttemptRecord;
 use persistence::{insert_changeset_attempt_from_result, row_to_summary, ChangesetAttemptContext};
@@ -122,6 +138,19 @@ pub async fn apply_changeset(db: &SqlitePool, request: ChangesetRequest) -> Resu
 
     if let Some(obj) = result.as_object_mut() {
         obj.insert("changeset_attempt_id".to_string(), Value::String(attempt_id));
+    }
+
+    let applied_actions = result.get("stats")
+        .and_then(|stats| stats.get("successful_actions"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if applied_actions > 0 {
+        publish_changeset_event(json!({
+            "repo_ref": request.repo_ref,
+            "run_id": request.run_id,
+            "changeset_attempt_id": result.get("changeset_attempt_id"),
+            "applied_actions": applied_actions
+        }));
     }
 
     Ok(result)

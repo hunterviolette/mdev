@@ -12,6 +12,7 @@ use uuid::Uuid;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
+use tokio_util::sync::CancellationToken;
 
 use crate::engine::capabilities::inference::{BrowserConfig, BrowserProbeResult, InferenceResult, InferenceTransport};
 
@@ -381,6 +382,13 @@ impl BridgeClient {
     }
 
     fn send_json(&self, value: Value) -> Result<Value> {
+        self.send_json_cancelable(value, None)
+    }
+
+    fn send_json_cancelable(&self, value: Value, cancellation: Option<&CancellationToken>) -> Result<Value> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(anyhow!("workflow execution was cancelled"));
+        }
         self.ensure_started()?;
         let request_id = value
             .get("id")
@@ -422,22 +430,57 @@ impl BridgeClient {
             return Err(err);
         }
 
-        let response = match receiver.recv_timeout(timeout) {
-            Ok(Ok(response)) => response,
-            Ok(Err(message)) => return Err(anyhow!(message)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let started = Instant::now();
+        let response = loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                let mut cancel_payload = bridge_cmd("cancel_request");
+                cancel_payload["request_id"] = Value::String(request_id.clone());
+                cancel_payload["session_id"] = Value::String(session_id.clone());
+                if let Ok(payload) = serde_json::to_string(&cancel_payload) {
+                    if let Ok(mut state) = self.state.lock() {
+                        if let Some(stdin) = state.stdin.as_mut() {
+                            let _ = stdin.write_all(payload.as_bytes());
+                            let _ = stdin.write_all(b"\n");
+                            let _ = stdin.flush();
+                        }
+                    }
+                }
+                return Err(anyhow!("workflow execution was cancelled"));
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
                 if let Ok(mut pending) = self.pending.lock() {
                     pending.remove(&request_id);
                 }
                 return Err(anyhow!("browser bridge request timed out (request_id={}, session_id={}, cmd={})", request_id, session_id, cmd));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.remove(&request_id);
+
+            let wait = if cancellation.is_some() {
+                remaining.min(Duration::from_millis(100))
+            } else {
+                remaining
+            };
+
+            match receiver.recv_timeout(wait) {
+                Ok(Ok(response)) => break response,
+                Ok(Err(message)) => return Err(anyhow!(message)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Ok(mut pending) = self.pending.lock() {
+                        pending.remove(&request_id);
+                    }
+                    return Err(anyhow!("browser bridge request waiter disconnected (request_id={}, session_id={}, cmd={})", request_id, session_id, cmd));
                 }
-                return Err(anyhow!("browser bridge request waiter disconnected (request_id={}, session_id={}, cmd={})", request_id, session_id, cmd));
             }
         };
+
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(anyhow!("workflow execution was cancelled"));
+        }
 
         debug!(request_id = %request_id, session_id = %session_id, cmd = %cmd, response = %response, "received response from browser bridge");
         if let Some(err) = response.get("error").and_then(Value::as_str) {
@@ -841,6 +884,17 @@ pub fn send_chat_and_wait_with_pasted_context(
     text: &str,
     pasted_context_text: Option<&str>,
 ) -> Result<InferenceResult> {
+    send_chat_and_wait_with_pasted_context_cancelable(cfg, text, pasted_context_text, None)
+}
+
+pub fn send_chat_and_wait_with_pasted_context_cancelable(
+    cfg: &mut BrowserConfig,
+    text: &str,
+    pasted_context_text: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<InferenceResult> {
+
+
     let session_id = cfg.session_id.clone().ok_or_else(|| anyhow!("Browser session missing before send_chat"))?;
 
     let probe = probe(cfg)?;
@@ -889,7 +943,7 @@ pub fn send_chat_and_wait_with_pasted_context(
     read_payload["session_id"] = Value::String(session_id);
     read_payload["response_selector"] = Value::Null;
     read_payload["timeout_ms"] = Value::Number(cfg.response_timeout_ms.into());
-    let read_value = client.send_json(read_payload)?;
+    let read_value = client.send_json_cancelable(read_payload, cancellation)?;
 
     let read_data = read_value.get("data").cloned().unwrap_or(read_value);
     let text = read_data

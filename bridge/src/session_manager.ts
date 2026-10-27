@@ -39,6 +39,30 @@ export type SessionState = {
 export class SessionManager {
   private sessions = new Map<string, SessionState>();
 
+  private async abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    signal.throwIfAborted();
+
+    return await new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new Error('Browser request cancelled'));
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      operation.then(
+        value => {
+          signal.removeEventListener('abort', onAbort);
+          if (signal.aborted) {
+            reject(signal.reason ?? new Error('Browser request cancelled'));
+          } else {
+            resolve(value);
+          }
+        },
+        error => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        }
+      );
+    });
+  }
+
   async startSession(cmd: StartSessionCommand) {
     const sessionId = cmd.session_id ?? randomUUID();
     const timeout = cmd.timeout_ms ?? 60000;
@@ -928,7 +952,8 @@ export class SessionManager {
   private async waitForCompletedResponse(
     state: SessionState,
     selector: string,
-    timeoutMs: number
+    timeoutMs: number,
+    signal: AbortSignal
   ): Promise<ResponseSnapshot> {
     const start = Date.now();
     const effectiveTimeoutMs = Math.max(timeoutMs, 1000);
@@ -937,12 +962,14 @@ export class SessionManager {
     let stablePolls = 0;
 
     while (true) {
+      signal.throwIfAborted();
       if (Date.now() - start >= effectiveTimeoutMs) {
         throw new Error(`Timed out waiting for completed response after ${effectiveTimeoutMs} ms`);
       }
 
-      const ready = await this.readPageReadySnapshot(state.page);
-      const snap = await this.readResponseSnapshot(state.page, selector).catch(() => ({ texts: [], count: 0, lastText: '' }));
+      const ready = await this.abortable(this.readPageReadySnapshot(state.page), signal);
+      const snap = await this.abortable(this.readResponseSnapshot(state.page, selector), signal);
+      signal.throwIfAborted();
       const hasResponse = snap.count > 0 && snap.lastText.length > 0;
       const hasNewResponse = !baseline
         || snap.count > baseline.count
@@ -958,12 +985,16 @@ export class SessionManager {
       const done = hasResponse && hasNewResponse && ready.ready && stablePolls >= 2;
 
       if (done) {
+        signal.throwIfAborted();
         state.responseTimeoutMs = undefined;
         state.lastResponseBaseline = undefined;
         return snap;
       }
 
-      await state.page.waitForTimeout(Math.max(250, Math.trunc(state.responsePollMs ?? 1000)));
+      await this.abortable(
+        new Promise<void>(resolve => setTimeout(resolve, Math.max(250, Math.trunc(state.responsePollMs ?? 1000)))),
+        signal
+      );
     }
   }
 
@@ -990,7 +1021,8 @@ export class SessionManager {
     };
   }
 
-  async readResponse(cmd: ReadResponseCommand) {
+  async readResponse(cmd: ReadResponseCommand, signal: AbortSignal) {
+    signal.throwIfAborted();
     const state = this.getSession(cmd.session_id);
     const timeout = cmd.timeout_ms ?? 120000;
     const selector = cmd.response_selector ?? state.responseSelector;
@@ -998,8 +1030,10 @@ export class SessionManager {
     const snap = await this.waitForCompletedResponse(
       state,
       selector,
-      timeout
+      timeout,
+      signal
     );
+    signal.throwIfAborted();
 
     return {
       session_id: state.sessionId,

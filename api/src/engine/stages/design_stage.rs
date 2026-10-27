@@ -65,6 +65,18 @@ impl Stage for DesignStage {
         )
     }
 
+    fn resolve_transition(
+        &self,
+        automatic_execution: bool,
+        transition: super::StageTransition,
+    ) -> super::StageTransition {
+        if automatic_execution {
+            transition
+        } else {
+            super::StageTransition::Stay
+        }
+    }
+
     fn build_execution_plan(
         &self,
         context: StagePlanContext<'_>,

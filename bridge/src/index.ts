@@ -10,6 +10,7 @@ const rl = readline.createInterface({
 
 const manager = new SessionManager();
 const sessionQueues = new Map<string, Promise<void>>();
+const requestControllers = new Map<string, { sessionId: string; controller: AbortController }>();
 let stdoutQueue = Promise.resolve();
 let shuttingDown = false;
 
@@ -19,6 +20,10 @@ async function shutdown(code = 0) {
   }
 
   shuttingDown = true;
+
+  for (const request of requestControllers.values()) {
+    request.controller.abort();
+  }
 
   try {
     await Promise.allSettled([...sessionQueues.values()]);
@@ -77,7 +82,12 @@ async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
     }
     case 'read_response': {
-      const data = await manager.readResponse(cmd);
+      const request = requestControllers.get(cmd.id);
+      if (!request || request.controller.signal.aborted) {
+        throw new Error(`Browser request cancelled: ${cmd.id}`);
+      }
+      const data = await manager.readResponse(cmd, request.controller.signal);
+      request.controller.signal.throwIfAborted();
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
     }
     case 'set_poll_config': {
@@ -91,6 +101,20 @@ async function handleCommand(cmd: BridgeCommand): Promise<BridgeResponse> {
     case 'set_response_timeout': {
       const data = await manager.setResponseTimeout(cmd);
       return { id: cmd.id, ok: true, cmd: cmd.cmd, session_id: cmd.session_id, data };
+    }
+    case 'cancel_request': {
+      const request = requestControllers.get(cmd.request_id);
+      const matched = Boolean(request && (!cmd.session_id || request.sessionId === cmd.session_id));
+      if (matched) {
+        request!.controller.abort();
+      }
+      return {
+        id: cmd.id,
+        ok: true,
+        cmd: cmd.cmd,
+        session_id: cmd.session_id,
+        data: { request_id: cmd.request_id, cancelled: matched }
+      };
     }
     case 'close_session': {
       const data = await manager.closeSession(cmd.session_id);
@@ -111,6 +135,24 @@ function commandSessionId(cmd: BridgeCommand) {
 
 function dispatchCommand(cmd: BridgeCommand) {
   const sessionId = commandSessionId(cmd);
+
+  if (cmd.cmd === 'read_response') {
+    if (requestControllers.has(cmd.id)) {
+      void writeResponse({
+        id: cmd.id,
+        ok: false,
+        cmd: cmd.cmd,
+        session_id: sessionId,
+        error: `Duplicate browser request id: ${cmd.id}`
+      });
+      return;
+    }
+    requestControllers.set(cmd.id, {
+      sessionId: cmd.session_id,
+      controller: new AbortController()
+    });
+  }
+
   const run = async () => {
     try {
       await writeResponse(await handleCommand(cmd));
@@ -123,10 +165,14 @@ function dispatchCommand(cmd: BridgeCommand) {
         session_id: sessionId,
         error: message
       });
+    } finally {
+      if (cmd.cmd === 'read_response') {
+        requestControllers.delete(cmd.id);
+      }
     }
   };
 
-  if (!sessionId) {
+  if (!sessionId || cmd.cmd === 'cancel_request') {
     void run();
     return;
   }

@@ -336,6 +336,15 @@ pub async fn execute(
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
+    if successful_actions > 0 {
+        crate::engine::capabilities::changeset::publish_changeset_event(json!({
+            "repo_ref": target.repo_ref,
+            "run_id": ctx.run_id.to_string(),
+            "changeset_attempt_id": result.get("changeset_attempt_id"),
+            "applied_actions": successful_actions
+        }));
+    }
+
     let repo_sync_connected = if successful_actions > 0 {
         ctx.state
             .repo_sync

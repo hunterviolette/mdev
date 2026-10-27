@@ -453,7 +453,7 @@ pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) 
                         .unwrap_or(".")
                         .trim();
 
-                    if id.is_empty() || ecosystem != "node" {
+                    if id.is_empty() || !matches!(ecosystem, "node" | "cargo") {
                         return None;
                     }
 
@@ -476,13 +476,16 @@ pub(crate) fn normalize_shared_dependencies(globals: &mut WorkflowGlobalConfig) 
                                 .collect::<Vec<_>>()
                         })
                         .filter(|values| !values.is_empty())
-                        .unwrap_or_else(|| vec!["package-lock.json".to_string()]);
+                        .unwrap_or_else(|| match ecosystem {
+                            "cargo" => vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
+                            _ => vec!["package.json".to_string(), "package-lock.json".to_string()],
+                        });
 
                     let isolated = provider
                         .get("isolated")
                         .cloned()
                         .unwrap_or_else(|| json!({
-                            "storage_path": "node_modules",
+                            "storage_path": if ecosystem == "cargo" { "target" } else { "node_modules" },
                             "seed_from_trusted": true,
                             "install": {
                                 "commands": [],
@@ -804,7 +807,8 @@ pub(crate) fn compile_descriptor() -> WorkflowStageDescriptor {
     template.execution = WorkflowStepExecutionConfig {
         changeset_apply: json!({}),
         compile_checks: json!({
-            "commands": []
+            "commands": [],
+            "strategy": "series"
         }),
         ..WorkflowStepExecutionConfig::default()
     };
@@ -830,6 +834,7 @@ pub(crate) fn compile_descriptor() -> WorkflowStageDescriptor {
             label: "Compile".to_string(),
             fields: vec![
                 text_field("execution.compile_checks.commands_text", "Compile commands", "execution.compile_checks.commands_text", ""),
+                select_field("execution.compile_checks.strategy", "Command execution", "execution.compile_checks.strategy", "series", vec![("series", "Series"), ("parallel", "Parallel")]),
             ],
         }],
         available_governance_policies: vec![],

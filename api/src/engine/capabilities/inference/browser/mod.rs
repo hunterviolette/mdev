@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
+use tokio_util::sync::CancellationToken;
 
 use super::{prompting::ModelInput, BrowserConfig, BrowserProbeResult, InferenceConfig};
 use super::session::{InferenceSession, ResolvedInferenceRoute};
@@ -132,6 +133,7 @@ fn wait_for_browser_chat_ready(browser: &mut BrowserConfig, target_url: &str) ->
     let mut last_probe: Option<BrowserProbeResult> = None;
 
     loop {
+
         match adapter::probe(browser) {
             Ok(probe) => {
                 if probe.ready && browser_probe_url_matches(&probe.url, target_url) {
@@ -288,6 +290,7 @@ pub async fn execute(
     input: &ModelInput,
 ) -> Result<InferenceTransportExecution> {
     let mut inference_cfg = route.config.clone();
+    ctx.ensure_active()?;
     let recover_stale_session = matches!(
         route.config.lifecycle,
         super::InferenceSessionLifecycle::Persistent
@@ -327,9 +330,14 @@ pub async fn execute(
     };
     inference_cfg.browser.target_url = target_url.clone();
 
+    ctx.ensure_active()?;
+    let attachment_cancellation = ctx.cancellation.clone();
     let (browser, session_id) = tokio::task::spawn_blocking({
         let mut browser = inference_cfg.browser.clone();
         move || {
+            if attachment_cancellation.is_cancelled() {
+                return Err(anyhow!("workflow execution was cancelled"));
+            }
             let session_id = ensure_live_browser_session(&mut browser)?;
             Ok::<_, anyhow::Error>((browser, session_id))
         }
@@ -370,6 +378,8 @@ pub async fn execute(
     let input_text = input.text.clone();
     let blocking_target_url = target_url.clone();
     let blocking_session_id = session_id.clone();
+    ctx.ensure_active()?;
+    let blocking_cancellation = ctx.cancellation.clone();
 
     let blocking_result = tokio::task::spawn_blocking(move || -> Result<_> {
         let current_probe = adapter::probe(&mut inference_cfg.browser).ok();
@@ -457,10 +467,11 @@ pub async fn execute(
             }
         }
 
-        let result = match adapter::send_chat_and_wait_with_pasted_context(
+        let result = match adapter::send_chat_and_wait_with_pasted_context_cancelable(
             &mut inference_cfg.browser,
             input_text.as_str(),
             pasted_context_text.as_deref(),
+            Some(&blocking_cancellation),
         ) {
             Ok(result) => result,
             Err(err) if is_stale_session_error(&err) => {
@@ -497,10 +508,11 @@ pub async fn execute(
                     }
                 }
 
-                adapter::send_chat_and_wait_with_pasted_context(
+                adapter::send_chat_and_wait_with_pasted_context_cancelable(
                     &mut inference_cfg.browser,
                     input_text.as_str(),
                     pasted_context_text.as_deref(),
+                    Some(&blocking_cancellation),
                 )?
             }
             Err(err) => return Err(err),
@@ -527,6 +539,7 @@ pub async fn execute(
     .map_err(|error| anyhow!("Browser bridge blocking task failed: {}", error))??;
 
     let (inference_cfg, readiness_failure, completed, uploaded_files) = blocking_result;
+    ctx.ensure_active()?;
     let theoretical_input_components = super::prompting::estimate_input_components(
         input,
         accounting_pasted_context.as_deref(),

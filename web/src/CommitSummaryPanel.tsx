@@ -1627,8 +1627,8 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
           ) : busy && commits.length === 0 ? (
             <Group justify="center" py="xl"><Loader /></Group>
           ) : (
-            <Box style={{ flex: 1, minHeight: 0, display: 'grid', gridTemplateColumns: 'minmax(520px, 1fr) minmax(360px, 0.62fr)', gap: 10 }}>
-              <ScrollArea style={{ minHeight: 0, width: '100%' }} type="auto" viewportRef={commitScrollViewportRef}>
+            <Box className={`mdev-workspace mdev-workspace-split${selectedCommit ? ' mdev-workspace--detail-open' : ''}`} style={{ flex: 1, minHeight: 0 }}>
+              <ScrollArea className="mdev-workspace-list" style={{ minHeight: 0, width: '100%' }} type="auto" viewportRef={commitScrollViewportRef}>
                 <Stack gap="xs" pr={4}>
                   {orderedCommits.map((commit) => {
                     const selected = selectedCommit?.sha === commit.sha;
@@ -1642,6 +1642,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
                       <Card
                         ref={setCommitItemMeasureRef(commit.sha)}
                         key={commit.sha}
+                        className="mdev-workspace-commit-row"
                         withBorder
                         p={7}
                         onMouseEnter={() => previewCommitDetails(commit)}
@@ -1705,6 +1706,7 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
               </ScrollArea>
 
               <Card
+                className="mdev-workspace-detail"
                 withBorder
                 p="sm"
                 onMouseEnter={() => {
@@ -1725,8 +1727,9 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
                   const pinned = selectedCommit?.sha === inspectorCommit.sha;
                   return (
                     <Stack gap="sm" style={{ minHeight: 0, flex: 1 }}>
+                      <Button className="mdev-workspace-mobile-action" size="xs" variant="default" onClick={() => { setSelectedCommit(null); setHoveredCommit(null); }}>Back to commits</Button>
                       <Stack gap={4}>
-                        <Group justify="space-between" wrap="nowrap" gap="xs">
+                        <Group justify="space-between" wrap="wrap" gap="xs">
                           <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
                             <Badge size="xs" variant="outline">{inspectorCommit.short_sha}</Badge>
                             <Text size="sm" fw={800} truncate title={inspectorCommit.subject}>{inspectorCommit.subject}</Text>
@@ -1766,8 +1769,8 @@ export function CommitSummaryPanel(props: CommitSummaryPanelProps) {
                   );
                 })() : (
                   <Stack gap={4} justify="center" align="center" style={{ flex: 1 }}>
-                    <Text size="sm" fw={800}>Hover a commit</Text>
-                    <Text size="xs" c="dimmed" ta="center">Changed files and per-file additions/deletions preview here. Click a commit to pin it.</Text>
+                    <Text size="sm" fw={800}>Select a commit</Text>
+                    <Text size="xs" c="dimmed" ta="center">Select a commit to inspect its changed files and review the diff.</Text>
                   </Stack>
                 )}
               </Card>

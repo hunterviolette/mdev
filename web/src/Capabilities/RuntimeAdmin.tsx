@@ -78,7 +78,7 @@ export function RuntimeAdmin() {
   }
 
   return (
-    <AppSurface p="md">
+    <AppSurface className="mdev-runtime-page" p="md">
       <Stack gap="sm">
         <Group justify="space-between" align="center" wrap="wrap" gap="sm">
           <Group gap="xs" wrap="wrap">
@@ -98,7 +98,7 @@ export function RuntimeAdmin() {
             />
           </Group>
 
-          <Group gap="xs" wrap="nowrap">
+          <Group gap="xs" wrap="wrap">
             <AppHeaderAction
               leftSection={<IconRefresh size={14} />}
               onClick={() => void refresh()}
@@ -120,8 +120,8 @@ export function RuntimeAdmin() {
 
         {error ? <Alert color="red">{error}</Alert> : null}
 
-          <ScrollArea h="70vh">
-            <Table striped highlightOnHover withTableBorder>
+          <ScrollArea className="mdev-runtime-scroll" h="70vh" type="auto">
+            <Table striped highlightOnHover withTableBorder className="mdev-responsive-table mdev-runtime-table">
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>Status</Table.Th>
@@ -137,18 +137,18 @@ export function RuntimeAdmin() {
               <Table.Tbody>
                 {visible.map((process) => (
                   <Table.Tr key={process.execution_id}>
-                    <Table.Td>
+                    <Table.Td data-label="Status" data-column="primary">
                       <Stack gap={3}>
                         <Badge color={statusColor(process.status)}>{process.status}</Badge>
                         <Text size="xs" c="dimmed">{process.mode}</Text>
                       </Stack>
                     </Table.Td>
-                    <Table.Td maw={320}>
+                    <Table.Td data-label="Command" data-column="command" maw={320}>
                       <Text fw={600} size="sm">{process.label || process.command_id}</Text>
                       <Code block>{process.command}</Code>
                       <Text size="xs" c="dimmed">{process.working_directory}</Text>
                     </Table.Td>
-                    <Table.Td>
+                    <Table.Td data-label="Owner" data-column="owner">
                       <Text size="sm">{process.owner.capability}</Text>
                       <Text size="xs" c="dimmed">run {process.owner.run_id.slice(0, 8)}</Text>
                       <Text size="xs" c="dimmed">step {process.owner.step_id}</Text>
@@ -156,17 +156,17 @@ export function RuntimeAdmin() {
                         <Text size="xs" c="dimmed">service {process.owner.service_id}</Text>
                       ) : null}
                     </Table.Td>
-                    <Table.Td>{process.pid ?? '—'}</Table.Td>
-                    <Table.Td>
+                    <Table.Td data-label="PID" data-column="pid">{process.pid ?? '—'}</Table.Td>
+                    <Table.Td data-label="Execution" data-column="execution">
                       <Text size="xs">{process.execution_id.slice(0, 8)}</Text>
                     </Table.Td>
-                    <Table.Td>
+                    <Table.Td data-label="Started" data-column="started">
                       <Text size="xs">{new Date(process.started_at).toLocaleString()}</Text>
                       {process.duration_ms != null ? (
                         <Text size="xs" c="dimmed">{process.duration_ms} ms</Text>
                       ) : null}
                     </Table.Td>
-                    <Table.Td maw={420}>
+                    <Table.Td data-label="Output" data-column="output" maw={420}>
                       <ScrollArea h={130}>
                         {process.stdout ? <Code block>{process.stdout}</Code> : null}
                         {process.stderr ? <Code block c="red">{process.stderr}</Code> : null}
@@ -175,7 +175,7 @@ export function RuntimeAdmin() {
                         ) : null}
                       </ScrollArea>
                     </Table.Td>
-                    <Table.Td>
+                    <Table.Td data-label="Controls" data-column="actions">
                       {ACTIVE.has(process.status) ? (
                         <Stack gap="xs">
                           <Button

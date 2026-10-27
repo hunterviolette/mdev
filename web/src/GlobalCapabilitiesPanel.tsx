@@ -213,18 +213,19 @@ export function GlobalCapabilitiesPanel(props: GlobalCapabilitiesPanelProps) {
           }
         }}
         title={
-          <Group gap="sm" wrap="nowrap">
+          <Stack gap={2} style={{ minWidth: 0 }}>
             <Text fw={600}>Automation</Text>
-            <Text size="sm" c="dimmed" fw={400}>
+            <Text size="sm" c="dimmed" fw={400} style={{ overflowWrap: 'anywhere' }}>
               Choose which behaviors run automatically and when they should activate.
             </Text>
-          </Group>
+          </Stack>
         }
-        size="min(1120px, 94vw)"
+        size="min(1120px, calc(100vw - 16px))"
         centered
         styles={{
-          content: { maxHeight: '92dvh' },
-          body: { overflow: 'hidden' },
+          content: { maxHeight: '92dvh', minWidth: 0 },
+          header: { minWidth: 0 },
+          body: { minWidth: 0, overflow: 'hidden' },
         }}
       >
         <Automation
