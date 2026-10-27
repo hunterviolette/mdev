@@ -2258,6 +2258,7 @@ export type ImpactEvent = {
 
 export type ImpactInferenceRecord = {
   id: string;
+  inference_session_id: string;
   step_id: string;
   stage_type: string;
   capability_invocation_id: string | null;
@@ -2289,7 +2290,7 @@ export function getImpactEvents(runId: string, filters: { after?: number; before
   return fetchJson<ImpactEventsResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/events?${query}`);
 }
 
-export function getImpactInference(runId: string, filters: { invocation_id?: string; step_id?: string; capability_invocation_id?: string; from?: string; to?: string; before?: string; limit?: number } = {}) {
+export function getImpactInference(runId: string, filters: { invocation_id?: string; step_id?: string; capability_invocation_id?: string; from?: string; to?: string; before?: string; before_id?: string; limit?: number } = {}) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') query.set(key, String(value));
   return fetchJson<ImpactInferenceResponse>(`/api/workflow-runs/${encodeURIComponent(runId)}/impact/inference?${query}`);

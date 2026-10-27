@@ -66,7 +66,6 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::connect(&db_url).await?;
     db::migrate(&db).await?;
-    db::migrate_supervisor_directories(&db).await?;
 
     let auth = auth::initialize(&db).await?;
     let state = AppState::new(db);

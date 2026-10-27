@@ -80,7 +80,7 @@ function thresholdUnit(descriptor: WorkflowAutomationControlDescriptor): string 
 
 function SectionRow(props: { title: string }) {
   return (
-    <Table.Tr>
+    <Table.Tr className="mdev-automation-section">
       <Table.Td colSpan={3} pt="md" pb="xs" px="sm">
         <Group gap="sm" wrap="nowrap">
           <Text size="xs" fw={700} tt="uppercase" c="dimmed" style={{ letterSpacing: '0.06em' }}>
@@ -140,17 +140,18 @@ export function Automation(props: AutomationProps) {
     descriptor.required_capabilities.every((capability) => invoked.has(capability));
 
   return (
-    <Stack gap="lg" h="100%">
+    <Stack className="mdev-automation-panel" gap="lg" h="100%" style={{ minWidth: 0, containerType: 'inline-size' }}>
       <ScrollArea.Autosize mah="calc(82dvh - 110px)" offsetScrollbars type="auto">
         <Table
+          className="mdev-automation-table"
           verticalSpacing={0}
           horizontalSpacing="md"
           withRowBorders={false}
-          style={{ tableLayout: 'fixed' }}
+          style={{ width: '100%', tableLayout: 'fixed' }}
         >
           <Table.Thead>
             <Table.Tr>
-              <Table.Th w={110} pb={6}>
+              <Table.Th w={76} pb={6}>
                 <Text
                   size="xs"
                   fw={700}
@@ -170,7 +171,7 @@ export function Automation(props: AutomationProps) {
                   Automation
                 </Text>
               </Table.Th>
-              <Table.Th w={260} pb={6}>
+              <Table.Th w={220} pb={6}>
                 <Text
                   size="xs"
                   fw={700}
@@ -194,7 +195,7 @@ export function Automation(props: AutomationProps) {
                   key={`new-session-${capability}`}
                   style={automationRowStyle(selected)}
                 >
-                  <Table.Td py="sm" pl="md">
+                  <Table.Td className="mdev-automation-enabled" py="sm" pl="md">
                     <Checkbox
                       aria-label={`Enable ${label}`}
                       checked={selected}
@@ -207,10 +208,10 @@ export function Automation(props: AutomationProps) {
                       }}
                     />
                   </Table.Td>
-                  <Table.Td py="sm">
+                  <Table.Td className="mdev-automation-description" py="sm">
                     <Text size="sm" fw={selected ? 600 : 400}>{label}</Text>
                   </Table.Td>
-                  <Table.Td py="sm">
+                  <Table.Td className="mdev-automation-trigger" py="sm">
                     <Text size="sm" c="dimmed">On session start</Text>
                   </Table.Td>
                 </Table.Tr>
@@ -231,7 +232,7 @@ export function Automation(props: AutomationProps) {
                       key={descriptor.key}
                       style={automationRowStyle(selected, available)}
                     >
-                      <Table.Td py="md" pl="md" style={{ verticalAlign: 'top' }}>
+                      <Table.Td className="mdev-automation-enabled" py="md" pl="md" style={{ verticalAlign: 'top' }}>
                         <Checkbox
                           mt={2}
                           aria-label={`Enable ${descriptor.label}`}
@@ -247,7 +248,7 @@ export function Automation(props: AutomationProps) {
                         />
                       </Table.Td>
 
-                      <Table.Td py="md">
+                      <Table.Td className="mdev-automation-description" py="md">
                         <Stack gap={3}>
                           <Text size="sm" fw={selected && available ? 600 : 400}>
                             {descriptor.label}
@@ -260,7 +261,7 @@ export function Automation(props: AutomationProps) {
                         </Stack>
                       </Table.Td>
 
-                      <Table.Td py="md" style={{ verticalAlign: 'top' }}>
+                      <Table.Td className="mdev-automation-trigger" py="md" style={{ verticalAlign: 'top' }}>
                         {descriptor.field_type === 'boolean' ? (
                           <Switch
                             mt={1}
@@ -276,7 +277,7 @@ export function Automation(props: AutomationProps) {
                             }}
                           />
                         ) : (
-                          <Group gap="xs" wrap="nowrap">
+                          <Group gap="xs" wrap="wrap" style={{ minWidth: 0 }}>
                             <Text size="sm" c="dimmed">after</Text>
                             <NumberInput
                               aria-label={`${descriptor.label} threshold`}

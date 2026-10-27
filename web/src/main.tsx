@@ -1,9 +1,40 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { MantineProvider } from '@mantine/core';
+import { MantineProvider, createTheme } from '@mantine/core';
 import '@mantine/core/styles.css';
 import '@xyflow/react/dist/style.css';
+import './responsive.css';
 import App from './App';
+
+const theme = createTheme({
+  primaryColor: 'blue',
+  defaultRadius: 'md',
+  spacing: {
+    xs: '0.375rem',
+    sm: '0.5rem',
+    md: '0.75rem',
+    lg: '1rem',
+    xl: '1.5rem',
+  },
+  breakpoints: {
+    xs: '30em',
+    sm: '48em',
+    md: '64em',
+    lg: '80em',
+    xl: '120em',
+  },
+  components: {
+    Paper: {
+      defaultProps: { radius: 'md' },
+    },
+    Card: {
+      defaultProps: { radius: 'md' },
+    },
+    Button: {
+      defaultProps: { radius: 'sm' },
+    },
+  },
+});
 
 const configuredApiBase = String(import.meta.env.VITE_API_BASE_URL ?? '')
   .trim()
@@ -38,7 +69,7 @@ if (!isQaProxyHost && configuredApiBase) {
 function renderApp() {
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
-      <MantineProvider defaultColorScheme="dark">
+      <MantineProvider theme={theme} defaultColorScheme="dark">
         <App />
       </MantineProvider>
     </React.StrictMode>

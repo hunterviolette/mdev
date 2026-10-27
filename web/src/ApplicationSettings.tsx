@@ -205,15 +205,16 @@ export function ApplicationSettings() {
   };
 
   return (
-    <Paper withBorder radius="md" p="lg">
-      <Stack gap="lg">
+    <Paper className="mdev-application-settings" withBorder radius="md" p="lg">
+      <Stack gap="lg" style={{ minWidth: 0 }}>
         <Title order={3}>Application Settings</Title>
         {loading ? <Loader size="sm" /> : (
           <>
-            <Stack gap="sm">
+            <Stack gap="sm" style={{ minWidth: 0 }}>
               <Title order={4}>Environment Configuration</Title>
               <Text size="sm" c="dimmed">Select the environment file loaded when MDEV starts. The application-root .env file takes precedence when present.</Text>
               <TextInput
+                className="mdev-settings-path-input"
                 label="Environment file path"
                 description="Enter an absolute path to an existing .env file. Leave empty to use the application default."
                 placeholder="C:\\Users\\YourName\\mdev\\.env"
@@ -223,28 +224,28 @@ export function ApplicationSettings() {
               />
               {envStatus && (
                 <Stack gap={4}>
-                  <Text size="sm">Effective path: <Code>{envStatus.effective_path}</Code></Text>
+                  <Text size="sm" className="mdev-settings-file-path">Effective path: <Code>{envStatus.effective_path}</Code></Text>
                   <Text size="sm" c={envStatus.readable ? 'green' : 'dimmed'}>{envStatus.readable ? 'Environment file is readable' : 'Environment file is not currently readable'}</Text>
                 </Stack>
               )}
               {envError && <Alert color="red">{envError}</Alert>}
               {envSaved && <Alert color="green">Environment configuration saved. Restart MDEV to load the selected environment file.</Alert>}
-              <Group justify="flex-end">
+              <Group className="mdev-settings-actions" justify="flex-end" wrap="wrap">
                 <Button onClick={() => void saveEnvironment()} loading={savingEnv}>Save Environment Configuration</Button>
               </Group>
             </Stack>
             <Divider />
-            <Stack gap="sm">
+            <Stack gap="sm" style={{ minWidth: 0 }}>
               <Title order={4}>Browser Configuration</Title>
               <Text size="sm" c="dimmed">Select the installed Chromium-based browser used for MDEV browser automation. Compatible browsers include Microsoft Edge, Google Chrome, Chromium and Brave.</Text>
-              <Radio.Group value={browserPath} onChange={(value) => { setBrowserPath(value); setBrowserSaved(false); setBrowserValidation(null); }}>
+              <Radio.Group className="mdev-settings-browser-list" value={browserPath} onChange={(value) => { setBrowserPath(value); setBrowserSaved(false); setBrowserValidation(null); }}>
                 <Stack gap="xs">
                   <Radio value="" label="Automatic browser selection" description="Use MDEV's built-in browser discovery order" />
                   {browsers.map((browser) => (
-                    <Group key={browser.id} justify="space-between" align="center" wrap="nowrap">
+                    <Group className="mdev-settings-browser-row" key={browser.id} justify="space-between" align="center" wrap="wrap" gap="sm">
                       <Radio
                         value={browser.executable_path}
-                        label={<Group gap="xs"><Text size="sm">{browser.name}</Text><Badge size="xs" color={browser.source === 'custom' ? 'blue' : 'gray'}>{browser.source}</Badge></Group>}
+                        label={<Group gap="xs" wrap="wrap"><Text size="sm">{browser.name}</Text><Badge size="xs" color={browser.source === 'custom' ? 'blue' : 'gray'}>{browser.source}</Badge></Group>}
                         description={<Text size="xs" style={{ overflowWrap: 'anywhere' }}>{browser.executable_path}</Text>}
                       />
                       {browser.source === 'custom' && <Button size="xs" variant="subtle" color="red" onClick={() => void removeCustomBrowser(browser)} disabled={savingBrowser || validatingBrowser}>Remove</Button>}
@@ -254,10 +255,11 @@ export function ApplicationSettings() {
               </Radio.Group>
               {browsers.length === 0 && <Text size="sm" c="dimmed">No installed browsers were discovered. Add a compatible browser executable below.</Text>}
               {!addingBrowser ? (
-                <Group><Button variant="light" onClick={() => setAddingBrowser(true)}>Add browser</Button><Button variant="subtle" onClick={() => void refresh()}>Refresh detected browsers</Button></Group>
+                <Group className="mdev-settings-actions" wrap="wrap"><Button variant="light" onClick={() => setAddingBrowser(true)}>Add browser</Button><Button variant="subtle" onClick={() => void refresh()}>Refresh detected browsers</Button></Group>
               ) : (
                 <Stack gap="xs">
                   <TextInput
+                    className="mdev-settings-path-input"
                     label="Custom browser executable path"
                     description="The executable must launch a CDP server and pass a real Playwright connection test."
                     placeholder="C:\\Path\\To\\Browser.exe"
@@ -265,7 +267,7 @@ export function ApplicationSettings() {
                     onChange={(event) => { setCustomPath(event.currentTarget.value); setBrowserValidation(null); }}
                     disabled={validatingBrowser}
                   />
-                  <Group>
+                  <Group className="mdev-settings-actions" wrap="wrap">
                     <Button loading={validatingBrowser} disabled={!customPath.trim()} onClick={() => void validateAndAddBrowser()}>Validate and add</Button>
                     <Button variant="default" disabled={validatingBrowser} onClick={() => { setAddingBrowser(false); setCustomPath(''); }}>Cancel</Button>
                   </Group>
@@ -276,7 +278,7 @@ export function ApplicationSettings() {
               {browserSaved && <Alert color="green">Browser configuration saved. New browser sessions will use the selected executable. MDEV does not need to restart.</Alert>}
               {browserPath !== savedBrowserPath && <Text size="xs" c="yellow">Unsaved browser configuration changes</Text>}
               <Text size="sm" c="dimmed">Existing browser sessions continue using their current browser until they are closed and relaunched. The selected path is shared through application settings.</Text>
-              <Group justify="flex-end">
+              <Group className="mdev-settings-actions" justify="flex-end" wrap="wrap">
                 <Button onClick={() => void saveBrowser()} loading={savingBrowser} disabled={browserPath === savedBrowserPath}>Save Browser Configuration</Button>
               </Group>
             </Stack>

@@ -107,6 +107,13 @@ export type CloseSessionCommand = {
   session_id: string;
 };
 
+export type CancelRequestCommand = {
+  id: string;
+  cmd: "cancel_request";
+  request_id: string;
+  session_id?: string;
+};
+
 export type BridgeCommand =
   | StartSessionCommand
   | ConnectOverCdpCommand
@@ -120,7 +127,8 @@ export type BridgeCommand =
   | SetPollConfigCommand
   | SetResponseTimeoutCommand
   | GetCookiesCommand
-  | CloseSessionCommand;
+  | CloseSessionCommand
+  | CancelRequestCommand;
 
 export type OkResponse = {
   id: string;

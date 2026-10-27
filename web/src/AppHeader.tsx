@@ -1,5 +1,6 @@
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties, MouseEvent, ReactNode } from 'react';
 import { Box, Button, Group, Paper, Stack, Tabs, type ButtonProps, type PaperProps } from '@mantine/core';
+import './AppHeader.css';
 
 export type AppHeaderView = 'workflows' | 'supervisor' | 'templates' | 'runtime' | 'settings';
 
@@ -21,15 +22,7 @@ export type AppHeaderActionProps = ButtonProps & {
 export function AppSurface(props: AppSurfaceProps) {
   const { children, style, ...paperProps } = props;
   return (
-    <Paper
-      withBorder
-      radius="md"
-      {...paperProps}
-      style={{
-        ...appSurfaceStyle,
-        ...(style ?? {}),
-      }}
-    >
+    <Paper withBorder radius="md" {...paperProps} style={{ ...appSurfaceStyle, ...(style ?? {}) }}>
       {children}
     </Paper>
   );
@@ -39,94 +32,87 @@ export function AppHeaderAction(props: AppHeaderActionProps) {
   return <Button size="xs" variant="light" {...props} />;
 }
 
+const navigation: { value: AppHeaderView; label: string; href: string }[] = [
+  { value: 'workflows', label: 'Workflows', href: '/workflows' },
+  { value: 'supervisor', label: 'Supervisors', href: '/supervisors' },
+  { value: 'templates', label: 'Templates', href: '/templates' },
+  { value: 'runtime', label: 'Runtime', href: '/runtime' },
+];
+
 export function AppHeader(props: {
   active: AppHeaderView;
   onChange: (value: AppHeaderView) => void;
-  onActiveDoubleClick?: () => void;
+  onActiveTabClick?: () => void;
   actions?: ReactNode;
   children?: ReactNode;
+  contextLabel?: ReactNode;
 }) {
+  const navigate = (event: MouseEvent<HTMLAnchorElement | HTMLButtonElement>, value: AppHeaderView) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    if (value === 'supervisor' && props.active === 'supervisor' && props.onActiveTabClick) {
+      props.onActiveTabClick();
+      return;
+    }
+    props.onChange(value);
+  };
+
+  const settingsActive = props.active === 'settings';
+
   return (
-    <AppSurface px="md" style={{ overflow: 'hidden' }}>
-      <Stack gap={0}>
-        <Group justify="space-between" align="center" wrap="wrap" gap="sm" mih={44}>
-          <Tabs value={props.active}>
-            <Tabs.List style={{ borderBottom: 0 }}>
+    <Box component="header" className="mdev-header">
+      <div className="mdev-header__primary">
+        <a
+          className="mdev-header__brand"
+          href="/workflows"
+          aria-label="mdev home"
+          onClick={(event) => navigate(event, 'workflows')}
+        >
+          <span className="mdev-header__mark" aria-hidden="true">m</span>
+          <span className="mdev-header__wordmark">m<span>dev</span></span>
+        </a>
+        <div className="mdev-header__divider" aria-hidden="true" />
+        <Tabs value={props.active} className="mdev-header__tabs">
+          <Tabs.List className="mdev-header__nav" aria-label="Application navigation">
+            {navigation.map((item) => (
               <Tabs.Tab
-                value="workflows"
-                renderRoot={(rootProps) => <a {...rootProps} href="/workflows" />}
-                onClick={(event) => {
-                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
-                  event.preventDefault();
-                  props.onChange('workflows');
-                }}
+                key={item.value}
+                value={item.value}
+                className="mdev-header__nav-item"
+                renderRoot={(rootProps) => <a {...rootProps} href={item.href} />}
+                onClick={(event) => navigate(event, item.value)}
               >
-                Workflows
+                {item.label}
               </Tabs.Tab>
-              <Tabs.Tab
-                value="supervisor"
-                renderRoot={(rootProps) => <a {...rootProps} href="/supervisors" />}
-                onClick={(event) => {
-                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
-                  event.preventDefault();
-                  props.onChange('supervisor');
-                }}
-                onDoubleClick={() => {
-                  if (props.active === 'supervisor') props.onActiveDoubleClick?.();
-                }}
-              >
-                Supervisors
-              </Tabs.Tab>
-              <Tabs.Tab
-                value="templates"
-                renderRoot={(rootProps) => <a {...rootProps} href="/templates" />}
-                onClick={(event) => {
-                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
-                  event.preventDefault();
-                  props.onChange('templates');
-                }}
-              >
-                Templates
-              </Tabs.Tab>
-              <Tabs.Tab
-                value="runtime"
-                renderRoot={(rootProps) => <a {...rootProps} href="/runtime" />}
-                onClick={(event) => {
-                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
-                  event.preventDefault();
-                  props.onChange('runtime');
-                }}
-              >
-                Runtime
-              </Tabs.Tab>
-              <Tabs.Tab
-                value="settings"
-                renderRoot={(rootProps) => <a {...rootProps} href="/settings" />}
-                onClick={(event) => {
-                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
-                  event.preventDefault();
-                  props.onChange('settings');
-                }}
-              >
-                Application Settings
-              </Tabs.Tab>
-            </Tabs.List>
-          </Tabs>
-
-          {props.actions ? <Group gap="xs" wrap="nowrap">{props.actions}</Group> : null}
-        </Group>
-
-        {props.children ? (
-          <Box
-            py="sm"
-            style={{
-              borderTop: '1px solid rgba(139,148,158,0.20)',
-            }}
+            ))}
+          </Tabs.List>
+        </Tabs>
+        <div className="mdev-header__utilities">
+          {props.actions ? <Group gap="xs" wrap="nowrap" className="mdev-header__actions">{props.actions}</Group> : null}
+          <a
+            href="/settings"
+            className={`mdev-header__settings${settingsActive ? ' mdev-header__settings--active' : ''}`}
+            aria-current={settingsActive ? 'page' : undefined}
+            title="Application settings"
+            onClick={(event) => navigate(event, 'settings')}
           >
-            {props.children}
-          </Box>
-        ) : null}
-      </Stack>
-    </AppSurface>
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2 2-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1 1.56V20h-2.82v-.09a1.7 1.7 0 0 0-1-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-2-2 .06-.06A1.7 1.7 0 0 0 7.5 15a1.7 1.7 0 0 0-1.56-1H5.8v-2.82h.09a1.7 1.7 0 0 0 1.56-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06 2-2 .06.06A1.7 1.7 0 0 0 11 6.64a1.7 1.7 0 0 0 1-1.56V5h2.82v.09a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 2 2-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.56 1H21v2.82h-.09a1.7 1.7 0 0 0-1.51.99Z" transform="translate(-1 -1)" />
+            </svg>
+            <span>Settings</span>
+          </a>
+        </div>
+      </div>
+      {props.children ? (
+        <div className="mdev-header__secondary">
+          <div className="mdev-header__context" aria-hidden="true">
+            <span className="mdev-header__context-dot" />
+            {props.contextLabel ?? 'Workspace'}
+          </div>
+          <div className="mdev-header__secondary-content">{props.children}</div>
+        </div>
+      ) : null}
+    </Box>
   );
 }

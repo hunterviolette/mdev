@@ -26,9 +26,12 @@ import {
   Text,
   TextInput,
   Textarea,
-  Title
+  Title,
+  Tooltip
 } from '@mantine/core';
-import { IconPlayerPause, IconPlayerPlay, IconRefresh, IconTrash } from '@tabler/icons-react';
+import { IconChevronDown, IconChevronRight, IconPlayerPause, IconPlayerPlay, IconRefresh, IconTrash } from '@tabler/icons-react';
+import { WorkflowTopology, normalizeWorkflowTopologyState, type WorkflowTopologyStage } from './WorkflowTopology';
+
 import {
   createRun,
   applyWorkflowChangeset,
@@ -100,6 +103,7 @@ import {
 import { StageInputAttachments, getStageInputAttachments, clearStageInputAttachments, serializeStageInputAttachments } from './StageInputAttachments';
 import { GlobalCapabilitiesPanel } from './GlobalCapabilitiesPanel';
 import { InferenceSessionsPanel } from './InferenceSessionsPanel';
+import { ModelHistoryTranscript } from './ModelHistoryTranscript';
 import { RepoTree, type RepoTreeEntry } from './RepoTree';
 import { ContextExportTree, resolveContextExport } from './Capabilities/ContextExport';
 import type { DiffPanelState } from './DiffPanel';
@@ -2419,6 +2423,7 @@ export function WorkflowShell(props: {
   const runtimeProjectionLastRequestedAtRef = useRef<Record<string, number>>({});
   const workflowDetailContentRef = useRef<HTMLDivElement | null>(null);
   const [workflowDetailPanelHeight, setWorkflowDetailPanelHeight] = useState<number | null>(null);
+  const [workflowMobileView, setWorkflowMobileView] = useState<'controls' | 'sessions' | 'events'>('sessions');
 
 
   function patchRuntimeDeployQAField<K extends keyof DeployQAValues>(
@@ -3486,10 +3491,15 @@ export function WorkflowShell(props: {
     if (!contentElement) return;
 
     function updatePanelHeight(element: HTMLDivElement) {
-      const rect = element.getBoundingClientRect();
+      if (window.matchMedia('(max-width: 1199px)').matches) {
+        setWorkflowDetailPanelHeight(null);
+        return;
+      }
+
+      const top = element.closest('.mdev-workflow-detail-grid')?.getBoundingClientRect().top ?? element.getBoundingClientRect().top;
       const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-      const availableHeight = Math.max(0, viewportHeight - rect.top - 16);
-      setWorkflowDetailPanelHeight(Math.ceil(Math.max(rect.height, availableHeight)));
+      const height = Math.max(320, Math.floor(viewportHeight - top - 16));
+      setWorkflowDetailPanelHeight((previous) => previous === height ? previous : height);
     }
 
     const updateCurrentPanelHeight = () => updatePanelHeight(contentElement);
@@ -4173,11 +4183,11 @@ export function WorkflowShell(props: {
     if (manuallyExpandedLiveExecutionIds.has(trail.key)) return true;
     if (manuallyCollapsedLiveExecutionIds.has(trail.key)) return false;
     if (stickyCompletedLiveExecutionId === trail.key) return true;
-    return getLiveExecutionDefaultExpanded(trail);
+    return liveExecutionTrails.findIndex((item) => item.key === trail.key) < 8;
   }
 
   function toggleLiveExecutionExpanded(trail: LiveStageTrail) {
-    const defaultExpanded = getLiveExecutionDefaultExpanded(trail);
+    const defaultExpanded = liveExecutionTrails.findIndex((item) => item.key === trail.key) < 8;
     const currentlyExpanded = isLiveExecutionExpanded(trail);
 
     if (currentlyExpanded) {
@@ -4868,6 +4878,25 @@ export function WorkflowShell(props: {
     return projection;
   }
 
+  function replayStageStatus(stage: EventChainSummaryResponse['stages'][number]): string {
+    if (stage.capabilities.length === 0) return stage.status;
+    const sortedCapabilities = [...stage.capabilities].sort((a, b) => {
+      const aTime = a.started_at || a.latest_created_at;
+      const bTime = b.started_at || b.latest_created_at;
+      return aTime.localeCompare(bTime) || a.latest_created_at.localeCompare(b.latest_created_at);
+    });
+    const terminalCapability = sortedCapabilities[sortedCapabilities.length - 1];
+    if (!terminalCapability) return stage.status;
+    const status = executionPresentation(terminalCapability.status).status;
+    if (status === 'completed' || status === 'failed' || status === 'paused') return status;
+    if (status === 'user_input') return 'waiting';
+    if (!stage.is_active) {
+      const stageStatus = executionPresentation(stage.status).status;
+      if (stageStatus === 'completed' || stageStatus === 'failed' || stageStatus === 'paused') return stageStatus;
+    }
+    return 'running';
+  }
+
   function mapLiveExecutionTrailsFromProjection(projection: EventChainSummaryResponse): LiveStageTrail[] {
     const stagesByExecutionId = new Map<string, EventChainSummaryResponse['stages'][number]>();
     for (const stage of projection.stages) {
@@ -4883,7 +4912,7 @@ export function WorkflowShell(props: {
       stepId: stage.step_id,
       label: stage.label,
       stageExecutionId: stage.stage_execution_id,
-      status: stage.status,
+      status: replayStageStatus(stage),
       latestCreatedAt: stage.latest_created_at,
       durationMs: stage.duration_ms,
       isActive: stage.is_active,
@@ -6215,25 +6244,11 @@ export function WorkflowShell(props: {
       return parts.join('\n\n');
     }
 
-    const sourceEvents = events.length > 0 ? events : executionItems;
-    const turns = collectModelIoTurns(sourceEvents);
-
-    if (turns.length > 0) return `${turns.length.toLocaleString()} model history turns`;
-    if (selectedLiveExecutionState?.loading) return '### MODEL I/O HISTORY\nLoading workflow model history…';
-    if (selectedLiveExecutionState?.error) return `### MODEL I/O HISTORY\nUnable to load workflow model history: ${selectedLiveExecutionState.error}`;
     return '';
   }, [composedInferencePrompt, events, inferenceResponse, selectedLiveExecutionState, selectedStepId, selectedWorkflowStep?.step_type]);
 
-  const modelHistoryTurns = useMemo(() => {
-    const executionItems = selectedLiveExecutionState?.chain?.items ?? [];
-    const sourceEvents = events.length > 0 ? events : executionItems;
-    return collectModelIoTurns(sourceEvents);
-  }, [events, selectedLiveExecutionState]);
-
-  const modelHistoryText = useMemo(() => modelHistoryCopyText(modelHistoryTurns), [modelHistoryTurns]);
-
   const previewViewerContent = previewViewerMode === 'stream'
-    ? (modelHistoryText || stageStreamContent)
+    ? stageStreamContent
     : previewViewerMode === 'prompt'
       ? composedInferencePrompt
       : inferenceResponse;
@@ -6629,18 +6644,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             <Tabs.Tab value="diff">Diff</Tabs.Tab>
           </Tabs.List>
           <Tabs.Panel value="model_io" pt="sm" style={{ flex: 1, minHeight: 0 }}>
-            {renderPreviewPanel(
-              'Model history',
-              stageStreamContent,
-              emptyText,
-              'stream',
-              <ModelHistoryContent
-                turns={modelHistoryTurns}
-                fallbackInput={composedInferencePrompt}
-                fallbackOutput={inferenceResponse}
-                emptyText={emptyText}
-              />
-            )}
+            <ModelHistoryTranscript
+              runId={selectedRunId}
+              emptyText={emptyText}
+              onFullScreen={() => { setPreviewViewerMode('stream'); setResponseViewerOpen(true); }}
+            />
           </Tabs.Panel>
           <Tabs.Panel value="diff" pt="sm" style={{ flex: 1, minHeight: 0 }}>
             <Suspense fallback={
@@ -6665,16 +6673,11 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
     if (selectedWorkflowStep?.step_type === 'sap_export') {
       return <></>;
     }
-    return renderPreviewPanel(
-      'Model history',
-      stageStreamContent,
-      emptyText,
-      'stream',
-      <ModelHistoryContent
-        turns={modelHistoryTurns}
-        fallbackInput={composedInferencePrompt}
-        fallbackOutput={inferenceResponse}
+    return (
+      <ModelHistoryTranscript
+        runId={selectedRunId}
         emptyText={emptyText}
+        onFullScreen={() => { setPreviewViewerMode('stream'); setResponseViewerOpen(true); }}
       />
     );
   }
@@ -7293,7 +7296,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
 
   return (
-    <AppShell padding="md">
+    <AppShell padding="md" className="mdev-responsive-shell">
       <AppShell.Main>
         <Stack>
           {error ? <Alert color="red">{error}</Alert> : null}
@@ -7302,6 +7305,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
             <>
               <AppHeader
                 active="workflows"
+                contextLabel={selectedRun?.status ?? 'Workflow'}
                 onChange={(next) => {
                   setView('monitor');
                   setMonitorView('workflow_list');
@@ -7322,18 +7326,32 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 }}
               >
                 <Tabs
-                    value={activeWorkspaceTab}
-                    onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}
-                  >
-                    <Tabs.List style={{ borderBottom: 0 }}>
-                  <Tabs.Tab value="workflows">Home ({workflowShortcutLabel(1)})</Tabs.Tab>
-                  <Tabs.Tab value="diff" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Changes ({workflowShortcutLabel(2)})</Tabs.Tab>
-                  <Tabs.Tab value="commits" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Commits ({workflowShortcutLabel(3)})</Tabs.Tab>
-                  <Tabs.Tab value="files" disabled={!((selectedRun?.repo_ref ?? repoRef ?? '').trim())}>Repository ({workflowShortcutLabel(4)})</Tabs.Tab>
-                  <Tabs.Tab value="capabilities">Capabilities ({workflowShortcutLabel(5)})</Tabs.Tab>
-                  <Tabs.Tab value="impact">Impact ({workflowShortcutLabel(6)})</Tabs.Tab>
-                    </Tabs.List>
-                  </Tabs>
+                  value={activeWorkspaceTab}
+                  onChange={(value) => setActiveWorkspaceTab((value as WorkspaceTabKey) ?? 'workflows')}
+                  className="workspace-nav"
+                >
+                  <Tabs.List className="workspace-nav__list" aria-label="Workflow navigation">
+                    {([
+                      { value: 'workflows', label: 'Home', shortcut: 1, requiresRepo: false },
+                      { value: 'diff', label: 'Changes', shortcut: 2, requiresRepo: true },
+                      { value: 'commits', label: 'Commits', shortcut: 3, requiresRepo: true },
+                      { value: 'files', label: 'Repository', shortcut: 4, requiresRepo: true },
+                      { value: 'capabilities', label: 'Capabilities', shortcut: 5, requiresRepo: false },
+                      { value: 'impact', label: 'Impact', shortcut: 6, requiresRepo: false },
+                    ] as const).map((item) => (
+                      <Tabs.Tab
+                        key={item.value}
+                        value={item.value}
+                        className="workspace-nav__tab"
+                        disabled={item.requiresRepo && !((selectedRun?.repo_ref ?? repoRef ?? '').trim())}
+                        title={`${item.label} (${workflowShortcutLabel(item.shortcut)})`}
+                      >
+                        <span>{item.label}</span>
+                        <span className="workspace-nav__shortcut" aria-hidden="true">{workflowShortcutLabel(item.shortcut)}</span>
+                      </Tabs.Tab>
+                    ))}
+                  </Tabs.List>
+                </Tabs>
               </AppHeader>
             </>
           ) : null}
@@ -7348,12 +7366,13 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               fullScreen
               padding="md"
               zIndex={200}
+              classNames={{ body: 'mdev-builder-modal-body' }}
               styles={{
-                body: { paddingTop: 0, height: 'calc(100vh - 72px)' },
+                body: { paddingTop: 0, height: 'calc(100dvh - 72px)' },
                 content: { background: 'var(--mantine-color-body)' }
               }}
             >
-              <Stack h="100%" gap="sm">
+              <Stack className="mdev-builder-modal-content" h="100%" gap="sm">
                 <AppSurface p="sm">
                   <Stack gap="sm">
                     <Group justify="space-between" align="flex-start" wrap="wrap">
@@ -7387,7 +7406,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                   </Stack>
                 </AppSurface>
 
-                <AppSurface p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
+                <AppSurface className="mdev-builder-modal-workspace" p={0} style={{ overflow: 'hidden', flex: 1, minHeight: 0 }}>
                   <WorkflowBuilderEditor
                     key={`builder-load-${builderLoadRevision}`}
                     initialDefinition={loadedTemplateDefinition}
@@ -7651,7 +7670,7 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     {templates.length === 0 ? (
                       <Text size="sm" c="dimmed">No saved templates yet.</Text>
                     ) : (
-                      <Table striped highlightOnHover>
+                      <Table striped highlightOnHover className="mdev-responsive-table mdev-templates-table">
                         <Table.Thead>
                           <Table.Tr>
                             <Table.Th>Template</Table.Th>
@@ -7663,19 +7682,19 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Table.Tbody>
                           {templates.map((template) => (
                             <Table.Tr key={template.id}>
-                              <Table.Td>
+                              <Table.Td data-label="Template" data-column="primary">
                                 <Text fw={700}>{template.name}</Text>
                               </Table.Td>
-                              <Table.Td>
+                              <Table.Td data-label="Description" data-column="description">
                                 <Text size="sm" c="dimmed" lineClamp={2}>
                                   {template.description || 'No description provided.'}
                                 </Text>
                               </Table.Td>
-                              <Table.Td>
+                              <Table.Td data-label="Repository" data-column="repository">
                                 <Code>{template.repo_ref || '—'}</Code>
                               </Table.Td>
-                              <Table.Td>
-                                <Group gap="xs" wrap="nowrap">
+                              <Table.Td data-label="Actions" data-column="actions">
+                                <Group gap="xs" wrap="wrap">
                                   <Button
                                     size="compact-xs"
                                     variant="light"
@@ -7719,7 +7738,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           <Badge variant="light" color="gray">{runs.length}</Badge>
                         </Group>
                       </Group>
-                      <Table striped highlightOnHover>
+                      <Table.ScrollContainer minWidth={0} className="mdev-workflow-list-region">
+                        <Table striped highlightOnHover className="mdev-workflow-table">
                         <Table.Thead>
                           <Table.Tr>
                             <Table.Th>Workflow</Table.Th>
@@ -7733,17 +7753,17 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                         <Table.Tbody>
                           {runs.map((run) => (
                             <Table.Tr key={run.id}>
-                              <Table.Td>
+                              <Table.Td data-label="Workflow" data-column="workflow">
                                 <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)}>
                                   {run.title}
                                 </Anchor>
                               </Table.Td>
-                              <Table.Td><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
-                              <Table.Td><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
-                              <Table.Td><Code>{run.repo_ref}</Code></Table.Td>
-                              <Table.Td>{formatTimestamp(run.updated_at)}</Table.Td>
-                              <Table.Td>
-                                <Group gap="xs">
+                              <Table.Td data-label="Status" data-column="status"><Badge color={statusColor(run.status)}>{run.status}</Badge></Table.Td>
+                              <Table.Td data-label="Current step" data-column="step"><Code>{run.current_step_id ?? '—'}</Code></Table.Td>
+                              <Table.Td data-label="Repository" data-column="repository"><Code>{run.repo_ref}</Code></Table.Td>
+                              <Table.Td data-label="Updated" data-column="updated">{formatTimestamp(run.updated_at)}</Table.Td>
+                              <Table.Td data-label="Actions" data-column="actions">
+                                <Group gap="xs" wrap="wrap">
                                   <Anchor href={workflowRoute(run.id)} onClick={(event) => handleWorkflowLinkClick(event, run.id)} size="sm">
                                     Open
                                   </Anchor>
@@ -7753,7 +7773,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                             </Table.Tr>
                           ))}
                         </Table.Tbody>
-                      </Table>
+                        </Table>
+                      </Table.ScrollContainer>
                     </Stack>
                   </AppSurface>
 
@@ -7796,93 +7817,154 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
               )}
             </Stack>
           ) : (
-            <Grid align="start">
-              <Grid.Col span={{ base: 12, xl: 7 }}>
+            <>
+              <Group className="mdev-workflow-mobile-navigation" gap="xs" grow>
+                <Button size="sm" variant={workflowMobileView === 'controls' ? 'filled' : 'light'} onClick={() => setWorkflowMobileView('controls')}>Controls</Button>
+                <Button size="sm" variant={workflowMobileView === 'sessions' ? 'filled' : 'light'} onClick={() => setWorkflowMobileView('sessions')}>Sessions</Button>
+                <Button size="sm" variant={workflowMobileView === 'events' ? 'filled' : 'light'} onClick={() => setWorkflowMobileView('events')}>Events</Button>
+              </Group>
+              <Grid align="start" className="mdev-workflow-detail-grid" data-mobile-view={workflowMobileView}>
+              <Grid.Col span={{ base: 12, xl: 7 }} className="mdev-workflow-detail-left-column">
                 <Stack
                   ref={workflowDetailContentRef}
+                  className="mdev-workflow-detail-left"
                   style={{
-                    width: '100%'
+                    width: '100%',
+                    height: workflowDetailPanelHeight ?? undefined,
+                    maxHeight: workflowDetailPanelHeight ?? undefined,
+                    minHeight: 0
                   }}
                 >
-                  <AppSurface p="md">
+                  <AppSurface p="md" className="mdev-workflow-operations-surface">
                     {selectedRun ? (
                       <Stack>
-                        <Group justify="space-between">
-                          <Group>
-                            <div>
-                              <Title order={4}>{selectedRun.title}</Title>
-                              <Text c="dimmed">{selectedRun.repo_ref}</Text>
-                            </div>
-                          </Group>
-                          <Badge color={statusColor(selectedRun.status)}>{selectedRun.status}</Badge>
+                        <Group className="mdev-workflow-identity" gap="sm" wrap="nowrap" align="center">
+                          <Title order={4} className="mdev-workflow-identity-title">{selectedRun.title}</Title>
+                          {selectedRun.repo_ref ? (
+                            <Tooltip
+                              position="bottom-start"
+                              withArrow
+                              multiline
+                              withinPortal
+                              label={
+                                <Stack gap={4} style={{ maxWidth: 'min(460px, calc(100vw - 48px))' }}>
+                                  <Text size="xs" style={{ overflowWrap: 'anywhere' }}>{selectedRun.repo_ref}</Text>
+                                  <Text size="xs" c="dimmed">Click to copy</Text>
+                                </Stack>
+                              }
+                            >
+                              <button
+                                type="button"
+                                className="mdev-workflow-repo-path"
+                                aria-label={`Copy repository path: ${selectedRun.repo_ref}`}
+                                onClick={() => void navigator.clipboard.writeText(selectedRun.repo_ref)}
+                              >
+                                <span className="mdev-workflow-repo-path-label">{selectedRun.repo_ref}</span>
+                              </button>
+                            </Tooltip>
+                          ) : null}
                         </Group>
-                        <Stack gap="md">
-                          <Group justify="space-between" align="flex-start" wrap="wrap">
-                            <Group>
-                              <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !['paused', 'waiting', 'error', 'success', 'complete'].includes(selectedRun?.status ?? '') || isBackendRunLocked}>Run autonomously</Button>
-                              <Button variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
-                              <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={() => selectedRunId && void refreshRunDetails(selectedRunId)}>Refresh run</Button>
-                              <Button variant="default" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Cancel run</Button>
-                            </Group>
-                            <Stack gap={2} align="flex-end">
-                              <Text size="xs" c="dimmed">Created: {formatTimestamp(selectedRun.created_at)}</Text>
-                              <Text size="xs" c="dimmed">Updated: {formatTimestamp(selectedRun.updated_at)}</Text>
-                            </Stack>
-                          </Group>
-                          <Card withBorder>
-                            <Stack gap="md">
-                              <Group justify="space-between" align="center">
-                                <Title order={6}>Workflow controls</Title>
-                              </Group>
-                              <Group>
-                                <Button variant="default" onClick={() => void handleManualPatchStageState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview}>Save stage inputs</Button>
-                                <Button onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview} loading={manualCapabilityBusy}>Run stage</Button>
-                                <Button variant="light" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>View run context</Button>
-                              </Group>
-                            </Stack>
-                          </Card>
-                        </Stack>
-                        <Card withBorder>
-                          <Stack gap="md">
-                            <Text fw={600}>Workflow progress</Text>
+                        <Stack gap="sm" className="mdev-workflow-unified-controls">
+                          <div className="mdev-workflow-unified-actions">
+                            <Button className="mdev-workflow-action-auto" leftSection={<IconPlayerPlay size={16} />} onClick={() => void handleStartRun()} loading={busy} disabled={!selectedRunId || !['paused', 'waiting', 'error', 'success', 'complete'].includes(selectedRun?.status ?? '') || isBackendRunLocked}>Run autonomously</Button>
+                            <Button className="mdev-workflow-action-run" variant="light" onClick={() => void handleManualRunWithPatchedState()} disabled={!isInteractiveMode || !selectedRunStepId || isBackendRunLocked || hasPendingDispositionReview} loading={manualCapabilityBusy}>Run stage</Button>
+                            <Button className="mdev-workflow-action-pause" variant="default" leftSection={<IconPlayerPause size={16} />} onClick={() => void handlePauseRun()} loading={pauseRequestBusy} disabled={!canRequestRunPause}>{hasPendingDispositionReview ? 'Pause outcome' : 'Pause after stage'}</Button>
+                            <Button className="mdev-workflow-action-context" variant="default" onClick={() => setRunContextOpen(true)} disabled={!selectedRun}>Run context</Button>
+                            <Button className="mdev-workflow-action-cancel" color="red" variant="subtle" onClick={() => void handleForceWaitRun()} disabled={!selectedRunId || selectedRun?.status !== 'running'}>Cancel run</Button>
+                          </div>
+                          <Box className="mdev-workflow-control-topology">
                             {selectedRunDefinition ? (
-                              <Group gap="sm" wrap="wrap" align="stretch">
+                              <WorkflowTopology
+                                rail
+                                selectedId={selectedRunStepId}
+                                onSelect={handleStageCardClick}
+                                stages={selectedRunDefinition.steps.map((step, index): WorkflowTopologyStage => {
+                                  const currentIndex = selectedRunDefinition.steps.findIndex((item) => item.id === selectedRun?.current_step_id);
+                                  const trail = liveExecutionTrails.filter((item) => item.stepId === step.id).sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt))[0];
+                                  const runStatus = (selectedRun?.status ?? '').toLowerCase();
+                                  const trailStatus = (trail?.status ?? '').toLowerCase();
+                                  const runComplete = runStatus === 'complete' || runStatus === 'success' || runStatus === 'completed';
+                                  const current = selectedRun?.current_step_id === step.id;
+                                  const failed = trailStatus.includes('fail') || trailStatus.includes('error') || (current && (runStatus === 'error' || runStatus === 'failed'));
+                                  const complete = !failed && (trailStatus.includes('complet') || trailStatus.includes('success') || (runComplete && (currentIndex < 0 || index <= currentIndex)) || (currentIndex >= 0 && index < currentIndex));
+                                  const running = !complete && !failed && (trail?.isActive || (current && runStatus === 'running'));
+                                  const waiting = !complete && !failed && !running && current;
+                                  return {
+                                    id: step.id,
+                                    label: step.name,
+                                    state: normalizeWorkflowTopologyState(failed ? 'failed' : complete ? 'complete' : running ? 'active' : waiting ? 'waiting' : 'future')
+                                  };
+                                })}
+                              />
+                            ) : null}
+                            {selectedRunDefinition ? (
+                              <Box className="mdev-workflow-progress-source" aria-hidden="true" style={{ display: 'none' }}>
                                   {selectedRunDefinition.steps.map((step, index) => {
-                                    const isCurrent = selectedRun?.current_step_id === step.id;
                                     const currentIndex = selectedRunDefinition.steps.findIndex((item) => item.id === selectedRun?.current_step_id);
-                                    const isCompleted = currentIndex >= 0 && index < currentIndex;
-                                    const isUnknownCurrentStep = Boolean(selectedRun?.current_step_id) && currentIndex < 0;
-                                    const color = isCurrent ? 'blue' : isCompleted ? 'green' : 'gray';
+                                    const trail = liveExecutionTrails.filter((item) => item.stepId === step.id).sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt))[0];
+                                    const runStatus = (selectedRun?.status ?? '').toLowerCase();
+                                    const trailStatus = (trail?.status ?? '').toLowerCase();
+                                    const isRunComplete = runStatus === 'complete' || runStatus === 'success';
+                                    const isCurrent = selectedRun?.current_step_id === step.id;
+                                    const isFailed = trailStatus.includes('fail') || trailStatus.includes('error') || (isCurrent && runStatus === 'error');
+                                    const isCompleted = !isFailed && (trailStatus.includes('complet') || trailStatus.includes('success') || (isRunComplete && (currentIndex < 0 || index <= currentIndex)) || (currentIndex >= 0 && index < currentIndex));
+                                    const isRunning = !isCompleted && !isFailed && (trail?.isActive || (isCurrent && runStatus === 'running'));
+                                    const isWaiting = !isCompleted && !isFailed && !isRunning && isCurrent;
+                                    const statusLabel = isFailed ? 'FAILED' : isCompleted ? 'COMPLETE' : isRunning ? 'RUNNING' : isWaiting ? 'WAITING' : 'FUTURE';
+                                    const color = isFailed ? 'red' : isCompleted ? 'green' : isRunning ? 'blue' : isWaiting ? 'yellow' : 'gray';
+                                    const capabilities = trail?.capabilities ?? [];
+                                    const terminalCapability = capabilities.filter((capability) => !capability.isActive && capability.message.trim()).sort((a, b) => b.latestCreatedAt.localeCompare(a.latestCreatedAt))[0];
+                                    const capabilityMessage = terminalCapability?.message?.trim() ?? '';
+                                    const isSelected = selectedRunStepId === step.id;
                                     return (
-                                      <Group key={step.id} gap="sm" wrap="nowrap" align="center">
+                                      <Box key={step.id} className="mdev-workflow-progress-item" data-selected={isSelected} data-status={statusLabel.toLowerCase()}>
                                         <Box
-                                          p="md"
+                                          p="sm"
+                                          className="mdev-workflow-progress-card"
                                           onClick={() => handleStageCardClick(step.id)}
                                           style={{
-                                            minWidth: 180,
-                                            borderRadius: 12,
+                                            minWidth: 0,
+                                            borderRadius: 10,
                                             border: `1px solid var(--mantine-color-${color}-6)`,
-                                            background: isCurrent
-                                              ? 'rgba(34, 139, 230, 0.14)'
-                                              : isCompleted
-                                                ? 'rgba(64, 192, 87, 0.12)'
-                                                : 'rgba(255,255,255,0.02)',
+                                            background: isFailed
+                                              ? 'rgba(250,82,82,0.09)'
+                                              : isRunning
+                                                ? 'rgba(34,139,230,0.12)'
+                                                : isCompleted
+                                                  ? 'rgba(64,192,87,0.08)'
+                                                  : isWaiting
+                                                    ? 'rgba(250,176,5,0.08)'
+                                                    : 'rgba(255,255,255,0.02)',
                                             cursor: 'pointer'
                                           }}
                                         >
-                                          <Stack gap={6}>
-                                            <Badge color={color} variant={isCurrent ? 'filled' : 'light'} style={{ alignSelf: 'flex-start' }}>
-                                              {index + 1}
-                                            </Badge>
-                                            <Text fw={600}>{step.name}</Text>
-                                            <Text size="xs" c="dimmed">{step.automation_mode}</Text>
-                                            <Badge color={color} variant={isCurrent ? 'filled' : 'light'} style={{ alignSelf: 'flex-start' }}>
-                                              {isCurrent ? 'ACTIVE' : isCompleted ? 'DONE' : 'UP NEXT'}
-                                            </Badge>
+                                          <Stack gap={8}>
+                                            <Group justify="space-between" align="center" wrap="nowrap">
+                                              <Badge color={color} variant={isRunning ? 'filled' : 'light'} size="sm" circle>
+                                                {index + 1}
+                                              </Badge>
+                                              <Badge color={color} variant="light" size="xs">
+                                                {statusLabel}
+                                              </Badge>
+                                            </Group>
+                                            <Box>
+                                              <Text fw={600} size="sm" lineClamp={2}>{step.name}</Text>
+                                              <Text size="xs" c="dimmed" lineClamp={1}>{step.automation_mode}</Text>
+                                            </Box>
+                                            {capabilityMessage ? (
+                                              <Text size="xs" c={isFailed ? 'red' : 'dimmed'} lineClamp={2} className="mdev-stage-terminal-message" title={capabilityMessage}>
+                                                {capabilityMessage}
+                                              </Text>
+                                            ) : null}
+                                            {capabilities.length > 0 ? (
+                                              <Group gap={4} justify="space-between" wrap="nowrap">
+                                                <Text size="xs" c="dimmed">{capabilities.filter((capability) => !capability.isActive).length}/{capabilities.length} capabilities</Text>
+                                                {trail?.durationMs != null ? <Text size="xs" c="dimmed">{trail.durationMs < 1000 ? `${Math.round(trail.durationMs)} ms` : `${(trail.durationMs / 1000).toFixed(1)} s`}</Text> : null}
+                                              </Group>
+                                            ) : null}
                                           </Stack>
                                         </Box>
-                                        {index < selectedRunDefinition.steps.length - 1 ? <Text c="dimmed" fw={700}>→</Text> : null}
-                                      </Group>
+                                      </Box>
                                     );
                                   })}
                                   {Boolean(selectedRun?.current_step_id) && selectedRunDefinition.steps.findIndex((item) => item.id === selectedRun.current_step_id) < 0 ? (
@@ -7890,23 +7972,23 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                       Current step id: {selectedRun.current_step_id}
                                     </Alert>
                                   ) : null}
-                                </Group>
+                                </Box>
                             ) : (
                               <Text c="dimmed">The selected run is not linked to a loaded template.</Text>
                             )}
-                          </Stack>
-                        </Card>
+                          </Box>
+                        </Stack>
                       </Stack>
                     ) : (
                       <Text c="dimmed">No workflow selected.</Text>
                     )}
                   </AppSurface>
 
-                  <AppSurface p="md">
-                    <Stack>
-                      <Grid align="stretch">
-                        <Grid.Col span={{ base: 12, xl: 4 }}>
-                          <Stack>
+                  <AppSurface p="md" className="mdev-workflow-stage-surface mdev-workflow-integrated-inputs">
+                    <Stack className="mdev-stage-workspace">
+                      <Grid align="stretch" className="mdev-stage-workspace-grid">
+                        <Grid.Col span={{ base: 12, xl: 4 }} className="mdev-stage-inputs-column">
+                          <Stack className="mdev-workflow-stage-controls">
                             {pendingDispositionReview && pendingDispositionReview.stageId === selectedWorkflowStep?.id ? (
                               <>
                                 <Card withBorder>
@@ -8033,8 +8115,8 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                             ) : null}
                           </Stack>
                         </Grid.Col>
-                        <Grid.Col span={{ base: 12, xl: 8 }} style={{ display: 'flex' }}>
-                          <Box style={{ flex: 1 }}>
+                        <Grid.Col span={{ base: 12, xl: 8 }} className="mdev-stage-history-column mdev-workflow-session-panel" style={{ display: 'flex' }}>
+                          <Box className="mdev-stage-history-content" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
                             {showStageStream ? <StageStreamPanel renderStageStreamPanel={renderStageStreamPanel} /> : null}
                           </Box>
                         </Grid.Col>
@@ -8049,11 +8131,16 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
 
                 <Grid.Col
                   span={{ base: 12, xl: 5 }}
+                  className="mdev-workflow-events-panel"
                   style={{
                     height: workflowDetailPanelHeight ?? undefined,
-                    minHeight: 320,
+                    minHeight: workflowDetailPanelHeight === null ? 0 : 240,
+                    maxHeight: workflowDetailPanelHeight ?? undefined,
                     display: 'flex',
-                    overflow: 'hidden'
+                    flexDirection: 'column',
+                    alignSelf: 'start',
+                    overflow: 'hidden',
+                    minWidth: 0
                   }}
                 >
                   <AppSurface
@@ -8067,100 +8154,104 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                     }}
                   >
                     <Stack h="100%" gap="sm" style={{ minHeight: 0, flex: 1 }}>
-                      <Group justify="space-between" style={{ flexShrink: 0 }}>
-                        <Group gap="xs">
-                          <Title order={5}>Live workflow events</Title>
-                          <Badge color={eventStreamStatus.color} variant="light">Stream {eventStreamStatus.label}</Badge>
+                      <Box className="mdev-workflow-events-header mdev-replay-toolbar" style={{ flexShrink: 0 }}>
+                        <Group gap="xs" wrap="wrap" className="mdev-replay-toolbar-title">
+                          <Title order={5}>Event replay</Title>
+                          <Badge color={eventStreamStatus.color} variant="light" size="sm">{eventStreamStatus.label}</Badge>
                         </Group>
-                        <Group gap="xs" align="center">
-                <Text size="xs" c="dimmed">Event window
-                </Text>
-                <Select
-                  value={String(eventWindow)}
-                  onChange={(value) => {
-                    const next = Number(value);
-                    if (Number.isFinite(next) && next > 0) {
-                      setEventWindow(next);
-                    }
-                  }}
-                  data={['20', '50', '100', '200']}
-                  allowDeselect={false}
-                  size="xs"
-                  w={82}
-                />
-              </Group>
-              <Button
-                size="xs"
-                variant="light"
-                leftSection={<IconRefresh size={14} />}
-                onClick={() => {
-                  if (!selectedRunId) return;
-                  void Promise.all([
-                    hydrateWorkflowEventsFromHistory(selectedRunId, eventWindow),
-                    hydrateRuntimeProjection(selectedRunId, eventWindow)
-                  ]);
-                }}
-              >
-                Refresh events</Button>
-                      </Group>
+                        <Group gap="xs" wrap="wrap" className="mdev-replay-toolbar-actions">
+                          <Text size="xs" c="dimmed">Events</Text>
+                          <Select
+                            aria-label="Event window"
+                            value={String(eventWindow)}
+                            onChange={(value) => {
+                              const next = Number(value);
+                              if (Number.isFinite(next) && next > 0) setEventWindow(next);
+                            }}
+                            data={['20', '50', '100', '200']}
+                            allowDeselect={false}
+                            size="xs"
+                            w={76}
+                          />
+                          <Tooltip label="Refresh workflow events">
+                            <ActionIcon
+                              aria-label="Refresh workflow events"
+                              size="lg"
+                              variant="light"
+                              onClick={() => {
+                                if (!selectedRunId) return;
+                                void Promise.all([
+                                  hydrateWorkflowEventsFromHistory(selectedRunId, eventWindow),
+                                  hydrateRuntimeProjection(selectedRunId, eventWindow)
+                                ]);
+                              }}
+                            >
+                              <IconRefresh size={16} />
+                            </ActionIcon>
+                          </Tooltip>
+                        </Group>
+                      </Box>
                       <ScrollArea
                         type="auto"
                         offsetScrollbars
-                        style={{ flex: 1, minHeight: 0 }}
+                        className="mdev-workflow-events-scroll"
+                        style={{ flex: '1 1 auto', minHeight: 0, minWidth: 0, overflow: 'hidden' }}
                       >
                         {liveExecutionTrails.length > 0 ? (
-                          <Stack gap="xs" pr="xs">
+                          <Stack gap="xs" px="sm">
                             {liveExecutionTrails.map((trail, index) => {
                             const trailExpanded = isLiveExecutionExpanded(trail);
                             return (
                               <Box
                                 key={trail.key}
                                 p="sm"
+                                className="mdev-workflow-event-card mdev-replay-stage"
+                                data-replay-tone={executionPresentation(trail.status).tone}
                                 style={{
-                                  border: `1px solid var(--mantine-color-${executionPresentation(trail.status).tone}-4)`,
-                                  borderRadius: 10,
-                                  background: trail.isCurrent
-                                    ? 'rgba(34, 139, 230, 0.08)'
-                                    : trail.isActive
-                                      ? 'rgba(250, 176, 5, 0.08)'
-                                      : executionPresentation(trail.status).tone === 'green'
-                                        ? 'rgba(64, 192, 87, 0.08)'
-                                        : executionPresentation(trail.status).tone === 'red'
-                                          ? 'rgba(250, 82, 82, 0.08)'
-                                          : executionPresentation(trail.status).tone === 'yellow'
-                                            ? 'rgba(250, 176, 5, 0.08)'
-                                            : 'rgba(255,255,255,0.02)'
+                                  border: '1px solid var(--mantine-color-default-border)',
+                                  borderLeft: `3px solid var(--mantine-color-${executionPresentation(trail.status).tone}-5)`,
+                                  borderRadius: 8,
+                                  background: 'var(--mantine-color-body)'
                                 }}
                               >
-                                <Group justify="space-between" align="center" wrap="nowrap">
-                                  <Group gap="xs" wrap="wrap" style={{ flex: 1 }}>
-                                    <Badge color={executionPresentation(trail.status).tone}>
+                                <Group justify="space-between" align="center" wrap="wrap" className="mdev-live-execution-header mdev-replay-stage-header">
+                                  <Group gap="xs" wrap="wrap" className="mdev-live-execution-identity" style={{ flex: '1 1 180px', minWidth: 0 }}>
+                                    <Text fw={650} size="sm" className="mdev-replay-stage-title">
+                                      {trail.stepId === '__ungrouped__'
+                                        ? 'Workflow'
+                                        : trail.stepId.replace(/-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, '').replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())}
+                                    </Text>
+                                    <Badge color={executionPresentation(trail.status).tone} variant="filled" size="sm">
                                       {executionPresentation(trail.status).label}
                                     </Badge>
-                                    <Badge variant="light">{trail.stepId !== '__ungrouped__' ? trail.stepId : trail.label}</Badge>
+                                    <Text size="xs" c="dimmed">{trail.capabilities.length} capabilities</Text>
                                   </Group>
-                                  <Group gap="md" align="center" wrap="nowrap">
-                                    <Stack gap={0} align="flex-end">
-                                      <Text size="sm" fw={600}>{formatTimestamp(trail.latestCreatedAt)}</Text>
-                                      <Text size="sm" fw={600}>{formatDurationMs(trail.durationMs, null, null)}</Text>
-                                    </Stack>
-                                    <Button
-                                      size="xs"
-                                      variant="subtle"
-                                      onClick={() => {
-                                        toggleLiveExecutionExpanded(trail);
-                                        if (!trailExpanded) {
-                                          void ensureLiveExecutionChainLoaded(trail);
-                                        }
-                                      }}
-                                    >
-                                      {trailExpanded ? 'Collapse execution' : 'Expand execution'}
-                                    </Button>
+                                  <Group gap="sm" align="center" wrap="wrap" className="mdev-live-execution-meta">
+                                    <Group gap="xs" wrap="wrap" className="mdev-live-execution-time">
+                                      <Text size="xs" c="dimmed" className="mdev-replay-stage-time">{formatTimestamp(trail.latestCreatedAt)}</Text>
+                                      {trail.durationMs !== null ? (
+                                        <Text size="xs" c="dimmed">{formatDurationMs(trail.durationMs, null, null)}</Text>
+                                      ) : null}
+                                    </Group>
+                                    <Tooltip label={trailExpanded ? 'Collapse stage' : 'Expand stage'}>
+                                      <ActionIcon
+                                        size="lg"
+                                        variant="subtle"
+                                        aria-label={trailExpanded ? 'Collapse stage' : 'Expand stage'}
+                                        aria-expanded={trailExpanded}
+                                        onClick={() => {
+                                          toggleLiveExecutionExpanded(trail);
+                                          if (!trailExpanded) void ensureLiveExecutionChainLoaded(trail);
+                                        }}
+                                      >
+                                        {trailExpanded ? <IconChevronDown size={18} /> : <IconChevronRight size={18} />}
+                                      </ActionIcon>
+                                    </Tooltip>
                                   </Group>
                                 </Group>
                                 {trailExpanded ? (
                                   <Stack gap="xs" mt="sm">
-                                    <Divider label="Capabilities" labelPosition="left" />
+                                    <Divider my={2} />
 
                                     {(() => {
                                       const capabilityCards = trail.capabilities;
@@ -8173,45 +8264,52 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                                           <Box
                                             key={capability.key}
                                             p="sm"
+                                            className="mdev-workflow-event-card mdev-workflow-event-details mdev-replay-capability"
+                                            data-replay-tone={executionPresentation(capability.status).tone}
+                                            data-replay-running={capability.isActive && executionPresentation(capability.status).status === 'running' ? 'true' : 'false'}
                                             style={{
-                                              ...livePulseStyle(capability.isActive, capability.isNew),
-                                              border: `1px solid var(--mantine-color-${executionPresentation(capability.status).tone}-4)`,
-                                              borderRadius: 8,
-                                              background: capability.isActive
-                                                ? 'rgba(34, 139, 230, 0.08)'
-                                                : executionPresentation(capability.status).tone === 'green'
-                                                  ? 'rgba(64, 192, 87, 0.08)'
-                                                  : executionPresentation(capability.status).tone === 'red'
-                                                    ? 'rgba(250, 82, 82, 0.08)'
-                                                    : executionPresentation(capability.status).tone === 'yellow'
-                                                      ? 'rgba(250, 176, 5, 0.08)'
-                                                      : 'rgba(255,255,255,0.02)'
+                                              position: 'relative',
+                                              border: '1px solid var(--mantine-color-default-border)',
+                                              borderRadius: 6,
+                                              background: 'var(--mantine-color-default-hover)'
                                             }}
                                           >
-                                            <Box style={liveProgressBar(capability.isActive, executionPresentation(capability.status).tone)} />
-                                            <Group justify="space-between" align="flex-start" wrap="nowrap" style={{ position: 'relative', zIndex: 1 }}>
-                                              <Group align="flex-start" justify="space-between" wrap="nowrap" style={{ flex: 1 }}>
-                                                <Stack gap={4} style={{ flex: 1 }}>
-                                                  <Group gap="xs" wrap="wrap">
-                                                    <Badge color={executionPresentation(capability.status).tone}>{executionPresentation(capability.status).label}</Badge>
-                                                    <Badge variant="light">{capability.name}</Badge>
-                                                    <Text size="xs" c="dimmed">events {capability.eventCount}</Text>
+                                            <Box style={{ position: 'absolute', insetInlineStart: 0, top: 0, bottom: 0, width: 2, background: `var(--mantine-color-${executionPresentation(capability.status).tone}-5)` }} />
+                                            <Group justify="space-between" align="flex-start" wrap="wrap" className="mdev-live-capability-header" style={{ position: 'relative', zIndex: 1 }}>
+                                              <Group align="flex-start" justify="space-between" wrap="wrap" className="mdev-live-capability-content" style={{ flex: '1 1 100%', minWidth: 0 }}>
+                                                <Stack gap={4} className="mdev-live-capability-summary" style={{ flex: '1 1 180px', minWidth: 0 }}>
+                                                  <Group gap="xs" wrap="wrap" className="mdev-live-capability-badges">
+                                                    <Text size="sm" fw={600}>{capability.name}</Text>
+                                                    <Badge color={executionPresentation(capability.status).tone} variant="filled" size="sm">{executionPresentation(capability.status).label}</Badge>
+                                                    <Text size="xs" c="dimmed">{capability.eventCount} events</Text>
                                                   </Group>
-                                                  <Text size="sm">{capability.message}</Text>
+                                                  <Text size="sm" className="mdev-live-capability-message">{capability.message}</Text>
                                                 </Stack>
-                                                <Stack gap={2} align="flex-end" style={{ minWidth: 220 }}>
-                                                  <Text size="sm" fw={600}>{capability.startedAtText}</Text>
-                                                  <Text size="sm" fw={600}>{capability.isActive ? formatDuration(capability.startedAtRaw ?? capability.latestCreatedAt, new Date(liveNow).toISOString()) : capability.durationText}</Text>
-                                                </Stack>
+                                                <Group gap="xs" wrap="wrap" className="mdev-live-capability-time" style={{ minWidth: 0, flex: '0 1 auto', maxWidth: '100%' }}>
+                                                  <Text size="xs" c="dimmed">{capability.startedAtText}</Text>
+                                                  <Text size="xs" c="dimmed">{capability.isActive ? formatDuration(capability.startedAtRaw ?? capability.latestCreatedAt, new Date(liveNow).toISOString()) : capability.durationText}</Text>
+                                                </Group>
                                               </Group>
-                                              <Button size="xs" variant="subtle" onClick={() => toggleLiveEventExpanded(capability.key)}>
-                                                {eventExpanded ? 'Hide raw JSON' : 'Show raw JSON'}
-                                              </Button>
+                                              <Tooltip label={eventExpanded ? 'Collapse capability' : 'Expand capability'}>
+                                                <ActionIcon
+                                                  size="lg"
+                                                  variant="subtle"
+                                                  className="mdev-live-capability-action"
+                                                  aria-label={eventExpanded ? 'Collapse capability' : 'Expand capability'}
+                                                  aria-expanded={eventExpanded}
+                                                  onClick={() => toggleLiveEventExpanded(capability.key)}
+                                                >
+                                                  {eventExpanded ? <IconChevronDown size={17} /> : <IconChevronRight size={17} />}
+                                                </ActionIcon>
+                                              </Tooltip>
                                             </Group>
                                             {eventExpanded ? (
-                                              <ScrollArea mt="sm" offsetScrollbars>
-                                                <Code block>{JSON.stringify(capabilityIoPayload(capability), null, 2)}</Code>
-                                              </ScrollArea>
+                                              <Box className="mdev-replay-capability-details" mt="sm" pt="sm">
+                                                <Text size="xs" fw={600} c="dimmed" mb="xs">Capability details</Text>
+                                                <ScrollArea type="auto" offsetScrollbars>
+                                                  <Code block>{JSON.stringify(capabilityIoPayload(capability), null, 2)}</Code>
+                                                </ScrollArea>
+                                              </Box>
                                             ) : null}
                                           </Box>
                                         );
@@ -8225,13 +8323,14 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                           </Stack>
                         ) : null}
                         {liveExecutionTrails.length === 0 ? (
-                          <Text c="dimmed">No live executions yet.</Text>
+                          <Text c="dimmed" size="sm" ta="center" py="xl">No workflow events yet.</Text>
                         ) : null}
                       </ScrollArea>
                     </Stack>
                   </AppSurface>
                 </Grid.Col>
               </Grid>
+            </>
                   )}
                 </div>
               ))}
@@ -8243,28 +8342,29 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           opened={repoContextConfigOpen}
           onClose={() => setRepoContextConfigOpen(false)}
           title="Repo fragment"
-          size="min(1600px, calc(100vw - 64px))"
+          size="min(1600px, calc(100vw - 16px))"
           centered
           padding="md"
           zIndex={300}
           withCloseButton
+          classNames={{ body: 'mdev-context-export-body' }}
           styles={{
-            body: { paddingTop: 0, height: 'calc(100vh - 140px)' },
-            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100vh - 32px)' }
+            body: { paddingTop: 0, height: 'calc(100dvh - 140px)' },
+            content: { background: 'var(--mantine-color-body)', maxHeight: 'calc(100dvh - 16px)' }
           }}
         >
-          <Group h="100%" align="stretch" wrap="nowrap" gap="lg">
-            <ScrollArea style={{ flex: '0 0 430px' }} offsetScrollbars>
-              <Stack gap="md" pr="sm">
+          <Group className="mdev-context-export-layout" h="100%" align="stretch" wrap="nowrap" gap="lg">
+            <ScrollArea className="mdev-context-export-settings" style={{ flex: '0 0 430px', minWidth: 0 }} offsetScrollbars>
+              <Stack gap="md" pr="sm" style={{ minWidth: 0 }}>
                 <TextInput label="Git ref" value={stageRepoContextGitRef} onChange={(event) => setStageRepoContextGitRef(event.currentTarget.value)} placeholder="WORKTREE" />
-                <SimpleGrid cols={2}>
+                <SimpleGrid className="mdev-context-export-options" cols={{ base: 1, sm: 2 }}>
                   <Switch label="Skip binary" checked={stageRepoContextSkipBinary} onChange={(event) => setStageRepoContextSkipBinary(event.currentTarget.checked)} />
                   <Switch label="Skip .gitignore" checked={stageRepoContextSkipGitignore} onChange={(event) => setStageRepoContextSkipGitignore(event.currentTarget.checked)} />
                   <Switch label="Include staged diff" checked={stageRepoContextIncludeStagedDiff} onChange={(event) => setStageRepoContextIncludeStagedDiff(event.currentTarget.checked)} />
                   <Switch label="Include unstaged diff" checked={stageRepoContextIncludeUnstagedDiff} onChange={(event) => setStageRepoContextIncludeUnstagedDiff(event.currentTarget.checked)} />
                 </SimpleGrid>
                 <Switch label="Inline repo context in prompt instead of uploading attachment" checked={stageRepoContextInlinePrompt} onChange={(event) => setStageRepoContextInlinePrompt(event.currentTarget.checked)} />
-                <Group gap="xs">
+                <Group className="mdev-context-export-actions" gap="xs" wrap="wrap">
                   <Button
                     size="xs"
                     variant="light"
@@ -8303,15 +8403,15 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
                 <Textarea label="Exclude files" minRows={6} value={stageRepoContextExcludeFilesText} onChange={(event) => setStageRepoContextExcludeFilesText(event.currentTarget.value)} placeholder={"api/Cargo.lock\nweb/package-lock.json"} />
                 <Textarea label="Exclude regex" minRows={5} value={stageRepoContextExcludeRegexText} onChange={(event) => setStageRepoContextExcludeRegexText(event.currentTarget.value)} placeholder={"^generated/\n\\.snapshot$"} />
                 <Textarea label="Include override regex" minRows={4} value={stageRepoContextIncludeOverrideRegexText} onChange={(event) => setStageRepoContextIncludeOverrideRegexText(event.currentTarget.value)} placeholder={"^api/Cargo\\.lock$"} />
-                <Group justify="flex-end">
+                <Group className="mdev-context-export-actions" justify="flex-end" wrap="wrap">
                   <Button size="xs" variant="default" onClick={() => setRepoContextConfigOpen(false)}>Cancel</Button>
                   <Button size="xs" onClick={handleSaveBuilderRepoContext}>Save</Button>
                 </Group>
               </Stack>
             </ScrollArea>
-            <Stack gap="sm" style={{ flex: 1, minWidth: 0 }}>
-              <Group justify="space-between">
-                <Group gap="xs">
+            <Stack className="mdev-context-export-tree-panel" gap="sm" style={{ flex: 1, minWidth: 0 }}>
+              <Group justify="space-between" wrap="wrap" gap="xs">
+                <Group gap="xs" wrap="wrap">
                   <Badge color="green" variant="light">Included</Badge>
                   <Badge color="red" variant="light">Excluded</Badge>
                   <Badge color="gray" variant="outline">Not selected</Badge>
@@ -8691,22 +8791,21 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           <Stack gap="md">
             <Group justify="space-between" align="center">
               <Group gap="xs">
-                <Badge variant="light">{previewViewerMode === 'stream' && modelHistoryTurns.length > 0 ? `${groupModelIoExchanges(modelHistoryTurns).length.toLocaleString()} exchanges` : previewViewerContent ? `${previewViewerContent.length.toLocaleString()} chars` : 'empty'}</Badge>
+                <Badge variant="light">{previewViewerMode === 'stream' ? 'Transcript' : previewViewerContent ? `${previewViewerContent.length.toLocaleString()} chars` : 'empty'}</Badge>
                 <Text size="sm" c="dimmed">Wrapped and formatted for review</Text>
               </Group>
-              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerContent); }} disabled={!previewViewerContent.trim()}>
-                {previewViewerMode === 'stream' ? 'Copy stream' : previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
+              <Button size="xs" variant="light" onClick={() => { void navigator.clipboard.writeText(previewViewerContent); }} disabled={previewViewerMode === 'stream' || !previewViewerContent.trim()}>
+                {previewViewerMode === 'stream' ? 'Transcript' : previewViewerMode === 'prompt' ? 'Copy prompt' : 'Copy response'}
               </Button>
             </Group>
             <Box p="lg" style={{ border: '1px solid var(--mantine-color-dark-4)', borderRadius: 12, background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))' }}>
               <ScrollArea h="82vh" offsetScrollbars>
                 <Box maw={920} mx="auto">
                   {previewViewerMode === 'stream' ? (
-                    <ModelHistoryContent
-                      turns={modelHistoryTurns}
-                      fallbackInput={composedInferencePrompt}
-                      fallbackOutput={inferenceResponse}
-                      emptyText="No stage stream yet."
+                    <ModelHistoryTranscript
+                      runId={selectedRunId}
+                      emptyText="No recorded model invocations"
+                      showHeader={false}
                     />
                   ) : (
                     <MarkdownPreviewContent
@@ -8812,12 +8911,41 @@ function renderPreviewPanel(title: string, content: string, emptyText: string, m
           </Stack>
         </Modal>
 
-        <Modal opened={!!pendingStageSelectionId} onClose={() => setPendingStageSelectionId(null)} title="Move to stage" centered>
-          <Stack gap="md">
-            <Text>
+        <Modal
+          opened={!!pendingStageSelectionId}
+          onClose={() => setPendingStageSelectionId(null)}
+          title="Move to stage"
+          centered
+          withinPortal
+          size="min(420px, calc(100dvw - 32px))"
+          classNames={{ root: 'mdev-stage-selection-modal', inner: 'mdev-stage-selection-modal-inner', content: 'mdev-stage-selection-modal-content', body: 'mdev-stage-selection-modal-body' }}
+          styles={{
+            inner: {
+              position: 'fixed',
+              inset: 0,
+              width: '100%',
+              maxWidth: '100dvw',
+              height: '100dvh',
+              padding: '16px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxSizing: 'border-box'
+            },
+            content: {
+              width: 'min(420px, calc(100dvw - 32px))',
+              maxWidth: '100%',
+              minWidth: 0,
+              margin: 0,
+              boxSizing: 'border-box'
+            }
+          }}
+        >
+          <Stack gap="md" className="mdev-stage-selection-modal-layout">
+            <Text className="mdev-stage-selection-modal-message">
               Move this run to {pendingStageSelection?.name ?? pendingStageSelectionId ?? 'the selected stage'}?
             </Text>
-            <Group justify="flex-end">
+            <Group justify="flex-end" gap="sm" className="mdev-stage-selection-modal-actions">
               <Button variant="default" onClick={() => setPendingStageSelectionId(null)}>Cancel</Button>
               <Button onClick={() => void confirmStageSelection()} loading={manualCapabilityBusy} disabled={isBackendRunLocked}>Confirm</Button>
             </Group>

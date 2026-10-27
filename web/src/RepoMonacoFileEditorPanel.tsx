@@ -30,6 +30,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [mobileEditorOpen, setMobileEditorOpen] = useState(false);
   const [hideBinary, setHideBinary] = useState(true);
   const [hideGitignored, setHideGitignored] = useState(true);
   const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
@@ -442,6 +443,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
       ensureTabOpen(normalizedPath);
       markTabDirty(normalizedPath, false);
       setSelectedPath(normalizedPath);
+      setMobileEditorOpen(true);
       entryPathRef.current = normalizedPath;
       await Promise.resolve(currentWorkspace.openTextDocument(normalizedPath));
     } catch (err) {
@@ -662,6 +664,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
       ensureTabOpen(normalizedPath);
       markTabDirty(normalizedPath, false);
       setSelectedPath(normalizedPath);
+      setMobileEditorOpen(true);
       entryPathRef.current = normalizedPath;
       await Promise.resolve(currentWorkspace.openTextDocument(normalizedPath));
       await loadRoot();
@@ -820,9 +823,14 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
             <Text size="sm" c="dimmed">Explorer mode uses the shared tree core without fragment-selection checkboxes.</Text>
             <Text size="xs" c="dimmed">Workflow: {runId || 'No workflow selected'}</Text>
           </Stack>
-          <Button variant="default" disabled={!selectedPath} onClick={() => void saveCurrentFile()} loading={saving}>
-            Save file
-          </Button>
+          <Group gap="xs" wrap="wrap">
+            <Button className="mdev-workspace-mobile-action" variant="default" onClick={() => setMobileEditorOpen((current) => !current)}>
+              {mobileEditorOpen ? 'Explorer' : 'Editor'}
+            </Button>
+            <Button variant="default" disabled={!selectedPath} onClick={() => void saveCurrentFile()} loading={saving}>
+              Save file
+            </Button>
+          </Group>
         </Group>
 
         <Group gap="md">
@@ -838,16 +846,8 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
 
         {error ? <Alert color="red">{error}</Alert> : null}
 
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'minmax(280px, 360px) minmax(0, 1fr)',
-            gap: 16,
-            minHeight: 620,
-            alignItems: 'stretch',
-          }}
-        >
-          <Card withBorder p="sm" style={{ minHeight: 620, overflow: 'hidden' }}>
+        <div className={`mdev-workspace mdev-workspace-repository${mobileEditorOpen ? ' mdev-workspace--detail-open' : ''}`}>
+          <Card className="mdev-workspace-explorer" withBorder p="sm" style={{ overflow: 'hidden' }}>
             <Stack gap="sm" h="100%" style={{ minHeight: 0 }}>
               <Group justify="space-between">
                 <Text fw={600}>Explorer</Text>
@@ -868,8 +868,8 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
             </Stack>
           </Card>
 
-          <Card withBorder p={0} style={{ minHeight: 620, overflow: 'hidden' }}>
-            <Stack gap={0} h="100%" style={{ minHeight: 620 }}>
+          <Card className="mdev-workspace-editor" withBorder p={0} style={{ minHeight: 0, overflow: 'hidden' }}>
+            <Stack gap={0} h="100%" style={{ minHeight: 0 }}>
               <Stack gap={0}>
                 <Group justify="space-between" p="sm" style={{ borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
                   <div>
@@ -927,7 +927,7 @@ export function RepoMonacoFileEditorPanel(props: RepoMonacoFileEditorPanelProps)
                 <monaco-editor
                   key={`workspace-${workspaceVersion}`}
                   theme="one-dark-pro"
-                  style={{ display: 'block', width: '100%', height: '620px' }}
+                  style={{ display: 'block', width: '100%', height: 'max(360px, 60dvh)' }}
                 />
               </div>
             </Stack>

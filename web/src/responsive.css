@@ -1,0 +1,3842 @@
+:root {
+  --mdev-content-gap: clamp(var(--mantine-spacing-sm), 0.8vw, var(--mantine-spacing-xl));
+  --mdev-page-gutter: clamp(var(--mantine-spacing-sm), 1.4vw, 3rem);
+  --mdev-card-min: 9rem;
+  --mdev-control-min: 11rem;
+  --mdev-content-max: 160rem;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  margin: 0;
+}
+
+#root {
+  min-height: 100dvh;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+.mdev-responsive-shell {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-responsive-shell .mantine-AppShell-main {
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--mdev-page-gutter);
+}
+
+.mdev-supervisor-card,
+.mdev-supervisor-cockpit,
+.mdev-pool-section,
+.mdev-workflow-events-panel,
+.mdev-workflow-event-details,
+.mdev-execution-list {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-supervisor-card,
+.mdev-supervisor-cockpit,
+.mdev-pool-section,
+.mdev-execution-list,
+.mdev-workflow-list-region {
+  container-type: inline-size;
+}
+
+.mdev-supervisor-content,
+.mdev-pool-header-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--mdev-content-gap);
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-content {
+  --mdev-supervisor-gap: clamp(0.75rem, 1vw, 1.25rem);
+  gap: var(--mdev-supervisor-gap);
+  align-items: stretch;
+}
+
+.mdev-supervisor-content > .mantine-Stack-root {
+  min-width: 0;
+  width: 100%;
+  gap: var(--mantine-spacing-xs);
+}
+
+.mdev-supervisor-content > .mantine-Stack-root > .mantine-Text-root:first-child {
+  min-height: 1.375rem;
+  display: flex;
+  align-items: center;
+}
+
+.mdev-supervisor-content .mdev-execution-list {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-content .mdev-execution-list .mantine-ScrollArea-viewport {
+  min-width: 0;
+}
+
+.mdev-supervisor-content .mdev-execution-list .mantine-Stack-root {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-content > *,
+.mdev-pool-header-layout > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-pool-header,
+.mdev-pool-title,
+.mdev-workflow-events-header,
+.mdev-workflow-events-scroll {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-stage-rail,
+.mdev-workflow-progress,
+.mdev-stage-loading {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--mdev-card-min)), 1fr));
+  align-items: stretch;
+  gap: var(--mantine-spacing-sm);
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-content .mdev-stage-rail {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8.5rem), 1fr));
+  gap: var(--mantine-spacing-xs);
+  align-content: start;
+}
+
+.mdev-supervisor-content .mdev-stage-rail-item > .mantine-Paper-root {
+  min-height: 4.25rem;
+  padding: var(--mantine-spacing-sm);
+}
+
+.mdev-supervisor-content .mdev-stage-rail-item .mantine-Stack-root {
+  gap: 0.375rem;
+}
+
+.mdev-supervisor-content .mdev-stage-rail-item .mantine-Badge-root {
+  max-width: 100%;
+}
+
+.mdev-supervisor-content .mdev-stage-rail-item .mantine-Text-root {
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.mdev-stage-rail-item,
+.mdev-workflow-progress-item {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mdev-stage-rail-item > .mantine-Paper-root,
+.mdev-workflow-progress-card {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: var(--mantine-spacing-md);
+}
+
+.mdev-stage-rail-item > .mantine-Paper-root {
+  min-height: 4.5rem;
+}
+
+.mdev-workflow-progress-card {
+  transition: border-color 150ms ease, background 150ms ease;
+}
+
+.mdev-workflow-progress-card:hover {
+  filter: brightness(1.12);
+}
+
+.mdev-supervisor-content .mdev-stage-rail[data-stage-count="1"] {
+  display: grid;
+  grid-template-columns: minmax(0, min(100%, 15rem));
+  justify-content: start;
+  width: 100%;
+  max-width: 100%;
+}
+
+.mdev-supervisor-content .mdev-stage-rail[data-stage-count="1"] .mdev-stage-rail-item {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-content .mdev-stage-rail[data-stage-count="1"] .mdev-stage-rail-item > .mantine-Paper-root {
+  width: 100%;
+  height: auto;
+  min-height: 4.25rem;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] {
+  display: flex;
+  width: min(100%, 20rem);
+  max-width: 20rem;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  overflow: visible;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-item {
+  flex: 0 1 100%;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card {
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  padding: 0.75rem;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-stage-terminal-message {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+
+.mdev-workflow-progress {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: 0.625rem;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.125rem 0 0.625rem;
+  scrollbar-width: thin;
+}
+
+.mdev-workflow-progress-item {
+  display: block;
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  max-width: none;
+}
+
+.mdev-workflow-progress-card {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 6.25rem;
+  padding: 0.75rem;
+  transition: border-color 150ms ease, background 150ms ease, filter 150ms ease;
+}
+
+.mdev-workflow-progress-item[data-selected="true"] .mdev-workflow-progress-card {
+  box-shadow: inset 0 0 0 1px var(--mantine-primary-color-5);
+}
+
+.mdev-workflow-progress-item[data-status="future"] .mdev-workflow-progress-card {
+  opacity: 0.72;
+}
+
+.mdev-workflow-progress-item[data-status="failed"] .mdev-stage-terminal-message {
+  color: var(--mantine-color-red-4);
+}
+
+.mdev-stage-terminal-message {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-item {
+  flex: 1 1 100%;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card {
+  min-height: 0;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card > .mantine-Stack-root {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card > .mantine-Stack-root > :first-child {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card > .mantine-Stack-root > :nth-child(2) {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card > .mantine-Stack-root > :nth-child(n+3) {
+  grid-column: 1 / -1;
+}
+
+.mdev-workflow-progress[data-stage-count="1"] .mdev-workflow-progress-card > .mantine-Stack-root > :first-child > :first-child {
+  display: none;
+}
+
+.mdev-workflow-progress[data-stage-count="2"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="3"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="4"] .mdev-workflow-progress-item {
+  flex: 1 1 0;
+}
+
+.mdev-workflow-progress[data-stage-count="5"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="6"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="7"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="8"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="9"] .mdev-workflow-progress-item,
+.mdev-workflow-progress[data-stage-count="10"] .mdev-workflow-progress-item {
+  flex: 0 0 11.5rem;
+}
+
+@media (max-width: 800px) {
+  .mdev-workflow-progress:not([data-stage-count="1"]) .mdev-workflow-progress-item {
+    flex: 0 0 10.5rem;
+  }
+}
+
+
+.mdev-stage-connector,
+.mdev-workflow-progress-arrow {
+  display: none;
+}
+
+.mdev-pool-action-rail,
+.mdev-supervisor-actions,
+.mdev-workflow-events-header,
+.mdev-supervisor-workflow-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-pool-action-rail {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.mdev-pool-action-rail > .mantine-Button-root {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.mdev-pool-action-rail > .mantine-TextInput-root {
+  flex: 0 1 220px;
+  min-width: min(100%, 160px);
+}
+
+.mdev-pool-action-rail > .mantine-TextInput-root {
+  flex: 1 1 var(--mdev-control-min);
+  min-width: 0;
+}
+
+.mdev-pool-action-rail > .mantine-Button-root,
+.mdev-supervisor-actions > * {
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+.mdev-pool-controls {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.mdev-pool-controls > .mantine-Paper-root {
+  display: flex;
+  flex: 0 1 auto;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  align-items: stretch;
+}
+
+.mdev-pool-controls .mantine-Select-root,
+.mdev-pool-controls .mantine-NumberInput-root,
+.mdev-pool-controls .mantine-Select-wrapper,
+.mdev-pool-controls .mantine-NumberInput-wrapper {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-pool-controls .mantine-Select-root {
+  width: min(180px, 100%);
+}
+
+.mdev-pool-controls .mantine-NumberInput-root {
+  width: 64px;
+}
+
+.mdev-pool-controls .mantine-Select-wrapper,
+.mdev-pool-controls .mantine-NumberInput-wrapper {
+  width: 100%;
+}
+
+.mdev-pool-controls .mantine-Select-input,
+.mdev-pool-controls .mantine-NumberInput-input {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+.mdev-execution-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.25rem;
+  align-items: start;
+  min-width: 0;
+  width: 100%;
+  padding: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
+  border-radius: var(--mantine-radius-sm);
+}
+
+.mdev-supervisor-content .mdev-execution-row {
+  column-gap: var(--mantine-spacing-sm);
+  row-gap: 0.125rem;
+  min-height: 2.375rem;
+  align-content: center;
+}
+
+.mdev-supervisor-content .mdev-execution-row .mantine-Text-root {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.mdev-supervisor-content .mdev-execution-row .mantine-Text-root:first-child {
+  font-weight: 700;
+}
+
+.mdev-supervisor-content .mdev-execution-list .mantine-Stack-root {
+  gap: 0.25rem;
+}
+
+.mdev-execution-row > * {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.mdev-execution-row > .mantine-Text-root:first-child {
+  font-weight: 700;
+}
+
+.mdev-execution-row > .mantine-Text-root:last-child:not(:first-child) {
+  font-size: var(--mantine-font-size-xs);
+}
+
+.mdev-workflow-event-card {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.mdev-workflow-event-card > .mantine-Group-root,
+.mdev-workflow-event-details > .mantine-Group-root {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.mdev-workflow-event-card .mantine-Text-root,
+.mdev-workflow-event-details .mantine-Text-root,
+.mdev-supervisor-cockpit .mantine-Text-root,
+.mdev-pool-title .mantine-Text-root {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.mdev-workflow-event-card .mantine-Badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mdev-replay-stage {
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.mdev-replay-stage-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.mdev-replay-stage-title {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.mdev-replay-stage-time {
+  white-space: nowrap;
+}
+
+.mdev-replay-capability {
+  position: relative;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.mdev-replay-capability-details {
+  min-width: 0;
+  max-width: 100%;
+  border-top: 1px solid var(--mantine-color-default-border);
+}
+
+.mdev-replay-capability-details .mantine-Code-root {
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.mdev-replay-stage .mdev-live-execution-meta,
+.mdev-replay-capability .mdev-live-capability-time {
+  gap: 0.25rem 0.75rem;
+}
+
+.mdev-replay-stage .mantine-Button-root,
+.mdev-replay-capability .mantine-Button-root {
+  flex-shrink: 0;
+}
+
+@container (max-width: 560px) {
+  .mdev-replay-stage-header {
+    align-items: stretch;
+    gap: 0.375rem;
+  }
+
+  .mdev-replay-stage .mdev-live-execution-identity {
+    flex: 1 1 100% !important;
+  }
+
+  .mdev-replay-stage .mdev-live-execution-meta {
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .mdev-replay-stage .mdev-live-execution-meta > .mantine-Button-root {
+    margin-left: auto;
+  }
+
+  .mdev-replay-capability .mdev-live-capability-header {
+    align-items: stretch;
+  }
+
+  .mdev-replay-capability .mdev-live-capability-content {
+    gap: 0.375rem;
+  }
+
+  .mdev-replay-capability .mdev-live-capability-time {
+    justify-content: flex-start;
+  }
+
+  .mdev-replay-capability .mdev-live-capability-action {
+    align-self: flex-end;
+  }
+}
+
+@container (max-width: 340px) {
+  .mdev-replay-stage .mdev-live-execution-meta {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .mdev-replay-stage .mdev-live-execution-meta > .mantine-Button-root {
+    margin-left: auto;
+  }
+}
+
+.mdev-workflow-events-panel .mdev-workflow-events-scroll .mantine-ScrollArea-viewport > div {
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage {
+  padding: 0.625rem 0.75rem !important;
+  border: 1px solid var(--mantine-color-default-border) !important;
+  border-left: 3px solid var(--mantine-color-default-border) !important;
+  border-radius: 7px !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mantine-Badge-root[data-color="yellow"]) {
+  border-left-color: var(--mantine-color-yellow-6) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mantine-Badge-root[data-color="red"]) {
+  border-left-color: var(--mantine-color-red-6) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  min-height: 30px;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-identity {
+  flex: 1 1 160px !important;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage-title {
+  font-size: 0.875rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-meta {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.625rem;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-time {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-time .mantine-Text-root {
+  font-size: 0.6875rem;
+  font-weight: 400;
+  color: var(--mantine-color-dimmed);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-meta .mantine-Button-root {
+  height: 26px;
+  min-height: 26px;
+  padding-inline: 0.375rem;
+  font-size: 0.75rem;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage > .mantine-Stack-root {
+  gap: 0 !important;
+  margin-top: 0.5rem !important;
+  border-top: 1px solid var(--mantine-color-default-border);
+  padding-top: 0.25rem;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage > .mantine-Stack-root > .mantine-Divider-root {
+  display: none;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability {
+  position: relative;
+  min-width: 0;
+  width: 100%;
+  padding: 0.5rem 0.375rem 0.5rem 0.625rem !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-bottom: 1px solid var(--mantine-color-default-border) !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  animation: none !important;
+  transition: background-color 120ms ease;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:last-child {
+  border-bottom: 0 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:hover {
+  background: var(--mantine-color-default-hover) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability > .mantine-Box-root:first-child {
+  width: 2px !important;
+  border-radius: 2px;
+  opacity: 0.8;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.25rem 0.625rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-content {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1875rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges > .mantine-Text-root:first-child {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mantine-Badge-root,
+.mdev-workflow-events-panel .mdev-replay-stage-header .mantine-Badge-root {
+  height: 18px;
+  min-height: 18px;
+  padding-inline: 0.4rem;
+  border-radius: 5px;
+  font-size: 0.625rem;
+  letter-spacing: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-message {
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--mantine-color-dimmed);
+  margin: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mantine-Badge-root[data-color="green"]) .mdev-live-capability-message {
+  display: none;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-time {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.25rem 0.625rem;
+  min-width: 0;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-time .mantine-Text-root {
+  font-size: 0.6875rem;
+  font-weight: 400;
+  color: var(--mantine-color-dimmed);
+  line-height: 1.3;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-action {
+  align-self: center;
+  justify-self: end;
+  height: 26px;
+  min-height: 26px;
+  padding-inline: 0.375rem;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability-details {
+  grid-column: 1 / -1;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 0.375rem !important;
+  padding-top: 0.5rem !important;
+  border-top: 1px solid var(--mantine-color-default-border);
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability-details .mantine-Code-root {
+  max-width: 100%;
+  font-size: 0.6875rem;
+  line-height: 1.45;
+}
+
+@container (min-width: 720px) {
+  .mdev-workflow-events-panel .mdev-replay-stage {
+    padding: 0.75rem 1rem !important;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability {
+    padding: 0.5rem 0.75rem !important;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-content {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-time {
+    flex-shrink: 0;
+  }
+}
+
+@container (max-width: 560px) {
+  .mdev-workflow-events-panel .mdev-replay-stage {
+    padding: 0.5rem !important;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-stage-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.25rem;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-identity {
+    grid-column: 1 / -1;
+    flex: 1 1 auto !important;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-meta {
+    grid-column: 1 / -1;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability {
+    padding: 0.5rem !important;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-content {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-action {
+    align-self: center;
+  }
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage {
+  background: rgba(90, 95, 105, 0.10) !important;
+  border-color: rgba(150, 155, 165, 0.28) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="green"]) {
+  background: rgba(47, 158, 68, 0.13) !important;
+  border-color: rgba(64, 192, 87, 0.55) !important;
+  border-left-color: var(--mantine-color-green-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="yellow"]) {
+  background: rgba(250, 176, 5, 0.13) !important;
+  border-color: rgba(250, 176, 5, 0.55) !important;
+  border-left-color: var(--mantine-color-yellow-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="red"]) {
+  background: rgba(250, 82, 82, 0.13) !important;
+  border-color: rgba(250, 82, 82, 0.55) !important;
+  border-left-color: var(--mantine-color-red-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="blue"]) {
+  background: rgba(34, 139, 230, 0.13) !important;
+  border-color: rgba(34, 139, 230, 0.55) !important;
+  border-left-color: var(--mantine-color-blue-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability {
+  background: rgba(38, 41, 47, 0.78) !important;
+  border-bottom-color: rgba(150, 155, 165, 0.20) !important;
+  border-radius: 5px !important;
+  margin-block: 3px !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="green"]) {
+  background: rgba(47, 158, 68, 0.19) !important;
+  border-left: 3px solid var(--mantine-color-green-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="yellow"]) {
+  background: rgba(250, 176, 5, 0.19) !important;
+  border-left: 3px solid var(--mantine-color-yellow-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="red"]) {
+  background: rgba(250, 82, 82, 0.19) !important;
+  border-left: 3px solid var(--mantine-color-red-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="blue"]) {
+  background: rgba(34, 139, 230, 0.19) !important;
+  border-left: 3px solid var(--mantine-color-blue-5) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:hover {
+  filter: brightness(1.15);
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-message {
+  color: var(--mantine-color-text);
+  opacity: 0.88;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-replay-stage-title,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges > .mantine-Text-root:first-child {
+  color: var(--mantine-color-text);
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-time .mantine-Text-root,
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-time .mantine-Text-root {
+  opacity: 0.85;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage {
+  background: rgba(90, 95, 105, 0.18) !important;
+  border-color: rgba(150, 155, 165, 0.4) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="green"]) {
+  background: rgba(30, 105, 54, 0.42) !important;
+  border-color: rgba(64, 192, 87, 0.72) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="yellow"]) {
+  background: rgba(145, 105, 14, 0.43) !important;
+  border-color: rgba(250, 176, 5, 0.75) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="red"]) {
+  background: rgba(145, 42, 48, 0.43) !important;
+  border-color: rgba(250, 82, 82, 0.75) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage:has(.mdev-live-execution-identity .mantine-Badge-root[data-color="blue"]) {
+  background: rgba(25, 88, 145, 0.43) !important;
+  border-color: rgba(34, 139, 230, 0.75) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability {
+  background: rgba(45, 49, 56, 0.75) !important;
+  border: 1px solid rgba(150, 155, 165, 0.2) !important;
+  border-radius: 5px !important;
+  margin-block: 4px !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="green"]) {
+  background: rgba(30, 105, 54, 0.52) !important;
+  border-color: rgba(64, 192, 87, 0.65) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="yellow"]) {
+  background: rgba(145, 105, 14, 0.52) !important;
+  border-color: rgba(250, 176, 5, 0.68) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="red"]) {
+  background: rgba(145, 42, 48, 0.52) !important;
+  border-color: rgba(250, 82, 82, 0.68) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:has(.mdev-live-capability-badges .mantine-Badge-root[data-color="blue"]) {
+  background: rgba(25, 88, 145, 0.52) !important;
+  border-color: rgba(34, 139, 230, 0.68) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-identity .mantine-Badge-root,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges .mantine-Badge-root {
+  display: none !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-replay-stage-title,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges > .mantine-Text-root:first-child {
+  color: #f3f5f7 !important;
+  font-weight: 700;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-time .mantine-Text-root,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-time .mantine-Text-root {
+  color: rgba(235, 239, 244, 0.78) !important;
+  opacity: 1;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-message {
+  color: rgba(245, 247, 250, 0.92) !important;
+  opacity: 1;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability:hover {
+  filter: brightness(1.12);
+}
+
+.mdev-workflow-events-panel {
+  container-type: inline-size;
+}
+
+.mdev-live-execution-header,
+.mdev-live-capability-header,
+.mdev-live-capability-content {
+  min-width: 0;
+  width: 100%;
+}
+
+.mdev-live-execution-identity,
+.mdev-live-capability-summary {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-live-capability-message {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+  line-height: 1.45;
+}
+
+.mdev-live-execution-meta,
+.mdev-live-capability-time {
+  min-width: 0;
+}
+
+.mdev-live-execution-identity .mantine-Badge-root,
+.mdev-live-capability-badges .mantine-Badge-root {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-live-execution-identity .mantine-Badge-root:first-child,
+.mdev-live-capability-badges .mantine-Badge-root:first-child {
+  flex-shrink: 0;
+}
+
+.mdev-live-execution-time .mantine-Text-root,
+.mdev-live-capability-time .mantine-Text-root {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.mdev-live-capability-action {
+  flex-shrink: 0;
+}
+
+@container (max-width: 560px) {
+  .mdev-workflow-event-card {
+    padding: 0.65rem;
+    overflow-wrap: normal;
+  }
+
+  .mdev-live-execution-header {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .mdev-live-execution-identity {
+    flex: 0 1 auto !important;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .mdev-live-execution-meta {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.375rem 0.75rem;
+  }
+
+  .mdev-live-execution-time {
+    align-items: flex-start !important;
+    flex: 1 1 auto;
+  }
+
+  .mdev-live-execution-time .mantine-Text-root {
+    font-size: 0.75rem;
+  }
+
+  .mdev-live-execution-meta > .mantine-Button-root {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding-inline: 0.4rem;
+  }
+
+  .mdev-live-capability-header {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .mdev-live-capability-content {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+    width: 100%;
+    flex: 0 1 auto !important;
+  }
+
+  .mdev-live-capability-summary {
+    width: 100%;
+    flex: 0 1 auto !important;
+  }
+
+  .mdev-live-capability-summary > .mantine-Group-root {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .mdev-live-capability-badges .mantine-Badge-root {
+    max-width: 100%;
+  }
+
+  .mdev-live-capability-message {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    overflow-wrap: break-word;
+    word-break: normal;
+  }
+
+  .mdev-live-capability-time {
+    width: 100%;
+    flex: 0 1 auto !important;
+    align-items: flex-start !important;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.25rem 0.75rem;
+  }
+
+  .mdev-live-capability-time .mantine-Text-root {
+    font-size: 0.75rem;
+  }
+
+  .mdev-live-capability-action {
+    align-self: flex-end;
+    width: auto;
+    min-width: 0;
+  }
+
+  .mdev-workflow-event-details .mantine-Badge-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+@container (max-width: 340px) {
+  .mdev-live-execution-meta {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .mdev-live-execution-meta > .mantine-Button-root {
+    align-self: flex-end;
+  }
+
+  .mdev-live-capability-badges .mantine-Badge-root {
+    max-width: 100%;
+  }
+}
+
+
+.mdev-supervisor-workflow-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2rem;
+  padding: 0.3rem 0.625rem;
+  border: 1px solid var(--mantine-color-blue-6);
+  border-radius: var(--mantine-radius-md);
+  background: var(--mantine-color-blue-light);
+  color: var(--mantine-color-blue-light-color);
+  font-size: var(--mantine-font-size-xs);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.mdev-supervisor-workflow-link:hover {
+  background: var(--mantine-color-blue-light-hover);
+}
+
+.mdev-workflow-list-region {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-workflow-table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.mdev-workflow-table th,
+.mdev-workflow-table td {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+
+.mdev-workflow-table th {
+  width: auto;
+}
+
+.mdev-workflow-table code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@container (min-width: 45rem) {
+  .mdev-supervisor-content {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mdev-supervisor-content > :first-child {
+    grid-column: 1 / -1;
+  }
+
+  .mdev-pool-header-layout {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 8px;
+  }
+
+  .mdev-pool-action-rail {
+    justify-content: flex-start;
+  }
+
+  .mdev-execution-row {
+    grid-template-columns: minmax(6rem, 0.8fr) minmax(0, 1.5fr) auto;
+    align-items: center;
+  }
+}
+
+@container (min-width: 66rem) {
+  .mdev-supervisor-content {
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 1.15fr);
+    gap: var(--mdev-supervisor-gap);
+  }
+
+  .mdev-supervisor-content > :first-child {
+    grid-column: auto;
+  }
+
+  .mdev-supervisor-content .mdev-stage-rail {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 8.5rem), 1fr));
+  }
+}
+
+@container (min-width: 100rem) {
+  .mdev-supervisor-content {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.1fr);
+  }
+
+  .mdev-supervisor-content .mdev-stage-rail {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  }
+}
+
+@container (max-width: 63.9375rem) {
+  .mdev-workflow-table th:nth-child(4),
+  .mdev-workflow-table [data-column='repository'] {
+    display: none;
+  }
+}
+
+@container (max-width: 47.9375rem) {
+  .mdev-workflow-table {
+    display: block;
+    border: 0;
+  }
+
+  .mdev-workflow-table thead {
+    display: none;
+  }
+
+  .mdev-workflow-table tbody {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--mantine-spacing-md);
+    width: 100%;
+  }
+
+  .mdev-workflow-table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'workflow status' 'step step' 'repository repository' 'updated actions';
+    gap: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+    align-items: center;
+    padding: var(--mantine-spacing-lg);
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: var(--mantine-radius-md);
+    background: var(--mantine-color-body);
+  }
+
+  .mdev-workflow-table tbody td {
+    display: block;
+    width: auto;
+    padding: 0;
+    border: 0;
+  }
+
+  .mdev-workflow-table [data-column='workflow'] {
+    grid-area: workflow;
+    font-weight: 650;
+  }
+
+  .mdev-workflow-table [data-column='status'] {
+    grid-area: status;
+    text-align: right;
+  }
+
+  .mdev-workflow-table [data-column='step'] {
+    grid-area: step;
+  }
+
+  .mdev-workflow-table [data-column='repository'] {
+    display: block;
+    grid-area: repository;
+  }
+
+  .mdev-workflow-table [data-column='updated'] {
+    grid-area: updated;
+    color: var(--mantine-color-dimmed);
+  }
+
+  .mdev-workflow-table [data-column='actions'] {
+    grid-area: actions;
+    justify-self: end;
+  }
+
+  .mdev-workflow-table [data-column='step']::before,
+  .mdev-workflow-table [data-column='repository']::before {
+    display: block;
+    margin-bottom: 0.25rem;
+    color: var(--mantine-color-dimmed);
+    font-size: var(--mantine-font-size-xs);
+    font-weight: 600;
+    content: attr(data-label);
+  }
+}
+
+@media (max-width: 47.9375rem) {
+  .mdev-supervisor-actions > *,
+  .mdev-pool-action-rail > .mantine-Button-root {
+    flex: 1 1 9rem;
+  }
+
+  .mdev-pool-action-rail > .mantine-TextInput-root {
+    flex: 1 1 100%;
+  }
+
+  .mdev-workflow-events-panel {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    align-self: start;
+    align-items: flex-start;
+    overflow: visible !important;
+  }
+
+  .mdev-workflow-events-panel > * {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    flex: 0 0 auto !important;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .mdev-workflow-events-panel > * > .mantine-Stack-root {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    flex: 0 0 auto !important;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .mdev-workflow-events-scroll {
+    height: min(55dvh, 480px) !important;
+    min-height: 0 !important;
+    max-height: min(55dvh, 480px) !important;
+    flex: 0 0 auto !important;
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-events-scroll .mantine-ScrollArea-root {
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
+  }
+
+  .mdev-workflow-events-scroll .mantine-ScrollArea-viewport {
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
+    overflow-x: hidden !important;
+  }
+
+  .mdev-workflow-events-scroll .mantine-ScrollArea-viewport > div {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .mdev-supervisor-workflow-link {
+    width: 100%;
+  }
+}
+
+.mdev-workspace {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-events-panel {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    align-self: start !important;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-events-panel .mdev-workflow-events-scroll {
+    height: min(55dvh, 480px) !important;
+    min-height: 0 !important;
+    max-height: min(55dvh, 480px) !important;
+    flex: 0 0 auto !important;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-events-panel .mantine-ScrollArea-root {
+    min-height: 0;
+    max-height: 100%;
+  }
+
+  .mdev-workflow-events-panel .mantine-ScrollArea-viewport {
+    min-height: 0;
+    overflow-x: hidden !important;
+  }
+
+  .mdev-workflow-events-panel .mantine-ScrollArea-viewport > div {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
+.mdev-workflow-detail-grid {
+  min-width: 0;
+  align-items: start;
+}
+
+.mdev-workflow-detail-left-column {
+  min-width: 0;
+}
+
+.mdev-workflow-detail-left {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
+}
+
+.mdev-workflow-detail-grid .mdev-workflow-events-panel {
+  min-width: 0;
+  min-height: 0;
+}
+
+.mdev-workflow-detail-grid .mdev-workflow-events-panel > .mantine-Stack-root {
+  min-height: 0;
+}
+
+@media (min-width: 1200px) {
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left-column,
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    min-height: 0;
+    align-self: start;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left {
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel .mdev-workflow-events-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    overflow: hidden;
+  }
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left,
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    height: auto !important;
+    max-height: none !important;
+    min-height: 0 !important;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left {
+    overflow: visible;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    align-self: start;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel .mdev-workflow-events-scroll {
+    height: min(55dvh, 480px) !important;
+    max-height: min(55dvh, 480px) !important;
+    min-height: 0 !important;
+    flex: 0 0 auto !important;
+    overflow: hidden;
+  }
+}
+
+@media (min-width: 1200px) {
+  .mdev-workflow-detail-grid {
+    align-items: stretch;
+    min-height: 0;
+  }
+
+  .mdev-workflow-detail-grid > .mantine-Grid-col {
+    min-height: 0;
+  }
+
+  .mdev-workflow-detail-left {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    overscroll-behavior-y: contain;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel > * {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 100%;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel .mdev-workflow-events-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    overflow: hidden;
+  }
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-detail-grid,
+  .mdev-workflow-detail-grid > .mantine-Grid-col {
+    height: auto;
+    min-height: 0;
+  }
+
+  .mdev-workflow-detail-left {
+    height: auto !important;
+    max-height: none !important;
+    min-height: 0 !important;
+    overflow: visible;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    height: auto !important;
+    max-height: none !important;
+    min-height: 0 !important;
+    align-self: start;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel .mdev-workflow-events-scroll {
+    height: min(55dvh, 480px) !important;
+    max-height: min(55dvh, 480px) !important;
+    min-height: 0 !important;
+    flex: 0 0 auto !important;
+    overflow: hidden;
+  }
+}
+
+@media (min-width: 1200px) {
+  .mdev-workflow-detail-left {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    align-items: stretch;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:not(:last-child) {
+    flex: 0 0 auto;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root > .mantine-Grid-root {
+    flex: 1 1 auto;
+    min-height: 0;
+    align-content: stretch;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root > .mantine-Grid-root > .mantine-Grid-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root > .mantine-Grid-root > .mantine-Grid-col:last-child > .mantine-Box-root {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+  }
+
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child .mantine-Grid-col:last-child .mantine-Box-root > .mantine-Box-root {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child,
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root,
+  .mdev-workflow-detail-left > .mantine-Paper-root:last-child > .mantine-Stack-root > .mantine-Grid-root {
+    height: auto;
+    max-height: none;
+    min-height: 0;
+    flex: 0 1 auto;
+    overflow: visible;
+  }
+}
+
+.mdev-stage-workspace,
+.mdev-stage-workspace-grid,
+.mdev-stage-inputs-column,
+.mdev-stage-history-column,
+.mdev-stage-history-content {
+  min-width: 0;
+}
+
+@media (min-width: 1200px) {
+  .mdev-workflow-detail-left {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-left > :last-child:has(.mdev-stage-workspace) {
+    display: flex;
+    flex: 1 1 0;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-left > :last-child:has(.mdev-stage-workspace) > * {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .mdev-stage-workspace {
+    display: flex;
+    flex: 1 1 0;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .mdev-stage-workspace-grid {
+    flex: 1 1 0;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+    align-content: stretch;
+  }
+
+  .mdev-stage-workspace-grid > .mantine-Grid-inner {
+    height: 100%;
+    min-height: 0;
+    align-content: stretch;
+  }
+
+  .mdev-stage-inputs-column,
+  .mdev-stage-history-column {
+    height: 100%;
+    max-height: 100%;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--mantine-color-dark-3) transparent;
+  }
+
+  .mdev-stage-inputs-column > .mantine-Stack-root {
+    min-height: min-content;
+    height: auto;
+  }
+
+  .mdev-stage-history-column {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .mdev-stage-history-content {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    width: 100%;
+    min-height: 0;
+  }
+
+  .mdev-stage-workspace > .mantine-Alert-root {
+    flex: 0 0 auto;
+    position: relative;
+    z-index: 1;
+    margin-top: var(--mantine-spacing-xs);
+  }
+}
+
+@media (max-width: 1199px) {
+  .mdev-stage-workspace,
+  .mdev-stage-workspace-grid,
+  .mdev-stage-workspace-grid > .mantine-Grid-inner,
+  .mdev-stage-inputs-column,
+  .mdev-stage-history-column,
+  .mdev-stage-history-content {
+    height: auto !important;
+    max-height: none !important;
+    min-height: 0;
+    overflow: visible !important;
+  }
+
+  .mdev-stage-workspace {
+    flex: 0 1 auto;
+  }
+
+  .mdev-stage-workspace-grid {
+    flex: 0 1 auto;
+  }
+
+  .mdev-stage-inputs-column,
+  .mdev-stage-history-column {
+    max-width: 100%;
+    overscroll-behavior-y: auto;
+  }
+}
+
+.mdev-workflow-mobile-navigation {
+  display: none !important;
+}
+
+.mdev-workflow-detail-grid,
+.mdev-workflow-operations-surface,
+.mdev-workflow-stage-surface,
+.mdev-workflow-session-panel,
+.mdev-workflow-events-panel {
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+@media (min-width: 1200px) {
+  .mdev-workflow-detail-grid {
+    height: calc(100dvh - 155px);
+    min-height: 460px;
+    max-height: calc(100dvh - 155px);
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid > .mantine-Grid-inner {
+    display: grid !important;
+    grid-template-columns: minmax(225px, 22fr) minmax(0, 53fr) minmax(245px, 25fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 10px;
+    height: 100%;
+    min-height: 0;
+    width: 100%;
+    margin: 0;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left-column,
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left,
+  .mdev-workflow-detail-grid .mdev-workflow-stage-surface,
+  .mdev-workflow-detail-grid .mdev-stage-workspace,
+  .mdev-workflow-detail-grid .mdev-stage-workspace-grid,
+  .mdev-workflow-detail-grid .mdev-stage-workspace-grid > .mantine-Grid-inner {
+    display: contents !important;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-operations-surface {
+    grid-column: 1;
+    grid-row: 1;
+    align-self: stretch;
+    min-width: 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+
+  .mdev-workflow-detail-grid .mdev-stage-inputs-column {
+    grid-column: 1;
+    grid-row: 2;
+    display: flex !important;
+    flex-direction: column;
+    width: 100% !important;
+    max-width: none !important;
+    padding: 12px !important;
+    min-width: 0;
+    min-height: 0;
+    height: 100% !important;
+    max-height: 100% !important;
+    overflow-x: hidden;
+    overflow-y: auto;
+    background: var(--mantine-color-body);
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: 10px;
+    scrollbar-width: thin;
+    overscroll-behavior-y: contain;
+  }
+
+  .mdev-workflow-detail-grid .mdev-stage-inputs-column > .mdev-workflow-stage-controls {
+    flex: 0 0 auto;
+    height: auto;
+  }
+
+  .mdev-workflow-detail-grid .mdev-stage-history-column {
+    grid-column: 2;
+    grid-row: 1 / 3;
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0;
+    min-height: 0;
+    height: 100% !important;
+    max-height: 100% !important;
+    padding: 12px !important;
+    overflow: hidden !important;
+    background: var(--mantine-color-body);
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: 10px;
+  }
+
+  .mdev-workflow-detail-grid .mdev-stage-history-content {
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
+    scrollbar-width: thin;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    grid-column: 3;
+    grid-row: 1 / 3;
+    display: flex !important;
+    flex-direction: column;
+    align-self: stretch !important;
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0;
+    min-height: 0 !important;
+    height: 100% !important;
+    max-height: 100% !important;
+    padding: 0 !important;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel > * {
+    height: 100% !important;
+    max-height: 100% !important;
+    min-height: 0 !important;
+    flex: 1 1 auto;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-events-scroll {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    height: auto !important;
+  }
+
+  .mdev-workflow-operations-surface .mantine-Group-root {
+    min-width: 0;
+  }
+
+  .mdev-workflow-operations-surface .mantine-Button-root {
+    max-width: 100%;
+  }
+
+  .mdev-workflow-operations-surface .mdev-topology {
+    padding: 8px;
+  }
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-mobile-navigation {
+    display: flex !important;
+    width: 100%;
+    margin-bottom: 10px;
+  }
+
+  .mdev-workflow-mobile-navigation .mantine-Button-root {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  .mdev-workflow-detail-grid,
+  .mdev-workflow-detail-grid > .mantine-Grid-inner {
+    display: block !important;
+    height: auto !important;
+    max-height: none !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left-column,
+  .mdev-workflow-detail-grid .mdev-workflow-detail-left,
+  .mdev-workflow-detail-grid .mdev-workflow-stage-surface,
+  .mdev-workflow-detail-grid .mdev-stage-workspace,
+  .mdev-workflow-detail-grid .mdev-stage-workspace-grid,
+  .mdev-workflow-detail-grid .mdev-stage-workspace-grid > .mantine-Grid-inner {
+    display: contents !important;
+  }
+
+  .mdev-workflow-detail-grid .mdev-workflow-operations-surface,
+  .mdev-workflow-detail-grid .mdev-stage-inputs-column,
+  .mdev-workflow-detail-grid .mdev-stage-history-column,
+  .mdev-workflow-detail-grid .mdev-workflow-events-panel {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0;
+    min-height: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+    margin: 0;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="controls"] .mdev-stage-history-column,
+  .mdev-workflow-detail-grid[data-mobile-view="controls"] .mdev-workflow-events-panel,
+  .mdev-workflow-detail-grid[data-mobile-view="sessions"] .mdev-workflow-operations-surface,
+  .mdev-workflow-detail-grid[data-mobile-view="sessions"] .mdev-stage-inputs-column,
+  .mdev-workflow-detail-grid[data-mobile-view="sessions"] .mdev-workflow-events-panel,
+  .mdev-workflow-detail-grid[data-mobile-view="events"] .mdev-workflow-operations-surface,
+  .mdev-workflow-detail-grid[data-mobile-view="events"] .mdev-stage-inputs-column,
+  .mdev-workflow-detail-grid[data-mobile-view="events"] .mdev-stage-history-column {
+    display: none !important;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="controls"] .mdev-workflow-operations-surface {
+    display: block;
+    margin-bottom: 10px;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="controls"] .mdev-stage-inputs-column {
+    display: block;
+    padding: 12px !important;
+    overflow: visible !important;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="sessions"] .mdev-stage-history-column {
+    display: flex !important;
+    flex-direction: column;
+    min-height: min(65dvh, 600px) !important;
+    padding: 12px !important;
+    overflow: auto !important;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="sessions"] .mdev-stage-history-content {
+    min-height: min(65dvh, 600px);
+    overflow: auto;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="events"] .mdev-workflow-events-panel {
+    display: flex !important;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .mdev-workflow-detail-grid[data-mobile-view="events"] .mdev-workflow-events-scroll {
+    height: min(70dvh, 650px) !important;
+    max-height: min(70dvh, 650px) !important;
+    min-height: 0 !important;
+    flex: 0 0 auto !important;
+  }
+}
+
+.mdev-stage-selection-modal {
+  --modal-size: min(420px, calc(100vw - 32px));
+}
+
+.mdev-stage-selection-modal .mantine-Modal-inner {
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+
+.mdev-stage-selection-modal-content {
+  width: min(420px, 100%);
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow-x: hidden;
+}
+
+.mdev-stage-selection-modal-body,
+.mdev-stage-selection-modal-layout {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-stage-selection-modal-message {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.mdev-stage-selection-modal-actions {
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 480px) {
+  .mdev-stage-selection-modal .mantine-Modal-inner {
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+
+  .mdev-stage-selection-modal-content {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+  }
+
+  .mdev-stage-selection-modal-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .mdev-stage-selection-modal-actions .mantine-Button-root {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+@media (max-width: 320px) {
+  .mdev-stage-selection-modal-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.mdev-stage-selection-modal {
+  --modal-size: min(420px, calc(100dvw - 32px));
+}
+
+.mdev-stage-selection-modal-inner {
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100% !important;
+  max-width: 100dvw !important;
+  height: 100dvh !important;
+  padding: 16px !important;
+  box-sizing: border-box !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow-x: hidden !important;
+}
+
+.mdev-stage-selection-modal-content {
+  flex: 0 1 420px !important;
+  width: min(420px, calc(100dvw - 32px)) !important;
+  max-width: calc(100dvw - 32px) !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+  overflow-x: hidden !important;
+}
+
+.mdev-stage-selection-modal-content .mantine-Modal-header,
+.mdev-stage-selection-modal-body,
+.mdev-stage-selection-modal-layout {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.mdev-stage-selection-modal-content .mantine-Modal-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.mdev-stage-selection-modal-message {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.mdev-stage-selection-modal-actions {
+  display: grid !important;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-stage-selection-modal-actions .mantine-Button-root {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 320px) {
+  .mdev-stage-selection-modal-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.mdev-workflow-repo-path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin: 4px 0 0;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mantine-color-dimmed);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.mdev-workflow-repo-path-label {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+}
+
+.mdev-workflow-repo-path-copy {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--mantine-primary-color-4);
+  opacity: 0.65;
+}
+
+.mdev-workflow-repo-path:hover {
+  background: var(--mantine-color-default-hover);
+  border-color: var(--mantine-color-default-border);
+  color: var(--mantine-color-text);
+}
+
+.mdev-workflow-repo-path:hover .mdev-workflow-repo-path-copy,
+.mdev-workflow-repo-path:focus-visible .mdev-workflow-repo-path-copy {
+  opacity: 1;
+}
+
+.mdev-workflow-repo-path:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-5);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1199px) {
+  .mdev-workflow-repo-path {
+    padding: 6px 4px;
+    font-size: 11px;
+  }
+}
+
+.mdev-workflow-unified-controls{gap:16px!important;min-width:0}
+.mdev-workflow-unified-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;min-width:0}
+.mdev-workflow-unified-actions .mantine-Button-root{width:100%;min-width:0;max-width:100%;height:auto;min-height:36px;padding:8px;font-size:12px}
+.mdev-workflow-unified-actions .mantine-Button-label{white-space:normal;text-align:center;line-height:1.25}
+.mdev-workflow-unified-actions .mdev-workflow-action-auto{grid-column:1/-1}
+.mdev-workflow-unified-actions .mdev-workflow-action-cancel{border:1px solid rgba(250,82,82,.25)}
+.mdev-workflow-control-topology{min-width:0;border-top:1px solid var(--mantine-color-default-border);padding-top:14px}
+.mdev-workflow-operations-surface{min-width:0}
+.mdev-workflow-detail-grid .mdev-workflow-operations-surface>.mantine-Stack-root{gap:12px}
+.mdev-workflow-detail-grid .mdev-workflow-integrated-inputs{min-width:0}
+@media(min-width:1200px){
+  .mdev-workflow-detail-grid .mdev-workflow-operations-surface{padding-bottom:12px!important}
+  .mdev-workflow-detail-grid .mdev-workflow-integrated-inputs{background:transparent;border:0;box-shadow:none}
+  .mdev-workflow-detail-grid .mdev-stage-inputs-column{border-top:0!important;border-radius:0 0 10px 10px!important;background:var(--mantine-color-body)}
+  .mdev-workflow-detail-grid .mdev-workflow-operations-surface{border-radius:10px 10px 0 0}
+}
+@media(max-width:1199px){
+  .mdev-workflow-detail-grid .mdev-workflow-integrated-inputs{padding-top:0!important}
+  .mdev-workflow-detail-grid .mdev-stage-inputs-column{border-top:0!important}
+  .mdev-workflow-unified-actions .mantine-Button-root{min-height:40px}
+}
+@media(max-width:340px){
+  .mdev-workflow-unified-actions{gap:6px}
+  .mdev-workflow-unified-actions .mantine-Button-root{font-size:11px;padding:7px 5px}
+  .mdev-topology-rail__label{font-size:9px}
+}
+
+.mdev-workflow-control-topology .mdev-topology-rail__track{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,80px),1fr));gap:12px 8px;align-items:start}
+.mdev-workflow-control-topology .mdev-topology-rail__stage{flex:none;width:100%;min-width:0}
+.mdev-workflow-control-topology .mdev-topology-rail__label{white-space:normal;overflow-wrap:break-word;line-height:14px;min-height:28px;max-height:28px}
+@media(max-width:480px){.mdev-workflow-control-topology .mdev-topology-rail__track{grid-template-columns:repeat(auto-fit,minmax(min(100%,76px),1fr));gap:10px 7px}}
+
+.mdev-pool-section .mdev-pool-header-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-pool-section .mdev-pool-title {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-pool-section .mdev-pool-action-rail {
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 8px;
+}
+
+.mdev-pool-section .mdev-pool-controls {
+  display: flex;
+  flex: 0 1 auto;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.mdev-pool-section .mdev-pool-controls > .mantine-Paper-root {
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.mdev-pool-section .mdev-pool-controls .mantine-Select-root {
+  flex: 0 1 auto;
+  width: min(180px, 100%);
+  min-width: 0;
+}
+
+.mdev-pool-section .mdev-pool-controls .mantine-NumberInput-root {
+  flex: 0 0 64px;
+  width: 64px;
+}
+
+.mdev-pool-section .mdev-pool-controls .mantine-Select-wrapper,
+.mdev-pool-section .mdev-pool-controls .mantine-NumberInput-wrapper {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-pool-section .mdev-pool-controls .mantine-Select-input,
+.mdev-pool-section .mdev-pool-controls .mantine-NumberInput-input {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container (max-width: 480px) {
+  .mdev-pool-section .mdev-pool-action-rail {
+    align-items: stretch;
+  }
+
+  .mdev-pool-section .mdev-pool-controls {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .mdev-pool-section .mdev-pool-controls > .mantine-Paper-root {
+    flex: 1 1 180px;
+    max-width: 100%;
+  }
+
+  .mdev-pool-section .mdev-pool-controls .mantine-Select-root {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .mdev-pool-section .mdev-pool-action-rail > .mantine-Button-root {
+    flex: 0 1 auto;
+  }
+}
+
+.mdev-supervisor-work-unit-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-supervisor-work-unit-toolbar > .mantine-Group-root:first-child {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.mdev-supervisor-work-unit-actions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mdev-supervisor-work-unit-actions .mantine-Button-root,
+.mdev-supervisor-work-unit-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  height: 30px;
+  min-height: 30px;
+  max-height: 30px;
+  padding: 0 11px;
+  border-radius: 6px;
+  box-sizing: border-box;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.mdev-supervisor-work-unit-open {
+  border: 1px solid var(--mantine-primary-color-5);
+  background: rgba(34,139,230,0.12);
+  color: var(--mantine-primary-color-3);
+  text-decoration: none;
+}
+
+.mdev-supervisor-work-unit-open:hover {
+  background: rgba(34,139,230,0.22);
+  text-decoration: none;
+}
+
+.mdev-supervisor-work-unit-actions .mantine-Button-label {
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: 1;
+}
+
+.mdev-pool-section .mdev-pool-header-layout {
+  min-width: 0;
+  align-items: center;
+}
+
+.mdev-pool-section .mdev-pool-title {
+  min-width: 0;
+}
+
+.mdev-pool-section .mdev-pool-action-rail {
+  min-width: 0;
+  gap: 8px;
+  align-items: center;
+}
+
+.mdev-pool-section .mdev-pool-action-rail > .mantine-Button-root {
+  flex: 0 0 auto;
+  height: 32px;
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+@container (min-width: 920px) {
+  .mdev-pool-section .mdev-pool-header-layout {
+    display: grid !important;
+    grid-template-columns: minmax(200px,1fr) minmax(0,auto) !important;
+    gap: 16px !important;
+    align-items: center !important;
+  }
+
+  .mdev-pool-section .mdev-pool-action-rail {
+    display: flex !important;
+    width: auto !important;
+    max-width: 100%;
+    flex-wrap: nowrap !important;
+    justify-content: flex-end !important;
+    justify-self: end;
+    gap: 8px;
+  }
+
+  .mdev-pool-section .mdev-pool-controls {
+    display: flex !important;
+    flex: 0 1 auto;
+    flex-wrap: nowrap !important;
+    width: auto !important;
+    min-width: 0;
+    max-width: 100%;
+    gap: 8px;
+  }
+
+  .mdev-pool-section .mdev-pool-controls > .mantine-Paper-root {
+    flex: 0 1 auto;
+    width: auto !important;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .mdev-pool-section .mdev-pool-action-rail > .mantine-Button-root {
+    flex: 0 0 auto !important;
+  }
+}
+
+@container (min-width: 680px) {
+  .mdev-supervisor-work-unit-toolbar {
+    display: grid !important;
+    grid-template-columns: minmax(0,1fr) auto auto;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .mdev-supervisor-work-unit-toolbar > .mantine-Group-root:first-child {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .mdev-supervisor-work-unit-open {
+    grid-column: 2;
+  }
+
+  .mdev-supervisor-work-unit-actions {
+    grid-column: 3;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+  }
+}
+
+@container (max-width: 679px) {
+  .mdev-supervisor-work-unit-toolbar > .mantine-Group-root:first-child {
+    flex: 1 1 100%;
+  }
+
+  .mdev-supervisor-work-unit-open {
+    flex: 0 0 auto;
+  }
+
+  .mdev-supervisor-work-unit-actions {
+    flex: 1 1 auto;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
+  .mdev-supervisor-work-unit-toolbar {
+    gap: 8px;
+  }
+
+  .mdev-supervisor-work-unit-open,
+  .mdev-supervisor-work-unit-actions .mantine-Button-root {
+    height: 34px;
+    min-height: 34px;
+    max-height: none;
+    padding-inline: 10px;
+  }
+
+  .mdev-supervisor-work-unit-actions {
+    gap: 6px;
+  }
+
+  .mdev-pool-section .mdev-pool-action-rail {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}
+
+.mdev-execution-list {
+  container-type: inline-size;
+  min-width: 0;
+}
+
+.mdev-execution-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.mdev-execution-row-label {
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mdev-execution-row-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.mdev-execution-row-timing {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
+@container (max-width: 340px) {
+  .mdev-execution-row-message {
+    flex-basis: 100% !important;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+  }
+
+  .mdev-execution-row-timing {
+    margin-left: auto;
+  }
+}
+
+@container (max-width: 220px) {
+  .mdev-execution-row-label {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+.mdev-workflow-identity {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.mdev-workflow-identity-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mdev-workflow-identity .mdev-workflow-repo-path {
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--mantine-color-dimmed);
+  text-align: left;
+  cursor: copy;
+}
+
+.mdev-workflow-identity .mdev-workflow-repo-path-label {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: normal;
+}
+
+.mdev-workflow-identity .mdev-workflow-repo-path:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--mantine-color-text);
+}
+
+.mdev-workflow-identity .mdev-workflow-repo-path:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-5);
+  outline-offset: 2px;
+}
+
+@media (max-width: 480px) {
+  .mdev-workflow-identity {
+    gap: 8px;
+  }
+
+  .mdev-workflow-identity-title {
+    max-width: 50%;
+  }
+
+  .mdev-workflow-identity .mdev-workflow-repo-path {
+    font-size: 11px;
+  }
+}
+
+.mdev-workspace-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.62fr);
+  gap: var(--mdev-content-gap);
+  min-width: 0;
+  min-height: 0;
+}
+
+.mdev-workspace-split > *,
+.mdev-workspace-repository > *,
+.mdev-workspace-diff > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-workspace-repository {
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: var(--mdev-content-gap);
+  min-width: 0;
+  min-height: 620px;
+  align-items: stretch;
+}
+
+.mdev-workspace-diff {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 8px var(--diff-sidebar-width);
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.mdev-workspace-diff:not(.mdev-workspace--browser-open) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.mdev-workspace-mobile-action {
+  display: none;
+}
+
+@media (max-width: 48rem) {
+  .mdev-workspace-split,
+  .mdev-workspace-repository,
+  .mdev-workspace-diff {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--mantine-spacing-sm);
+    min-height: 0;
+  }
+
+  .mdev-workspace-mobile-action {
+    display: inline-flex;
+  }
+
+  .mdev-workspace-split > *,
+  .mdev-workspace-repository > *,
+  .mdev-workspace-diff > * {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .mdev-workspace-split > *,
+  .mdev-workspace-repository > * {
+    grid-column: 1;
+  }
+
+  .mdev-workspace--detail-open > .mdev-workspace-list,
+  .mdev-workspace--detail-open > .mdev-workspace-explorer {
+    display: none;
+  }
+
+  .mdev-workspace-split:not(.mdev-workspace--detail-open) > .mdev-workspace-detail,
+  .mdev-workspace-repository:not(.mdev-workspace--detail-open) > .mdev-workspace-editor {
+    display: none;
+  }
+
+  .mdev-workspace-repository {
+    height: auto;
+  }
+
+  .mdev-workspace-repository > * {
+    min-height: min(620px, 70dvh);
+  }
+
+  .mdev-workspace-diff.mdev-workspace--browser-open > .mdev-workspace-diff-content {
+    display: none;
+  }
+
+  .mdev-workspace-diff:not(.mdev-workspace--browser-open) > .mdev-workspace-diff-browser {
+    display: none;
+  }
+
+  .mdev-workspace-diff > .mdev-workspace-diff-resizer {
+    display: none;
+  }
+
+  .mdev-workspace-diff > .mdev-workspace-diff-browser {
+    border-left: 0;
+    overflow: auto;
+  }
+
+  .mdev-workspace-diff .mantine-Group-root {
+    flex-wrap: wrap;
+  }
+
+  .mdev-workspace-diff .mantine-SegmentedControl-root {
+    max-width: 100%;
+  }
+
+  .mdev-workspace .mantine-Card-root {
+    min-width: 0;
+  }
+
+  .mdev-workspace-commit-row > .mantine-Group-root {
+    flex-wrap: wrap;
+  }
+
+  .mdev-workspace-commit-row .mantine-Badge-root {
+    flex-shrink: 0;
+  }
+}
+
+.mdev-automation-panel {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-automation-table {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-automation-table th,
+.mdev-automation-table td {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.mdev-automation-description {
+  min-width: 0;
+}
+
+.mdev-automation-description .mantine-Stack-root {
+  min-width: 0;
+}
+
+.mdev-automation-trigger {
+  min-width: 0;
+}
+
+.mdev-automation-trigger .mantine-Group-root {
+  min-width: 0;
+}
+
+@container (max-width: 43rem) {
+  .mdev-automation-table {
+    display: block;
+    width: 100%;
+    border: 0;
+  }
+
+  .mdev-automation-table thead {
+    display: none;
+  }
+
+  .mdev-automation-table tbody {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    gap: var(--mantine-spacing-xs);
+  }
+
+  .mdev-automation-table tbody tr:not(.mdev-automation-section) {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: 28px minmax(0, 1fr);
+    grid-template-areas: 'enabled description' '. trigger';
+    column-gap: var(--mantine-spacing-md);
+    row-gap: var(--mantine-spacing-xs);
+    align-items: start;
+    padding: var(--mantine-spacing-md);
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: var(--mantine-radius-sm);
+    background: var(--mantine-color-body);
+  }
+
+  .mdev-automation-table tbody tr:not(.mdev-automation-section) > td {
+    display: block;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .mdev-automation-table .mdev-automation-enabled {
+    grid-area: enabled;
+    padding-top: 2px;
+  }
+
+  .mdev-automation-table .mdev-automation-description {
+    grid-area: description;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+  }
+
+  .mdev-automation-table .mdev-automation-trigger {
+    grid-area: trigger;
+    padding-top: var(--mantine-spacing-xs);
+  }
+
+  .mdev-automation-table .mdev-automation-trigger .mantine-Group-root {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--mantine-spacing-xs);
+  }
+
+  .mdev-automation-table .mdev-automation-trigger .mantine-NumberInput-root {
+    width: 76px;
+    flex: 0 0 76px;
+  }
+
+  .mdev-automation-table .mdev-automation-section {
+    display: block;
+    width: 100%;
+    margin-top: var(--mantine-spacing-sm);
+  }
+
+  .mdev-automation-table .mdev-automation-section > td {
+    display: block;
+    width: 100%;
+    padding: var(--mantine-spacing-sm) 0 var(--mantine-spacing-xs);
+  }
+
+  .mdev-automation-table .mdev-automation-section .mantine-Group-root {
+    display: flex;
+    min-width: 0;
+    flex-wrap: nowrap;
+  }
+}
+
+.mdev-builder-page {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-builder-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 22.5rem);
+  gap: var(--mantine-spacing-md);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mdev-builder-layout > * {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+}
+
+.mdev-builder-layout .mantine-Stack-root,
+.mdev-builder-layout .mantine-ScrollArea-root {
+  min-width: 0;
+}
+
+.mdev-builder-layout .mantine-Group-root {
+  max-width: 100%;
+}
+
+.mdev-builder-layout .mantine-Card-root {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-runtime-page {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-responsive-table {
+  width: 100%;
+}
+
+.mdev-responsive-table td {
+  overflow-wrap: anywhere;
+}
+
+.mdev-responsive-table td[data-column="actions"] .mantine-Group-root {
+  flex-wrap: wrap;
+}
+
+@media (max-width: 64rem) {
+  .mdev-builder-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    height: auto;
+    align-items: start;
+  }
+
+  .mdev-builder-page {
+    height: auto !important;
+  }
+
+  .mdev-builder-pipeline,
+  .mdev-builder-inspector {
+    height: auto !important;
+    min-height: 0;
+  }
+
+  .mdev-builder-pipeline > .mantine-Stack-root,
+  .mdev-builder-inspector > .mantine-Stack-root {
+    height: auto !important;
+  }
+
+  .mdev-builder-pipeline .mantine-ScrollArea-root,
+  .mdev-builder-inspector .mantine-ScrollArea-root {
+    height: auto !important;
+    max-height: none;
+  }
+
+  .mdev-builder-pipeline .mantine-ScrollArea-viewport,
+  .mdev-builder-inspector .mantine-ScrollArea-viewport {
+    max-height: none;
+  }
+}
+
+@media (max-width: 48rem) {
+  .mdev-builder-page {
+    padding: var(--mantine-spacing-xs) !important;
+  }
+
+  .mdev-builder-layout {
+    gap: var(--mantine-spacing-sm);
+  }
+
+  .mdev-builder-layout .mantine-Group-root {
+    flex-wrap: wrap;
+  }
+
+  .mdev-builder-layout .mantine-Button-root {
+    max-width: 100%;
+  }
+
+  .mdev-responsive-table,
+  .mdev-responsive-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .mdev-responsive-table thead {
+    display: none;
+  }
+
+  .mdev-responsive-table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--mantine-spacing-sm);
+    padding: var(--mantine-spacing-md);
+    margin-bottom: var(--mantine-spacing-sm);
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: var(--mantine-radius-md);
+    background: var(--mantine-color-body);
+    min-width: 0;
+  }
+
+  .mdev-responsive-table tbody td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .mdev-responsive-table tbody td[data-column="primary"] {
+    grid-row: 1;
+  }
+
+  .mdev-responsive-table tbody td[data-column="actions"] {
+    padding-top: var(--mantine-spacing-xs);
+    border-top: 1px solid var(--mantine-color-default-border);
+  }
+
+  .mdev-responsive-table tbody td[data-label]:not([data-column="primary"]):not([data-column="actions"])::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--mantine-color-dimmed);
+    font-size: var(--mantine-font-size-xs);
+    font-weight: 600;
+    margin-bottom: 3px;
+  }
+
+  .mdev-responsive-table tbody td .mantine-Code-root {
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .mdev-responsive-table tbody td[data-column="actions"] .mantine-Group-root,
+  .mdev-responsive-table tbody td[data-column="actions"] .mantine-Stack-root {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--mantine-spacing-xs);
+  }
+
+  .mdev-responsive-table tbody td[data-column="actions"] .mantine-Button-root {
+    min-height: 36px;
+  }
+
+  .mdev-runtime-scroll {
+    height: auto !important;
+    max-height: none;
+    min-width: 0;
+  }
+
+  .mdev-runtime-scroll .mantine-ScrollArea-viewport {
+    max-height: none;
+  }
+
+  .mdev-runtime-table td[data-column="command"] .mantine-Code-root,
+  .mdev-runtime-table td[data-column="output"] .mantine-Code-root {
+    display: block;
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .mdev-runtime-table td[data-column="output"] .mantine-ScrollArea-root {
+    max-width: 100%;
+  }
+
+  .mdev-runtime-table td[data-column="primary"] .mantine-Stack-root {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .mdev-templates-table td[data-column="repository"] .mantine-Code-root {
+    display: inline-block;
+    max-width: 100%;
+  }
+}
+
+.mdev-application-settings {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  container-type: inline-size;
+}
+
+.mdev-application-settings .mantine-Stack-root,
+.mdev-application-settings .mantine-RadioGroup-root,
+.mdev-application-settings .mantine-InputWrapper-root {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-settings-browser-row {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-settings-browser-row .mantine-Radio-root {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.mdev-settings-browser-row .mantine-Radio-body,
+.mdev-settings-browser-row .mantine-Radio-labelWrapper,
+.mdev-settings-browser-row .mantine-Radio-label,
+.mdev-settings-browser-row .mantine-Radio-description {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-settings-browser-row .mantine-Radio-label,
+.mdev-settings-browser-row .mantine-Radio-description,
+.mdev-settings-file-path,
+.mdev-settings-file-path .mantine-Code-root {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.mdev-settings-file-path .mantine-Code-root {
+  white-space: pre-wrap;
+}
+
+.mdev-settings-path-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.mdev-settings-path-input .mantine-Input-input {
+  min-width: 0;
+  width: 100%;
+}
+
+.mdev-settings-actions {
+  min-width: 0;
+  max-width: 100%;
+}
+
+@container (max-width: 36rem) {
+  .mdev-settings-browser-row {
+    align-items: flex-start;
+    padding: var(--mantine-spacing-sm) 0;
+    border-bottom: 1px solid var(--mantine-color-default-border);
+  }
+
+  .mdev-settings-browser-row .mantine-Radio-root {
+    flex-basis: 100%;
+  }
+
+  .mdev-settings-browser-row > .mantine-Button-root {
+    margin-left: 28px;
+  }
+
+  .mdev-settings-actions {
+    justify-content: stretch;
+  }
+
+  .mdev-settings-actions > .mantine-Button-root {
+    flex: 1 1 100%;
+    min-width: 0;
+    max-width: 100%;
+    height: auto;
+    min-height: 40px;
+  }
+
+  .mdev-settings-actions > .mantine-Button-root .mantine-Button-label {
+    white-space: normal;
+    text-align: center;
+    padding: 6px 0;
+  }
+}
+
+@media (max-width: 64rem) {
+  .mdev-builder-modal-body {
+    height: calc(100dvh - 72px) !important;
+    max-height: calc(100dvh - 72px);
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mdev-builder-modal-content {
+    height: auto !important;
+    min-height: 100%;
+    min-width: 0;
+  }
+
+  .mdev-builder-modal-workspace {
+    flex: 0 0 auto !important;
+    height: auto !important;
+    min-height: 0;
+    min-width: 0;
+    overflow: visible !important;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-page {
+    height: auto !important;
+    min-height: 0;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-layout {
+    height: auto !important;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-pipeline,
+  .mdev-builder-modal-workspace .mdev-builder-inspector {
+    height: auto !important;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-pipeline > .mantine-Stack-root,
+  .mdev-builder-modal-workspace .mdev-builder-inspector > .mantine-Stack-root {
+    height: auto !important;
+    min-height: 0;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-pipeline .mantine-ScrollArea-root,
+  .mdev-builder-modal-workspace .mdev-builder-inspector .mantine-ScrollArea-root {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-pipeline .mantine-ScrollArea-viewport,
+  .mdev-builder-modal-workspace .mdev-builder-inspector .mantine-ScrollArea-viewport {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .mdev-builder-modal-workspace .mdev-builder-pipeline .mantine-ScrollArea-viewport > div,
+  .mdev-builder-modal-workspace .mdev-builder-inspector .mantine-ScrollArea-viewport > div {
+    min-height: 0;
+  }
+}
+
+.mdev-context-export-layout {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-context-export-layout > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-context-export-settings .mantine-ScrollArea-viewport,
+.mdev-context-export-tree-panel,
+.mdev-context-export-file-tree {
+  min-width: 0;
+}
+
+.mdev-context-export-tree-toolbar {
+  min-width: 0;
+}
+
+.mdev-context-export-tree-row {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mdev-context-export-tree-row .mantine-Text-root {
+  min-width: 0;
+}
+
+.mdev-context-export-tree-scroll {
+  min-width: 0;
+}
+
+@media (max-width: 64rem) {
+  .mdev-context-export-body {
+    height: calc(100dvh - 100px) !important;
+    max-height: calc(100dvh - 100px);
+    min-width: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mdev-context-export-layout {
+    flex-direction: column;
+    align-items: stretch;
+    height: auto !important;
+    min-height: 0;
+    gap: var(--mantine-spacing-md);
+  }
+
+  .mdev-context-export-settings {
+    flex: 0 0 auto !important;
+    width: 100%;
+    height: auto !important;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .mdev-context-export-settings .mantine-ScrollArea-viewport {
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  .mdev-context-export-settings .mantine-ScrollArea-viewport > div {
+    min-width: 0;
+  }
+
+  .mdev-context-export-tree-panel {
+    flex: 0 0 auto !important;
+    width: 100%;
+    min-height: 0;
+  }
+
+  .mdev-context-export-file-tree {
+    height: auto !important;
+    min-height: 0;
+  }
+
+  .mdev-context-export-tree-scroll {
+    flex: 0 0 auto !important;
+    height: min(55dvh, 520px);
+    min-height: 240px;
+  }
+
+  .mdev-context-export-tree-row {
+    min-height: 40px !important;
+    touch-action: manipulation;
+  }
+
+  .mdev-context-export-expand {
+    min-width: 32px;
+    min-height: 32px;
+  }
+}
+
+@media (max-width: 48rem) {
+  .mdev-context-export-actions {
+    flex-wrap: wrap;
+  }
+
+  .mdev-context-export-actions > .mantine-Button-root {
+    flex: 1 1 auto;
+    min-height: 40px;
+  }
+
+  .mdev-context-export-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mdev-context-export-tree-toolbar {
+    align-items: stretch;
+  }
+
+  .mdev-context-export-tree-toolbar .mantine-TextInput-root {
+    flex: 1 1 100% !important;
+    width: 100%;
+  }
+
+  .mdev-context-export-tree-toolbar .mantine-Button-root {
+    flex: 1 1 auto;
+    min-height: 36px;
+  }
+
+  .mdev-context-export-tree-panel > .mantine-Group-root {
+    flex-wrap: wrap;
+  }
+
+  .mdev-context-export-settings textarea,
+  .mdev-context-export-settings input {
+    max-width: 100%;
+  }
+}
+
+@container (max-width: 44.9375rem) {
+  .mdev-supervisor-content {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--mantine-spacing-md);
+  }
+
+  .mdev-supervisor-content > :first-child {
+    grid-column: auto;
+  }
+
+  .mdev-supervisor-content .mdev-stage-rail {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 8.5rem), 1fr));
+  }
+
+  .mdev-supervisor-content .mdev-execution-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0.1875rem;
+    padding: var(--mantine-spacing-sm);
+  }
+}
+
+@media (max-width: 22.5rem) {
+  .mdev-stage-rail,
+  .mdev-pool-controls,
+  .mdev-stage-loading {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mdev-supervisor-actions > *,
+  .mdev-pool-action-rail > .mantine-Button-root {
+    flex-basis: 100%;
+  }
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] {
+  background: rgba(55, 60, 68, 0.65) !important;
+  border: 1px solid rgba(140, 150, 165, 0.45) !important;
+  border-left-width: 3px !important;
+  box-shadow: none !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="green"] {
+  background: rgba(38, 100, 58, 0.47) !important;
+  border-color: #40c057 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="orange"] {
+  background: rgba(148, 109, 18, 0.47) !important;
+  border-color: #fab005 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="red"] {
+  background: rgba(151, 47, 54, 0.48) !important;
+  border-color: #fa5252 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="cyan"] {
+  background: rgba(35, 101, 165, 0.48) !important;
+  border-color: #339af0 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] {
+  background: rgba(43, 47, 54, 0.88) !important;
+  border: 1px solid rgba(140, 150, 165, 0.35) !important;
+  border-radius: 6px !important;
+  margin-block: 5px !important;
+  box-shadow: none !important;
+  filter: none;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="green"] {
+  background: rgba(39, 103, 56, 0.68) !important;
+  border-color: #40c057 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="orange"] {
+  background: rgba(155, 112, 16, 0.68) !important;
+  border-color: #fab005 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="red"] {
+  background: rgba(153, 46, 54, 0.68) !important;
+  border-color: #fa5252 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="cyan"] {
+  background: rgba(35, 105, 177, 0.68) !important;
+  border-color: #339af0 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone]:hover {
+  filter: brightness(1.13);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] .mdev-replay-stage-title,
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] .mdev-live-capability-badges > .mantine-Text-root:first-child {
+  color: #ffffff !important;
+  font-weight: 700;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] .mdev-live-execution-time .mantine-Text-root,
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] .mdev-live-capability-time .mantine-Text-root {
+  color: rgba(255, 255, 255, 0.78) !important;
+  opacity: 1;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] .mdev-live-capability-message {
+  color: rgba(255, 255, 255, 0.94) !important;
+  opacity: 1;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] .mdev-live-execution-identity .mantine-Badge-root,
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] .mdev-live-capability-badges .mantine-Badge-root {
+  display: none !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] .mdev-live-execution-meta .mantine-Button-root,
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] .mdev-live-capability-action {
+  color: #8ecaff;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] {
+  background: rgba(55, 60, 68, 0.18) !important;
+  border-color: rgba(140, 150, 165, 0.35) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="green"] {
+  background: rgba(47, 158, 68, 0.04) !important;
+  border-color: rgba(64, 192, 87, 0.35) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="orange"] {
+  background: rgba(250, 176, 5, 0.14) !important;
+  border-color: rgba(250, 176, 5, 0.78) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="red"] {
+  background: rgba(250, 82, 82, 0.16) !important;
+  border-color: rgba(250, 82, 82, 0.8) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="cyan"] {
+  background: rgba(34, 139, 230, 0.16) !important;
+  border-color: rgba(34, 139, 230, 0.8) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] {
+  background: rgba(43, 47, 54, 0.3) !important;
+  border-color: rgba(140, 150, 165, 0.3) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="green"] {
+  background: rgba(47, 158, 68, 0.06) !important;
+  border-color: rgba(64, 192, 87, 0.35) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="orange"] {
+  background: rgba(250, 176, 5, 0.20) !important;
+  border-color: rgba(250, 176, 5, 0.78) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="red"] {
+  background: rgba(250, 82, 82, 0.22) !important;
+  border-color: rgba(250, 82, 82, 0.8) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="cyan"] {
+  background: rgba(34, 139, 230, 0.22) !important;
+  border-color: rgba(34, 139, 230, 0.8) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] {
+  background: rgba(34, 38, 44, 0.92) !important;
+  border: 1px solid rgba(125, 137, 152, 0.38) !important;
+  border-left-width: 3px !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="cyan"] {
+  border-left-color: #339af0 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="green"] {
+  border-left-color: #40c057 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="orange"] {
+  border-left-color: #fab005 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="red"] {
+  border-left-color: #fa5252 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage-header {
+  padding: 10px 12px;
+  border-radius: 5px;
+  border-bottom: 1px solid rgba(140, 150, 165, 0.22);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="blue"] > .mdev-replay-stage-header,
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="cyan"] > .mdev-replay-stage-header {
+  background: rgba(34, 139, 230, 0.19);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="green"] > .mdev-replay-stage-header {
+  background: rgba(47, 158, 68, 0.19);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="yellow"] > .mdev-replay-stage-header,
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="orange"] > .mdev-replay-stage-header {
+  background: rgba(250, 176, 5, 0.19);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone="red"] > .mdev-replay-stage-header {
+  background: rgba(250, 82, 82, 0.19);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-identity .mantine-Badge-root,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-badges .mantine-Badge-root {
+  display: inline-flex !important;
+  opacity: 1 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  border: 1px solid rgba(140, 150, 165, 0.4) !important;
+  border-radius: 6px !important;
+  margin-block: 5px !important;
+  box-shadow: none !important;
+  transition: filter 150ms ease, border-color 150ms ease;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="green"] {
+  background: rgba(30, 105, 54, 0.52) !important;
+  border-color: #40c057 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="orange"] {
+  background: rgba(145, 105, 14, 0.55) !important;
+  border-color: #fab005 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="red"] {
+  background: rgba(145, 42, 48, 0.55) !important;
+  border-color: #fa5252 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone="cyan"] {
+  background: rgba(25, 88, 145, 0.58) !important;
+  border-color: #339af0 !important;
+}
+
+@keyframes mdev-replay-stripe-translate {
+  from {
+    transform: translate3d(-34px, 0, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-running="true"]::before {
+  content: '';
+  position: absolute;
+  inset: -48px;
+  z-index: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(-45deg, rgba(51, 154, 240, 0.09) 0px, rgba(51, 154, 240, 0.09) 12px, rgba(255, 255, 255, 0.075) 12px, rgba(255, 255, 255, 0.075) 24px);
+  background-size: 34px 34px;
+  transform: translate3d(-34px, 0, 0);
+  animation: mdev-replay-stripe-translate 2.8s linear infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mdev-workflow-events-panel .mdev-replay-capability[data-replay-running="true"]::before {
+    animation: none;
+    transform: none;
+    will-change: auto;
+  }
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone] > * {
+  position: relative;
+  z-index: 1;
+}
+
+.mdev-workflow-events-panel .mdev-replay-capability[data-replay-tone]:hover {
+  filter: brightness(1.12);
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="blue"],
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="cyan"] {
+  background: rgba(34, 139, 230, 0.19) !important;
+  border-color: #339af0 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="green"] {
+  background: rgba(47, 158, 68, 0.19) !important;
+  border-color: #40c057 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="yellow"],
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="orange"] {
+  background: rgba(250, 176, 5, 0.19) !important;
+  border-color: #fab005 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="red"] {
+  background: rgba(250, 82, 82, 0.19) !important;
+  border-color: #fa5252 !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage.mdev-replay-stage[data-replay-tone="gray"] {
+  background: rgba(125, 137, 152, 0.12) !important;
+  border-color: rgba(125, 137, 152, 0.38) !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage[data-replay-tone] > .mdev-replay-stage-header {
+  background: transparent !important;
+}
+
+.mdev-workflow-events-panel .mdev-replay-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--mantine-color-default-border);
+}
+
+.mdev-workflow-events-panel .mdev-replay-toolbar-title,
+.mdev-workflow-events-panel .mdev-replay-toolbar-actions {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 0.5rem;
+}
+
+.mdev-workflow-events-panel .mdev-replay-toolbar-title .mantine-Title-root {
+  font-size: 1rem;
+  white-space: nowrap;
+}
+
+.mdev-workflow-events-panel .mdev-replay-toolbar-actions {
+  margin-left: auto;
+}
+
+.mdev-workflow-events-panel .mdev-replay-stage .mdev-live-execution-meta .mantine-ActionIcon-root,
+.mdev-workflow-events-panel .mdev-replay-capability .mdev-live-capability-action.mantine-ActionIcon-root {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  color: #8ecaff;
+}
+
+@container (max-width: 420px) {
+  .mdev-workflow-events-panel .mdev-replay-toolbar {
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-toolbar-title {
+    width: 100%;
+  }
+
+  .mdev-workflow-events-panel .mdev-replay-toolbar-actions {
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-end;
+  }
+}
+
+

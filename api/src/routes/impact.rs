@@ -37,7 +37,7 @@ struct EventsResult { events: Vec<EventRecord>, has_more: bool, next_cursor: Opt
 #[derive(Deserialize)]
 struct InferenceQuery {
     invocation_id: Option<String>, step_id: Option<String>, capability_invocation_id: Option<String>,
-    from: Option<String>, to: Option<String>, before: Option<String>, limit: Option<i64>,
+    from: Option<String>, to: Option<String>, before: Option<String>, before_id: Option<String>, limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +48,7 @@ struct InvocationInput {
 
 #[derive(Serialize)]
 struct InvocationRecord {
-    id: String, step_id: String, stage_type: String, capability_invocation_id: Option<String>,
+    id: String, inference_session_id: String, step_id: String, stage_type: String, capability_invocation_id: Option<String>,
     provider: String, model: String, transport: String, status: String,
     error_message: Option<String>, created_at: String, completed_at: Option<String>,
     inputs: Vec<InvocationInput>, response_text: Option<String>,
@@ -337,12 +337,13 @@ async fn get_events(State(state): State<AppState>, Path(run_id): Path<String>, Q
 async fn get_inference(State(state): State<AppState>, Path(run_id): Path<String>, Query(q): Query<InferenceQuery>) -> Result<Json<InferenceResult>, ApiError> {
     check_run(&state, &run_id).await?;
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
-    let rows = sqlx::query(r#"SELECT i.id, i.step_id, i.stage_type, i.capability_invocation_id, i.provider, i.model, i.transport, i.status, i.error_message, i.created_at, i.completed_at, i.input_json, json_extract(i.output_json, '$.text') AS response_text, json_extract(i.output_json, '$.payload') AS response_payload_json, json_extract(i.output_json, '$.provider_metadata') AS provider_metadata_json, CAST(json_extract(i.accounting_json, '$.reported_usage.input_tokens') AS INTEGER) AS input_tokens, CAST(json_extract(i.accounting_json, '$.reported_usage.output_tokens') AS INTEGER) AS output_tokens, CAST(json_extract(i.accounting_json, '$.reported_usage.cached_input_tokens') AS INTEGER) AS cached_input_tokens, NULL AS cost_amount, NULL AS cost_currency, i.accounting_json FROM inference_invocations i WHERE i.workflow_run_id = ? AND (? IS NULL OR i.id = ?) AND (? IS NULL OR i.step_id = ?) AND (? IS NULL OR i.capability_invocation_id = ?) AND (? IS NULL OR i.created_at >= ?) AND (? IS NULL OR i.created_at <= ?) AND (? IS NULL OR i.created_at < ?) ORDER BY i.created_at DESC, i.id DESC LIMIT ?"#)
-        .bind(&run_id).bind(&q.invocation_id).bind(&q.invocation_id)
+    let rows = sqlx::query(r#"SELECT i.id, i.inference_session_id, i.step_id, i.stage_type, i.capability_invocation_id, i.provider, i.model, i.transport, i.status, i.error_message, i.created_at, i.completed_at, i.input_json, json_extract(i.output_json, '$.text') AS response_text, json_extract(i.output_json, '$.payload') AS response_payload_json, json_extract(i.output_json, '$.provider_metadata') AS provider_metadata_json, CAST(json_extract(i.accounting_json, '$.reported_usage.input_tokens') AS INTEGER) AS input_tokens, CAST(json_extract(i.accounting_json, '$.reported_usage.output_tokens') AS INTEGER) AS output_tokens, CAST(json_extract(i.accounting_json, '$.reported_usage.cached_input_tokens') AS INTEGER) AS cached_input_tokens, NULL AS cost_amount, NULL AS cost_currency, i.accounting_json FROM inference_invocations i WHERE (i.workflow_run_id = ? OR EXISTS (SELECT 1 FROM supervisor_work_units target JOIN supervisor_work_units sibling ON sibling.feature_id = target.feature_id WHERE target.workflow_run_id = ? AND target.feature_id IS NOT NULL AND sibling.workflow_run_id = i.workflow_run_id)) AND (? IS NULL OR i.id = ?) AND (? IS NULL OR i.step_id = ?) AND (? IS NULL OR i.capability_invocation_id = ?) AND (? IS NULL OR i.created_at >= ?) AND (? IS NULL OR i.created_at <= ?) AND (? IS NULL OR i.created_at < ? OR (i.created_at = ? AND (? IS NULL OR i.id < ?))) ORDER BY i.created_at DESC, i.id DESC LIMIT ?"#)
+        .bind(&run_id).bind(&run_id)
+        .bind(&q.invocation_id).bind(&q.invocation_id)
         .bind(&q.step_id).bind(&q.step_id)
         .bind(&q.capability_invocation_id).bind(&q.capability_invocation_id)
         .bind(&q.from).bind(&q.from).bind(&q.to).bind(&q.to)
-        .bind(&q.before).bind(&q.before).bind(limit + 1)
+        .bind(&q.before).bind(&q.before).bind(&q.before).bind(&q.before_id).bind(&q.before_id).bind(limit + 1)
         .fetch_all(&state.db).await.map_err(db_error)?;
     let has_more = rows.len() as i64 > limit;
     let mut invocations = Vec::new();
@@ -359,7 +360,7 @@ async fn get_inference(State(state): State<AppState>, Path(run_id): Path<String>
         let payload: Option<String> = row.get("response_payload_json");
         let metadata: Option<String> = row.get("provider_metadata_json");
         invocations.push(InvocationRecord {
-            id, step_id: row.get("step_id"), stage_type: row.get("stage_type"),
+            id, inference_session_id: row.get("inference_session_id"), step_id: row.get("step_id"), stage_type: row.get("stage_type"),
             capability_invocation_id: row.get("capability_invocation_id"),
             provider: row.get("provider"), model: row.get("model"), transport: row.get("transport"),
             status: row.get("status"), error_message: row.get("error_message"),

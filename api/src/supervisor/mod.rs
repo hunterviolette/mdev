@@ -3527,6 +3527,15 @@ pub async fn apply_supervisor_work_unit(
 
     tx.commit().await?;
 
+    crate::engine::capabilities::changeset::publish_changeset_event(json!({
+        "repo_ref": run.root_repo_path,
+        "run_id": integration_run_id.to_string(),
+        "source": "supervisor_integration",
+        "supervisor_run_id": run.id.to_string(),
+        "work_unit_id": work_unit_id,
+        "final_patch_hash": patch_hash,
+    }));
+
     if archive_integrated_workflows {
         for source_work_unit_id in &source_work_unit_ids {
             lifecycle::archive_supervisor_workflow_by_work_unit(

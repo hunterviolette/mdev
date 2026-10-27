@@ -2124,24 +2124,25 @@ function WorkPoolActionRail(props: { groupKey: string; units: SupervisorWorkUnit
       <Group gap="xs" align="center" wrap="nowrap">
         {poolControls}
         {manualNameOpen ? (
-          <TextInput
-            size="xs"
-            autoFocus
-            placeholder="Work unit name"
-            value={manualName}
-            onChange={(event) => setManualName(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') void createManualShard();
-              if (event.key === 'Escape') {
-                setManualName('');
-                setManualNameOpen(false);
-              }
-            }}
-            w={190}
-          />
-        ) : null}
-        {manualNameOpen ? (
-          <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
+          <Stack gap="xs" miw={280}>
+            <TextInput
+              size="xs"
+              placeholder="Work unit name"
+              value={manualName}
+              onChange={(event) => setManualName(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void createManualShard();
+                if (event.key === 'Escape') {
+                  setManualName('');
+                  setManualNameOpen(false);
+                }
+              }}
+            />
+            <Group gap="xs">
+              <Button size="xs" variant="light" loading={manualBusy} onClick={() => void createManualShard()}>Create</Button>
+              <Button size="xs" variant="subtle" onClick={() => { setManualName(''); setManualNameOpen(false); }}>Cancel</Button>
+            </Group>
+          </Stack>
         ) : (
           <Button size="xs" variant="light" onClick={() => setManualNameOpen(true)}>New work unit</Button>
         )}
@@ -2545,7 +2546,7 @@ function MissionBar(props: {
     <AppHeader
       active="supervisor"
       onChange={navigate}
-      onActiveDoubleClick={() => props.setControlsOpen(!props.controlsOpen)}
+      onActiveTabClick={() => props.setControlsOpen(!props.controlsOpen)}
       actions={(
         <>
           <Badge size="sm" variant="light" color="gray">
